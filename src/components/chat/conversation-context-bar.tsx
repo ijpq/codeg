@@ -3,7 +3,7 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { useTranslations } from "next-intl"
 import { toast } from "sonner"
-import { Check, ChevronsUpDown, Folder, GitBranch, Loader2 } from "lucide-react"
+import { Check, ChevronDown, Folder, GitBranch, Loader2 } from "lucide-react"
 import type { OverlayScrollbarsComponentRef } from "overlayscrollbars-react"
 import { useAppWorkspace } from "@/contexts/app-workspace-context"
 import { useTabContext } from "@/contexts/tab-context"
@@ -31,16 +31,12 @@ import { toErrorMessage } from "@/lib/app-error"
 interface ConversationContextBarProps {
   extraContent?: React.ReactNode
   hasExtraContent?: boolean
-  leadingContent?: React.ReactNode
-  hasLeadingContent?: boolean
   scrollEndTrigger?: number
 }
 
 export const ConversationContextBar = memo(function ConversationContextBar({
   extraContent,
   hasExtraContent = false,
-  leadingContent,
-  hasLeadingContent = false,
   scrollEndTrigger,
 }: ConversationContextBarProps = {}) {
   const scrollRef = useRef<OverlayScrollbarsComponentRef>(null)
@@ -77,27 +73,20 @@ export const ConversationContextBar = memo(function ConversationContextBar({
     return () => inner.removeEventListener("wheel", handler)
   }, [hasExtraContent])
 
-  if (!hasExtraContent && !hasLeadingContent) return null
+  if (!hasExtraContent) return null
 
   return (
     <div className="flex shrink-0 items-center gap-1.5 px-2 pt-2 text-xs text-muted-foreground">
-      {hasLeadingContent && (
-        <div className="flex shrink-0 items-center gap-1.5">
-          {leadingContent}
+      <ScrollArea
+        x="scroll"
+        y="hidden"
+        className="min-w-0 flex-1"
+        ref={scrollRef}
+      >
+        <div ref={innerRef} className="flex w-max items-center gap-1.5">
+          {extraContent}
         </div>
-      )}
-      {hasExtraContent && (
-        <ScrollArea
-          x="scroll"
-          y="hidden"
-          className="min-w-0 flex-1"
-          ref={scrollRef}
-        >
-          <div ref={innerRef} className="flex w-max items-center gap-1.5">
-            {extraContent}
-          </div>
-        </ScrollArea>
-      )}
+      </ScrollArea>
     </div>
   )
 })
@@ -105,8 +94,8 @@ export const ConversationContextBar = memo(function ConversationContextBar({
 ConversationContextBar.displayName = "ConversationContextBar"
 
 // ============================================================================
-// ConversationFolderBranchPicker — folder + branch buttons designed to sit
-// inline inside the message input action row.
+// ConversationFolderBranchPicker — folder + branch buttons rendered below the
+// message input.
 // ============================================================================
 
 interface ConversationFolderBranchPickerProps {
@@ -202,10 +191,10 @@ ConversationFolderBranchPicker.displayName = "ConversationFolderBranchPicker"
 
 /**
  * Mirror the visibility check inside `ConversationFolderBranchPicker` so the
- * parent can decide whether the surrounding bar should reserve space for it.
- * The picker itself returns `null` when no tab/folder is resolved (e.g. while
- * folders are still loading on first paint), and the parent must avoid
- * rendering an otherwise-empty leading wrapper in that interval.
+ * parent can decide whether to render its wrapper row at all. The picker
+ * itself returns `null` when no tab/folder is resolved (e.g. while folders
+ * are still loading on first paint), and the parent must avoid rendering an
+ * otherwise-empty wrapper in that interval.
  */
 export function useConversationFolderBranchPickerVisible(
   tabId?: string | null
@@ -249,17 +238,17 @@ const FolderPicker = memo(function FolderPicker({
 
   const trigger = (
     <Button
-      variant="outline"
+      variant="ghost"
       size="xs"
       title={title}
       className={cn(
-        "min-w-0 bg-transparent",
+        "min-w-0",
         !editable && "cursor-default opacity-60 hover:bg-transparent"
       )}
     >
       <Folder className="size-3 shrink-0 text-muted-foreground" />
       <span className="max-w-[140px] truncate">{currentFolderName}</span>
-      <ChevronsUpDown className="size-3 shrink-0 text-muted-foreground" />
+      <ChevronDown className="size-3 shrink-0 text-muted-foreground/60" />
     </Button>
   )
 
@@ -355,17 +344,12 @@ const BranchPicker = memo(function BranchPicker({
   return (
     <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger asChild>
-        <Button
-          variant="outline"
-          size="xs"
-          title={title}
-          className="min-w-0 bg-transparent"
-        >
+        <Button variant="ghost" size="xs" title={title} className="min-w-0">
           <GitBranch className="size-3 shrink-0 text-muted-foreground" />
           <span className="max-w-[160px] truncate">
             {currentBranch ?? t("noBranch")}
           </span>
-          <ChevronsUpDown className="size-3 shrink-0 text-muted-foreground" />
+          <ChevronDown className="size-3 shrink-0 text-muted-foreground/60" />
         </Button>
       </PopoverTrigger>
       <PopoverContent align="start" className="p-0 w-80 overflow-hidden">

@@ -2310,7 +2310,7 @@ export function MessageInput({
       )}
       <div
         className={cn(
-          "@container flex flex-col rounded-xl border border-input bg-transparent transition-colors focus-within:border-ring focus-within:ring-[3px] focus-within:ring-ring/50",
+          "@container relative flex flex-col rounded-xl border border-input bg-transparent transition-colors focus-within:border-ring focus-within:ring-[3px] focus-within:ring-ring/50",
           showDragActive && "ring-1 ring-primary/40",
           className
         )}
@@ -2318,12 +2318,6 @@ export function MessageInput({
         <ConversationContextBar
           hasExtraContent={hasImageAttachments || hasResourceAttachments}
           scrollEndTrigger={attachments.length}
-          hasLeadingContent={hasFolderBranchPicker}
-          leadingContent={
-            hasFolderBranchPicker ? (
-              <ConversationFolderBranchPicker tabId={attachmentTabId} />
-            ) : null
-          }
           extraContent={
             <>
               {imageAttachments.map((attachment) => (
@@ -2685,10 +2679,15 @@ export function MessageInput({
           </div>
           <div className="shrink-0">{actionButtons}</div>
         </div>
+        {showDragActive && (
+          <div className="pointer-events-none absolute inset-1 z-20 flex items-center justify-center rounded-md border border-dashed border-primary/50 bg-background/80 text-xs text-muted-foreground">
+            {t("dropFilesToAttach")}
+          </div>
+        )}
       </div>
-      {showDragActive && (
-        <div className="pointer-events-none absolute inset-1 z-20 flex items-center justify-center rounded-md border border-dashed border-primary/50 bg-background/80 text-xs text-muted-foreground">
-          {t("dropFilesToAttach")}
+      {hasFolderBranchPicker && (
+        <div className="mt-1.5 flex items-center gap-1.5 text-xs text-muted-foreground">
+          <ConversationFolderBranchPicker tabId={attachmentTabId} />
         </div>
       )}
       <ImagePreviewDialog
