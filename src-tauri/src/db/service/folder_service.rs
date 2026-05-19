@@ -125,6 +125,33 @@ pub async fn update_folder_color(
     Ok(Some(to_detail(updated)))
 }
 
+pub async fn update_folder_default_agent(
+    conn: &DatabaseConnection,
+    folder_id: i32,
+    default_agent_type: Option<AgentType>,
+) -> Result<Option<FolderDetail>, DbError> {
+    let row = folder::Entity::find_by_id(folder_id)
+        .filter(folder::Column::DeletedAt.is_null())
+        .one(conn)
+        .await?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    // Serialize AgentType to its snake_case wire form (e.g. "claude_code").
+    // Mirrors `parse_agent_type`'s round-trip through serde_json.
+    let serialized = default_agent_type
+        .map(|t| serde_json::to_value(t).ok())
+        .and_then(|v| v.and_then(|val| val.as_str().map(|s| s.to_string())));
+
+    let mut active = row.into_active_model();
+    active.default_agent_type = Set(serialized);
+    active.updated_at = Set(Utc::now());
+    let updated = active.update(conn).await?;
+    Ok(Some(to_detail(updated)))
+}
+
 pub async fn list_folders(conn: &DatabaseConnection) -> Result<Vec<FolderHistoryEntry>, DbError> {
     let rows = folder::Entity::find()
         .filter(folder::Column::DeletedAt.is_null())
