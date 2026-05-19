@@ -123,6 +123,10 @@ pub fn build_router(
             post(handlers::folders::update_folder_color),
         )
         .route(
+            "/update_folder_default_agent",
+            post(handlers::folders::update_folder_default_agent),
+        )
+        .route(
             "/add_folder_to_history",
             post(handlers::folders::add_folder_to_history),
         )
