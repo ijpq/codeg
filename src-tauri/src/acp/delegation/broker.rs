@@ -31,11 +31,13 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use tokio::sync::{oneshot, Mutex};
 
+use crate::acp::delegation::event_emitter::{DelegationEventEmitter, NoopEventEmitter};
 use crate::acp::delegation::meta_writer::{
     build_delegation_meta, is_synthetic_parent_tool_use_id, DelegationMetaWriter, NoopMetaWriter,
 };
 use crate::acp::delegation::spawner::{ConnectionSpawner, DelegationLink};
 use crate::acp::delegation::types::{DelegationError, DelegationOutcome, DelegationRequest};
+use crate::acp::types::DelegationResultSummary;
 
 /// Lookup the `parent_id` for a conversation. Abstracted so the broker can be
 /// unit-tested against an in-memory chain without touching SeaORM.
@@ -105,8 +107,14 @@ pub struct DelegationBroker {
     /// `delegate_to_agent` ToolCallState. Defaults to a no-op so tests
     /// that aren't exercising the meta lifecycle don't need to wire
     /// anything; production constructs the broker with the
-    /// `ConnectionManagerMetaWriter` via `with_meta_writer`.
+    /// `ConnectionManagerMetaWriter` via `with_writers`.
     meta_writer: Arc<dyn DelegationMetaWriter>,
+    /// Emitter for `AcpEvent::DelegationCompleted` against the parent
+    /// connection's event stream. Same Noop/Mock/Production scheme as
+    /// the meta writer — production wires `ConnectionManagerEventEmitter`
+    /// via `with_writers`; tests that don't observe the event lifecycle
+    /// take the default Noop.
+    event_emitter: Arc<dyn DelegationEventEmitter>,
     pending: Arc<PendingCalls>,
     pending_tool_calls: Arc<PendingToolCalls>,
     config: Arc<Mutex<DelegationConfig>>,
@@ -117,26 +125,47 @@ impl DelegationBroker {
         spawner: Arc<dyn ConnectionSpawner>,
         depth_lookup: Arc<dyn ConversationDepthLookup>,
     ) -> Self {
-        Self::with_meta_writer(
+        Self::with_writers(
             spawner,
             depth_lookup,
             Arc::new(NoopMetaWriter) as Arc<dyn DelegationMetaWriter>,
+            Arc::new(NoopEventEmitter) as Arc<dyn DelegationEventEmitter>,
         )
     }
 
-    /// Production-grade constructor wiring the broker to a real meta
-    /// writer (typically `ConnectionManagerMetaWriter`). Tests that
-    /// observe the meta lifecycle should also use this with a
-    /// `MockMetaWriter`.
+    /// Test-only constructor that injects a meta writer but keeps the
+    /// default Noop event emitter. Retained so existing meta-focused
+    /// tests don't have to mention the emitter parameter. New callsites
+    /// (and production wiring) should prefer `with_writers`.
     pub fn with_meta_writer(
         spawner: Arc<dyn ConnectionSpawner>,
         depth_lookup: Arc<dyn ConversationDepthLookup>,
         meta_writer: Arc<dyn DelegationMetaWriter>,
     ) -> Self {
+        Self::with_writers(
+            spawner,
+            depth_lookup,
+            meta_writer,
+            Arc::new(NoopEventEmitter) as Arc<dyn DelegationEventEmitter>,
+        )
+    }
+
+    /// Production-grade constructor wiring the broker to both a real
+    /// meta writer (`ConnectionManagerMetaWriter`) AND an event emitter
+    /// (`ConnectionManagerEventEmitter`). Tests that observe the full
+    /// lifecycle (meta writes + DelegationCompleted emits) should use
+    /// this with `MockMetaWriter` + `MockEventEmitter`.
+    pub fn with_writers(
+        spawner: Arc<dyn ConnectionSpawner>,
+        depth_lookup: Arc<dyn ConversationDepthLookup>,
+        meta_writer: Arc<dyn DelegationMetaWriter>,
+        event_emitter: Arc<dyn DelegationEventEmitter>,
+    ) -> Self {
         Self {
             spawner,
             depth_lookup,
             meta_writer,
+            event_emitter,
             pending: Arc::new(PendingCalls::default()),
             pending_tool_calls: Arc::new(PendingToolCalls::default()),
             config: Arc::new(Mutex::new(DelegationConfig::default())),
@@ -369,15 +398,21 @@ impl DelegationBroker {
 
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(outcome)) => {
-                // complete_call already removed from `pending` and disconnected;
-                // belt-and-braces idempotent prune.
+                // complete_call already removed from `pending`, wrote meta,
+                // emitted DelegationCompleted, and disconnected; this is a
+                // belt-and-braces idempotent prune in case complete_call
+                // wasn't reached on this path (it always is in production,
+                // but the prune is cheap).
                 self.pending.inner.lock().await.remove(&call_id);
                 outcome
             }
             Ok(Err(_)) => {
                 // The sender was dropped before sending — should not happen in
                 // practice (complete_call always sends before drop), but be defensive.
-                self.pending.inner.lock().await.remove(&call_id);
+                // Drain pending FIRST so a racing complete_call (from a late
+                // lifecycle TurnComplete) finds no entry and silently no-ops
+                // instead of double-emitting DelegationCompleted.
+                let _ = self.pending.inner.lock().await.remove(&call_id);
                 self.write_meta_if_real(
                     &req.parent_connection_id,
                     &req.parent_tool_use_id,
@@ -389,6 +424,16 @@ impl DelegationBroker {
                     ),
                 )
                 .await;
+                self.emit_completed_if_real(
+                    &req.parent_connection_id,
+                    &req.parent_tool_use_id,
+                    &child_connection_id,
+                    child_conversation_id,
+                    DelegationResultSummary::Err {
+                        error_code: "canceled".to_string(),
+                    },
+                )
+                .await;
                 let _ = self.spawner.disconnect(&child_connection_id).await;
                 DelegationOutcome::from_err(
                     DelegationError::Canceled {
@@ -398,7 +443,12 @@ impl DelegationBroker {
                 )
             }
             Err(_) => {
-                // Timeout: cancel in-flight, then disconnect, then return.
+                // Timeout. Drain pending FIRST so the subsequent
+                // spawner.disconnect (which fires the child's
+                // StatusChanged{Disconnected} → forward_disconnect_to_broker →
+                // cancel_by_child_connection cascade) finds an empty entry
+                // and doesn't race us into a double DelegationCompleted emit.
+                let _ = self.pending.inner.lock().await.remove(&call_id);
                 self.write_meta_if_real(
                     &req.parent_connection_id,
                     &req.parent_tool_use_id,
@@ -410,9 +460,18 @@ impl DelegationBroker {
                     ),
                 )
                 .await;
+                self.emit_completed_if_real(
+                    &req.parent_connection_id,
+                    &req.parent_tool_use_id,
+                    &child_connection_id,
+                    child_conversation_id,
+                    DelegationResultSummary::Err {
+                        error_code: "timeout".to_string(),
+                    },
+                )
+                .await;
                 let _ = self.spawner.cancel(&child_connection_id).await;
                 let _ = self.spawner.disconnect(&child_connection_id).await;
-                self.pending.inner.lock().await.remove(&call_id);
                 DelegationOutcome::from_err(
                     DelegationError::Timeout {
                         elapsed_ms: started_at.elapsed().as_millis() as u64,
@@ -456,9 +515,31 @@ impl DelegationBroker {
             };
             self.write_meta_if_real(&parent_connection_id, &parent_tool_use_id, meta)
                 .await;
+            self.emit_completed_if_real(
+                &parent_connection_id,
+                &parent_tool_use_id,
+                &child_connection_id,
+                child_conversation_id,
+                Self::outcome_to_summary(&outcome),
+            )
+            .await;
             // v1 one-shot: always tear down the child.
             let _ = self.spawner.disconnect(&child_connection_id).await;
             let _ = tx.send(outcome);
+        }
+    }
+
+    /// Project a `DelegationOutcome` onto the wire-stable
+    /// `DelegationResultSummary` carried by `AcpEvent::DelegationCompleted`.
+    /// Keeps the mapping (and the `error_code` choice) in one place.
+    fn outcome_to_summary(outcome: &DelegationOutcome) -> DelegationResultSummary {
+        match outcome {
+            DelegationOutcome::Ok(ok) => DelegationResultSummary::Ok {
+                duration_ms: ok.duration_ms,
+            },
+            DelegationOutcome::Err { code, .. } => DelegationResultSummary::Err {
+                error_code: code.clone(),
+            },
         }
     }
 
@@ -479,6 +560,33 @@ impl DelegationBroker {
         }
         self.meta_writer
             .write_meta(parent_connection_id, parent_tool_use_id, meta)
+            .await;
+    }
+
+    /// Internal helper — emit `AcpEvent::DelegationCompleted` on the parent's
+    /// stream iff the `parent_tool_use_id` refers to a real ACP tool_call.
+    /// Synthetic ids (the `"delegation-<uuid>"` UUID fallback) map to no
+    /// live UI binding, so the emit would be wasted noise — same skip
+    /// criterion as `write_meta_if_real`.
+    async fn emit_completed_if_real(
+        &self,
+        parent_connection_id: &str,
+        parent_tool_use_id: &str,
+        child_connection_id: &str,
+        child_conversation_id: i32,
+        result: DelegationResultSummary,
+    ) {
+        if is_synthetic_parent_tool_use_id(parent_tool_use_id) {
+            return;
+        }
+        self.event_emitter
+            .emit_completed(
+                parent_connection_id,
+                parent_tool_use_id,
+                child_connection_id,
+                child_conversation_id,
+                result,
+            )
             .await;
     }
 
@@ -509,6 +617,16 @@ impl DelegationBroker {
                     Some(entry.child_conversation_id),
                     Some("canceled"),
                 ),
+            )
+            .await;
+            self.emit_completed_if_real(
+                &entry.parent_connection_id,
+                &entry.parent_tool_use_id,
+                &entry.child_connection_id,
+                entry.child_conversation_id,
+                DelegationResultSummary::Err {
+                    error_code: "canceled".to_string(),
+                },
             )
             .await;
             let _ = self.spawner.disconnect(&entry.child_connection_id).await;
@@ -554,6 +672,16 @@ impl DelegationBroker {
                     Some(entry.child_conversation_id),
                     Some("canceled"),
                 ),
+            )
+            .await;
+            self.emit_completed_if_real(
+                &entry.parent_connection_id,
+                &entry.parent_tool_use_id,
+                &entry.child_connection_id,
+                entry.child_conversation_id,
+                DelegationResultSummary::Err {
+                    error_code: "canceled".to_string(),
+                },
             )
             .await;
             let _ = self.spawner.cancel(&entry.child_connection_id).await;
@@ -1326,6 +1454,359 @@ mod tests {
             calls.is_empty(),
             "writer should be skipped for synthetic parent_tool_use_id, got {:?}",
             calls
+        );
+    }
+
+    // -- Event emitter lifecycle ------------------------------------------
+    //
+    // Issue: `.docs/issues/2026-05-24-delegation-termination-cascade.md`.
+    // The broker must emit `AcpEvent::DelegationCompleted` once per drained
+    // pending entry, regardless of which terminal path drained it (happy
+    // `complete_call`, broker-side timeout, child-disconnect cleanup, or
+    // parent-cancel cascade). Without these emits the frontend's live
+    // delegation binding stays at "running" forever — see the issue doc
+    // for the full path matrix.
+
+    use crate::acp::delegation::event_emitter::mock::MockEventEmitter;
+    use crate::acp::delegation::event_emitter::DelegationEventEmitter;
+    use crate::acp::types::DelegationResultSummary;
+
+    fn broker_with_emitter(
+        mock: Arc<MockSpawner>,
+        writer: Arc<MockMetaWriter>,
+        emitter: Arc<MockEventEmitter>,
+    ) -> DelegationBroker {
+        DelegationBroker::with_writers(
+            mock as Arc<dyn ConnectionSpawner>,
+            shallow_lookup(),
+            writer as Arc<dyn DelegationMetaWriter>,
+            emitter as Arc<dyn DelegationEventEmitter>,
+        )
+    }
+
+    #[tokio::test]
+    async fn emitter_records_ok_on_complete_call_happy_path() {
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("child-conn-1".into())).await;
+        mock.queue_send(Ok(42)).await;
+        let writer = Arc::new(MockMetaWriter::new());
+        let emitter = Arc::new(MockEventEmitter::new());
+        let broker = broker_with_emitter(mock.clone(), writer.clone(), emitter.clone());
+
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move { broker.handle_request(request(1, "pt-ok")).await })
+        };
+        let call_id = loop {
+            if let Some(id) = broker.peek_first_pending_call_id().await {
+                break id;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        broker
+            .complete_call(
+                &call_id,
+                DelegationOutcome::Ok(DelegationSuccess {
+                    text: "done".into(),
+                    child_conversation_id: 42,
+                    child_agent_type: AgentType::ClaudeCode,
+                    turn_count: 1,
+                    duration_ms: 73,
+                    token_usage: None,
+                }),
+            )
+            .await;
+        driver.await.unwrap();
+
+        let calls = emitter.snapshot().await;
+        assert_eq!(calls.len(), 1);
+        let call = &calls[0];
+        assert_eq!(call.parent_tool_use_id, "pt-ok");
+        assert_eq!(call.child_connection_id, "child-conn-1");
+        assert_eq!(call.child_conversation_id, 42);
+        assert!(
+            matches!(call.result, DelegationResultSummary::Ok { duration_ms: 73 }),
+            "expected Ok{{73}}, got {:?}",
+            call.result
+        );
+    }
+
+    #[tokio::test]
+    async fn emitter_records_err_on_complete_call_err_outcome() {
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("child-conn-err".into())).await;
+        mock.queue_send(Ok(11)).await;
+        let writer = Arc::new(MockMetaWriter::new());
+        let emitter = Arc::new(MockEventEmitter::new());
+        let broker = broker_with_emitter(mock.clone(), writer.clone(), emitter.clone());
+
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move { broker.handle_request(request(1, "pt-err")).await })
+        };
+        let call_id = loop {
+            if let Some(id) = broker.peek_first_pending_call_id().await {
+                break id;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        broker
+            .complete_call(
+                &call_id,
+                DelegationOutcome::from_err(
+                    DelegationError::SubagentRuntimeError("agent died".into()),
+                    Some(11),
+                ),
+            )
+            .await;
+        driver.await.unwrap();
+
+        let calls = emitter.snapshot().await;
+        assert_eq!(calls.len(), 1);
+        match &calls[0].result {
+            DelegationResultSummary::Err { error_code } => {
+                assert_eq!(error_code, "subagent_error")
+            }
+            other => panic!("expected Err, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn emitter_records_timeout_on_broker_side_timeout() {
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("child-conn-to".into())).await;
+        mock.queue_send(Ok(91)).await;
+        let writer = Arc::new(MockMetaWriter::new());
+        let emitter = Arc::new(MockEventEmitter::new());
+        let broker = broker_with_emitter(mock.clone(), writer.clone(), emitter.clone());
+
+        let mut req = request(1, "pt-timeout");
+        req.timeout_seconds = Some(1);
+        let outcome = broker.handle_request(req).await;
+        assert!(matches!(
+            outcome,
+            DelegationOutcome::Err { ref code, .. } if code == "timeout"
+        ));
+
+        let calls = emitter.snapshot().await;
+        assert_eq!(calls.len(), 1, "expected exactly one emit, got {calls:?}");
+        let call = &calls[0];
+        assert_eq!(call.parent_tool_use_id, "pt-timeout");
+        assert_eq!(call.child_connection_id, "child-conn-to");
+        assert_eq!(call.child_conversation_id, 91);
+        match &call.result {
+            DelegationResultSummary::Err { error_code } => {
+                assert_eq!(error_code, "timeout")
+            }
+            other => panic!("expected Err{{timeout}}, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn emitter_records_canceled_on_cancel_by_child_connection() {
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("c-dropped".into())).await;
+        mock.queue_send(Ok(55)).await;
+        let writer = Arc::new(MockMetaWriter::new());
+        let emitter = Arc::new(MockEventEmitter::new());
+        let broker = broker_with_emitter(mock.clone(), writer.clone(), emitter.clone());
+
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move { broker.handle_request(request(1, "pt-cbc")).await })
+        };
+        while broker.pending_count().await == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        broker.cancel_by_child_connection("c-dropped").await;
+        let outcome = driver.await.unwrap();
+        assert!(matches!(
+            outcome,
+            DelegationOutcome::Err { ref code, .. } if code == "canceled"
+        ));
+
+        let calls = emitter.snapshot().await;
+        assert_eq!(calls.len(), 1);
+        match &calls[0].result {
+            DelegationResultSummary::Err { error_code } => {
+                assert_eq!(error_code, "canceled")
+            }
+            other => panic!("expected Err{{canceled}}, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn emitter_records_one_event_per_drained_entry_on_cancel_by_parent() {
+        let mock = Arc::new(MockSpawner::new());
+        for i in 0..3 {
+            mock.queue_spawn(Ok(format!("c{i}"))).await;
+            mock.queue_send(Ok(100 + i)).await;
+        }
+        let writer = Arc::new(MockMetaWriter::new());
+        let emitter = Arc::new(MockEventEmitter::new());
+        let broker = broker_with_emitter(mock.clone(), writer.clone(), emitter.clone());
+
+        let mut handles = Vec::new();
+        for i in 0..3 {
+            let broker = broker.clone();
+            handles.push(tokio::spawn(async move {
+                broker.handle_request(request(1, &format!("pt-{i}"))).await
+            }));
+        }
+        while broker.pending_count().await < 3 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        broker.cancel_by_parent("parent-conn").await;
+        for h in handles {
+            let _ = h.await.unwrap();
+        }
+
+        let calls = emitter.snapshot().await;
+        assert_eq!(calls.len(), 3, "expected 3 emits, got {calls:?}");
+        let mut parent_tool_use_ids: Vec<String> = calls
+            .iter()
+            .map(|c| c.parent_tool_use_id.clone())
+            .collect();
+        parent_tool_use_ids.sort();
+        assert_eq!(
+            parent_tool_use_ids,
+            vec!["pt-0".to_string(), "pt-1".to_string(), "pt-2".to_string()]
+        );
+        for call in &calls {
+            match &call.result {
+                DelegationResultSummary::Err { error_code } => {
+                    assert_eq!(error_code, "canceled")
+                }
+                other => panic!("expected Err{{canceled}}, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn emitter_does_not_double_emit_on_repeat_cancel_by_parent() {
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("c-once".into())).await;
+        mock.queue_send(Ok(42)).await;
+        let writer = Arc::new(MockMetaWriter::new());
+        let emitter = Arc::new(MockEventEmitter::new());
+        let broker = broker_with_emitter(mock.clone(), writer.clone(), emitter.clone());
+
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move { broker.handle_request(request(1, "pt-idem")).await })
+        };
+        while broker.pending_count().await == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // First call drains the entry + emits one.
+        broker.cancel_by_parent("parent-conn").await;
+        // Second call finds the pending map empty — no extra emit.
+        broker.cancel_by_parent("parent-conn").await;
+        // Cleanup-guard-style triple call also stays bounded.
+        broker.cancel_by_parent("parent-conn").await;
+        let _ = driver.await.unwrap();
+
+        assert_eq!(emitter.count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn emitter_skipped_for_synthetic_parent_tool_use_id() {
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("c-synth".into())).await;
+        mock.queue_send(Ok(8)).await;
+        let writer = Arc::new(MockMetaWriter::new());
+        let emitter = Arc::new(MockEventEmitter::new());
+        let broker = broker_with_emitter(mock.clone(), writer.clone(), emitter.clone());
+
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move { broker.handle_request(request(1, "")).await })
+        };
+        let call_id = loop {
+            if let Some(id) = broker.peek_first_pending_call_id().await {
+                break id;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        broker
+            .complete_call(
+                &call_id,
+                DelegationOutcome::Ok(DelegationSuccess {
+                    text: "ok".into(),
+                    child_conversation_id: 8,
+                    child_agent_type: AgentType::Codex,
+                    turn_count: 1,
+                    duration_ms: 5,
+                    token_usage: None,
+                }),
+            )
+            .await;
+        driver.await.unwrap();
+
+        let calls = emitter.snapshot().await;
+        assert!(
+            calls.is_empty(),
+            "emitter must skip synthetic parent_tool_use_id (same rule as meta writer); got {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn emitter_records_after_meta_write_on_complete_call() {
+        // Frontend's snapshot-recovery path reads `meta["codeg.delegation"]`
+        // first and the live event second; if the emit lands before the
+        // meta write, a snapshot taken between them would see "running"
+        // meta paired with a "completed" event. Enforce meta-before-emit
+        // by checking the MockMetaWriter has at least one call before the
+        // emitter records.
+        let mock = Arc::new(MockSpawner::new());
+        mock.queue_spawn(Ok("c-order".into())).await;
+        mock.queue_send(Ok(7)).await;
+        let writer = Arc::new(MockMetaWriter::new());
+        let emitter = Arc::new(MockEventEmitter::new());
+        let broker = broker_with_emitter(mock.clone(), writer.clone(), emitter.clone());
+
+        let driver = {
+            let broker = broker.clone();
+            tokio::spawn(async move { broker.handle_request(request(1, "pt-order")).await })
+        };
+        let call_id = loop {
+            if let Some(id) = broker.peek_first_pending_call_id().await {
+                break id;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        broker
+            .complete_call(
+                &call_id,
+                DelegationOutcome::Ok(DelegationSuccess {
+                    text: "ok".into(),
+                    child_conversation_id: 7,
+                    child_agent_type: AgentType::ClaudeCode,
+                    turn_count: 1,
+                    duration_ms: 5,
+                    token_usage: None,
+                }),
+            )
+            .await;
+        driver.await.unwrap();
+
+        let meta_calls = writer.snapshot().await;
+        let event_calls = emitter.snapshot().await;
+        // running (from handle_request) + completed (from complete_call) =
+        // 2 meta writes. The single event must be the "completed" one,
+        // and it must land AFTER the running meta — guaranteed structurally
+        // by complete_call's order (write_meta_if_real then emit).
+        assert_eq!(meta_calls.len(), 2);
+        assert_eq!(event_calls.len(), 1);
+        let inner_second = meta_calls[1]
+            .meta
+            .get("codeg.delegation")
+            .unwrap()
+            .as_object()
+            .unwrap();
+        assert_eq!(
+            inner_second.get("status").unwrap().as_str().unwrap(),
+            "completed"
         );
     }
 }

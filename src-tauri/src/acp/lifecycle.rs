@@ -25,7 +25,7 @@ use crate::acp::delegation::types::{
 use crate::acp::internal_bus::InternalEventBus;
 use crate::acp::manager::ConnectionManager;
 use crate::acp::session_state::SessionState;
-use crate::acp::types::{AcpEvent, ConnectionStatus, DelegationResultSummary, EventEnvelope};
+use crate::acp::types::{AcpEvent, ConnectionStatus, EventEnvelope};
 use crate::db::entities::conversation::ConversationStatus;
 use crate::db::error::DbError;
 use crate::db::service::conversation_service;
@@ -266,9 +266,14 @@ pub(crate) async fn handle_event(
     }
 }
 
-/// On TurnComplete for a delegation child, resolve the pending broker call,
-/// emit `DelegationCompleted` for frontend rendering, and let the broker
-/// disconnect the child.
+/// On TurnComplete for a delegation child, resolve the pending broker call
+/// and let the broker drive the rest of the lifecycle (meta write, the
+/// `AcpEvent::DelegationCompleted` emit against the parent stream, child
+/// disconnect, tx.send). Keeping the emit responsibility inside
+/// `broker.complete_call` is what guarantees the broker's other terminal
+/// paths (`timeout` / `cancel_by_child_connection` / `cancel_by_parent`)
+/// also surface the event — see
+/// `.docs/issues/2026-05-24-delegation-termination-cascade.md`.
 #[allow(clippy::too_many_arguments)]
 async fn forward_turn_complete_to_broker(
     db_conn: &DatabaseConnection,
@@ -276,9 +281,9 @@ async fn forward_turn_complete_to_broker(
     conversation_id: i32,
     stop_reason: &str,
     last_text: Option<String>,
-    state_arc: &Arc<RwLock<SessionState>>,
-    emitter: &EventEmitter,
-    child_connection_id: &str,
+    _state_arc: &Arc<RwLock<SessionState>>,
+    _emitter: &EventEmitter,
+    _child_connection_id: &str,
 ) {
     let row = match conversation_service::get_by_id(db_conn, conversation_id).await {
         Ok(r) => r,
@@ -294,65 +299,35 @@ async fn forward_turn_complete_to_broker(
         Some(id) => id,
         None => return, // not a delegation child; nothing to do.
     };
-    let parent_tool_use_id = match row.parent_tool_use_id.clone() {
-        Some(id) => id,
-        None => {
-            eprintln!(
-                "[delegation][lifecycle] conversation {conversation_id} has \
-                 delegation_call_id but no parent_tool_use_id; dropping"
-            );
-            return;
-        }
-    };
+    if row.parent_tool_use_id.is_none() {
+        eprintln!(
+            "[delegation][lifecycle] conversation {conversation_id} has \
+             delegation_call_id but no parent_tool_use_id; dropping"
+        );
+        return;
+    }
     let agent_type = row.agent_type;
-    let (outcome, result_summary) = match stop_reason {
-        "end_turn" => (
-            DelegationOutcome::Ok(DelegationSuccess {
-                text: last_text.unwrap_or_default(),
-                child_conversation_id: conversation_id,
-                child_agent_type: agent_type,
-                turn_count: 1,
-                duration_ms: 0,
-                token_usage: None,
-            }),
-            DelegationResultSummary::Ok { duration_ms: 0 },
-        ),
-        "cancelled" => (
-            DelegationOutcome::from_err(
-                DelegationError::Canceled {
-                    reason: "child session was cancelled".into(),
-                },
-                Some(conversation_id),
-            ),
-            DelegationResultSummary::Err {
-                error_code: "canceled".into(),
+    let outcome = match stop_reason {
+        "end_turn" => DelegationOutcome::Ok(DelegationSuccess {
+            text: last_text.unwrap_or_default(),
+            child_conversation_id: conversation_id,
+            child_agent_type: agent_type,
+            turn_count: 1,
+            duration_ms: 0,
+            token_usage: None,
+        }),
+        "cancelled" => DelegationOutcome::from_err(
+            DelegationError::Canceled {
+                reason: "child session was cancelled".into(),
             },
+            Some(conversation_id),
         ),
-        other => (
-            DelegationOutcome::from_err(
-                DelegationError::SubagentRuntimeError(format!(
-                    "stop_reason: {other}"
-                )),
-                Some(conversation_id),
-            ),
-            DelegationResultSummary::Err {
-                error_code: "subagent_error".into(),
-            },
+        other => DelegationOutcome::from_err(
+            DelegationError::SubagentRuntimeError(format!("stop_reason: {other}")),
+            Some(conversation_id),
         ),
     };
     broker.complete_call(&call_id, outcome).await;
-    emit_with_state(
-        state_arc,
-        emitter,
-        AcpEvent::DelegationCompleted {
-            parent_connection_id: String::new(), // populated by parent-side listeners using parent_tool_use_id
-            parent_tool_use_id,
-            child_connection_id: child_connection_id.to_string(),
-            child_conversation_id: conversation_id,
-            result: result_summary,
-        },
-    )
-    .await;
 }
 
 /// Snapshot the connection's `(state, emitter)` into the lifecycle cache when

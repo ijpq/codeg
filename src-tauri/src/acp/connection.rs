@@ -1456,6 +1456,7 @@ async fn run_connection(
                             terminal_runtime.clone(),
                             &cwd_string,
                             supports_fork,
+                            delegation_injection.as_ref(),
                         )
                         .await;
                         terminal_runtime.release_all_for_session(&sid).await;
@@ -1471,6 +1472,7 @@ async fn run_connection(
                             terminal_runtime.clone(),
                             &cwd,
                             &cwd_string,
+                            delegation_injection.as_ref(),
                         )
                         .await
                     }
@@ -1593,6 +1595,7 @@ async fn run_connection(
                             terminal_runtime.clone(),
                             &cwd_string,
                             supports_fork,
+                            delegation_injection.as_ref(),
                         )
                         .await;
                         terminal_runtime
@@ -1610,6 +1613,7 @@ async fn run_connection(
                             terminal_runtime.clone(),
                             &cwd,
                             &cwd_string,
+                            delegation_injection.as_ref(),
                         )
                         .await
                     }
@@ -1665,6 +1669,7 @@ async fn run_connection(
                     terminal_runtime.clone(),
                     &cwd_string,
                     supports_fork,
+                    delegation_injection.as_ref(),
                 )
                 .await;
                 terminal_runtime.release_all_for_session(&sid).await;
@@ -1680,6 +1685,7 @@ async fn run_connection(
                     terminal_runtime.clone(),
                     &cwd,
                     &cwd_string,
+                    delegation_injection.as_ref(),
                 )
                 .await
             }
@@ -2522,6 +2528,10 @@ async fn handle_fork_or_exit(
     terminal_runtime: Arc<TerminalRuntime>,
     _cwd: &std::path::Path,
     cwd_string: &str,
+    // Threaded through from run_connection so the forked session's
+    // run_conversation_loop call has the same delegation cascade
+    // capability as the original.
+    delegation_injection: Option<&DelegationInjection>,
 ) -> Result<(), sacp::Error> {
     let fork_info = match loop_result {
         Ok(Some(info)) => info,
@@ -2585,6 +2595,7 @@ async fn handle_fork_or_exit(
         terminal_runtime.clone(),
         cwd_string,
         true, // fork already succeeded on this process
+        delegation_injection,
     )
     .await;
     terminal_runtime.release_all_for_session(&new_sid).await;
@@ -2602,6 +2613,7 @@ async fn handle_fork_or_exit(
         terminal_runtime,
         _cwd,
         cwd_string,
+        delegation_injection,
     ))
     .await
 }
@@ -2701,6 +2713,10 @@ async fn run_conversation_loop<'a>(
     terminal_runtime: Arc<TerminalRuntime>,
     cwd: &str,
     supports_fork: bool,
+    // Source of the broker reference used to cascade-cancel pending
+    // delegations on parent prompt cancel / non-success TurnComplete.
+    // `None` for test paths that don't wire delegation.
+    delegation_injection: Option<&DelegationInjection>,
 ) -> Result<Option<ForkExitInfo>, sacp::Error> {
     // Session-scoped cache for diffing cumulative `raw_output` snapshots
     // into incremental deltas. Shared across the idle loop and the active
@@ -2885,6 +2901,21 @@ async fn run_conversation_loop<'a>(
                                         },
                                     )
                                     .await;
+                                    // Cascade-cancel any pending delegations
+                                    // whenever the parent's turn ended for a
+                                    // reason other than clean `end_turn`. The
+                                    // `end_turn` path lets the legitimate
+                                    // delegation completion drain naturally;
+                                    // every other reason (cancelled / refusal /
+                                    // max_tokens / max_turn_requests / empty /
+                                    // unknown) means the parent will never
+                                    // consume the in-flight result, so the
+                                    // child must be torn down.
+                                    if reason_str != "end_turn" {
+                                        if let Some(inj) = delegation_injection {
+                                            inj.broker.cancel_by_parent(conn_id).await;
+                                        }
+                                    }
                                     break;
                                 }
                                 _ => {}
@@ -2925,6 +2956,16 @@ async fn run_conversation_loop<'a>(
                                 },
                             )
                             .await;
+                            // Mirror the StopReason-message branch above:
+                            // cascade-cancel on any non-`end_turn` reason
+                            // so in-flight delegations don't dangle when
+                            // the parent's turn ended without consuming
+                            // their result.
+                            if reason_str != "end_turn" {
+                                if let Some(inj) = delegation_injection {
+                                    inj.broker.cancel_by_parent(conn_id).await;
+                                }
+                            }
                             break;
                         }
                         _ = terminal_poll_interval.tick(), if !tracked_terminal_tool_calls.is_empty() => {
@@ -3028,6 +3069,7 @@ async fn run_conversation_loop<'a>(
                                             RequestPermissionOutcome::Cancelled,
                                         ));
                                     }
+                                    drop(locked);
                                     // Immediately emit TurnComplete so the frontend
                                     // transitions out of "prompting" and the user can
                                     // send new messages.  Don't wait for the agent --
@@ -3042,6 +3084,16 @@ async fn run_conversation_loop<'a>(
                                         },
                                     )
                                     .await;
+                                    // Cascade-cancel any in-flight delegations owned by
+                                    // this parent connection. Idempotent with the
+                                    // cleanup-guard cancel_by_parent at the end of
+                                    // run_connection (#1: empty pending → no-op).
+                                    // Without this, a user-initiated cancel of a parent
+                                    // prompt mid-delegation leaves the child agent
+                                    // running indefinitely until broker timeout.
+                                    if let Some(inj) = delegation_injection {
+                                        inj.broker.cancel_by_parent(conn_id).await;
+                                    }
                                     // Drain the prompt response in the background so
                                     // the SACP library doesn't log "receiver dropped"
                                     // errors when the agent eventually responds.
@@ -3155,6 +3207,16 @@ async fn run_conversation_loop<'a>(
                     let _ = responder.respond(RequestPermissionResponse::new(
                         RequestPermissionOutcome::Cancelled,
                     ));
+                }
+                drop(locked);
+                // Cascade-cancel any pending delegations owned by this parent.
+                // Reached when Cancel arrives between prompts (idle path); the
+                // inner Cancel handler covers mid-prompt. Both must trigger
+                // because the per-prompt cancel path doesn't tear down the
+                // parent connection, so the cleanup-guard cancel_by_parent
+                // at run_connection's exit wouldn't fire.
+                if let Some(inj) = delegation_injection {
+                    inj.broker.cancel_by_parent(conn_id).await;
                 }
             }
             Some(ConnectionCommand::Fork { reply }) => {

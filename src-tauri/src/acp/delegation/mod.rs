@@ -33,6 +33,7 @@
 pub mod broker;
 pub mod companion;
 pub mod depth;
+pub mod event_emitter;
 pub mod listener;
 pub mod meta_writer;
 pub mod spawner;

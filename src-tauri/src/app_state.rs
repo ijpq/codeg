@@ -71,6 +71,9 @@ pub fn build_delegation_stack(
 ) -> (Arc<DelegationBroker>, Arc<TokenRegistry>, PathBuf) {
     use crate::acp::connection::DelegationInjection;
     use crate::acp::delegation::broker::{ConversationDepthLookup, DbDepthLookup};
+    use crate::acp::delegation::event_emitter::{
+        ConnectionManagerEventEmitter, DelegationEventEmitter,
+    };
     use crate::acp::delegation::listener::default_socket_path;
     use crate::acp::delegation::meta_writer::{
         ConnectionManagerMetaWriter, DelegationMetaWriter,
@@ -88,12 +91,16 @@ pub fn build_delegation_stack(
     }) as Arc<dyn ConnectionSpawner>;
     let depth_lookup = Arc::new(DbDepthLookup { db: db_arc }) as Arc<dyn ConversationDepthLookup>;
     let meta_writer = Arc::new(ConnectionManagerMetaWriter {
-        manager: cm_arc,
+        manager: cm_arc.clone(),
     }) as Arc<dyn DelegationMetaWriter>;
-    let broker = Arc::new(DelegationBroker::with_meta_writer(
+    let event_emitter = Arc::new(ConnectionManagerEventEmitter {
+        manager: cm_arc,
+    }) as Arc<dyn DelegationEventEmitter>;
+    let broker = Arc::new(DelegationBroker::with_writers(
         spawner,
         depth_lookup,
         meta_writer,
+        event_emitter,
     ));
     let tokens = Arc::new(TokenRegistry::default());
     let socket_path = default_socket_path(&std::env::temp_dir());
