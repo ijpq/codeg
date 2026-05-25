@@ -119,28 +119,44 @@ sudo apt-get install -y \
   patchelf
 ```
 
+### Binários
+
+O Codeg fornece três binários Rust a partir de um único workspace:
+
+| Binário        | Função                                                                                                       | Build                                                                      |
+| -------------- | ------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------- |
+| `codeg`        | Aplicativo desktop Tauri (janela, bandeja, atualizador)                                                      | `pnpm tauri build` (release) / `pnpm tauri dev` (dev)                      |
+| `codeg-server` | Servidor HTTP + WebSocket standalone para implantações em navegador/headless                                 | `pnpm server:build` / `pnpm server:dev`                                    |
+| `codeg-mcp`    | Companion stdio MCP por execução que expõe a ferramenta `delegate_to_agent` às CLIs de agentes (colaboração multi-agente) | `pnpm tauri:prepare-sidecars` (invocado automaticamente por `tauri dev` / `tauri build`) |
+
+`codeg-mcp` deve ficar ao lado de seu binário pai em tempo de execução — instaladores, a imagem Docker e o empacotador de sidecars do Tauri o colocam ao lado de `codeg` / `codeg-server`. Compilações a partir do código-fonte e layouts personalizados podem sobrescrever a busca com a variável de ambiente `CODEG_MCP_BIN=/abs/path/codeg-mcp`. Se o companion estiver ausente, a delegação é ignorada (um único aviso é registrado) e o restante da sessão do agente continua funcionando.
+
 ### Desenvolvimento
 
 ```bash
 pnpm install
 
+# Apenas frontend (servidor de desenvolvimento Next.js, sem Rust)
+pnpm dev
+
 # Exportação estática do frontend para out/
 pnpm build
 
-# Aplicativo desktop completo (Tauri + Next.js)
+# Aplicativo desktop completo (Tauri + Next.js, compila o sidecar codeg-mcp automaticamente)
 pnpm tauri dev
 
-# Apenas frontend
-pnpm dev
-
-# Build do aplicativo desktop
+# Build de release do desktop (empacota codeg-mcp como externalBin)
 pnpm tauri build
 
 # Servidor standalone (sem Tauri/GUI necessário)
 pnpm server:dev
+pnpm server:build                  # binário de release em src-tauri/target/release/codeg-server
 
-# Build do binário do servidor
-pnpm server:build
+# Compilar explicitamente o companion codeg-mcp (para o triple do host)
+pnpm tauri:prepare-sidecars        # saída: src-tauri/binaries/codeg-mcp-<triple>
+
+# Pular a preparação do sidecar ao iterar no frontend quando você não precisa de delegação
+CODEG_SKIP_SIDECAR=1 pnpm tauri dev
 
 # Lint
 pnpm eslint .
@@ -151,14 +167,18 @@ pnpm test:watch
 pnpm test:coverage
 
 # Verificações Rust (executar em src-tauri/)
-cargo check
+cargo check                                                     # desktop (features padrão)
+cargo check --no-default-features --bin codeg-server            # modo servidor
+cargo check --no-default-features --bin codeg-mcp               # companion MCP
 cargo clippy --all-targets --features test-utils -- -D warnings
-cargo build
 
 # Testes Rust
 cargo test --features test-utils                                # desktop (incl. integração)
 cargo test --no-default-features --bin codeg-server --lib       # modo servidor
+cargo insta review                                              # aceitar atualizações de snapshots do parser
 ```
+
+> Dica: quando você tiver um build recente de `codeg-mcp` em `src-tauri/target/release/` e quiser apontar um `codeg-server` lançado manualmente para ele sem reinstalar, exporte `CODEG_MCP_BIN=$(pwd)/src-tauri/target/release/codeg-mcp`.
 
 ### Implantação do servidor
 
@@ -238,8 +258,11 @@ A imagem Docker usa um build multi-stage (Node.js + Rust → runtime Debian slim
 pnpm install && pnpm build          # compilar frontend
 cd src-tauri
 cargo build --release --bin codeg-server --no-default-features
-CODEG_STATIC_DIR=../out ./target/release/codeg-server
+cargo build --release --bin codeg-mcp --no-default-features    # companion de delegação
+CODEG_STATIC_DIR=../out ./target/release/codeg-server          # codeg-mcp é detectado como irmão
 ```
+
+Se você mantiver os dois binários em diretórios separados, defina `CODEG_MCP_BIN=/abs/path/to/codeg-mcp` para que o runtime ainda possa encontrar o companion; sem isso, a delegação multi-agente é desativada silenciosamente.
 
 #### Configuração
 
@@ -252,6 +275,8 @@ Variáveis de ambiente:
 | `CODEG_TOKEN`                  | _(aleatório)_          | Token de autenticação (impresso no stderr ao iniciar)                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `CODEG_DATA_DIR`               | `~/.local/share/codeg` | Diretório do banco de dados SQLite (também raiz de `uploads/`, `pets/`)                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `CODEG_STATIC_DIR`             | `./web` ou `./out`     | Diretório de exportação estática do Next.js                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `CODEG_MCP_BIN`                | _(não definido)_       | Caminho absoluto para o companion `codeg-mcp`. Sobrescreve a busca padrão por irmão-do-executável + `PATH`. Use isso para compilações a partir do código-fonte ou layouts personalizados em que o companion reside fora do diretório de instalação do servidor.                                                                                                                                                                                                                                   |
+| `CODEG_SKIP_SIDECAR`           | _(não definido)_       | Conveniência apenas de frontend para `pnpm tauri dev` / `pnpm tauri build` — quando `1`, pula a compilação do sidecar `codeg-mcp`. A delegação fica desativada nesse build; artefatos de qualidade de release devem deixá-la não definida.                                                                                                                                                                                                                                                        |
 | `CODEG_UPLOAD_MAX_TOTAL_BYTES` | _(não definido)_       | Limite rígido do total de bytes residentes em `<data dir>/uploads/`. Contagem decimal de bytes (ex.: `10737418240` para 10 GiB). Não definido, `0` ou um valor não analisável desativa o limite e imprime uma linha de inicialização para tornar o estado visível. O limite é aplicado dentro de um único processo `codeg-server` — implantações escaladas horizontalmente que compartilham um volume `uploads/` precisam de coordenação externa (lock de arquivo, Redis, cota de proxy reverso). |
 | `CODEG_UPLOAD_QUOTA_STRICT`    | _(não definido)_       | Quando verdadeiro (`1` / `true` / `yes` / `on`), aborta a inicialização com código de saída 2 se `CODEG_UPLOAD_MAX_TOTAL_BYTES` estiver definido como um valor não analisável, em vez de continuar com um WARN. Use isso quando sua política de segurança exigir que "a cota configurada deve ser efetiva".                                                                                                                                                                                       |
 

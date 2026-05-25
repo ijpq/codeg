@@ -119,28 +119,44 @@ sudo apt-get install -y \
   patchelf
 ```
 
+### Binaries
+
+Codeg ships three Rust binaries from a single workspace:
+
+| Binary         | Role                                                                                                          | Build                                                                |
+| -------------- | ------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| `codeg`        | Tauri desktop app (window, tray, updater)                                                                     | `pnpm tauri build` (release) / `pnpm tauri dev` (dev)                |
+| `codeg-server` | Standalone HTTP + WebSocket server for browser/headless deployments                                           | `pnpm server:build` / `pnpm server:dev`                              |
+| `codeg-mcp`    | Per-launch stdio MCP companion that surfaces the `delegate_to_agent` tool to agent CLIs (multi-agent collab) | `pnpm tauri:prepare-sidecars` (auto-invoked by `tauri dev` / `tauri build`) |
+
+`codeg-mcp` must sit next to its parent binary at runtime — installers, the Docker image, and the Tauri sidecar bundler all place it next to `codeg` / `codeg-server`. Source builds and custom layouts can override the lookup with the `CODEG_MCP_BIN=/abs/path/codeg-mcp` env var. If the companion is missing, delegation is skipped (a single warning is logged) and the rest of the agent session keeps working.
+
 ### Development
 
 ```bash
 pnpm install
 
+# Frontend only (Next.js dev server, no Rust)
+pnpm dev
+
 # Frontend static export to out/
 pnpm build
 
-# Full desktop app (Tauri + Next.js)
+# Full desktop app (Tauri + Next.js, builds codeg-mcp sidecar automatically)
 pnpm tauri dev
 
-# Frontend only
-pnpm dev
-
-# Desktop build
+# Desktop release build (bundles codeg-mcp as externalBin)
 pnpm tauri build
 
 # Standalone server (no Tauri/GUI required)
 pnpm server:dev
+pnpm server:build                  # release binary at src-tauri/target/release/codeg-server
 
-# Build server release binary
-pnpm server:build
+# Build the codeg-mcp companion explicitly (for the host triple)
+pnpm tauri:prepare-sidecars        # output: src-tauri/binaries/codeg-mcp-<triple>
+
+# Skip sidecar prep when iterating on the frontend and you don't need delegation
+CODEG_SKIP_SIDECAR=1 pnpm tauri dev
 
 # Lint
 pnpm eslint .
@@ -151,14 +167,18 @@ pnpm test:watch
 pnpm test:coverage
 
 # Rust checks (run in src-tauri/)
-cargo check
+cargo check                                                     # desktop (default features)
+cargo check --no-default-features --bin codeg-server            # server mode
+cargo check --no-default-features --bin codeg-mcp               # MCP companion
 cargo clippy --all-targets --features test-utils -- -D warnings
-cargo build
 
 # Rust tests
 cargo test --features test-utils                                # desktop (incl. integration)
 cargo test --no-default-features --bin codeg-server --lib       # server mode
+cargo insta review                                              # accept parser snapshot updates
 ```
+
+> Tip: when you have a fresh `codeg-mcp` build under `src-tauri/target/release/` and want to point a manually-launched `codeg-server` at it without reinstalling, export `CODEG_MCP_BIN=$(pwd)/src-tauri/target/release/codeg-mcp`.
 
 ### Server Deployment
 
@@ -238,8 +258,11 @@ The Docker image uses a multi-stage build (Node.js + Rust → slim Debian runtim
 pnpm install && pnpm build          # build frontend
 cd src-tauri
 cargo build --release --bin codeg-server --no-default-features
-CODEG_STATIC_DIR=../out ./target/release/codeg-server
+cargo build --release --bin codeg-mcp --no-default-features    # delegation companion
+CODEG_STATIC_DIR=../out ./target/release/codeg-server          # codeg-mcp is picked up as a sibling
 ```
+
+If you keep the two binaries in separate directories, set `CODEG_MCP_BIN=/abs/path/to/codeg-mcp` so the runtime can still find the companion; without it, multi-agent delegation is silently disabled.
 
 #### Configuration
 
@@ -252,6 +275,8 @@ Environment variables:
 | `CODEG_TOKEN`                  | _(random)_             | Auth token (printed to stderr on start)                                                                                                                                                                                                                                                                                                                                                                                          |
 | `CODEG_DATA_DIR`               | `~/.local/share/codeg` | SQLite database directory (also roots `uploads/`, `pets/`)                                                                                                                                                                                                                                                                                                                                                                       |
 | `CODEG_STATIC_DIR`             | `./web` or `./out`     | Next.js static export directory                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `CODEG_MCP_BIN`                | _(unset)_              | Absolute path to the `codeg-mcp` companion. Overrides the default sibling-of-executable + `PATH` lookup. Use this for source builds or custom layouts where the companion lives outside the server's install directory.                                                                                                                                                                                                          |
+| `CODEG_SKIP_SIDECAR`           | _(unset)_              | Frontend-only convenience for `pnpm tauri dev` / `pnpm tauri build` — when `1`, skips building the `codeg-mcp` sidecar. Delegation is disabled in that build; ship-quality artifacts must leave it unset.                                                                                                                                                                                                                        |
 | `CODEG_UPLOAD_MAX_TOTAL_BYTES` | _(unset)_              | Hard cap on total bytes resident under `<data dir>/uploads/`. Plain decimal byte count (e.g. `10737418240` for 10 GiB). Unset, `0`, or an unparseable value disables the cap and prints a startup line so the posture is visible. The cap is enforced within a single `codeg-server` process — horizontally-scaled deployments sharing one `uploads/` volume need external coordination (file lock, Redis, reverse-proxy quota). |
 | `CODEG_UPLOAD_QUOTA_STRICT`    | _(unset)_              | When truthy (`1` / `true` / `yes` / `on`), abort startup with exit code 2 if `CODEG_UPLOAD_MAX_TOTAL_BYTES` is set to an unparseable value, instead of fail-open with a WARN. Use this when your security policy requires "configured quota must be effective".                                                                                                                                                                  |
 

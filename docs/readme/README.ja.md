@@ -119,28 +119,44 @@ sudo apt-get install -y \
   patchelf
 ```
 
+### バイナリ
+
+Codeg は単一の workspace から 3 つの Rust バイナリを提供します:
+
+| バイナリ       | 役割                                                                                              | ビルド                                                                       |
+| -------------- | ------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| `codeg`        | Tauri デスクトップアプリ（ウィンドウ、トレイ、自動更新）                                          | `pnpm tauri build`（リリース）/ `pnpm tauri dev`（開発）                     |
+| `codeg-server` | ブラウザ/ヘッドレスデプロイ向けスタンドアロン HTTP + WebSocket サーバー                           | `pnpm server:build` / `pnpm server:dev`                                      |
+| `codeg-mcp`    | 起動ごとの stdio MCP コンパニオン。agent CLI に `delegate_to_agent` ツールを公開（マルチエージェント協調用） | `pnpm tauri:prepare-sidecars`（`tauri dev` / `tauri build` から自動呼び出し）|
+
+`codeg-mcp` は実行時に親バイナリと同じディレクトリに配置されている必要があります — インストーラ、Docker イメージ、Tauri sidecar バンドラはすべて `codeg` / `codeg-server` の隣に配置します。ソースビルドやカスタム配置では、`CODEG_MCP_BIN=/abs/path/codeg-mcp` 環境変数で検索パスを上書きできます。コンパニオンが見つからない場合、デリゲートはスキップされ（警告ログが 1 行記録されます）、agent セッションの他の部分は引き続き動作します。
+
 ### 開発
 
 ```bash
 pnpm install
 
+# フロントエンドのみ（Next.js 開発サーバー、Rust 不要）
+pnpm dev
+
 # フロントエンド静的エクスポート（out/ へ）
 pnpm build
 
-# デスクトップアプリ全体（Tauri + Next.js）
+# デスクトップアプリ全体（Tauri + Next.js、codeg-mcp sidecar を自動ビルド）
 pnpm tauri dev
 
-# フロントエンドのみ
-pnpm dev
-
-# デスクトップビルド
+# デスクトップリリースビルド（codeg-mcp を externalBin としてバンドル）
 pnpm tauri build
 
 # スタンドアロンサーバー（Tauri/GUI 不要）
 pnpm server:dev
+pnpm server:build                  # リリースバイナリは src-tauri/target/release/codeg-server
 
-# サーバーリリースバイナリのビルド
-pnpm server:build
+# codeg-mcp コンパニオンを明示的にビルド（ホストトリプル向け）
+pnpm tauri:prepare-sidecars        # 出力: src-tauri/binaries/codeg-mcp-<triple>
+
+# フロントエンドのイテレーション中でデリゲートが不要な場合に sidecar 準備をスキップ
+CODEG_SKIP_SIDECAR=1 pnpm tauri dev
 
 # Lint
 pnpm eslint .
@@ -151,14 +167,18 @@ pnpm test:watch
 pnpm test:coverage
 
 # Rust チェック（src-tauri/ で実行）
-cargo check
+cargo check                                                     # デスクトップ（デフォルト features）
+cargo check --no-default-features --bin codeg-server            # サーバーモード
+cargo check --no-default-features --bin codeg-mcp               # MCP コンパニオン
 cargo clippy --all-targets --features test-utils -- -D warnings
-cargo build
 
 # Rust テスト
 cargo test --features test-utils                                # デスクトップ（統合テスト含む）
 cargo test --no-default-features --bin codeg-server --lib       # サーバーモード
+cargo insta review                                              # パーサスナップショットの更新を受理
 ```
+
+> ヒント: `src-tauri/target/release/` に新しい `codeg-mcp` ビルドがあり、再インストールせずに手動起動の `codeg-server` をそこに向けたい場合は、`CODEG_MCP_BIN=$(pwd)/src-tauri/target/release/codeg-mcp` をエクスポートしてください。
 
 ### サーバーデプロイ
 
@@ -238,8 +258,11 @@ Docker イメージはマルチステージビルド（Node.js + Rust → 軽量
 pnpm install && pnpm build          # フロントエンドをビルド
 cd src-tauri
 cargo build --release --bin codeg-server --no-default-features
-CODEG_STATIC_DIR=../out ./target/release/codeg-server
+cargo build --release --bin codeg-mcp --no-default-features    # デリゲートコンパニオン
+CODEG_STATIC_DIR=../out ./target/release/codeg-server          # codeg-mcp は同階層のバイナリとして検出されます
 ```
+
+> 2 つのバイナリを別々のディレクトリに置く場合は、`CODEG_MCP_BIN=/abs/path/to/codeg-mcp` を設定して、ランタイムからコンパニオンを見つけられるようにしてください。設定しない場合、マルチエージェントのデリゲートはサイレントに無効化されます。
 
 #### 設定
 
@@ -252,6 +275,8 @@ CODEG_STATIC_DIR=../out ./target/release/codeg-server
 | `CODEG_TOKEN`                  | _(ランダム)_           | 認証トークン（起動時に stderr に出力）                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `CODEG_DATA_DIR`               | `~/.local/share/codeg` | SQLite データベースディレクトリ（`uploads/`、`pets/` のルートも兼ねる）                                                                                                                                                                                                                                                                                                                                                                         |
 | `CODEG_STATIC_DIR`             | `./web` または `./out` | Next.js 静的エクスポートディレクトリ                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `CODEG_MCP_BIN`                | _（未設定）_           | `codeg-mcp` コンパニオンの絶対パス。デフォルトの「実行ファイルと同階層 + `PATH`」検索を上書きします。コンパニオンがサーバーのインストールディレクトリ外にあるソースビルドやカスタム配置で使用します。                                                                                                                                                                                                                                              |
+| `CODEG_SKIP_SIDECAR`           | _（未設定）_           | `pnpm tauri dev` / `pnpm tauri build` でのフロントエンド作業向け — `1` を指定すると `codeg-mcp` sidecar のビルドをスキップします。そのビルドではデリゲートが無効になります。出荷品質の成果物では未設定のままにしてください。                                                                                                                                                                                                                      |
 | `CODEG_UPLOAD_MAX_TOTAL_BYTES` | _（未設定）_           | `<data dir>/uploads/` 配下に存在するファイルの合計バイト数のハードキャップ。10進数のバイト数（例: `10737418240` で 10 GiB）。未設定、`0`、または解析できない値の場合、キャップは無効になり、起動時に現在の状態が分かるログ行を出力します。このキャップは単一の `codeg-server` プロセス内でのみ強制されます——同じ `uploads/` ボリュームを共有する水平スケール構成では、外部協調（ファイルロック、Redis、リバースプロキシのクォータ）が必要です。 |
 | `CODEG_UPLOAD_QUOTA_STRICT`    | _（未設定）_           | 真値（`1` / `true` / `yes` / `on`）の場合、`CODEG_UPLOAD_MAX_TOTAL_BYTES` が解析できない値に設定されているときに、WARN を出して fail-open するのではなく、終了コード 2 で起動を中断します。セキュリティポリシーで「設定されたクォータは有効でなければならない」と要求される場合に使用します。                                                                                                                                                   |
 

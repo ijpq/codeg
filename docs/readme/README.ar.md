@@ -119,28 +119,44 @@ sudo apt-get install -y \
   patchelf
 ```
 
+### الملفات التنفيذية
+
+يوفّر Codeg ثلاثة ملفات تنفيذية بلغة Rust من workspace واحد:
+
+| الملف التنفيذي | الدور                                                                                                                  | البناء                                                                       |
+| -------------- | ---------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| `codeg`        | تطبيق سطح المكتب Tauri (نافذة، شريط النظام، المُحدِّث)                                                                 | `pnpm tauri build` (إصدار) / `pnpm tauri dev` (تطوير)                        |
+| `codeg-server` | خادم HTTP + WebSocket مستقل لعمليات النشر عبر المتصفح/بدون واجهة                                                       | `pnpm server:build` / `pnpm server:dev`                                      |
+| `codeg-mcp`    | رفيق MCP عبر stdio يُشغَّل لكل جلسة، ويُتيح أداة `delegate_to_agent` لواجهات CLI للوكلاء (التعاون متعدد الوكلاء)        | `pnpm tauri:prepare-sidecars` (يُستدعى تلقائيًا من `tauri dev` / `tauri build`) |
+
+يجب أن يكون `codeg-mcp` بجوار ملفه التنفيذي الأصلي وقت التشغيل — برامج التثبيت وصورة Docker ومُجمِّع sidecar الخاص بـ Tauri جميعها تضعه بجوار `codeg` / `codeg-server`. يمكن لعمليات البناء من المصدر والتخطيطات المخصّصة تجاوز البحث باستخدام متغير البيئة `CODEG_MCP_BIN=/مسار/مطلق/codeg-mcp`. في حال غياب الرفيق، يتم تخطّي التفويض (مع تسجيل تحذير واحد) وتستمر باقي جلسة الوكيل في العمل.
+
 ### التطوير
 
 ```bash
 pnpm install
 
+# الواجهة الأمامية فقط (خادم تطوير Next.js، بدون Rust)
+pnpm dev
+
 # تصدير ثابت للواجهة الأمامية إلى out/
 pnpm build
 
-# تطبيق سطح المكتب الكامل (Tauri + Next.js)
+# تطبيق سطح المكتب الكامل (Tauri + Next.js، يبني sidecar الخاص بـ codeg-mcp تلقائيًا)
 pnpm tauri dev
 
-# الواجهة الأمامية فقط
-pnpm dev
-
-# بناء تطبيق سطح المكتب
+# بناء إصدار سطح المكتب (يُضمِّن codeg-mcp بوصفه externalBin)
 pnpm tauri build
 
 # خادم مستقل (بدون Tauri/واجهة رسومية)
 pnpm server:dev
+pnpm server:build                  # ملف الإصدار التنفيذي ضمن src-tauri/target/release/codeg-server
 
-# بناء الملف التنفيذي للخادم
-pnpm server:build
+# بناء رفيق codeg-mcp بشكل صريح (لثلاثية المضيف)
+pnpm tauri:prepare-sidecars        # الناتج: src-tauri/binaries/codeg-mcp-<triple>
+
+# تخطّي تحضير sidecar عند التكرار على الواجهة الأمامية ولا تحتاج إلى التفويض
+CODEG_SKIP_SIDECAR=1 pnpm tauri dev
 
 # فحص الأكواد
 pnpm eslint .
@@ -151,14 +167,18 @@ pnpm test:watch
 pnpm test:coverage
 
 # فحوصات Rust (تنفيذ في src-tauri/)
-cargo check
+cargo check                                                     # سطح المكتب (الميزات الافتراضية)
+cargo check --no-default-features --bin codeg-server            # وضع الخادم
+cargo check --no-default-features --bin codeg-mcp               # رفيق MCP
 cargo clippy --all-targets --features test-utils -- -D warnings
-cargo build
 
 # اختبارات Rust
 cargo test --features test-utils                                # سطح المكتب (يشمل التكامل)
 cargo test --no-default-features --bin codeg-server --lib       # وضع الخادم
+cargo insta review                                              # قبول تحديثات لقطات المُحلِّل
 ```
+
+> نصيحة: عند توفّر بناء جديد لـ `codeg-mcp` ضمن `src-tauri/target/release/` وأردت توجيه `codeg-server` مُشغَّل يدويًا إليه دون إعادة التثبيت، صدِّر `CODEG_MCP_BIN=$(pwd)/src-tauri/target/release/codeg-mcp`.
 
 ### نشر الخادم
 
@@ -238,8 +258,11 @@ docker run -d -p 3080:3080 \
 pnpm install && pnpm build          # بناء الواجهة الأمامية
 cd src-tauri
 cargo build --release --bin codeg-server --no-default-features
-CODEG_STATIC_DIR=../out ./target/release/codeg-server
+cargo build --release --bin codeg-mcp --no-default-features    # رفيق التفويض
+CODEG_STATIC_DIR=../out ./target/release/codeg-server          # يتم التقاط codeg-mcp بوصفه ملفًا شقيقًا
 ```
+
+إذا احتفظت بالملفين التنفيذيين في دليلين منفصلين، فاضبط `CODEG_MCP_BIN=/مسار/مطلق/إلى/codeg-mcp` حتى يستطيع التشغيل العثور على الرفيق؛ بدون ذلك، يُعطَّل التفويض متعدد الوكلاء بصمت.
 
 #### التكوين
 
@@ -252,6 +275,8 @@ CODEG_STATIC_DIR=../out ./target/release/codeg-server
 | `CODEG_TOKEN`                  | _(عشوائي)_             | رمز المصادقة (يُطبع في stderr عند البدء)                                                                                                                                                                                                                                                                                                                                                                    |
 | `CODEG_DATA_DIR`               | `~/.local/share/codeg` | دليل قاعدة بيانات SQLite (والجذر أيضاً لـ `uploads/` و `pets/`)                                                                                                                                                                                                                                                                                                                                             |
 | `CODEG_STATIC_DIR`             | `./web` أو `./out`     | دليل التصدير الثابت لـ Next.js                                                                                                                                                                                                                                                                                                                                                                              |
+| `CODEG_MCP_BIN`                | _(غير مُحدّد)_         | المسار المطلق لرفيق `codeg-mcp`. يتجاوز البحث الافتراضي (ملف شقيق للملف التنفيذي + `PATH`). استخدمه لعمليات البناء من المصدر أو التخطيطات المخصّصة التي يقع فيها الرفيق خارج دليل تثبيت الخادم.                                                                                                                                                                                                            |
+| `CODEG_SKIP_SIDECAR`           | _(غير مُحدّد)_         | متغير راحة للواجهة الأمامية فقط لـ `pnpm tauri dev` / `pnpm tauri build` — عند `1` يتم تخطّي بناء sidecar الخاص بـ `codeg-mcp`. يُعطَّل التفويض في هذا البناء؛ ويجب ترك المتغير غير مُحدَّد للقطع الصالحة للشحن.                                                                                                                                                                                            |
 | `CODEG_UPLOAD_MAX_TOTAL_BYTES` | _(غير مُحدّد)_         | حدّ صارم لإجمالي البايتات المقيمة تحت `<data dir>/uploads/`. عدد بايتات عشري (مثلاً `10737418240` لـ 10 GiB). إذا كان غير مُحدّد أو `0` أو قيمة لا يمكن تحليلها فسيتم تعطيل الحدّ وطباعة سطر عند البدء حتى تكون الحالة مرئية. يُطبَّق الحدّ داخل عملية `codeg-server` واحدة — تحتاج عمليات النشر الموسَّعة أفقياً التي تتشارك حجم `uploads/` واحداً إلى تنسيق خارجي (قفل ملف، Redis، حصّة عبر بروكسي عكسي). |
 | `CODEG_UPLOAD_QUOTA_STRICT`    | _(غير مُحدّد)_         | عند كونه صحيحاً (`1` / `true` / `yes` / `on`)، يُلغي البدء برمز خروج 2 إذا كانت `CODEG_UPLOAD_MAX_TOTAL_BYTES` مضبوطة على قيمة لا يمكن تحليلها، بدلاً من المتابعة مع تحذير WARN. استخدم هذا حين تتطلب سياستك الأمنية أن «تكون الحصّة المُعدَّة فعّالة».                                                                                                                                                     |
 

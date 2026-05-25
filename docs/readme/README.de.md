@@ -119,28 +119,44 @@ sudo apt-get install -y \
   patchelf
 ```
 
+### Binärdateien
+
+Codeg liefert drei Rust-Binärdateien aus einem einzigen Workspace:
+
+| Binärdatei     | Rolle                                                                                                                | Build                                                                       |
+| -------------- | -------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| `codeg`        | Tauri-Desktop-App (Fenster, Tray, Updater)                                                                           | `pnpm tauri build` (Release) / `pnpm tauri dev` (Dev)                       |
+| `codeg-server` | Standalone HTTP- + WebSocket-Server für Browser-/Headless-Deployments                                                | `pnpm server:build` / `pnpm server:dev`                                     |
+| `codeg-mcp`    | Pro-Launch-stdio-MCP-Begleiter, der Agent-CLIs das Werkzeug `delegate_to_agent` bereitstellt (Multi-Agent-Kollaboration) | `pnpm tauri:prepare-sidecars` (automatisch durch `tauri dev` / `tauri build`) |
+
+`codeg-mcp` muss zur Laufzeit neben seiner übergeordneten Binärdatei liegen — Installer, das Docker-Image und der Tauri-Sidecar-Bundler legen ihn alle neben `codeg` / `codeg-server` ab. Quellcode-Builds und benutzerdefinierte Layouts können die Suche mit der Umgebungsvariablen `CODEG_MCP_BIN=/abs/pfad/codeg-mcp` überschreiben. Fehlt der Begleiter, wird die Delegation übersprungen (eine einzige Warnung wird protokolliert) und die restliche Agenten-Sitzung funktioniert weiter.
+
 ### Entwicklung
 
 ```bash
 pnpm install
 
+# Nur Frontend (Next.js-Dev-Server, kein Rust)
+pnpm dev
+
 # Frontend-Statikexport nach out/
 pnpm build
 
-# Vollständige Desktop-App (Tauri + Next.js)
+# Vollständige Desktop-App (Tauri + Next.js, baut codeg-mcp-Sidecar automatisch)
 pnpm tauri dev
 
-# Nur Frontend
-pnpm dev
-
-# Desktop-Build
+# Desktop-Release-Build (bündelt codeg-mcp als externalBin)
 pnpm tauri build
 
 # Standalone-Server (kein Tauri/GUI erforderlich)
 pnpm server:dev
+pnpm server:build                  # Release-Binary unter src-tauri/target/release/codeg-server
 
-# Server-Release-Binary erstellen
-pnpm server:build
+# codeg-mcp-Begleiter explizit bauen (für das Host-Triple)
+pnpm tauri:prepare-sidecars        # Ausgabe: src-tauri/binaries/codeg-mcp-<triple>
+
+# Sidecar-Vorbereitung überspringen, wenn am Frontend gearbeitet wird und keine Delegation benötigt wird
+CODEG_SKIP_SIDECAR=1 pnpm tauri dev
 
 # Lint
 pnpm eslint .
@@ -151,14 +167,18 @@ pnpm test:watch
 pnpm test:coverage
 
 # Rust-Prüfungen (in src-tauri/ ausführen)
-cargo check
+cargo check                                                     # Desktop (Standard-Features)
+cargo check --no-default-features --bin codeg-server            # Server-Modus
+cargo check --no-default-features --bin codeg-mcp               # MCP-Begleiter
 cargo clippy --all-targets --features test-utils -- -D warnings
-cargo build
 
 # Rust-Tests
 cargo test --features test-utils                                # Desktop (inkl. Integration)
 cargo test --no-default-features --bin codeg-server --lib       # Server-Modus
+cargo insta review                                              # Parser-Snapshot-Updates akzeptieren
 ```
+
+> Tipp: Wenn unter `src-tauri/target/release/` ein frischer `codeg-mcp`-Build vorliegt und Sie einen manuell gestarteten `codeg-server` darauf zeigen lassen wollen, ohne ihn neu zu installieren, exportieren Sie `CODEG_MCP_BIN=$(pwd)/src-tauri/target/release/codeg-mcp`.
 
 ### Server-Bereitstellung
 
@@ -238,8 +258,11 @@ Das Docker-Image verwendet einen Multi-Stage-Build (Node.js + Rust → schlanke 
 pnpm install && pnpm build          # Frontend kompilieren
 cd src-tauri
 cargo build --release --bin codeg-server --no-default-features
-CODEG_STATIC_DIR=../out ./target/release/codeg-server
+cargo build --release --bin codeg-mcp --no-default-features    # Delegations-Begleiter
+CODEG_STATIC_DIR=../out ./target/release/codeg-server          # codeg-mcp wird als Geschwisterdatei erkannt
 ```
+
+Wenn Sie die beiden Binärdateien in getrennten Verzeichnissen halten, setzen Sie `CODEG_MCP_BIN=/abs/pfad/zu/codeg-mcp`, damit die Laufzeit den Begleiter dennoch findet; ohne diese Variable wird die Multi-Agent-Delegation stillschweigend deaktiviert.
 
 #### Konfiguration
 
@@ -252,6 +275,8 @@ Umgebungsvariablen:
 | `CODEG_TOKEN`                  | _(zufällig)_           | Authentifizierungstoken (wird beim Start auf stderr ausgegeben)                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `CODEG_DATA_DIR`               | `~/.local/share/codeg` | SQLite-Datenbankverzeichnis (auch Wurzel für `uploads/`, `pets/`)                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `CODEG_STATIC_DIR`             | `./web` oder `./out`   | Next.js-Statikexport-Verzeichnis                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `CODEG_MCP_BIN`                | _(nicht gesetzt)_      | Absoluter Pfad zum `codeg-mcp`-Begleiter. Überschreibt die Standardsuche (Geschwisterdatei der ausführbaren Datei + `PATH`). Verwenden Sie dies für Quellcode-Builds oder benutzerdefinierte Layouts, bei denen der Begleiter außerhalb des Installationsverzeichnisses des Servers liegt.                                                                                                                                                                                                              |
+| `CODEG_SKIP_SIDECAR`           | _(nicht gesetzt)_      | Frontend-only Komfortvariable für `pnpm tauri dev` / `pnpm tauri build` — bei `1` wird der Build des `codeg-mcp`-Sidecars übersprungen. Die Delegation ist in diesem Build deaktiviert; produktionsreife Artefakte dürfen diese Variable nicht gesetzt haben.                                                                                                                                                                                                                                          |
 | `CODEG_UPLOAD_MAX_TOTAL_BYTES` | _(nicht gesetzt)_      | Harte Obergrenze für die Gesamtzahl an Bytes unter `<data dir>/uploads/`. Dezimaler Byte-Wert (z. B. `10737418240` für 10 GiB). Nicht gesetzt, `0` oder ein nicht parsbarer Wert deaktiviert das Limit und gibt eine Startzeile aus, damit der Zustand sichtbar ist. Das Limit wird innerhalb eines einzelnen `codeg-server`-Prozesses durchgesetzt — horizontal skalierte Deployments, die sich ein `uploads/`-Volume teilen, benötigen externe Koordination (Datei-Lock, Redis, Reverse-Proxy-Quota). |
 | `CODEG_UPLOAD_QUOTA_STRICT`    | _(nicht gesetzt)_      | Wenn wahr (`1` / `true` / `yes` / `on`), wird der Start mit Exit-Code 2 abgebrochen, falls `CODEG_UPLOAD_MAX_TOTAL_BYTES` auf einen nicht parsbaren Wert gesetzt ist, statt mit einer WARN fail-open zu starten. Verwenden Sie dies, wenn Ihre Sicherheitsrichtlinie verlangt, dass „die konfigurierte Quota wirksam sein muss".                                                                                                                                                                        |
 

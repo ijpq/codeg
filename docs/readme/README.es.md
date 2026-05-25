@@ -119,28 +119,44 @@ sudo apt-get install -y \
   patchelf
 ```
 
+### Binarios
+
+Codeg distribuye tres binarios de Rust desde un único workspace:
+
+| Binario        | Rol                                                                                                          | Compilación                                                                |
+| -------------- | ------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------- |
+| `codeg`        | Aplicación de escritorio Tauri (ventana, bandeja, actualizador)                                              | `pnpm tauri build` (release) / `pnpm tauri dev` (dev)                      |
+| `codeg-server` | Servidor HTTP + WebSocket independiente para despliegues en navegador/sin interfaz                           | `pnpm server:build` / `pnpm server:dev`                                    |
+| `codeg-mcp`    | Compañero stdio MCP por lanzamiento que expone la herramienta `delegate_to_agent` a las CLI de agentes (colaboración multi-agente) | `pnpm tauri:prepare-sidecars` (invocado automáticamente por `tauri dev` / `tauri build`) |
+
+`codeg-mcp` debe ubicarse junto a su binario padre en tiempo de ejecución — los instaladores, la imagen Docker y el empaquetador de sidecars de Tauri lo colocan junto a `codeg` / `codeg-server`. Las compilaciones desde fuente y los diseños personalizados pueden anular la búsqueda con la variable de entorno `CODEG_MCP_BIN=/abs/path/codeg-mcp`. Si el compañero falta, la delegación se omite (se registra una única advertencia) y el resto de la sesión del agente sigue funcionando.
+
 ### Desarrollo
 
 ```bash
 pnpm install
 
+# Solo frontend (servidor de desarrollo de Next.js, sin Rust)
+pnpm dev
+
 # Exportación estática del frontend a out/
 pnpm build
 
-# Aplicación de escritorio completa (Tauri + Next.js)
+# Aplicación de escritorio completa (Tauri + Next.js, compila automáticamente el sidecar codeg-mcp)
 pnpm tauri dev
 
-# Solo frontend
-pnpm dev
-
-# Compilación de escritorio
+# Compilación de escritorio de release (incluye codeg-mcp como externalBin)
 pnpm tauri build
 
 # Servidor independiente (sin Tauri/GUI necesario)
 pnpm server:dev
+pnpm server:build                  # binario de release en src-tauri/target/release/codeg-server
 
-# Compilar binario de servidor para producción
-pnpm server:build
+# Compilar explícitamente el compañero codeg-mcp (para el triple del host)
+pnpm tauri:prepare-sidecars        # salida: src-tauri/binaries/codeg-mcp-<triple>
+
+# Saltar la preparación del sidecar al iterar el frontend cuando no necesitas delegación
+CODEG_SKIP_SIDECAR=1 pnpm tauri dev
 
 # Lint
 pnpm eslint .
@@ -151,14 +167,18 @@ pnpm test:watch
 pnpm test:coverage
 
 # Verificaciones de Rust (ejecutar en src-tauri/)
-cargo check
+cargo check                                                     # escritorio (features por defecto)
+cargo check --no-default-features --bin codeg-server            # modo servidor
+cargo check --no-default-features --bin codeg-mcp               # compañero MCP
 cargo clippy --all-targets --features test-utils -- -D warnings
-cargo build
 
 # Pruebas de Rust
 cargo test --features test-utils                                # escritorio (incl. integración)
 cargo test --no-default-features --bin codeg-server --lib       # modo servidor
+cargo insta review                                              # aceptar actualizaciones de snapshots del parser
 ```
+
+> Sugerencia: cuando tengas una compilación reciente de `codeg-mcp` en `src-tauri/target/release/` y quieras apuntar un `codeg-server` lanzado manualmente sin reinstalar, exporta `CODEG_MCP_BIN=$(pwd)/src-tauri/target/release/codeg-mcp`.
 
 ### Despliegue del servidor
 
@@ -238,8 +258,11 @@ La imagen Docker utiliza una compilación multi-etapa (Node.js + Rust → runtim
 pnpm install && pnpm build          # compilar frontend
 cd src-tauri
 cargo build --release --bin codeg-server --no-default-features
-CODEG_STATIC_DIR=../out ./target/release/codeg-server
+cargo build --release --bin codeg-mcp --no-default-features    # compañero de delegación
+CODEG_STATIC_DIR=../out ./target/release/codeg-server          # codeg-mcp se detecta como hermano
 ```
+
+Si mantienes los dos binarios en directorios separados, define `CODEG_MCP_BIN=/abs/path/to/codeg-mcp` para que el runtime pueda seguir encontrando el compañero; sin esto, la delegación multi-agente se desactiva silenciosamente.
 
 #### Configuración
 
@@ -252,6 +275,8 @@ Variables de entorno:
 | `CODEG_TOKEN`                  | _(aleatorio)_          | Token de autenticación (se imprime en stderr al iniciar)                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `CODEG_DATA_DIR`               | `~/.local/share/codeg` | Directorio de la base de datos SQLite (también raíz de `uploads/`, `pets/`)                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `CODEG_STATIC_DIR`             | `./web` o `./out`      | Directorio de exportación estática de Next.js                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `CODEG_MCP_BIN`                | _(sin definir)_        | Ruta absoluta al compañero `codeg-mcp`. Anula la búsqueda por defecto de hermano-del-ejecutable + `PATH`. Úsalo para compilaciones desde fuente o diseños personalizados donde el compañero reside fuera del directorio de instalación del servidor.                                                                                                                                                                                                                                                                                  |
+| `CODEG_SKIP_SIDECAR`           | _(sin definir)_        | Conveniencia solo de frontend para `pnpm tauri dev` / `pnpm tauri build` — cuando vale `1`, omite la compilación del sidecar `codeg-mcp`. La delegación queda desactivada en esa compilación; los artefactos de calidad de release deben dejarla sin definir.                                                                                                                                                                                                                                                                        |
 | `CODEG_UPLOAD_MAX_TOTAL_BYTES` | _(sin definir)_        | Límite máximo de bytes totales residentes en `<data dir>/uploads/`. Conteo de bytes en decimal (p. ej. `10737418240` para 10 GiB). Si no se define, vale `0` o tiene un valor no analizable, el límite se desactiva y se imprime una línea de inicio para que la configuración sea visible. El límite se aplica dentro de un único proceso `codeg-server` — los despliegues escalados horizontalmente que comparten un mismo volumen `uploads/` requieren coordinación externa (bloqueo de archivos, Redis, cuota de proxy inverso). |
 | `CODEG_UPLOAD_QUOTA_STRICT`    | _(sin definir)_        | Cuando es verdadero (`1` / `true` / `yes` / `on`), aborta el inicio con código de salida 2 si `CODEG_UPLOAD_MAX_TOTAL_BYTES` tiene un valor no analizable, en vez de continuar con un WARN. Úselo cuando su política de seguridad requiera que «la cuota configurada debe ser efectiva».                                                                                                                                                                                                                                             |
 

@@ -119,28 +119,44 @@ sudo apt-get install -y \
   patchelf
 ```
 
+### 바이너리
+
+Codeg는 단일 워크스페이스에서 세 개의 Rust 바이너리를 제공합니다:
+
+| 바이너리       | 역할                                                                                                | 빌드                                                                        |
+| -------------- | --------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| `codeg`        | Tauri 데스크톱 앱 (윈도우, 트레이, 업데이터)                                                        | `pnpm tauri build` (릴리스) / `pnpm tauri dev` (개발)                       |
+| `codeg-server` | 브라우저/헤드리스 배포용 독립형 HTTP + WebSocket 서버                                               | `pnpm server:build` / `pnpm server:dev`                                     |
+| `codeg-mcp`    | 에이전트 CLI에 `delegate_to_agent` 도구를 노출하는 실행별 stdio MCP 컴패니언 (멀티 에이전트 협업) | `pnpm tauri:prepare-sidecars` (`tauri dev` / `tauri build`에서 자동 호출) |
+
+`codeg-mcp`는 런타임에 부모 바이너리 옆에 위치해야 합니다 — 설치 프로그램, Docker 이미지, Tauri 사이드카 번들러 모두 이를 `codeg` / `codeg-server` 옆에 배치합니다. 소스 빌드나 사용자 정의 레이아웃의 경우 `CODEG_MCP_BIN=/abs/path/codeg-mcp` 환경 변수로 조회 위치를 재정의할 수 있습니다. 컴패니언이 누락된 경우 위임은 건너뛰어지고(경고가 한 번 기록됨) 나머지 에이전트 세션은 계속 작동합니다.
+
 ### 개발
 
 ```bash
 pnpm install
 
+# 프론트엔드 전용 (Next.js 개발 서버, Rust 없음)
+pnpm dev
+
 # 프론트엔드 정적 내보내기 (out/)
 pnpm build
 
-# 전체 데스크톱 앱 (Tauri + Next.js)
+# 전체 데스크톱 앱 (Tauri + Next.js, codeg-mcp 사이드카 자동 빌드)
 pnpm tauri dev
 
-# 프론트엔드만
-pnpm dev
-
-# 데스크톱 빌드
+# 데스크톱 릴리스 빌드 (codeg-mcp를 externalBin으로 번들링)
 pnpm tauri build
 
 # 독립형 서버 (Tauri/GUI 불필요)
 pnpm server:dev
+pnpm server:build                  # 릴리스 바이너리 위치: src-tauri/target/release/codeg-server
 
-# 서버 릴리스 바이너리 빌드
-pnpm server:build
+# codeg-mcp 컴패니언을 명시적으로 빌드 (호스트 트리플용)
+pnpm tauri:prepare-sidecars        # 출력: src-tauri/binaries/codeg-mcp-<triple>
+
+# 프론트엔드 작업 중이고 위임이 필요하지 않을 때 사이드카 준비 건너뛰기
+CODEG_SKIP_SIDECAR=1 pnpm tauri dev
 
 # Lint
 pnpm eslint .
@@ -151,14 +167,18 @@ pnpm test:watch
 pnpm test:coverage
 
 # Rust 검사 (src-tauri/에서 실행)
-cargo check
+cargo check                                                     # 데스크톱 (기본 features)
+cargo check --no-default-features --bin codeg-server            # 서버 모드
+cargo check --no-default-features --bin codeg-mcp               # MCP 컴패니언
 cargo clippy --all-targets --features test-utils -- -D warnings
-cargo build
 
 # Rust 테스트
 cargo test --features test-utils                                # 데스크톱 (통합 포함)
 cargo test --no-default-features --bin codeg-server --lib       # 서버 모드
+cargo insta review                                              # 파서 스냅샷 업데이트 승인
 ```
+
+> 팁: `src-tauri/target/release/` 아래에 새 `codeg-mcp` 빌드가 있고 재설치 없이 수동으로 실행한 `codeg-server`가 이를 가리키게 하려면, `CODEG_MCP_BIN=$(pwd)/src-tauri/target/release/codeg-mcp`를 export 하십시오.
 
 ### 서버 배포
 
@@ -238,8 +258,11 @@ Docker 이미지는 멀티 스테이지 빌드(Node.js + Rust → 경량 Debian 
 pnpm install && pnpm build          # 프론트엔드 빌드
 cd src-tauri
 cargo build --release --bin codeg-server --no-default-features
-CODEG_STATIC_DIR=../out ./target/release/codeg-server
+cargo build --release --bin codeg-mcp --no-default-features    # 위임 컴패니언
+CODEG_STATIC_DIR=../out ./target/release/codeg-server          # codeg-mcp는 형제 파일로 인식됨
 ```
+
+두 바이너리를 서로 다른 디렉토리에 두는 경우, 런타임이 컴패니언을 찾을 수 있도록 `CODEG_MCP_BIN=/abs/path/to/codeg-mcp`를 설정하십시오. 설정하지 않으면 멀티 에이전트 위임이 조용히 비활성화됩니다.
 
 #### 구성
 
@@ -252,6 +275,8 @@ CODEG_STATIC_DIR=../out ./target/release/codeg-server
 | `CODEG_TOKEN`                  | _(랜덤)_               | 인증 토큰 (시작 시 stderr에 출력)                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `CODEG_DATA_DIR`               | `~/.local/share/codeg` | SQLite 데이터베이스 디렉토리(`uploads/`, `pets/`의 루트 역할도 함)                                                                                                                                                                                                                                                                                                                                                                          |
 | `CODEG_STATIC_DIR`             | `./web` 또는 `./out`   | Next.js 정적 내보내기 디렉토리                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `CODEG_MCP_BIN`                | _(설정 안 됨)_         | `codeg-mcp` 컴패니언의 절대 경로. 기본 실행 파일 형제 + `PATH` 조회를 재정의합니다. 컴패니언이 서버의 설치 디렉토리 외부에 있는 소스 빌드나 사용자 정의 레이아웃에 사용하십시오.                                                                                                                                                                                                                                                            |
+| `CODEG_SKIP_SIDECAR`           | _(설정 안 됨)_         | `pnpm tauri dev` / `pnpm tauri build`를 위한 프론트엔드 전용 편의 기능 — `1`일 때 `codeg-mcp` 사이드카 빌드를 건너뜁니다. 해당 빌드에서는 위임이 비활성화됩니다. 출시 품질 산출물에서는 설정하지 않아야 합니다.                                                                                                                                                                                                                              |
 | `CODEG_UPLOAD_MAX_TOTAL_BYTES` | _(설정 안 됨)_         | `<data dir>/uploads/` 아래 상주하는 모든 파일의 총 바이트 수에 대한 하드 한도. 10진수 바이트 수(예: 10 GiB의 경우 `10737418240`). 설정하지 않거나 `0`, 또는 파싱할 수 없는 값이면 한도가 비활성화되며, 현재 상태가 보이도록 시작 시 로그 라인을 출력합니다. 이 한도는 단일 `codeg-server` 프로세스 내에서만 적용됩니다 — 하나의 `uploads/` 볼륨을 공유하는 수평 확장 배포에는 외부 조정(파일 잠금, Redis, 리버스 프록시 쿼터)이 필요합니다. |
 | `CODEG_UPLOAD_QUOTA_STRICT`    | _(설정 안 됨)_         | 참값(`1` / `true` / `yes` / `on`)으로 설정된 경우, `CODEG_UPLOAD_MAX_TOTAL_BYTES`가 파싱할 수 없는 값으로 설정되어 있으면 WARN과 함께 fail-open 하는 대신 종료 코드 2로 시작을 중단합니다. 보안 정책상 "구성된 쿼터가 반드시 적용되어야 한다"는 요구가 있을 때 사용합니다.                                                                                                                                                                  |
 
