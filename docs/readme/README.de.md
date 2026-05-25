@@ -35,8 +35,8 @@ Codeg (Code Generation) ist ein Multi-Agent-Coding-Workspace. Es vereint mehrere
 
 ## Highlights
 
-- Einheitlicher Multi-Agent-Workspace im selben Projekt
-- Lokale Konversationserfassung mit strukturierter Darstellung
+- **Konversations-Aggregation** — Sitzungen aller unterstützten Agenten in einen einheitlichen Workspace importieren
+- **Multi-Agent-Kollaboration** — innerhalb einer Sitzung delegiert der Haupt-Agent an Sub-Agenten unterschiedlicher Typen (z. B. Claude Code ruft Codex, Gemini auf), um eine Aufgabe gemeinsam zu erledigen, wobei jeder Sub-Agent als eigenständige Sitzung läuft
 - Parallele Entwicklung mit integrierten `git worktree`-Abläufen
 - **Projekt-Starter** — neue Projekte visuell erstellen mit Live-Vorschau
 - **Chat-Kanäle** — Telegram, Lark (Feishu), iLink (Weixin) und mehr mit Ihren Coding-Agenten verbinden für Echtzeit-Benachrichtigungen, vollständige Sitzungsinteraktion und Remote-Aufgabensteuerung
