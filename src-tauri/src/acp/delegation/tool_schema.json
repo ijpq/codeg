@@ -30,7 +30,7 @@
         "minimum": 0,
         "maximum": 3600,
         "default": 600,
-        "description": "Timeout in seconds for the sub-agent run. Defaults to 600; set 0 to disable the timeout."
+        "description": "Timeout in seconds for the sub-agent run. Defaults to 600 seconds; 0 disables the timeout."
       }
     }
   }
