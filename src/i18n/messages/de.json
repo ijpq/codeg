@@ -1946,6 +1946,25 @@
         "agentStatsSearch": "Suchen",
         "agentStatsEdit": "Bearbeitungen",
         "agentStatsOther": "Sonstige",
+        "goal": {
+          "title": "Ziel:",
+          "titleWithStatus": "Ziel {status}",
+          "objective": "Ziel",
+          "statusLabel": "Status",
+          "tokensUsed": "Verwendete tokens",
+          "budget": "Budget",
+          "remaining": "Verbleibend",
+          "elapsed": "Verstrichen",
+          "tokens": "tokens",
+          "status": {
+            "active": "aktiv",
+            "paused": "pausiert",
+            "blocked": "blockiert",
+            "usageLimited": "Nutzung begrenzt",
+            "budgetLimited": "Budget begrenzt",
+            "complete": "abgeschlossen"
+          }
+        },
         "field": {
           "file": "Datei",
           "notebook": "Notizbuch",

@@ -22,7 +22,10 @@ import type {
   ToolCallStatus,
   TurnUsage,
 } from "@/lib/types"
-import { inferLiveToolName } from "@/lib/tool-call-normalization"
+import {
+  inferLiveToolName,
+  parseGoalUpdateTitle,
+} from "@/lib/tool-call-normalization"
 import { toErrorMessage } from "@/lib/app-error"
 
 export type ConversationSyncState = "idle" | "awaiting_persist"
@@ -367,6 +370,30 @@ function extractRevisedPrompt(content: string | null): string | null {
   return trimmed
 }
 
+function resolveGoalToolInputFromLiveTitle(
+  toolName: string,
+  info: ToolCallInfo
+): string | null {
+  if (info.raw_input && info.raw_input.trim().length > 0) {
+    return info.raw_input
+  }
+
+  const goal = parseGoalUpdateTitle(info.title)
+  if (!goal) return info.raw_input
+
+  if (toolName === "create_goal") {
+    return JSON.stringify({ objective: goal.objective })
+  }
+  if (toolName === "update_goal") {
+    return JSON.stringify({
+      status: goal.status,
+      objective: goal.objective,
+    })
+  }
+
+  return info.raw_input
+}
+
 function buildStreamingTurnsFromLiveMessage(
   conversationId: number,
   liveMessage: LiveMessage
@@ -558,7 +585,10 @@ function buildStreamingTurnsFromLiveMessage(
           type: "tool_use",
           tool_use_id: block.info.tool_call_id,
           tool_name: toolName,
-          input_preview: block.info.raw_input,
+          input_preview: resolveGoalToolInputFromLiveTitle(
+            toolName,
+            block.info
+          ),
           // Forward the ACP `meta` field downstream so the renderer can
           // read delegation state (`meta["codeg.delegation"]`) for
           // pre-binding / post-refresh fallback rendering of

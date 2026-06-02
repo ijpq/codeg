@@ -1946,6 +1946,25 @@
         "agentStatsSearch": "عمليات البحث",
         "agentStatsEdit": "التعديلات",
         "agentStatsOther": "أخرى",
+        "goal": {
+          "title": "الهدف:",
+          "titleWithStatus": "الهدف {status}",
+          "objective": "الهدف",
+          "statusLabel": "الحالة",
+          "tokensUsed": "tokens المستخدمة",
+          "budget": "الميزانية",
+          "remaining": "المتبقي",
+          "elapsed": "المدة",
+          "tokens": "tokens",
+          "status": {
+            "active": "نشط",
+            "paused": "متوقف مؤقتًا",
+            "blocked": "محظور",
+            "usageLimited": "الاستخدام محدود",
+            "budgetLimited": "الميزانية محدودة",
+            "complete": "مكتمل"
+          }
+        },
         "field": {
           "file": "ملف",
           "notebook": "دفتر",

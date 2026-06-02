@@ -5,6 +5,7 @@ import { useConversationRuntime } from "@/contexts/conversation-runtime-context"
 import { ContentPartsRenderer } from "./content-parts-renderer"
 import {
   createMessageTurnAdapter,
+  groupGoalRuns,
   mergeAdjacentToolGroups,
   mergeAdjacentDelegationStatusGroups,
   type AdaptedContentPart,
@@ -143,8 +144,12 @@ const CollapsibleSystemMessage = memo(function CollapsibleSystemMessage({
 
 function extractTextFromParts(parts: AdaptedContentPart[]): string {
   return parts
-    .filter((p): p is { type: "text"; text: string } => p.type === "text")
-    .map((p) => p.text)
+    .flatMap((p): string[] => {
+      if (p.type === "text") return [p.text]
+      if (p.type === "goal-run") return [extractTextFromParts(p.items)]
+      return []
+    })
+    .filter((text) => text.length > 0)
     .join("\n")
 }
 
@@ -188,8 +193,8 @@ function mergeConsecutiveAssistantTurns(
       // Fold tool-groups straddling the turn boundary, then collapse runs of
       // single-poll delegation-status groups (each polling round is its own
       // turn) into one merged status card.
-      const mergedParts = mergeAdjacentDelegationStatusGroups(
-        mergeAdjacentToolGroups(allParts)
+      const mergedParts = groupGoalRuns(
+        mergeAdjacentDelegationStatusGroups(mergeAdjacentToolGroups(allParts))
       )
       const last = buffer[buffer.length - 1]
       const first = buffer[0]

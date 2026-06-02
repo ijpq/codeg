@@ -1946,6 +1946,25 @@
         "agentStatsSearch": "검색",
         "agentStatsEdit": "편집",
         "agentStatsOther": "기타",
+        "goal": {
+          "title": "목표:",
+          "titleWithStatus": "목표 {status}",
+          "objective": "목표",
+          "statusLabel": "상태",
+          "tokensUsed": "사용 tokens",
+          "budget": "예산",
+          "remaining": "남음",
+          "elapsed": "경과",
+          "tokens": "tokens",
+          "status": {
+            "active": "진행 중",
+            "paused": "일시 중지",
+            "blocked": "차단됨",
+            "usageLimited": "사용량 제한",
+            "budgetLimited": "예산 제한",
+            "complete": "완료"
+          }
+        },
         "field": {
           "file": "파일",
           "notebook": "노트북",

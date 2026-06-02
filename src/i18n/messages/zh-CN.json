@@ -1946,6 +1946,25 @@
         "agentStatsSearch": "搜索",
         "agentStatsEdit": "编辑",
         "agentStatsOther": "其他",
+        "goal": {
+          "title": "目标：",
+          "titleWithStatus": "目标{status}",
+          "objective": "目标",
+          "statusLabel": "状态",
+          "tokensUsed": "已用 tokens",
+          "budget": "预算",
+          "remaining": "剩余",
+          "elapsed": "耗时",
+          "tokens": "tokens",
+          "status": {
+            "active": "进行中",
+            "paused": "已暂停",
+            "blocked": "受阻",
+            "usageLimited": "用量受限",
+            "budgetLimited": "预算受限",
+            "complete": "已完成"
+          }
+        },
         "field": {
           "file": "文件",
           "notebook": "笔记本",

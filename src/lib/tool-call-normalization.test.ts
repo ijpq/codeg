@@ -198,3 +198,36 @@ describe("normalizeToolName collapses delegation companion tools across hosts", 
     )
   })
 })
+
+describe("normalizeToolName collapses Codex goal tools across wrappers", () => {
+  it.each([
+    ["create_goal", "create_goal"],
+    ["functions.create_goal", "create_goal"],
+    ["mcp__codeg__create_goal", "create_goal"],
+    ["Goal updated (active): 分析 README 文件", "create_goal"],
+    ["update_goal", "update_goal"],
+    ["functions.update_goal", "update_goal"],
+    ["mcp__codeg__update_goal", "update_goal"],
+    ["Goal updated (complete): 分析 README 文件", "update_goal"],
+  ])("%s -> %s", (input, expected) => {
+    expect(normalizeToolName(input)).toBe(expected)
+  })
+
+  it("infers live Codex goal updates from ACP titles", () => {
+    expect(
+      inferLiveToolName({
+        title: "Goal updated (active): 分析 README 文件",
+        kind: "other",
+        rawInput: JSON.stringify({ objective: "分析 README 文件" }),
+      })
+    ).toBe("create_goal")
+
+    expect(
+      inferLiveToolName({
+        title: "Goal updated (complete): 分析 README 文件",
+        kind: "other",
+        rawInput: JSON.stringify({ status: "complete" }),
+      })
+    ).toBe("update_goal")
+  })
+})
