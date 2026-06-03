@@ -25,6 +25,10 @@ pub struct UpdateActionResult {
     pub need_restart: bool,
     /// Relaunch delay (ms) the frontend countdown should use.
     pub restart_delay_ms: u64,
+    /// Supervisor probation window (seconds) during which a freshly-upgraded
+    /// worker that crashes is auto-rolled-back. 0 when there is no supervisor
+    /// (re-exec mode): no auto-rollback, so the frontend need not wait it out.
+    pub trial_seconds: u64,
     pub capability: UpdateCapability,
 }
 
@@ -78,6 +82,17 @@ fn busy() -> AppCommandError {
 /// Refuse on platforms where in-place self-update is not validated. Windows
 /// server self-update is disabled (running-.exe swap + re-exec rebind are
 /// untested there); the desktop Windows app updates via tauri-plugin-updater.
+/// The probation window the frontend should wait out before declaring success,
+/// in seconds — only meaningful under the supervisor (which performs the
+/// auto-rollback). Re-exec mode has no supervisor, hence no trial.
+#[cfg(not(feature = "tauri-runtime"))]
+fn trial_seconds_value() -> u64 {
+    match crate::update::runtime::capability() {
+        UpdateCapability::Supervised => crate::update::runtime::upgrade_trial_secs(),
+        _ => 0,
+    }
+}
+
 #[cfg(not(feature = "tauri-runtime"))]
 fn ensure_supported() -> Result<(), AppCommandError> {
     if cfg!(target_os = "windows") {
@@ -117,6 +132,7 @@ async fn perform_impl(state: Arc<AppState>) -> Result<UpdateActionResult, AppCom
         version: Some(outcome.version),
         need_restart: true,
         restart_delay_ms: crate::update::runtime::restart_delay_ms(),
+        trial_seconds: trial_seconds_value(),
         capability: crate::update::runtime::capability(),
     })
 }
@@ -124,18 +140,21 @@ async fn perform_impl(state: Arc<AppState>) -> Result<UpdateActionResult, AppCom
 #[cfg(not(feature = "tauri-runtime"))]
 fn restart_impl(state: Arc<AppState>) -> Result<UpdateActionResult, AppCommandError> {
     ensure_supported()?;
-    // Just guard against a perform/rollback in flight; the lock is released
-    // immediately (the restart itself is fire-and-forget).
-    if state.system_op_lock.try_lock().is_err() {
-        return Err(busy());
-    }
+    // Take the lock and hold it until the process exits, so a perform/rollback
+    // can't start in the flush window and then be killed by the restart.
+    let guard = state
+        .system_op_lock
+        .clone()
+        .try_lock_owned()
+        .map_err(|_| busy())?;
     let restart_delay_ms = crate::update::runtime::restart_delay_ms();
     // Responds first, then exits/re-execs after a short flush delay.
-    crate::update::schedule_restart();
+    crate::update::schedule_restart(guard);
     Ok(UpdateActionResult {
         version: None,
         need_restart: false,
         restart_delay_ms,
+        trial_seconds: trial_seconds_value(),
         capability: crate::update::runtime::capability(),
     })
 }
@@ -149,6 +168,7 @@ async fn rollback_impl(state: Arc<AppState>) -> Result<UpdateActionResult, AppCo
         version: None,
         need_restart: true,
         restart_delay_ms: crate::update::runtime::restart_delay_ms(),
+        trial_seconds: 0,
         capability: crate::update::runtime::capability(),
     })
 }

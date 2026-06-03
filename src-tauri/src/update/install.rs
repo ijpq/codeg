@@ -132,14 +132,35 @@ pub fn upgrade_staged() -> bool {
     upgrade_marker_path().map(|p| p.exists()).unwrap_or(false)
 }
 
-/// Record that an upgrade has been staged (best-effort: a failure only means
-/// the supervisor won't put the next launch on probation, not data loss).
-fn mark_upgrade_staged() {
-    if let Some(p) = upgrade_marker_path() {
-        if let Err(e) = std::fs::write(&p, b"staged\n") {
-            eprintln!("[update][WARN] failed to write upgrade marker: {e}");
-        }
+/// Record that an upgrade has been staged, durably. The marker is the only
+/// thing that puts the next launch on probation (auto-rollback) and refuses a
+/// second perform from clobbering `.bak`; if we cannot fsync it to disk the
+/// swap is not safely committed, so the caller must undo the swap rather than
+/// report success.
+fn mark_upgrade_staged() -> Result<(), AppCommandError> {
+    use std::io::Write;
+    let p = upgrade_marker_path()
+        .ok_or_else(|| AppCommandError::io_error("Cannot resolve upgrade marker path"))?;
+    // Write to a temp file, fsync it, then atomically rename it into place.
+    // A failed/partial write must never leave the *real* marker visible — a
+    // stray marker would refuse every future update as "already staged" until
+    // a restart consumed it.
+    let mut tmp = p.clone().into_os_string();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let _ = std::fs::remove_file(&tmp);
+    let write = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(b"staged\n")?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, &p)?;
+        Ok(())
+    })();
+    if let Err(e) = write {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(AppCommandError::io(e));
     }
+    Ok(())
 }
 
 /// Consume the staged-upgrade marker, returning whether it was present.
@@ -282,8 +303,19 @@ pub async fn perform_update(
 
     // The swap is complete. Mark it staged so (a) the supervisor puts the
     // next launch on probation and (b) a second perform is refused until a
-    // restart applies this one.
-    mark_upgrade_staged();
+    // restart applies this one. If the marker can't be recorded durably, the
+    // upgrade is not safely committed (no probation, no double-perform guard),
+    // so undo the swap and surface the error instead of reporting success.
+    if let Err(e) = mark_upgrade_staged() {
+        // Undo the swap and make sure no marker survives: a marker without a
+        // committed upgrade would refuse every future update as "already
+        // staged" until the next restart consumed it.
+        let _ = take_upgrade_staged();
+        let _ = restore_from_bak(&targets.server_bin);
+        let _ = restore_from_bak(&targets.mcp_bin);
+        let _ = restore_dir_from_bak(&targets.web_dir);
+        return Err(e);
+    }
 
     Ok(InstallOutcome {
         version: new_version,
@@ -569,13 +601,44 @@ fn replace_file(target: &Path, new_src: &Path) -> Result<(), AppCommandError> {
 
     let bak = bak_path(target);
     let _ = std::fs::remove_file(&bak);
-    if target.exists() {
-        std::fs::rename(target, &bak).map_err(AppCommandError::io)?;
+
+    // On unix, back the live file up *without* moving it aside, then replace it
+    // with a single atomic rename. `rename(2)` guarantees `target` always
+    // resolves to either the old or the new inode — never missing — so a crash
+    // (SIGKILL, OOM, host down) mid-swap can't leave the server binary absent
+    // and the container unbootable. The backup is a hard link to the old inode
+    // (O(1), no copy); fall back to a byte copy on filesystems without links.
+    #[cfg(unix)]
+    {
+        if target.exists() && std::fs::hard_link(target, &bak).is_err() {
+            // hard_link unsupported on this filesystem: copy instead, but stage
+            // through a temp path so a partial/interrupted copy can never leave
+            // a truncated `.bak` that a later rollback would restore over a
+            // good binary. `.bak` only ever appears complete or absent.
+            let mut bak_tmp = bak.clone().into_os_string();
+            bak_tmp.push(".tmp");
+            let bak_tmp = PathBuf::from(bak_tmp);
+            let _ = std::fs::remove_file(&bak_tmp);
+            std::fs::copy(target, &bak_tmp).map_err(AppCommandError::io)?;
+            std::fs::rename(&bak_tmp, &bak).map_err(AppCommandError::io)?;
+        }
+        if let Err(e) = std::fs::rename(&staged, target) {
+            let _ = std::fs::remove_file(&staged);
+            return Err(AppCommandError::io(e));
+        }
     }
-    if let Err(e) = std::fs::rename(&staged, target) {
-        // Best-effort un-rename so we don't leave the target missing.
-        let _ = std::fs::rename(&bak, target);
-        return Err(AppCommandError::io(e));
+    // Windows cannot rename over an existing file, so move the live file aside
+    // first. (Server self-update is gated off on Windows; this keeps the helper
+    // correct regardless.)
+    #[cfg(not(unix))]
+    {
+        if target.exists() {
+            std::fs::rename(target, &bak).map_err(AppCommandError::io)?;
+        }
+        if let Err(e) = std::fs::rename(&staged, target) {
+            let _ = std::fs::rename(&bak, target);
+            return Err(AppCommandError::io(e));
+        }
     }
     Ok(())
 }

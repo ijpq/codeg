@@ -23,10 +23,17 @@ pub use runtime::{capability, restart_delay_ms, runtime_label, UpdateCapability}
 /// Schedule a restart that fires *after* the current HTTP response has had
 /// time to flush, so the frontend receives its acknowledgement before the
 /// socket drops. Returns immediately.
-pub fn schedule_restart() {
-    tokio::spawn(async {
+///
+/// `hold` is the `system_op_lock` guard. It is kept alive until the process
+/// exits, so a concurrent perform/rollback cannot slip into the window between
+/// responding and exiting only to be killed mid-operation. `restart_now` never
+/// returns, so the guard dies with the process — there is no path that leaks
+/// the lock and wedges future operations.
+pub fn schedule_restart(hold: tokio::sync::OwnedMutexGuard<()>) {
+    tokio::spawn(async move {
         // Give axum a moment to write the response body to the client.
         tokio::time::sleep(Duration::from_millis(400)).await;
+        let _hold = hold;
         restart_now();
     });
 }
