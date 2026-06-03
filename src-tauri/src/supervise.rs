@@ -79,23 +79,19 @@ pub fn run() -> ! {
     let delay = runtime::restart_delay_ms();
     let trial = std::time::Duration::from_secs(runtime::upgrade_trial_secs());
 
-    let spawn_worker = || -> std::process::Child {
+    let spawn_worker = || -> std::io::Result<std::process::Child> {
         std::process::Command::new(&exe)
             .args(&args)
             .env(runtime::ENV_SUPERVISED, "1")
             .env(runtime::ENV_RESTART_DELAY_MS, delay.to_string())
             .spawn()
-            .unwrap_or_else(|e| {
-                eprintln!("[supervise][FATAL] failed to spawn worker: {e}");
-                std::process::exit(1);
-            })
     };
 
     // Spawn + publish the PID, then close the spawn→store race: if a stop
     // signal landed in that window the handler couldn't forward it (the PID
     // was still 0), so forward it here.
-    let spawn_and_track = || -> std::process::Child {
-        let child = spawn_worker();
+    let spawn_and_track = || -> std::io::Result<std::process::Child> {
+        let child = spawn_worker()?;
         let pid = child.id() as i32;
         WORKER_PID.store(pid, Ordering::SeqCst);
         if TERMINATING.load(Ordering::SeqCst) {
@@ -104,7 +100,32 @@ pub fn run() -> ! {
                 libc::kill(pid, libc::SIGTERM);
             }
         }
-        child
+        Ok(child)
+    };
+
+    // Spawn a launch that may be on trial. If spawning a freshly-upgraded
+    // binary fails outright — wrong architecture, ENOEXEC, missing dynamic
+    // loader, truncated file — the new version can't boot at all, which is
+    // exactly the failure the trial guards against; the run-then-die path
+    // never sees it because there is no process to wait on. Roll back and
+    // spawn the restored previous version instead. The marker was already
+    // consumed, so without this a container restart would re-run the same
+    // unspawnable binary forever. Exits only if even the fallback spawn fails.
+    let spawn_trial = |on_trial: &mut bool| -> std::process::Child {
+        match spawn_and_track() {
+            Ok(child) => child,
+            Err(e) if *on_trial && attempt_rollback(&format!("new version failed to spawn ({e})")) => {
+                *on_trial = false;
+                spawn_and_track().unwrap_or_else(|e2| {
+                    eprintln!("[supervise][FATAL] failed to spawn restored worker: {e2}");
+                    std::process::exit(1);
+                })
+            }
+            Err(e) => {
+                eprintln!("[supervise][FATAL] failed to spawn worker: {e}");
+                std::process::exit(1);
+            }
+        }
     };
 
     // A worker is "on trial" when this launch is the trial of a freshly
@@ -114,7 +135,7 @@ pub fn run() -> ! {
     // a trial if a swap completed in a prior lifetime and the container was
     // restarted before the upgrade-restart fired.
     let mut on_trial = crate::update::install::take_upgrade_staged();
-    let mut child = spawn_and_track();
+    let mut child = spawn_trial(&mut on_trial);
     let mut spawned_at = std::time::Instant::now();
     eprintln!("[supervise] worker started (pid {})", child.id());
 
@@ -171,7 +192,7 @@ pub fn run() -> ! {
                 // the marker); a plain restart leaves no marker and relaunches
                 // without probation.
                 on_trial = crate::update::install::take_upgrade_staged();
-                child = spawn_and_track();
+                child = spawn_trial(&mut on_trial);
                 spawned_at = std::time::Instant::now();
                 eprintln!("[supervise] worker relaunched (pid {})", child.id());
                 continue;
@@ -187,7 +208,10 @@ pub fn run() -> ! {
                 ))
             {
                 on_trial = false;
-                child = spawn_and_track();
+                child = spawn_and_track().unwrap_or_else(|e| {
+                    eprintln!("[supervise][FATAL] failed to spawn restored worker: {e}");
+                    std::process::exit(1);
+                });
                 spawned_at = std::time::Instant::now();
                 eprintln!("[supervise] previous version relaunched (pid {})", child.id());
                 continue;
@@ -206,7 +230,10 @@ pub fn run() -> ! {
                 ))
             {
                 on_trial = false;
-                child = spawn_and_track();
+                child = spawn_and_track().unwrap_or_else(|e| {
+                    eprintln!("[supervise][FATAL] failed to spawn restored worker: {e}");
+                    std::process::exit(1);
+                });
                 spawned_at = std::time::Instant::now();
                 eprintln!("[supervise] previous version relaunched (pid {})", child.id());
                 continue;

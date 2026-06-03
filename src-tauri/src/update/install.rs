@@ -95,9 +95,22 @@ fn resolve_targets() -> Result<Targets, AppCommandError> {
         .to_path_buf();
     let mcp_bin = bindir.join(mcp_bin_filename());
 
-    let web_dir = crate::web::find_static_dir_standalone(
-        std::env::var("CODEG_STATIC_DIR").ok().as_deref(),
-    );
+    // Resolve the `web/` *update target* deterministically — this is distinct
+    // from "where to serve static files from right now". When CODEG_STATIC_DIR
+    // is set (the Docker image sets it to /app/web), the bundle lives there by
+    // definition, so target it even if it is momentarily absent (e.g. a prior
+    // web swap was interrupted mid-rename). Routing this through the serving
+    // fallback would silently retarget a *different* directory when index.html
+    // is missing, so a retry could update the wrong path and never repair the
+    // real one.
+    let web_dir = match std::env::var("CODEG_STATIC_DIR")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        Some(dir) => PathBuf::from(dir),
+        None => crate::web::find_static_dir_standalone(None),
+    };
     // Absolutize so the rename-based swap is filesystem-stable regardless of
     // the process CWD (which the supervisor/respawn may not preserve).
     let web_dir = std::fs::canonicalize(&web_dir).unwrap_or(web_dir);
@@ -154,6 +167,11 @@ fn mark_upgrade_staged() -> Result<(), AppCommandError> {
         f.write_all(b"staged\n")?;
         f.sync_all()?;
         std::fs::rename(&tmp, &p)?;
+        // fsync the directory so the marker's rename survives power loss — the
+        // marker is what makes a return of success mean "durably staged".
+        if let Some(parent) = p.parent() {
+            sync_dir(parent)?;
+        }
         Ok(())
     })();
     if let Err(e) = write {
@@ -576,6 +594,22 @@ fn bak_path(target: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// fsync a directory so a `rename`/`create` inside it is durable across host
+/// power loss — fsyncing a file flushes its data but not the parent's updated
+/// directory entry. No-op on platforms without directory fsync (Windows, where
+/// server self-update is disabled anyway).
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
+}
+
 /// Replace `target` with `new_src`, keeping the previous file at
 /// `target.bak`. Staging happens in `target`'s own directory so the final
 /// rename is same-filesystem (atomic). Renaming over a running executable is
@@ -626,6 +660,9 @@ fn replace_file(target: &Path, new_src: &Path) -> Result<(), AppCommandError> {
             let _ = std::fs::remove_file(&staged);
             return Err(AppCommandError::io(e));
         }
+        // Durably record both the `.bak` creation and the swap rename (same
+        // dir) so a power loss can't resurrect the pre-swap directory entry.
+        let _ = sync_dir(dir);
     }
     // Windows cannot rename over an existing file, so move the live file aside
     // first. (Server self-update is gated off on Windows; this keeps the helper
@@ -665,6 +702,9 @@ fn replace_dir(target: &Path, new_src: &Path) -> Result<(), AppCommandError> {
         let _ = std::fs::rename(&bak, target);
         return Err(AppCommandError::io(e));
     }
+    // Durably record the directory swap so a power loss can't leave `web/`
+    // absent with the rename only in the page cache.
+    let _ = sync_dir(parent);
     Ok(())
 }
 
