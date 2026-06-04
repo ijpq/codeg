@@ -175,15 +175,26 @@ export async function waitForServerHealthy(opts: {
  */
 export async function getRunningServerVersion(): Promise<string | null> {
   try {
-    const res = await getTransport().call<{ version?: string }>(
-      "health",
-      {},
-      { timeoutMs: 4000 }
-    )
-    return res?.version ?? null
+    return await readServerVersionStrict()
   } catch {
     return null
   }
+}
+
+/**
+ * Like {@link getRunningServerVersion} but distinguishes "server reachable but
+ * reports no version" (resolves null — an older build) from "server
+ * unreachable" (rejects). Use where a silent fallback to stale UI state could
+ * mask a later rollback, e.g. establishing the pre-upgrade baseline: a failed
+ * `/health` call must not be mistaken for a definitive "no version" answer.
+ */
+export async function readServerVersionStrict(): Promise<string | null> {
+  const res = await getTransport().call<{ version?: string }>(
+    "health",
+    {},
+    { timeoutMs: 4000 }
+  )
+  return res?.version ?? null
 }
 
 export async function closeAppUpdate(

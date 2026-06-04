@@ -7,7 +7,48 @@ vi.mock("@/lib/transport", () => ({
   isDesktop: () => false,
 }))
 
-import { waitForServerHealthy } from "@/lib/updater"
+import {
+  getRunningServerVersion,
+  readServerVersionStrict,
+  waitForServerHealthy,
+} from "@/lib/updater"
+
+describe("readServerVersionStrict", () => {
+  beforeEach(() => {
+    call.mockReset()
+  })
+
+  it("returns the version when /health reports one", async () => {
+    call.mockResolvedValueOnce({ version: "0.14.12" })
+    await expect(readServerVersionStrict()).resolves.toBe("0.14.12")
+  })
+
+  it("resolves null when /health responds without a version (older server)", async () => {
+    call.mockResolvedValueOnce({})
+    await expect(readServerVersionStrict()).resolves.toBeNull()
+  })
+
+  it("rejects (does not swallow) when the server is unreachable", async () => {
+    call.mockRejectedValueOnce(new Error("down"))
+    await expect(readServerVersionStrict()).rejects.toThrow("down")
+  })
+})
+
+describe("getRunningServerVersion", () => {
+  beforeEach(() => {
+    call.mockReset()
+  })
+
+  it("returns the version on success", async () => {
+    call.mockResolvedValueOnce({ version: "1.2.3" })
+    await expect(getRunningServerVersion()).resolves.toBe("1.2.3")
+  })
+
+  it("swallows a transport failure as null", async () => {
+    call.mockRejectedValueOnce(new Error("down"))
+    await expect(getRunningServerVersion()).resolves.toBeNull()
+  })
+})
 
 describe("waitForServerHealthy", () => {
   beforeEach(() => {

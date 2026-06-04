@@ -41,6 +41,7 @@ import {
   installAppUpdate,
   normalizeAppUpdateError,
   performServerUpdate,
+  readServerVersionStrict,
   relaunchApp,
   restartServer,
   subscribeServerUpdateProgress,
@@ -394,9 +395,27 @@ export function SystemNetworkSettings() {
       // success. Read it live from /health rather than trusting `currentVersion`
       // state, which can be stale if another client updated the server since
       // this tab last checked (else a real rollback to a version this tab never
-      // saw would be mis-reported as success). Fall back to state only if
-      // /health reports no version (older server).
-      const baseline = (await getRunningServerVersion()) ?? currentVersion
+      // saw would be mis-reported as success). Distinguish "reachable but no
+      // version" (older server → fall back to state) from "unreachable": on a
+      // failed read, abort rather than upgrade a server we can't even reach and
+      // then trust stale state. Retry briefly to ride out a transient blip.
+      let liveBaseline: string | null = null
+      let reachable = false
+      for (let i = 0; i < 3; i++) {
+        try {
+          liveBaseline = await readServerVersionStrict()
+          reachable = true
+          break
+        } catch {
+          await new Promise<void>((r) => setTimeout(r, 1000))
+        }
+      }
+      if (!reachable) {
+        setUpdateError(t("serverUnreachable"))
+        toast.error(t("serverUnreachable"))
+        return
+      }
+      const baseline = liveBaseline ?? currentVersion
       const isRollback = (v: string | null): boolean =>
         !!v && !!baseline && v === baseline
 
