@@ -733,16 +733,85 @@ fn replace_dir(target: &Path, new_src: &Path) -> Result<(), AppCommandError> {
     let bak = bak_path(target);
     let _ = std::fs::remove_dir_all(&bak);
     if target.exists() {
-        std::fs::rename(target, &bak).map_err(AppCommandError::io)?;
-    }
-    if let Err(e) = std::fs::rename(&staged, target) {
-        let _ = std::fs::rename(&bak, target);
-        return Err(AppCommandError::io(e));
+        // Prefer a single atomic swap so `target` is *never* absent mid-operation
+        // — `rename(2)` of a populated directory can't overwrite another, so the
+        // portable fallback below has to move the live dir aside first, leaving a
+        // sub-millisecond window where a crash/power-loss strands `web/` missing
+        // (the API stays up, so the supervisor won't self-heal it). The exchange
+        // swaps the two inodes in one step: afterwards `target` holds the new
+        // tree and `staged` holds the previous one, which becomes `.bak`.
+        if exchange_dirs(target, &staged).is_ok() {
+            // The live swap is done and crash-safe; keeping the previous tree as
+            // `.bak` is best-effort (a same-dir rename that has every reason to
+            // succeed). Don't fail an already-committed upgrade if it doesn't —
+            // rollback is best-effort per artifact anyway.
+            let _ = std::fs::rename(&staged, &bak);
+        } else {
+            // No atomic exchange here (syscall unsupported, older kernel, or a
+            // cross-filesystem layout): fall back to backup-then-rename. The
+            // missing-`web/` window reopens, but it is recoverable — re-running
+            // the update restores the directory.
+            std::fs::rename(target, &bak).map_err(AppCommandError::io)?;
+            if let Err(e) = std::fs::rename(&staged, target) {
+                let _ = std::fs::rename(&bak, target);
+                return Err(AppCommandError::io(e));
+            }
+        }
+    } else {
+        // No live directory (first install, or recovering an interrupted swap
+        // that left `web/` absent): nothing to back up — move the staged tree in.
+        std::fs::rename(&staged, target).map_err(AppCommandError::io)?;
     }
     // Durably record the directory swap so a power loss can't leave `web/`
     // absent with the rename only in the page cache.
     let _ = sync_dir(parent);
     Ok(())
+}
+
+/// Atomically swap two existing paths (here, the live `web/` and its staged
+/// replacement) so neither is ever momentarily absent. Uses `RENAME_EXCHANGE`
+/// (Linux) / `RENAME_SWAP` (macOS); both paths must exist and share a
+/// filesystem. Returns `Err` when the syscall is unavailable (old kernel,
+/// unsupported FS, or any non-unix/other-unix target) so the caller can fall
+/// back to a non-atomic move.
+fn exchange_dirs(a: &Path, b: &Path) -> std::io::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let ca = CString::new(a.as_os_str().as_bytes())
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        let cb = CString::new(b.as_os_str().as_bytes())
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        // SAFETY: both pointers are valid NUL-terminated C strings that outlive
+        // the call; the kernel only reads them.
+        let ret = unsafe {
+            #[cfg(target_os = "linux")]
+            {
+                libc::renameat2(
+                    libc::AT_FDCWD,
+                    ca.as_ptr(),
+                    libc::AT_FDCWD,
+                    cb.as_ptr(),
+                    libc::RENAME_EXCHANGE,
+                )
+            }
+            #[cfg(target_os = "macos")]
+            {
+                libc::renamex_np(ca.as_ptr(), cb.as_ptr(), libc::RENAME_SWAP)
+            }
+        };
+        if ret == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (a, b);
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+    }
 }
 
 fn restore_from_bak(target: &Path) -> Result<bool, AppCommandError> {
@@ -906,6 +975,35 @@ mod tests {
 
         assert!(restore_dir_from_bak(&target).unwrap());
         assert_eq!(std::fs::read(target.join("index.html")).unwrap(), b"old");
+
+        // The swap leaves no `.web.new` scratch dir behind (it became `.bak`).
+        assert!(!dir.path().join(".web.new").exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn exchange_dirs_swaps_two_directories_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(a.join("mark"), b"A").unwrap();
+        std::fs::write(b.join("mark"), b"B").unwrap();
+
+        // On a filesystem that supports the syscall the contents swap atomically;
+        // if it is unsupported here, the helper reports the error (and replace_dir
+        // would fall back) rather than corrupting either side.
+        match exchange_dirs(&a, &b) {
+            Ok(()) => {
+                assert_eq!(std::fs::read(a.join("mark")).unwrap(), b"B");
+                assert_eq!(std::fs::read(b.join("mark")).unwrap(), b"A");
+            }
+            Err(_) => {
+                assert_eq!(std::fs::read(a.join("mark")).unwrap(), b"A");
+                assert_eq!(std::fs::read(b.join("mark")).unwrap(), b"B");
+            }
+        }
     }
 
     #[test]
