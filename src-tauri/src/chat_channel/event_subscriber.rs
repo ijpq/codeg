@@ -500,6 +500,57 @@ mod permission_push_tests {
         );
     }
 
+    /// The reviewer's exact common path: ONE connection approves a first gate
+    /// (e.g. ExitPlanMode) and immediately hits a second (e.g. Bash) well inside
+    /// the 5s window. Both must deliver. Distinct from the test above, which
+    /// covers two *different* connections — here the connection_id is identical,
+    /// proving the exemption is connection-agnostic (debounce keys on
+    /// (channel, event), so a blocked agent's follow-up gate is never swallowed).
+    #[tokio::test]
+    async fn permission_requests_same_connection_sequential_not_debounced() {
+        let db = test_helpers::fresh_in_memory_db().await;
+        let (chat, rec) = manager_with_recorder(7).await;
+        let bridge = Arc::new(Mutex::new(SessionBridge::new()));
+        let config = config_all_on(7);
+        let mut last_push = HashMap::new();
+
+        let gate = |title: &str, raw: serde_json::Value| EventEnvelope {
+            seq: 1,
+            connection_id: "conn-a".into(),
+            payload: AcpEvent::PermissionRequest {
+                request_id: "req".into(),
+                tool_call: serde_json::json!({ "title": title, "rawInput": raw }),
+                options: vec![],
+            },
+        };
+
+        process_envelope(
+            &gate("ExitPlanMode", serde_json::json!({})),
+            &bridge,
+            &chat,
+            &db.conn,
+            &config,
+            &mut last_push,
+        )
+        .await;
+        process_envelope(
+            &gate("Bash", serde_json::json!({ "command": "npm run build" })),
+            &bridge,
+            &chat,
+            &db.conn,
+            &config,
+            &mut last_push,
+        )
+        .await;
+
+        let msgs = sent(&rec).await;
+        assert_eq!(
+            msgs.len(),
+            2,
+            "both sequential gates on one connection must deliver, got {msgs:?}"
+        );
+    }
+
     /// Contrast: turn_complete is still debounced — a second one within the 5s
     /// window is dropped. Guards against accidentally exempting everything.
     #[tokio::test]
