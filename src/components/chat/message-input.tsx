@@ -134,6 +134,9 @@ interface MessageInputProps {
   isEditingQueueItem?: boolean
   onSaveQueueEdit?: (draft: PromptDraft) => void
   onCancelQueueEdit?: () => void
+  /** Fork the session and send `draft`. Fire-and-forget: the input consumes the
+   *  draft synchronously (clears on click); the parent re-queues it if the fork
+   *  can't run, so it is never lost. */
   onForkSend?: (draft: PromptDraft, modeId?: string | null) => void
 }
 
@@ -1938,6 +1941,10 @@ export function MessageInput({
     if (!onForkSend) return
     const draft = buildDraft()
     if (!draft) return
+    // Fork-send consumes the draft synchronously, exactly like a normal send:
+    // fire-and-forget and clear the input immediately, so there is no in-flight
+    // editable window. If the fork can't run (queue non-empty / disconnected /
+    // failure) the parent re-queues the draft, so it is never lost.
     onForkSend(draft, showModeSelector ? effectiveModeId : null)
     if (effectiveDraftStorageKey) {
       clearMessageInputDraft(effectiveDraftStorageKey)

@@ -1370,6 +1370,46 @@ pub fn message_sent(lang: Lang) -> &'static str {
     }
 }
 
+/// Shown when a prompt is rejected because the agent is still processing the
+/// previous turn. Transient — the session stays alive; the user retries.
+pub fn agent_busy_retry(lang: Lang) -> &'static str {
+    match lang {
+        Lang::ZhCn => "智能体正在处理上一条消息，请稍后再发送。",
+        Lang::ZhTw => "智慧代理正在處理上一則訊息，請稍後再發送。",
+        Lang::Ja => "エージェントが前のメッセージを処理中です。少し待ってから再送信してください。",
+        Lang::Ko => "에이전트가 이전 메시지를 처리 중입니다. 잠시 후 다시 보내 주세요.",
+        Lang::Es => "El agente sigue procesando el mensaje anterior; vuelve a enviarlo en un momento.",
+        Lang::De => "Der Agent verarbeitet noch die vorherige Nachricht – bitte gleich erneut senden.",
+        Lang::Fr => "L'agent traite encore le message précédent ; renvoyez-le dans un instant.",
+        Lang::Pt => "O agente ainda está processando a mensagem anterior; envie novamente em instantes.",
+        Lang::Ar => "لا يزال الوكيل يعالج الرسالة السابقة، يرجى إعادة الإرسال بعد قليل.",
+        Lang::En => {
+            "The agent is still processing the previous message — please send again in a moment."
+        }
+    }
+}
+
+/// Shown when a task's initial prompt arrives while another turn is already in
+/// flight on the same (shared) connection. Unlike `agent_busy_retry`, the user
+/// does NOT need to resend — the kickoff is deferred and runs automatically
+/// once the current turn finishes.
+pub fn task_deferred_busy(lang: Lang) -> &'static str {
+    match lang {
+        Lang::ZhCn => "智能体正忙，任务将在当前回合结束后自动开始。",
+        Lang::ZhTw => "智慧代理忙碌中，任務將在目前回合結束後自動開始。",
+        Lang::Ja => "エージェントがビジー状態です。現在のターンが終了すると、タスクが自動的に開始されます。",
+        Lang::Ko => "에이전트가 사용 중입니다. 현재 턴이 끝나면 작업이 자동으로 시작됩니다.",
+        Lang::Es => "El agente está ocupado; la tarea comenzará automáticamente cuando finalice el turno actual.",
+        Lang::De => "Der Agent ist beschäftigt; die Aufgabe startet automatisch, sobald der aktuelle Zug endet.",
+        Lang::Fr => "L'agent est occupé ; la tâche démarrera automatiquement à la fin du tour en cours.",
+        Lang::Pt => "O agente está ocupado; a tarefa começará automaticamente quando o turno atual terminar.",
+        Lang::Ar => "الوكيل مشغول؛ ستبدأ المهمة تلقائيًا عند انتهاء الجولة الحالية.",
+        Lang::En => {
+            "The agent is busy — your task will start automatically once the current turn finishes."
+        }
+    }
+}
+
 // Internal error labels
 pub fn failed_to_list_folders_label(lang: Lang) -> &'static str {
     match lang {

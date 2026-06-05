@@ -430,6 +430,85 @@ describe("ConversationRuntimeProvider getTimelineTurns memoization", () => {
   })
 })
 
+describe("ConversationRuntimeProvider removeOptimisticTurn (bounce rollback)", () => {
+  const runtimeHolder: {
+    current: ReturnType<typeof useConversationRuntime> | undefined
+  } = { current: undefined }
+
+  function RuntimeCapture() {
+    const runtime = useConversationRuntime()
+    useEffect(() => {
+      runtimeHolder.current = runtime
+    })
+    return null
+  }
+
+  function userTurn(id: string): MessageTurn {
+    return {
+      id,
+      role: "user",
+      blocks: [{ type: "text", text: id }],
+      timestamp: "2026-05-28T00:00:00.000Z",
+    }
+  }
+
+  beforeEach(() => {
+    runtimeHolder.current = undefined
+  })
+
+  it("removes the turn by id and resets syncState to idle when none remain", () => {
+    renderProvider(<RuntimeCapture />)
+    const api = () => runtimeHolder.current!
+
+    act(() => {
+      api().appendOptimisticTurn(7, userTurn("t1"), "t1")
+    })
+    expect(api().getSession(7)?.optimisticTurns).toHaveLength(1)
+    expect(api().getSession(7)?.syncState).toBe("awaiting_persist")
+
+    act(() => {
+      api().removeOptimisticTurn(7, "t1")
+    })
+    // Optimistic turn rolled back, and awaiting_persist cleared so the next
+    // detail fetch reconciles cleanly instead of preserving a stale turn.
+    expect(api().getSession(7)?.optimisticTurns).toHaveLength(0)
+    expect(api().getSession(7)?.syncState).toBe("idle")
+  })
+
+  it("keeps awaiting_persist while another optimistic turn is still in flight", () => {
+    renderProvider(<RuntimeCapture />)
+    const api = () => runtimeHolder.current!
+
+    act(() => {
+      api().appendOptimisticTurn(8, userTurn("a"), "a")
+    })
+    act(() => {
+      api().appendOptimisticTurn(8, userTurn("b"), "b")
+    })
+    act(() => {
+      api().removeOptimisticTurn(8, "a")
+    })
+    const session = api().getSession(8)
+    expect(session?.optimisticTurns.map((t) => t.id)).toEqual(["b"])
+    expect(session?.syncState).toBe("awaiting_persist")
+  })
+
+  it("is a no-op for an unknown id", () => {
+    renderProvider(<RuntimeCapture />)
+    const api = () => runtimeHolder.current!
+
+    act(() => {
+      api().appendOptimisticTurn(9, userTurn("keep"), "keep")
+    })
+    act(() => {
+      api().removeOptimisticTurn(9, "does-not-exist")
+    })
+    const after = api().getSession(9)
+    expect(after?.optimisticTurns.map((t) => t.id)).toEqual(["keep"])
+    expect(after?.syncState).toBe("awaiting_persist")
+  })
+})
+
 /**
  * Delegation-child viewer projection in `getTimelineTurns`. When the sub-agent
  * dialog marks a session `liveOwnsActiveTurn` and supplies the kickoff task:

@@ -159,7 +159,7 @@ async fn acp_find_connection_for_conversation_returns_null_when_none_live() {
     let resp = server
         .post("/api/acp_find_connection_for_conversation")
         .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
-        .json(&json!({"conversationId": 999}))
+        .json(&json!({"conversationId": 999, "agentType": "claude_code"}))
         .await;
     assert_eq!(resp.status_code(), 200, "body: {}", resp.text());
     let body: Value = resp.json();

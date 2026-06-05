@@ -8,6 +8,7 @@ import {
 } from "./transport"
 import { getCodegToken, redirectToCodegLogin } from "./transport/web-auth"
 import { getCurrentEffectiveAppLocale } from "./i18n"
+import { TurnBusyError, isTurnInProgressRejection } from "./turn-busy"
 import type { FolderThemeColor } from "./theme-presets"
 import type {
   AgentType,
@@ -144,13 +145,18 @@ export async function acpPrompt(
   conversationId: number | null = null,
   clientMessageId: string | null = null
 ): Promise<void> {
-  return getTransport().call("acp_prompt", {
-    connectionId,
-    blocks,
-    folderId,
-    conversationId,
-    clientMessageId,
-  })
+  try {
+    await getTransport().call("acp_prompt", {
+      connectionId,
+      blocks,
+      folderId,
+      conversationId,
+      clientMessageId,
+    })
+  } catch (e) {
+    if (isTurnInProgressRejection(e)) throw new TurnBusyError()
+    throw e
+  }
 }
 
 export async function acpSetMode(
@@ -183,7 +189,15 @@ export interface ForkResult {
 }
 
 export async function acpFork(connectionId: string): Promise<ForkResult> {
-  return getTransport().call("acp_fork", { connectionId })
+  try {
+    return await getTransport().call("acp_fork", { connectionId })
+  } catch (e) {
+    // A fork is serialized with prompts on the backend: it returns
+    // TurnInProgress while a turn is in flight. Surface it as TurnBusyError so
+    // callers can treat it as transient (re-queue) rather than a fork failure.
+    if (isTurnInProgressRejection(e)) throw new TurnBusyError()
+    throw e
+  }
 }
 
 export async function acpRespondPermission(
@@ -227,10 +241,14 @@ export async function acpGetSessionSnapshotByConversation(
 }
 
 export async function acpFindConnectionForConversation(
-  conversationId: number
+  conversationId: number,
+  sessionId: string | undefined,
+  agentType: AgentType
 ): Promise<ConversationConnectionInfo | null> {
   return getTransport().call("acp_find_connection_for_conversation", {
     conversationId,
+    sessionId,
+    agentType,
   })
 }
 

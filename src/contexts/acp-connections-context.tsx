@@ -3255,7 +3255,17 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         if (conversationId != null && conversationId > 0) {
           let discovered: ConversationConnectionInfo | null = null
           try {
-            discovered = await acpFindConnectionForConversation(conversationId)
+            // Pass sessionId so discovery can fall back to external_id when the
+            // live owner hasn't bound its conversation_id yet (pre-first-prompt
+            // window) — without it a second client would reuse the owner's
+            // connection as a mis-tagged owner and kill it on tab close. The
+            // external_id fallback is matched WITH agentType (external_id is
+            // unique only per agent).
+            discovered = await acpFindConnectionForConversation(
+              conversationId,
+              sessionId,
+              agentType
+            )
           } catch (e) {
             console.warn(
               "[acp-context] connection discovery failed for conversation",

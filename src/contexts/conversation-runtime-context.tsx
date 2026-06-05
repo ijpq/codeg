@@ -168,6 +168,16 @@ type Action =
       turnToken: string
     }
   | {
+      // Roll back an optimistic user turn that never reached the backend
+      // (e.g. the send was rejected because a turn was already in flight, and
+      // the draft is being re-queued instead). Resets syncState to idle when no
+      // other optimistic turns remain so a stranded `awaiting_persist` doesn't
+      // block the next detail reconciliation.
+      type: "REMOVE_OPTIMISTIC_TURN"
+      conversationId: number
+      id: string
+    }
+  | {
       // Cross-client VIEWER synthesizes the sender's user turn from a
       // `user_message` event / snapshot. Idempotent + sender-guarded in the
       // reducer (never fires on a client that has its own in-flight send).
@@ -926,6 +936,25 @@ function reducer(
         activeTurnToken: action.turnToken,
       }))
 
+    case "REMOVE_OPTIMISTIC_TURN": {
+      const current = state.byConversationId.get(action.conversationId)
+      if (!current) return state
+      const remaining = current.optimisticTurns.filter(
+        (t) => t.id !== action.id
+      )
+      // Not found → no-op (avoid a needless re-render / identity change).
+      if (remaining.length === current.optimisticTurns.length) return state
+      return updateSessionInState(state, action.conversationId, (s) => ({
+        ...s,
+        optimisticTurns: remaining,
+        // Drop back to idle once the last in-flight optimistic turn is rolled
+        // back, so the `awaiting_persist` set on append doesn't linger and
+        // suppress the next detail reconciliation. Concurrent optimistic turns
+        // (if any) keep us awaiting_persist.
+        syncState: remaining.length === 0 ? "idle" : s.syncState,
+      }))
+    }
+
     case "APPEND_VIEWER_USER_TURN": {
       const current =
         state.byConversationId.get(action.conversationId) ??
@@ -1192,6 +1221,9 @@ interface ConversationRuntimeContextValue {
     turn: MessageTurn,
     turnToken: string
   ) => void
+  /** Roll back an optimistic user turn that never reached the backend (e.g. a
+   *  send rejected as "turn in progress", whose draft is being re-queued). */
+  removeOptimisticTurn: (conversationId: number, id: string) => void
   /** Cross-client VIEWER: synthesize the sender's user turn from a broadcast
    *  `user_message` / snapshot. No-op on the sender (sender-guarded + idempotent
    *  in the reducer). */
@@ -1681,6 +1713,13 @@ export function ConversationRuntimeProvider({
     []
   )
 
+  const removeOptimisticTurn = useCallback(
+    (conversationId: number, id: string) => {
+      dispatch({ type: "REMOVE_OPTIMISTIC_TURN", conversationId, id })
+    },
+    []
+  )
+
   const appendViewerUserTurn = useCallback(
     (conversationId: number, turn: MessageTurn) => {
       dispatch({ type: "APPEND_VIEWER_USER_TURN", conversationId, turn })
@@ -1780,6 +1819,7 @@ export function ConversationRuntimeProvider({
       syncTurnMetadata,
       completeTurn,
       appendOptimisticTurn,
+      removeOptimisticTurn,
       appendViewerUserTurn,
       setLiveMessage,
       setExternalId,
@@ -1800,6 +1840,7 @@ export function ConversationRuntimeProvider({
       syncTurnMetadata,
       completeTurn,
       appendOptimisticTurn,
+      removeOptimisticTurn,
       appendViewerUserTurn,
       setLiveMessage,
       setExternalId,

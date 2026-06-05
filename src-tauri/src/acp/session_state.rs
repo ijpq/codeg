@@ -303,6 +303,17 @@ pub struct SessionState {
     /// mid-turn renders the user turn even though no `UserMessage` event will
     /// replay for it. `None` outside an active turn.
     pub pending_user_message: Option<PendingUserMessage>,
+
+    /// True between a prompt being accepted (enqueued to the connection loop)
+    /// and that turn completing. Set by the manager BEFORE the enqueue (so it
+    /// is guaranteed set before the loop can dequeue) and cleared on
+    /// `TurnComplete`. The manager rejects a second prompt with
+    /// `AcpError::TurnInProgress` while this is set — otherwise the second
+    /// `Prompt` would queue behind the active turn and be silently dropped by
+    /// the loop's in-turn command handler (`_ => {}`), with the caller still
+    /// seeing success. Not serialized: it is a connection-loop liveness flag,
+    /// not part of the client-visible snapshot.
+    pub turn_in_flight: bool,
 }
 
 impl SessionState {
@@ -343,6 +354,7 @@ impl SessionState {
             delegation_token: None,
             last_assistant_text: None,
             pending_user_message: None,
+            turn_in_flight: false,
         }
     }
 
@@ -575,6 +587,11 @@ impl SessionState {
                 // truth. Clear it so a post-turn snapshot doesn't carry a stale
                 // pending user message into a fresh attach.
                 self.pending_user_message = None;
+                // Turn finished: release the concurrency gate so the next prompt
+                // is accepted. (All connection-alive turn endings — normal,
+                // cancel, stop-reason — emit TurnComplete; disconnect/error
+                // discard the state entirely, so no stale flag can outlive them.)
+                self.turn_in_flight = false;
                 // NOTE: `active_delegations` is intentionally NOT cleared here.
                 // A running delegation's child runs in the background long after
                 // the parent's `delegate_to_agent` tool call returns and this

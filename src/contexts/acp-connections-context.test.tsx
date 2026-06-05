@@ -140,9 +140,13 @@ describe("AcpConnectionsProvider cross-client viewer lifecycle", () => {
       await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 42)
     })
 
-    // Discovery ran for the conversation, and we attached to the owner's
-    // connection instead of spawning a new agent.
-    expect(h.acpFindConnectionForConversation).toHaveBeenCalledWith(42)
+    // Discovery ran for the conversation (with the sessionId + agentType
+    // fallback), and we attached to the owner's connection instead of spawning.
+    expect(h.acpFindConnectionForConversation).toHaveBeenCalledWith(
+      42,
+      "sess-1",
+      "claude_code"
+    )
     expect(h.acpConnect).not.toHaveBeenCalled()
     // COLD attach: a viewer has applied no prior events, so it must request a
     // full snapshot (sinceSeq undefined) — NOT the discovered event_seq, which
@@ -162,7 +166,11 @@ describe("AcpConnectionsProvider cross-client viewer lifecycle", () => {
       await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 42)
     })
 
-    expect(h.acpFindConnectionForConversation).toHaveBeenCalledWith(42)
+    expect(h.acpFindConnectionForConversation).toHaveBeenCalledWith(
+      42,
+      "sess-1",
+      "claude_code"
+    )
     expect(h.acpConnect).toHaveBeenCalledTimes(1)
     expect(h.attach).toHaveBeenCalledWith(
       "spawned-conn",

@@ -30,6 +30,13 @@ const DEFAULT_PROMPT_CAPABILITIES: PromptCapabilitiesInfo = {
 
 export interface UseConnectionReturn {
   connectionId: string | null
+  /**
+   * True when this context attached to a connection another client owns
+   * (cross-client viewing). Viewers detach but never `acpDisconnect`, so the
+   * unmount cleanup must tear them down even mid-turn (the owner's agent is
+   * unaffected) — otherwise the attach subscription leaks past tab close.
+   */
+  isViewer: boolean
   status: ConnectionStatus | null
   promptCapabilities: PromptCapabilitiesInfo
   supportsFork: boolean
@@ -87,6 +94,7 @@ export function useConnection(contextKey: string): UseConnectionReturn {
   const connection = useSyncExternalStore(subscribe, getSnapshot, getSnapshot)
 
   const connectionId = connection?.connectionId ?? null
+  const isViewer = connection?.isViewer ?? false
   const status = connection?.status ?? null
   const promptCapabilities =
     connection?.promptCapabilities ?? DEFAULT_PROMPT_CAPABILITIES
@@ -168,6 +176,7 @@ export function useConnection(contextKey: string): UseConnectionReturn {
   return useMemo(
     () => ({
       connectionId,
+      isViewer,
       status,
       promptCapabilities,
       supportsFork,
@@ -194,6 +203,7 @@ export function useConnection(contextKey: string): UseConnectionReturn {
     }),
     [
       connectionId,
+      isViewer,
       status,
       promptCapabilities,
       supportsFork,

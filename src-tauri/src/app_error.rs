@@ -62,6 +62,10 @@ pub enum AppErrorCode {
     ExternalCommandFailed,
     WindowOperationFailed,
     TaskExecutionFailed,
+    /// A prompt was rejected because a turn is already in flight on the
+    /// connection (a second, concurrent send). Maps to HTTP 409 — an expected,
+    /// recoverable condition in multi-client co-control, not a server fault.
+    TurnInProgress,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, thiserror::Error)]
