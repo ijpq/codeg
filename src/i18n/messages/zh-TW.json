@@ -1796,6 +1796,12 @@
         "noEnabledAgents": "暫無已啟用的 Agent",
         "openAgentsSettings": "開啟 Agents 設定"
       },
+      "subAgentOverlay": {
+        "title": "子智能體",
+        "collapsedSummary": "子智能體 {count}",
+        "collapseAria": "摺疊子智能體",
+        "expandAria": "展開子智能體"
+      },
       "agentPlanOverlay": {
         "title": "計畫任務",
         "collapsePlanAria": "摺疊計畫",

@@ -1796,6 +1796,12 @@
         "noEnabledAgents": "No enabled agents",
         "openAgentsSettings": "Open Agents settings"
       },
+      "subAgentOverlay": {
+        "title": "Sub-agents",
+        "collapsedSummary": "Sub-agents {count}",
+        "collapseAria": "Collapse sub-agents",
+        "expandAria": "Expand sub-agents"
+      },
       "agentPlanOverlay": {
         "title": "Agent Plan",
         "collapsePlanAria": "Collapse plan",

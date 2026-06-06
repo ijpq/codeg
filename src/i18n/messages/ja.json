@@ -1796,6 +1796,12 @@
         "noEnabledAgents": "有効なエージェントがありません",
         "openAgentsSettings": "エージェント設定を開く"
       },
+      "subAgentOverlay": {
+        "title": "サブエージェント",
+        "collapsedSummary": "サブエージェント {count}",
+        "collapseAria": "サブエージェントを折りたたむ",
+        "expandAria": "サブエージェントを展開"
+      },
       "agentPlanOverlay": {
         "title": "エージェントプラン",
         "collapsePlanAria": "プランを折りたたむ",

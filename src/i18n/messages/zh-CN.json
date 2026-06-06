@@ -1796,6 +1796,12 @@
         "noEnabledAgents": "暂无已启用的 Agent",
         "openAgentsSettings": "打开 Agents 设置"
       },
+      "subAgentOverlay": {
+        "title": "子智能体",
+        "collapsedSummary": "子智能体 {count}",
+        "collapseAria": "折叠子智能体",
+        "expandAria": "展开子智能体"
+      },
       "agentPlanOverlay": {
         "title": "计划任务",
         "collapsePlanAria": "折叠计划",

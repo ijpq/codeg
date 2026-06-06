@@ -39,6 +39,11 @@ import {
 import { ImagePreviewDialog } from "@/components/ui/image-preview-dialog"
 import { AgentIcon } from "@/components/agent-icon"
 import { cn, randomUUID } from "@/lib/utils"
+import {
+  filesFromClipboard,
+  clipboardHasText,
+  imageFilesFromClipboardApi,
+} from "@/lib/clipboard-images"
 import { matchShortcutEvent } from "@/lib/keyboard-shortcuts"
 import { useShortcutSettings } from "@/hooks/use-shortcut-settings"
 import {
@@ -213,26 +218,6 @@ function toFileUri(path: string): string {
 function hasDragFiles(dataTransfer: DataTransfer | null): boolean {
   if (!dataTransfer?.types) return false
   return Array.from(dataTransfer.types).includes("Files")
-}
-
-// Extract pasted files from a clipboard event. On macOS/Windows pasted images
-// land in `clipboardData.files`, but on Linux (X11/Wayland) the same image is
-// only exposed through `clipboardData.items` as a file-kind DataTransferItem,
-// so fall back to `getAsFile()` when `files` is empty.
-function filesFromClipboard(dataTransfer: DataTransfer | null): File[] {
-  if (!dataTransfer) return []
-  const files = Array.from(dataTransfer.files ?? [])
-  if (files.length > 0) return files
-  // Mixed text+image clipboards (spreadsheet cells, rich web content) expose
-  // both a text/plain string and an image file item. Prefer the text and let
-  // the default paste run, so copying a cell doesn't get hijacked into an
-  // image attachment. Pure image pastes (screenshots) carry no text.
-  if (dataTransfer.getData("text/plain").trim().length > 0) return []
-  const items = dataTransfer.items ? Array.from(dataTransfer.items) : []
-  return items
-    .filter((item) => item.kind === "file")
-    .map((item) => item.getAsFile())
-    .filter((file): file is File => file !== null)
 }
 
 function pointWithinElement(
@@ -1300,11 +1285,32 @@ export function MessageInput({
     (event: React.ClipboardEvent<HTMLTextAreaElement>) => {
       if (disabled) return
       const files = filesFromClipboard(event.clipboardData)
-      if (files.length === 0) return
-      event.preventDefault()
-      void appendFilesFromInput(files).catch((error) => {
-        console.error("[MessageInput] paste files failed:", error)
-      })
+      if (files.length > 0) {
+        event.preventDefault()
+        void appendFilesFromInput(files).catch((error) => {
+          console.error("[MessageInput] paste files failed:", error)
+        })
+        return
+      }
+
+      // Linux/Tauri (WebKitGTK) fallback: screenshot tools (e.g. WeChat) write
+      // the image to the clipboard in a form the synchronous DataTransfer API
+      // can't read, so retry through the async Clipboard API. Only for a pure-
+      // image clipboard — when text is present we let the default paste run
+      // (mirroring `filesFromClipboard`) so copying a spreadsheet cell or rich
+      // web content isn't hijacked into an image attachment. Kept synchronous
+      // so `imageFilesFromClipboardApi` runs inside the paste user gesture.
+      // No `preventDefault()`: the default paste of a textless clipboard is a
+      // no-op anyway, and it can't be cancelled after the async boundary.
+      if (clipboardHasText(event.clipboardData)) return
+      void imageFilesFromClipboardApi()
+        .then((imageFiles) => {
+          if (imageFiles.length === 0) return
+          return appendFilesFromInput(imageFiles)
+        })
+        .catch((error) => {
+          console.error("[MessageInput] clipboard image paste failed:", error)
+        })
     },
     [appendFilesFromInput, disabled]
   )

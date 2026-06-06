@@ -1796,6 +1796,12 @@
         "noEnabledAgents": "لا يوجد وكلاء مفعّلون",
         "openAgentsSettings": "فتح إعدادات الوكلاء"
       },
+      "subAgentOverlay": {
+        "title": "الوكلاء الفرعيون",
+        "collapsedSummary": "الوكلاء الفرعيون {count}",
+        "collapseAria": "طي الوكلاء الفرعيين",
+        "expandAria": "توسيع الوكلاء الفرعيين"
+      },
       "agentPlanOverlay": {
         "title": "خطة الوكيل",
         "collapsePlanAria": "طي الخطة",

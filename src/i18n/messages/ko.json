@@ -1796,6 +1796,12 @@
         "noEnabledAgents": "활성화된 에이전트가 없습니다",
         "openAgentsSettings": "에이전트 설정 열기"
       },
+      "subAgentOverlay": {
+        "title": "서브 에이전트",
+        "collapsedSummary": "서브 에이전트 {count}",
+        "collapseAria": "서브 에이전트 접기",
+        "expandAria": "서브 에이전트 펼치기"
+      },
       "agentPlanOverlay": {
         "title": "에이전트 계획",
         "collapsePlanAria": "계획 접기",
