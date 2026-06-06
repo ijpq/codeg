@@ -155,3 +155,143 @@ export function groupByFolderWithReuse(
   }
   return next
 }
+
+// ── Flat row model (Phase 2 virtualization) ─────────────────────────────────
+// The sidebar tree (folders → their conversation rows) is flattened into a
+// single linear array so it can be windowed by `virtua`. Each visible folder
+// contributes one header row, and — when expanded — either one empty-hint row
+// or its sorted conversation rows.
+
+export interface FolderHeaderRow {
+  kind: "folder"
+  folderId: number
+}
+
+export interface ConversationRow {
+  kind: "conversation"
+  /**
+   * The summary object reference is passed through untouched (never copied), so
+   * a status event that replaces exactly one summary keeps every other row's
+   * `conversation` identity — the linchpin that lets the card `memo` bail out
+   * through the virtualized render. See {@link groupByFolderWithReuse}.
+   */
+  conversation: DbConversationSummary
+}
+
+export interface EmptyHintRow {
+  kind: "empty"
+  folderId: number
+  /**
+   * Total (unfiltered) conversation count for this folder, used by the renderer
+   * to pick between the "empty folder" and "no unfinished conversations" hints.
+   */
+  totalConversationCount: number
+}
+
+export type SidebarRow = FolderHeaderRow | ConversationRow | EmptyHintRow
+
+/**
+ * Flatten folders + conversations into a single linear row list for windowing.
+ *
+ * Pure and deliberately **does not take `now`**: the per-minute `now` tick that
+ * refreshes relative time labels must not rebuild this array (that would defeat
+ * the Phase 1 memo chain). `timeLabel` stays computed at the row renderer from
+ * the shared `now` against the row's `conversation`.
+ *
+ * Order follows `orderedFolderIds`. A collapsed folder contributes only its
+ * header; an expanded empty folder contributes header + one empty-hint row; an
+ * expanded non-empty folder contributes header + its (already sorted) bucket.
+ */
+export function buildRows(
+  orderedFolderIds: readonly number[],
+  byFolder: Map<number, DbConversationSummary[]>,
+  folderExpanded: Record<number, boolean>,
+  folderTotalCounts: Map<number, number>
+): SidebarRow[] {
+  const rows: SidebarRow[] = []
+  for (const folderId of orderedFolderIds) {
+    rows.push({ kind: "folder", folderId })
+    const expanded = folderExpanded[folderId] ?? true
+    if (!expanded) continue
+    const convs = byFolder.get(folderId)
+    if (!convs || convs.length === 0) {
+      rows.push({
+        kind: "empty",
+        folderId,
+        totalConversationCount: folderTotalCounts.get(folderId) ?? 0,
+      })
+      continue
+    }
+    for (const conv of convs) {
+      rows.push({ kind: "conversation", conversation: conv })
+    }
+  }
+  return rows
+}
+
+/**
+ * Flat index of the conversation row for `(id, agentType)`, or -1 if absent
+ * (folder collapsed, filtered out, or unknown). Used by `scrollToActive` to
+ * drive `VirtualizerHandle.scrollToIndex` — off-screen virtualized rows are not
+ * in the DOM, so a querySelector-based lookup no longer works.
+ */
+export function flatIndexOfConversation(
+  rows: readonly SidebarRow[],
+  id: number,
+  agentType: string
+): number {
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i]
+    if (
+      row.kind === "conversation" &&
+      row.conversation.id === id &&
+      row.conversation.agent_type === agentType
+    ) {
+      return i
+    }
+  }
+  return -1
+}
+
+// ── Folder drag index math (Phase 2 custom pointer reorder) ──────────────────
+
+/**
+ * Map a pointer's Y position over the (fixed row height) collapsed drag surface
+ * to a target folder slot, clamped to `[0, count - 1]`.
+ *
+ * @param pointerY   `clientY` of the pointer
+ * @param surfaceTop `getBoundingClientRect().top` of the scroll viewport
+ * @param scrollTop  current scroll offset of the viewport
+ * @param rowHeight  height of one folder header row in px (fixed, 32)
+ * @param count      number of folder rows on the surface
+ */
+export function pointerYToTargetIndex(
+  pointerY: number,
+  surfaceTop: number,
+  scrollTop: number,
+  rowHeight: number,
+  count: number
+): number {
+  if (count <= 0) return 0
+  if (rowHeight <= 0) return 0
+  const raw = Math.floor((pointerY - surfaceTop + scrollTop) / rowHeight)
+  return Math.max(0, Math.min(count - 1, raw))
+}
+
+/**
+ * Move the item at `from` to `to`, returning a new array. Out-of-range indices
+ * are clamped; a no-op move still returns a fresh array copy.
+ */
+export function applyReorder<T>(
+  order: readonly T[],
+  from: number,
+  to: number
+): T[] {
+  const next = order.slice()
+  if (from < 0 || from >= next.length) return next
+  const clampedTo = Math.max(0, Math.min(next.length - 1, to))
+  if (from === clampedTo) return next
+  const [moved] = next.splice(from, 1)
+  next.splice(clampedTo, 0, moved)
+  return next
+}

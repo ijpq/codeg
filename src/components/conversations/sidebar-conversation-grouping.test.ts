@@ -1,10 +1,15 @@
 import { describe, expect, it } from "vitest"
 import type { DbConversationSummary } from "@/lib/types"
 import {
+  applyReorder,
+  buildRows,
+  flatIndexOfConversation,
   formatRelative,
   groupByFolderWithReuse,
+  pointerYToTargetIndex,
   reuseSelected,
   reuseSet,
+  type SidebarRow,
 } from "./sidebar-conversation-grouping"
 
 const MINUTE = 60_000
@@ -153,5 +158,140 @@ describe("reuseSelected", () => {
     })
     expect(reuseSelected(prev, null)).toBeNull()
     expect(reuseSelected(null, prev)).toBe(prev)
+  })
+})
+
+describe("buildRows", () => {
+  it("emits a single header row for a collapsed folder", () => {
+    const byFolder = new Map([[10, [conv(1, 10), conv(2, 10)]]])
+    const rows = buildRows([10], byFolder, { 10: false }, new Map([[10, 2]]))
+    expect(rows).toEqual([{ kind: "folder", folderId: 10 }])
+  })
+
+  it("defaults to expanded when folderExpanded has no entry", () => {
+    const byFolder = new Map([[10, [conv(1, 10)]]])
+    const rows = buildRows([10], byFolder, {}, new Map([[10, 1]]))
+    expect(rows.map((r) => r.kind)).toEqual(["folder", "conversation"])
+  })
+
+  it("emits header + empty-hint row for an expanded folder with no visible rows", () => {
+    const rows = buildRows([10], new Map(), { 10: true }, new Map([[10, 3]]))
+    expect(rows).toEqual([
+      { kind: "folder", folderId: 10 },
+      { kind: "empty", folderId: 10, totalConversationCount: 3 },
+    ])
+  })
+
+  it("carries the unfiltered total count on the empty-hint row", () => {
+    // byFolder is empty (all filtered out) but the folder has 5 conversations
+    // total → renderer shows "no unfinished conversations", not "empty folder".
+    const rows = buildRows([10], new Map(), { 10: true }, new Map([[10, 5]]))
+    const empty = rows.find((r) => r.kind === "empty")
+    expect(empty).toMatchObject({ totalConversationCount: 5 })
+  })
+
+  it("emits header + each conversation row, passing summary references through", () => {
+    const a = conv(1, 10)
+    const b = conv(2, 10)
+    const byFolder = new Map([[10, [a, b]]])
+    const rows = buildRows([10], byFolder, { 10: true }, new Map([[10, 2]]))
+    expect(rows).toHaveLength(3)
+    expect(rows[0]).toEqual({ kind: "folder", folderId: 10 })
+    // The exact summary object references survive (identity, not a copy) — this
+    // is what keeps the card memo alive through the flat row model.
+    expect(rows[1]).toEqual({ kind: "conversation", conversation: a })
+    expect(
+      (rows[1] as { conversation: DbConversationSummary }).conversation
+    ).toBe(a)
+    expect(
+      (rows[2] as { conversation: DbConversationSummary }).conversation
+    ).toBe(b)
+  })
+
+  it("follows orderedFolderIds order across multiple folders", () => {
+    const byFolder = new Map([
+      [10, [conv(1, 10)]],
+      [20, [conv(2, 20)]],
+    ])
+    const expanded = { 10: true, 20: false }
+    const counts = new Map([
+      [10, 1],
+      [20, 1],
+    ])
+    // Folder 20 first (collapsed → header only), then 10 (expanded).
+    const rows = buildRows([20, 10], byFolder, expanded, counts)
+    expect(rows).toEqual([
+      { kind: "folder", folderId: 20 },
+      { kind: "folder", folderId: 10 },
+      { kind: "conversation", conversation: byFolder.get(10)![0] },
+    ])
+  })
+})
+
+describe("flatIndexOfConversation", () => {
+  const rows: SidebarRow[] = [
+    { kind: "folder", folderId: 10 },
+    { kind: "conversation", conversation: conv(1, 10) },
+    {
+      kind: "conversation",
+      conversation: conv(2, 10, { agent_type: "codex" }),
+    },
+    { kind: "folder", folderId: 20 },
+    { kind: "empty", folderId: 20, totalConversationCount: 0 },
+  ]
+
+  it("returns the flat index of the matching conversation row", () => {
+    expect(flatIndexOfConversation(rows, 1, "claude_code")).toBe(1)
+    expect(flatIndexOfConversation(rows, 2, "codex")).toBe(2)
+  })
+
+  it("requires both id and agent_type to match", () => {
+    expect(flatIndexOfConversation(rows, 2, "claude_code")).toBe(-1)
+    expect(flatIndexOfConversation(rows, 99, "claude_code")).toBe(-1)
+  })
+})
+
+describe("pointerYToTargetIndex", () => {
+  it("maps a pointer offset to the row under it", () => {
+    // surfaceTop=100, scrollTop=0, rowHeight=32 → y=148 lands in row 1 (132..164)
+    expect(pointerYToTargetIndex(148, 100, 0, 32, 5)).toBe(1)
+    expect(pointerYToTargetIndex(100, 100, 0, 32, 5)).toBe(0)
+  })
+
+  it("accounts for scroll offset", () => {
+    // Scrolled down 64px → the same screen Y points two rows lower.
+    expect(pointerYToTargetIndex(100, 100, 64, 32, 5)).toBe(2)
+  })
+
+  it("clamps above and below the surface", () => {
+    expect(pointerYToTargetIndex(0, 100, 0, 32, 5)).toBe(0)
+    expect(pointerYToTargetIndex(9999, 100, 0, 32, 5)).toBe(4)
+  })
+
+  it("is safe for degenerate inputs", () => {
+    expect(pointerYToTargetIndex(150, 100, 0, 32, 0)).toBe(0)
+    expect(pointerYToTargetIndex(150, 100, 0, 0, 5)).toBe(0)
+  })
+})
+
+describe("applyReorder", () => {
+  it("moves an item forward", () => {
+    expect(applyReorder([1, 2, 3, 4], 0, 2)).toEqual([2, 3, 1, 4])
+  })
+
+  it("moves an item backward", () => {
+    expect(applyReorder([1, 2, 3, 4], 3, 1)).toEqual([1, 4, 2, 3])
+  })
+
+  it("returns a fresh copy on a no-op move", () => {
+    const order = [1, 2, 3]
+    const result = applyReorder(order, 1, 1)
+    expect(result).toEqual([1, 2, 3])
+    expect(result).not.toBe(order)
+  })
+
+  it("clamps the destination and ignores an out-of-range source", () => {
+    expect(applyReorder([1, 2, 3], 0, 99)).toEqual([2, 3, 1])
+    expect(applyReorder([1, 2, 3], 5, 0)).toEqual([1, 2, 3])
   })
 })
