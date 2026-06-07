@@ -1064,7 +1064,6 @@
     },
     "auxPanel": {
       "tabs": {
-        "diff": "Différences",
         "files": "Fichiers",
         "changes": "Changements",
         "commits": "Validations"
@@ -1108,16 +1107,6 @@
       "closeAll": "Tout fermer",
       "hideTerminal": "Masquer le terminal ({shortcut})",
       "openFolderFirst": "Ouvrez d'abord un dossier"
-    },
-    "sessionFiles": {
-      "currentResponse": "Réponse actuelle",
-      "noDiffDataAvailable": "Aucune donnée de diff disponible pour {filePath}",
-      "loading": "Chargement...",
-      "noFileChangesInConversation": "Aucun changement de fichier dans cette conversation",
-      "openConversationToSeeChanges": "Ouvrez une conversation pour voir ses changements de fichiers",
-      "remove": "Retirer",
-      "changeCount": "{count, plural, one {# changement} other {# changements}}",
-      "fileCount": "{count, plural, one {# fichier} other {# fichiers}}"
     },
     "folderNameDropdown": {
       "fallbackFolderName": "Dossier",
@@ -2078,6 +2067,16 @@
           "errorSuffix": "{count, plural, one {# échec} other {# échecs}}",
           "joiner": " · "
         }
+      },
+      "messageNav": {
+        "title": "Navigation des messages",
+        "expand": "Développer la navigation des messages",
+        "collapse": "Réduire la navigation des messages",
+        "jumpToMessage": "Aller à : {label}",
+        "noChanges": "Aucune modification de fichier",
+        "fileCount": "{count, plural, one {# fichier} other {# fichiers}}",
+        "remove": "Retirer",
+        "noDiffDataAvailable": "Aucune donnée de diff disponible pour {filePath}"
       }
     },
     "diffPreview": {

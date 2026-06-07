@@ -1064,7 +1064,6 @@
     },
     "auxPanel": {
       "tabs": {
-        "diff": "Diferencias",
         "files": "Archivos",
         "changes": "Cambios",
         "commits": "Confirmaciones"
@@ -1108,16 +1107,6 @@
       "closeAll": "Cerrar todo",
       "hideTerminal": "Ocultar terminal ({shortcut})",
       "openFolderFirst": "Abre primero una carpeta"
-    },
-    "sessionFiles": {
-      "currentResponse": "Respuesta actual",
-      "noDiffDataAvailable": "No hay datos de diff disponibles para {filePath}",
-      "loading": "Cargando...",
-      "noFileChangesInConversation": "No se encontraron cambios de archivos en esta conversación",
-      "openConversationToSeeChanges": "Abre una conversación para ver sus cambios de archivos",
-      "remove": "Quitar",
-      "changeCount": "{count, plural, one {# cambio} other {# cambios}}",
-      "fileCount": "{count, plural, one {# archivo} other {# archivos}}"
     },
     "folderNameDropdown": {
       "fallbackFolderName": "Carpeta",
@@ -2078,6 +2067,16 @@
           "errorSuffix": "{count, plural, one {# falló} other {# fallaron}}",
           "joiner": " · "
         }
+      },
+      "messageNav": {
+        "title": "Navegación de mensajes",
+        "expand": "Expandir navegación de mensajes",
+        "collapse": "Contraer navegación de mensajes",
+        "jumpToMessage": "Ir a: {label}",
+        "noChanges": "Sin cambios de archivos",
+        "fileCount": "{count, plural, one {# archivo} other {# archivos}}",
+        "remove": "Quitar",
+        "noDiffDataAvailable": "No hay datos de diff disponibles para {filePath}"
       }
     },
     "diffPreview": {

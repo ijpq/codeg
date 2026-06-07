@@ -1064,7 +1064,6 @@
     },
     "auxPanel": {
       "tabs": {
-        "diff": "差異",
         "files": "檔案",
         "changes": "變更",
         "commits": "提交"
@@ -1108,16 +1107,6 @@
       "closeAll": "關閉所有",
       "hideTerminal": "隱藏終端（{shortcut}）",
       "openFolderFirst": "請先開啟一個資料夾"
-    },
-    "sessionFiles": {
-      "currentResponse": "目前回應",
-      "noDiffDataAvailable": "找不到 {filePath} 的差異資料",
-      "loading": "載入中...",
-      "noFileChangesInConversation": "此會話未發現檔案變更",
-      "openConversationToSeeChanges": "打開會話以查看檔案變更",
-      "remove": "移除",
-      "changeCount": "{count} 處變更",
-      "fileCount": "{count} 個檔案"
     },
     "folderNameDropdown": {
       "fallbackFolderName": "資料夾",
@@ -2078,6 +2067,16 @@
           "errorSuffix": "{count} 個失敗",
           "joiner": " · "
         }
+      },
+      "messageNav": {
+        "title": "訊息導覽",
+        "expand": "展開訊息導覽",
+        "collapse": "收合訊息導覽",
+        "jumpToMessage": "跳至：{label}",
+        "noChanges": "無檔案變更",
+        "fileCount": "{count} 個檔案",
+        "remove": "移除",
+        "noDiffDataAvailable": "找不到 {filePath} 的差異資料"
       }
     },
     "diffPreview": {

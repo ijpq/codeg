@@ -1064,7 +1064,6 @@
     },
     "auxPanel": {
       "tabs": {
-        "diff": "Unterschiede",
         "files": "Dateien",
         "changes": "Änderungen",
         "commits": "Einträge"
@@ -1108,16 +1107,6 @@
       "closeAll": "Alle schließen",
       "hideTerminal": "Terminal ausblenden ({shortcut})",
       "openFolderFirst": "Öffnen Sie zuerst einen Ordner"
-    },
-    "sessionFiles": {
-      "currentResponse": "Aktuelle Antwort",
-      "noDiffDataAvailable": "Keine Diff-Daten verfügbar für {filePath}",
-      "loading": "Wird geladen...",
-      "noFileChangesInConversation": "Keine Dateiänderungen in dieser Konversation gefunden",
-      "openConversationToSeeChanges": "Öffne eine Konversation, um Dateiänderungen zu sehen",
-      "remove": "Entfernen",
-      "changeCount": "{count, plural, one {# Änderung} other {# Änderungen}}",
-      "fileCount": "{count, plural, one {# Datei} other {# Dateien}}"
     },
     "folderNameDropdown": {
       "fallbackFolderName": "Ordner",
@@ -2078,6 +2067,16 @@
           "errorSuffix": "{count, plural, one {# fehlgeschlagen} other {# fehlgeschlagen}}",
           "joiner": " · "
         }
+      },
+      "messageNav": {
+        "title": "Nachrichtennavigation",
+        "expand": "Nachrichtennavigation einblenden",
+        "collapse": "Nachrichtennavigation ausblenden",
+        "jumpToMessage": "Springen zu: {label}",
+        "noChanges": "Keine Dateiänderungen",
+        "fileCount": "{count, plural, one {# Datei} other {# Dateien}}",
+        "remove": "Entfernen",
+        "noDiffDataAvailable": "Keine Diff-Daten verfügbar für {filePath}"
       }
     },
     "diffPreview": {

@@ -1064,7 +1064,6 @@
     },
     "auxPanel": {
       "tabs": {
-        "diff": "الفرق",
         "files": "الملفات",
         "changes": "التغييرات",
         "commits": "الالتزامات"
@@ -1108,16 +1107,6 @@
       "closeAll": "إغلاق الكل",
       "hideTerminal": "إخفاء الطرفية ({shortcut})",
       "openFolderFirst": "افتح مجلدا أولا"
-    },
-    "sessionFiles": {
-      "currentResponse": "الاستجابة الحالية",
-      "noDiffDataAvailable": "لا توجد بيانات diff متاحة لـ {filePath}",
-      "loading": "جارٍ التحميل...",
-      "noFileChangesInConversation": "لم يتم العثور على تغييرات ملفات في هذه المحادثة",
-      "openConversationToSeeChanges": "افتح محادثة لرؤية تغييرات الملفات الخاصة بها",
-      "remove": "إزالة",
-      "changeCount": "{count, plural, one {# تغيير} other {# تغييرات}}",
-      "fileCount": "{count, plural, one {# ملف} other {# ملفات}}"
     },
     "folderNameDropdown": {
       "fallbackFolderName": "مجلد",
@@ -2078,6 +2067,16 @@
           "errorSuffix": "{count, plural, zero {صفر فشل} one {فشل واحد} two {فشلان} few {# فشلوا} many {# فشلاً} other {# فشل}}",
           "joiner": " · "
         }
+      },
+      "messageNav": {
+        "title": "تنقل الرسائل",
+        "expand": "توسيع تنقل الرسائل",
+        "collapse": "طي تنقل الرسائل",
+        "jumpToMessage": "الانتقال إلى: {label}",
+        "noChanges": "لا توجد تغييرات في الملفات",
+        "fileCount": "{count, plural, one {# ملف} other {# ملفات}}",
+        "remove": "إزالة",
+        "noDiffDataAvailable": "لا توجد بيانات diff متاحة لـ {filePath}"
       }
     },
     "diffPreview": {

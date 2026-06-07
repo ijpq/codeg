@@ -1064,7 +1064,6 @@
     },
     "auxPanel": {
       "tabs": {
-        "diff": "差分",
         "files": "ファイル",
         "changes": "変更",
         "commits": "コミット"
@@ -1108,16 +1107,6 @@
       "closeAll": "すべて閉じる",
       "hideTerminal": "ターミナルを隠す ({shortcut})",
       "openFolderFirst": "先にフォルダを開いてください"
-    },
-    "sessionFiles": {
-      "currentResponse": "現在の応答",
-      "noDiffDataAvailable": "{filePath} の差分データがありません",
-      "loading": "読み込み中...",
-      "noFileChangesInConversation": "この会話にはファイル変更がありません",
-      "openConversationToSeeChanges": "会話を開いてファイル変更を表示してください",
-      "remove": "削除",
-      "changeCount": "{count, plural, one {# 件の変更} other {# 件の変更}}",
-      "fileCount": "{count, plural, one {# 個のファイル} other {# 個のファイル}}"
     },
     "folderNameDropdown": {
       "fallbackFolderName": "フォルダ",
@@ -2078,6 +2067,16 @@
           "errorSuffix": "{count} 件失敗",
           "joiner": " · "
         }
+      },
+      "messageNav": {
+        "title": "メッセージナビ",
+        "expand": "メッセージナビを開く",
+        "collapse": "メッセージナビを閉じる",
+        "jumpToMessage": "移動: {label}",
+        "noChanges": "ファイル変更なし",
+        "fileCount": "{count, plural, one {# 個のファイル} other {# 個のファイル}}",
+        "remove": "削除",
+        "noDiffDataAvailable": "{filePath} の差分データがありません"
       }
     },
     "diffPreview": {

@@ -1064,7 +1064,6 @@
     },
     "auxPanel": {
       "tabs": {
-        "diff": "차이",
         "files": "파일",
         "changes": "변경사항",
         "commits": "커밋"
@@ -1108,16 +1107,6 @@
       "closeAll": "모두 닫기",
       "hideTerminal": "터미널 숨기기 ({shortcut})",
       "openFolderFirst": "먼저 폴더를 여세요"
-    },
-    "sessionFiles": {
-      "currentResponse": "현재 응답",
-      "noDiffDataAvailable": "{filePath}에 대한 diff 데이터가 없습니다",
-      "loading": "로딩 중...",
-      "noFileChangesInConversation": "이 대화에서 파일 변경을 찾을 수 없습니다",
-      "openConversationToSeeChanges": "대화를 열어 파일 변경을 확인하세요",
-      "remove": "제거",
-      "changeCount": "{count, plural, one {#개 변경} other {#개 변경}}",
-      "fileCount": "{count, plural, one {#개 파일} other {#개 파일}}"
     },
     "folderNameDropdown": {
       "fallbackFolderName": "폴더",
@@ -2078,6 +2067,16 @@
           "errorSuffix": "{count}건 실패",
           "joiner": " · "
         }
+      },
+      "messageNav": {
+        "title": "메시지 탐색",
+        "expand": "메시지 탐색 펼치기",
+        "collapse": "메시지 탐색 접기",
+        "jumpToMessage": "이동: {label}",
+        "noChanges": "파일 변경 없음",
+        "fileCount": "{count, plural, one {#개 파일} other {#개 파일}}",
+        "remove": "제거",
+        "noDiffDataAvailable": "{filePath}에 대한 diff 데이터가 없습니다"
       }
     },
     "diffPreview": {

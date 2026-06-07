@@ -1064,7 +1064,6 @@
     },
     "auxPanel": {
       "tabs": {
-        "diff": "差异",
         "files": "文件",
         "changes": "变更",
         "commits": "提交"
@@ -1108,16 +1107,6 @@
       "closeAll": "关闭所有",
       "hideTerminal": "隐藏终端（{shortcut}）",
       "openFolderFirst": "请先打开一个文件夹"
-    },
-    "sessionFiles": {
-      "currentResponse": "当前响应",
-      "noDiffDataAvailable": "未找到 {filePath} 的差异数据",
-      "loading": "加载中...",
-      "noFileChangesInConversation": "该会话未发现文件变更",
-      "openConversationToSeeChanges": "打开会话以查看文件变更",
-      "remove": "移除",
-      "changeCount": "{count} 处变更",
-      "fileCount": "{count} 个文件"
     },
     "folderNameDropdown": {
       "fallbackFolderName": "文件夹",
@@ -2078,6 +2067,16 @@
           "errorSuffix": "{count} 个失败",
           "joiner": " · "
         }
+      },
+      "messageNav": {
+        "title": "消息导航",
+        "expand": "展开消息导航",
+        "collapse": "收起消息导航",
+        "jumpToMessage": "跳转到：{label}",
+        "noChanges": "无文件改动",
+        "fileCount": "{count} 个文件",
+        "remove": "移除",
+        "noDiffDataAvailable": "未找到 {filePath} 的差异数据"
       }
     },
     "diffPreview": {

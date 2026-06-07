@@ -1064,7 +1064,6 @@
     },
     "auxPanel": {
       "tabs": {
-        "diff": "Diff",
         "files": "Files",
         "changes": "Changes",
         "commits": "Commits"
@@ -1108,16 +1107,6 @@
       "closeAll": "Close All",
       "hideTerminal": "Hide Terminal ({shortcut})",
       "openFolderFirst": "Open a folder first"
-    },
-    "sessionFiles": {
-      "currentResponse": "Current response",
-      "noDiffDataAvailable": "No diff data available for {filePath}",
-      "loading": "Loading...",
-      "noFileChangesInConversation": "No file changes found in this conversation",
-      "openConversationToSeeChanges": "Open a conversation to see its file changes",
-      "remove": "Remove",
-      "changeCount": "{count, plural, one {# change} other {# changes}}",
-      "fileCount": "{count, plural, one {# file} other {# files}}"
     },
     "folderNameDropdown": {
       "fallbackFolderName": "Folder",
@@ -2078,6 +2067,16 @@
           "errorSuffix": "{count, plural, one {# failed} other {# failed}}",
           "joiner": " · "
         }
+      },
+      "messageNav": {
+        "title": "Message navigation",
+        "expand": "Expand message navigation",
+        "collapse": "Collapse message navigation",
+        "jumpToMessage": "Jump to: {label}",
+        "noChanges": "No file changes",
+        "fileCount": "{count, plural, one {# file} other {# files}}",
+        "remove": "Remove",
+        "noDiffDataAvailable": "No diff data available for {filePath}"
       }
     },
     "diffPreview": {
