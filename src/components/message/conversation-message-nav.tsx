@@ -153,22 +153,23 @@ export function ConversationMessageNav({
 
   if (entries.length === 0) return null
 
-  // Float near the conversation's right edge; the dots are small enough to sit
-  // clear of the centered message column's text.
+  // Float near the conversation's right edge. The rail spans the full height
+  // (pointer-events only on the dots/toggle) so the expanded popout can be
+  // height-capped to the conversation area and never slip under the tabs above.
   return (
-    <div className="group absolute right-2 top-1/2 z-20 flex max-h-[80%] -translate-y-1/2 flex-col items-center">
+    <div className="group pointer-events-none absolute inset-y-0 right-2 z-20 flex flex-col items-center justify-center">
       <button
         type="button"
         aria-label={expanded ? t("collapse") : t("expand")}
         aria-expanded={expanded}
         title={t("title")}
         onClick={() => setExpandedPersist(!expanded)}
-        className="flex size-4 shrink-0 items-center justify-center rounded-md text-muted-foreground opacity-60 transition-colors hover:bg-accent/40 hover:text-foreground hover:opacity-100 focus-visible:opacity-100"
+        className="pointer-events-auto flex size-4 shrink-0 items-center justify-center rounded-md text-muted-foreground opacity-60 transition-colors hover:bg-accent/40 hover:text-foreground hover:opacity-100 focus-visible:opacity-100"
       >
         <ListTree className="h-2.5 w-2.5" />
       </button>
 
-      <ScrollArea className="flex-1 min-h-0">
+      <ScrollArea className="pointer-events-auto max-h-[80%] min-h-0">
         <div className="flex flex-col items-center py-1">
           {entries.map((entry) => {
             const active = activeThreadIndex === entry.threadIndex
@@ -202,7 +203,7 @@ export function ConversationMessageNav({
       </ScrollArea>
 
       {expanded && (
-        <div className="absolute right-full top-1/2 z-30 mr-1 flex max-h-[80vh] w-72 max-w-[80vw] -translate-y-1/2 flex-col rounded-lg border border-border bg-popover text-popover-foreground shadow-xl">
+        <div className="pointer-events-auto absolute right-full top-1/2 z-30 mr-1 flex max-h-[calc(100%_-_1rem)] w-72 max-w-[80vw] -translate-y-1/2 flex-col rounded-lg border border-border bg-popover text-popover-foreground shadow-xl">
           <div className="flex h-9 shrink-0 items-center justify-between border-b border-border px-3">
             <span className="text-xs font-medium">{t("title")}</span>
             <button
