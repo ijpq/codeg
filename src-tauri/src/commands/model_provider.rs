@@ -397,4 +397,105 @@ mod tests {
         assert_eq!(rows[0].api_key, "sk-密钥abcd1234");
         assert!(!rows[0].api_key_masked.is_empty());
     }
+
+    /// Regression for the model-provider staleness path: editing a provider must
+    /// flag the running sessions of agents bound to it. The mechanism is "the
+    /// bound agent's config fingerprint shifts" — `refresh_connection_staleness`
+    /// (tested in manager.rs) then flags any session whose spawn fingerprint no
+    /// longer matches. This proves the shift actually happens for a credential
+    /// change, and that a non-runtime edit (display name) does NOT shift it (so
+    /// provider edits don't over-flag).
+    ///
+    /// DB-only: we mutate the provider row directly via the service rather than
+    /// `update_model_provider_core`, so the on-disk config cascade never runs and
+    /// the test can't touch a developer's real agent config files. The fingerprint
+    /// also reads native config files, but only ever reads them and only between
+    /// DB mutations, so that component stays constant across the comparisons.
+    #[tokio::test]
+    async fn provider_credential_change_shifts_bound_agent_fingerprint() {
+        use crate::db::entities::agent_setting;
+        use crate::models::agent::AgentType;
+        use sea_orm::{ActiveModelTrait, NotSet, Set};
+
+        let db = fresh_in_memory_db().await;
+        let data_dir = std::env::temp_dir();
+
+        let provider = create_model_provider_core(
+            &db,
+            "Prov".to_string(),
+            "https://api.example.com".to_string(),
+            "sk-old-key".to_string(),
+            "codex".to_string(),
+            None,
+        )
+        .await
+        .expect("create provider");
+
+        // A Codex agent setting bound to that provider.
+        let now = chrono::Utc::now();
+        agent_setting::ActiveModel {
+            id: NotSet,
+            agent_type: Set(serde_json::to_string(&AgentType::Codex).unwrap()),
+            registry_id: Set("codex".to_string()),
+            enabled: Set(true),
+            sort_order: Set(0),
+            installed_version: Set(None),
+            env_json: Set(Some("{}".to_string())),
+            model_provider_id: Set(Some(provider.id)),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&db.conn)
+        .await
+        .expect("insert codex agent setting");
+
+        let fp_before = acp::compute_session_config_fingerprint(&db, AgentType::Codex, &data_dir)
+            .await
+            .expect("fingerprint before");
+
+        // Changing the api_key (DB-only) must shift the bound agent's fingerprint:
+        // `apply_model_provider_env` injects the provider's key into the env.
+        model_provider_service::update(
+            &db.conn,
+            provider.id,
+            None,
+            None,
+            Some("sk-new-key".to_string()),
+            None,
+            None,
+        )
+        .await
+        .expect("update provider key");
+
+        let fp_after_key =
+            acp::compute_session_config_fingerprint(&db, AgentType::Codex, &data_dir)
+                .await
+                .expect("fingerprint after key change");
+        assert_ne!(
+            fp_before, fp_after_key,
+            "changing the bound provider's api_key must shift the agent fingerprint"
+        );
+
+        // A non-runtime change (display name only) must NOT shift it.
+        model_provider_service::update(
+            &db.conn,
+            provider.id,
+            Some("Renamed".to_string()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("rename provider");
+
+        let fp_after_name =
+            acp::compute_session_config_fingerprint(&db, AgentType::Codex, &data_dir)
+                .await
+                .expect("fingerprint after rename");
+        assert_eq!(
+            fp_after_key, fp_after_name,
+            "renaming the provider must not shift the agent fingerprint"
+        );
+    }
 }
