@@ -91,6 +91,22 @@
       "placeholder": "請選擇縮放檔位",
       "default": "預設",
       "current": "目前縮放：{zoom}%"
+    },
+    "fonts": {
+      "sectionTitle": "字型",
+      "sectionDescription": "為介面、程式碼編輯器與終端機分別選擇字型。內建字型會按需載入；選擇「自訂…」可使用系統已安裝的任意字型。",
+      "interface": "介面",
+      "editor": "編輯器",
+      "terminal": "終端機",
+      "groupSans": "無襯線",
+      "groupMono": "等寬",
+      "custom": "自訂…",
+      "customPlaceholder": "字型名稱，如 Fira Code",
+      "fontSize": "字級",
+      "ligatures": "啟用連字",
+      "ligaturesUnavailable": "此字型不含連字",
+      "terminalLigaturesHint": "終端機連字僅對內建程式字型生效。",
+      "preview": "預覽"
     }
   },
   "SystemSettings": {

@@ -7,6 +7,22 @@
 export const STORAGE_KEY_THEME_COLOR = "codeg-theme-color"
 export const STORAGE_KEY_ZOOM_LEVEL = "codeg-zoom-level"
 
+// 字体偏好（界面 / 编辑器 / 终端）。
+// *_STACK 保存「已解析的 CSS font-family 栈」，供 inline 脚本零依赖地预水合写入
+// CSS 变量；*_FONT 保存 id、*_CUSTOM 保存自定义族名，供设置界面回显选中态。
+export const STORAGE_KEY_UI_FONT = "codeg-ui-font"
+export const STORAGE_KEY_UI_FONT_CUSTOM = "codeg-ui-font-custom"
+export const STORAGE_KEY_UI_FONT_STACK = "codeg-ui-font-stack"
+export const STORAGE_KEY_EDITOR_FONT = "codeg-editor-font"
+export const STORAGE_KEY_EDITOR_FONT_CUSTOM = "codeg-editor-font-custom"
+export const STORAGE_KEY_EDITOR_FONT_STACK = "codeg-editor-font-stack"
+export const STORAGE_KEY_EDITOR_FONT_SIZE = "codeg-editor-font-size"
+export const STORAGE_KEY_EDITOR_LIGATURES = "codeg-editor-ligatures"
+export const STORAGE_KEY_TERMINAL_FONT = "codeg-terminal-font"
+export const STORAGE_KEY_TERMINAL_FONT_CUSTOM = "codeg-terminal-font-custom"
+export const STORAGE_KEY_TERMINAL_FONT_SIZE = "codeg-terminal-font-size"
+export const STORAGE_KEY_TERMINAL_LIGATURES = "codeg-terminal-ligatures"
+
 /**
  * 同步执行的 inline 脚本，由 layout.tsx 通过 dangerouslySetInnerHTML 注入。
  *
@@ -32,6 +48,17 @@ const SCRIPT = `
     var storedZoom = parseInt(localStorage.getItem("${STORAGE_KEY_ZOOM_LEVEL}") || "", 10);
     var zoom = VALID_ZOOMS.indexOf(storedZoom) >= 0 ? storedZoom : 100;
     document.documentElement.style.fontSize = (16 * zoom / 100) + "px";
+
+    // 字体偏好：界面字体 -> --font-sans，编辑器字体 -> --font-mono。
+    // 仅写入已解析的 stack，无需在脚本里复制字体目录；空/超长/含越界字符则跳过走默认。
+    var applyFontVar = function(key, prop) {
+      var v = localStorage.getItem(key);
+      if (v && v.length < 512 && !/[;{}<>]/.test(v)) {
+        document.documentElement.style.setProperty(prop, v);
+      }
+    };
+    applyFontVar("${STORAGE_KEY_UI_FONT_STACK}", "--font-sans");
+    applyFontVar("${STORAGE_KEY_EDITOR_FONT_STACK}", "--font-mono");
 
     // 在 next-themes 水合之前同步检测暗色模式，防止白色闪屏。
     // next-themes 使用 localStorage key "theme"，attribute="class"。

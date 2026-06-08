@@ -10,8 +10,31 @@ import {
   type ZoomLevel,
 } from "@/lib/theme-presets"
 import {
+  resolveFontStack,
+  isValidFontId,
+  isValidFontSize,
+  DEFAULT_UI_FONT_ID,
+  DEFAULT_EDITOR_FONT_ID,
+  DEFAULT_TERMINAL_FONT_ID,
+  DEFAULT_EDITOR_FONT_SIZE,
+  DEFAULT_TERMINAL_FONT_SIZE,
+  type FontSize,
+} from "@/lib/font-presets"
+import {
   STORAGE_KEY_THEME_COLOR,
   STORAGE_KEY_ZOOM_LEVEL,
+  STORAGE_KEY_UI_FONT,
+  STORAGE_KEY_UI_FONT_CUSTOM,
+  STORAGE_KEY_UI_FONT_STACK,
+  STORAGE_KEY_EDITOR_FONT,
+  STORAGE_KEY_EDITOR_FONT_CUSTOM,
+  STORAGE_KEY_EDITOR_FONT_STACK,
+  STORAGE_KEY_EDITOR_FONT_SIZE,
+  STORAGE_KEY_EDITOR_LIGATURES,
+  STORAGE_KEY_TERMINAL_FONT,
+  STORAGE_KEY_TERMINAL_FONT_CUSTOM,
+  STORAGE_KEY_TERMINAL_FONT_SIZE,
+  STORAGE_KEY_TERMINAL_LIGATURES,
 } from "@/lib/appearance-script"
 
 function syncTrafficLightPosition(zoom: number) {
@@ -30,22 +53,93 @@ function syncAppearanceMode(mode: string) {
   )
 }
 
+export type FontSelection = { id: string; custom: string }
+
 type AppearanceContextValue = {
   themeColor: ThemeColor
   setThemeColor: (color: ThemeColor) => void
   zoomLevel: ZoomLevel
   setZoomLevel: (zoom: ZoomLevel) => void
+  /** 界面字体（普通组件，驱动 --font-sans） */
+  uiFont: FontSelection
+  setUiFont: (id: string, custom?: string) => void
+  /** 编辑器字体（驱动 Monaco fontFamily 与 --font-mono） */
+  editorFont: FontSelection
+  setEditorFont: (id: string, custom?: string) => void
+  /** 终端字体（驱动 xterm fontFamily） */
+  terminalFont: FontSelection
+  setTerminalFont: (id: string, custom?: string) => void
+  editorFontSize: FontSize
+  setEditorFontSize: (size: FontSize) => void
+  terminalFontSize: FontSize
+  setTerminalFontSize: (size: FontSize) => void
+  editorLigatures: boolean
+  setEditorLigatures: (on: boolean) => void
+  terminalLigatures: boolean
+  setTerminalLigatures: (on: boolean) => void
 }
 
 export const AppearanceContext = createContext<AppearanceContextValue | null>(
   null
 )
 
+function persist(key: string, value: string) {
+  try {
+    localStorage.setItem(key, value)
+  } catch {
+    // 隐私模式 / 禁用 storage 时静默忽略，本次会话内仍然生效
+  }
+}
+
+function readStored(key: string): string | null {
+  try {
+    return localStorage.getItem(key)
+  } catch {
+    return null
+  }
+}
+
+function readFontSelection(
+  idKey: string,
+  customKey: string,
+  def: string
+): FontSelection {
+  if (typeof document === "undefined") return { id: def, custom: "" }
+  try {
+    const id = localStorage.getItem(idKey)
+    const custom = localStorage.getItem(customKey) ?? ""
+    return { id: isValidFontId(id) ? (id as string) : def, custom }
+  } catch {
+    return { id: def, custom: "" }
+  }
+}
+
+function readFontSize(key: string, def: FontSize): FontSize {
+  if (typeof document === "undefined") return def
+  try {
+    const n = parseInt(localStorage.getItem(key) ?? "", 10)
+    return isValidFontSize(n) ? n : def
+  } catch {
+    return def
+  }
+}
+
+function readBool(key: string, def: boolean): boolean {
+  if (typeof document === "undefined") return def
+  try {
+    const v = localStorage.getItem(key)
+    return v === null ? def : v === "1"
+  } catch {
+    return def
+  }
+}
+
 /**
- * AppearanceProvider 管理 themeColor 和 zoomLevel 两个外观偏好。
+ * AppearanceProvider 管理 themeColor、zoomLevel 与字体偏好。
  *
  * 与 next-themes 完全正交：next-themes 负责 <html class="dark/light">，
- * 这里负责 <html data-theme="..."> 和 <html style="font-size: ...">。
+ * 这里负责 <html data-theme="...">、<html style="font-size: ...">
+ * 以及 --font-sans / --font-mono 两个字体变量。
  *
  * 注意：next-themes 的 attribute 配置必须保持 "class"。如果改为 "data-theme"
  * 会与本 Provider 冲突，导致主题色无法生效。
@@ -76,25 +170,98 @@ export function AppearanceProvider({
       : DEFAULT_ZOOM_LEVEL
   })
 
+  // 字体偏好的初始值从 localStorage 读 id/custom（视觉已由 inline 脚本就位，
+  // 这里只是回填选中态，不会造成闪烁）。
+  const [uiFont, setUiFontState] = useState<FontSelection>(() =>
+    readFontSelection(
+      STORAGE_KEY_UI_FONT,
+      STORAGE_KEY_UI_FONT_CUSTOM,
+      DEFAULT_UI_FONT_ID
+    )
+  )
+  const [editorFont, setEditorFontState] = useState<FontSelection>(() =>
+    readFontSelection(
+      STORAGE_KEY_EDITOR_FONT,
+      STORAGE_KEY_EDITOR_FONT_CUSTOM,
+      DEFAULT_EDITOR_FONT_ID
+    )
+  )
+  const [terminalFont, setTerminalFontState] = useState<FontSelection>(() =>
+    readFontSelection(
+      STORAGE_KEY_TERMINAL_FONT,
+      STORAGE_KEY_TERMINAL_FONT_CUSTOM,
+      DEFAULT_TERMINAL_FONT_ID
+    )
+  )
+  const [editorFontSize, setEditorFontSizeState] = useState<FontSize>(() =>
+    readFontSize(STORAGE_KEY_EDITOR_FONT_SIZE, DEFAULT_EDITOR_FONT_SIZE)
+  )
+  const [terminalFontSize, setTerminalFontSizeState] = useState<FontSize>(() =>
+    readFontSize(STORAGE_KEY_TERMINAL_FONT_SIZE, DEFAULT_TERMINAL_FONT_SIZE)
+  )
+  const [editorLigatures, setEditorLigaturesState] = useState<boolean>(() =>
+    readBool(STORAGE_KEY_EDITOR_LIGATURES, false)
+  )
+  const [terminalLigatures, setTerminalLigaturesState] = useState<boolean>(() =>
+    readBool(STORAGE_KEY_TERMINAL_LIGATURES, false)
+  )
+
   const setThemeColor = useCallback((color: ThemeColor) => {
     setThemeColorState(color)
     document.documentElement.setAttribute("data-theme", color)
-    try {
-      localStorage.setItem(STORAGE_KEY_THEME_COLOR, color)
-    } catch {
-      // 隐私模式 / 禁用 storage 时静默忽略，本次会话内仍然生效
-    }
+    persist(STORAGE_KEY_THEME_COLOR, color)
   }, [])
 
   const setZoomLevel = useCallback((zoom: ZoomLevel) => {
     setZoomLevelState(zoom)
     document.documentElement.style.fontSize = `${(16 * zoom) / 100}px`
     syncTrafficLightPosition(zoom)
-    try {
-      localStorage.setItem(STORAGE_KEY_ZOOM_LEVEL, String(zoom))
-    } catch {
-      // 同上
-    }
+    persist(STORAGE_KEY_ZOOM_LEVEL, String(zoom))
+  }, [])
+
+  const setUiFont = useCallback((id: string, custom = "") => {
+    setUiFontState({ id, custom })
+    const stack = resolveFontStack(id, custom, "sans")
+    document.documentElement.style.setProperty("--font-sans", stack)
+    persist(STORAGE_KEY_UI_FONT, id)
+    persist(STORAGE_KEY_UI_FONT_CUSTOM, custom)
+    persist(STORAGE_KEY_UI_FONT_STACK, stack)
+  }, [])
+
+  const setEditorFont = useCallback((id: string, custom = "") => {
+    setEditorFontState({ id, custom })
+    const stack = resolveFontStack(id, custom, "mono")
+    // 编辑器字体同时驱动 --font-mono，让聊天代码块/命令菜单等 font-mono UI 与编辑器一致
+    document.documentElement.style.setProperty("--font-mono", stack)
+    persist(STORAGE_KEY_EDITOR_FONT, id)
+    persist(STORAGE_KEY_EDITOR_FONT_CUSTOM, custom)
+    persist(STORAGE_KEY_EDITOR_FONT_STACK, stack)
+  }, [])
+
+  const setTerminalFont = useCallback((id: string, custom = "") => {
+    setTerminalFontState({ id, custom })
+    persist(STORAGE_KEY_TERMINAL_FONT, id)
+    persist(STORAGE_KEY_TERMINAL_FONT_CUSTOM, custom)
+  }, [])
+
+  const setEditorFontSize = useCallback((size: FontSize) => {
+    setEditorFontSizeState(size)
+    persist(STORAGE_KEY_EDITOR_FONT_SIZE, String(size))
+  }, [])
+
+  const setTerminalFontSize = useCallback((size: FontSize) => {
+    setTerminalFontSizeState(size)
+    persist(STORAGE_KEY_TERMINAL_FONT_SIZE, String(size))
+  }, [])
+
+  const setEditorLigatures = useCallback((on: boolean) => {
+    setEditorLigaturesState(on)
+    persist(STORAGE_KEY_EDITOR_LIGATURES, on ? "1" : "0")
+  }, [])
+
+  const setTerminalLigatures = useCallback((on: boolean) => {
+    setTerminalLigaturesState(on)
+    persist(STORAGE_KEY_TERMINAL_LIGATURES, on ? "1" : "0")
   }, [])
 
   // Sync traffic-light position and appearance mode on mount
@@ -108,8 +275,77 @@ export function AppearanceProvider({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  // 用当前选中 id 重新解析字体栈，吸收跨版本字体目录变更（inline 脚本写入的是旧
+  // 版本已解析栈，可能与新目录不一致）。仅在确有漂移时才写，避免每次加载都触发
+  // localStorage 写入与跨标签页 storage 事件。
+  useEffect(() => {
+    const root = document.documentElement
+    const sans = resolveFontStack(uiFont.id, uiFont.custom, "sans")
+    if (readStored(STORAGE_KEY_UI_FONT_STACK) !== sans) {
+      root.style.setProperty("--font-sans", sans)
+      persist(STORAGE_KEY_UI_FONT_STACK, sans)
+    }
+    const mono = resolveFontStack(editorFont.id, editorFont.custom, "mono")
+    if (readStored(STORAGE_KEY_EDITOR_FONT_STACK) !== mono) {
+      root.style.setProperty("--font-mono", mono)
+      persist(STORAGE_KEY_EDITOR_FONT_STACK, mono)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
   // 跨标签页同步：用户在另一个窗口改了设置时，本窗口实时跟进
   useEffect(() => {
+    const FONT_KEYS = new Set<string>([
+      STORAGE_KEY_UI_FONT,
+      STORAGE_KEY_UI_FONT_CUSTOM,
+      STORAGE_KEY_UI_FONT_STACK,
+      STORAGE_KEY_EDITOR_FONT,
+      STORAGE_KEY_EDITOR_FONT_CUSTOM,
+      STORAGE_KEY_EDITOR_FONT_STACK,
+      STORAGE_KEY_EDITOR_FONT_SIZE,
+      STORAGE_KEY_EDITOR_LIGATURES,
+      STORAGE_KEY_TERMINAL_FONT,
+      STORAGE_KEY_TERMINAL_FONT_CUSTOM,
+      STORAGE_KEY_TERMINAL_FONT_SIZE,
+      STORAGE_KEY_TERMINAL_LIGATURES,
+    ])
+    const rehydrateFonts = () => {
+      const ui = readFontSelection(
+        STORAGE_KEY_UI_FONT,
+        STORAGE_KEY_UI_FONT_CUSTOM,
+        DEFAULT_UI_FONT_ID
+      )
+      const ed = readFontSelection(
+        STORAGE_KEY_EDITOR_FONT,
+        STORAGE_KEY_EDITOR_FONT_CUSTOM,
+        DEFAULT_EDITOR_FONT_ID
+      )
+      const tm = readFontSelection(
+        STORAGE_KEY_TERMINAL_FONT,
+        STORAGE_KEY_TERMINAL_FONT_CUSTOM,
+        DEFAULT_TERMINAL_FONT_ID
+      )
+      setUiFontState(ui)
+      setEditorFontState(ed)
+      setTerminalFontState(tm)
+      setEditorFontSizeState(
+        readFontSize(STORAGE_KEY_EDITOR_FONT_SIZE, DEFAULT_EDITOR_FONT_SIZE)
+      )
+      setTerminalFontSizeState(
+        readFontSize(STORAGE_KEY_TERMINAL_FONT_SIZE, DEFAULT_TERMINAL_FONT_SIZE)
+      )
+      setEditorLigaturesState(readBool(STORAGE_KEY_EDITOR_LIGATURES, false))
+      setTerminalLigaturesState(readBool(STORAGE_KEY_TERMINAL_LIGATURES, false))
+      document.documentElement.style.setProperty(
+        "--font-sans",
+        resolveFontStack(ui.id, ui.custom, "sans")
+      )
+      document.documentElement.style.setProperty(
+        "--font-mono",
+        resolveFontStack(ed.id, ed.custom, "mono")
+      )
+    }
+
     const onStorage = (e: StorageEvent) => {
       if (e.key === STORAGE_KEY_THEME_COLOR && e.newValue) {
         const color = e.newValue as ThemeColor
@@ -126,6 +362,9 @@ export function AppearanceProvider({
           syncTrafficLightPosition(zoom)
         }
       }
+      if (e.key && FONT_KEYS.has(e.key)) {
+        rehydrateFonts()
+      }
       // Sync appearance mode to Tauri DB when changed in another window
       if (e.key === "theme") {
         syncAppearanceMode(e.newValue ?? "system")
@@ -137,7 +376,26 @@ export function AppearanceProvider({
 
   return (
     <AppearanceContext.Provider
-      value={{ themeColor, setThemeColor, zoomLevel, setZoomLevel }}
+      value={{
+        themeColor,
+        setThemeColor,
+        zoomLevel,
+        setZoomLevel,
+        uiFont,
+        setUiFont,
+        editorFont,
+        setEditorFont,
+        terminalFont,
+        setTerminalFont,
+        editorFontSize,
+        setEditorFontSize,
+        terminalFontSize,
+        setTerminalFontSize,
+        editorLigatures,
+        setEditorLigatures,
+        terminalLigatures,
+        setTerminalLigatures,
+      }}
     >
       {children}
     </AppearanceContext.Provider>

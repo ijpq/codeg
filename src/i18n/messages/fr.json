@@ -91,6 +91,22 @@
       "placeholder": "Sélectionnez le niveau de zoom",
       "default": "Par défaut",
       "current": "Zoom actuel : {zoom}%"
+    },
+    "fonts": {
+      "sectionTitle": "Polices",
+      "sectionDescription": "Choisissez les polices pour l’interface, l’éditeur de code et le terminal. Les polices intégrées sont chargées à la demande ; sélectionnez « Personnalisée… » pour utiliser n’importe quelle police installée sur votre système.",
+      "interface": "Interface",
+      "editor": "Éditeur",
+      "terminal": "Terminal",
+      "groupSans": "Sans empattement",
+      "groupMono": "Monospace",
+      "custom": "Personnalisée…",
+      "customPlaceholder": "Nom de la police, par ex. Fira Code",
+      "fontSize": "Taille de police",
+      "ligatures": "Activer les ligatures",
+      "ligaturesUnavailable": "Cette police n’a pas de ligatures",
+      "terminalLigaturesHint": "Les ligatures du terminal ne s’appliquent qu’aux polices de programmation intégrées.",
+      "preview": "Aperçu"
     }
   },
   "SystemSettings": {

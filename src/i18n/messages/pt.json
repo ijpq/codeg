@@ -91,6 +91,22 @@
       "placeholder": "Selecione o nível de zoom",
       "default": "Padrão",
       "current": "Zoom atual: {zoom}%"
+    },
+    "fonts": {
+      "sectionTitle": "Fontes",
+      "sectionDescription": "Escolha as fontes para a interface, o editor de código e o terminal. As fontes incluídas são carregadas sob demanda; selecione “Personalizada…” para usar qualquer fonte instalada no seu sistema.",
+      "interface": "Interface",
+      "editor": "Editor",
+      "terminal": "Terminal",
+      "groupSans": "Sem serifa",
+      "groupMono": "Monoespaçada",
+      "custom": "Personalizada…",
+      "customPlaceholder": "Nome da fonte, ex.: Fira Code",
+      "fontSize": "Tamanho da fonte",
+      "ligatures": "Ativar ligaduras",
+      "ligaturesUnavailable": "Esta fonte não tem ligaduras",
+      "terminalLigaturesHint": "As ligaduras do terminal aplicam-se apenas às fontes de programação incluídas.",
+      "preview": "Pré-visualização"
     }
   },
   "SystemSettings": {

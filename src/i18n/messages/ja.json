@@ -91,6 +91,22 @@
       "placeholder": "ズームレベルを選択",
       "default": "デフォルト",
       "current": "現在のズーム：{zoom}%"
+    },
+    "fonts": {
+      "sectionTitle": "フォント",
+      "sectionDescription": "インターフェース、コードエディター、ターミナルのフォントをそれぞれ選択します。内蔵フォントは必要に応じて読み込まれます。「カスタム…」を選ぶと、システムにインストールされた任意のフォントを使用できます。",
+      "interface": "インターフェース",
+      "editor": "エディター",
+      "terminal": "ターミナル",
+      "groupSans": "サンセリフ",
+      "groupMono": "等幅",
+      "custom": "カスタム…",
+      "customPlaceholder": "フォント名（例：Fira Code）",
+      "fontSize": "フォントサイズ",
+      "ligatures": "合字を有効にする",
+      "ligaturesUnavailable": "このフォントには合字がありません",
+      "terminalLigaturesHint": "ターミナルの合字は内蔵のコーディングフォントにのみ適用されます。",
+      "preview": "プレビュー"
     }
   },
   "SystemSettings": {

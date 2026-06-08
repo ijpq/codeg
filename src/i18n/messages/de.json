@@ -91,6 +91,22 @@
       "placeholder": "Zoomstufe wählen",
       "default": "Standard",
       "current": "Aktueller Zoom: {zoom}%"
+    },
+    "fonts": {
+      "sectionTitle": "Schriftarten",
+      "sectionDescription": "Wähle Schriftarten für Oberfläche, Code-Editor und Terminal. Mitgelieferte Schriftarten werden bei Bedarf geladen; wähle „Benutzerdefiniert…“, um eine beliebige auf deinem System installierte Schriftart zu verwenden.",
+      "interface": "Oberfläche",
+      "editor": "Editor",
+      "terminal": "Terminal",
+      "groupSans": "Serifenlos",
+      "groupMono": "Monospace",
+      "custom": "Benutzerdefiniert…",
+      "customPlaceholder": "Schriftartname, z. B. Fira Code",
+      "fontSize": "Schriftgröße",
+      "ligatures": "Ligaturen aktivieren",
+      "ligaturesUnavailable": "Diese Schriftart hat keine Ligaturen",
+      "terminalLigaturesHint": "Terminal-Ligaturen gelten nur für mitgelieferte Programmierschriftarten.",
+      "preview": "Vorschau"
     }
   },
   "SystemSettings": {

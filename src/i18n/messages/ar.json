@@ -91,6 +91,22 @@
       "placeholder": "اختر مستوى التكبير",
       "default": "افتراضي",
       "current": "التكبير الحالي: {zoom}%"
+    },
+    "fonts": {
+      "sectionTitle": "الخطوط",
+      "sectionDescription": "اختر خطوطًا للواجهة ومحرّر الأكواد والطرفية. تُحمّل الخطوط المضمّنة عند الحاجة؛ اختر «مخصّص…» لاستخدام أي خط مثبّت على نظامك.",
+      "interface": "الواجهة",
+      "editor": "المحرّر",
+      "terminal": "الطرفية",
+      "groupSans": "بلا زوائد",
+      "groupMono": "ثابت العرض",
+      "custom": "مخصّص…",
+      "customPlaceholder": "اسم الخط، مثل Fira Code",
+      "fontSize": "حجم الخط",
+      "ligatures": "تفعيل الحروف المتصلة",
+      "ligaturesUnavailable": "هذا الخط لا يحتوي على حروف متصلة",
+      "terminalLigaturesHint": "تنطبق الحروف المتصلة في الطرفية على خطوط البرمجة المضمّنة فقط.",
+      "preview": "معاينة"
     }
   },
   "SystemSettings": {

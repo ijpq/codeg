@@ -91,6 +91,22 @@
       "placeholder": "请选择缩放档位",
       "default": "默认",
       "current": "当前缩放：{zoom}%"
+    },
+    "fonts": {
+      "sectionTitle": "字体",
+      "sectionDescription": "为界面、代码编辑器和终端分别选择字体。内置字体按需加载；选择“自定义…”可使用系统已安装的任意字体。",
+      "interface": "界面",
+      "editor": "编辑器",
+      "terminal": "终端",
+      "groupSans": "无衬线",
+      "groupMono": "等宽",
+      "custom": "自定义…",
+      "customPlaceholder": "字体名称，如 Fira Code",
+      "fontSize": "字号",
+      "ligatures": "启用连字",
+      "ligaturesUnavailable": "该字体不含连字",
+      "terminalLigaturesHint": "终端连字仅对内置编程字体生效。",
+      "preview": "预览"
     }
   },
   "SystemSettings": {
