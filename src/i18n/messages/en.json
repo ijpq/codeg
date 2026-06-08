@@ -735,7 +735,7 @@
       "clineSaved": "Cline config saved",
       "saveClineFailed": "Failed to save Cline config",
       "modelProviderRequired": "Please select a model provider before saving.",
-      "affectedRunningSessions": "{count, plural, one {# running session needs a restart to apply the change} other {# running sessions need a restart to apply the change}}"
+      "affectedRunningSessions": "{count, plural, one {# running session needs to reconnect to apply the change} other {# running sessions need to reconnect to apply the change}}"
     },
     "version": {
       "statusLabel": "Version Status",
@@ -2083,12 +2083,12 @@
       "configStale": {
         "agentConfigTitle": "Agent settings updated",
         "modelProviderTitle": "Model provider updated",
-        "description": "This session is still using its previous configuration. Restart to apply — your conversation history is kept.",
-        "restart": "Restart to apply",
-        "restarting": "Restarting…",
-        "restartDisabledDuringTurn": "Available once the current turn finishes",
+        "description": "This session is still using its previous configuration. Reconnect to apply — your conversation history is kept.",
+        "reconnect": "Reconnect to apply",
+        "reconnecting": "Reconnecting…",
+        "reconnectDisabledDuringTurn": "Available once the current turn finishes",
         "dismiss": "Dismiss",
-        "restartFailed": "Failed to restart session",
+        "reconnectFailed": "Failed to reconnect session",
         "applied": "New configuration applied"
       }
     },
@@ -2440,7 +2440,7 @@
     "delete": "Delete",
     "create": "Create",
     "save": "Save",
-    "affectedRunningSessions": "{count, plural, one {# running session needs a restart to apply the change} other {# running sessions need a restart to apply the change}}"
+    "affectedRunningSessions": "{count, plural, one {# running session needs to reconnect to apply the change} other {# running sessions need to reconnect to apply the change}}"
   },
   "ExpertsSettings": {
     "title": "Expert Skills",

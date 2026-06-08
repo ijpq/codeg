@@ -735,7 +735,7 @@
       "clineSaved": "Configuration Cline enregistrée",
       "saveClineFailed": "Échec de l'enregistrement de la configuration Cline",
       "modelProviderRequired": "Veuillez sélectionner un fournisseur de modèle avant d'enregistrer.",
-      "affectedRunningSessions": "{count, plural, one {# session active doit redémarrer pour appliquer la modification} other {# sessions actives doivent redémarrer pour appliquer la modification}}"
+      "affectedRunningSessions": "{count, plural, one {# session active doit se reconnecter pour appliquer la modification} other {# sessions actives doivent se reconnecter pour appliquer la modification}}"
     },
     "version": {
       "statusLabel": "Statut de version",
@@ -2083,12 +2083,12 @@
       "configStale": {
         "agentConfigTitle": "Paramètres de l'agent mis à jour",
         "modelProviderTitle": "Fournisseur de modèle mis à jour",
-        "description": "Cette session utilise encore son ancienne configuration. Redémarrez pour l'appliquer (l'historique de conversation est conservé).",
-        "restart": "Redémarrer pour appliquer",
-        "restarting": "Redémarrage…",
-        "restartDisabledDuringTurn": "Disponible une fois le tour en cours terminé",
+        "description": "Cette session utilise encore son ancienne configuration. Reconnectez-vous pour l'appliquer (l'historique de conversation est conservé).",
+        "reconnect": "Reconnecter pour appliquer",
+        "reconnecting": "Reconnexion…",
+        "reconnectDisabledDuringTurn": "Disponible une fois le tour en cours terminé",
         "dismiss": "Ignorer",
-        "restartFailed": "Échec du redémarrage de la session",
+        "reconnectFailed": "Échec de la reconnexion de la session",
         "applied": "Nouvelle configuration appliquée"
       }
     },
@@ -2428,7 +2428,7 @@
     "delete": "Supprimer",
     "create": "Créer",
     "save": "Enregistrer",
-    "affectedRunningSessions": "{count, plural, one {# session active doit redémarrer pour appliquer la modification} other {# sessions actives doivent redémarrer pour appliquer la modification}}"
+    "affectedRunningSessions": "{count, plural, one {# session active doit se reconnecter pour appliquer la modification} other {# sessions actives doivent se reconnecter pour appliquer la modification}}"
   },
   "ExpertsSettings": {
     "title": "Compétences d'experts",

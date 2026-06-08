@@ -735,7 +735,7 @@
       "clineSaved": "Cline 配置已保存",
       "saveClineFailed": "保存 Cline 配置失败",
       "modelProviderRequired": "请先选择一个模型供应商再保存。",
-      "affectedRunningSessions": "{count} 个进行中的会话需重启以应用更改"
+      "affectedRunningSessions": "{count} 个进行中的会话需重连以应用更改"
     },
     "version": {
       "statusLabel": "版本状态",
@@ -2083,12 +2083,12 @@
       "configStale": {
         "agentConfigTitle": "智能体配置已更新",
         "modelProviderTitle": "模型供应商已更新",
-        "description": "当前会话仍在使用旧配置，重启后生效（对话历史不会丢失）。",
-        "restart": "重启以应用",
-        "restarting": "正在重启…",
-        "restartDisabledDuringTurn": "当前回合结束后可重启",
+        "description": "当前会话仍在使用旧配置，重连后生效（对话历史不会丢失）。",
+        "reconnect": "重连以应用",
+        "reconnecting": "正在重连…",
+        "reconnectDisabledDuringTurn": "当前回合结束后可重连",
         "dismiss": "忽略",
-        "restartFailed": "重启会话失败",
+        "reconnectFailed": "重连会话失败",
         "applied": "新配置已应用"
       }
     },
@@ -2440,7 +2440,7 @@
     "delete": "删除",
     "create": "创建",
     "save": "保存",
-    "affectedRunningSessions": "{count} 个进行中的会话需重启以应用更改"
+    "affectedRunningSessions": "{count} 个进行中的会话需重连以应用更改"
   },
   "ExpertsSettings": {
     "title": "专家技能",

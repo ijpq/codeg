@@ -735,7 +735,7 @@
       "clineSaved": "تم حفظ تكوين Cline",
       "saveClineFailed": "فشل في حفظ تكوين Cline",
       "modelProviderRequired": "يرجى اختيار مزود نموذج قبل الحفظ.",
-      "affectedRunningSessions": "{count} جلسة نشطة تحتاج إلى إعادة تشغيل لتطبيق التغيير"
+      "affectedRunningSessions": "{count} جلسة نشطة تحتاج إلى إعادة الاتصال لتطبيق التغيير"
     },
     "version": {
       "statusLabel": "حالة الإصدار",
@@ -2083,12 +2083,12 @@
       "configStale": {
         "agentConfigTitle": "تم تحديث إعدادات الوكيل",
         "modelProviderTitle": "تم تحديث مزوّد النموذج",
-        "description": "لا تزال هذه الجلسة تستخدم الإعدادات السابقة. أعد التشغيل لتطبيقها (سيتم الاحتفاظ بسجل المحادثة).",
-        "restart": "أعد التشغيل للتطبيق",
-        "restarting": "جارٍ إعادة التشغيل…",
-        "restartDisabledDuringTurn": "متاح بعد انتهاء الدور الحالي",
+        "description": "لا تزال هذه الجلسة تستخدم الإعدادات السابقة. أعد الاتصال لتطبيقها (سيتم الاحتفاظ بسجل المحادثة).",
+        "reconnect": "أعد الاتصال للتطبيق",
+        "reconnecting": "جارٍ إعادة الاتصال…",
+        "reconnectDisabledDuringTurn": "متاح بعد انتهاء الدور الحالي",
         "dismiss": "تجاهل",
-        "restartFailed": "فشل في إعادة تشغيل الجلسة",
+        "reconnectFailed": "فشل في إعادة الاتصال بالجلسة",
         "applied": "تم تطبيق الإعدادات الجديدة"
       }
     },
@@ -2428,7 +2428,7 @@
     "delete": "حذف",
     "create": "إنشاء",
     "save": "حفظ",
-    "affectedRunningSessions": "{count} جلسة نشطة تحتاج إلى إعادة تشغيل لتطبيق التغيير"
+    "affectedRunningSessions": "{count} جلسة نشطة تحتاج إلى إعادة الاتصال لتطبيق التغيير"
   },
   "ExpertsSettings": {
     "title": "مهارات الخبراء",

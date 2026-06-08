@@ -735,7 +735,7 @@
       "clineSaved": "Configuración de Cline guardada",
       "saveClineFailed": "Error al guardar la configuración de Cline",
       "modelProviderRequired": "Seleccione un proveedor de modelo antes de guardar.",
-      "affectedRunningSessions": "{count, plural, one {# sesión activa necesita reiniciarse para aplicar el cambio} other {# sesiones activas necesitan reiniciarse para aplicar el cambio}}"
+      "affectedRunningSessions": "{count, plural, one {# sesión activa necesita reconectarse para aplicar el cambio} other {# sesiones activas necesitan reconectarse para aplicar el cambio}}"
     },
     "version": {
       "statusLabel": "Estado de versión",
@@ -2083,12 +2083,12 @@
       "configStale": {
         "agentConfigTitle": "Configuración del agente actualizada",
         "modelProviderTitle": "Proveedor de modelo actualizado",
-        "description": "Esta sesión sigue usando su configuración anterior. Reiníciala para aplicarla (se conserva el historial de la conversación).",
-        "restart": "Reiniciar para aplicar",
-        "restarting": "Reiniciando…",
-        "restartDisabledDuringTurn": "Disponible cuando termine el turno actual",
+        "description": "Esta sesión sigue usando su configuración anterior. Vuelve a conectarte para aplicarla (se conserva el historial de la conversación).",
+        "reconnect": "Reconectar para aplicar",
+        "reconnecting": "Reconectando…",
+        "reconnectDisabledDuringTurn": "Disponible cuando termine el turno actual",
         "dismiss": "Descartar",
-        "restartFailed": "No se pudo reiniciar la sesión",
+        "reconnectFailed": "No se pudo reconectar la sesión",
         "applied": "Nueva configuración aplicada"
       }
     },
@@ -2428,7 +2428,7 @@
     "delete": "Eliminar",
     "create": "Crear",
     "save": "Guardar",
-    "affectedRunningSessions": "{count, plural, one {# sesión activa necesita reiniciarse para aplicar el cambio} other {# sesiones activas necesitan reiniciarse para aplicar el cambio}}"
+    "affectedRunningSessions": "{count, plural, one {# sesión activa necesita reconectarse para aplicar el cambio} other {# sesiones activas necesitan reconectarse para aplicar el cambio}}"
   },
   "ExpertsSettings": {
     "title": "Habilidades de expertos",

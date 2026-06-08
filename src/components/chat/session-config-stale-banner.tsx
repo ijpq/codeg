@@ -21,13 +21,17 @@ import { cn } from "@/lib/utils"
  * renders its own banner, so the user can spot and resolve them one by one.
  *
  * Behaviour:
- * - Owners only — viewers don't own the backend process and can't restart it.
- * - "Restart to apply" disconnects + resumes the same session (history kept),
+ * - Owners only — viewers and delegation children don't own the backend
+ *   process, so reconnecting isn't theirs to do.
+ * - "Reconnect to apply" disconnects + resumes the same session (history kept),
  *   so the new process reads current config and the banner clears.
- * - Disabled while a turn is in flight (`prompting`) — restarting would
+ * - Disabled while a turn is in flight (`prompting`) — reconnecting would
  *   interrupt it — with a tooltip explaining why.
  * - The X dismisses the banner for the CURRENT drift only; a later settings
  *   change re-shows it.
+ * - Responsive via container queries: in a narrow panel (small screen or a
+ *   thin tiled column) the text and the actions stack; they sit on one row
+ *   once the panel is wide enough.
  *
  * Returns null (no layout impact) when there's nothing to show.
  */
@@ -47,91 +51,95 @@ export function SessionConfigStaleBanner({
     reapplyConfig,
     dismissConfigStale,
   } = useConnection(contextKey)
-  const [restarting, setRestarting] = useState(false)
+  // Our own "reconnect in flight" flag. Kept distinct from the connection's
+  // `connecting` status because `reapplyConfig` briefly disconnects first.
+  const [reconnecting, setReconnecting] = useState(false)
 
   // Owners only: viewers and delegation children don't own the backend process,
-  // so "restart to apply" isn't theirs to do.
+  // so "reconnect to apply" isn't theirs to do.
   if (!configStale || configStaleDismissed || isViewer || isDelegationChild)
     return null
 
   const turnInFlight = status === "prompting"
-  // `connecting` covers the reconnect that `reapplyConfig` itself triggers.
-  const reconnecting = restarting || status === "connecting"
-  const restartDisabled = turnInFlight || reconnecting
+  // Spinner while our reconnect is in flight OR the connection is
+  // (re)establishing — `connecting` covers the reconnect `reapplyConfig` fires.
+  const busy = reconnecting || status === "connecting"
+  const actionDisabled = turnInFlight || busy
 
   const title =
     configStaleKind === "model_provider"
       ? t("modelProviderTitle")
       : t("agentConfigTitle")
 
-  const handleRestart = async () => {
-    if (restartDisabled) return
-    setRestarting(true)
+  const handleReconnect = async () => {
+    if (actionDisabled) return
+    setReconnecting(true)
     try {
-      const restarted = await reapplyConfig()
-      if (restarted) {
-        toast.success(t("applied"))
-        // On success the session restarts and `configStale` clears, which
-        // unmounts this banner — no need to reset `restarting`.
-      } else {
-        // No-op (connection vanished mid-click, etc.) — don't claim "applied".
-        setRestarting(false)
-      }
+      const reconnected = await reapplyConfig()
+      if (reconnected) toast.success(t("applied"))
+      // else: no-op (connection vanished mid-click, viewer/child) — say nothing.
     } catch (error) {
-      toast.error(t("restartFailed"), {
+      toast.error(t("reconnectFailed"), {
         description: error instanceof Error ? error.message : String(error),
       })
-      setRestarting(false)
+    } finally {
+      // Always clear our flag. Returning null above does NOT unmount this
+      // component, so a leaked `true` would later show a phantom "reconnecting…"
+      // spinner on the NEXT drift without the user clicking anything.
+      setReconnecting(false)
     }
   }
 
   return (
-    <div className="border-b border-amber-500/30 bg-amber-500/10 px-4 py-2 text-xs text-amber-700 dark:text-amber-300">
-      <div className="mx-auto flex w-full max-w-3xl items-center gap-2">
-        <AlertTriangle className="h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
-        <div className="min-w-0 flex-1 leading-snug">
-          <span className="font-medium">{title}</span>
-          <span className="ml-1 text-amber-700/80 dark:text-amber-300/80">
-            {t("description")}
-          </span>
+    <div className="@container border-b border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
+      <div className="mx-auto flex w-full max-w-3xl flex-col gap-1.5 @lg:flex-row @lg:items-center @lg:gap-2">
+        <div className="flex min-w-0 flex-1 items-start gap-2">
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400 @lg:mt-0" />
+          <div className="min-w-0 leading-snug">
+            <span className="font-medium">{title}</span>{" "}
+            <span className="text-amber-700/80 dark:text-amber-300/80">
+              {t("description")}
+            </span>
+          </div>
         </div>
-        <TooltipProvider>
-          <Tooltip>
-            <TooltipTrigger asChild>
-              {/* Wrapper span so the tooltip still fires while the button is
-                  disabled (disabled elements don't emit pointer events). */}
-              <span className="shrink-0">
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="h-7 gap-1.5 border-amber-500/40 bg-transparent text-amber-700 hover:bg-amber-500/20 hover:text-amber-800 dark:text-amber-300 dark:hover:text-amber-200"
-                  disabled={restartDisabled}
-                  onClick={handleRestart}
-                >
-                  <RefreshCw
-                    className={cn(
-                      "h-3.5 w-3.5",
-                      reconnecting && "animate-spin"
-                    )}
-                  />
-                  {reconnecting ? t("restarting") : t("restart")}
-                </Button>
-              </span>
-            </TooltipTrigger>
-            {turnInFlight && (
-              <TooltipContent>{t("restartDisabledDuringTurn")}</TooltipContent>
-            )}
-          </Tooltip>
-        </TooltipProvider>
-        <Button
-          size="icon"
-          variant="ghost"
-          className="h-6 w-6 shrink-0 text-amber-700/70 hover:bg-amber-500/20 hover:text-amber-800 dark:text-amber-300/70 dark:hover:text-amber-200"
-          onClick={dismissConfigStale}
-          aria-label={t("dismiss")}
-        >
-          <X className="h-3.5 w-3.5" />
-        </Button>
+        <div className="flex shrink-0 items-center gap-1 self-end @lg:self-auto">
+          <TooltipProvider>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                {/* Wrapper span so the tooltip still fires while the button is
+                    disabled (disabled elements don't emit pointer events). */}
+                <span>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-7 gap-1.5 border-amber-500/40 bg-transparent text-amber-700 hover:bg-amber-500/20 hover:text-amber-800 dark:text-amber-300 dark:hover:text-amber-200"
+                    disabled={actionDisabled}
+                    onClick={handleReconnect}
+                  >
+                    <RefreshCw
+                      className={cn("h-3.5 w-3.5", busy && "animate-spin")}
+                    />
+                    {busy ? t("reconnecting") : t("reconnect")}
+                  </Button>
+                </span>
+              </TooltipTrigger>
+              {turnInFlight && (
+                <TooltipContent>
+                  {t("reconnectDisabledDuringTurn")}
+                </TooltipContent>
+              )}
+            </Tooltip>
+          </TooltipProvider>
+          <Button
+            size="icon"
+            variant="ghost"
+            className="h-6 w-6 shrink-0 text-amber-700/70 hover:bg-amber-500/20 hover:text-amber-800 dark:text-amber-300/70 dark:hover:text-amber-200"
+            onClick={dismissConfigStale}
+            aria-label={t("dismiss")}
+          >
+            <X className="h-3.5 w-3.5" />
+          </Button>
+        </div>
       </div>
     </div>
   )

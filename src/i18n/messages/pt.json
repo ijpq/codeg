@@ -735,7 +735,7 @@
       "clineSaved": "Configuração do Cline salva",
       "saveClineFailed": "Falha ao salvar a configuração do Cline",
       "modelProviderRequired": "Selecione um provedor de modelo antes de salvar.",
-      "affectedRunningSessions": "{count, plural, one {# sessão ativa precisa reiniciar para aplicar a alteração} other {# sessões ativas precisam reiniciar para aplicar a alteração}}"
+      "affectedRunningSessions": "{count, plural, one {# sessão ativa precisa reconectar para aplicar a alteração} other {# sessões ativas precisam reconectar para aplicar a alteração}}"
     },
     "version": {
       "statusLabel": "Status da versão",
@@ -2083,12 +2083,12 @@
       "configStale": {
         "agentConfigTitle": "Configurações do agente atualizadas",
         "modelProviderTitle": "Provedor de modelo atualizado",
-        "description": "Esta sessão ainda está usando a configuração anterior. Reinicie para aplicar (o histórico da conversa é mantido).",
-        "restart": "Reiniciar para aplicar",
-        "restarting": "Reiniciando…",
-        "restartDisabledDuringTurn": "Disponível quando o turno atual terminar",
+        "description": "Esta sessão ainda está usando a configuração anterior. Reconecte para aplicar (o histórico da conversa é mantido).",
+        "reconnect": "Reconectar para aplicar",
+        "reconnecting": "Reconectando…",
+        "reconnectDisabledDuringTurn": "Disponível quando o turno atual terminar",
         "dismiss": "Dispensar",
-        "restartFailed": "Falha ao reiniciar a sessão",
+        "reconnectFailed": "Falha ao reconectar a sessão",
         "applied": "Nova configuração aplicada"
       }
     },
@@ -2428,7 +2428,7 @@
     "delete": "Excluir",
     "create": "Criar",
     "save": "Salvar",
-    "affectedRunningSessions": "{count, plural, one {# sessão ativa precisa reiniciar para aplicar a alteração} other {# sessões ativas precisam reiniciar para aplicar a alteração}}"
+    "affectedRunningSessions": "{count, plural, one {# sessão ativa precisa reconectar para aplicar a alteração} other {# sessões ativas precisam reconectar para aplicar a alteração}}"
   },
   "ExpertsSettings": {
     "title": "Habilidades de Especialista",
