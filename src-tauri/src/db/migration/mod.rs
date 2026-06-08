@@ -18,6 +18,7 @@ mod m20260513_000001_remote_workspace_connection;
 mod m20260518_000001_model_provider_single_type_and_model;
 mod m20260522_000001_delegation_columns;
 mod m20260607_000001_folder_parent_id;
+mod m20260608_000001_conversation_title_locked;
 pub struct Migrator;
 
 #[async_trait::async_trait]
@@ -42,6 +43,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260518_000001_model_provider_single_type_and_model::Migration),
             Box::new(m20260522_000001_delegation_columns::Migration),
             Box::new(m20260607_000001_folder_parent_id::Migration),
+            Box::new(m20260608_000001_conversation_title_locked::Migration),
         ]
     }
 }

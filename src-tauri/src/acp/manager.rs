@@ -1390,6 +1390,7 @@ impl ConnectionManager {
                         id: NotSet,
                         folder_id: Set(folder_id),
                         title: Set(clean_title),
+                        title_locked: Set(false),
                         agent_type: Set(agent_type_str),
                         status: Set(ConversationStatus::PendingReview),
                         model: Set(None),

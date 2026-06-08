@@ -29,6 +29,7 @@ function conv(
     id,
     folder_id: folderId,
     title: `conv-${id}`,
+    title_locked: false,
     agent_type: "claude_code",
     status: "pending",
     model: null,

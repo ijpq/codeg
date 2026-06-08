@@ -254,6 +254,9 @@ export interface DbConversationSummary {
   id: number
   folder_id: number
   title: string | null
+  /** True once the user renamed this conversation by hand; the backend then
+   *  stops auto-deriving its title from the session file. */
+  title_locked: boolean
   agent_type: AgentType
   status: string
   model: string | null
@@ -316,6 +319,7 @@ export interface SaveTabsOutcome {
 
 export interface ImportResult {
   imported: number
+  updated: number
   skipped: number
 }
 
