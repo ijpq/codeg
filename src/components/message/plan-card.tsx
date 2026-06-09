@@ -3,6 +3,7 @@
 import { memo } from "react"
 import { useTranslations } from "next-intl"
 import { Badge } from "@/components/ui/badge"
+import { ScrollArea } from "@/components/ui/scroll-area"
 import type { PlanEntryInfo } from "@/lib/types"
 import { cn } from "@/lib/utils"
 import {
@@ -171,9 +172,9 @@ export const PlanCard = memo(function PlanCard({
           {completedCount}/{entries.length}
         </Badge>
       </div>
-      <div className="px-2 py-2">
+      <ScrollArea className="max-h-72 px-2 py-2">
         <PlanEntriesList entries={entries} isStreaming={isStreaming} />
-      </div>
+      </ScrollArea>
     </div>
   )
 })
