@@ -12,7 +12,7 @@ import type { ReferenceAttrs } from "../types"
 
 const ICON_CLASS = "size-3.5 shrink-0"
 
-function ReferenceIcon({ data }: { data: ReferenceAttrs }) {
+export function ReferenceIcon({ data }: { data: ReferenceAttrs }) {
   const meta = data.meta
   switch (data.refType) {
     case "file":

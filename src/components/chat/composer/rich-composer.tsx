@@ -2,18 +2,29 @@
 
 import {
   forwardRef,
+  useCallback,
   useEffect,
   useImperativeHandle,
+  useMemo,
   useRef,
+  useState,
   type CSSProperties,
 } from "react"
 import { type Editor } from "@tiptap/core"
 import { EditorContent, useEditor } from "@tiptap/react"
+import { exitSuggestion } from "@tiptap/suggestion"
 
 import { cn } from "@/lib/utils"
 
 import { buildComposerExtensions } from "./editor-config"
 import { shouldSubmitOnEnter } from "./submit-key"
+import type {
+  MentionController,
+  MentionRenderState,
+} from "./suggestion/mention-suggestion"
+import { SuggestionPopup } from "./suggestion/suggestion-popup"
+import type { ReferenceSearch, SuggestionPopupHandle } from "./suggestion/types"
+import type { ReferenceAttrs } from "./types"
 
 /**
  * Imperative handle exposed to the parent (e.g. the message input that owns
@@ -61,13 +72,20 @@ export interface RichComposerProps {
   onSubmit?: () => void
   onFocus?: () => void
   onBlur?: () => void
+  /**
+   * Enables the unified `@` mention panel. Resolves the typed query into
+   * grouped suggestions (files/agents/sessions/commits/skills). MUST be
+   * referentially stable (memoize it) — it is a dependency of the panel's fetch
+   * effect. Omit to disable mentions.
+   */
+  referenceSearch?: ReferenceSearch
 }
 
 /**
- * Phase 0 rich-text composer: a Tiptap editor with live WYSIWYG Markdown and
- * IME-safe Enter-to-submit. Reference badges and the unified `@` panel are
- * layered on in later phases; this component is the foundation that de-risks
- * IME, auto-grow and Markdown round-trip.
+ * Rich-text composer: a Tiptap editor with live WYSIWYG Markdown, IME-safe
+ * Enter-to-submit, inline reference badges, and an optional unified `@` mention
+ * panel (enabled by `referenceSearch`). Not yet wired into message-input — that
+ * integration (drafts, attachments, real data sources) is Phase 3.
  */
 export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
   function RichComposer(
@@ -83,6 +101,7 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
       onSubmit,
       onFocus,
       onBlur,
+      referenceSearch,
     },
     ref
   ) {
@@ -92,17 +111,62 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
     const onSubmitRef = useRef(onSubmit)
     const onFocusRef = useRef(onFocus)
     const onBlurRef = useRef(onBlur)
+    // Latest referenceSearch, read at event time so the mention plugin (always
+    // installed) is gated on whether mentions are currently enabled — robust to
+    // the prop being added/removed after the editor is created once.
+    const referenceSearchRef = useRef(referenceSearch)
     useEffect(() => {
       onChangeRef.current = onChange
       onSubmitRef.current = onSubmit
       onFocusRef.current = onFocus
       onBlurRef.current = onBlur
+      referenceSearchRef.current = referenceSearch
     })
+
+    // ── Unified `@` mention panel state bridge ──
+    // The suggestion plugin lives in ProseMirror; its lifecycle is bridged to
+    // this React state so the popup can render in-tree (where data hooks work).
+    const [mentionState, setMentionState] = useState<MentionRenderState | null>(
+      null
+    )
+    // Mirrors `mentionState != null` for synchronous reads inside handleKeyDown
+    // (so Enter defers to the panel without waiting for a re-render).
+    const mentionOpenRef = useRef(false)
+    const popupRef = useRef<SuggestionPopupHandle>(null)
+    // Stable controller created once (refs/setState are stable), so the editor
+    // is built a single time with it.
+    const mentionController = useMemo<MentionController>(
+      () => ({
+        onStart: (mention) => {
+          // Inert unless mentions are enabled (no referenceSearch → no panel).
+          if (!referenceSearchRef.current) return
+          mentionOpenRef.current = true
+          setMentionState(mention)
+        },
+        onUpdate: (mention) => {
+          if (!referenceSearchRef.current) return
+          setMentionState(mention)
+        },
+        onExit: () => {
+          mentionOpenRef.current = false
+          setMentionState(null)
+        },
+        onKeyDown: (event) => popupRef.current?.onKeyDown(event) ?? false,
+      }),
+      []
+    )
 
     const editor = useEditor({
       // Static export / SSR safety: never render on the server.
       immediatelyRender: false,
-      extensions: buildComposerExtensions({ placeholder }),
+      // The mention plugin is always installed (the editor is created once);
+      // it stays inert until `referenceSearch` is set (checked at runtime in the
+      // controller). `mentionController` (stable, from useMemo) captures refs
+      // but only dereferences them inside event-time callbacks, never during
+      // render — the React Compiler lint can't prove that. Mirrors Tiptap's own
+      // React suggestion pattern (render() → component.ref.onKeyDown).
+      // eslint-disable-next-line react-hooks/refs
+      extensions: buildComposerExtensions({ placeholder, mentionController }),
       editable: !disabled,
       autofocus: autoFocus ? "end" : false,
       editorProps: {
@@ -115,6 +179,9 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
         handleKeyDown: (view, event) => {
           // Only Enter is special; let everything else fall through cheaply.
           if (event.key !== "Enter") return false
+          // While the `@` panel is open it owns Enter (select / close); never
+          // submit. Checked synchronously via a ref to beat the re-render.
+          if (mentionOpenRef.current) return false
           // Resolve structural context: code blocks and list items keep Enter
           // (newline / list split) instead of submitting.
           const { $from } = view.state.selection
@@ -179,6 +246,36 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
       [editor]
     )
 
+    const closeMention = useCallback(() => {
+      mentionOpenRef.current = false
+      setMentionState(null)
+      // Also dismiss the Tiptap suggestion plugin so its state can't stay active
+      // while React thinks the panel is closed (onExit will also fire).
+      const view = editor?.view
+      if (view) exitSuggestion(view)
+    }, [editor])
+
+    // If mentions get disabled while a panel is open, actively dismiss it so the
+    // editor's Enter handling and the plugin state return to normal (the popup
+    // also unmounts via the render guard below).
+    useEffect(() => {
+      if (!referenceSearch && mentionOpenRef.current) closeMention()
+    }, [referenceSearch, closeMention])
+
+    const handleReferenceSelect = useCallback(
+      (reference: ReferenceAttrs, range: { from: number; to: number }) => {
+        editor
+          ?.chain()
+          .focus()
+          .deleteRange(range)
+          .insertReference(reference)
+          .insertContent(" ")
+          .run()
+        closeMention()
+      },
+      [editor, closeMention]
+    )
+
     return (
       <div
         className={cn("codeg-composer flex min-h-0 flex-col", className)}
@@ -189,6 +286,15 @@ export const RichComposer = forwardRef<RichComposerHandle, RichComposerProps>(
           editor={editor}
           className="codeg-composer-scroll min-h-0 flex-1 overflow-y-auto px-3 py-2 text-base md:text-sm"
         />
+        {referenceSearch && mentionState && (
+          <SuggestionPopup
+            ref={popupRef}
+            state={mentionState}
+            search={referenceSearch}
+            onSelect={handleReferenceSelect}
+            onClose={closeMention}
+          />
+        )}
       </div>
     )
   }

@@ -7,6 +7,11 @@ import "@testing-library/jest-dom/vitest"
 if (typeof document !== "undefined" && !document.elementFromPoint) {
   document.elementFromPoint = () => null
 }
+if (typeof Element !== "undefined") {
+  // jsdom doesn't implement scrollIntoView; the composer's suggestion popup
+  // calls it to keep the active row visible.
+  Element.prototype.scrollIntoView ??= () => {}
+}
 if (typeof Range !== "undefined") {
   Range.prototype.getClientRects ??= () =>
     ({

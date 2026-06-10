@@ -4,15 +4,23 @@ import { Placeholder } from "@tiptap/extension-placeholder"
 import StarterKit from "@tiptap/starter-kit"
 
 import { Reference } from "./nodes/reference-node"
+import {
+  MentionSuggestion,
+  type MentionController,
+} from "./suggestion/mention-suggestion"
 
 /**
- * Options for the shared composer extension set. The `@`/`/` suggestion
- * extensions are layered on in Phase 2 via additional entries to
- * {@link buildComposerExtensions}.
+ * Options for the shared composer extension set.
  */
 export interface ComposerExtensionOptions {
   /** Placeholder shown when the document is empty. */
   placeholder?: string
+  /**
+   * When provided, enables the unified `@` mention panel: the suggestion plugin
+   * forwards lifecycle/keys to this controller, whose React popup owns data and
+   * insertion.
+   */
+  mentionController?: MentionController
 }
 
 /**
@@ -30,7 +38,7 @@ export interface ComposerExtensionOptions {
 export function buildComposerExtensions(
   options: ComposerExtensionOptions = {}
 ): Extensions {
-  return [
+  const extensions: Extensions = [
     StarterKit,
     Placeholder.configure({
       placeholder: options.placeholder ?? "",
@@ -41,4 +49,10 @@ export function buildComposerExtensions(
     Markdown,
     Reference,
   ]
+  if (options.mentionController) {
+    extensions.push(
+      MentionSuggestion.configure({ controller: options.mentionController })
+    )
+  }
+  return extensions
 }
