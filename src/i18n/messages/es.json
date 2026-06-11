@@ -926,6 +926,8 @@
       "collapseAllGroups": "Colapsar todos los grupos",
       "newConversation": "Nueva conversación",
       "newConversationShort": "Nueva",
+      "newChat": "Nueva conversación",
+      "search": "Buscar",
       "noConversationsFound": "No se encontraron conversaciones.",
       "importLocalSessions": "Importar sesiones locales",
       "importing": "Importando...",
@@ -997,7 +999,9 @@
         "toastDeleted": "Se eliminaron {count} conversación(es)",
         "toastStatusUpdated": "Estado actualizado para {count} conversación(es)",
         "toastOpFailed": "Error en la operación: {message}"
-      }
+      },
+      "sectionPinned": "Fijadas",
+      "sectionFolders": "Carpetas"
     },
     "conversation": {
       "reloadFailed": "No se pudo recargar la conversación: {message}",
@@ -1051,7 +1055,11 @@
       "deleteConversationTitle": "¿Eliminar conversación?",
       "deleteConversationDescription": "Esto eliminará \"{title}\". Esta acción no se puede deshacer.",
       "cancel": "Cancelar",
-      "save": "Guardar"
+      "save": "Guardar",
+      "pin": "Fijar",
+      "unpin": "Dejar de fijar",
+      "markCompleted": "Marcar como completada",
+      "reopen": "Reabrir"
     },
     "search": {
       "dialogTitle": "Buscar",
