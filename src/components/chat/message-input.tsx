@@ -2314,7 +2314,7 @@ export function MessageInput({
                     disabled={disabled}
                     variant="ghost"
                     size="icon-xs"
-                    className="shrink-0"
+                    className="shrink-0 text-muted-foreground"
                     title={t("addActions")}
                     aria-label={t("addActions")}
                   >
