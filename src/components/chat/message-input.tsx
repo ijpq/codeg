@@ -40,6 +40,11 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover"
+import {
   ContextMenu,
   ContextMenuContent,
   ContextMenuItem,
@@ -103,14 +108,13 @@ import {
   ConversationFolderBranchPicker,
   useConversationFolderBranchPickerVisible,
 } from "@/components/chat/conversation-context-bar"
+import { InlineModeSelector } from "@/components/chat/mode-selector"
+import { InlineSessionConfigSelector } from "@/components/chat/session-config-selector"
 import {
-  InlineModeSelector,
-  ModeSelector,
-} from "@/components/chat/mode-selector"
-import {
-  InlineSessionConfigSelector,
-  SessionConfigSelector,
-} from "@/components/chat/session-config-selector"
+  SessionSelectorsPanel,
+  type SessionSelectorGroup,
+  type SessionSelectorSetting,
+} from "@/components/chat/session-selectors-panel"
 import {
   getExpertIcon,
   pickExpertLocalized,
@@ -575,6 +579,11 @@ export function MessageInput({
   const [attachments, setAttachments] = useState<InputAttachment[]>([])
   const embeddedPayloadsRef = useRef<Map<string, PromptInputBlock>>(new Map())
   const [isDragActive, setIsDragActive] = useState(false)
+  // Collapsed (narrow) selectors live in a controlled Popover holding a
+  // master–detail panel (`SessionSelectorsPanel`). It's controlled so a value
+  // pick closes it explicitly — matching the prior cog menu, which also closed
+  // on every selection.
+  const [collapsedSelectorsOpen, setCollapsedSelectorsOpen] = useState(false)
   const [quickMessages, setQuickMessages] = useState<QuickMessage[]>([])
   const [quickMessagesLoading, setQuickMessagesLoading] = useState(false)
   // Whether the async Clipboard read API is usable here. It's absent in
@@ -2409,33 +2418,6 @@ export function MessageInput({
   const hasImageAttachments = imageAttachments.length > 0
   const showDragActive = isDragActive && !disabled
 
-  const selectorItems = (
-    <>
-      {showConfigLoading && (
-        <SelectorLoadingChip label={t("loadingSettings")} />
-      )}
-      {hasConfigOptions &&
-        availableConfigOptions.map((option) => (
-          <SessionConfigSelector
-            key={option.id}
-            option={option}
-            onSelect={(configId, valueId) =>
-              onConfigOptionChange?.(configId, valueId)
-            }
-          />
-        ))}
-      {showModeLoading && <SelectorLoadingChip label={t("loadingMode")} />}
-      {showModeSelector && (
-        <ModeSelector
-          modes={availableModes}
-          selectedModeId={effectiveModeId!}
-          onSelect={handleModeSelect}
-          label={t("modeLabel")}
-        />
-      )}
-    </>
-  )
-
   const inlineSelectorItems = (
     <>
       {hasConfigOptions &&
@@ -2458,6 +2440,85 @@ export function MessageInput({
       )}
     </>
   )
+
+  // Normalized settings for the collapsed (narrow) master–detail panel. Config
+  // options and the mode picker are mutually exclusive in this UI (see
+  // `showModeSelector`), but both are mapped so the panel stays agnostic.
+  const collapsedSettings = useMemo<SessionSelectorSetting[]>(() => {
+    const result: SessionSelectorSetting[] = []
+    if (hasConfigOptions) {
+      for (const option of availableConfigOptions) {
+        if (option.kind.type !== "select") continue
+        const kind = option.kind
+        const groups: SessionSelectorGroup[] =
+          kind.groups.length > 0
+            ? kind.groups.map((group) => ({
+                key: group.group,
+                name: group.name,
+                options: group.options.map((item) => ({
+                  value: item.value,
+                  name: item.name,
+                  description: item.description,
+                })),
+              }))
+            : [
+                {
+                  key: "__flat__",
+                  name: null,
+                  options: kind.options.map((item) => ({
+                    value: item.value,
+                    name: item.name,
+                    description: item.description,
+                  })),
+                },
+              ]
+        const current = groups
+          .flatMap((group) => group.options)
+          .find((item) => item.value === kind.current_value)
+        result.push({
+          key: `config:${option.id}`,
+          title: option.name,
+          currentValue: kind.current_value,
+          currentLabel: current?.name ?? kind.current_value,
+          groups,
+          onSelect: (value) => onConfigOptionChange?.(option.id, value),
+        })
+      }
+    }
+    if (showModeSelector) {
+      const selected = availableModes.find(
+        (mode) => mode.id === effectiveModeId
+      )
+      result.push({
+        key: "mode",
+        title: t("modeLabel"),
+        currentValue: effectiveModeId ?? "",
+        currentLabel: selected?.name ?? effectiveModeId ?? "",
+        groups: [
+          {
+            key: "__modes__",
+            name: null,
+            options: availableModes.map((mode) => ({
+              value: mode.id,
+              name: mode.name,
+              description: mode.description,
+            })),
+          },
+        ],
+        onSelect: (value) => handleModeSelect(value),
+      })
+    }
+    return result
+  }, [
+    hasConfigOptions,
+    availableConfigOptions,
+    showModeSelector,
+    availableModes,
+    effectiveModeId,
+    onConfigOptionChange,
+    handleModeSelect,
+    t,
+  ])
 
   const actionButtons = isEditingQueueItem ? (
     <div className="flex items-center gap-1">
@@ -2979,8 +3040,11 @@ export function MessageInput({
                         hasInlineSelectors && "@[30rem]:hidden"
                       )}
                     >
-                      <DropdownMenu>
-                        <DropdownMenuTrigger asChild>
+                      <Popover
+                        open={collapsedSelectorsOpen}
+                        onOpenChange={setCollapsedSelectorsOpen}
+                      >
+                        <PopoverTrigger asChild>
                           <Button
                             variant="ghost"
                             size="icon-xs"
@@ -2997,15 +3061,30 @@ export function MessageInput({
                               <Cog className="size-3" />
                             )}
                           </Button>
-                        </DropdownMenuTrigger>
-                        <DropdownMenuContent
+                        </PopoverTrigger>
+                        <PopoverContent
                           side="top"
                           align="start"
-                          className="min-w-56"
+                          aria-label={t("agentSettings")}
+                          className="w-[22rem] max-w-[calc(100vw-1rem)] p-1"
                         >
-                          {selectorItems}
-                        </DropdownMenuContent>
-                      </DropdownMenu>
+                          {showConfigLoading && (
+                            <SelectorLoadingChip label={t("loadingSettings")} />
+                          )}
+                          {showModeLoading && (
+                            <SelectorLoadingChip label={t("loadingMode")} />
+                          )}
+                          {collapsedSettings.length > 0 && (
+                            <SessionSelectorsPanel
+                              settings={collapsedSettings}
+                              settingsLabel={t("agentSettings")}
+                              onAfterSelect={() =>
+                                setCollapsedSelectorsOpen(false)
+                              }
+                            />
+                          )}
+                        </PopoverContent>
+                      </Popover>
                     </div>
                   )}
                 </div>
