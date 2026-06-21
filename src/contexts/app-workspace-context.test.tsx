@@ -8,6 +8,7 @@ import {
 import type {
   ConversationChange,
   DbConversationSummary,
+  FolderChange,
   FolderDetail,
 } from "@/lib/types"
 
@@ -17,27 +18,49 @@ import type {
 // can close over this shared state without a TDZ error.
 const h = vi.hoisted(() => ({
   handler: null as null | ((change: unknown) => void),
+  folderHandler: null as null | ((change: unknown) => void),
   reconnect: null as null | (() => void),
+  folderReconnect: null as null | (() => void),
   disposeSpy: vi.fn(),
+  folderDisposeSpy: vi.fn(),
   reconnectUnsubSpy: vi.fn(),
+  folderReconnectUnsubSpy: vi.fn(),
   listAll: vi.fn(async () => [] as unknown[]),
+  listOpenFolders: vi.fn(async () => [] as unknown[]),
+  listAllFolders: vi.fn(async () => [] as unknown[]),
 }))
 
 vi.mock("@/lib/platform", () => ({
-  subscribe: vi.fn(async (_event: string, handler: (c: unknown) => void) => {
+  // The provider registers two subscriptions — `conversation://changed` and
+  // `folder://changed` — so capture each handler / dispose spy independently;
+  // the conversation-sync tests keep asserting against `h.handler`/`h.disposeSpy`
+  // unchanged.
+  subscribe: vi.fn(async (event: string, handler: (c: unknown) => void) => {
+    if (event === "folder://changed") {
+      h.folderHandler = handler
+      return h.folderDisposeSpy
+    }
     h.handler = handler
     return h.disposeSpy
   }),
+  // Both subscription effects register a reconnect backstop. The folder effect
+  // runs after the conversation effect (later in the component body), so the
+  // second registration is the folder one; distinct unsub spies keep each
+  // subscription's cleanup independently assertable.
   onTransportReconnect: vi.fn((cb: () => void) => {
-    h.reconnect = cb
-    return h.reconnectUnsubSpy
+    if (h.reconnect == null) {
+      h.reconnect = cb
+      return h.reconnectUnsubSpy
+    }
+    h.folderReconnect = cb
+    return h.folderReconnectUnsubSpy
   }),
 }))
 
 vi.mock("@/lib/api", () => ({
   listAllConversations: h.listAll,
-  listAllFolderDetails: vi.fn(async () => []),
-  listOpenFolderDetails: vi.fn(async () => []),
+  listAllFolderDetails: h.listAllFolders,
+  listOpenFolderDetails: h.listOpenFolders,
   getGitBranch: vi.fn(async () => null),
   getGitHead: vi.fn(async () => ({
     is_repo: false,
@@ -151,13 +174,27 @@ function emit(change: ConversationChange) {
   })
 }
 
+function emitFolder(change: FolderChange) {
+  act(() => {
+    h.folderHandler?.(change)
+  })
+}
+
 beforeEach(() => {
   h.handler = null
+  h.folderHandler = null
   h.reconnect = null
+  h.folderReconnect = null
   h.disposeSpy.mockClear()
+  h.folderDisposeSpy.mockClear()
   h.reconnectUnsubSpy.mockClear()
+  h.folderReconnectUnsubSpy.mockClear()
   h.listAll.mockClear()
   h.listAll.mockResolvedValue([])
+  h.listOpenFolders.mockClear()
+  h.listOpenFolders.mockResolvedValue([])
+  h.listAllFolders.mockClear()
+  h.listAllFolders.mockResolvedValue([])
   ctx = null
 })
 
@@ -296,5 +333,52 @@ describe("upsertFolder list routing", () => {
     })
     expect(screen.getByTestId("all-folder-ids")).toHaveTextContent("7,9")
     expect(screen.getByTestId("folder-ids").textContent).toBe("")
+  })
+})
+
+describe("AppWorkspaceProvider folder://changed sync", () => {
+  it("registers a folder subscription + reconnect backstop on mount", async () => {
+    await mountProvider()
+    expect(h.folderHandler).toBeTypeOf("function")
+    expect(h.folderReconnect).toBeTypeOf("function")
+  })
+
+  it("upserts a regular folder into both lists on a folder upsert event", async () => {
+    // A headlessly-created worktree (e.g. an automation per-run worktree) must
+    // land in `folders` (so a conversation inside it can be grouped/rendered)
+    // and `allFolders` (cwd resolution) without a re-fetch.
+    await mountProvider()
+    emitFolder({ kind: "upsert", folder: makeFolder({ id: 12, parent_id: 1 }) })
+    expect(screen.getByTestId("folder-ids")).toHaveTextContent("12")
+    expect(screen.getByTestId("all-folder-ids")).toHaveTextContent("12")
+  })
+
+  it("replaces an existing folder in place on a repeat upsert", async () => {
+    await mountProvider()
+    emitFolder({ kind: "upsert", folder: makeFolder({ id: 12 }) })
+    emitFolder({ kind: "upsert", folder: makeFolder({ id: 13 }) })
+    emitFolder({
+      kind: "upsert",
+      folder: makeFolder({ id: 12, name: "renamed" }),
+    })
+    expect(screen.getByTestId("folder-ids")).toHaveTextContent("12,13")
+  })
+
+  it("re-fetches folders on transport reconnect (disconnect backstop)", async () => {
+    await mountProvider()
+    // Mount already fetched folders once.
+    expect(h.listOpenFolders).toHaveBeenCalledTimes(1)
+    await act(async () => {
+      h.folderReconnect?.()
+    })
+    expect(h.listOpenFolders).toHaveBeenCalledTimes(2)
+    expect(h.listAllFolders).toHaveBeenCalledTimes(2)
+  })
+
+  it("disposes the folder subscription + reconnect handler on unmount", async () => {
+    const { unmount } = await mountProvider()
+    unmount()
+    expect(h.folderDisposeSpy).toHaveBeenCalledTimes(1)
+    expect(h.folderReconnectUnsubSpy).toHaveBeenCalledTimes(1)
   })
 })

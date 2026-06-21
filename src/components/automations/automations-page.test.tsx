@@ -1,7 +1,19 @@
-import { render, screen, fireEvent } from "@testing-library/react"
+import {
+  render,
+  screen,
+  fireEvent,
+  waitFor,
+  within,
+} from "@testing-library/react"
+import userEvent from "@testing-library/user-event"
 import { NextIntlClientProvider } from "next-intl"
 import { beforeEach, describe, expect, it, vi } from "vitest"
 import enMessages from "@/i18n/messages/en.json"
+import {
+  automationRunNow,
+  automationSetEnabled,
+  automationDelete,
+} from "@/lib/api"
 import type { Automation } from "@/lib/types"
 
 // ── Context + side-effect mocks ────────────────────────────────────────────
@@ -156,5 +168,102 @@ describe("AutomationsPage (master-detail)", () => {
     expect(
       screen.queryByText(enMessages.Automations.startFromTemplate)
     ).not.toBeInTheDocument()
+  })
+
+  it("keeps the header switch and surfaces Run now + Edit beneath the prompt", () => {
+    renderPage()
+    // The detail header exposes only the enable toggle...
+    expect(screen.getByRole("switch")).toBeInTheDocument()
+    // ...the per-row ⋯ menu carries the full action set...
+    expect(
+      screen.getByLabelText(enMessages.Automations.moreActions)
+    ).toBeInTheDocument()
+    // ...and the detail surfaces Run now + Edit as buttons below the prompt.
+    expect(
+      screen.getByRole("button", { name: enMessages.Automations.runNow })
+    ).toBeInTheDocument()
+    expect(
+      screen.getByRole("button", { name: enMessages.Automations.edit })
+    ).toBeInTheDocument()
+  })
+
+  // Open the per-row ⋯ menu. Radix opens its menu on pointerdown, which
+  // user-event's click doesn't drive through this particular tree under jsdom
+  // (real browsers open on click fine); the keyboard path is deterministic and
+  // exercises the same menu wiring.
+  async function openRowMenu(user: ReturnType<typeof userEvent.setup>) {
+    const trigger = screen.getByLabelText(enMessages.Automations.moreActions)
+    trigger.focus()
+    await user.keyboard("{Enter}")
+  }
+
+  it("runs an automation from the list ⋯ menu", async () => {
+    const user = userEvent.setup()
+    renderPage()
+    await openRowMenu(user)
+    await user.click(
+      await screen.findByRole("menuitem", {
+        name: enMessages.Automations.runNow,
+      })
+    )
+    await waitFor(() =>
+      expect(vi.mocked(automationRunNow)).toHaveBeenCalledWith(7)
+    )
+  })
+
+  it("toggles enabled from the list ⋯ menu (enabled → disable)", async () => {
+    const user = userEvent.setup()
+    renderPage()
+    await openRowMenu(user)
+    // FIXTURE is enabled, so the toggle reads "Disable" and flips it off.
+    await user.click(
+      await screen.findByRole("menuitem", {
+        name: enMessages.Automations.disable,
+      })
+    )
+    await waitFor(() =>
+      expect(vi.mocked(automationSetEnabled)).toHaveBeenCalledWith(7, false)
+    )
+  })
+
+  it("confirms before deleting from the list ⋯ menu", async () => {
+    const user = userEvent.setup()
+    renderPage()
+    await openRowMenu(user)
+    await user.click(
+      await screen.findByRole("menuitem", {
+        name: enMessages.Automations.delete,
+      })
+    )
+    // A confirm dialog gates the destructive action.
+    const confirm = await screen.findByRole("alertdialog")
+    await user.click(
+      within(confirm).getByRole("button", {
+        name: enMessages.Automations.delete,
+      })
+    )
+    await waitFor(() =>
+      expect(vi.mocked(automationDelete)).toHaveBeenCalledWith(7)
+    )
+  })
+
+  it("runs the automation from the detail Run now button", async () => {
+    const user = userEvent.setup()
+    renderPage()
+    await user.click(
+      screen.getByRole("button", { name: enMessages.Automations.runNow })
+    )
+    await waitFor(() =>
+      expect(vi.mocked(automationRunNow)).toHaveBeenCalledWith(7)
+    )
+  })
+
+  it("opens the editor from the detail Edit button", async () => {
+    const user = userEvent.setup()
+    renderPage()
+    await user.click(
+      screen.getByRole("button", { name: enMessages.Automations.edit })
+    )
+    expect(screen.getByTestId("editor-name")).toHaveTextContent("Nightly sweep")
   })
 })

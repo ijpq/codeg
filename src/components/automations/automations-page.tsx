@@ -1,16 +1,32 @@
 "use client"
 
-import { useCallback, useEffect, useRef, useState } from "react"
+import {
+  Fragment,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react"
 import { useTranslations } from "next-intl"
 import { toast } from "sonner"
 import {
+  CalendarClock,
   Clock,
   CirclePlay,
+  Folder,
+  GitBranch,
+  ListFilter,
   Loader2,
+  MoreHorizontal,
+  MousePointerClick,
   Pencil,
   Play,
   Plus,
+  Power,
+  PowerOff,
   RotateCw,
+  SlidersHorizontal,
   SquareArrowOutUpRight,
   Trash2,
   X,
@@ -36,12 +52,33 @@ import {
   AlertDialogFooter,
   AlertDialogHeader,
   AlertDialogTitle,
-  AlertDialogTrigger,
 } from "@/components/ui/alert-dialog"
+import { AgentIcon } from "@/components/agent-icon"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { Switch } from "@/components/ui/switch"
 import { ScrollArea } from "@/components/ui/scroll-area"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
+import {
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuSeparator,
+  ContextMenuTrigger,
+} from "@/components/ui/context-menu"
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
 import {
   ResizableHandle,
   ResizablePanel,
@@ -148,6 +185,14 @@ function formatDuration(
   return `${hr}h ${min % 60}m`
 }
 
+// Absolute local date-time for run-history rows; null/invalid → "—".
+function formatDateTime(iso: string | null): string {
+  if (!iso) return "—"
+  const ts = Date.parse(iso)
+  if (Number.isNaN(ts)) return "—"
+  return new Date(ts).toLocaleString()
+}
+
 /** The detail pane's three states. "gallery" is the template picker shown when
  *  starting a new automation; "editor" hosts the form, seeded from a template
  *  (create) or an existing automation (edit). */
@@ -187,6 +232,22 @@ export function AutomationsPage() {
   // during render is impure (react-hooks/purity); this is the RunHistory idiom.
   const [now] = useState(() => Date.now())
 
+  // List filters (folder + enabled state), ephemeral per page mount.
+  const [folderFilter, setFolderFilter] = useState<number | "all">("all")
+  const [statusFilter, setStatusFilter] = useState<
+    "all" | "enabled" | "disabled"
+  >("all")
+  const visibleAutomations = useMemo(
+    () =>
+      automations.filter(
+        (a) =>
+          (folderFilter === "all" || a.root_folder_id === folderFilter) &&
+          (statusFilter === "all" ||
+            (statusFilter === "enabled" ? a.enabled : !a.enabled))
+      ),
+    [automations, folderFilter, statusFilter]
+  )
+
   const openGallery = () => {
     setEditing(null)
     setMode("gallery")
@@ -220,6 +281,20 @@ export function AutomationsPage() {
     setMode("detail")
   }
 
+  // Shared mutation runner for the per-row quick actions (run now / toggle /
+  // delete) hoisted out of the detail pane so the list's ⋯ menu can drive them.
+  const runAction = useCallback(
+    async (fn: () => Promise<unknown>) => {
+      try {
+        await fn()
+        await refetch()
+      } catch (e) {
+        toast.error(e instanceof Error ? e.message : String(e))
+      }
+    },
+    [refetch]
+  )
+
   const handleSubmit = async (draft: AutomationDraft) => {
     const saved =
       editing?.kind === "edit"
@@ -235,6 +310,14 @@ export function AutomationsPage() {
       <ScrollArea className="h-full">
         <div className="mx-auto w-full max-w-2xl p-4 sm:p-6">
           <AutomationEditor
+            // Key by edit target so switching to a different automation (e.g.
+            // ⋯ → Edit on another row while the editor is open) remounts with
+            // fresh state instead of showing the previous target's fields.
+            key={
+              editing.kind === "edit"
+                ? `edit-${editing.automation.id}`
+                : "create"
+            }
             automation={
               editing.kind === "edit" ? editing.automation : editing.seed
             }
@@ -278,25 +361,6 @@ export function AutomationsPage() {
 
   return (
     <div className="flex h-full min-h-0 flex-col bg-background">
-      <header className="flex h-11 shrink-0 items-center justify-between gap-2 border-b border-border px-4">
-        <div className="flex min-w-0 items-center gap-2">
-          <Zap
-            className="size-4 shrink-0 text-muted-foreground"
-            aria-hidden="true"
-          />
-          <h1 className="text-sm font-semibold">{t("title")}</h1>
-          <span className="hidden truncate text-xs text-muted-foreground md:inline">
-            {t("headerSubtitle")}
-          </span>
-        </div>
-        {hasAutomations && mode === "detail" ? (
-          <Button size="sm" onClick={openGallery}>
-            <Plus className="h-3.5 w-3.5" aria-hidden="true" />
-            {t("new")}
-          </Button>
-        ) : null}
-      </header>
-
       {hasAutomations ? (
         <ResizablePanelGroup direction="horizontal" className="min-h-0 flex-1">
           <ResizablePanel
@@ -305,19 +369,45 @@ export function AutomationsPage() {
             defaultSize={32}
             minSize={22}
           >
-            <ScrollArea className="h-full">
-              <ul className="flex flex-col gap-1 p-2">
-                {automations.map((a) => (
-                  <AutomationListItem
-                    key={a.id}
-                    automation={a}
-                    now={now}
-                    selected={mode === "detail" && current?.id === a.id}
-                    onSelect={() => selectAutomation(a)}
-                  />
-                ))}
-              </ul>
-            </ScrollArea>
+            <div className="@container flex h-full flex-col">
+              <PageHeader showNew={mode === "detail"} onNew={openGallery} />
+              {automations.length > 1 ? (
+                <ListFilters
+                  folders={folders}
+                  folderFilter={folderFilter}
+                  onFolderFilter={setFolderFilter}
+                  statusFilter={statusFilter}
+                  onStatusFilter={setStatusFilter}
+                />
+              ) : null}
+              <ScrollArea className="min-h-0 flex-1">
+                {visibleAutomations.length === 0 ? (
+                  <p className="px-3 py-6 text-center text-xs text-muted-foreground">
+                    {t("noMatches")}
+                  </p>
+                ) : (
+                  <ul className="flex flex-col gap-0.5 p-1.5">
+                    {visibleAutomations.map((a) => (
+                      <AutomationListItem
+                        key={a.id}
+                        automation={a}
+                        now={now}
+                        selected={mode === "detail" && current?.id === a.id}
+                        onSelect={() => selectAutomation(a)}
+                        onRunNow={() => runAction(() => automationRunNow(a.id))}
+                        onToggleEnabled={() =>
+                          runAction(() =>
+                            automationSetEnabled(a.id, !a.enabled)
+                          )
+                        }
+                        onEdit={() => startEdit(a)}
+                        onDelete={() => runAction(() => automationDelete(a.id))}
+                      />
+                    ))}
+                  </ul>
+                )}
+              </ScrollArea>
+            </div>
           </ResizablePanel>
           <ResizableHandle withHandle />
           <ResizablePanel id="automations-detail" order={2} defaultSize={68}>
@@ -328,9 +418,8 @@ export function AutomationsPage() {
             ) : current ? (
               <AutomationDetail
                 automation={current}
-                now={now}
-                onEdit={() => startEdit(current)}
                 refetch={refetch}
+                onEdit={() => startEdit(current)}
               />
             ) : (
               // Defensive only: `current` falls back to automations[0], which is
@@ -343,11 +432,159 @@ export function AutomationsPage() {
           </ResizablePanel>
         </ResizablePanelGroup>
       ) : (
-        <div className="min-h-0 flex-1">
-          {mode === "editor" && editing ? editorPane : picker(true)}
+        <div className="flex h-full min-h-0 flex-col">
+          <PageHeader showNew={false} onNew={openGallery} />
+          <div className="min-h-0 flex-1">
+            {mode === "editor" && editing ? editorPane : picker(true)}
+          </div>
         </div>
       )}
     </div>
+  )
+}
+
+// Folder + enabled-state filters above the list. The folder select only appears
+// when the workspace has more than one folder; the status select is always shown.
+function ListFilters({
+  folders,
+  folderFilter,
+  onFolderFilter,
+  statusFilter,
+  onStatusFilter,
+}: {
+  folders: Array<{ id: number; name: string }>
+  folderFilter: number | "all"
+  onFolderFilter: (v: number | "all") => void
+  statusFilter: "all" | "enabled" | "disabled"
+  onStatusFilter: (v: "all" | "enabled" | "disabled") => void
+}) {
+  const t = useTranslations("Automations")
+  return (
+    <div className="flex flex-wrap items-center gap-2 border-b border-border px-2 py-1.5">
+      <Select
+        value={statusFilter}
+        onValueChange={(v) =>
+          onStatusFilter(v as "all" | "enabled" | "disabled")
+        }
+      >
+        <SelectTrigger size="sm" className="h-7 w-auto gap-1.5 text-xs">
+          <ListFilter
+            className="size-3.5 text-muted-foreground"
+            aria-hidden="true"
+          />
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="all">{t("filterAll")}</SelectItem>
+          <SelectItem value="enabled">{t("enabled")}</SelectItem>
+          <SelectItem value="disabled">{t("statusDisabled")}</SelectItem>
+        </SelectContent>
+      </Select>
+      {folders.length > 1 ? (
+        <Select
+          value={folderFilter === "all" ? "all" : String(folderFilter)}
+          onValueChange={(v) => onFolderFilter(v === "all" ? "all" : Number(v))}
+        >
+          <SelectTrigger
+            size="sm"
+            className="h-7 w-auto max-w-[12rem] gap-1.5 text-xs"
+          >
+            <Folder
+              className="size-3.5 text-muted-foreground"
+              aria-hidden="true"
+            />
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">{t("allFolders")}</SelectItem>
+            {folders.map((f) => (
+              <SelectItem key={f.id} value={String(f.id)}>
+                {f.name}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      ) : null}
+    </div>
+  )
+}
+
+function PageHeader({
+  showNew,
+  onNew,
+}: {
+  showNew: boolean
+  onNew: () => void
+}) {
+  const t = useTranslations("Automations")
+  return (
+    <header className="flex h-10 shrink-0 items-center justify-between gap-2 border-b border-border pl-3.5 pr-2.5">
+      <div className="flex min-w-0 items-center gap-2">
+        <Zap
+          className="size-4 shrink-0 text-muted-foreground"
+          aria-hidden="true"
+        />
+        <h1 className="truncate text-sm font-semibold">{t("title")}</h1>
+      </div>
+      {showNew ? (
+        <Button
+          size="sm"
+          onClick={onNew}
+          aria-label={t("new")}
+          title={t("new")}
+        >
+          <Plus className="h-3.5 w-3.5" aria-hidden="true" />
+          {/* Collapses to a "+"-only button when the pane is too narrow for both
+              the title and the labeled button (the @container is the list pane). */}
+          <span className="hidden @[16rem]:inline">{t("new")}</span>
+        </Button>
+      ) : null}
+    </header>
+  )
+}
+
+// A single status dot riding the agent icon, mirroring the sidebar conversation
+// row. It blends two facts: a disabled automation reads muted regardless of
+// history; an enabled one is colored by its last run (emerald when it has never
+// run yet, i.e. "ready").
+const RUN_STATUS_DOT: Record<string, string> = {
+  running: "bg-amber-500",
+  succeeded: "bg-emerald-500",
+  failed: "bg-destructive",
+  cancelled: "bg-muted-foreground/50",
+  skipped: "bg-muted-foreground/50",
+}
+
+// Run-history timeline node tint per status — colors the node ring and the
+// trigger icon inside it; falls back to a neutral border for unknown states.
+const RUN_NODE_RING: Record<string, string> = {
+  running: "border-amber-500/50 text-amber-600 dark:text-amber-400",
+  succeeded: "border-emerald-500/50 text-emerald-600 dark:text-emerald-400",
+  failed: "border-destructive/50 text-destructive",
+  cancelled: "border-border text-muted-foreground",
+  skipped: "border-border text-muted-foreground",
+}
+
+function AutomationDot({
+  enabled,
+  status,
+}: {
+  enabled: boolean
+  status: string | null
+}) {
+  const color = !enabled
+    ? "bg-muted-foreground/40"
+    : status
+      ? (RUN_STATUS_DOT[status] ?? "bg-emerald-500")
+      : "bg-emerald-500"
+  return (
+    <span
+      className={cn(
+        "block size-1.5 rounded-full ring-2 ring-background",
+        color
+      )}
+      aria-hidden="true"
+    />
   )
 }
 
@@ -356,84 +593,235 @@ function AutomationListItem({
   now,
   selected,
   onSelect,
+  onRunNow,
+  onToggleEnabled,
+  onEdit,
+  onDelete,
 }: {
   automation: Automation
   now: number
   selected: boolean
   onSelect: () => void
+  onRunNow: () => void
+  onToggleEnabled: () => void
+  onEdit: () => void
+  onDelete: () => void
 }) {
   const t = useTranslations("Automations")
+  const [confirmOpen, setConfirmOpen] = useState(false)
+  const [menuOpen, setMenuOpen] = useState(false)
   const isSchedule = automation.trigger_kind === "schedule" && !!automation.cron
+  const isRunning = automation.last_run_status === "running"
   const showNextIn =
     isSchedule && automation.enabled && !!automation.next_run_at
-  const subline = showNextIn
+  const timeLabel = showNextIn
     ? t("nextIn", { rel: formatRelativeFuture(automation.next_run_at, now) })
     : automation.last_run_at
-      ? `${t("lastRun")} · ${formatRelative(automation.last_run_at, now)}`
+      ? formatRelative(automation.last_run_at, now)
       : null
+
+  // The row's quick actions, authored once so the ⋯ dropdown and the right-click
+  // context menu render exactly the same set (the user asked for parity).
+  const actions: Array<{
+    key: string
+    icon: React.ReactNode
+    label: string
+    onSelect: () => void
+    variant?: "destructive"
+    separatorBefore?: boolean
+  }> = [
+    {
+      key: "run",
+      icon: <Play className="size-3.5" aria-hidden="true" />,
+      label: t("runNow"),
+      onSelect: onRunNow,
+    },
+    {
+      key: "toggle",
+      icon: automation.enabled ? (
+        <PowerOff className="size-3.5" aria-hidden="true" />
+      ) : (
+        <Power className="size-3.5" aria-hidden="true" />
+      ),
+      label: automation.enabled ? t("disable") : t("enable"),
+      onSelect: onToggleEnabled,
+    },
+    {
+      key: "edit",
+      icon: <Pencil className="size-3.5" aria-hidden="true" />,
+      label: t("edit"),
+      onSelect: onEdit,
+    },
+    {
+      key: "delete",
+      icon: <Trash2 className="size-3.5" aria-hidden="true" />,
+      label: t("delete"),
+      // Let the menu close (and restore focus) before the dialog mounts —
+      // opening synchronously races focus restoration and self-dismisses.
+      onSelect: () => setTimeout(() => setConfirmOpen(true), 0),
+      variant: "destructive",
+      separatorBefore: true,
+    },
+  ]
+
+  // Render the shared actions into either menu's item/separator components.
+  const renderActions = (
+    Item: React.ElementType,
+    Separator: React.ElementType
+  ) =>
+    actions.map((a) => (
+      <Fragment key={a.key}>
+        {a.separatorBefore ? <Separator /> : null}
+        <Item variant={a.variant} onSelect={a.onSelect}>
+          {a.icon}
+          {a.label}
+        </Item>
+      </Fragment>
+    ))
 
   return (
     <li>
-      <button
-        type="button"
-        onClick={onSelect}
-        className={cn(
-          "flex w-full flex-col gap-1.5 rounded-lg border border-transparent px-2.5 py-2 text-left outline-none transition-colors",
-          "hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
-          selected && "border-border bg-accent"
-        )}
-      >
-        <div className="flex items-center gap-2">
-          <span
+      <ContextMenu>
+        <ContextMenuTrigger asChild>
+          <div
             className={cn(
-              "h-1.5 w-1.5 shrink-0 rounded-full",
-              automation.enabled ? "bg-emerald-500" : "bg-muted-foreground/40"
+              "group flex h-8 w-full items-center rounded-full pr-1 transition-colors",
+              selected ? "bg-accent" : "hover:bg-accent/60"
             )}
-            aria-hidden="true"
-          />
-          <span className="min-w-0 flex-1 truncate text-sm font-medium">
-            {automation.name}
-          </span>
-          <StatusChip status={automation.last_run_status} />
-        </div>
-        <div className="flex items-center gap-1.5 pl-3.5 text-xs text-muted-foreground">
-          <Badge variant="secondary" className="font-mono text-[0.625rem]">
-            {automation.agent_type}
-          </Badge>
-          <span className="flex min-w-0 items-center gap-1 truncate">
-            <Clock className="h-3 w-3 shrink-0" aria-hidden="true" />
-            <span className="truncate">
-              {isSchedule && automation.cron ? (
-                <ScheduleLabel cron={automation.cron} />
-              ) : (
-                t("manual")
-              )}
-            </span>
-          </span>
-        </div>
-        {subline ? (
-          <div className="truncate pl-3.5 text-[0.6875rem] text-muted-foreground/80">
-            {subline}
+          >
+            <button
+              type="button"
+              onClick={onSelect}
+              className="flex h-full min-w-0 flex-1 items-center gap-2.5 rounded-full pl-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
+            >
+              <span className="relative flex size-5 shrink-0 items-center justify-center">
+                <AgentIcon
+                  agentType={automation.agent_type}
+                  className="size-4"
+                />
+                <span className="absolute -right-0.5 -bottom-0.5">
+                  <AutomationDot
+                    enabled={automation.enabled}
+                    status={automation.last_run_status}
+                  />
+                </span>
+              </span>
+              <span
+                className={cn(
+                  "min-w-0 flex-1 truncate text-sm",
+                  automation.enabled
+                    ? "font-medium"
+                    : "font-normal text-muted-foreground"
+                )}
+              >
+                {automation.name}
+              </span>
+            </button>
+
+            <div className="flex shrink-0 items-center gap-0.5 pl-1">
+              {/* Time yields to the ⋯ affordance on hover, keyboard focus, or
+                  while the menu is open — mirroring the conversation row. */}
+              <span
+                className={cn(
+                  "flex items-center group-hover:hidden group-focus-within:hidden",
+                  menuOpen && "hidden"
+                )}
+              >
+                {isRunning ? (
+                  <Loader2
+                    className="size-3.5 animate-spin text-amber-600 dark:text-amber-400"
+                    aria-hidden="true"
+                  />
+                ) : timeLabel ? (
+                  <span
+                    className={cn(
+                      "shrink-0 tabular-nums text-[0.71875rem]",
+                      selected
+                        ? "font-medium text-muted-foreground"
+                        : "text-muted-foreground/70"
+                    )}
+                  >
+                    {timeLabel}
+                  </span>
+                ) : null}
+              </span>
+
+              <DropdownMenu onOpenChange={setMenuOpen}>
+                <DropdownMenuTrigger asChild>
+                  {/* Hidden when idle (the time sits in its place); reveals on
+                      hover, on keyboard focus entering the row, and while open.
+                      justify-end flushes the glyph to the time's right edge;
+                      no hover/open fill — only the icon color shifts. */}
+                  <Button
+                    variant="ghost"
+                    size="icon-xs"
+                    className="hidden justify-end text-muted-foreground/80 hover:bg-transparent hover:text-foreground group-hover:flex group-focus-within:flex aria-expanded:bg-transparent data-[state=open]:flex dark:hover:bg-transparent"
+                    aria-label={t("moreActions")}
+                  >
+                    <MoreHorizontal className="size-4" aria-hidden="true" />
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className="w-40">
+                  {renderActions(DropdownMenuItem, DropdownMenuSeparator)}
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </div>
           </div>
-        ) : null}
-      </button>
+        </ContextMenuTrigger>
+        {/* Right-click anywhere on the row opens the same actions as ⋯. */}
+        <ContextMenuContent className="w-40">
+          {renderActions(ContextMenuItem, ContextMenuSeparator)}
+        </ContextMenuContent>
+      </ContextMenu>
+
+      <AlertDialog open={confirmOpen} onOpenChange={setConfirmOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t("deleteTitle")}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {t("deleteDescription")}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{t("cancel")}</AlertDialogCancel>
+            <AlertDialogAction onClick={onDelete}>
+              {t("delete")}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </li>
   )
 }
 
-function DetailField({
+// One fact per card — icon + uppercase label on top, value below. Replaces the
+// old dense InfoRow grid so the detail's "Schedule & target" reads as a tidy set
+// of stat cards rather than a cramped two-column list.
+function StatCard({
+  icon,
   label,
   children,
+  className,
 }: {
+  icon: React.ReactNode
   label: string
   children: React.ReactNode
+  className?: string
 }) {
   return (
-    <div className="flex flex-col gap-0.5">
-      <dt className="text-[0.6875rem] font-medium uppercase tracking-wide text-muted-foreground">
-        {label}
-      </dt>
-      <dd className="text-sm">{children}</dd>
+    <div
+      className={cn(
+        "flex flex-col gap-1.5 rounded-xl border border-border bg-card p-3",
+        className
+      )}
+    >
+      <div className="flex items-center gap-1.5 text-muted-foreground [&>svg]:size-3.5">
+        {icon}
+        <span className="text-[0.6875rem] font-medium uppercase tracking-wide">
+          {label}
+        </span>
+      </div>
+      <div className="min-w-0 text-sm">{children}</div>
     </div>
   )
 }
@@ -457,14 +845,12 @@ function SectionCard({
 
 function AutomationDetail({
   automation,
-  now,
-  onEdit,
   refetch,
+  onEdit,
 }: {
   automation: Automation
-  now: number
-  onEdit: () => void
   refetch: () => Promise<void>
+  onEdit: () => void
 }) {
   const t = useTranslations("Automations")
   const { folders } = useAppWorkspace()
@@ -487,12 +873,10 @@ function AutomationDetail({
   const labels = automation.config.label_snapshot
   const configEntries = Object.entries(automation.config.config_values || {})
   const isSchedule = automation.trigger_kind === "schedule" && !!automation.cron
-  const showNextIn =
-    isSchedule && automation.enabled && !!automation.next_run_at
 
   return (
     <ScrollArea className="h-full">
-      <div className="mx-auto flex w-full max-w-3xl flex-col gap-4 p-4 sm:p-6">
+      <div className="@container mx-auto flex w-full max-w-3xl flex-col gap-4 p-4 sm:p-6">
         <div className="flex items-start justify-between gap-3">
           <div className="flex min-w-0 flex-col gap-1">
             <div className="flex min-w-0 items-center gap-2">
@@ -501,24 +885,9 @@ function AutomationDetail({
               </h2>
               <StatusChip status={automation.last_run_status} />
             </div>
-            <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-xs text-muted-foreground">
-              <Clock className="h-3 w-3 shrink-0" aria-hidden="true" />
-              {isSchedule && automation.cron ? (
-                <ScheduleLabel cron={automation.cron} />
-              ) : (
-                t("manual")
-              )}
-              {showNextIn ? (
-                <span>
-                  {"· "}
-                  {t("nextIn", {
-                    rel: formatRelativeFuture(automation.next_run_at, now),
-                  })}
-                </span>
-              ) : null}
-            </div>
           </div>
-          <div className="flex shrink-0 items-center gap-1.5">
+          <label className="flex shrink-0 items-center gap-2 text-xs text-muted-foreground">
+            {automation.enabled ? t("enabled") : t("statusDisabled")}
             <Switch
               checked={automation.enabled}
               disabled={busy}
@@ -527,61 +896,20 @@ function AutomationDetail({
               }
               aria-label={t("enabled")}
             />
-            <Button
-              size="sm"
-              variant="outline"
-              disabled={busy}
-              onClick={() => run(() => automationRunNow(automation.id))}
-            >
-              <Play className="h-3.5 w-3.5" aria-hidden="true" />
-              {t("runNow")}
-            </Button>
-            <Button size="sm" variant="ghost" disabled={busy} onClick={onEdit}>
-              <Pencil className="h-3.5 w-3.5" aria-hidden="true" />
-              {t("edit")}
-            </Button>
-            <AlertDialog>
-              <AlertDialogTrigger asChild>
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  disabled={busy}
-                  className="text-muted-foreground hover:text-destructive"
-                  aria-label={t("delete")}
-                >
-                  <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
-                </Button>
-              </AlertDialogTrigger>
-              <AlertDialogContent>
-                <AlertDialogHeader>
-                  <AlertDialogTitle>{t("deleteTitle")}</AlertDialogTitle>
-                  <AlertDialogDescription>
-                    {t("deleteDescription")}
-                  </AlertDialogDescription>
-                </AlertDialogHeader>
-                <AlertDialogFooter>
-                  <AlertDialogCancel>{t("cancel")}</AlertDialogCancel>
-                  <AlertDialogAction
-                    onClick={() => run(() => automationDelete(automation.id))}
-                  >
-                    {t("delete")}
-                  </AlertDialogAction>
-                </AlertDialogFooter>
-              </AlertDialogContent>
-            </AlertDialog>
-          </div>
+          </label>
         </div>
 
-        <SectionCard title={t("sectionSchedule")}>
-          <dl className="grid grid-cols-2 gap-x-6 gap-y-3">
-            <DetailField label={t("agent")}>
-              <Badge variant="secondary" className="font-mono text-[0.625rem]">
-                {labels?.agent_label ?? automation.agent_type}
-              </Badge>
-            </DetailField>
-            <DetailField label={t("trigger")}>
+        <div className="flex flex-col gap-2">
+          <h3 className="text-[0.6875rem] font-medium uppercase tracking-wide text-muted-foreground">
+            {t("sectionSchedule")}
+          </h3>
+          <div className="grid grid-cols-1 gap-3 @sm:grid-cols-2 @xl:grid-cols-3">
+            <StatCard
+              icon={isSchedule ? <CalendarClock /> : <MousePointerClick />}
+              label={t("trigger")}
+            >
               {isSchedule && automation.cron ? (
-                <span className="flex flex-wrap items-center gap-1.5">
+                <span className="flex flex-col gap-0.5">
                   <ScheduleLabel cron={automation.cron} />
                   <span className="font-mono text-xs text-muted-foreground">
                     {automation.cron}
@@ -590,32 +918,47 @@ function AutomationDetail({
               ) : (
                 t("manual")
               )}
-            </DetailField>
-            <DetailField label={t("folder")}>
-              <span className="truncate">
+            </StatCard>
+            <StatCard
+              icon={
+                <AgentIcon
+                  agentType={automation.agent_type}
+                  className="size-3.5"
+                />
+              }
+              label={t("agent")}
+            >
+              <span className="block truncate">
+                {labels?.agent_label ?? automation.agent_type}
+              </span>
+            </StatCard>
+            <StatCard icon={<Folder />} label={t("folder")}>
+              <span className="block truncate">
                 {labels?.folder_label ?? folderName}
               </span>
-            </DetailField>
-            <DetailField label={t("isolation")}>
-              {automation.isolation === "worktree_per_run"
-                ? t("isolationWorktree")
-                : t("isolationShared")}
-              {automation.isolation === "shared_in_root" &&
-              automation.branch ? (
-                <span className="ml-1 font-mono text-xs text-muted-foreground">
-                  {automation.branch}
-                </span>
-              ) : null}
-            </DetailField>
+            </StatCard>
+            <StatCard icon={<GitBranch />} label={t("isolation")}>
+              <span className="block">
+                {automation.isolation === "worktree_per_run"
+                  ? t("isolationWorktree")
+                  : t("isolationShared")}
+                {automation.isolation === "shared_in_root" &&
+                automation.branch ? (
+                  <span className="ml-1 font-mono text-xs text-muted-foreground">
+                    {automation.branch}
+                  </span>
+                ) : null}
+              </span>
+            </StatCard>
             {isSchedule ? (
-              <DetailField label={t("nextRun")}>
+              <StatCard icon={<Clock />} label={t("nextRun")}>
                 {automation.next_run_at
                   ? new Date(automation.next_run_at).toLocaleString()
                   : "—"}
-              </DetailField>
+              </StatCard>
             ) : null}
             {automation.config.mode_id || configEntries.length > 0 ? (
-              <DetailField label={t("config")}>
+              <StatCard icon={<SlidersHorizontal />} label={t("config")}>
                 <div className="flex flex-wrap gap-1">
                   {automation.config.mode_id ? (
                     <Badge variant="outline" className="text-[0.625rem]">
@@ -632,16 +975,30 @@ function AutomationDetail({
                     </Badge>
                   ))}
                 </div>
-              </DetailField>
+              </StatCard>
             ) : null}
-          </dl>
-        </SectionCard>
+          </div>
+        </div>
 
         <SectionCard title={t("sectionPrompt")}>
           <p className="whitespace-pre-wrap text-sm text-foreground/90">
             {automation.config.display_text || "—"}
           </p>
         </SectionCard>
+
+        <div className="flex gap-2">
+          <Button
+            onClick={() => run(() => automationRunNow(automation.id))}
+            disabled={busy}
+          >
+            <Play className="size-3.5" aria-hidden="true" />
+            {t("runNow")}
+          </Button>
+          <Button variant="outline" onClick={onEdit}>
+            <Pencil className="size-3.5" aria-hidden="true" />
+            {t("edit")}
+          </Button>
+        </div>
 
         <RunHistory
           key={automation.id}
@@ -665,7 +1022,6 @@ function RunHistory({
   const { openConversations } = useWorkbenchRoute()
   const [runs, setRuns] = useState<AutomationRun[]>([])
   const [loading, setLoading] = useState(true)
-  const [now, setNow] = useState(() => Date.now())
   const reqRef = useRef(0)
 
   const load = useCallback(async () => {
@@ -674,7 +1030,6 @@ function RunHistory({
       const list = await automationRuns(automation.id)
       if (id === reqRef.current) {
         setRuns(list)
-        setNow(Date.now())
       }
     } catch {
       // keep the previous list on transient error
@@ -746,43 +1101,88 @@ function RunHistory({
       ) : runs.length === 0 ? (
         <p className="py-4 text-xs text-muted-foreground">{t("noRuns")}</p>
       ) : (
-        <ul className="flex flex-col divide-y divide-border rounded-lg border border-border">
-          {runs.map((r) => (
-            <li key={r.id} className="flex items-center gap-2 px-3 py-2">
-              {r.trigger === "manual" ? (
-                <CirclePlay
-                  className="h-3.5 w-3.5 shrink-0 text-muted-foreground"
-                  aria-hidden="true"
-                />
-              ) : (
-                <Clock
-                  className="h-3.5 w-3.5 shrink-0 text-muted-foreground"
-                  aria-hidden="true"
-                />
-              )}
-              <StatusChip status={r.status} />
-              <div className="flex min-w-0 flex-1 flex-col">
+        <ol className="flex flex-col">
+          {runs.map((r, i) => (
+            <li key={r.id} className="flex gap-3">
+              {/* Rail: a status-tinted node + a connector line down to the next
+                  run. The connector is omitted on the last item so the line
+                  terminates at the final node. */}
+              <div className="flex flex-col items-center">
                 <span
-                  className="truncate text-xs"
-                  title={
-                    r.started_at
-                      ? new Date(r.started_at).toLocaleString()
-                      : undefined
-                  }
+                  className={cn(
+                    "z-10 flex size-7 shrink-0 items-center justify-center rounded-full border-2 bg-background",
+                    RUN_NODE_RING[r.status ?? ""] ??
+                      "border-border text-muted-foreground"
+                  )}
                 >
-                  {formatRelative(r.started_at, now)}
-                  {r.ended_at ? (
-                    <span className="text-muted-foreground">
-                      {" · "}
-                      {formatDuration(r.started_at, r.ended_at)}
-                    </span>
-                  ) : r.status === "running" ? (
-                    <span className="text-muted-foreground">
-                      {" · "}
-                      {t("running")}
-                    </span>
-                  ) : null}
+                  {r.trigger === "manual" ? (
+                    <CirclePlay className="size-3.5" aria-hidden="true" />
+                  ) : (
+                    <Clock className="size-3.5" aria-hidden="true" />
+                  )}
                 </span>
+                {i < runs.length - 1 ? (
+                  <span className="w-px flex-1 bg-border" aria-hidden="true" />
+                ) : null}
+              </div>
+
+              <div
+                className={cn(
+                  "flex min-w-0 flex-1 flex-col gap-0.5",
+                  i < runs.length - 1 && "pb-5"
+                )}
+              >
+                <div className="flex items-center gap-2">
+                  <StatusChip status={r.status} />
+                  {r.conversation_id != null ? (
+                    <Button
+                      size="icon"
+                      variant="ghost"
+                      className="size-6 shrink-0 text-muted-foreground"
+                      onClick={() => viewConversation(r)}
+                      title={t("viewConversation")}
+                      aria-label={t("viewConversation")}
+                    >
+                      <SquareArrowOutUpRight
+                        className="h-3.5 w-3.5"
+                        aria-hidden="true"
+                      />
+                    </Button>
+                  ) : null}
+                  {r.status === "running" ? (
+                    <Button
+                      size="icon"
+                      variant="ghost"
+                      className="size-6 shrink-0 text-muted-foreground hover:text-destructive"
+                      onClick={() => void cancel(r)}
+                      title={t("cancelRun")}
+                      aria-label={t("cancelRun")}
+                    >
+                      <X className="h-3.5 w-3.5" aria-hidden="true" />
+                    </Button>
+                  ) : null}
+                  <span
+                    className="min-w-0 flex-1 truncate text-xs tabular-nums text-muted-foreground"
+                    title={
+                      r.started_at
+                        ? new Date(r.started_at).toLocaleString()
+                        : undefined
+                    }
+                  >
+                    {formatDateTime(r.started_at)}
+                    {r.ended_at ? (
+                      <>
+                        {" · "}
+                        {formatDuration(r.started_at, r.ended_at)}
+                      </>
+                    ) : r.status === "running" ? (
+                      <>
+                        {" · "}
+                        {t("running")}
+                      </>
+                    ) : null}
+                  </span>
+                </div>
                 {r.error ? (
                   <span className="truncate text-[0.6875rem] text-destructive">
                     {r.error}
@@ -793,36 +1193,9 @@ function RunHistory({
                   </span>
                 ) : null}
               </div>
-              {r.status === "running" ? (
-                <Button
-                  size="icon"
-                  variant="ghost"
-                  className="h-6 w-6 text-muted-foreground hover:text-destructive"
-                  onClick={() => void cancel(r)}
-                  title={t("cancelRun")}
-                  aria-label={t("cancelRun")}
-                >
-                  <X className="h-3.5 w-3.5" aria-hidden="true" />
-                </Button>
-              ) : null}
-              {r.conversation_id != null ? (
-                <Button
-                  size="icon"
-                  variant="ghost"
-                  className="h-6 w-6 text-muted-foreground"
-                  onClick={() => viewConversation(r)}
-                  title={t("viewConversation")}
-                  aria-label={t("viewConversation")}
-                >
-                  <SquareArrowOutUpRight
-                    className="h-3.5 w-3.5"
-                    aria-hidden="true"
-                  />
-                </Button>
-              ) : null}
             </li>
           ))}
-        </ul>
+        </ol>
       )}
     </div>
   )

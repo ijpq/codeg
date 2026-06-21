@@ -326,6 +326,16 @@ export type ConversationChange =
 
 export const CONVERSATION_CHANGED_EVENT = "conversation://changed"
 
+/** Payload for the global `folder://changed` side-channel. A folder created or
+ *  updated headlessly — e.g. the automation engine minting a per-run worktree —
+ *  reaches every client's workspace list so a conversation produced inside it can
+ *  be grouped/rendered in the sidebar. Mirrors the Rust `FolderChange` enum
+ *  (serde `tag = "kind"`). Distinct from `folder://open-in-workspace`, whose
+ *  listener also opens + focuses a tab. */
+export type FolderChange = { kind: "upsert"; folder: FolderDetail }
+
+export const FOLDER_CHANGED_EVENT = "folder://changed"
+
 /** Global side-channel announcing a live-feedback enable/disable (payload is
  *  `FeedbackSettings`). The settings UI runs in a separate window, so the
  *  conversation feedback bar converges on this backend broadcast rather than a
@@ -876,6 +886,9 @@ export interface SessionConfigOptionInfo {
 export interface AgentOptionsSnapshot {
   modes: SessionModeStateInfo | null
   config_options: SessionConfigOptionInfo[]
+  /** Slash commands captured during the same transient probe as modes/config
+   *  (empty when the agent advertises none in the probe window). */
+  available_commands: AvailableCommandInfo[]
 }
 
 export interface AgentDelegationDefaults {

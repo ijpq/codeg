@@ -27,11 +27,13 @@ import { onTransportReconnect, subscribe } from "@/lib/platform"
 import { useAcpEvent } from "@/contexts/acp-connections-context"
 import {
   CONVERSATION_CHANGED_EVENT,
+  FOLDER_CHANGED_EVENT,
   type AgentStats,
   type AgentType,
   type ConversationChange,
   type DbConversationSummary,
   type EventEnvelope,
+  type FolderChange,
   type FolderDetail,
   type GitHeadInfo,
 } from "@/lib/types"
@@ -367,6 +369,50 @@ export function AppWorkspaceProvider({ children }: AppWorkspaceProviderProps) {
     }
     setAllFolders(upsert)
   }, [])
+
+  // Subscribe to the global `folder://changed` side-channel so a folder created
+  // headlessly (e.g. an automation per-run worktree) lands in this client's
+  // workspace list in real time — without it, a conversation produced in that
+  // worktree has no known folder to group under and never renders in the sidebar.
+  // Only upserts the list (+ seeds its branch); unlike WorkspaceOpenFolderListener
+  // it never opens/focuses a tab, so a background emitter can't steal focus.
+  useEffect(() => {
+    let disposed = false
+    let unlisten: (() => void) | undefined
+
+    void (async () => {
+      const dispose = await subscribe<FolderChange>(
+        FOLDER_CHANGED_EVENT,
+        (change) => {
+          if (change.kind === "upsert") {
+            upsertFolder(change.folder)
+            // Only seed the branch when the event actually carries one. A
+            // freshly-minted worktree row stores `git_branch: null` (resolved
+            // later by git-head detection), and re-broadcasting an existing root
+            // must not clobber its already-known in-memory branch with null.
+            if (change.folder.git_branch) {
+              setBranch(change.folder.id, change.folder.git_branch)
+            }
+          }
+        }
+      )
+      if (disposed) dispose()
+      else unlisten = dispose
+    })()
+
+    // A folder created while the WS was disconnected is dropped by the
+    // broadcaster (receiver_count == 0); a full folder re-fetch on reconnect
+    // reconciles. Returns null on desktop IPC (no disconnect window) → no-op.
+    const offReconnect = onTransportReconnect(() => {
+      void fetchFolders()
+    })
+
+    return () => {
+      disposed = true
+      unlisten?.()
+      offReconnect?.()
+    }
+  }, [upsertFolder, setBranch, fetchFolders])
 
   const openFolder = useCallback(
     async (path: string) => {
