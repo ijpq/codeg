@@ -847,14 +847,20 @@ function FolderLayoutShell({ children }: { children: React.ReactNode }) {
 // change activeTabId, so the interactive conversation pickers (sidebar list,
 // search dialog, run history) also call openConversations() directly.
 function WorkbenchRouteConversationSync() {
-  const { activeTabId } = useTabContext()
+  const { activeTabId, consumeRemoteActivation } = useTabContext()
   const { openConversations } = useWorkbenchRoute()
   const prevRef = useRef(activeTabId)
   useEffect(() => {
     if (prevRef.current === activeTabId) return
     prevRef.current = activeTabId
+    // A remote tab snapshot that mirrors another client's focus also changes
+    // activeTabId. That's not a local conversation activation, so don't hijack
+    // this window into the conversations route — doing so would unmount whatever
+    // non-conversation view it's on (e.g. the Automations editor + unsaved
+    // edits). Local activations leave the flag false and switch as before.
+    if (consumeRemoteActivation()) return
     openConversations()
-  }, [activeTabId, openConversations])
+  }, [activeTabId, openConversations, consumeRemoteActivation])
   return null
 }
 

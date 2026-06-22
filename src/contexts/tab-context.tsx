@@ -100,6 +100,14 @@ interface TabContextValue {
   pinTab: (tabId: string) => void
   toggleTileMode: () => void
   /**
+   * Read-and-clear the "the last active-tab change came from a remote snapshot"
+   * flag. The workbench route-sync chokepoint calls this on every active-tab
+   * change so a remotely-mirrored focus (another client switching tabs) does
+   * not yank this window into the conversations route. Returns true exactly
+   * once per remote-driven focus change.
+   */
+  consumeRemoteActivation: () => boolean
+  /**
    * Open (or re-target the singleton) draft conversation tab.
    *
    * - `inheritFromActive: false` (default) — resolve the agent purely from
@@ -313,6 +321,12 @@ export function TabProvider({ children }: TabProviderProps) {
   //   save (no version churn).
   const versionRef = useRef(0)
   const applyingRemoteRef = useRef(false)
+  // One-shot flag: an incoming remote snapshot mirrored the focused tab, so the
+  // active tab changed for a non-local reason. The route-sync chokepoint
+  // consumes this to avoid hijacking this window into the conversations route
+  // (which would unmount e.g. the Automations editor + its unsaved edits) just
+  // because another client switched tabs.
+  const remoteActivationPendingRef = useRef(false)
   const pendingRemoteRef = useRef<TabsChanged | null>(null)
   const tabsHydratedRef = useRef(false)
   const lastSavedPayloadRef = useRef<string | null>(null)
@@ -992,6 +1006,11 @@ export function TabProvider({ children }: TabProviderProps) {
           nextActiveId = nextTabs[0].id
         }
 
+        // A focus change driven by the remote snapshot (not local intent) must
+        // not trip the route-sync chokepoint into the conversations route.
+        if (nextActiveId !== prev.activeTabId) {
+          remoteActivationPendingRef.current = true
+        }
         // Seed the last-saved payload from the state we're about to commit
         // (focus included) so the guarded save-effect run is a confirmed no-op
         // AND a passive focus fallback never propagates to yank another client.
@@ -1805,12 +1824,20 @@ export function TabProvider({ children }: TabProviderProps) {
     }
   }, [rawTabs, activeTabId, tabsHydrated])
 
+  // Read-and-clear the remote-activation flag (see remoteActivationPendingRef).
+  const consumeRemoteActivation = useCallback(() => {
+    if (!remoteActivationPendingRef.current) return false
+    remoteActivationPendingRef.current = false
+    return true
+  }, [])
+
   const value = useMemo(
     () => ({
       tabs,
       activeTabId,
       tabsHydrated,
       isTileMode,
+      consumeRemoteActivation,
       openTab,
       closeTab,
       closeConversationTab,
@@ -1835,6 +1862,7 @@ export function TabProvider({ children }: TabProviderProps) {
       activeTabId,
       tabsHydrated,
       isTileMode,
+      consumeRemoteActivation,
       openTab,
       closeTab,
       closeConversationTab,
