@@ -15,7 +15,7 @@ function makeAgent(env: Record<string, string>): AcpAgentInfo {
   return {
     agent_type: "code_buddy",
     registry_id: "codebuddy-code",
-    registry_version: "2.109.2",
+    registry_version: "2.109.3",
     name: "CodeBuddy",
     description: "",
     available: true,

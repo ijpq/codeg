@@ -156,8 +156,8 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             name: "Claude Code",
             description: "ACP wrapper for Anthropic's Claude",
             distribution: AgentDistribution::Npx {
-                version: "0.49.0",
-                package: "@agentclientprotocol/claude-agent-acp@0.49.0",
+                version: "0.50.0",
+                package: "@agentclientprotocol/claude-agent-acp@0.50.0",
                 cmd: "claude-agent-acp",
                 args: &[],
                 env: &[],
@@ -203,8 +203,8 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             name: "OpenClaw",
             description: "OpenClaw is a personal AI assistant you run on your own devices.",
             distribution: AgentDistribution::Npx {
-                version: "2026.6.9",
-                package: "openclaw@2026.6.9",
+                version: "2026.6.10",
+                package: "openclaw@2026.6.10",
                 cmd: "openclaw",
                 args: &["acp"],
                 env: &[],
@@ -291,8 +291,8 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             name: "CodeBuddy",
             description: "Tencent Cloud's official AI coding assistant (ACP)",
             distribution: AgentDistribution::Npx {
-                version: "2.109.2",
-                package: "@tencent-ai/codebuddy-code@2.109.2",
+                version: "2.109.3",
+                package: "@tencent-ai/codebuddy-code@2.109.3",
                 cmd: "codebuddy",
                 args: &["--acp"],
                 env: &[],
@@ -404,8 +404,8 @@ mod tests {
     fn registry_pins_current_acp_agent_versions() {
         assert_npx_version(
             AgentType::ClaudeCode,
-            "0.49.0",
-            "@agentclientprotocol/claude-agent-acp@0.49.0",
+            "0.50.0",
+            "@agentclientprotocol/claude-agent-acp@0.50.0",
             None,
         );
         assert_npx_version(
@@ -416,15 +416,15 @@ mod tests {
         );
         assert_npx_version(
             AgentType::OpenClaw,
-            "2026.6.9",
-            "openclaw@2026.6.9",
+            "2026.6.10",
+            "openclaw@2026.6.10",
             Some("22.19.0"),
         );
         assert_npx_version(AgentType::Cline, "3.0.29", "cline@3.0.29", None);
         assert_npx_version(
             AgentType::CodeBuddy,
-            "2.109.2",
-            "@tencent-ai/codebuddy-code@2.109.2",
+            "2.109.3",
+            "@tencent-ai/codebuddy-code@2.109.3",
             Some("22.0.0"),
         );
         assert_npx_version(
