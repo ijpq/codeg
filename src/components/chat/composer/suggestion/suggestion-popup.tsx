@@ -413,11 +413,17 @@ export const SuggestionPopup = forwardRef<
                     onMouseEnter={() => setSelectedIndex(index)}
                   >
                     <ReferenceIcon data={item.reference} variant="option" />
-                    <span className="flex-1 truncate">
+                    <span
+                      className="flex-1 truncate"
+                      title={item.reference.label || item.reference.id}
+                    >
                       {item.reference.label || item.reference.id}
                     </span>
                     {item.detail && (
-                      <span className="max-w-[10rem] truncate text-xs text-muted-foreground">
+                      <span
+                        className="max-w-[10rem] truncate text-xs text-muted-foreground"
+                        title={item.detail}
+                      >
                         {item.detail}
                       </span>
                     )}
