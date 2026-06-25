@@ -10,7 +10,8 @@ use sacp::schema::{
     PermissionOptionKind, Plan, PlanEntryPriority, PlanEntryStatus, PromptRequest, ProtocolVersion,
     ReadTextFileRequest, ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, ResourceLink,
-    SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
+    ResumeSessionRequest, ResumeSessionResponse, SelectedPermissionOutcome, SessionConfigKind,
+    SessionConfigOption, SessionConfigOptionCategory,
     SessionConfigSelectGroup, SessionConfigSelectOption, SessionConfigSelectOptions, SessionId,
     SessionModeState, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
     SetSessionConfigOptionResponse, SetSessionModeRequest, StopReason, TerminalExitStatus,
@@ -985,6 +986,51 @@ fn build_load_session_request(
     req
 }
 
+/// Build a `session/resume` request. Mirrors `build_load_session_request`
+/// (same fields + ClaudeCode raw-SDK meta + non-empty mcp_servers); the only
+/// wire difference is that `ResumeSessionRequest.mcp_servers` is
+/// `skip_serializing_if = Vec::is_empty`, so an empty list is omitted from the
+/// payload rather than emitted as `[]`.
+fn build_resume_session_request(
+    agent_type: AgentType,
+    session_id: SessionId,
+    cwd: &Path,
+    mcp_servers: Vec<McpServer>,
+) -> ResumeSessionRequest {
+    let mut req = ResumeSessionRequest::new(session_id, cwd.to_path_buf());
+    if let Some(meta) = claude_raw_sdk_session_meta(agent_type) {
+        req = req.meta(meta);
+    }
+    if !mcp_servers.is_empty() {
+        req = req.mcp_servers(mcp_servers);
+    }
+    req
+}
+
+/// Wire-level half of `session/resume`: send the request and deserialize the
+/// reply into `ResumeSessionResponse`.
+///
+/// `sacp` 11.0.0 ships no `JsonRpcRequest` impl for `ResumeSessionRequest`, and
+/// the orphan rule blocks codeg from adding one, so we send via `UntypedMessage`
+/// — the same in-tree pattern `set_session_config_option_inner` already uses for
+/// `session/set_config_option`. On a JSON-RPC error the agent returns,
+/// `block_task()` yields `Err(sacp::Error)` with `.code` / `.to_string()`
+/// intact, so the caller's error ladder reads identically to the
+/// `session/load` arm.
+async fn send_resume_session(
+    cx: &ConnectionTo<Agent>,
+    req: ResumeSessionRequest,
+) -> Result<ResumeSessionResponse, sacp::Error> {
+    let untyped_req = UntypedMessage::new("session/resume", req).map_err(|e| {
+        sacp::util::internal_error(format!("Failed to build resume request: {e}"))
+    })?;
+
+    let raw_response = cx.send_request_to(Agent, untyped_req).block_task().await?;
+    serde_json::from_value(raw_response).map_err(|e| {
+        sacp::util::internal_error(format!("Failed to parse resume response: {e}"))
+    })
+}
+
 /// Load MCP servers configured for `agent_type` and convert them into the
 /// ACP wire format. Errors and unsupported entries are logged and skipped so
 /// a single malformed entry never blocks a session from starting.
@@ -1563,9 +1609,14 @@ async fn run_connection(
                 .session_capabilities
                 .fork
                 .is_some();
+            let supports_resume = init_resp
+                .agent_capabilities
+                .session_capabilities
+                .resume
+                .is_some();
             tracing::info!(
-                "[ACP] Agent capabilities: load_session={}, fork={}",
-                init_resp.agent_capabilities.load_session, supports_fork
+                "[ACP] Agent capabilities: load_session={}, fork={}, resume={}",
+                init_resp.agent_capabilities.load_session, supports_fork, supports_resume
             );
 
             // Whether this agent accepts MCP server entries over the ACP wire
@@ -1668,6 +1719,119 @@ async fn run_connection(
             .await;
 
             if let Some(sid) = session_id {
+                // Prefer session/resume when the agent advertises the
+                // capability: it restores session context WITHOUT replaying
+                // history (which session/load does only for us to drain and
+                // discard — the transcript the user sees comes from the disk
+                // parser, not the ACP wire). On any non-terminal resume failure
+                // we fall through to the session/load block below, so the
+                // effective chain is resume → load → new.
+                if supports_resume {
+                    let resume_req = build_resume_session_request(
+                        agent_type,
+                        SessionId::new(sid.clone()),
+                        &cwd,
+                        mcp_servers.clone(),
+                    );
+                    match send_resume_session(&cx, resume_req).await {
+                        Ok(resume_resp) => {
+                            let initial_config_options = resume_resp.config_options.clone();
+                            let new_resp = NewSessionResponse::new(SessionId::new(sid.clone()))
+                                .modes(resume_resp.modes)
+                                .config_options(resume_resp.config_options)
+                                .meta(resume_resp.meta);
+                            let mut session = cx.attach_session(new_resp, Default::default())?;
+
+                            // No drain: session/resume does not replay history,
+                            // so there is nothing to discard. Any buffered
+                            // notification (e.g. an early AvailableCommandsUpdate)
+                            // is consumed and forwarded by run_conversation_loop.
+
+                            emit_with_state(
+                                &state,
+                                &emitter_clone,
+                                AcpEvent::SessionStarted {
+                                    session_id: sid.clone(),
+                                },
+                            )
+                            .await;
+                            emit_session_modes(&state, &emitter_clone, session.modes()).await;
+                            let updated_config_options = apply_preferred_session_options(
+                                &cx,
+                                &mut session,
+                                &state,
+                                &emitter_clone,
+                                preferred_mode_id.as_deref(),
+                                &preferred_config_values,
+                                initial_config_options.unwrap_or_default(),
+                            )
+                            .await;
+                            emit_session_config_options_values(
+                                &state,
+                                &emitter_clone,
+                                agent_type,
+                                updated_config_options,
+                            )
+                            .await;
+                            emit_selectors_ready(&state, &emitter_clone).await;
+
+                            let loop_result = run_conversation_loop(
+                                &mut session,
+                                &conn_id,
+                                &emitter_clone,
+                                &state,
+                                agent_type,
+                                &perms,
+                                &mut cmd_rx,
+                                terminal_runtime.clone(),
+                                &cwd_string,
+                                supports_fork,
+                                delegation_injection.as_ref(),
+                            )
+                            .await;
+                            terminal_runtime.release_all_for_session(&sid).await;
+                            drop(session);
+                            // Explicit return: this arm is NOT in tail position
+                            // (the session/load block follows it), so without
+                            // `return` a successful resume would fall into
+                            // session/load.
+                            return handle_fork_or_exit(
+                                loop_result,
+                                &conn_id,
+                                &emitter_clone,
+                                &state,
+                                agent_type,
+                                &perms,
+                                &mut cmd_rx,
+                                terminal_runtime.clone(),
+                                &cwd,
+                                &cwd_string,
+                                delegation_injection.as_ref(),
+                            )
+                            .await;
+                        }
+                        Err(e) => {
+                            // resume is unstable and NOT guaranteed equivalent to
+                            // session/load, so a resume-specific failure must
+                            // never deny a load that might still succeed. EVERY
+                            // resume error — ResourceNotFound, "Authentication
+                            // required", "Method not found", or anything else —
+                            // falls through to the session/load block below,
+                            // which already owns all terminal decisions
+                            // (SessionLoadFailed for not-found, silent stop for
+                            // auth, fallback to session/new otherwise). No
+                            // user-facing event is emitted here: load re-derives
+                            // the same outcome a moment later, so emitting now
+                            // would double up (not-found) or flash a transient
+                            // error that self-heals when load succeeds.
+                            tracing::warn!(
+                                "[ACP] session/resume failed ({e}); falling back to session/load"
+                            );
+                            // fall through to the session/load block below
+                        }
+                    }
+                }
+
                 // Load existing session via session/load
                 let load_req = build_load_session_request(
                     agent_type,
@@ -4666,6 +4830,75 @@ mod tests {
             Some(&serde_json::json!([])),
             "OpenClaw session/load mcpServers must serialize as an empty list"
         );
+    }
+
+    #[test]
+    fn build_resume_session_request_sets_claude_raw_meta() {
+        let cwd = std::path::PathBuf::from("/tmp/codeg");
+        let req = build_resume_session_request(
+            AgentType::ClaudeCode,
+            SessionId::new("abc".to_string()),
+            &cwd,
+            Vec::new(),
+        );
+
+        assert_eq!(
+            req.meta
+                .as_ref()
+                .and_then(|m| m.get("claudeCode"))
+                .and_then(|v| v.get("emitRawSDKMessages"))
+                .and_then(|v| v.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn build_resume_session_request_skips_meta_for_non_claude() {
+        let cwd = std::path::PathBuf::from("/tmp/codeg");
+        let req = build_resume_session_request(
+            AgentType::Codex,
+            SessionId::new("abc".to_string()),
+            &cwd,
+            Vec::new(),
+        );
+
+        assert!(req.meta.is_none());
+    }
+
+    // Unlike NewSessionRequest/LoadSessionRequest (whose `mcp_servers` has no
+    // `skip_serializing_if`, so it always serializes as `[]`),
+    // ResumeSessionRequest marks `mcp_servers` `skip_serializing_if =
+    // Vec::is_empty` — an empty list is OMITTED from the wire entirely. OpenClaw
+    // (which supports session/resume) tolerates both an absent key and `[]`, and
+    // the connection-layer gate keeps the list empty regardless, so no server
+    // entry can ever reach it. Pin both the empty-list invariant and the
+    // documented wire-shape divergence here.
+    #[test]
+    fn openclaw_resume_request_carries_no_mcp_servers() {
+        let cwd = std::path::PathBuf::from("/tmp/codeg");
+        let req = build_resume_session_request(
+            AgentType::OpenClaw,
+            SessionId::new("openclaw-session".to_string()),
+            &cwd,
+            Vec::new(),
+        );
+        assert!(
+            req.mcp_servers.is_empty(),
+            "OpenClaw session/resume must carry no MCP servers"
+        );
+
+        let json = serde_json::to_value(&req).unwrap();
+        assert!(
+            json.get("mcpServers").is_none(),
+            "empty mcp_servers must be omitted from the resume wire payload"
+        );
+        // camelCase round-trip: sanity that the UntypedMessage send produces the
+        // ACP-correct shape.
+        assert!(
+            json.get("sessionId").is_some(),
+            "sessionId must serialize in camelCase"
+        );
+        assert!(json.get("cwd").is_some());
     }
 
     #[test]
