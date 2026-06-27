@@ -2420,6 +2420,22 @@
         "dismiss": "忽略",
         "reconnectFailed": "重新連線工作階段失敗",
         "applied": "已套用新設定"
+      },
+      "collabAgent": {
+        "title": "子智能體",
+        "errorTitle": "子智能體任務失敗",
+        "statesLabel": "子智能體",
+        "statusRunning": "執行中",
+        "statusCompleted": "已完成",
+        "statusFailed": "失敗",
+        "statusPending": "初始化中",
+        "statusInterrupted": "已中斷",
+        "statusClosed": "已關閉",
+        "statusNotFound": "未找到",
+        "opSpawn": "啟動子智能體",
+        "opWait": "取得子智能體結果",
+        "opClose": "結束子智能體",
+        "opResume": "恢復子智能體"
       }
     },
     "diffPreview": {

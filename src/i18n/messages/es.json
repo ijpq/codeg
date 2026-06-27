@@ -2420,6 +2420,22 @@
         "dismiss": "Descartar",
         "reconnectFailed": "No se pudo reconectar la sesión",
         "applied": "Nueva configuración aplicada"
+      },
+      "collabAgent": {
+        "title": "Subagente",
+        "errorTitle": "La tarea del subagente falló",
+        "statesLabel": "Subagentes",
+        "statusRunning": "En ejecución",
+        "statusCompleted": "Completado",
+        "statusFailed": "Fallido",
+        "statusPending": "Iniciando",
+        "statusInterrupted": "Interrumpido",
+        "statusClosed": "Cerrado",
+        "statusNotFound": "No encontrado",
+        "opSpawn": "Iniciando subagente",
+        "opWait": "Obteniendo resultado del subagente",
+        "opClose": "Cerrando subagente",
+        "opResume": "Reanudando subagente"
       }
     },
     "diffPreview": {

@@ -2420,6 +2420,22 @@
         "dismiss": "Ignorer",
         "reconnectFailed": "Échec de la reconnexion de la session",
         "applied": "Nouvelle configuration appliquée"
+      },
+      "collabAgent": {
+        "title": "Sous-agent",
+        "errorTitle": "Échec de la tâche du sous-agent",
+        "statesLabel": "Sous-agents",
+        "statusRunning": "En cours",
+        "statusCompleted": "Terminé",
+        "statusFailed": "Échec",
+        "statusPending": "Démarrage",
+        "statusInterrupted": "Interrompu",
+        "statusClosed": "Fermé",
+        "statusNotFound": "Introuvable",
+        "opSpawn": "Démarrage du sous-agent",
+        "opWait": "Récupération du résultat du sous-agent",
+        "opClose": "Fermeture du sous-agent",
+        "opResume": "Reprise du sous-agent"
       }
     },
     "diffPreview": {

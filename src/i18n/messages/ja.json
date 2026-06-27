@@ -2420,6 +2420,22 @@
         "dismiss": "閉じる",
         "reconnectFailed": "セッションの再接続に失敗しました",
         "applied": "新しい設定を適用しました"
+      },
+      "collabAgent": {
+        "title": "サブエージェント",
+        "errorTitle": "サブエージェントのタスクが失敗しました",
+        "statesLabel": "サブエージェント",
+        "statusRunning": "実行中",
+        "statusCompleted": "完了",
+        "statusFailed": "失敗",
+        "statusPending": "起動中",
+        "statusInterrupted": "中断",
+        "statusClosed": "終了",
+        "statusNotFound": "見つかりません",
+        "opSpawn": "サブエージェントを起動中",
+        "opWait": "サブエージェントの結果を取得中",
+        "opClose": "サブエージェントを終了中",
+        "opResume": "サブエージェントを再開中"
       }
     },
     "diffPreview": {

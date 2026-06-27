@@ -2420,6 +2420,22 @@
         "dismiss": "닫기",
         "reconnectFailed": "세션 다시 연결 실패",
         "applied": "새 설정이 적용되었습니다"
+      },
+      "collabAgent": {
+        "title": "서브 에이전트",
+        "errorTitle": "서브 에이전트 작업이 실패했습니다",
+        "statesLabel": "서브 에이전트",
+        "statusRunning": "실행 중",
+        "statusCompleted": "완료됨",
+        "statusFailed": "실패",
+        "statusPending": "시작 중",
+        "statusInterrupted": "중단됨",
+        "statusClosed": "종료됨",
+        "statusNotFound": "찾을 수 없음",
+        "opSpawn": "서브 에이전트 시작 중",
+        "opWait": "서브 에이전트 결과 가져오는 중",
+        "opClose": "서브 에이전트 종료 중",
+        "opResume": "서브 에이전트 재개 중"
       }
     },
     "diffPreview": {

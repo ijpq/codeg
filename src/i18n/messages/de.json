@@ -2420,6 +2420,22 @@
         "dismiss": "Schließen",
         "reconnectFailed": "Sitzung konnte nicht neu verbunden werden",
         "applied": "Neue Konfiguration angewendet"
+      },
+      "collabAgent": {
+        "title": "Subagent",
+        "errorTitle": "Subagent-Aufgabe fehlgeschlagen",
+        "statesLabel": "Subagenten",
+        "statusRunning": "Läuft",
+        "statusCompleted": "Abgeschlossen",
+        "statusFailed": "Fehlgeschlagen",
+        "statusPending": "Wird gestartet",
+        "statusInterrupted": "Unterbrochen",
+        "statusClosed": "Geschlossen",
+        "statusNotFound": "Nicht gefunden",
+        "opSpawn": "Sub-Agent wird gestartet",
+        "opWait": "Sub-Agent-Ergebnis wird abgerufen",
+        "opClose": "Sub-Agent wird geschlossen",
+        "opResume": "Sub-Agent wird fortgesetzt"
       }
     },
     "diffPreview": {
