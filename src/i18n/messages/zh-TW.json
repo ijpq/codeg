@@ -2440,6 +2440,12 @@
           "other": "呼叫 {count} 個工具",
           "errorSuffix": "{count} 個失敗",
           "joiner": " · "
+        },
+        "planMode": {
+          "entered": "進入計畫模式",
+          "planLabel": "計畫",
+          "submitted": "計畫已提交",
+          "switched": "切換模式"
         }
       },
       "messageNav": {

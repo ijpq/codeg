@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest"
 
 import {
+  extractPlanMarkdown,
   isPlanLikeToolName,
+  isPlanModeToolName,
   kimiTodoWriteEntries,
   normalizePriority,
   normalizeStatus,
@@ -49,6 +51,51 @@ describe("isPlanLikeToolName", () => {
   it("returns false for unrelated tools", () => {
     expect(isPlanLikeToolName("Bash")).toBe(false)
     expect(isPlanLikeToolName("read_file")).toBe(false)
+  })
+})
+
+describe("isPlanModeToolName", () => {
+  it("recognizes plan-mode transition tools (any casing/separator)", () => {
+    expect(isPlanModeToolName("EnterPlanMode")).toBe(true)
+    expect(isPlanModeToolName("enter_plan_mode")).toBe(true)
+    expect(isPlanModeToolName("ExitPlanMode")).toBe(true)
+    expect(isPlanModeToolName("exit_plan_mode")).toBe(true)
+    expect(isPlanModeToolName("switch_mode")).toBe(true)
+    expect(isPlanModeToolName("switchMode")).toBe(true)
+  })
+
+  it("is narrower than isPlanLikeToolName: update_plan is plan-like, not plan-mode", () => {
+    // update_plan (Codex) converts to a PlanCard checklist — it must NOT be
+    // pulled out of grouping as a mode tool.
+    expect(isPlanLikeToolName("update_plan")).toBe(true)
+    expect(isPlanModeToolName("update_plan")).toBe(false)
+  })
+
+  it("returns false for unrelated and plan-named-but-not-mode tools", () => {
+    expect(isPlanModeToolName("TodoWrite")).toBe(false)
+    expect(isPlanModeToolName("plan_review")).toBe(false)
+    expect(isPlanModeToolName("Bash")).toBe(false)
+  })
+})
+
+describe("extractPlanMarkdown", () => {
+  it("reads the direct plan / Plan field", () => {
+    expect(extractPlanMarkdown({ plan: "# Title\n- a" })).toBe("# Title\n- a")
+    expect(extractPlanMarkdown({ Plan: "do x" })).toBe("do x")
+  })
+
+  it("reads one level into a rawInput / raw_input envelope", () => {
+    expect(extractPlanMarkdown({ rawInput: { plan: "nested" } })).toBe("nested")
+    expect(extractPlanMarkdown({ raw_input: { Plan: "nested2" } })).toBe(
+      "nested2"
+    )
+  })
+
+  it("returns null when there is no non-empty plan string", () => {
+    expect(extractPlanMarkdown({})).toBeNull()
+    expect(extractPlanMarkdown({ plan: "   " })).toBeNull()
+    expect(extractPlanMarkdown({ plan: 42 })).toBeNull()
+    expect(extractPlanMarkdown({ rawInput: { other: "x" } })).toBeNull()
   })
 })
 

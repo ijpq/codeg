@@ -2440,6 +2440,12 @@
           "other": "{count, plural, one {Used # tool} other {Used # tools}}",
           "errorSuffix": "{count, plural, one {# failed} other {# failed}}",
           "joiner": " · "
+        },
+        "planMode": {
+          "entered": "Entered plan mode",
+          "planLabel": "Plan",
+          "submitted": "Plan submitted",
+          "switched": "Switched mode"
         }
       },
       "messageNav": {

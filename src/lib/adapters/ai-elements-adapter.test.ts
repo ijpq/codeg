@@ -136,6 +136,29 @@ describe("groupConsecutiveToolCalls", () => {
       "tool-call",
     ])
   })
+
+  it("leaves plan-mode tools standalone (no '思考 N 次' tool-group)", () => {
+    const out = groupConsecutiveToolCalls([
+      poll("read"),
+      poll("EnterPlanMode"),
+      poll("read"),
+    ])
+
+    expect(out.map((p) => p.type)).toEqual([
+      "tool-group",
+      "tool-call",
+      "tool-group",
+    ])
+  })
+
+  it("does not wrap a lone plan-mode tool into a group", () => {
+    expect(
+      groupConsecutiveToolCalls([poll("EnterPlanMode")]).map((p) => p.type)
+    ).toEqual(["tool-call"])
+    expect(
+      groupConsecutiveToolCalls([poll("switch_mode")]).map((p) => p.type)
+    ).toEqual(["tool-call"])
+  })
 })
 
 describe("dropHiddenFeedbackChecks", () => {
@@ -638,6 +661,53 @@ describe("adaptMessageTurn plan handling", () => {
       { content: "Step A", status: "in_progress", priority: "high" },
       { content: "Step B", status: "completed", priority: "low" },
     ])
+  })
+
+  it("drops an empty redacted-thinking block and renders EnterPlanMode standalone (history)", () => {
+    const adapted = adaptMessageTurn(
+      {
+        id: "plan-mode",
+        role: "assistant",
+        timestamp: "2026-06-29T00:00:00.000Z",
+        blocks: [
+          { type: "thinking", text: "" },
+          { type: "text", text: "I'll plan it first" },
+          {
+            type: "tool_use",
+            tool_use_id: "epm-1",
+            tool_name: "EnterPlanMode",
+            input_preview: "{}",
+          },
+        ],
+      },
+      msgText,
+      false
+    )
+
+    // Empty thinking is dropped; EnterPlanMode is a standalone tool-call (not a
+    // "思考 N 次" tool-group).
+    expect(adapted.content.map((p) => p.type)).toEqual(["text", "tool-call"])
+    const tc = adapted.content[1]
+    if (tc.type !== "tool-call") throw new Error("expected a tool-call")
+    expect(tc.toolName).toBe("EnterPlanMode")
+  })
+
+  it("keeps an empty thinking block while streaming (live Thinking… indicator)", () => {
+    const adapted = adaptMessageTurn(
+      {
+        id: "plan-mode-live",
+        role: "assistant",
+        timestamp: "2026-06-29T00:00:00.000Z",
+        blocks: [{ type: "thinking", text: "" }],
+      },
+      msgText,
+      true
+    )
+
+    expect(adapted.content.map((p) => p.type)).toEqual(["reasoning"])
+    const reasoning = adapted.content[0]
+    if (reasoning.type !== "reasoning") throw new Error("expected a reasoning")
+    expect(reasoning.isStreaming).toBe(true)
   })
 
   it("converts a persisted TodoWrite tool_use (+ its result) into a single plan part with no orphan tool-result", () => {

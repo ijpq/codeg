@@ -15,7 +15,11 @@ import {
 import { normalizeToolName } from "@/lib/tool-call-normalization"
 import { feedbackCheckHasContent } from "@/lib/feedback-check"
 import { stripFeedbackReminder } from "@/lib/feedback-reminder"
-import { isPlanLikeToolName, parseTodosFromJson } from "@/lib/plan-parse"
+import {
+  isPlanLikeToolName,
+  isPlanModeToolName,
+  parseTodosFromJson,
+} from "@/lib/plan-parse"
 import {
   tokenizeReferenceLinks,
   unescapeReferenceLabel,
@@ -1110,7 +1114,15 @@ export function groupConsecutiveToolCalls(
   }
 
   for (const part of parts) {
-    if (part.type === "tool-call" && !isAgentLikeToolName(part.toolName)) {
+    if (
+      part.type === "tool-call" &&
+      !isAgentLikeToolName(part.toolName) &&
+      // Plan-mode tools (EnterPlanMode/ExitPlanMode/switch_mode) render through
+      // a dedicated <PlanModeCard>, so they break the run instead of folding
+      // into a "思考 N 次" tool-group. `part.toolName` is the raw name here;
+      // `isPlanModeToolName` normalizes it internally.
+      !isPlanModeToolName(part.toolName)
+    ) {
       buffer.push(part)
       continue
     }
@@ -1638,6 +1650,18 @@ export function adaptMessageTurn(
 
     const adapted = adaptContentBlock(block, turn.id, index, false)
     if (adapted) {
+      // Drop stray empty redacted-thinking capsules (`{thinking:"",signature}`)
+      // on the history/replay path. Gated on `!isStreaming`: while streaming, an
+      // empty thinking block is a legitimate live state that drives the
+      // "Thinking…" indicator (and is permanent for reasoning-redacting models),
+      // so the streaming reducer keeps it on purpose.
+      if (
+        adapted.type === "reasoning" &&
+        adapted.content.trim() === "" &&
+        !isStreaming
+      ) {
+        continue
+      }
       adaptedContent.push(adapted)
     }
   }

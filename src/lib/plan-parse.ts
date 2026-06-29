@@ -118,6 +118,60 @@ export function isPlanLikeToolName(toolName: string): boolean {
 }
 
 /**
+ * Plan-*mode* transition tools — Claude Code's `EnterPlanMode`/`ExitPlanMode`
+ * and Cline's `switch_mode`. These are mode signals (not work tools), so they
+ * render through a dedicated `<PlanModeCard>` and must NOT fold into the
+ * "思考 N 次" tool-group the way `classifyToolKind` would otherwise group them.
+ *
+ * Distinct from `isPlanLikeToolName`: that matches anything containing "plan"
+ * (e.g. Codex's `update_plan`, which legitimately converts to a `<PlanCard>`
+ * checklist). `update_plan` normalizes to "updateplan" and is intentionally
+ * NOT matched here, so its PlanCard path stays untouched.
+ *
+ * Uses the separator-stripping `normalizeToolName` above, so `switch_mode`
+ * normalizes to "switchmode". (The renderer-side gate in `ToolCallPart` uses
+ * the underscore-preserving `tool-call-normalization` form and matches
+ * "switch_mode" directly — keep the two call sites in sync.)
+ */
+export function isPlanModeToolName(toolName: string): boolean {
+  const normalized = normalizeToolName(toolName)
+  return (
+    normalized === "enterplanmode" ||
+    normalized === "exitplanmode" ||
+    normalized === "switchmode"
+  )
+}
+
+/**
+ * Extract freeform plan markdown from a plan-mode tool's input. Looks at
+ * `plan`/`Plan` directly and one level into a `rawInput`/`raw_input` envelope
+ * (some hosts wrap the real arguments). Pure and dependency-free so the
+ * `<PlanModeCard>` component can import it without an adapter/component cycle.
+ * Returns null when there is no non-empty plan string.
+ */
+export function extractPlanMarkdown(
+  input: Record<string, unknown>
+): string | null {
+  const direct = input.plan ?? input.Plan
+  if (typeof direct === "string" && direct.trim().length > 0) return direct
+
+  const nested =
+    typeof input.rawInput === "object" && input.rawInput !== null
+      ? (input.rawInput as Record<string, unknown>)
+      : typeof input.raw_input === "object" && input.raw_input !== null
+        ? (input.raw_input as Record<string, unknown>)
+        : null
+  if (nested) {
+    const nestedPlan = nested.plan ?? nested.Plan
+    if (typeof nestedPlan === "string" && nestedPlan.trim().length > 0) {
+      return nestedPlan
+    }
+  }
+
+  return null
+}
+
+/**
  * Statuses accepted by Kimi Code's `TodoListInputSchema`
  * (`status: enum(["pending","in_progress","done"])`). Used as a structural
  * identity signal for a live Kimi todo *write*.

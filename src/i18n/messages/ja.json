@@ -2440,6 +2440,12 @@
           "other": "{count} 件のツールを使用",
           "errorSuffix": "{count} 件失敗",
           "joiner": " · "
+        },
+        "planMode": {
+          "entered": "計画モードを開始",
+          "planLabel": "計画",
+          "submitted": "計画を送信しました",
+          "switched": "モードを切り替え"
         }
       },
       "messageNav": {

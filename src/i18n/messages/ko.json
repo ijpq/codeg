@@ -2440,6 +2440,12 @@
           "other": "도구 {count}개 사용",
           "errorSuffix": "{count}건 실패",
           "joiner": " · "
+        },
+        "planMode": {
+          "entered": "계획 모드 시작",
+          "planLabel": "계획",
+          "submitted": "계획 제출됨",
+          "switched": "모드 전환됨"
         }
       },
       "messageNav": {

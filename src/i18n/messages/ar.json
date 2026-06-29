@@ -2440,6 +2440,12 @@
           "other": "{count, plural, zero {استخدام صفر أداة} one {استخدام أداة واحدة} two {استخدام أداتين} few {استخدام # أدوات} many {استخدام # أداة} other {استخدام # أداة}}",
           "errorSuffix": "{count, plural, zero {صفر فشل} one {فشل واحد} two {فشلان} few {# فشلوا} many {# فشلاً} other {# فشل}}",
           "joiner": " · "
+        },
+        "planMode": {
+          "entered": "تم بدء وضع التخطيط",
+          "planLabel": "الخطة",
+          "submitted": "تم إرسال الخطة",
+          "switched": "تم تبديل الوضع"
         }
       },
       "messageNav": {

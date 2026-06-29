@@ -2440,6 +2440,12 @@
           "other": "{count, plural, one {A utilisé # outil} other {A utilisé # outils}}",
           "errorSuffix": "{count, plural, one {# échec} other {# échecs}}",
           "joiner": " · "
+        },
+        "planMode": {
+          "entered": "Mode planification activé",
+          "planLabel": "Plan",
+          "submitted": "Plan soumis",
+          "switched": "Mode changé"
         }
       },
       "messageNav": {

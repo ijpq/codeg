@@ -49,6 +49,7 @@ import { DelegationStatusGroupCard } from "./delegation-status-group-card"
 import { GeneratedImagesBlock } from "./generated-images-block"
 import { GoalRunPart, GoalToolCallPart } from "./goal-tool-call"
 import { PlanCard, PlanEntriesList } from "./plan-card"
+import { PlanModeCard } from "./plan-mode-card"
 import {
   FileTextIcon,
   FilePenLineIcon,
@@ -1646,39 +1647,6 @@ function ApplyPatchToolInput({ input }: { input: string }) {
   return <UnifiedDiffPreview diffText={input} clickableFilePath />
 }
 
-// ── Switch mode (plan) input ──────────────────────────────────────────
-
-function extractPlanMarkdown(input: Record<string, unknown>): string | null {
-  const direct = input.plan ?? input.Plan
-  if (typeof direct === "string" && direct.trim().length > 0) return direct
-
-  const nested =
-    typeof input.rawInput === "object" && input.rawInput !== null
-      ? (input.rawInput as Record<string, unknown>)
-      : typeof input.raw_input === "object" && input.raw_input !== null
-        ? (input.raw_input as Record<string, unknown>)
-        : null
-  if (nested) {
-    const nestedPlan = nested.plan ?? nested.Plan
-    if (typeof nestedPlan === "string" && nestedPlan.trim().length > 0) {
-      return nestedPlan
-    }
-  }
-
-  return null
-}
-
-function SwitchModeToolInput({ input }: { input: Record<string, unknown> }) {
-  const planMarkdown = extractPlanMarkdown(input)
-  if (!planMarkdown) return null
-
-  return (
-    <div className="text-sm prose prose-sm dark:prose-invert max-w-none [&_ul]:list-inside [&_ol]:list-inside">
-      <MessageResponse>{planMarkdown}</MessageResponse>
-    </div>
-  )
-}
-
 // ── Generic structured input (fallback) ──────────────────────────────
 
 /** Fields that typically contain code / long text → render in code blocks */
@@ -1883,15 +1851,6 @@ function StructuredToolInput({
     name === "tasklist"
   )
     return <TaskToolInput input={parsed} />
-  if (
-    name === "switch_mode" ||
-    name === "enterplanmode" ||
-    name === "exitplanmode"
-  ) {
-    if (extractPlanMarkdown(parsed)) {
-      return <SwitchModeToolInput input={parsed} />
-    }
-  }
 
   return <GenericToolInput input={input} />
 }
@@ -2446,6 +2405,25 @@ const ToolCallPart = memo(function ToolCallPart({
           )}
         </ToolContent>
       </Tool>
+    )
+  }
+
+  // Plan-mode transition tools (EnterPlanMode/ExitPlanMode/switch_mode): render
+  // the plan directly via a dedicated card instead of folding into a misleading
+  // "思考 N 次" tool-group. `toolNameLower` is the underscore-preserving
+  // `tool-call-normalization` form, so `switch_mode` keeps its underscore here.
+  if (
+    toolNameLower === "enterplanmode" ||
+    toolNameLower === "exitplanmode" ||
+    toolNameLower === "switch_mode"
+  ) {
+    return (
+      <PlanModeCard
+        toolName={toolNameLower}
+        input={part.input ?? null}
+        errorText={part.errorText ?? null}
+        state={part.state}
+      />
     )
   }
 
