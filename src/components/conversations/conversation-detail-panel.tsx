@@ -65,6 +65,7 @@ import {
   useConversationRuntimeActions,
   useConversationRuntimeStore,
 } from "@/stores/conversation-runtime-store"
+import { useShallow } from "zustand/react/shallow"
 import { useConversationDetail } from "@/hooks/use-conversation-detail"
 import {
   extractUserImagesFromDraft,
@@ -398,12 +399,29 @@ const ConversationTabView = memo(function ConversationTabView({
     acpLoadError,
   } = useConversationDetail(effectiveConversationId)
 
-  // Subscribe to only this tab's own session — an unrelated conversation's
-  // streaming token no longer re-renders this keep-alive panel.
-  const runtimeSession = useConversationRuntimeStore(
-    (s) => s.byConversationId.get(effectiveConversationId) ?? null
+  // Subscribe to only the fields this panel actually reads from its runtime
+  // session — NOT the whole session object. The live-message sink rewrites the
+  // session object on every streaming batch (~60/s, via SET_LIVE_MESSAGE); a
+  // whole-object selector here would re-render this keep-alive panel (and the
+  // composer subtree it wraps) on every streaming token, even though none of
+  // these three fields change mid-stream. `useShallow` keeps the returned slice
+  // reference-stable across batches, so the panel re-renders only when one of
+  // them actually changes. (message-list-view subscribes to the session's
+  // liveMessage separately to render the live stream.)
+  const {
+    sessionStats: effectiveSessionStats,
+    externalId: runtimeExternalId,
+    syncState: runtimeSyncState,
+  } = useConversationRuntimeStore(
+    useShallow((s) => {
+      const session = s.byConversationId.get(effectiveConversationId)
+      return {
+        sessionStats: session?.sessionStats ?? null,
+        externalId: session?.externalId ?? null,
+        syncState: session?.syncState ?? "idle",
+      }
+    })
   )
-  const effectiveSessionStats = runtimeSession?.sessionStats ?? null
 
   useEffect(() => {
     if (!isActive) return
@@ -413,7 +431,7 @@ const ConversationTabView = memo(function ConversationTabView({
   // Two-source resolution for the session id passed to acp_connect:
   //   1. detail.summary.external_id — DB value, available for tabs opened
   //      from the sidebar (effectiveConversationId equals the real cid).
-  //   2. runtimeSession.externalId — populated by the connSessionId effect
+  //   2. runtimeExternalId — populated by the connSessionId effect
   //      below when SessionStarted fires. This is the ONLY source for tabs
   //      that started as a new conversation: their effectiveConversationId
   //      is locked to a virtual negative id (line 186 useState initializer
@@ -423,7 +441,7 @@ const ConversationTabView = memo(function ConversationTabView({
   //      backend takes session/new → DB.external_id is overwritten on the
   //      next prompt → original sid orphaned, agent loses prior context.
   const externalId =
-    detail?.summary.external_id ?? runtimeSession?.externalId ?? undefined
+    detail?.summary.external_id ?? runtimeExternalId ?? undefined
   // For persisted conversations opened from the sidebar, wait until the
   // session's external_id has been resolved before auto-connecting.
   // Otherwise the auto-connect effect fires with sessionId=undefined and
@@ -612,7 +630,6 @@ const ConversationTabView = memo(function ConversationTabView({
   // which blocks re-entry until that send settles (the turn completes, or it
   // bounces and rolls back to idle to retry the next item). A bounce backoff
   // rate-limits retries against a still-busy backend.
-  const runtimeSyncState = runtimeSession?.syncState ?? "idle"
   useEffect(() => {
     if (connStatus !== "connected") return
     // Don't flush onto a connection whose cwd doesn't match the tab's intended
