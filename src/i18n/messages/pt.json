@@ -2348,7 +2348,24 @@
         "elapsedHours": "{value} h",
         "elapsedMinutes": "{value} min",
         "elapsedSeconds": "{value} s",
-        "toolUseCount": "{count, plural, one {# uso de ferramenta} other {# usos de ferramenta}}"
+        "toolUseCount": "{count, plural, one {# uso de ferramenta} other {# usos de ferramenta}}",
+        "diagnostics": {
+          "open": "Diagnóstico de conexão",
+          "title": "Diagnóstico de geração",
+          "phase": "Fase atual",
+          "phaseThinking": "Pensando",
+          "phaseTool": "Executando ferramenta",
+          "phaseOutput": "Escrevendo resposta",
+          "phaseWaiting": "Aguardando resposta",
+          "sinceLastData": "Desde os últimos dados",
+          "testLink": "Testar conexão",
+          "testing": "Testando…",
+          "reachable": "Acessível · HTTP {status} · {latency}ms",
+          "unreachable": "Inacessível · {error}",
+          "notConfigured": "Conexão direta/oficial — nada a testar.",
+          "hintReachable": "A conexão está ativa. Se não chegarem novos dados por um tempo, provavelmente o modelo ainda está trabalhando.",
+          "hintUnreachable": "Problema de conexão — a rede/túnel pode estar travada."
+        }
       },
       "tool": {
         "parameters": "Parâmetros",
@@ -2631,6 +2648,16 @@
         "cardCompleted": "Tarefa em segundo plano concluída",
         "cardFinishedWithStatus": "Tarefa em segundo plano encerrada ({status})",
         "cardResultPending": "Resultado ainda não retornou"
+      },
+      "conversationArtifacts": {
+        "collapsedSummary": "Arquivos {count}",
+        "title": "Arquivos produzidos",
+        "collapse": "Recolher",
+        "empty": "Ainda não há arquivos produzidos nesta conversa.",
+        "openFile": "Abrir {filePath}",
+        "viewDiff": "Ver alterações",
+        "revealInFolder": "Mostrar no gerenciador de arquivos",
+        "removed": "removido"
       }
     },
     "diffPreview": {

@@ -2348,7 +2348,24 @@
         "elapsedHours": "{value}시간",
         "elapsedMinutes": "{value}분",
         "elapsedSeconds": "{value}초",
-        "toolUseCount": "도구 {count}회 사용"
+        "toolUseCount": "도구 {count}회 사용",
+        "diagnostics": {
+          "open": "연결 진단",
+          "title": "생성 진단",
+          "phase": "현재 단계",
+          "phaseThinking": "생각 중",
+          "phaseTool": "도구 실행 중",
+          "phaseOutput": "응답 작성 중",
+          "phaseWaiting": "응답 대기 중",
+          "sinceLastData": "마지막 수신 이후",
+          "testLink": "연결 테스트",
+          "testing": "테스트 중…",
+          "reachable": "연결됨 · HTTP {status} · {latency}ms",
+          "unreachable": "연결할 수 없음 · {error}",
+          "notConfigured": "공식 직접 연결이라 테스트할 대상이 없습니다.",
+          "hintReachable": "연결이 정상입니다. 한동안 새 데이터가 없으면 모델이 아직 처리 중일 가능성이 높습니다.",
+          "hintUnreachable": "연결 문제입니다. 네트워크/터널이 멈췄을 수 있습니다."
+        }
       },
       "tool": {
         "parameters": "매개변수",
@@ -2631,6 +2648,16 @@
         "cardCompleted": "백그라운드 작업 완료",
         "cardFinishedWithStatus": "백그라운드 작업 종료 ({status})",
         "cardResultPending": "결과가 아직 반환되지 않았습니다"
+      },
+      "conversationArtifacts": {
+        "collapsedSummary": "파일 {count}",
+        "title": "생성된 파일",
+        "collapse": "접기",
+        "empty": "이 대화에는 아직 생성된 파일이 없습니다.",
+        "openFile": "{filePath} 열기",
+        "viewDiff": "변경 사항 보기",
+        "revealInFolder": "파일 관리자에서 표시",
+        "removed": "삭제됨"
       }
     },
     "diffPreview": {
