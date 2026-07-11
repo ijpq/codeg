@@ -2350,7 +2350,24 @@
         "elapsedHours": "{value}h",
         "elapsedMinutes": "{value}m",
         "elapsedSeconds": "{value}s",
-        "toolUseCount": "{count} tool {count, plural, one {use} other {uses}}"
+        "toolUseCount": "{count} tool {count, plural, one {use} other {uses}}",
+        "diagnostics": {
+          "open": "Connection diagnostics",
+          "title": "Generation diagnostics",
+          "phase": "Current phase",
+          "phaseThinking": "Thinking",
+          "phaseTool": "Running tool",
+          "phaseOutput": "Writing reply",
+          "phaseWaiting": "Awaiting response",
+          "sinceLastData": "Since last data",
+          "testLink": "Test link",
+          "testing": "Testing…",
+          "reachable": "Reachable · HTTP {status} · {latency}ms",
+          "unreachable": "Unreachable · {error}",
+          "notConfigured": "Direct/official connection — nothing to test.",
+          "hintReachable": "Link is up. If no new data for a while, the model is likely still working.",
+          "hintUnreachable": "Link problem — the network/tunnel may be stuck."
+        }
       },
       "tool": {
         "parameters": "Parameters",
@@ -2633,6 +2650,16 @@
         "cardCompleted": "Background task completed",
         "cardFinishedWithStatus": "Background task finished ({status})",
         "cardResultPending": "Result not returned yet"
+      },
+      "conversationArtifacts": {
+        "collapsedSummary": "Files {count}",
+        "title": "Produced files",
+        "collapse": "Collapse",
+        "empty": "No produced files in this conversation yet.",
+        "openFile": "Open {filePath}",
+        "viewDiff": "View changes",
+        "revealInFolder": "Reveal in file manager",
+        "removed": "removed"
       }
     },
     "diffPreview": {

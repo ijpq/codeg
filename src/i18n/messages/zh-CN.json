@@ -2350,7 +2350,24 @@
         "elapsedHours": "{value} 小时",
         "elapsedMinutes": "{value} 分钟",
         "elapsedSeconds": "{value} 秒",
-        "toolUseCount": "{count} 次工具调用"
+        "toolUseCount": "{count} 次工具调用",
+        "diagnostics": {
+          "open": "连接诊断",
+          "title": "生成诊断",
+          "phase": "当前阶段",
+          "phaseThinking": "思考中",
+          "phaseTool": "执行工具",
+          "phaseOutput": "输出回复",
+          "phaseWaiting": "等待响应",
+          "sinceLastData": "距上次收到数据",
+          "testLink": "测试链路",
+          "testing": "测试中…",
+          "reachable": "链路可达 · HTTP {status} · {latency}ms",
+          "unreachable": "无法连接 · {error}",
+          "notConfigured": "官方直连,无自定义链路可测。",
+          "hintReachable": "链路正常。若长时间没有新数据,多半是模型仍在处理。",
+          "hintUnreachable": "链路异常,可能是网络/隧道卡住了。"
+        }
       },
       "tool": {
         "parameters": "参数",
@@ -2633,6 +2650,16 @@
         "cardCompleted": "后台任务已完成",
         "cardFinishedWithStatus": "后台任务已结束（{status}）",
         "cardResultPending": "结果尚未返回"
+      },
+      "conversationArtifacts": {
+        "collapsedSummary": "文件 {count}",
+        "title": "产出文件",
+        "collapse": "收起",
+        "empty": "本次对话暂无产出文件。",
+        "openFile": "打开 {filePath}",
+        "viewDiff": "查看改动",
+        "revealInFolder": "在文件管理器中显示",
+        "removed": "已删除"
       }
     },
     "diffPreview": {
