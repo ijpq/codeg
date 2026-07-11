@@ -6,7 +6,7 @@ use serde::Deserialize;
 use crate::app_error::AppCommandError;
 use crate::app_state::AppState;
 use crate::commands::model_provider as mp_commands;
-use crate::models::model_provider::ModelProviderInfo;
+use crate::models::model_provider::{ModelProviderInfo, ModelProviderProbeResult};
 
 // ---------------------------------------------------------------------------
 // Param structs
@@ -37,6 +37,12 @@ pub struct UpdateModelProviderParams {
 #[serde(rename_all = "camelCase")]
 pub struct ModelProviderIdParams {
     pub id: i32,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProbeModelProviderParams {
+    pub agent_type: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -92,4 +98,13 @@ pub async fn delete_model_provider(
 ) -> Result<Json<()>, AppCommandError> {
     mp_commands::delete_model_provider_core(&state.db, params.id).await?;
     Ok(Json(()))
+}
+
+pub async fn probe_active_model_provider(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<ProbeModelProviderParams>,
+) -> Result<Json<ModelProviderProbeResult>, AppCommandError> {
+    let result =
+        mp_commands::probe_active_model_provider_core(&state.db, params.agent_type).await?;
+    Ok(Json(result))
 }
