@@ -2327,7 +2327,24 @@
         "elapsedHours": "{value} Std",
         "elapsedMinutes": "{value} Min",
         "elapsedSeconds": "{value} Sek",
-        "toolUseCount": "{count, plural, one {# Tool-Aufruf} other {# Tool-Aufrufe}}"
+        "toolUseCount": "{count, plural, one {# Tool-Aufruf} other {# Tool-Aufrufe}}",
+        "diagnostics": {
+          "open": "Verbindungsdiagnose",
+          "title": "Generierungsdiagnose",
+          "phase": "Aktuelle Phase",
+          "phaseThinking": "Denkt nach",
+          "phaseTool": "Tool wird ausgeführt",
+          "phaseOutput": "Antwort wird geschrieben",
+          "phaseWaiting": "Warten auf Antwort",
+          "sinceLastData": "Seit letzten Daten",
+          "testLink": "Verbindung testen",
+          "testing": "Test läuft…",
+          "reachable": "Erreichbar · HTTP {status} · {latency}ms",
+          "unreachable": "Nicht erreichbar · {error}",
+          "notConfigured": "Direkte/offizielle Verbindung – nichts zu testen.",
+          "hintReachable": "Verbindung steht. Kommen längere Zeit keine neuen Daten, arbeitet vermutlich noch das Modell.",
+          "hintUnreachable": "Verbindungsproblem – Netzwerk/Tunnel hängt möglicherweise."
+        }
       },
       "tool": {
         "parameters": "Parameter",
@@ -2609,6 +2626,16 @@
         "cardCompleted": "Hintergrundaufgabe abgeschlossen",
         "cardFinishedWithStatus": "Hintergrundaufgabe beendet ({status})",
         "cardResultPending": "Ergebnis steht noch aus"
+      },
+      "conversationArtifacts": {
+        "collapsedSummary": "Dateien {count}",
+        "title": "Erzeugte Dateien",
+        "collapse": "Einklappen",
+        "empty": "Noch keine erzeugten Dateien in dieser Unterhaltung.",
+        "openFile": "{filePath} öffnen",
+        "viewDiff": "Änderungen anzeigen",
+        "revealInFolder": "Im Datei-Manager anzeigen",
+        "removed": "entfernt"
       }
     },
     "diffPreview": {
