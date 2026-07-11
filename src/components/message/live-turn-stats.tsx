@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useMemo, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { useLocale, useTranslations } from "next-intl"
 import type {
   LiveContentBlock,
@@ -12,9 +12,15 @@ import {
   countUnifiedDiffLineChanges,
   estimateChangedLineStats,
 } from "@/lib/line-change-stats"
-import { FilePenLine, Timer, Wrench } from "lucide-react"
-import type { AgentType } from "@/lib/types"
+import { Activity, FilePenLine, Loader2, Timer, Wrench } from "lucide-react"
+import type { AgentType, ModelProviderProbeResult } from "@/lib/types"
+import { probeActiveModelProvider } from "@/lib/api"
 import { AgentIcon } from "@/components/agent-icon"
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover"
 
 interface LiveTurnStatsProps {
   message: LiveMessage
@@ -353,6 +359,67 @@ export function LiveTurnStats({
 
   const elapsedLabel = formatElapsedLabel(elapsed, t)
 
+  // --- Streaming diagnostics: is data flowing, and is the link up? ----------
+  // "Time since the live message last advanced": a stall (network OR model)
+  // shows up as this number growing. The live message reference changes on
+  // every streamed batch (see the block-cache note above), so stamping the
+  // time whenever it changes tracks last-data-received without any new
+  // plumbing; the 1s elapsed timer re-renders this component, so the readout
+  // keeps climbing even when nothing new arrives. Adjusting a ref during render
+  // for a "previous value" comparison is the sanctioned pattern.
+  const lastAdvanceRef = useRef<{ msg: LiveMessage; at: number }>({
+    msg: message,
+    at: message.startedAt,
+  })
+  if (lastAdvanceRef.current.msg !== message) {
+    lastAdvanceRef.current = { msg: message, at: Date.now() }
+  }
+  const sinceLastData = Math.max(0, Date.now() - lastAdvanceRef.current.at)
+
+  // Current phase, inferred from the last live block: thinking/planning, a
+  // tool call (with its normalized name), or streaming text — else waiting.
+  // The label is resolved here with literal message keys (next-intl types
+  // reject a dynamic `diagnostics.${key}` key).
+  const phase = useMemo<{ label: string; tool: string | null }>(() => {
+    const last = message.content[message.content.length - 1]
+    if (!last) return { label: t("diagnostics.phaseWaiting"), tool: null }
+    if (last.type === "thinking" || last.type === "plan")
+      return { label: t("diagnostics.phaseThinking"), tool: null }
+    if (last.type === "tool_call")
+      return {
+        label: t("diagnostics.phaseTool"),
+        tool: inferLiveToolName({
+          title: last.info.title,
+          kind: last.info.kind,
+          rawInput: last.info.raw_input,
+          meta: last.info.meta,
+        }),
+      }
+    return { label: t("diagnostics.phaseOutput"), tool: null }
+  }, [message, t])
+
+  const [probing, setProbing] = useState(false)
+  const [probeResult, setProbeResult] =
+    useState<ModelProviderProbeResult | null>(null)
+
+  const runProbe = useCallback(async () => {
+    setProbing(true)
+    try {
+      setProbeResult(await probeActiveModelProvider(agentType))
+    } catch (err) {
+      setProbeResult({
+        configured: true,
+        reachable: false,
+        status: null,
+        latencyMs: null,
+        apiUrl: null,
+        error: err instanceof Error ? err.message : String(err),
+      })
+    } finally {
+      setProbing(false)
+    }
+  }, [agentType])
+
   return (
     <div className="@container/turnstats shrink-0">
       <div className="flex min-h-8 flex-wrap items-center justify-center gap-x-3 gap-y-1 px-4 py-1 text-xs leading-none text-muted-foreground">
@@ -394,6 +461,89 @@ export function LiveTurnStats({
             </span>
           </>
         )}
+        <span className="text-border leading-none">|</span>
+        <Popover>
+          <PopoverTrigger asChild>
+            <button
+              type="button"
+              aria-label={t("diagnostics.open")}
+              className="inline-flex items-center rounded-md p-0.5 leading-none text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+            >
+              <Activity className="h-3 w-3 shrink-0" />
+            </button>
+          </PopoverTrigger>
+          <PopoverContent
+            side="top"
+            align="end"
+            className="w-64 gap-2 p-3 text-start text-xs"
+          >
+            <div className="text-sm font-medium text-foreground">
+              {t("diagnostics.title")}
+            </div>
+            <div className="space-y-1.5 text-muted-foreground">
+              <div className="flex items-center justify-between gap-2">
+                <span>{t("diagnostics.phase")}</span>
+                <span className="min-w-0 truncate font-medium text-foreground">
+                  {phase.label}
+                  {phase.tool ? ` · ${phase.tool}` : ""}
+                </span>
+              </div>
+              <div className="flex items-center justify-between gap-2">
+                <span>{t("diagnostics.sinceLastData")}</span>
+                <span className="font-mono font-medium text-foreground">
+                  {formatElapsedLabel(sinceLastData, t)}
+                </span>
+              </div>
+            </div>
+
+            <button
+              type="button"
+              onClick={runProbe}
+              disabled={probing}
+              className="mt-1 inline-flex w-full items-center justify-center gap-1.5 rounded-md border border-border bg-muted/40 px-2 py-1.5 font-medium text-foreground transition-colors hover:bg-accent/60 disabled:opacity-60"
+            >
+              {probing ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Activity className="h-3.5 w-3.5" />
+              )}
+              {probing ? t("diagnostics.testing") : t("diagnostics.testLink")}
+            </button>
+
+            {probeResult && !probing && (
+              <div className="mt-1 space-y-1">
+                {!probeResult.configured ? (
+                  <p className="text-muted-foreground">
+                    {t("diagnostics.notConfigured")}
+                  </p>
+                ) : probeResult.reachable ? (
+                  <>
+                    <p className="font-medium text-emerald-600 dark:text-emerald-400">
+                      {t("diagnostics.reachable", {
+                        status: probeResult.status ?? 0,
+                        latency: probeResult.latencyMs ?? 0,
+                      })}
+                    </p>
+                    <p className="text-muted-foreground">
+                      {t("diagnostics.hintReachable")}
+                    </p>
+                  </>
+                ) : (
+                  <>
+                    <p className="font-medium text-destructive">
+                      {t("diagnostics.unreachable", {
+                        error: probeResult.error ?? "",
+                      })}
+                    </p>
+                    <p className="text-muted-foreground">
+                      {t("diagnostics.hintUnreachable")}
+                    </p>
+                  </>
+                )}
+              </div>
+            )}
+          </PopoverContent>
+        </Popover>
       </div>
     </div>
   )
