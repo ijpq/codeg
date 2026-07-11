@@ -7,7 +7,7 @@ use crate::commands::acp;
 use crate::db::service::{agent_setting_service, model_provider_service};
 use crate::db::AppDatabase;
 use crate::models::agent::AgentType;
-use crate::models::model_provider::ModelProviderInfo;
+use crate::models::model_provider::{ModelProviderInfo, ModelProviderProbeResult};
 use crate::web::event_bridge::EventEmitter;
 
 // ---------------------------------------------------------------------------
@@ -301,6 +301,97 @@ pub async fn update_model_provider_and_refresh(
     })
 }
 
+/// Not-configured probe result, reused by the several early-return paths below.
+fn probe_unconfigured() -> ModelProviderProbeResult {
+    ModelProviderProbeResult {
+        configured: false,
+        reachable: false,
+        status: None,
+        latency_ms: None,
+        api_url: None,
+        error: None,
+    }
+}
+
+/// Probe the reachability + latency of the custom model provider bound to
+/// `agent_type`.
+///
+/// This is the only observation point codeg can add to the user's model network
+/// path: the streaming HTTP request itself is made by the spawned agent CLI
+/// subprocess (local → CF tunnel → VPS), invisible to us. The "test link" button
+/// issues an independent, unauthenticated, timeout-bounded GET to the provider's
+/// base URL so the user can tell a stalled tunnel apart from a model that is
+/// still working. Any HTTP response — including a 404 to the bare base URL —
+/// proves the tunnel/VPS are alive (`reachable`).
+pub async fn probe_active_model_provider_core(
+    db: &AppDatabase,
+    agent_type: String,
+) -> Result<ModelProviderProbeResult, AppCommandError> {
+    validate_agent_type(&agent_type)?;
+    let parsed: AgentType =
+        serde_json::from_value(serde_json::Value::String(agent_type.clone())).map_err(|_| {
+            AppCommandError::invalid_input(format!("Invalid agent type: {agent_type}"))
+        })?;
+
+    let setting = agent_setting_service::get_by_agent_type(&db.conn, parsed)
+        .await
+        .map_err(AppCommandError::from)?;
+    let Some(provider_id) = setting.and_then(|s| s.model_provider_id) else {
+        return Ok(probe_unconfigured());
+    };
+    let Some(provider) = model_provider_service::get_by_id(&db.conn, provider_id)
+        .await
+        .map_err(AppCommandError::from)?
+    else {
+        return Ok(probe_unconfigured());
+    };
+    let api_url = provider.api_url.trim().to_string();
+    if api_url.is_empty() {
+        return Ok(probe_unconfigured());
+    }
+
+    Ok(probe_url(&api_url).await)
+}
+
+/// Issue one timeout-bounded GET to `url` and classify the outcome. Kept
+/// separate from provider resolution so it is unit-testable against a local
+/// unreachable port.
+async fn probe_url(url: &str) -> ModelProviderProbeResult {
+    const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+    let client = match reqwest::Client::builder().timeout(PROBE_TIMEOUT).build() {
+        Ok(client) => client,
+        Err(e) => {
+            return ModelProviderProbeResult {
+                configured: true,
+                reachable: false,
+                status: None,
+                latency_ms: None,
+                api_url: Some(url.to_string()),
+                error: Some(e.to_string()),
+            };
+        }
+    };
+    let started = std::time::Instant::now();
+    match client.get(url).send().await {
+        Ok(resp) => ModelProviderProbeResult {
+            configured: true,
+            reachable: true,
+            status: Some(resp.status().as_u16()),
+            latency_ms: Some(started.elapsed().as_millis() as u64),
+            api_url: Some(url.to_string()),
+            error: None,
+        },
+        Err(e) => ModelProviderProbeResult {
+            configured: true,
+            reachable: false,
+            status: None,
+            latency_ms: None,
+            api_url: Some(url.to_string()),
+            error: Some(e.to_string()),
+        },
+    }
+}
+
 pub async fn delete_model_provider_core(db: &AppDatabase, id: i32) -> Result<(), AppCommandError> {
     // Check if any agent settings reference this provider.
     let dependents = agent_setting_service::find_by_model_provider_id(&db.conn, id)
@@ -398,6 +489,15 @@ pub async fn delete_model_provider(
     delete_model_provider_core(&db, id).await
 }
 
+#[cfg(feature = "tauri-runtime")]
+#[tauri::command]
+pub async fn probe_active_model_provider(
+    db: tauri::State<'_, AppDatabase>,
+    agent_type: String,
+) -> Result<ModelProviderProbeResult, AppCommandError> {
+    probe_active_model_provider_core(&db, agent_type).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -466,6 +566,34 @@ mod tests {
         );
         assert!(validate_model("codex", Some(&big)).is_ok());
         assert!(validate_model("open_code", Some(&"a".repeat(10_000))).is_err());
+    }
+
+    /// A probe for an agent with no bound provider (no agent_setting row, or a
+    /// row without `model_provider_id`) reports `configured: false` and never
+    /// touches the network — the "test link" button then shows "official/direct
+    /// connection, nothing to probe".
+    #[tokio::test]
+    async fn probe_reports_unconfigured_without_bound_provider() {
+        let db = fresh_in_memory_db().await;
+        let res = probe_active_model_provider_core(&db, "codex".to_string())
+            .await
+            .expect("probe must not fail when no provider is bound");
+        assert!(!res.configured);
+        assert!(!res.reachable);
+        assert!(res.api_url.is_none());
+    }
+
+    /// A probe against a dead local port reports `reachable: false` with an
+    /// error, proving the "network is down" branch (as opposed to a hang): the
+    /// connection is refused immediately.
+    #[tokio::test]
+    async fn probe_url_reports_unreachable_on_dead_port() {
+        // Port 1 is privileged and effectively never listening → instant refuse.
+        let res = probe_url("http://127.0.0.1:1").await;
+        assert!(res.configured);
+        assert!(!res.reachable);
+        assert!(res.status.is_none());
+        assert!(res.error.is_some());
     }
 
     /// Regression for the model-provider staleness path: editing a provider must
