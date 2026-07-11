@@ -895,6 +895,30 @@ export function extractReplyFileChanges(
 }
 
 /**
+ * Cheap count of the distinct files produced/changed across a conversation's
+ * assistant turns — exactly the set `extractReplyFileChanges` returns, but
+ * WITHOUT generating any diffs (no `computeLineDiff`/`buildDiffChunk`). It only
+ * normalizes each write tool call's name and extracts its file paths, so it is
+ * cheap enough to run outside the streaming hot path: the collapsed "produced
+ * files" chip can show a live count while the expensive per-file diff parse
+ * stays gated behind the expanded panel.
+ */
+export function countSessionArtifactFiles(turns: MessageTurn[]): number {
+  const paths = new Set<string>()
+  for (const turn of turns) {
+    if (turn.role !== "assistant") continue
+    for (const block of turn.blocks) {
+      if (block.type !== "tool_use") continue
+      if (!WRITE_OPS.has(normalizeToolName(block.tool_name))) continue
+      for (const filePath of extractFilePaths(block.input_preview)) {
+        paths.add(normalizePath(filePath))
+      }
+    }
+  }
+  return paths.size
+}
+
+/**
  * Build a unified-diff string for a specific file within a user-message group.
  * Scans from `userTurnId` forward through assistant turns until the next user
  * turn, collecting all edit/write/apply_patch operations on `filePath`.

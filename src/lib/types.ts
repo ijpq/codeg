@@ -2555,6 +2555,26 @@ export interface UpdateModelProviderResult {
   affectedRunningSessions: number
 }
 
+/** Result of `probeActiveModelProvider` (mirror of Rust
+ *  `ModelProviderProbeResult`): a lightweight reachability + latency probe of
+ *  the custom provider bound to an agent, used by the streaming-diagnostics
+ *  panel to tell a stalled network path (CF tunnel / VPS) apart from a model
+ *  that is still working. */
+export interface ModelProviderProbeResult {
+  /** False when the agent has no custom provider bound (official/direct). */
+  configured: boolean
+  /** True when the endpoint returned any HTTP response (tunnel/VPS alive). */
+  reachable: boolean
+  /** HTTP status code, when a response was received. */
+  status: number | null
+  /** Round-trip latency in ms, when a response was received. */
+  latencyMs: number | null
+  /** The provider's base URL, when configured. */
+  apiUrl: string | null
+  /** Error string on a failed probe (connection refused / timeout / DNS). */
+  error: string | null
+}
+
 export interface ClaudeProviderModel {
   main?: string
   reasoning?: string

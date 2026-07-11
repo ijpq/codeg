@@ -2430,7 +2430,24 @@
         "elapsedHours": "{value} 小時",
         "elapsedMinutes": "{value} 分鐘",
         "elapsedSeconds": "{value} 秒",
-        "toolUseCount": "{count} 次工具呼叫"
+        "toolUseCount": "{count} 次工具呼叫",
+        "diagnostics": {
+          "open": "連線診斷",
+          "title": "生成診斷",
+          "phase": "目前階段",
+          "phaseThinking": "思考中",
+          "phaseTool": "執行工具",
+          "phaseOutput": "輸出回覆",
+          "phaseWaiting": "等待回應",
+          "sinceLastData": "距上次收到資料",
+          "testLink": "測試連線",
+          "testing": "測試中…",
+          "reachable": "連線可達 · HTTP {status} · {latency}ms",
+          "unreachable": "無法連線 · {error}",
+          "notConfigured": "官方直連,無自訂連線可測試。",
+          "hintReachable": "連線正常。若長時間沒有新資料,多半是模型仍在處理。",
+          "hintUnreachable": "連線異常,可能是網路/通道卡住了。"
+        }
       },
       "tool": {
         "parameters": "參數",
@@ -2713,6 +2730,16 @@
         "cardCompleted": "背景任務已完成",
         "cardFinishedWithStatus": "背景任務已結束（{status}）",
         "cardResultPending": "結果尚未返回"
+      },
+      "conversationArtifacts": {
+        "collapsedSummary": "檔案 {count}",
+        "title": "產出檔案",
+        "collapse": "收合",
+        "empty": "此對話尚無產出檔案。",
+        "openFile": "開啟 {filePath}",
+        "viewDiff": "檢視變更",
+        "revealInFolder": "在檔案管理員中顯示",
+        "removed": "已刪除"
       }
     },
     "diffPreview": {
