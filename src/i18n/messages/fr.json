@@ -2505,7 +2505,24 @@
         "elapsedHours": "{value} h",
         "elapsedMinutes": "{value} min",
         "elapsedSeconds": "{value} s",
-        "toolUseCount": "{count, plural, one {# appel d'outil} other {# appels d'outil}}"
+        "toolUseCount": "{count, plural, one {# appel d'outil} other {# appels d'outil}}",
+        "diagnostics": {
+          "open": "Diagnostic de connexion",
+          "title": "Diagnostic de génération",
+          "phase": "Phase actuelle",
+          "phaseThinking": "Réflexion",
+          "phaseTool": "Exécution d'outil",
+          "phaseOutput": "Rédaction de la réponse",
+          "phaseWaiting": "En attente de réponse",
+          "sinceLastData": "Depuis les dernières données",
+          "testLink": "Tester la liaison",
+          "testing": "Test en cours…",
+          "reachable": "Joignable · HTTP {status} · {latency}ms",
+          "unreachable": "Injoignable · {error}",
+          "notConfigured": "Connexion directe/officielle — rien à tester.",
+          "hintReachable": "La liaison fonctionne. Sans nouvelles données pendant un moment, le modèle travaille probablement encore.",
+          "hintUnreachable": "Problème de liaison — le réseau/tunnel est peut-être bloqué."
+        }
       },
       "tool": {
         "parameters": "Paramètres",
@@ -2788,6 +2805,16 @@
         "cardCompleted": "Tâche en arrière-plan terminée",
         "cardFinishedWithStatus": "Tâche en arrière-plan terminée ({status})",
         "cardResultPending": "Résultat pas encore reçu"
+      },
+      "conversationArtifacts": {
+        "collapsedSummary": "Fichiers {count}",
+        "title": "Fichiers produits",
+        "collapse": "Réduire",
+        "empty": "Aucun fichier produit dans cette conversation pour l'instant.",
+        "openFile": "Ouvrir {filePath}",
+        "viewDiff": "Voir les modifications",
+        "revealInFolder": "Afficher dans le gestionnaire de fichiers",
+        "removed": "supprimé"
       }
     },
     "diffPreview": {

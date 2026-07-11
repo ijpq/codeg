@@ -1242,6 +1242,7 @@ mod tauri_app {
                 model_provider_commands::create_model_provider,
                 model_provider_commands::update_model_provider,
                 model_provider_commands::delete_model_provider,
+                model_provider_commands::probe_active_model_provider,
                 web::start_web_server,
                 web::stop_web_server,
                 web::get_web_server_status,

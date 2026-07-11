@@ -1090,6 +1090,10 @@ pub fn build_router(
             "/delete_model_provider",
             post(handlers::model_provider::delete_model_provider),
         )
+        .route(
+            "/probe_active_model_provider",
+            post(handlers::model_provider::probe_active_model_provider),
+        )
         // ─── Quick Messages ───
         .route(
             "/quick_messages_list",

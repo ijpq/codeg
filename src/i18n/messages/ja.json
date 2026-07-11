@@ -2505,7 +2505,24 @@
         "elapsedHours": "{value}時間",
         "elapsedMinutes": "{value}分",
         "elapsedSeconds": "{value}秒",
-        "toolUseCount": "{count} 回のツール使用"
+        "toolUseCount": "{count} 回のツール使用",
+        "diagnostics": {
+          "open": "接続診断",
+          "title": "生成の診断",
+          "phase": "現在の段階",
+          "phaseThinking": "思考中",
+          "phaseTool": "ツール実行中",
+          "phaseOutput": "応答を出力中",
+          "phaseWaiting": "応答待ち",
+          "sinceLastData": "最後の受信からの経過",
+          "testLink": "接続をテスト",
+          "testing": "テスト中…",
+          "reachable": "到達可能 · HTTP {status} · {latency}ms",
+          "unreachable": "接続できません · {error}",
+          "notConfigured": "公式への直接接続のため、テスト対象がありません。",
+          "hintReachable": "接続は正常です。しばらく新しいデータが来ない場合は、モデルが処理中の可能性が高いです。",
+          "hintUnreachable": "接続に問題があります。ネットワーク/トンネルが停止している可能性があります。"
+        }
       },
       "tool": {
         "parameters": "パラメーター",
@@ -2788,6 +2805,16 @@
         "cardCompleted": "バックグラウンドタスクが完了しました",
         "cardFinishedWithStatus": "バックグラウンドタスクが終了しました（{status}）",
         "cardResultPending": "結果はまだ返っていません"
+      },
+      "conversationArtifacts": {
+        "collapsedSummary": "ファイル {count}",
+        "title": "生成されたファイル",
+        "collapse": "折りたたむ",
+        "empty": "この会話にはまだ生成されたファイルがありません。",
+        "openFile": "{filePath} を開く",
+        "viewDiff": "変更を表示",
+        "revealInFolder": "ファイルマネージャーで表示",
+        "removed": "削除"
       }
     },
     "diffPreview": {

@@ -117,6 +117,7 @@ import type {
   ChatChannelMessageLog,
   WebhookConfig,
   ModelProviderInfo,
+  ModelProviderProbeResult,
   UpdateModelProviderResult,
   PluginCheckSummary,
   OpenCodeCatalogProvider,
@@ -3448,6 +3449,15 @@ export async function updateModelProvider(params: {
 
 export async function deleteModelProvider(id: number): Promise<void> {
   return getTransport().call("delete_model_provider", { id })
+}
+
+/** Probe the reachability + latency of the custom provider bound to `agentType`.
+ *  Used by the streaming-diagnostics panel's "test link" button to tell a
+ *  stalled network path (CF tunnel / VPS) apart from a model still working. */
+export async function probeActiveModelProvider(
+  agentType: string
+): Promise<ModelProviderProbeResult> {
+  return getTransport().call("probe_active_model_provider", { agentType })
 }
 
 // ─── Delegation settings ───────────────────────────────────────────────

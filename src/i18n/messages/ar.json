@@ -2505,7 +2505,24 @@
         "elapsedHours": "{value}س",
         "elapsedMinutes": "{value}د",
         "elapsedSeconds": "{value}ث",
-        "toolUseCount": "{count} استخدام للأداة"
+        "toolUseCount": "{count} استخدام للأداة",
+        "diagnostics": {
+          "open": "تشخيص الاتصال",
+          "title": "تشخيص التوليد",
+          "phase": "المرحلة الحالية",
+          "phaseThinking": "يفكر",
+          "phaseTool": "تشغيل أداة",
+          "phaseOutput": "كتابة الرد",
+          "phaseWaiting": "في انتظار الرد",
+          "sinceLastData": "منذ آخر بيانات",
+          "testLink": "اختبار الاتصال",
+          "testing": "جارٍ الاختبار…",
+          "reachable": "يمكن الوصول · HTTP {status} · {latency}ms",
+          "unreachable": "تعذّر الوصول · {error}",
+          "notConfigured": "اتصال مباشر/رسمي — لا شيء لاختباره.",
+          "hintReachable": "الاتصال يعمل. إذا لم تصل بيانات جديدة لفترة، فالأرجح أن النموذج ما زال يعمل.",
+          "hintUnreachable": "مشكلة في الاتصال — قد تكون الشبكة/النفق متوقفة."
+        }
       },
       "tool": {
         "parameters": "المعلمات",
@@ -2788,6 +2805,16 @@
         "cardCompleted": "اكتملت مهمة الخلفية",
         "cardFinishedWithStatus": "انتهت مهمة الخلفية ({status})",
         "cardResultPending": "لم تصل النتيجة بعد"
+      },
+      "conversationArtifacts": {
+        "collapsedSummary": "ملفات {count}",
+        "title": "الملفات المُنتَجة",
+        "collapse": "طيّ",
+        "empty": "لا توجد ملفات مُنتَجة في هذه المحادثة بعد.",
+        "openFile": "فتح {filePath}",
+        "viewDiff": "عرض التغييرات",
+        "revealInFolder": "إظهار في مدير الملفات",
+        "removed": "محذوف"
       }
     },
     "diffPreview": {
