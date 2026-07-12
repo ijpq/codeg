@@ -2849,12 +2849,10 @@ export async function listDirectoryWithFiles(
   return getTransport().call("list_directory_with_files", { path })
 }
 
-// Hard ceiling for a single attachment, kept in lockstep with the server's
-// `UPLOAD_MAX_BYTES` (`web/handlers/files.rs`, mirrored in
-// `commands/remote_proxy.rs`). Sized to match the desktop drag-drop image
-// limit (`DRAG_DROP_IMAGE_MAX_BYTES`) so the same screenshot attaches in
-// every mode; oversize is rejected up front with a visible toast.
-export const UPLOAD_MAX_BYTES = 20 * 1024 * 1024
+// Attachments upload with no per-file size limit by default. An optional cap
+// (`CODEG_UPLOAD_MAX_ATTACHMENT_BYTES`) is enforced server-side; when it fires,
+// the handler stamps `UPLOAD_I18N_KEY_TOO_LARGE` with the effective `limit`, so
+// the client no longer pre-filters by a hardcoded ceiling.
 
 // `btoa` only accepts a binary string, and `String.fromCharCode(...bytes)`
 // hits the call-stack limit somewhere around a few hundred KB. Chunk the
