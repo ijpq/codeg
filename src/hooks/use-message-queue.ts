@@ -10,6 +10,48 @@ export interface QueuedMessage {
   modeId: string | null
 }
 
+// Persist the queue per conversation so undelivered messages (e.g. a send that
+// failed on a network blip, then re-queued) survive a page reload during the
+// outage. Best-effort: on quota/serialization failure the in-memory queue stays
+// authoritative, we just skip persistence.
+function queueStorageKey(
+  persistKey: string | number | null | undefined
+): string | null {
+  return persistKey != null ? `codeg:msg-queue:v1:${persistKey}` : null
+}
+
+function loadPersistedQueue(storageKey: string | null): QueuedMessage[] {
+  if (!storageKey || typeof window === "undefined") return []
+  try {
+    const raw = localStorage.getItem(storageKey)
+    if (!raw) return []
+    const parsed: unknown = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return []
+    return parsed.filter(
+      (x): x is QueuedMessage =>
+        !!x &&
+        typeof x === "object" &&
+        typeof (x as QueuedMessage).id === "string" &&
+        !!(x as QueuedMessage).draft
+    )
+  } catch {
+    return []
+  }
+}
+
+function persistQueue(storageKey: string | null, queue: QueuedMessage[]): void {
+  if (!storageKey || typeof window === "undefined") return
+  try {
+    if (queue.length === 0) {
+      localStorage.removeItem(storageKey)
+    } else {
+      localStorage.setItem(storageKey, JSON.stringify(queue))
+    }
+  } catch {
+    /* quota / serialization — keep the in-memory queue as source of truth */
+  }
+}
+
 export interface UseMessageQueueReturn {
   queue: QueuedMessage[]
   enqueue: (draft: PromptDraft, modeId: string | null) => void
@@ -36,8 +78,17 @@ export interface UseMessageQueueReturn {
   cancelEditing: () => void
 }
 
-export function useMessageQueue(): UseMessageQueueReturn {
-  const [queue, setQueue] = useState<QueuedMessage[]>([])
+export function useMessageQueue(
+  // When provided, the queue is persisted to localStorage under this key
+  // (typically the conversation id) so it survives a reload during an outage.
+  // Pass a STABLE key — a changing key would reload from the new slot and drop
+  // in-memory items.
+  persistKey?: string | number | null
+): UseMessageQueueReturn {
+  const storageKey = queueStorageKey(persistKey)
+  const [queue, setQueue] = useState<QueuedMessage[]>(() =>
+    loadPersistedQueue(storageKey)
+  )
   const [editingItemId, setEditingItemId] = useState<string | null>(null)
   // Authoritative copy of the queue, updated SYNCHRONOUSLY by every mutation
   // (before the React state commit). Reads that must observe the same-tick
@@ -51,10 +102,14 @@ export function useMessageQueue(): UseMessageQueueReturn {
   // Update the authoritative ref first, then schedule the render. A plain value
   // (not a functional updater) is correct because `queueRef.current` is always
   // the latest committed value.
-  const commit = useCallback((next: QueuedMessage[]) => {
-    queueRef.current = next
-    setQueue(next)
-  }, [])
+  const commit = useCallback(
+    (next: QueuedMessage[]) => {
+      queueRef.current = next
+      setQueue(next)
+      persistQueue(storageKey, next)
+    },
+    [storageKey]
+  )
 
   const enqueue = useCallback(
     (draft: PromptDraft, modeId: string | null) => {
