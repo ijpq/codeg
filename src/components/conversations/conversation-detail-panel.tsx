@@ -7,8 +7,14 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
   type PointerEvent as ReactPointerEvent,
 } from "react"
+import {
+  getWebConnectionServerSnapshot,
+  getWebConnectionSnapshot,
+  subscribeWebConnection,
+} from "@/lib/transport/web-connection-store"
 import {
   Copy,
   Download,
@@ -531,7 +537,16 @@ const ConversationTabView = memo(function ConversationTabView({
     conversationId: dbConversationId ?? undefined,
   })
   const { status: connStatus, sessionId: connSessionId } = conn
-  const messageQueue = useMessageQueue()
+  // Persist the queue under the STABLE virtual conversation id so undelivered
+  // messages survive a reload during a network outage.
+  const messageQueue = useMessageQueue(effectiveConversationId)
+  // Transport link health (web mode). Desktop/remote snapshots are always
+  // "connected", so the offline gates below are inert outside web mode.
+  const webConnState = useSyncExternalStore(
+    subscribeWebConnection,
+    getWebConnectionSnapshot,
+    getWebConnectionServerSnapshot
+  )
   const {
     queue: msgQueue,
     enqueue: mqEnqueue,
@@ -709,6 +724,11 @@ const ConversationTabView = memo(function ConversationTabView({
   // rate-limits retries against a still-busy backend.
   useEffect(() => {
     if (connStatus !== "connected") return
+    // Transport link down (web mode): the ACP connStatus can read a stale
+    // "connected" during a WS blip. Don't flush onto a reconnecting link — the
+    // send would fail and re-queue in a tight loop. Resumes automatically when
+    // the link recovers (this effect re-runs on webConnState change).
+    if (webConnState !== "connected") return
     // Don't flush onto a connection whose cwd doesn't match the tab's intended
     // working dir. This matters for a just-bound chat conversation: bind switches
     // the tab's workingDir from the draft's previous folder to the scratch dir,
@@ -738,6 +758,7 @@ const ConversationTabView = memo(function ConversationTabView({
     return () => clearTimeout(timer)
   }, [
     connStatus,
+    webConnState,
     runtimeSyncState,
     msgQueue.length,
     conn.connectedWorkingDir,
@@ -891,6 +912,15 @@ const ConversationTabView = memo(function ConversationTabView({
       if (!connectionReady) return
 
       const fromQueueFlush = opts?.fromQueueFlush ?? false
+      // Transport link down (web mode): the composer's ACP gate can read a stale
+      // "connected" during a WS blip. Park a direct send in the (persisted)
+      // queue instead of firing a request that will fail; auto-flush resends it
+      // when the link recovers. Inert on desktop/remote. Queue-flush sends are
+      // already gated by the flush effect's webConnState check.
+      if (!fromQueueFlush && getWebConnectionSnapshot() === "reconnecting") {
+        mqEnqueue(draft, selectedModeIdArg ?? null)
+        return
+      }
       // Preserve FIFO: a direct send issued while the queue is non-empty joins
       // the tail rather than racing ahead of the queued items. Read the
       // queue length synchronously (it reflects a same-tick bounce requeue).
@@ -965,6 +995,7 @@ const ConversationTabView = memo(function ConversationTabView({
           // turn by exact id (and never suppresses a different sender's prompt).
           clientMessageId: optimisticTurn.id,
           onTurnInProgress,
+          onSendFailed: onTurnInProgress,
         })
         return
       }
@@ -1068,6 +1099,7 @@ const ConversationTabView = memo(function ConversationTabView({
             conversationId: newConversationId,
             clientMessageId: optimisticTurn.id,
             onTurnInProgress,
+            onSendFailed: onTurnInProgress,
           })
         } catch (e) {
           console.error("[ConversationTabView] create conversation:", e)
@@ -1308,19 +1340,21 @@ const ConversationTabView = memo(function ConversationTabView({
       )
       setSendSignal((prev) => prev + 1)
       setSyncState(effectiveConversationId, "awaiting_persist")
+      // Rolled back + re-queued on BOTH a turn-in-flight rejection and a
+      // network/offline failure, so a direct answer is never stranded or lost.
+      const onSendRecovery = () => {
+        lastFlushBounceAtRef.current = Date.now()
+        removeOptimisticTurn(effectiveConversationId, optimisticTurn.id)
+        // A direct answer (never dequeued from the queue) re-queues at the
+        // TAIL — it was sent after any already-queued items, so FIFO keeps it
+        // behind them. (Only the auto-flush path, whose draft WAS the head,
+        // re-queues at the front.)
+        mqEnqueue(draft, null)
+      }
       lifecycleSend(draft, null, {
         clientMessageId: optimisticTurn.id,
-        // Rejected because a turn was already in flight — roll back the
-        // optimistic turn and re-queue so it isn't stranded or lost.
-        onTurnInProgress: () => {
-          lastFlushBounceAtRef.current = Date.now()
-          removeOptimisticTurn(effectiveConversationId, optimisticTurn.id)
-          // A direct answer (never dequeued from the queue) re-queues at the
-          // TAIL — it was sent after any already-queued items, so FIFO keeps it
-          // behind them. (Only the auto-flush path, whose draft WAS the head,
-          // re-queues at the front.)
-          mqEnqueue(draft, null)
-        },
+        onTurnInProgress: onSendRecovery,
+        onSendFailed: onSendRecovery,
       })
     },
     [
