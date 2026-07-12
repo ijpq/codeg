@@ -6,6 +6,7 @@ import { useAcpActions } from "@/contexts/acp-connections-context"
 import { useTaskContext } from "@/contexts/task-context"
 import { useConnection, type UseConnectionReturn } from "@/hooks/use-connection"
 import { TurnBusyError } from "@/lib/turn-busy"
+import { isNetworkOrOfflineError } from "@/lib/network-error"
 import { AGENT_LABELS, type AgentType, type PromptDraft } from "@/lib/types"
 
 interface UseConnectionLifecycleOptions {
@@ -42,6 +43,12 @@ export interface UseConnectionLifecycleReturn {
        * draft instead of treating it as an error.
        */
       onTurnInProgress?: () => void
+      /**
+       * Called when the send failed on a network/offline error (not a genuine
+       * backend error). The caller re-queues the draft for auto-resend on
+       * reconnect — the same recovery path as `onTurnInProgress`.
+       */
+      onSendFailed?: () => void
     }
   ) => void
   handleSetConfigOption: (configId: string, valueId: string) => void
@@ -385,10 +392,17 @@ export function useConnectionLifecycle({
         conversationId?: number | null
         clientMessageId?: string | null
         onTurnInProgress?: () => void
+        /**
+         * Called when the send fails on a network/offline error (not a genuine
+         * backend error). The caller re-queues the draft so it auto-resends on
+         * reconnect — the same recovery path as `onTurnInProgress`.
+         */
+        onSendFailed?: () => void
       }
     ) => {
       touchActivity(contextKey)
       const onTurnInProgress = opts?.onTurnInProgress
+      const onSendFailed = opts?.onSendFailed
       void (async () => {
         const currentModeId = modeIdRef.current
         if (modeId && modeId !== currentModeId) {
@@ -408,6 +422,11 @@ export function useConnectionLifecycle({
           return
         }
         console.error("[ConnLifecycle] sendPrompt:", e)
+        if (isNetworkOrOfflineError(e)) {
+          // Lost the link mid-send (web mode): don't drop the user's message —
+          // hand it back to the caller to re-queue for auto-resend on reconnect.
+          onSendFailed?.()
+        }
       })
     },
     [connSetMode, sendPrompt, contextKey, touchActivity]
