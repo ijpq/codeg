@@ -369,33 +369,26 @@ export function useComposerAttachments({
   const uploadAndAppendFiles = useCallback(
     async (files: File[]) => {
       if (files.length === 0) return
-      const oversized = files.filter((f) => f.size > UPLOAD_MAX_BYTES)
-      const accepted = files.filter((f) => f.size <= UPLOAD_MAX_BYTES)
-      const limitMb = Math.round(UPLOAD_MAX_BYTES / (1024 * 1024))
-      if (oversized.length > 0) {
-        toast.error(
-          tAttach("attachUploadTooLarge", {
-            limit: limitMb,
-            names: oversized.map((f) => f.name).join(", "),
-          })
-        )
-      }
-      if (accepted.length === 0) return
 
-      // Concurrent uploads — one failure doesn't block the rest. Cap at 3:
-      // small enough to keep server load predictable, large enough to feel
-      // responsive for a handful of files.
+      // No client-side size pre-filter: streamed web uploads are unlimited by
+      // default. An operator-configured server cap is reported below with its
+      // effective limit.
       const uploaded: string[] = []
       const failed: Array<{ name: string; reason: unknown }> = []
       const quotaRejected: string[] = []
+      const oversize: string[] = []
+      let oversizeLimitBytes: number | null = null
+      // Concurrent uploads — one failure doesn't block the rest. Cap at 3:
+      // small enough to keep server load predictable, large enough to feel
+      // responsive for a handful of files.
       const CONCURRENCY = 3
       let cursor = 0
       const workers = Array.from(
-        { length: Math.min(CONCURRENCY, accepted.length) },
+        { length: Math.min(CONCURRENCY, files.length) },
         async () => {
-          while (cursor < accepted.length) {
+          while (cursor < files.length) {
             const idx = cursor++
-            const file = accepted[idx]
+            const file = files[idx]
             try {
               const r = await uploadAttachment(file, attachmentTabId ?? null)
               uploaded.push(r.path)
@@ -409,6 +402,12 @@ export function useComposerAttachments({
                 continue
               }
               const appError = extractAppCommandError(error)
+              if (appError?.i18n_key === UPLOAD_I18N_KEY_TOO_LARGE) {
+                oversize.push(file.name)
+                const limit = Number(appError.i18n_params?.limit)
+                if (Number.isFinite(limit)) oversizeLimitBytes = limit
+                continue
+              }
               if (appError?.i18n_key === UPLOAD_I18N_KEY_QUOTA_EXCEEDED) {
                 quotaRejected.push(file.name)
                 continue
@@ -420,6 +419,17 @@ export function useComposerAttachments({
       )
       await Promise.all(workers)
 
+      if (oversize.length > 0) {
+        toast.error(
+          tAttach("attachUploadTooLarge", {
+            limit: Math.max(
+              1,
+              Math.round((oversizeLimitBytes ?? 0) / (1024 * 1024))
+            ),
+            names: oversize.join(", "),
+          })
+        )
+      }
       if (quotaRejected.length > 0) {
         toast.error(
           tAttach("attachUploadQuotaExceeded", {
@@ -782,10 +792,10 @@ export function useComposerAttachments({
       )
       if (normalized.length === 0) return
 
-      const limitMb = Math.round(UPLOAD_MAX_BYTES / (1024 * 1024))
       const succeeded: string[] = []
       const failed: Array<{ name: string; reason: unknown }> = []
       const oversize: string[] = []
+      let oversizeLimitBytes: number | null = null
       const directories: string[] = []
       const quotaRejected: string[] = []
       const imageAttachmentsToAdd: ImageInputAttachment[] = []
@@ -844,6 +854,8 @@ export function useComposerAttachments({
               const i18nKey = appError?.i18n_key ?? null
               if (i18nKey === UPLOAD_I18N_KEY_TOO_LARGE) {
                 oversize.push(name)
+                const limit = Number(appError?.i18n_params?.limit)
+                if (Number.isFinite(limit)) oversizeLimitBytes = limit
               } else if (i18nKey === UPLOAD_I18N_KEY_NOT_A_FILE) {
                 // Dragging a directory or a special file (FIFO, device
                 // node) lands here. The Rust guard short-circuits before
@@ -864,7 +876,10 @@ export function useComposerAttachments({
       if (oversize.length > 0) {
         toast.error(
           tAttach("attachUploadTooLarge", {
-            limit: limitMb,
+            limit: Math.max(
+              1,
+              Math.round((oversizeLimitBytes ?? 0) / (1024 * 1024))
+            ),
             names: oversize.join(", "),
           })
         )
