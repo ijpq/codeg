@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest"
+import { describe, it, expect, beforeEach, afterEach } from "vitest"
 import { act, renderHook } from "@testing-library/react"
 import { useMessageQueue } from "./use-message-queue"
 import type { PromptDraft } from "@/lib/types"
@@ -113,5 +113,40 @@ describe("useMessageQueue bounce FIFO ordering", () => {
     // use the authoritative edited A (by id), only applying the requested order.
     act(() => result.current.reorder([b, a]))
     expect(texts(result.current.queue)).toEqual(["B", "A-edited"])
+  })
+})
+
+describe("useMessageQueue persistence (offline survival across reload)", () => {
+  const KEY = "codeg:msg-queue:v1:42"
+  beforeEach(() => localStorage.clear())
+  afterEach(() => localStorage.clear())
+
+  it("does not touch localStorage without a persistKey", () => {
+    const { result } = renderHook(() => useMessageQueue())
+    act(() => result.current.enqueue(draft("hi"), null))
+    expect(result.current.queue).toHaveLength(1)
+    expect(localStorage.getItem(KEY)).toBeNull()
+  })
+
+  it("persists the queue and rehydrates it on a fresh mount (reload)", () => {
+    const first = renderHook(() => useMessageQueue(42))
+    act(() => first.result.current.enqueue(draft("offline message"), "modeA"))
+    expect(JSON.parse(localStorage.getItem(KEY)!)).toHaveLength(1)
+
+    // A fresh mount (page reload during the outage) restores the queue.
+    const reloaded = renderHook(() => useMessageQueue(42))
+    expect(texts(reloaded.result.current.queue)).toEqual(["offline message"])
+    expect(reloaded.result.current.queue[0].modeId).toBe("modeA")
+  })
+
+  it("clears the persisted slot when the queue drains", () => {
+    const { result } = renderHook(() => useMessageQueue(42))
+    act(() => result.current.enqueue(draft("m1"), null))
+    expect(localStorage.getItem(KEY)).toBeTruthy()
+    act(() => {
+      result.current.dequeue()
+    })
+    expect(result.current.queue).toHaveLength(0)
+    expect(localStorage.getItem(KEY)).toBeNull()
   })
 })
