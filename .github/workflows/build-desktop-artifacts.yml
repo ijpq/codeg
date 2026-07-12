@@ -1,0 +1,203 @@
+name: Build Desktop Artifacts
+
+# One-off helper to produce installable desktop bundles for this branch
+# WITHOUT cutting a release. `release.yml` is tag-only, requires the tag to
+# live on `main`, and uploads to a draft GitHub Release. This instead builds
+# unsigned installers and uploads them as downloadable Actions artifacts.
+#
+# Notes:
+#  - This repo (ijpq/codeg) is a fork with no Actions secrets, so there is no
+#    `TAURI_SIGNING_PRIVATE_KEY`. `tauri.conf.json` sets
+#    `createUpdaterArtifacts: true`, which would force minisign signing, so we
+#    flip it off in the ephemeral CI checkout below. Builds are UNSIGNED
+#    (macOS: right-click > Open; Windows: SmartScreen "More info > Run anyway").
+#  - Delete this file once the branch is merged / released.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feat/generation-diagnostics-and-produced-files
+    # Only run when this file changes so ordinary feature commits don't each
+    # kick off a full 6-target desktop build. Use the Actions "Re-run all
+    # jobs" button (or workflow_dispatch) to rebuild against a newer tip.
+    paths:
+      - .github/workflows/build-desktop-artifacts.yml
+
+concurrency:
+  group: build-desktop-artifacts-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    strategy:
+      # Independent targets: a flaky arm64 cross build must not cancel the
+      # Windows/macOS/Linux-x64 artifacts everyone actually installs.
+      fail-fast: false
+      matrix:
+        include:
+          - name: "Windows x64"
+            runner: "windows-2022"
+            target: "x86_64-pc-windows-msvc"
+            # Skip MSI (tauri-apps/tauri#14681: light.exe fails with
+            # externalBin). NSIS installer covers Windows distribution.
+            args: "--bundles nsis"
+          - name: "Windows arm64"
+            runner: "windows-latest"
+            target: "aarch64-pc-windows-msvc"
+            args: "--bundles nsis"
+          - name: "macOS arm64"
+            runner: "macos-latest"
+            target: "aarch64-apple-darwin"
+            args: ""
+          - name: "macOS x64"
+            runner: "macos-latest"
+            target: "x86_64-apple-darwin"
+            args: ""
+          - name: "Linux x64"
+            runner: "ubuntu-22.04"
+            target: "x86_64-unknown-linux-gnu"
+            args: ""
+          - name: "Linux arm64"
+            runner: "ubuntu-22.04"
+            target: "aarch64-unknown-linux-gnu"
+            # AppImage cross-bundling is unreliable; deb + rpm cover arm64.
+            args: "--bundles deb,rpm"
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: "pnpm"
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+          shared-key: build-artifacts-${{ matrix.target }}
+
+      - name: Install Linux x64 dependencies
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - name: Install Linux arm64 cross dependencies
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          cat > /tmp/sources.list << 'EOF'
+          deb [arch=amd64] http://archive.ubuntu.com/ubuntu jammy main restricted universe multiverse
+          deb [arch=amd64] http://archive.ubuntu.com/ubuntu jammy-updates main restricted universe multiverse
+          deb [arch=amd64] http://archive.ubuntu.com/ubuntu jammy-backports main restricted universe multiverse
+          deb [arch=amd64] http://security.ubuntu.com/ubuntu jammy-security main restricted universe multiverse
+
+          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy main restricted universe multiverse
+          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy-updates main restricted universe multiverse
+          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy-backports main restricted universe multiverse
+          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy-security main restricted universe multiverse
+          EOF
+          sudo mv /etc/apt/sources.list /etc/apt/sources.list.default
+          sudo mv /tmp/sources.list /etc/apt/sources.list
+
+          sudo dpkg --add-architecture arm64
+          sudo apt-get update
+          # Multi-Arch: same libs must match versions across :amd64/:arm64.
+          # Upgrade the preinstalled :amd64 copies first so the :arm64 webkit
+          # dev chain isn't held back by a stale amd64 pin.
+          sudo apt-get install -y --only-upgrade \
+            libgraphite2-3 \
+            libharfbuzz0b \
+            libfreetype6 \
+            libssl3
+          sudo apt-get install -y \
+            gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu \
+            libwebkit2gtk-4.1-dev:arm64 \
+            libayatana-appindicator3-dev:arm64 \
+            librsvg2-dev:arm64 \
+            libssl-dev:arm64 \
+            patchelf
+
+      - name: Configure Linux arm64 cross env
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          echo "PKG_CONFIG_ALLOW_CROSS=1" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_SYSROOT_DIR=/usr/aarch64-linux-gnu" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_AR=aarch64-linux-gnu-gcc-ar" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-Clinker=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+          echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+          echo "CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++" >> "$GITHUB_ENV"
+          echo "AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc-ar" >> "$GITHUB_ENV"
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      # No signing key on this fork. Disable updater-artifact generation in the
+      # ephemeral checkout so tauri doesn't try to minisign the bundles. This
+      # edit is never committed — it only affects this CI run.
+      - name: Disable updater artifacts (no signing key)
+        shell: bash
+        run: |
+          node -e "const f='src-tauri/tauri.conf.json';const c=require('./'+f);c.bundle.createUpdaterArtifacts=false;require('fs').writeFileSync(f,JSON.stringify(c,null,2)+'\n');console.log('createUpdaterArtifacts ->',c.bundle.createUpdaterArtifacts)"
+
+      # Build the codeg-mcp sidecar for the matrix target and stage it at
+      # src-tauri/binaries/codeg-mcp-<triple>{.exe}. CODEG_SKIP_SIDECAR=1 below
+      # then stops tauri's beforeBuild from re-staging it for the host triple.
+      - name: Stage codeg-mcp sidecar for Tauri bundle
+        shell: bash
+        run: pnpm tauri:prepare-sidecars --target ${{ matrix.target }}
+
+      - name: Verify codeg-mcp sidecar landed
+        shell: bash
+        run: |
+          ext=""
+          case "${{ matrix.target }}" in
+            *windows*) ext=".exe" ;;
+          esac
+          file="src-tauri/binaries/codeg-mcp-${{ matrix.target }}${ext}"
+          if [ ! -f "$file" ]; then
+            echo "FATAL: sidecar $file missing after prepare-sidecars"
+            exit 1
+          fi
+          ls -la "$file"
+
+      - name: Build desktop bundles
+        uses: tauri-apps/tauri-action@v0.6.1
+        env:
+          # Sidecar already staged for the matrix target above; don't let the
+          # beforeBuild pass fall back to the runner host triple.
+          CODEG_SKIP_SIDECAR: "1"
+        with:
+          # No tagName/releaseId => tauri-action builds only, no release.
+          tauriScript: pnpm tauri
+          args: --target ${{ matrix.target }} ${{ matrix.args }}
+          retryAttempts: 2
+
+      - name: Upload installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: codeg-desktop-${{ matrix.target }}
+          path: src-tauri/target/${{ matrix.target }}/release/bundle/**
+          if-no-files-found: error
+          retention-days: 14
