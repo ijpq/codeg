@@ -51,6 +51,7 @@
       "experts": "Especialistas",
       "science": "Ciência",
       "office_tools": "Ferramentas de escritório",
+      "skill_packs": "Pacotes de habilidades",
       "quick_messages": "Mensagens rápidas",
       "logs": "Registros de execução"
     }
@@ -1048,7 +1049,8 @@
     }
   },
   "SettingsPages": {
-    "agentsLoading": "Carregando configurações de agentes..."
+    "agentsLoading": "Carregando configurações de agentes...",
+    "skillPacksLoading": "Carregando pacotes de habilidades…"
   },
   "GeneralSettings": {
     "loading": "Carregando...",
@@ -3167,6 +3169,22 @@
     },
     "autoPreviewLabel": "Abrir visualização automaticamente",
     "autoPreviewHint": "Quando um agente cria ou edita um arquivo do Word, Excel ou PowerPoint, abre sua visualização ao vivo automaticamente."
+  },
+  "SkillPacksSettings": {
+    "title": "Pacotes de habilidades",
+    "description": "Pacotes de habilidades selecionados que o codeg gerencia de forma centralizada e vincula aos seus agentes de IA — especialistas em programação, pesquisa científica e ferramentas de documentos de escritório. Ative-os por agente abaixo.",
+    "tabs": {
+      "experts": "Especialistas",
+      "science": "Ciência",
+      "office": "Ferramentas de escritório"
+    },
+    "actions": {
+      "openCentralDir": "Abrir pasta central",
+      "refresh": "Atualizar"
+    },
+    "toasts": {
+      "openFolderFailed": "Falha ao abrir a pasta"
+    }
   },
   "QuickMessagesSettings": {
     "title": "Mensagens rápidas",

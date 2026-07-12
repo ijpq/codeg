@@ -51,6 +51,7 @@
       "experts": "الخبراء",
       "science": "البحث العلمي",
       "office_tools": "أدوات المكتب",
+      "skill_packs": "حزم المهارات",
       "quick_messages": "رسائل سريعة",
       "logs": "سجلات التشغيل"
     }
@@ -1048,7 +1049,8 @@
     }
   },
   "SettingsPages": {
-    "agentsLoading": "جارٍ تحميل إعدادات الوكلاء..."
+    "agentsLoading": "جارٍ تحميل إعدادات الوكلاء...",
+    "skillPacksLoading": "جارٍ تحميل حزم المهارات…"
   },
   "GeneralSettings": {
     "loading": "جارٍ التحميل...",
@@ -3167,6 +3169,22 @@
     },
     "autoPreviewLabel": "فتح المعاينة تلقائيًا",
     "autoPreviewHint": "عندما ينشئ وكيل ملف Word أو Excel أو PowerPoint أو يعدّله، افتح معاينته المباشرة تلقائيًا."
+  },
+  "SkillPacksSettings": {
+    "title": "حزم المهارات",
+    "description": "حزم مهارات منسّقة يديرها codeg مركزيًا ويربطها بوكلاء الذكاء الاصطناعي لديك — خبراء البرمجة، والبحث العلمي، وأدوات مستندات المكتب. فعّلها لكل وكيل أدناه.",
+    "tabs": {
+      "experts": "الخبراء",
+      "science": "البحث العلمي",
+      "office": "أدوات المكتب"
+    },
+    "actions": {
+      "openCentralDir": "فتح المجلد المركزي",
+      "refresh": "تحديث"
+    },
+    "toasts": {
+      "openFolderFailed": "فشل فتح المجلد"
+    }
   },
   "QuickMessagesSettings": {
     "title": "رسائل سريعة",

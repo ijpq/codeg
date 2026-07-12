@@ -51,6 +51,7 @@
       "experts": "专家",
       "science": "科学研究",
       "office_tools": "办公工具",
+      "skill_packs": "技能包",
       "quick_messages": "快捷消息",
       "logs": "运行日志"
     }
@@ -1048,7 +1049,8 @@
     }
   },
   "SettingsPages": {
-    "agentsLoading": "加载 Agent 设置中..."
+    "agentsLoading": "加载 Agent 设置中...",
+    "skillPacksLoading": "正在加载技能包…"
   },
   "GeneralSettings": {
     "loading": "加载中...",
@@ -3179,6 +3181,22 @@
     },
     "autoPreviewLabel": "自动打开预览",
     "autoPreviewHint": "当智能体创建或编辑 Word、Excel、PowerPoint 文件时，自动打开其实时预览。"
+  },
+  "SkillPacksSettings": {
+    "title": "技能包",
+    "description": "由 codeg 集中管理、并链接到各 AI 智能体的成套技能——编码专家、科学研究与办公文档工具。可在下方按智能体分别启用。",
+    "tabs": {
+      "experts": "专家",
+      "science": "科学研究",
+      "office": "办公工具"
+    },
+    "actions": {
+      "openCentralDir": "打开中央目录",
+      "refresh": "刷新"
+    },
+    "toasts": {
+      "openFolderFailed": "打开目录失败"
+    }
   },
   "QuickMessagesSettings": {
     "title": "快捷消息",

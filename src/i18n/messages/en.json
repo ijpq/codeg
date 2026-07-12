@@ -51,6 +51,7 @@
       "experts": "Experts",
       "science": "Science",
       "office_tools": "Office Tools",
+      "skill_packs": "Skill Packs",
       "quick_messages": "Quick Messages",
       "logs": "Runtime Logs"
     }
@@ -1048,7 +1049,8 @@
     }
   },
   "SettingsPages": {
-    "agentsLoading": "Loading agent settings..."
+    "agentsLoading": "Loading agent settings...",
+    "skillPacksLoading": "Loading skill packs…"
   },
   "GeneralSettings": {
     "loading": "Loading...",
@@ -3179,6 +3181,22 @@
     },
     "autoPreviewLabel": "Auto-open preview",
     "autoPreviewHint": "When an agent creates or edits a Word, Excel, or PowerPoint file, open its live preview automatically."
+  },
+  "SkillPacksSettings": {
+    "title": "Skill Packs",
+    "description": "Curated skill bundles that codeg manages centrally and links into your AI agents — coding experts, scientific research, and office document tools. Enable them per agent below.",
+    "tabs": {
+      "experts": "Experts",
+      "science": "Science",
+      "office": "Office Tools"
+    },
+    "actions": {
+      "openCentralDir": "Open central folder",
+      "refresh": "Refresh"
+    },
+    "toasts": {
+      "openFolderFailed": "Failed to open folder"
+    }
   },
   "QuickMessagesSettings": {
     "title": "Quick Messages",

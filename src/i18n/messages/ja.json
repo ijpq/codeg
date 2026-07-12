@@ -51,6 +51,7 @@
       "experts": "エキスパート",
       "science": "科学研究",
       "office_tools": "Officeツール",
+      "skill_packs": "スキルパック",
       "quick_messages": "クイックメッセージ",
       "logs": "実行ログ"
     }
@@ -1048,7 +1049,8 @@
     }
   },
   "SettingsPages": {
-    "agentsLoading": "エージェント設定を読み込み中..."
+    "agentsLoading": "エージェント設定を読み込み中...",
+    "skillPacksLoading": "スキルパックを読み込み中…"
   },
   "GeneralSettings": {
     "loading": "読み込み中...",
@@ -3167,6 +3169,22 @@
     },
     "autoPreviewLabel": "プレビューを自動で開く",
     "autoPreviewHint": "エージェントが Word、Excel、PowerPoint ファイルを作成または編集したときに、ライブプレビューを自動で開きます。"
+  },
+  "SkillPacksSettings": {
+    "title": "スキルパック",
+    "description": "codeg が一元管理し、各 AI エージェントにリンクする厳選スキルの束です——コーディング専門家、科学研究、オフィス文書ツール。下でエージェントごとに有効化できます。",
+    "tabs": {
+      "experts": "エキスパート",
+      "science": "科学研究",
+      "office": "Officeツール"
+    },
+    "actions": {
+      "openCentralDir": "中央フォルダを開く",
+      "refresh": "更新"
+    },
+    "toasts": {
+      "openFolderFailed": "フォルダを開けませんでした"
+    }
   },
   "QuickMessagesSettings": {
     "title": "クイックメッセージ",

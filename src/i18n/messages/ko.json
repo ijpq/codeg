@@ -51,6 +51,7 @@
       "experts": "전문가",
       "science": "과학 연구",
       "office_tools": "오피스 도구",
+      "skill_packs": "스킬 팩",
       "quick_messages": "빠른 메시지",
       "logs": "실행 로그"
     }
@@ -1048,7 +1049,8 @@
     }
   },
   "SettingsPages": {
-    "agentsLoading": "에이전트 설정을 불러오는 중..."
+    "agentsLoading": "에이전트 설정을 불러오는 중...",
+    "skillPacksLoading": "스킬 팩 로딩 중…"
   },
   "GeneralSettings": {
     "loading": "로딩 중...",
@@ -3167,6 +3169,22 @@
     },
     "autoPreviewLabel": "미리보기 자동 열기",
     "autoPreviewHint": "에이전트가 Word, Excel, PowerPoint 파일을 만들거나 편집하면 실시간 미리보기를 자동으로 엽니다."
+  },
+  "SkillPacksSettings": {
+    "title": "스킬 팩",
+    "description": "codeg가 중앙에서 관리하고 각 AI 에이전트에 연결하는 엄선된 스킬 모음입니다 — 코딩 전문가, 과학 연구, 오피스 문서 도구. 아래에서 에이전트별로 활성화하세요.",
+    "tabs": {
+      "experts": "전문가",
+      "science": "과학 연구",
+      "office": "오피스 도구"
+    },
+    "actions": {
+      "openCentralDir": "중앙 폴더 열기",
+      "refresh": "새로고침"
+    },
+    "toasts": {
+      "openFolderFailed": "폴더를 열지 못했습니다"
+    }
   },
   "QuickMessagesSettings": {
     "title": "빠른 메시지",

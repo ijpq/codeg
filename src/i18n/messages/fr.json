@@ -51,6 +51,7 @@
       "experts": "Experts",
       "science": "Science",
       "office_tools": "Outils bureautiques",
+      "skill_packs": "Packs de compétences",
       "quick_messages": "Messages rapides",
       "logs": "Journaux d'exécution"
     }
@@ -1048,7 +1049,8 @@
     }
   },
   "SettingsPages": {
-    "agentsLoading": "Chargement des paramètres des agents..."
+    "agentsLoading": "Chargement des paramètres des agents...",
+    "skillPacksLoading": "Chargement des packs de compétences…"
   },
   "GeneralSettings": {
     "loading": "Chargement...",
@@ -3167,6 +3169,22 @@
     },
     "autoPreviewLabel": "Ouvrir l'aperçu automatiquement",
     "autoPreviewHint": "Lorsqu'un agent crée ou modifie un fichier Word, Excel ou PowerPoint, ouvrir automatiquement son aperçu en direct."
+  },
+  "SkillPacksSettings": {
+    "title": "Packs de compétences",
+    "description": "Ensembles de compétences sélectionnés que codeg gère de manière centralisée et relie à vos agents IA : experts en programmation, recherche scientifique et outils de documents bureautiques. Activez-les par agent ci-dessous.",
+    "tabs": {
+      "experts": "Experts",
+      "science": "Science",
+      "office": "Outils bureautiques"
+    },
+    "actions": {
+      "openCentralDir": "Ouvrir le dossier central",
+      "refresh": "Actualiser"
+    },
+    "toasts": {
+      "openFolderFailed": "Échec de l'ouverture du dossier"
+    }
   },
   "QuickMessagesSettings": {
     "title": "Messages rapides",
