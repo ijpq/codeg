@@ -275,6 +275,31 @@ fn upload_quota_config_from_env() -> UploadQuotaConfig {
     parse_upload_quota_config(std::env::var(UPLOAD_TOTAL_BYTES_ENV).ok().as_deref())
 }
 
+/// Env var overriding the per-attachment size cap. See `attachment_max_bytes`.
+const UPLOAD_ATTACHMENT_MAX_ENV: &str = "CODEG_UPLOAD_MAX_ATTACHMENT_BYTES";
+
+/// Pure-function form of the per-attachment cap parser (testable without
+/// mutating process-global env).
+fn parse_attachment_max_bytes(raw: Option<&str>) -> Option<u64> {
+    let s = raw?.trim();
+    if s.is_empty() {
+        return None;
+    }
+    s.parse::<u64>().ok().filter(|n| *n > 0)
+}
+
+/// Optional per-attachment size cap for the web `/upload_attachment` endpoint.
+///
+/// Unset / `0` / non-numeric → `None`: **no per-file limit** (the default —
+/// web-server users routinely attach large files that the old 2 MiB cap
+/// rejected). The upload is then bounded only by disk and the optional total
+/// quota (`CODEG_UPLOAD_MAX_TOTAL_BYTES`). A positive integer caps each
+/// attachment at that many bytes, enforced by the streaming chunk-sum check in
+/// `stream_and_finalize`.
+fn attachment_max_bytes() -> Option<u64> {
+    parse_attachment_max_bytes(std::env::var(UPLOAD_ATTACHMENT_MAX_ENV).ok().as_deref())
+}
+
 /// Truthy boolean parse for env-var flags. Accepts `1 / true / yes /
 /// on` (case-insensitive, trim-tolerant). Everything else — including
 /// `0`, `false`, empty, unset — returns `false`. Lives next to the
@@ -741,9 +766,22 @@ pub async fn upload_attachment(
     // on every exit path (success, multipart error, panic) closes the
     // TOCTOU window where two concurrent uploads both saw the same
     // disk-level `used` and admitted past the cap.
-    let _quota_guard = if let Some(cap) = upload_quota_config_from_env().cap_bytes() {
+    //
+    // With a per-file cap the reserved worst-case is that cap; without one
+    // (unlimited attachments, the default) we reserve the nominal
+    // `UPLOAD_MAX_BYTES` and additionally bound the *actual* bytes mid-stream
+    // via `quota_total`, so an unlimited attachment still can't push the
+    // uploads dir past the total cap.
+    let per_file_cap = attachment_max_bytes();
+    let quota_cap = upload_quota_config_from_env().cap_bytes();
+    let mut quota_total: Option<(u64, u64)> = None;
+    let _quota_guard = if let Some(cap) = quota_cap {
         let used = current_uploads_total_bytes(&uploads_root).await;
-        match try_reserve_in_flight(&UPLOAD_IN_FLIGHT_BYTES, UPLOAD_MAX_BYTES, used, cap) {
+        if per_file_cap.is_none() {
+            quota_total = Some((used, cap));
+        }
+        let reserve = per_file_cap.unwrap_or(UPLOAD_MAX_BYTES);
+        match try_reserve_in_flight(&UPLOAD_IN_FLIGHT_BYTES, reserve, used, cap) {
             Ok(guard) => Some(guard),
             Err(()) => {
                 let mut params = BTreeMap::new();
@@ -797,7 +835,15 @@ pub async fn upload_attachment(
     // Cleanup goes through `upload_jail::remove_staging_best_effort` so the
     // unlink itself can't be redirected by a swap of `.tmp` between
     // streaming and cleanup.
-    let result = stream_and_finalize(&mut multipart, &uploads_root, &tmp_dir, &staging_name).await;
+    let result = stream_and_finalize(
+        &mut multipart,
+        &uploads_root,
+        &tmp_dir,
+        &staging_name,
+        per_file_cap,
+        quota_total,
+    )
+    .await;
     if result.is_err() {
         upload_jail::remove_staging_best_effort(&tmp_dir, &staging_name).await;
     }
@@ -821,6 +867,12 @@ async fn stream_and_finalize(
     uploads_root: &std::path::Path,
     tmp_dir: &std::path::Path,
     staging_name: &str,
+    // Per-attachment cap (`None` = unlimited, the default).
+    per_file_cap: Option<u64>,
+    // `(bytes already resident under uploads_root, total cap)` — set only when
+    // the disk-total quota is on AND no per-file cap applies, so an unlimited
+    // attachment is still bounded by the total cap mid-stream.
+    quota_total: Option<(u64, u64)>,
 ) -> Result<UploadAttachmentResult, AppCommandError> {
     let mut session_id: Option<String> = None;
     let mut raw_name: Option<String> = None;
@@ -864,22 +916,36 @@ async fn stream_and_finalize(
                         .with_detail(e.to_string())
                 })? {
                     let new_total = written.saturating_add(chunk.len() as u64);
-                    if new_total > UPLOAD_MAX_BYTES {
-                        // Symmetric with the proxy's pre/post-decode caps
-                        // in `commands/remote_proxy.rs`: any of the three
-                        // layers can fire first depending on how the
-                        // request reached us (web direct, Tauri-proxied,
-                        // or local path read), and they all surface as
-                        // the same i18n key so the toast text in the UI
-                        // is uniform.
-                        let mut params = BTreeMap::new();
-                        params.insert("size".to_string(), new_total.to_string());
-                        params.insert("limit".to_string(), UPLOAD_MAX_BYTES.to_string());
-                        return Err(AppCommandError::io_error(
-                            "Upload exceeds the maximum allowed size",
-                        )
-                        .with_detail(format!("size={new_total} limit={UPLOAD_MAX_BYTES}"))
-                        .with_i18n(UPLOAD_I18N_KEY_TOO_LARGE, params));
+                    // Per-file cap, only when configured (default: unlimited).
+                    // Symmetric with the proxy's pre/post-decode caps in
+                    // `commands/remote_proxy.rs`: whichever layer the request
+                    // reached surfaces the same i18n key so the UI toast is
+                    // uniform.
+                    if let Some(cap) = per_file_cap {
+                        if new_total > cap {
+                            let mut params = BTreeMap::new();
+                            params.insert("size".to_string(), new_total.to_string());
+                            params.insert("limit".to_string(), cap.to_string());
+                            return Err(AppCommandError::io_error(
+                                "Upload exceeds the maximum allowed size",
+                            )
+                            .with_detail(format!("size={new_total} limit={cap}"))
+                            .with_i18n(UPLOAD_I18N_KEY_TOO_LARGE, params));
+                        }
+                    }
+                    // Total-quota bound for the unlimited-per-file case.
+                    if let Some((used0, cap)) = quota_total {
+                        let projected = used0.saturating_add(new_total);
+                        if projected > cap {
+                            let mut params = BTreeMap::new();
+                            params.insert("used".to_string(), projected.to_string());
+                            params.insert("limit".to_string(), cap.to_string());
+                            return Err(AppCommandError::io_error(
+                                "Upload quota exceeded for this server",
+                            )
+                            .with_detail(format!("used={projected} limit={cap}"))
+                            .with_i18n(UPLOAD_I18N_KEY_QUOTA_EXCEEDED, params));
+                        }
                     }
                     out.write_all(&chunk).await.map_err(|e| {
                         AppCommandError::io_error("Failed to write chunk")
@@ -1151,6 +1217,20 @@ mod tests {
             parse_upload_quota_config(Some("-1")),
             UploadQuotaConfig::Invalid("-1".to_string())
         );
+    }
+
+    #[test]
+    fn parse_attachment_max_bytes_defaults_to_unlimited() {
+        // Unset / empty / whitespace / 0 / non-numeric → no per-file cap.
+        assert_eq!(parse_attachment_max_bytes(None), None);
+        assert_eq!(parse_attachment_max_bytes(Some("")), None);
+        assert_eq!(parse_attachment_max_bytes(Some("   ")), None);
+        assert_eq!(parse_attachment_max_bytes(Some("0")), None);
+        assert_eq!(parse_attachment_max_bytes(Some("10MB")), None);
+        assert_eq!(parse_attachment_max_bytes(Some("not-a-number")), None);
+        assert_eq!(parse_attachment_max_bytes(Some("-5")), None);
+        // A positive integer (trim-tolerant) enables the cap at that many bytes.
+        assert_eq!(parse_attachment_max_bytes(Some("  1048576 ")), Some(1_048_576));
     }
 
     #[test]
