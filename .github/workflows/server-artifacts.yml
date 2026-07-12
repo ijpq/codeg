@@ -28,12 +28,19 @@ jobs:
           - os: linux
             arch: x64
             runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
           - os: darwin
             arch: arm64
             runner: macos-latest
+            target: aarch64-apple-darwin
+          - os: darwin
+            arch: x64
+            runner: macos-latest
+            target: x86_64-apple-darwin
           - os: windows
             arch: x64
             runner: windows-latest
+            target: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v4
 
@@ -50,6 +57,8 @@ jobs:
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - name: Rust cache
         uses: swatinem/rust-cache@v2
@@ -70,7 +79,7 @@ jobs:
       # (`.exe` on Windows).
       - name: Build server binaries
         working-directory: src-tauri
-        run: cargo build --release --bin codeg-server --bin codeg-mcp --no-default-features
+        run: cargo build --release --bin codeg-server --bin codeg-mcp --no-default-features --target ${{ matrix.target }}
 
       # Bundle a runnable server: the two binaries side-by-side (codeg-mcp must
       # sit next to codeg-server for its exe-sibling lookup) + the static export
@@ -81,7 +90,7 @@ jobs:
           set -euo pipefail
           NAME="codeg-server-${{ matrix.os }}-${{ matrix.arch }}"
           mkdir -p "dist/$NAME/web"
-          cp src-tauri/target/release/codeg-server src-tauri/target/release/codeg-mcp "dist/$NAME/"
+          cp "src-tauri/target/${{ matrix.target }}/release/codeg-server" "src-tauri/target/${{ matrix.target }}/release/codeg-mcp" "dist/$NAME/"
           cp -R out/. "dist/$NAME/web/"
           cat > "dist/$NAME/README.txt" <<'EOF'
           codeg-server standalone build.
@@ -107,7 +116,7 @@ jobs:
         run: |
           $NAME = "codeg-server-${{ matrix.os }}-${{ matrix.arch }}"
           New-Item -ItemType Directory -Force "dist/$NAME/web" | Out-Null
-          Copy-Item "src-tauri/target/release/codeg-server.exe","src-tauri/target/release/codeg-mcp.exe" "dist/$NAME/"
+          Copy-Item "src-tauri/target/${{ matrix.target }}/release/codeg-server.exe","src-tauri/target/${{ matrix.target }}/release/codeg-mcp.exe" "dist/$NAME/"
           Copy-Item -Recurse -Force "out/*" "dist/$NAME/web/"
           @'
           codeg-server standalone build.
