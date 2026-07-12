@@ -2723,7 +2723,8 @@
         "openFile": "Abrir {filePath}",
         "openInEditor": "Abrir en el editor",
         "remove": "Quitar",
-        "noDiffDataAvailable": "No hay datos de diff disponibles para {filePath}"
+        "noDiffDataAvailable": "No hay datos de diff disponibles para {filePath}",
+        "downloadToPc": "Descargar a mi PC"
       },
       "askQuestion": {
         "title": "El agente necesita tu elección",
@@ -3329,7 +3330,9 @@
       "syncFailed": "Error al sincronizar habilidades"
     },
     "autoPreviewLabel": "Abrir vista previa automáticamente",
-    "autoPreviewHint": "Cuando un agente crea o edita un archivo de Word, Excel o PowerPoint, abre su vista previa en vivo automáticamente."
+    "autoPreviewHint": "Cuando un agente crea o edita un archivo de Word, Excel o PowerPoint, abre su vista previa en vivo automáticamente.",
+    "autoDownloadProducedLabel": "Descargar automáticamente los archivos generados",
+    "autoDownloadProducedHint": "Al usar el servidor web (p. ej., por Tailscale/LAN), descarga automáticamente a la carpeta de Descargas de este navegador los archivos que el agente crea o modifica."
   },
   "SkillPacksSettings": {
     "title": "Paquetes de habilidades",
@@ -3751,7 +3754,7 @@
     "isolation": "Aislamiento",
     "isolationWorktree": "Nuevo worktree por ejecución",
     "isolationShared": "Ejecutar en la carpeta",
-    "isolationSharedCaveat": "Las ejecuciones usan directamente el árbol de trabajo de esta carpeta y pueden entrar en conflicto con tus cambios sin confirmar. Activa la opción de árbol de trabajo para aislar cada ejecución.",
+    "isolationSharedCaveat": "Las ejecuciones usan el árbol de trabajo de esta carpeta directamente y pueden entrar en conflicto con tus cambios sin confirmar. Elige «Nuevo worktree por ejecución» para aislar cada ejecución.",
     "trigger": "Activador",
     "triggerSchedule": "Programado",
     "triggerManual": "Solo manual",
@@ -3867,7 +3870,8 @@
     "branchLocal": "Local",
     "branchRemote": "Remota",
     "branchSearchPlaceholder": "Buscar ramas…",
-    "branchNone": "Sin ramas"
+    "branchNone": "Sin ramas",
+    "advanced": "Avanzado"
   },
   "CustomSkillsSettings": {
     "loading": "Cargando habilidades personalizadas…",

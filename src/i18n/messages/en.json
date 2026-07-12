@@ -2723,7 +2723,8 @@
         "openFile": "Open {filePath}",
         "openInEditor": "Open in editor",
         "remove": "Remove",
-        "noDiffDataAvailable": "No diff data available for {filePath}"
+        "noDiffDataAvailable": "No diff data available for {filePath}",
+        "downloadToPc": "Download to my PC"
       },
       "askQuestion": {
         "title": "The agent needs your input",
@@ -3341,7 +3342,9 @@
       "syncFailed": "Failed to sync skills"
     },
     "autoPreviewLabel": "Auto-open preview",
-    "autoPreviewHint": "When an agent creates or edits a Word, Excel, or PowerPoint file, open its live preview automatically."
+    "autoPreviewHint": "When an agent creates or edits a Word, Excel, or PowerPoint file, open its live preview automatically.",
+    "autoDownloadProducedLabel": "Auto-download produced files",
+    "autoDownloadProducedHint": "When using the web server (e.g. over Tailscale/LAN), automatically download files the agent creates or changes to this browser's Downloads folder."
   },
   "SkillPacksSettings": {
     "title": "Skill Packs",
@@ -3751,7 +3754,7 @@
     "isolation": "Isolation",
     "isolationWorktree": "New worktree per run",
     "isolationShared": "Run in the folder",
-    "isolationSharedCaveat": "Runs use this folder's working tree directly — they can collide with your uncommitted changes. Enable the worktree option to isolate each run.",
+    "isolationSharedCaveat": "Runs use this folder's working tree directly — they can collide with your uncommitted changes. Choose “New worktree per run” to isolate each run.",
     "trigger": "Trigger",
     "triggerSchedule": "On a schedule",
     "triggerManual": "Manual only",
@@ -3867,7 +3870,8 @@
     "branchLocal": "Local",
     "branchRemote": "Remote",
     "branchSearchPlaceholder": "Search branches…",
-    "branchNone": "No branches"
+    "branchNone": "No branches",
+    "advanced": "Advanced"
   },
   "CustomSkillsSettings": {
     "loading": "Loading custom skills…",

@@ -2723,7 +2723,8 @@
         "openFile": "Abrir {filePath}",
         "openInEditor": "Abrir no editor",
         "remove": "Remover",
-        "noDiffDataAvailable": "Nenhum dado de diff disponível para {filePath}"
+        "noDiffDataAvailable": "Nenhum dado de diff disponível para {filePath}",
+        "downloadToPc": "Baixar para o meu PC"
       },
       "askQuestion": {
         "title": "O agente precisa da sua escolha",
@@ -3329,7 +3330,9 @@
       "syncFailed": "Falha ao sincronizar habilidades"
     },
     "autoPreviewLabel": "Abrir visualização automaticamente",
-    "autoPreviewHint": "Quando um agente cria ou edita um arquivo do Word, Excel ou PowerPoint, abre sua visualização ao vivo automaticamente."
+    "autoPreviewHint": "Quando um agente cria ou edita um arquivo do Word, Excel ou PowerPoint, abre sua visualização ao vivo automaticamente.",
+    "autoDownloadProducedLabel": "Baixar automaticamente os arquivos produzidos",
+    "autoDownloadProducedHint": "Ao usar o servidor web (por ex., via Tailscale/LAN), baixa automaticamente para a pasta de Downloads deste navegador os arquivos que o agente cria ou altera."
   },
   "SkillPacksSettings": {
     "title": "Pacotes de habilidades",
@@ -3751,7 +3754,7 @@
     "isolation": "Isolamento",
     "isolationWorktree": "Novo worktree por execução",
     "isolationShared": "Executar na pasta",
-    "isolationSharedCaveat": "As execuções usam diretamente a árvore de trabalho desta pasta e podem entrar em conflito com suas alterações não confirmadas. Ative a opção de worktree para isolar cada execução.",
+    "isolationSharedCaveat": "As execuções usam a árvore de trabalho desta pasta diretamente e podem entrar em conflito com suas alterações não confirmadas. Escolha «Novo worktree por execução» para isolar cada execução.",
     "trigger": "Gatilho",
     "triggerSchedule": "Agendado",
     "triggerManual": "Somente manual",
@@ -3867,7 +3870,8 @@
     "branchLocal": "Local",
     "branchRemote": "Remoto",
     "branchSearchPlaceholder": "Pesquisar branches…",
-    "branchNone": "Sem branches"
+    "branchNone": "Sem branches",
+    "advanced": "Avançado"
   },
   "CustomSkillsSettings": {
     "loading": "Carregando habilidades personalizadas…",

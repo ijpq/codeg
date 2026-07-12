@@ -1,8 +1,9 @@
 "use client"
 
-import { memo, useMemo, useState } from "react"
+import { memo, useEffect, useMemo, useState } from "react"
 import {
   ChevronRight,
+  Download,
   ExternalLink,
   FileDiff,
   FileIcon,
@@ -11,6 +12,12 @@ import {
 import { useTranslations } from "next-intl"
 import { useActiveFolder } from "@/contexts/active-folder-context"
 import { useWorkspaceActions } from "@/contexts/workspace-context"
+import { downloadWorkspaceFile } from "@/lib/api"
+import {
+  hasSyncedProducedFile,
+  markProducedFileSynced,
+  useAutoDownloadProduced,
+} from "@/lib/produced-file-sync-prefs"
 import {
   CommitFileAdditions,
   CommitFileDeletions,
@@ -93,10 +100,32 @@ export const ReplyArtifacts = memo(function ReplyArtifacts({
     return { addedFiles, changedFiles }
   }, [files])
 
+  const folderPath = folder?.path
+
+  // Auto-sync produced files to the local PC (web / remote over HTTP): the
+  // browser can't write to an arbitrary folder, so trigger a one-time browser
+  // download per produced file. Opt-in, deduped across re-renders AND reloads
+  // (see produced-file-sync-prefs). Skipped on local desktop — the files are
+  // already on this machine there.
+  const autoDownloadEnabled = useAutoDownloadProduced()
+  useEffect(() => {
+    if (!autoDownloadEnabled || !isResponseComplete || isLocalDesktop()) return
+    if (!folderPath || files.length === 0) return
+    const turnId = sourceTurns[0]?.id ?? ""
+    for (const file of files) {
+      if (isRemovedFileDiff(file.diff)) continue
+      const key = `${folderPath}:${turnId}:${normalizeSlashPath(file.path)}`
+      if (hasSyncedProducedFile(key)) continue
+      markProducedFileSynced(key)
+      const rel = toFolderRelativePath(file.path, folderPath)
+      void downloadWorkspaceFile(folderPath, rel, fileNameOf(rel)).catch((e) =>
+        console.error("[ReplyArtifacts] auto-download failed:", e)
+      )
+    }
+  }, [autoDownloadEnabled, isResponseComplete, folderPath, files, sourceTurns])
+
   if (!isResponseComplete) return null
   if (files.length === 0) return null
-
-  const folderPath = folder?.path
 
   const openInTabs = (file: FileChangeStat) => {
     // openFilePreview accepts absolute paths (any location) and paths
@@ -108,6 +137,17 @@ export const ReplyArtifacts = memo(function ReplyArtifacts({
   const revealInFolder = (file: FileChangeStat) => {
     const absolute = toAbsoluteFilePath(file.path, folderPath)
     if (absolute) void revealItemInDir(absolute)
+  }
+
+  // Manual "download to my PC" (web / remote, where reveal-in-folder can't
+  // reach the user's machine). Streams the file through a one-time download
+  // ticket into the browser's Downloads folder.
+  const downloadToPc = (file: FileChangeStat) => {
+    if (!folderPath) return
+    const rel = toFolderRelativePath(file.path, folderPath)
+    void downloadWorkspaceFile(folderPath, rel, fileNameOf(rel)).catch((e) =>
+      console.error("[ReplyArtifacts] download failed:", e)
+    )
   }
 
   const totalAdditions = changedFiles.reduce((sum, f) => sum + f.additions, 0)
@@ -196,7 +236,7 @@ export const ReplyArtifacts = memo(function ReplyArtifacts({
                           </TooltipContent>
                         </Tooltip>
 
-                        {isLocalDesktop() && (
+                        {isLocalDesktop() ? (
                           <Tooltip>
                             <TooltipTrigger asChild>
                               <button
@@ -210,6 +250,24 @@ export const ReplyArtifacts = memo(function ReplyArtifacts({
                             </TooltipTrigger>
                             <TooltipContent side="top">
                               {t("revealInFolder")}
+                            </TooltipContent>
+                          </Tooltip>
+                        ) : (
+                          // Web / remote over HTTP: reveal-in-folder can't reach
+                          // the user's machine, so offer a browser download.
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <button
+                                type="button"
+                                onClick={() => downloadToPc(file)}
+                                aria-label={t("downloadToPc")}
+                                className="flex w-9 shrink-0 items-center justify-center border-l border-green-600/30 text-muted-foreground transition-colors hover:bg-green-500/15 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring dark:border-green-400/30"
+                              >
+                                <Download className="h-3.5 w-3.5" />
+                              </button>
+                            </TooltipTrigger>
+                            <TooltipContent side="top">
+                              {t("downloadToPc")}
                             </TooltipContent>
                           </Tooltip>
                         )}
@@ -347,7 +405,7 @@ export const ReplyArtifacts = memo(function ReplyArtifacts({
                           </TooltipContent>
                         </Tooltip>
 
-                        {isLocalDesktop() && (
+                        {isLocalDesktop() ? (
                           <Tooltip>
                             <TooltipTrigger asChild>
                               <button
@@ -361,6 +419,22 @@ export const ReplyArtifacts = memo(function ReplyArtifacts({
                             </TooltipTrigger>
                             <TooltipContent side="top">
                               {t("revealInFolder")}
+                            </TooltipContent>
+                          </Tooltip>
+                        ) : (
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <button
+                                type="button"
+                                onClick={() => downloadToPc(file)}
+                                aria-label={t("downloadToPc")}
+                                className="flex w-9 shrink-0 items-center justify-center border-l border-border text-muted-foreground transition-colors hover:bg-accent/60 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+                              >
+                                <Download className="h-3.5 w-3.5" />
+                              </button>
+                            </TooltipTrigger>
+                            <TooltipContent side="top">
+                              {t("downloadToPc")}
                             </TooltipContent>
                           </Tooltip>
                         )}
