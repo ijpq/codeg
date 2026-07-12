@@ -2327,7 +2327,24 @@
         "elapsedHours": "{value} h",
         "elapsedMinutes": "{value} min",
         "elapsedSeconds": "{value} s",
-        "toolUseCount": "{count, plural, one {# uso de herramienta} other {# usos de herramienta}}"
+        "toolUseCount": "{count, plural, one {# uso de herramienta} other {# usos de herramienta}}",
+        "diagnostics": {
+          "open": "Diagnóstico de conexión",
+          "title": "Diagnóstico de generación",
+          "phase": "Fase actual",
+          "phaseThinking": "Pensando",
+          "phaseTool": "Ejecutando herramienta",
+          "phaseOutput": "Escribiendo respuesta",
+          "phaseWaiting": "Esperando respuesta",
+          "sinceLastData": "Desde los últimos datos",
+          "testLink": "Probar enlace",
+          "testing": "Probando…",
+          "reachable": "Accesible · HTTP {status} · {latency}ms",
+          "unreachable": "Inaccesible · {error}",
+          "notConfigured": "Conexión directa/oficial: nada que probar.",
+          "hintReachable": "El enlace funciona. Si no llegan datos nuevos durante un rato, probablemente el modelo sigue trabajando.",
+          "hintUnreachable": "Problema de enlace: la red o el túnel pueden estar bloqueados."
+        }
       },
       "tool": {
         "parameters": "Parámetros",
@@ -2609,6 +2626,16 @@
         "cardCompleted": "Tarea en segundo plano completada",
         "cardFinishedWithStatus": "Tarea en segundo plano finalizada ({status})",
         "cardResultPending": "El resultado aún no ha llegado"
+      },
+      "conversationArtifacts": {
+        "collapsedSummary": "Archivos {count}",
+        "title": "Archivos generados",
+        "collapse": "Contraer",
+        "empty": "Aún no hay archivos generados en esta conversación.",
+        "openFile": "Abrir {filePath}",
+        "viewDiff": "Ver cambios",
+        "revealInFolder": "Mostrar en el administrador de archivos",
+        "removed": "eliminado"
       }
     },
     "diffPreview": {

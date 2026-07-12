@@ -67,8 +67,14 @@ import {
   ConversationMessageNav,
   type MessageNavEntry,
 } from "@/components/message/conversation-message-nav"
+import { ConversationArtifactsPanel } from "@/components/message/conversation-artifacts-panel"
 import type { MessageScrollContextValue } from "@/components/message/message-scroll-context"
-import { extractSessionFilesGrouped } from "@/lib/session-files"
+import {
+  countSessionArtifactFiles,
+  extractReplyFileChanges,
+  extractSessionFilesGrouped,
+  type FileChangeStat,
+} from "@/lib/session-files"
 import { unescapeComposerText } from "@/lib/composer-copy-text"
 import { useStickToBottomContext } from "use-stick-to-bottom"
 
@@ -147,6 +153,8 @@ const EMPTY_DELEGATIONS: DelegationCardSource[] = []
 // Stable empty reference so the navigator memo / equality checks don't churn
 // when a conversation has no user messages.
 const EMPTY_NAV_ENTRIES: MessageNavEntry[] = []
+// Same, for the produced-files panel while collapsed / empty.
+const EMPTY_ARTIFACT_FILES: FileChangeStat[] = []
 
 // A single turn's `sourceTurns` is just `[turn]`. Cache the wrapper per turn
 // object so an unchanged historical turn keeps a stable `sourceTurns` reference
@@ -856,6 +864,26 @@ export function MessageListView({
     return entries.length > 0 ? entries : EMPTY_NAV_ENTRIES
   }, [showMessageNav, navExpanded, timelineTurns, threadItems])
 
+  // --- Produced-files panel ---------------------------------------------------
+  const [artifactsExpanded, setArtifactsExpanded] = useState(false)
+
+  // Cheap count of distinct produced/changed files for the collapsed chip —
+  // `countSessionArtifactFiles` extracts paths without parsing any diffs.
+  const artifactFileCount = useMemo(() => {
+    if (!showMessageNav) return 0
+    return countSessionArtifactFiles(timelineTurns.map((item) => item.turn))
+  }, [showMessageNav, timelineTurns])
+
+  // Full deduped file list (with diffs) — computed lazily only while the panel
+  // is expanded, since `extractReplyFileChanges` parses every write's diff.
+  const artifactFiles = useMemo<FileChangeStat[]>(() => {
+    if (!showMessageNav || !artifactsExpanded) return EMPTY_ARTIFACT_FILES
+    const files = extractReplyFileChanges(
+      timelineTurns.map((item) => item.turn)
+    )
+    return files.length > 0 ? files : EMPTY_ARTIFACT_FILES
+  }, [showMessageNav, artifactsExpanded, timelineTurns])
+
   const hasRenderableContent = threadItems.length > 0 || Boolean(liveMessage)
 
   if (detailLoading && !hasRenderableContent) {
@@ -966,6 +994,14 @@ export function MessageListView({
             onToggle={setNavExpanded}
             entries={navEntries}
             scrollApiRef={scrollApiRef}
+          />
+        )}
+        {showMessageNav && artifactFileCount > 0 && (
+          <ConversationArtifactsPanel
+            count={artifactFileCount}
+            expanded={artifactsExpanded}
+            onToggle={setArtifactsExpanded}
+            files={artifactFiles}
           />
         )}
         <AgentPlanOverlay
