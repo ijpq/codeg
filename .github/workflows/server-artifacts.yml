@@ -1,11 +1,9 @@
-name: Server Artifacts
+name: Fork Artifacts
 
-# Fork-friendly build of the standalone codeg-server for each platform, uploaded
-# as downloadable workflow artifacts. Unlike release.yml's `build-server` job —
-# which only runs on a `v*.*.*` tag, signs with `secrets.TAURI_SIGNING_PRIVATE_KEY`,
-# and uploads to a GitHub Release — this needs NO secrets, NO tag, NO signing and
-# NO release. Trigger it from the Actions tab ("Run workflow") or by pushing the
-# branch; download the per-platform bundles from the run's Artifacts section.
+# Fork-friendly desktop and standalone server builds, uploaded as downloadable
+# workflow artifacts. Unlike release.yml, this needs no secrets, tag, signing,
+# notarization, or GitHub Release. Trigger it from the Actions tab ("Run
+# workflow") or by pushing the branch, then download bundles from Artifacts.
 
 on:
   workflow_dispatch:
@@ -14,10 +12,76 @@ on:
       - custom/fork-features
 
 concurrency:
-  group: server-artifacts-${{ github.ref }}
+  group: fork-artifacts-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  build-client:
+    name: codeg-client ${{ matrix.os }}-x64
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: darwin
+            runner: macos-latest
+            target: x86_64-apple-darwin
+            bundles: dmg
+            bundle_path: src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/*.dmg
+          - os: windows
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            bundles: nsis
+            bundle_path: src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+          shared-key: client-${{ matrix.target }}
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Stage x64 codeg-mcp sidecar
+        run: pnpm tauri:prepare-sidecars --target ${{ matrix.target }}
+
+      - name: Build unsigned x64 desktop bundle
+        shell: bash
+        env:
+          CODEG_SKIP_SIDECAR: "1"
+        run: >-
+          pnpm tauri build
+          --target ${{ matrix.target }}
+          --bundles ${{ matrix.bundles }}
+          --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: codeg-client-${{ matrix.os }}-x64
+          path: ${{ matrix.bundle_path }}
+          retention-days: 14
+          if-no-files-found: error
+
   build-server:
     name: codeg-server ${{ matrix.os }}-${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
@@ -75,8 +139,7 @@ jobs:
       # `--no-default-features` drops the `tauri-runtime` feature, so the server
       # and its stdio MCP companion build with no webkit/appindicator system
       # deps (the same command `test.yml`'s server job compiles on a bare
-      # ubuntu runner). Both bins land in `src-tauri/target/release/`
-      # (`.exe` on Windows).
+      # ubuntu runner). Both bins land in the target-specific release folder.
       - name: Build server binaries
         working-directory: src-tauri
         run: cargo build --release --bin codeg-server --bin codeg-mcp --no-default-features --target ${{ matrix.target }}
