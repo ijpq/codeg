@@ -35,6 +35,10 @@ import {
   saveOfficeAutoPreview,
 } from "@/lib/office-preview-prefs"
 import {
+  loadAutoDownloadProduced,
+  saveAutoDownloadProduced,
+} from "@/lib/produced-file-sync-prefs"
+import {
   acpListAgents,
   officecliDetect,
   officecliInstall,
@@ -225,6 +229,9 @@ export function OfficeToolsBody({
   const t = useTranslations("OfficeToolsSettings")
   const locale = useLocale()
   const [autoPreview, setAutoPreview] = useState(() => loadOfficeAutoPreview())
+  const [autoDownloadProduced, setAutoDownloadProduced] = useState(() =>
+    loadAutoDownloadProduced()
+  )
 
   const [info, setInfo] = useState<OfficecliInfo | null>(null)
   const [detecting, setDetecting] = useState(true)
@@ -486,6 +493,29 @@ export function OfficeToolsBody({
           onCheckedChange={(next) => {
             setAutoPreview(next)
             saveOfficeAutoPreview(next)
+          }}
+          className="shrink-0"
+        />
+      </div>
+
+      <div className="mt-4 flex items-center justify-between gap-3 rounded-lg border bg-card px-4 py-3">
+        <div className="min-w-0 space-y-1">
+          <label
+            htmlFor="auto-download-produced"
+            className="text-sm font-medium"
+          >
+            {t("autoDownloadProducedLabel")}
+          </label>
+          <p className="text-xs text-muted-foreground">
+            {t("autoDownloadProducedHint")}
+          </p>
+        </div>
+        <Switch
+          id="auto-download-produced"
+          checked={autoDownloadProduced}
+          onCheckedChange={(next) => {
+            setAutoDownloadProduced(next)
+            saveAutoDownloadProduced(next)
           }}
           className="shrink-0"
         />
