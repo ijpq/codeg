@@ -2566,7 +2566,8 @@
         "openFile": "Ouvrir {filePath}",
         "openInEditor": "Ouvrir dans l'éditeur",
         "remove": "Retirer",
-        "noDiffDataAvailable": "Aucune donnée de diff disponible pour {filePath}"
+        "noDiffDataAvailable": "Aucune donnée de diff disponible pour {filePath}",
+        "downloadToPc": "Télécharger sur mon PC"
       },
       "askQuestion": {
         "title": "L'agent attend votre choix",
@@ -3172,7 +3173,9 @@
       "syncFailed": "Échec de la synchronisation des compétences"
     },
     "autoPreviewLabel": "Ouvrir l'aperçu automatiquement",
-    "autoPreviewHint": "Lorsqu'un agent crée ou modifie un fichier Word, Excel ou PowerPoint, ouvrir automatiquement son aperçu en direct."
+    "autoPreviewHint": "Lorsqu'un agent crée ou modifie un fichier Word, Excel ou PowerPoint, ouvrir automatiquement son aperçu en direct.",
+    "autoDownloadProducedLabel": "Télécharger automatiquement les fichiers produits",
+    "autoDownloadProducedHint": "Lors de l'utilisation du serveur web (par ex. via Tailscale/LAN), télécharge automatiquement dans le dossier Téléchargements de ce navigateur les fichiers que l'agent crée ou modifie."
   },
   "SkillPacksSettings": {
     "title": "Packs de compétences",
@@ -3594,7 +3597,7 @@
     "isolation": "Isolation",
     "isolationWorktree": "Nouveau worktree par exécution",
     "isolationShared": "Exécuter dans le dossier",
-    "isolationSharedCaveat": "Les exécutions utilisent directement l'arbre de travail de ce dossier et peuvent entrer en conflit avec vos modifications non validées. Activez l'option worktree pour isoler chaque exécution.",
+    "isolationSharedCaveat": "Les exécutions utilisent directement l'arbre de travail de ce dossier et peuvent entrer en conflit avec vos modifications non validées. Choisissez « Nouveau worktree par exécution » pour isoler chaque exécution.",
     "trigger": "Déclencheur",
     "triggerSchedule": "Planifié",
     "triggerManual": "Manuel uniquement",
@@ -3710,7 +3713,8 @@
     "branchLocal": "Locale",
     "branchRemote": "Distante",
     "branchSearchPlaceholder": "Rechercher des branches…",
-    "branchNone": "Aucune branche"
+    "branchNone": "Aucune branche",
+    "advanced": "Avancé"
   },
   "CustomSkillsSettings": {
     "loading": "Chargement des compétences personnalisées…",

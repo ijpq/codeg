@@ -1,8 +1,9 @@
 "use client"
 
-import { memo, useMemo, useState } from "react"
+import { memo, useEffect, useMemo, useState } from "react"
 import {
   ChevronRight,
+  Download,
   ExternalLink,
   FileDiff,
   FileIcon,
@@ -11,6 +12,12 @@ import {
 import { useTranslations } from "next-intl"
 import { useActiveFolder } from "@/contexts/active-folder-context"
 import { useWorkspaceActions } from "@/contexts/workspace-context"
+import { downloadWorkspaceFile } from "@/lib/api"
+import {
+  hasSyncedProducedFile,
+  markProducedFileSynced,
+  useAutoDownloadProduced,
+} from "@/lib/produced-file-sync-prefs"
 import {
   CommitFileAdditions,
   CommitFileDeletions,
@@ -94,10 +101,32 @@ export const ReplyArtifacts = memo(function ReplyArtifacts({
     return { addedFiles, changedFiles }
   }, [files])
 
+  const folderPath = folder?.path
+
+  // Auto-sync produced files to the local PC (web / remote over HTTP): the
+  // browser can't write to an arbitrary folder, so trigger a one-time browser
+  // download per produced file. Opt-in, deduped across re-renders AND reloads
+  // (see produced-file-sync-prefs). Skipped on local desktop — the files are
+  // already on this machine there.
+  const autoDownloadEnabled = useAutoDownloadProduced()
+  useEffect(() => {
+    if (!autoDownloadEnabled || !isResponseComplete || isLocalDesktop()) return
+    if (!folderPath || files.length === 0) return
+    const turnId = sourceTurns[0]?.id ?? ""
+    for (const file of files) {
+      if (isRemovedFileDiff(file.diff)) continue
+      const key = `${folderPath}:${turnId}:${normalizeSlashPath(file.path)}`
+      if (hasSyncedProducedFile(key)) continue
+      markProducedFileSynced(key)
+      const rel = toFolderRelativePath(file.path, folderPath)
+      void downloadWorkspaceFile(folderPath, rel, fileNameOf(rel)).catch((e) =>
+        console.error("[ReplyArtifacts] auto-download failed:", e)
+      )
+    }
+  }, [autoDownloadEnabled, isResponseComplete, folderPath, files, sourceTurns])
+
   if (!isResponseComplete) return null
   if (files.length === 0) return null
-
-  const folderPath = folder?.path
 
   const openInTabs = (file: FileChangeStat) => {
     // openFilePreview accepts absolute paths (any location) and paths
@@ -109,6 +138,17 @@ export const ReplyArtifacts = memo(function ReplyArtifacts({
   const revealInFolder = (file: FileChangeStat) => {
     const absolute = toAbsoluteFilePath(file.path, folderPath)
     if (absolute) void revealItemInDir(absolute)
+  }
+
+  // Manual "download to my PC" (web / remote, where reveal-in-folder can't
+  // reach the user's machine). Streams the file through a one-time download
+  // ticket into the browser's Downloads folder.
+  const downloadToPc = (file: FileChangeStat) => {
+    if (!folderPath) return
+    const rel = toFolderRelativePath(file.path, folderPath)
+    void downloadWorkspaceFile(folderPath, rel, fileNameOf(rel)).catch((e) =>
+      console.error("[ReplyArtifacts] download failed:", e)
+    )
   }
 
   const totalAdditions = changedFiles.reduce((sum, f) => sum + f.additions, 0)
@@ -197,7 +237,7 @@ export const ReplyArtifacts = memo(function ReplyArtifacts({
                           </TooltipContent>
                         </Tooltip>
 
-                        {isLocalDesktop() && (
+                        {isLocalDesktop() ? (
                           <Tooltip>
                             <TooltipTrigger asChild>
                               <button
@@ -211,6 +251,24 @@ export const ReplyArtifacts = memo(function ReplyArtifacts({
                             </TooltipTrigger>
                             <TooltipContent side="top">
                               {t("revealInFolder")}
+                            </TooltipContent>
+                          </Tooltip>
+                        ) : (
+                          // Web / remote over HTTP: reveal-in-folder can't reach
+                          // the user's machine, so offer a browser download.
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <button
+                                type="button"
+                                onClick={() => downloadToPc(file)}
+                                aria-label={t("downloadToPc")}
+                                className="flex w-9 shrink-0 items-center justify-center border-l border-green-600/30 text-muted-foreground transition-colors hover:bg-green-500/15 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring dark:border-green-400/30"
+                              >
+                                <Download className="h-3.5 w-3.5" />
+                              </button>
+                            </TooltipTrigger>
+                            <TooltipContent side="top">
+                              {t("downloadToPc")}
                             </TooltipContent>
                           </Tooltip>
                         )}
@@ -278,68 +336,85 @@ export const ReplyArtifacts = memo(function ReplyArtifacts({
                       isOpen && "bg-muted/20"
                     )}
                   >
-                    <button
-                      type="button"
-                      aria-expanded={isOpen}
-                      onClick={() => setOpenPath(isOpen ? null : file.path)}
-                      title={displayPath}
+                    <div
                       className={cn(
-                        "flex w-full min-w-0 items-center gap-2 px-2 py-1.5 text-left transition-colors",
-                        isRemoved
-                          ? "hover:bg-destructive/10"
-                          : "hover:bg-accent/40",
+                        "flex items-stretch",
                         isOpen &&
                           (isRemoved
                             ? "border-b border-destructive/30"
                             : "border-b border-border")
                       )}
                     >
-                      <ChevronRight
+                      <button
+                        type="button"
+                        aria-expanded={isOpen}
+                        onClick={() => setOpenPath(isOpen ? null : file.path)}
+                        title={displayPath}
                         className={cn(
-                          "h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform",
-                          isOpen && "rotate-90"
-                        )}
-                      />
-                      <FileIcon
-                        className={cn(
-                          "h-3.5 w-3.5 shrink-0",
+                          "flex min-w-0 flex-1 items-center gap-2 px-2 py-1.5 text-left transition-colors",
                           isRemoved
-                            ? "text-destructive"
-                            : "text-muted-foreground"
+                            ? "hover:bg-destructive/10"
+                            : "hover:bg-accent/40"
                         )}
-                      />
-                      <span className="flex min-w-0 flex-1 items-baseline gap-2">
-                        <span
+                      >
+                        <ChevronRight
                           className={cn(
-                            "min-w-0 truncate text-xs",
-                            isRemoved ? "text-destructive" : "text-foreground"
+                            "h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform",
+                            isOpen && "rotate-90"
                           )}
-                        >
-                          {name}
+                        />
+                        <FileIcon
+                          className={cn(
+                            "h-3.5 w-3.5 shrink-0",
+                            isRemoved
+                              ? "text-destructive"
+                              : "text-muted-foreground"
+                          )}
+                        />
+                        <span className="flex min-w-0 flex-1 items-baseline gap-2">
+                          <span
+                            className={cn(
+                              "min-w-0 truncate text-xs",
+                              isRemoved ? "text-destructive" : "text-foreground"
+                            )}
+                          >
+                            {name}
+                          </span>
+                          {dir && (
+                            <span className="min-w-0 flex-1 truncate text-[10px] text-muted-foreground">
+                              {dir}
+                            </span>
+                          )}
                         </span>
-                        {dir && (
-                          <span className="min-w-0 flex-1 truncate text-[10px] text-muted-foreground">
-                            {dir}
+                        {isRemoved ? (
+                          <span className="inline-flex shrink-0 items-center rounded-md border border-destructive/30 bg-destructive/10 px-1.5 py-0.5 font-mono text-[10px] text-destructive">
+                            {t("remove")}
+                          </span>
+                        ) : (
+                          <span className="inline-flex shrink-0 items-center gap-1 rounded-md border border-border bg-muted/40 px-1.5 py-0.5 font-mono text-[10px] text-foreground">
+                            <CommitFileAdditions
+                              count={file.additions}
+                              className="text-[10px]"
+                            />
+                            <CommitFileDeletions
+                              count={file.deletions}
+                              className="text-[10px]"
+                            />
                           </span>
                         )}
-                      </span>
-                      {isRemoved ? (
-                        <span className="inline-flex shrink-0 items-center rounded-md border border-destructive/30 bg-destructive/10 px-1.5 py-0.5 font-mono text-[10px] text-destructive">
-                          {t("remove")}
-                        </span>
-                      ) : (
-                        <span className="inline-flex shrink-0 items-center gap-1 rounded-md border border-border bg-muted/40 px-1.5 py-0.5 font-mono text-[10px] text-foreground">
-                          <CommitFileAdditions
-                            count={file.additions}
-                            className="text-[10px]"
-                          />
-                          <CommitFileDeletions
-                            count={file.deletions}
-                            className="text-[10px]"
-                          />
-                        </span>
+                      </button>
+                      {!isRemoved && !isLocalDesktop() && (
+                        <button
+                          type="button"
+                          onClick={() => downloadToPc(file)}
+                          aria-label={t("downloadToPc")}
+                          title={t("downloadToPc")}
+                          className="flex w-8 shrink-0 items-center justify-center border-s border-border text-muted-foreground transition-colors hover:bg-accent/40 hover:text-foreground"
+                        >
+                          <Download className="h-3.5 w-3.5" />
+                        </button>
                       )}
-                    </button>
+                    </div>
 
                     {isOpen &&
                       (file.diff ? (

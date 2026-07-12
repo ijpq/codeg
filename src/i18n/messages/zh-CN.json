@@ -2566,7 +2566,8 @@
         "openFile": "打开 {filePath}",
         "openInEditor": "在编辑器中打开",
         "remove": "移除",
-        "noDiffDataAvailable": "未找到 {filePath} 的差异数据"
+        "noDiffDataAvailable": "未找到 {filePath} 的差异数据",
+        "downloadToPc": "下载到本机"
       },
       "askQuestion": {
         "title": "智能体需要你的选择",
@@ -3184,7 +3185,9 @@
       "syncFailed": "同步技能失败"
     },
     "autoPreviewLabel": "自动打开预览",
-    "autoPreviewHint": "当智能体创建或编辑 Word、Excel、PowerPoint 文件时，自动打开其实时预览。"
+    "autoPreviewHint": "当智能体创建或编辑 Word、Excel、PowerPoint 文件时，自动打开其实时预览。",
+    "autoDownloadProducedLabel": "自动下载产出文件到本机",
+    "autoDownloadProducedHint": "通过 web server(如经 Tailscale/局域网)使用时,自动把 agent 创建或修改的文件下载到此浏览器的下载目录。"
   },
   "SkillPacksSettings": {
     "title": "技能包",
@@ -3594,7 +3597,7 @@
     "isolation": "隔离方式",
     "isolationWorktree": "每次运行新建 worktree",
     "isolationShared": "在文件夹内运行",
-    "isolationSharedCaveat": "运行会直接使用该文件夹的工作树，可能与你未提交的改动冲突。勾选每次运行新建工作树以隔离每次运行。",
+    "isolationSharedCaveat": "运行会直接使用该文件夹的工作树,可能与你未提交的改动冲突。选择「每次运行新建 worktree」以隔离每次运行。",
     "trigger": "触发方式",
     "triggerSchedule": "按计划",
     "triggerManual": "仅手动",
@@ -3710,7 +3713,8 @@
     "branchLocal": "本地",
     "branchRemote": "远程",
     "branchSearchPlaceholder": "搜索分支…",
-    "branchNone": "无分支"
+    "branchNone": "无分支",
+    "advanced": "高级"
   },
   "CustomSkillsSettings": {
     "loading": "正在加载自定义技能…",
