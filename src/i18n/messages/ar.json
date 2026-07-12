@@ -2545,7 +2545,8 @@
         "openFile": "فتح {filePath}",
         "openInEditor": "فتح في المحرر",
         "remove": "إزالة",
-        "noDiffDataAvailable": "لا توجد بيانات diff متاحة لـ {filePath}"
+        "noDiffDataAvailable": "لا توجد بيانات diff متاحة لـ {filePath}",
+        "downloadToPc": "تنزيل إلى جهازي"
       },
       "askQuestion": {
         "title": "يحتاج الوكيل إلى اختيارك",
@@ -3149,7 +3150,9 @@
       "syncFailed": "فشل مزامنة المهارات"
     },
     "autoPreviewLabel": "فتح المعاينة تلقائيًا",
-    "autoPreviewHint": "عندما ينشئ وكيل ملف Word أو Excel أو PowerPoint أو يعدّله، افتح معاينته المباشرة تلقائيًا."
+    "autoPreviewHint": "عندما ينشئ وكيل ملف Word أو Excel أو PowerPoint أو يعدّله، افتح معاينته المباشرة تلقائيًا.",
+    "autoDownloadProducedLabel": "تنزيل الملفات المُنتَجة تلقائيًا",
+    "autoDownloadProducedHint": "عند استخدام خادم الويب (مثلًا عبر Tailscale/الشبكة المحلية)، ينزّل تلقائيًا الملفات التي ينشئها الوكيل أو يعدّلها إلى مجلد التنزيلات في هذا المتصفح."
   },
   "QuickMessagesSettings": {
     "title": "رسائل سريعة",
@@ -3554,7 +3557,7 @@
     "isolation": "العزل",
     "isolationWorktree": "worktree جديد لكل تشغيل",
     "isolationShared": "التشغيل داخل المجلد",
-    "isolationSharedCaveat": "تستخدم عمليات التشغيل شجرة عمل هذا المجلد مباشرةً، وقد تتعارض مع تغييراتك غير المُلتزَم بها. فعِّل خيار شجرة العمل لعزل كل عملية تشغيل.",
+    "isolationSharedCaveat": "تستخدم عمليات التشغيل شجرة عمل هذا المجلد مباشرةً وقد تتعارض مع تغييراتك غير المُلتزَم بها. اختر «worktree جديد لكل تشغيل» لعزل كل تشغيل.",
     "trigger": "المُشغِّل",
     "triggerSchedule": "وفق جدول",
     "triggerManual": "يدوي فقط",
@@ -3670,6 +3673,7 @@
     "branchLocal": "محلي",
     "branchRemote": "بعيد",
     "branchSearchPlaceholder": "بحث في الفروع…",
-    "branchNone": "لا توجد فروع"
+    "branchNone": "لا توجد فروع",
+    "advanced": "متقدم"
   }
 }

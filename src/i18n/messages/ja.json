@@ -2545,7 +2545,8 @@
         "openFile": "{filePath} を開く",
         "openInEditor": "エディタで開く",
         "remove": "削除",
-        "noDiffDataAvailable": "{filePath} の差分データがありません"
+        "noDiffDataAvailable": "{filePath} の差分データがありません",
+        "downloadToPc": "PC にダウンロード"
       },
       "askQuestion": {
         "title": "エージェントが選択を求めています",
@@ -3149,7 +3150,9 @@
       "syncFailed": "スキルの同期に失敗"
     },
     "autoPreviewLabel": "プレビューを自動で開く",
-    "autoPreviewHint": "エージェントが Word、Excel、PowerPoint ファイルを作成または編集したときに、ライブプレビューを自動で開きます。"
+    "autoPreviewHint": "エージェントが Word、Excel、PowerPoint ファイルを作成または編集したときに、ライブプレビューを自動で開きます。",
+    "autoDownloadProducedLabel": "生成ファイルを自動ダウンロード",
+    "autoDownloadProducedHint": "Web サーバー(Tailscale/LAN 経由など)で使用する際、エージェントが作成・変更したファイルをこのブラウザーのダウンロードフォルダーに自動ダウンロードします。"
   },
   "QuickMessagesSettings": {
     "title": "クイックメッセージ",
@@ -3554,7 +3557,7 @@
     "isolation": "分離",
     "isolationWorktree": "実行ごとに新しい worktree",
     "isolationShared": "フォルダ内で実行",
-    "isolationSharedCaveat": "実行はこのフォルダーの作業ツリーを直接使用するため、コミットしていない変更と競合する可能性があります。実行ごとに分離するにはワークツリーのオプションを有効にしてください。",
+    "isolationSharedCaveat": "実行はこのフォルダーのワークツリーを直接使用するため、未コミットの変更と競合する可能性があります。各実行を分離するには「実行ごとに新しい worktree」を選択してください。",
     "trigger": "トリガー",
     "triggerSchedule": "スケジュール",
     "triggerManual": "手動のみ",
@@ -3670,6 +3673,7 @@
     "branchLocal": "ローカル",
     "branchRemote": "リモート",
     "branchSearchPlaceholder": "ブランチを検索…",
-    "branchNone": "ブランチがありません"
+    "branchNone": "ブランチがありません",
+    "advanced": "詳細設定"
   }
 }
