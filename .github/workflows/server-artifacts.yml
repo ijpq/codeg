@@ -1,0 +1,136 @@
+name: Server Artifacts
+
+# Fork-friendly build of the standalone codeg-server for each platform, uploaded
+# as downloadable workflow artifacts. Unlike release.yml's `build-server` job —
+# which only runs on a `v*.*.*` tag, signs with `secrets.TAURI_SIGNING_PRIVATE_KEY`,
+# and uploads to a GitHub Release — this needs NO secrets, NO tag, NO signing and
+# NO release. Trigger it from the Actions tab ("Run workflow") or by pushing the
+# branch; download the per-platform bundles from the run's Artifacts section.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - custom/fork-features
+
+concurrency:
+  group: server-artifacts-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-server:
+    name: codeg-server ${{ matrix.os }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            arch: x64
+            runner: ubuntu-22.04
+          - os: darwin
+            arch: arm64
+            runner: macos-latest
+          - os: windows
+            arch: x64
+            runner: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+          shared-key: server-${{ matrix.os }}-${{ matrix.arch }}
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build static frontend
+        run: pnpm build
+
+      # `--no-default-features` drops the `tauri-runtime` feature, so the server
+      # and its stdio MCP companion build with no webkit/appindicator system
+      # deps (the same command `test.yml`'s server job compiles on a bare
+      # ubuntu runner). Both bins land in `src-tauri/target/release/`
+      # (`.exe` on Windows).
+      - name: Build server binaries
+        working-directory: src-tauri
+        run: cargo build --release --bin codeg-server --bin codeg-mcp --no-default-features
+
+      # Bundle a runnable server: the two binaries side-by-side (codeg-mcp must
+      # sit next to codeg-server for its exe-sibling lookup) + the static export
+      # as `./web` (auto-detected by `find_static_dir_standalone`).
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          NAME="codeg-server-${{ matrix.os }}-${{ matrix.arch }}"
+          mkdir -p "dist/$NAME/web"
+          cp src-tauri/target/release/codeg-server src-tauri/target/release/codeg-mcp "dist/$NAME/"
+          cp -R out/. "dist/$NAME/web/"
+          cat > "dist/$NAME/README.txt" <<'EOF'
+          codeg-server standalone build.
+
+          Run from THIS folder so the bundled ./web static UI is auto-detected:
+
+              CODEG_TOKEN=your-secret ./codeg-server
+
+          Then open http://<host>:3080/ and enter the token.
+
+          Optional env:
+            CODEG_PORT        listen port (default 3080)
+            CODEG_HOST        bind host (default 0.0.0.0)
+            CODEG_DATA_DIR    data/db directory
+            CODEG_STATIC_DIR  static web root (defaults to ./web next to the binary)
+
+          `codeg-mcp` must stay next to `codeg-server`.
+          EOF
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $NAME = "codeg-server-${{ matrix.os }}-${{ matrix.arch }}"
+          New-Item -ItemType Directory -Force "dist/$NAME/web" | Out-Null
+          Copy-Item "src-tauri/target/release/codeg-server.exe","src-tauri/target/release/codeg-mcp.exe" "dist/$NAME/"
+          Copy-Item -Recurse -Force "out/*" "dist/$NAME/web/"
+          @'
+          codeg-server standalone build.
+
+          Run from THIS folder so the bundled .\web static UI is auto-detected:
+
+              $env:CODEG_TOKEN="your-secret"; .\codeg-server.exe
+
+          Then open http://<host>:3080/ and enter the token.
+
+          Optional env:
+            CODEG_PORT        listen port (default 3080)
+            CODEG_HOST        bind host (default 0.0.0.0)
+            CODEG_DATA_DIR    data/db directory
+            CODEG_STATIC_DIR  static web root (defaults to .\web next to the binary)
+
+          codeg-mcp.exe must stay next to codeg-server.exe.
+          '@ | Out-File -Encoding utf8 "dist/$NAME/README.txt"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: codeg-server-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/codeg-server-${{ matrix.os }}-${{ matrix.arch }}
+          retention-days: 14
+          if-no-files-found: error
