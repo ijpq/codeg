@@ -56,12 +56,10 @@ export interface UseConnectionLifecycleReturn {
       onTurnInProgress?: () => void
       /**
        * Called for every OTHER send failure (413, hydration failure, network
-       * drop) after the error toast is shown. The caller must settle any
-       * optimistic state it created for this send — roll back the optimistic
-       * user turn so the conversation doesn't stay `awaiting_persist` (which
-       * would block queue auto-flush) and doesn't display the failed prompt
-       * as though it were sent. The draft is deliberately NOT re-queued: a
-       * deterministic failure would otherwise retry forever.
+       * drop) after the error toast is shown. The caller settles optimistic
+       * state and may re-queue only recoverable transport failures; the error
+       * argument distinguishes those from deterministic failures that would
+       * otherwise retry forever.
        */
       onSendFailed?: (error: unknown) => void
     }
