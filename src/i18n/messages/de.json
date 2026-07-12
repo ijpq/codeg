@@ -2568,7 +2568,8 @@
         "openFile": "{filePath} öffnen",
         "openInEditor": "Im Editor öffnen",
         "remove": "Entfernen",
-        "noDiffDataAvailable": "Keine Diff-Daten verfügbar für {filePath}"
+        "noDiffDataAvailable": "Keine Diff-Daten verfügbar für {filePath}",
+        "downloadToPc": "Auf meinen PC herunterladen"
       },
       "askQuestion": {
         "title": "Der Agent benötigt deine Auswahl",
@@ -3174,7 +3175,9 @@
       "syncFailed": "Skills konnten nicht synchronisiert werden"
     },
     "autoPreviewLabel": "Vorschau automatisch öffnen",
-    "autoPreviewHint": "Wenn ein Agent eine Word-, Excel- oder PowerPoint-Datei erstellt oder bearbeitet, wird die Live-Vorschau automatisch geöffnet."
+    "autoPreviewHint": "Wenn ein Agent eine Word-, Excel- oder PowerPoint-Datei erstellt oder bearbeitet, wird die Live-Vorschau automatisch geöffnet.",
+    "autoDownloadProducedLabel": "Erzeugte Dateien automatisch herunterladen",
+    "autoDownloadProducedHint": "Bei Nutzung des Webservers (z. B. über Tailscale/LAN) Dateien, die der Agent erstellt oder ändert, automatisch in den Downloads-Ordner dieses Browsers herunterladen."
   },
   "SkillPacksSettings": {
     "title": "Skill-Pakete",
@@ -3596,7 +3599,7 @@
     "isolation": "Isolierung",
     "isolationWorktree": "Neues Worktree pro Lauf",
     "isolationShared": "Im Ordner ausführen",
-    "isolationSharedCaveat": "Ausführungen verwenden den Arbeitsbaum dieses Ordners direkt und können mit deinen nicht committeten Änderungen kollidieren. Aktiviere die Worktree-Option, um jede Ausführung zu isolieren.",
+    "isolationSharedCaveat": "Läufe verwenden den Arbeitsbaum dieses Ordners direkt und können mit deinen nicht committeten Änderungen kollidieren. Wähle „Neuer Worktree pro Lauf“, um jeden Lauf zu isolieren.",
     "trigger": "Auslöser",
     "triggerSchedule": "Nach Zeitplan",
     "triggerManual": "Nur manuell",
@@ -3712,7 +3715,8 @@
     "branchLocal": "Lokal",
     "branchRemote": "Remote",
     "branchSearchPlaceholder": "Branches suchen…",
-    "branchNone": "Keine Branches"
+    "branchNone": "Keine Branches",
+    "advanced": "Erweitert"
   },
   "CustomSkillsSettings": {
     "loading": "Benutzerdefinierte Skills werden geladen…",
