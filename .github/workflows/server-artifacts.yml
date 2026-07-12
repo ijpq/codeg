@@ -33,6 +33,11 @@ jobs:
             target: x86_64-pc-windows-msvc
             bundles: nsis
             bundle_path: src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+          - os: linux
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            bundles: deb
+            bundle_path: src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/deb/*.deb
     steps:
       - uses: actions/checkout@v4
 
@@ -61,7 +66,19 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Stage x64 codeg-mcp sidecar
+      # The Linux desktop bundle links webkit2gtk + appindicator; patchelf is
+      # needed by Tauri's bundler. macOS/Windows ship their webview with the OS.
+      - name: Install Linux desktop dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - name: Stage codeg-mcp sidecar
         run: pnpm tauri:prepare-sidecars --target ${{ matrix.target }}
 
       - name: Build unsigned x64 desktop bundle
