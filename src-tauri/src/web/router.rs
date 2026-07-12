@@ -9,7 +9,6 @@ use axum::{
     Json, Router,
 };
 
-use crate::web::handlers::files::UPLOAD_MAX_BYTES;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
 
@@ -368,16 +367,14 @@ pub fn build_router(
         )
         .route(
             "/upload_attachment",
-            // The 2MiB `UPLOAD_MAX_BYTES` is the *file payload* limit; the
-            // raw multipart body also carries boundary markers, the
-            // `Content-Disposition` headers, and the `session_id` field —
-            // ~256-512 bytes of overhead. Without this layer, axum's default
-            // 2MiB `DefaultBodyLimit` rejects a perfectly-sized 2MiB file
-            // before our handler ever sees a chunk. Pad by 64KiB so the
-            // handler's own chunk-summing check (in `files.rs`) stays the
-            // authoritative size boundary.
-            post(handlers::files::upload_attachment)
-                .layer(DefaultBodyLimit::max(UPLOAD_MAX_BYTES as usize + 64 * 1024)),
+            // Attachments upload with no per-file limit by default (streamed
+            // straight to disk, like `/upload_workspace_file`). Disable axum's
+            // 2MiB `DefaultBodyLimit` so it can't reject before our handler
+            // sees a chunk; the optional `CODEG_UPLOAD_MAX_ATTACHMENT_BYTES`
+            // cap (and the disk-total quota) are enforced by the handler's
+            // chunk-summing check in `files.rs`, which stays the authoritative
+            // size boundary.
+            post(handlers::files::upload_attachment).layer(DefaultBodyLimit::disable()),
         )
         // ─── Workspace files (web upload/download) ───
         //
