@@ -2662,6 +2662,10 @@
         "revealInFolder": "ファイルマネージャーで表示",
         "removed": "削除",
         "fileUnavailable": "ファイルが利用できないか、存在しません: {filePath}"
+      },
+      "userResources": {
+        "openFile": "{filePath} を開く",
+        "fileUnavailable": "ファイルが利用できないか、存在しません: {filePath}"
       }
     },
     "diffPreview": {

@@ -2662,6 +2662,10 @@
         "revealInFolder": "Afficher dans le gestionnaire de fichiers",
         "removed": "supprimé",
         "fileUnavailable": "Fichier indisponible ou inexistant : {filePath}"
+      },
+      "userResources": {
+        "openFile": "Ouvrir {filePath}",
+        "fileUnavailable": "Fichier indisponible ou inexistant : {filePath}"
       }
     },
     "diffPreview": {

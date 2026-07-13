@@ -2662,6 +2662,10 @@
         "revealInFolder": "在檔案管理員中顯示",
         "removed": "已刪除",
         "fileUnavailable": "檔案不可用或已不存在:{filePath}"
+      },
+      "userResources": {
+        "openFile": "開啟 {filePath}",
+        "fileUnavailable": "檔案不可用或已不存在:{filePath}"
       }
     },
     "diffPreview": {
