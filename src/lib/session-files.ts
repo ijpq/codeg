@@ -787,6 +787,8 @@ export function extractSessionFilesGrouped(
 
       const normalized = normalizeToolName(block.tool_name)
       if (!WRITE_OPS.has(normalized)) continue
+      // Skip writes that were blocked/denied/errored — they never hit disk.
+      if (hasErrorToolResult(turn.blocks, block.tool_use_id)) continue
 
       const filePaths = extractFilePaths(block.input_preview)
       if (filePaths.length === 0) continue
@@ -849,6 +851,8 @@ export function extractReplyFileChanges(
 
       const normalized = normalizeToolName(block.tool_name)
       if (!WRITE_OPS.has(normalized)) continue
+      // Skip writes that were blocked/denied/errored — they never hit disk.
+      if (hasErrorToolResult(turn.blocks, block.tool_use_id)) continue
 
       const filePaths = extractFilePaths(block.input_preview)
       if (filePaths.length === 0) continue
@@ -910,6 +914,9 @@ export function countSessionArtifactFiles(turns: MessageTurn[]): number {
     for (const block of turn.blocks) {
       if (block.type !== "tool_use") continue
       if (!WRITE_OPS.has(normalizeToolName(block.tool_name))) continue
+      // Skip writes that were blocked/denied/errored — they never hit disk, so
+      // the collapsed count matches the expanded list (which filters the same).
+      if (hasErrorToolResult(turn.blocks, block.tool_use_id)) continue
       for (const filePath of extractFilePaths(block.input_preview)) {
         paths.add(normalizePath(filePath))
       }
@@ -994,6 +1001,30 @@ function findToolResultOutput(
     }
   }
   return null
+}
+
+/**
+ * True when the write's matching tool_result (same turn) is an ERROR — a
+ * permission-denied / blocked / failed write. Such a call only *proposed* a
+ * change that was never applied to disk, so it must not be counted as a
+ * produced file (else the list wouldn't match the files actually written, and
+ * opening the entry would fail because the file doesn't exist). Both the Claude
+ * and Codex parsers set `is_error` on denial/error, and the result is emitted
+ * in the same turn as the tool_use (same assumption `findToolResultOutput`
+ * already relies on). A write with a clean result — or no result at all — is
+ * kept, so agents that don't emit an explicit result aren't over-filtered.
+ */
+function hasErrorToolResult(
+  blocks: ContentBlock[],
+  toolUseId: string | null
+): boolean {
+  if (!toolUseId) return false
+  return blocks.some(
+    (block) =>
+      block.type === "tool_result" &&
+      block.tool_use_id === toolUseId &&
+      block.is_error === true
+  )
 }
 
 function buildDiffChunk(
