@@ -1784,7 +1784,8 @@ fn parse_grok_settings(raw_toml: &str) -> GrokSettings {
 
     GrokSettings {
         default_reasoning_effort: get("models", "default_reasoning_effort"),
-        permission_mode: get("ui", "permission_mode"),
+        permission_mode: get("ui", "permission_mode")
+            .map(|v| migrate_grok_permission_mode(&v).to_string()),
         custom_model_id,
         custom_base_url,
         custom_api_key,
@@ -1794,22 +1795,49 @@ fn parse_grok_settings(raw_toml: &str) -> GrokSettings {
     }
 }
 
-/// Pure predicate: does this Grok `config.toml` select the "always-approve"
-/// permission mode? Drives whether the ACP launch carries the explicit
-/// `--always-approve` flag. Anything else — "ask", unset, or malformed — is
-/// `false`, so ACP permission requests keep flowing to codeg's UI.
-fn grok_config_selects_always_approve(config_toml: &str) -> bool {
-    parse_grok_settings(config_toml).permission_mode.as_deref() == Some("always-approve")
+/// grok's real `--permission-mode` enum (docs.x.ai / verified against the
+/// 0.2.99 binary). codeg historically wrote a codeg-invented
+/// `permission_mode = "always-approve"` / `"ask"` into `~/.grok/config.toml`,
+/// neither of which grok accepts — `grok --permission-mode always-approve`
+/// errors out. `migrate_grok_permission_mode` maps those legacy markers onto the
+/// real modes so the settings dropdown, the launch flag, and grok's own TUI all
+/// agree.
+const GROK_PERMISSION_MODES: &[&str] = &[
+    "default",
+    "acceptEdits",
+    "auto",
+    "dontAsk",
+    "bypassPermissions",
+    "plan",
+];
+
+/// Legacy → real `permission_mode` value mapping (see [`GROK_PERMISSION_MODES`]).
+/// Unknown values pass through untouched (a user hand-editing config.toml to a
+/// real grok mode is preserved).
+fn migrate_grok_permission_mode(value: &str) -> &str {
+    match value {
+        "always-approve" => "bypassPermissions",
+        "ask" => "default",
+        other => other,
+    }
 }
 
-/// Whether Grok's ACP launch should carry `--always-approve`, read from the
-/// global `~/.grok/config.toml` (the same `[ui].permission_mode` the settings
-/// panel writes). Best-effort: a missing/unreadable config reads as `false`, so
-/// the default preserves codeg's ability to prompt for approvals.
-pub(crate) fn grok_launch_always_approve() -> bool {
-    load_grok_config_toml_raw()
-        .map(|raw| grok_config_selects_always_approve(&raw))
-        .unwrap_or(false)
+/// Pure helper: the `--permission-mode` value this Grok `config.toml` should hand
+/// the ACP launch, or `None` to pass no flag. `default` (grok's own default —
+/// ACP permission requests flow to codeg's UI) and unset/unrecognized values map
+/// to `None`, preserving the historical "ask" behaviour where codeg prompts.
+fn grok_config_permission_mode(config_toml: &str) -> Option<String> {
+    parse_grok_settings(config_toml)
+        .permission_mode
+        .filter(|m| m != "default" && GROK_PERMISSION_MODES.contains(&m.as_str()))
+}
+
+/// The `--permission-mode <value>` Grok's ACP launch should carry, read from the
+/// global `~/.grok/config.toml` `[ui].permission_mode` (legacy-migrated by
+/// `parse_grok_settings`). Best-effort: a missing/unreadable/`default` config
+/// yields `None`, so the default preserves codeg's ability to prompt for approvals.
+pub(crate) fn grok_launch_permission_mode() -> Option<String> {
+    load_grok_config_toml_raw().and_then(|raw| grok_config_permission_mode(&raw))
 }
 
 /// Merge the Grok panel's structured control values into the raw config.toml
@@ -8263,11 +8291,24 @@ mod tests {
 
     #[test]
     fn parse_grok_settings_reads_documented_keys() {
-        let toml = "[ui]\npermission_mode = \"always-approve\"\n\n\
+        let toml = "[ui]\npermission_mode = \"acceptEdits\"\n\n\
                     [models]\ndefault_reasoning_effort = \"high\"\n";
         let s = parse_grok_settings(toml);
-        assert_eq!(s.permission_mode.as_deref(), Some("always-approve"));
+        assert_eq!(s.permission_mode.as_deref(), Some("acceptEdits"));
         assert_eq!(s.default_reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn parse_grok_settings_migrates_legacy_permission_values() {
+        // codeg's old codeg-invented markers map onto grok's real enum so the
+        // dropdown, launch flag, and grok's TUI agree.
+        let approve = parse_grok_settings("[ui]\npermission_mode = \"always-approve\"\n");
+        assert_eq!(approve.permission_mode.as_deref(), Some("bypassPermissions"));
+        let ask = parse_grok_settings("[ui]\npermission_mode = \"ask\"\n");
+        assert_eq!(ask.permission_mode.as_deref(), Some("default"));
+        // A real grok mode is preserved untouched.
+        let real = parse_grok_settings("[ui]\npermission_mode = \"auto\"\n");
+        assert_eq!(real.permission_mode.as_deref(), Some("auto"));
     }
 
     #[test]
@@ -8287,14 +8328,14 @@ mod tests {
             "",
             &GrokStructuredConfig {
                 default_reasoning_effort: Some("high".into()),
-                permission_mode: Some("ask".into()),
+                permission_mode: Some("acceptEdits".into()),
                 ..Default::default()
             },
         )
         .unwrap();
         let back = parse_grok_settings(&merged);
         assert_eq!(back.default_reasoning_effort.as_deref(), Some("high"));
-        assert_eq!(back.permission_mode.as_deref(), Some("ask"));
+        assert_eq!(back.permission_mode.as_deref(), Some("acceptEdits"));
     }
 
     #[test]
@@ -8305,7 +8346,7 @@ mod tests {
             base,
             &GrokStructuredConfig {
                 default_reasoning_effort: Some("low".into()),
-                permission_mode: Some("always-approve".into()),
+                permission_mode: Some("bypassPermissions".into()),
                 ..Default::default()
             },
         )
@@ -8318,7 +8359,7 @@ mod tests {
         assert!(merged.contains("default = \"grok-4.5\""));
         let back = parse_grok_settings(&merged);
         assert_eq!(back.default_reasoning_effort.as_deref(), Some("low"));
-        assert_eq!(back.permission_mode.as_deref(), Some("always-approve"));
+        assert_eq!(back.permission_mode.as_deref(), Some("bypassPermissions"));
     }
 
     #[test]
@@ -8546,18 +8587,25 @@ mod tests {
     }
 
     #[test]
-    fn grok_config_selects_always_approve_only_for_that_mode() {
-        // Only an explicit always-approve arms the launch flag.
-        assert!(grok_config_selects_always_approve(
-            "[ui]\npermission_mode = \"always-approve\"\n"
-        ));
-        // "ask" keeps the flag off so ACP permission requests reach codeg.
-        assert!(!grok_config_selects_always_approve(
-            "[ui]\npermission_mode = \"ask\"\n"
-        ));
-        // Unset / malformed ⇒ false (preserve the ability to prompt).
-        assert!(!grok_config_selects_always_approve(""));
-        assert!(!grok_config_selects_always_approve("== not toml =="));
+    fn grok_config_permission_mode_maps_to_launch_flag() {
+        // Legacy always-approve → real bypassPermissions, passed as the flag.
+        assert_eq!(
+            grok_config_permission_mode("[ui]\npermission_mode = \"always-approve\"\n").as_deref(),
+            Some("bypassPermissions")
+        );
+        // A real granular mode passes through.
+        assert_eq!(
+            grok_config_permission_mode("[ui]\npermission_mode = \"acceptEdits\"\n").as_deref(),
+            Some("acceptEdits")
+        );
+        // `default` (grok's own default) and legacy `ask` keep the flag off so
+        // ACP permission requests reach codeg's UI.
+        assert!(grok_config_permission_mode("[ui]\npermission_mode = \"default\"\n").is_none());
+        assert!(grok_config_permission_mode("[ui]\npermission_mode = \"ask\"\n").is_none());
+        // Unset / malformed / unknown ⇒ no flag (preserve the ability to prompt).
+        assert!(grok_config_permission_mode("").is_none());
+        assert!(grok_config_permission_mode("== not toml ==").is_none());
+        assert!(grok_config_permission_mode("[ui]\npermission_mode = \"bogus\"\n").is_none());
     }
 
     /// Build a `runtime_env` whose `PI_CODING_AGENT_DIR` points at `agent_dir`,

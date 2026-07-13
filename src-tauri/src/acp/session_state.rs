@@ -13,7 +13,8 @@ use crate::acp::feedback::{FeedbackItem, FeedbackStatus};
 use crate::acp::question::PendingQuestionState;
 use crate::acp::types::{
     AcpEvent, AvailableCommandInfo, ConfigStaleKind, ConnectionStatus, EventEnvelope,
-    PromptCapabilitiesInfo, SessionConfigOptionInfo, SessionModeStateInfo, ToolCallImageInfo,
+    GrokEffortSpec, PromptCapabilitiesInfo, SessionConfigOptionInfo, SessionModeStateInfo,
+    ToolCallImageInfo,
 };
 use crate::models::agent::AgentType;
 use crate::models::message::MessageRole;
@@ -277,6 +278,14 @@ pub struct SessionState {
     pub modes: Option<SessionModeStateInfo>,
     pub current_mode: Option<String>,
     pub config_options: Option<Vec<SessionConfigOptionInfo>>,
+    /// Grok only: per-model reasoning-effort specs, parsed from the top-level
+    /// `models` of the session-establishment response (guaranteed on
+    /// `session/new`; opportunistic on resume/fork). Grok never re-sends this on
+    /// `set_model`, so it is cached here to rebuild the composer's effort
+    /// selector for the target model on a mid-session model switch. `None` for
+    /// non-Grok agents and when the response carried no `models` (flat fallback).
+    /// Backend-internal — not serialized.
+    pub grok_effort_specs: Option<std::collections::HashMap<String, GrokEffortSpec>>,
     pub prompt_capabilities: Option<PromptCapabilitiesInfo>,
     pub fork_supported: bool,
     pub available_commands: Vec<AvailableCommandInfo>,
@@ -421,6 +430,7 @@ impl SessionState {
             modes: None,
             current_mode: None,
             config_options: None,
+            grok_effort_specs: None,
             prompt_capabilities: None,
             fork_supported: false,
             available_commands: Vec::new(),
