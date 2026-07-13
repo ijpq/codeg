@@ -70,8 +70,8 @@ import {
 import { ConversationArtifactsPanel } from "@/components/message/conversation-artifacts-panel"
 import type { MessageScrollContextValue } from "@/components/message/message-scroll-context"
 import {
-  countSessionArtifactFiles,
-  extractReplyFileChanges,
+  countProducedFiles,
+  extractProducedFiles,
   extractSessionFilesGrouped,
   type FileChangeStat,
 } from "@/lib/session-files"
@@ -939,20 +939,18 @@ export function MessageListView({
   // --- Produced-files panel ---------------------------------------------------
   const [artifactsExpanded, setArtifactsExpanded] = useState(false)
 
-  // Cheap count of distinct produced/changed files for the collapsed chip —
-  // `countSessionArtifactFiles` extracts paths without parsing any diffs.
+  // Cheap count of distinct produced files for the collapsed chip —
+  // `countProducedFiles` (written files + blocked @mentions) without diffs.
   const artifactFileCount = useMemo(() => {
     if (!showMessageNav) return 0
-    return countSessionArtifactFiles(timelineTurns.map((item) => item.turn))
+    return countProducedFiles(timelineTurns.map((item) => item.turn))
   }, [showMessageNav, timelineTurns])
 
   // Full deduped file list (with diffs) — computed lazily only while the panel
-  // is expanded, since `extractReplyFileChanges` parses every write's diff.
+  // is expanded, since `extractProducedFiles` parses every write's diff.
   const artifactFiles = useMemo<FileChangeStat[]>(() => {
     if (!showMessageNav || !artifactsExpanded) return EMPTY_ARTIFACT_FILES
-    const files = extractReplyFileChanges(
-      timelineTurns.map((item) => item.turn)
-    )
+    const files = extractProducedFiles(timelineTurns.map((item) => item.turn))
     return files.length > 0 ? files : EMPTY_ARTIFACT_FILES
   }, [showMessageNav, artifactsExpanded, timelineTurns])
 
