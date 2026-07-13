@@ -2666,7 +2666,8 @@
         "openInEditor": "Abrir en el editor",
         "remove": "Quitar",
         "noDiffDataAvailable": "No hay datos de diff disponibles para {filePath}",
-        "downloadToPc": "Descargar a mi PC"
+        "downloadToPc": "Descargar a mi PC",
+        "fileUnavailable": "Archivo no disponible o que ya no existe: {filePath}"
       },
       "askQuestion": {
         "title": "El agente necesita tu elección",
@@ -2739,7 +2740,8 @@
         "openFile": "Abrir {filePath}",
         "viewDiff": "Ver cambios",
         "revealInFolder": "Mostrar en el administrador de archivos",
-        "removed": "eliminado"
+        "removed": "eliminado",
+        "fileUnavailable": "Archivo no disponible o que ya no existe: {filePath}"
       }
     },
     "diffPreview": {

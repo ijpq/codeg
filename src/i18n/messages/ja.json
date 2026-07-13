@@ -2666,7 +2666,8 @@
         "openInEditor": "エディタで開く",
         "remove": "削除",
         "noDiffDataAvailable": "{filePath} の差分データがありません",
-        "downloadToPc": "PC にダウンロード"
+        "downloadToPc": "PC にダウンロード",
+        "fileUnavailable": "ファイルが利用できないか、存在しません: {filePath}"
       },
       "askQuestion": {
         "title": "エージェントが選択を求めています",
@@ -2739,7 +2740,8 @@
         "openFile": "{filePath} を開く",
         "viewDiff": "変更を表示",
         "revealInFolder": "ファイルマネージャーで表示",
-        "removed": "削除"
+        "removed": "削除",
+        "fileUnavailable": "ファイルが利用できないか、存在しません: {filePath}"
       }
     },
     "diffPreview": {
