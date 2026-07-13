@@ -12,7 +12,8 @@ import {
 import { useTranslations } from "next-intl"
 import { useActiveFolder } from "@/contexts/active-folder-context"
 import { useWorkspaceActions } from "@/contexts/workspace-context"
-import { downloadWorkspaceFile } from "@/lib/api"
+import { toast } from "sonner"
+import { downloadWorkspaceFile, readFilePreview } from "@/lib/api"
 import {
   hasSyncedProducedFile,
   markProducedFileSynced,
@@ -128,11 +129,23 @@ export const ReplyArtifacts = memo(function ReplyArtifacts({
   if (!isResponseComplete) return null
   if (files.length === 0) return null
 
-  const openInTabs = (file: FileChangeStat) => {
-    // openFilePreview accepts absolute paths (any location) and paths
-    // relative to the active folder — agent-reported paths are one of the
-    // two, so hand them over as-is.
-    void openFilePreview(normalizeSlashPath(file.path))
+  const openInTabs = async (file: FileChangeStat) => {
+    // Probe existence first so a produced entry that isn't on disk gives a
+    // clear toast instead of `openFilePreview`'s silent no-op / easily-missed
+    // error tab. openFilePreview accepts absolute paths and folder-relative
+    // paths, so hand the raw path over on success.
+    const rel = toFolderRelativePath(file.path, folderPath)
+    if (folderPath) {
+      try {
+        await readFilePreview(folderPath, rel)
+      } catch {
+        toast.error(t("fileUnavailable", { filePath: rel }))
+        return
+      }
+    }
+    void openFilePreview(normalizeSlashPath(file.path), {
+      folderId: folder?.id,
+    })
   }
 
   const revealInFolder = (file: FileChangeStat) => {
@@ -206,7 +219,7 @@ export const ReplyArtifacts = memo(function ReplyArtifacts({
                           <TooltipTrigger asChild>
                             <button
                               type="button"
-                              onClick={() => openInTabs(file)}
+                              onClick={() => void openInTabs(file)}
                               title={displayPath}
                               aria-label={t("openFile", {
                                 filePath: displayPath,

@@ -2584,7 +2584,8 @@
         "openInEditor": "在编辑器中打开",
         "remove": "移除",
         "noDiffDataAvailable": "未找到 {filePath} 的差异数据",
-        "downloadToPc": "下载到本机"
+        "downloadToPc": "下载到本机",
+        "fileUnavailable": "文件不可用或已不存在:{filePath}"
       },
       "askQuestion": {
         "title": "智能体需要你的选择",
@@ -2657,7 +2658,8 @@
         "openFile": "打开 {filePath}",
         "viewDiff": "查看改动",
         "revealInFolder": "在文件管理器中显示",
-        "removed": "已删除"
+        "removed": "已删除",
+        "fileUnavailable": "文件不可用或已不存在:{filePath}"
       }
     },
     "diffPreview": {
