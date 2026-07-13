@@ -2817,6 +2817,10 @@
         "revealInFolder": "Im Datei-Manager anzeigen",
         "removed": "entfernt",
         "fileUnavailable": "Datei nicht verfügbar oder nicht mehr vorhanden: {filePath}"
+      },
+      "userResources": {
+        "openFile": "{filePath} öffnen",
+        "fileUnavailable": "Datei nicht verfügbar oder nicht mehr vorhanden: {filePath}"
       }
     },
     "diffPreview": {

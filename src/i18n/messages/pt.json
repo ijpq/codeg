@@ -2817,6 +2817,10 @@
         "revealInFolder": "Mostrar no gerenciador de arquivos",
         "removed": "removido",
         "fileUnavailable": "Arquivo indisponível ou que não existe mais: {filePath}"
+      },
+      "userResources": {
+        "openFile": "Abrir {filePath}",
+        "fileUnavailable": "Arquivo indisponível ou que não existe mais: {filePath}"
       }
     },
     "diffPreview": {
