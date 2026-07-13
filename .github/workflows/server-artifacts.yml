@@ -1,9 +1,9 @@
 name: Fork Artifacts
 
-# Fork-friendly desktop and standalone server builds, uploaded as downloadable
-# workflow artifacts. Unlike release.yml, this needs no secrets, tag, signing,
-# notarization, or GitHub Release. Trigger it from the Actions tab ("Run
-# workflow") or by pushing the branch, then download bundles from Artifacts.
+# Fork-friendly desktop and standalone server builds. A branch push uploads the
+# bundles as workflow artifacts and publishes the same files in a snapshot
+# prerelease; a manual run only produces workflow artifacts. Unlike release.yml,
+# this needs no signing or notarization secrets.
 
 on:
   workflow_dispatch:
@@ -12,8 +12,10 @@ on:
       - custom/fork-features
 
 concurrency:
-  group: fork-artifacts-${{ github.ref }}
-  cancel-in-progress: true
+  # A SHA-specific group keeps reruns orderly without cancelling a previous
+  # push: every distinct pushed commit must be able to reach publish-release.
+  group: fork-artifacts-${{ github.sha }}
+  cancel-in-progress: false
 
 jobs:
   build-client:
@@ -223,3 +225,129 @@ jobs:
           path: dist/codeg-server-${{ matrix.os }}-${{ matrix.arch }}
           retention-days: 14
           if-no-files-found: error
+
+  publish-release:
+    name: Publish snapshot release
+    if: github.event_name == 'push'
+    needs: [build-client, build-server]
+    runs-on: ubuntu-22.04
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download desktop bundles
+        uses: actions/download-artifact@v4
+        with:
+          pattern: codeg-client-*
+          path: release-assets
+          merge-multiple: true
+
+      # Keep server artifacts in separate directories. Merging them would make
+      # their codeg-server/codeg-mcp binaries and web trees overwrite each other.
+      - name: Download standalone server bundles
+        uses: actions/download-artifact@v4
+        with:
+          pattern: codeg-server-*
+          path: server-artifacts
+
+      - name: Package server bundles and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! command -v zip > /dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y zip
+          fi
+
+          for directory in server-artifacts/codeg-server-*; do
+            name="$(basename "$directory")"
+            if [[ "$name" == *-windows-* ]]; then
+              (
+                cd server-artifacts
+                zip -q -r "../release-assets/$name.zip" "$name"
+              )
+            else
+              # upload-artifact/download-artifact normalizes file modes. Put
+              # the executable bit back before wrapping Unix bundles in tar.
+              find "$directory" -type f \
+                \( -name codeg-server -o -name codeg-mcp \) \
+                -exec chmod 755 {} +
+              tar -C server-artifacts -czf "release-assets/$name.tar.gz" "$name"
+            fi
+          done
+
+          if ! compgen -G 'release-assets/*' > /dev/null; then
+            echo 'No release assets were prepared.'
+            exit 1
+          fi
+
+          (
+            cd release-assets
+            sha256sum ./* > SHA256SUMS.txt
+          )
+
+      - id: release-meta
+        name: Generate release metadata and notes
+        shell: bash
+        env:
+          BASE_BRANCH: main
+        run: |
+          set -euo pipefail
+
+          git fetch --no-tags origin "$BASE_BRANCH"
+
+          short_sha="${GITHUB_SHA::12}"
+          tag="snapshot-$short_sha"
+          title="Codeg custom snapshot $short_sha"
+          compare_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/compare/${BASE_BRANCH}...${GITHUB_SHA}"
+          commits="$(git log --reverse --no-merges --format='- %s (`%h`)' "origin/$BASE_BRANCH..$GITHUB_SHA")"
+
+          {
+            cat .github/release-notes/custom-fork.md
+            printf '\n## 相对 `%s` 的提交\n\n' "$BASE_BRANCH"
+            if [[ -n "$commits" ]]; then
+              printf '%s\n' "$commits"
+            else
+              printf '_当前提交与 `%s` 没有差异。_\n' "$BASE_BRANCH"
+            fi
+            printf '\n[查看相对 `%s` 的完整差异](%s)\n' "$BASE_BRANCH" "$compare_url"
+          } > release-notes.md
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "title=$title" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update snapshot prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release-meta.outputs.tag }}
+          TITLE: ${{ steps.release-meta.outputs.title }}
+        run: |
+          set -euo pipefail
+
+          release_is_draft="$(
+            gh release view "$TAG" --json isDraft --jq .isDraft 2> /dev/null || true
+          )"
+
+          if [[ "$release_is_draft" == "false" ]]; then
+            echo "Release $TAG is already published; nothing to update."
+            exit 0
+          elif [[ "$release_is_draft" == "true" ]]; then
+            gh release edit "$TAG" \
+              --title "$TITLE" \
+              --notes-file release-notes.md
+          else
+            gh release create "$TAG" \
+              --draft \
+              --target "$GITHUB_SHA" \
+              --title "$TITLE" \
+              --notes-file release-notes.md
+          fi
+
+          gh release upload "$TAG" release-assets/* --clobber
+          gh release edit "$TAG" --draft=false --prerelease
