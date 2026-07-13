@@ -2742,6 +2742,10 @@
         "revealInFolder": "Reveal in file manager",
         "removed": "removed",
         "fileUnavailable": "File unavailable or no longer exists: {filePath}"
+      },
+      "userResources": {
+        "openFile": "Open {filePath}",
+        "fileUnavailable": "File unavailable or no longer exists: {filePath}"
       }
     },
     "diffPreview": {

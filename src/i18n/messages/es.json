@@ -2742,6 +2742,10 @@
         "revealInFolder": "Mostrar en el administrador de archivos",
         "removed": "eliminado",
         "fileUnavailable": "Archivo no disponible o que ya no existe: {filePath}"
+      },
+      "userResources": {
+        "openFile": "Abrir {filePath}",
+        "fileUnavailable": "Archivo no disponible o que ya no existe: {filePath}"
       }
     },
     "diffPreview": {
