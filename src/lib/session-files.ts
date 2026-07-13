@@ -894,24 +894,94 @@ export function extractReplyFileChanges(
   })
 }
 
+// Codex marks a file its sandbox couldn't read as `@path [blocked: …]`; the
+// message adapter lifts these into resource chips (see ai-elements-adapter's
+// BLOCKED_RESOURCE_MENTION_RE + sanitizeMentionName). Mirror the same extraction
+// here so the produced-files panel can also list — and open — them (codeg's
+// file server runs OUTSIDE Codex's sandbox, so an in-workspace path is usually
+// readable even though Codex couldn't).
+const BLOCKED_MENTION_RE = /@([^\s@]+)\s*\[blocked[^\]]*\]/gi
+
+function sanitizeMentionPath(raw: string): string {
+  return raw.replace(/[),.;:!?]+$/g, "").trim()
+}
+
 /**
- * Cheap count of the distinct files produced/changed across a conversation's
- * assistant turns — exactly the set `extractReplyFileChanges` returns, but
- * WITHOUT generating any diffs (no `computeLineDiff`/`buildDiffChunk`). It only
- * normalizes each write tool call's name and extracts its file paths, so it is
- * cheap enough to run outside the streaming hot path: the collapsed "produced
- * files" chip can show a live count while the expensive per-file diff parse
- * stays gated behind the expanded panel.
+ * Distinct file paths a message referenced via a `@path [blocked]` marker.
+ * Scans USER turns only — the parser strips assistant-side blocked mentions, so
+ * the marker survives only in what the user sent. Referenced, not written, so
+ * each entry carries no diff and zero line counts.
  */
-export function countSessionArtifactFiles(turns: MessageTurn[]): number {
+export function extractBlockedMentionFiles(
+  turns: MessageTurn[]
+): FileChangeStat[] {
+  const seen = new Set<string>()
+  const out: FileChangeStat[] = []
+  for (const turn of turns) {
+    if (turn.role !== "user") continue
+    for (const block of turn.blocks) {
+      if (block.type !== "text" || !block.text) continue
+      for (const match of block.text.matchAll(BLOCKED_MENTION_RE)) {
+        const raw = sanitizeMentionPath(match[1] ?? "")
+        if (!raw) continue
+        const norm = normalizePath(raw)
+        if (seen.has(norm)) continue
+        seen.add(norm)
+        out.push({
+          id: `blocked-mention:${out.length}:${norm}`,
+          path: norm,
+          additions: 0,
+          deletions: 0,
+          diff: null,
+        })
+      }
+    }
+  }
+  return out
+}
+
+/**
+ * The full produced-files list for the conversation panel: written files
+ * (`extractReplyFileChanges`) plus blocked `@mention` files, deduped by path — a
+ * written file wins (it carries a diff).
+ */
+export function extractProducedFiles(turns: MessageTurn[]): FileChangeStat[] {
+  const written = extractReplyFileChanges(turns)
+  const seen = new Set(written.map((file) => normalizePath(file.path)))
+  const merged = [...written]
+  for (const file of extractBlockedMentionFiles(turns)) {
+    const norm = normalizePath(file.path)
+    if (seen.has(norm)) continue
+    seen.add(norm)
+    merged.push(file)
+  }
+  return merged
+}
+
+/**
+ * Cheap distinct count for the collapsed chip: written files (Write/Edit/
+ * apply_patch) UNION blocked `@mention` paths, WITHOUT generating any diffs — so
+ * it can run outside the streaming hot path while the expensive per-file diff
+ * parse stays gated behind the expanded panel.
+ */
+export function countProducedFiles(turns: MessageTurn[]): number {
   const paths = new Set<string>()
   for (const turn of turns) {
-    if (turn.role !== "assistant") continue
-    for (const block of turn.blocks) {
-      if (block.type !== "tool_use") continue
-      if (!WRITE_OPS.has(normalizeToolName(block.tool_name))) continue
-      for (const filePath of extractFilePaths(block.input_preview)) {
-        paths.add(normalizePath(filePath))
+    if (turn.role === "assistant") {
+      for (const block of turn.blocks) {
+        if (block.type !== "tool_use") continue
+        if (!WRITE_OPS.has(normalizeToolName(block.tool_name))) continue
+        for (const filePath of extractFilePaths(block.input_preview)) {
+          paths.add(normalizePath(filePath))
+        }
+      }
+    } else if (turn.role === "user") {
+      for (const block of turn.blocks) {
+        if (block.type !== "text" || !block.text) continue
+        for (const match of block.text.matchAll(BLOCKED_MENTION_RE)) {
+          const raw = sanitizeMentionPath(match[1] ?? "")
+          if (raw) paths.add(normalizePath(raw))
+        }
       }
     }
   }
