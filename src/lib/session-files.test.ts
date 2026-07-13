@@ -1,10 +1,74 @@
 import { describe, it, expect } from "vitest"
 import {
+  countSessionArtifactFiles,
   extractReplyFileChanges,
   extractSessionFilesGrouped,
 } from "./session-files"
 import { isAddedFileDiff, isRemovedFileDiff } from "./file-path-display"
 import type { MessageTurn } from "./types"
+
+// A write whose tool_result carries `is_error` — the shape a blocked/denied or
+// failed write takes in the transcript.
+function blockedWriteTurn(
+  id: string,
+  toolId: string,
+  filePath: string,
+  content: string,
+  isError = true
+): MessageTurn {
+  return {
+    id,
+    role: "assistant",
+    blocks: [
+      {
+        type: "tool_use",
+        tool_use_id: toolId,
+        tool_name: "Write",
+        input_preview: JSON.stringify({ file_path: filePath, content }),
+      },
+      {
+        type: "tool_result",
+        tool_use_id: toolId,
+        output_preview: isError ? "Permission denied" : "ok",
+        is_error: isError,
+      },
+    ],
+    timestamp: "2024-01-01T00:00:02Z",
+  }
+}
+
+describe("produced files exclude blocked/errored writes", () => {
+  it("drops a write whose tool_result is an error (blocked/denied)", () => {
+    const files = extractReplyFileChanges([
+      blockedWriteTurn("a1", "t1", "/repo/blocked.ts", "x\n"),
+    ])
+    expect(files).toEqual([])
+  })
+
+  it("keeps writes with a clean result, and writes with no result", () => {
+    const clean = blockedWriteTurn("a1", "t1", "/repo/ok.ts", "a\n", false)
+    expect(extractReplyFileChanges([clean]).map((f) => f.path)).toEqual([
+      "/repo/ok.ts",
+    ])
+    // A write with no tool_result at all must NOT be over-filtered.
+    expect(
+      extractReplyFileChanges([
+        writeTurn("a2", "t2", "/repo/nr.ts", "a\n"),
+      ]).map((f) => f.path)
+    ).toEqual(["/repo/nr.ts"])
+  })
+
+  it("countSessionArtifactFiles matches the filtered list", () => {
+    const turns = [
+      blockedWriteTurn("a1", "t1", "/repo/blocked.ts", "x\n"),
+      writeTurn("a2", "t2", "/repo/ok.ts", "a\n"),
+    ]
+    expect(countSessionArtifactFiles(turns)).toBe(1)
+    expect(extractReplyFileChanges(turns).map((f) => f.path)).toEqual([
+      "/repo/ok.ts",
+    ])
+  })
+})
 
 function userTurn(id: string, text: string): MessageTurn {
   return {

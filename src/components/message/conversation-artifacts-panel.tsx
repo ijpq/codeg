@@ -8,9 +8,11 @@ import {
   FileIcon,
   Files,
 } from "lucide-react"
+import { toast } from "sonner"
 import { useTranslations } from "next-intl"
 import { useActiveFolder } from "@/contexts/active-folder-context"
 import { useWorkspaceActions } from "@/contexts/workspace-context"
+import { readFilePreview } from "@/lib/api"
 import type { FileChangeStat } from "@/lib/session-files"
 import { CollapsedOverlayChip } from "@/components/chat/collapsed-overlay-chip"
 import {
@@ -83,15 +85,35 @@ export const ConversationArtifactsPanel = memo(
 
     const folderPath = folder?.path
 
-    const openInTab = (file: FileChangeStat) => {
-      // openFilePreview accepts absolute paths and paths relative to the active
-      // folder — agent-reported paths are one of the two, so pass them as-is.
-      void openFilePreview(normalizeSlashPath(file.path))
+    const openInTab = async (file: FileChangeStat) => {
+      // `openFilePreview` silently no-ops when the path can't be resolved and
+      // shows an (easily-missed) error tab when the read fails. Probe existence
+      // first so a file that isn't on disk — e.g. a write the agent proposed
+      // but that was later removed — gives a clear toast instead of nothing.
+      const rel = toFolderRelativePath(file.path, folderPath)
+      if (folderPath) {
+        try {
+          await readFilePreview(folderPath, rel)
+        } catch {
+          toast.error(t("fileUnavailable", { filePath: rel }))
+          return
+        }
+      }
+      void openFilePreview(normalizeSlashPath(file.path), {
+        folderId: folder?.id,
+      })
     }
 
     const openDiff = (file: FileChangeStat) => {
-      if (!file.diff) return
-      openSessionFileDiff(file.path, file.diff, `artifact-${file.id}`)
+      if (!file.diff) {
+        toast.error(t("fileUnavailable", { filePath: file.path }))
+        return
+      }
+      // Pass the folder explicitly: `openSessionFileDiff` silently returns when
+      // it can't resolve a target folder from the (absent) default.
+      openSessionFileDiff(file.path, file.diff, `artifact-${file.id}`, {
+        folderId: folder?.id,
+      })
     }
 
     const reveal = (file: FileChangeStat) => {
@@ -146,7 +168,7 @@ export const ConversationArtifactsPanel = memo(
                   >
                     <button
                       type="button"
-                      onClick={() => openInTab(file)}
+                      onClick={() => void openInTab(file)}
                       title={displayPath}
                       aria-label={t("openFile", { filePath: displayPath })}
                       className="flex min-w-0 flex-1 items-center gap-2 px-2 py-1.5 text-left transition-colors hover:bg-accent/40"
