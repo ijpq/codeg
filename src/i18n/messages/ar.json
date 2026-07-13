@@ -2586,7 +2586,8 @@
         "openInEditor": "فتح في المحرر",
         "remove": "إزالة",
         "noDiffDataAvailable": "لا توجد بيانات diff متاحة لـ {filePath}",
-        "downloadToPc": "تنزيل إلى جهازي"
+        "downloadToPc": "تنزيل إلى جهازي",
+        "fileUnavailable": "الملف غير متاح أو لم يعد موجودًا: {filePath}"
       },
       "askQuestion": {
         "title": "يحتاج الوكيل إلى اختيارك",
@@ -2659,7 +2660,8 @@
         "openFile": "فتح {filePath}",
         "viewDiff": "عرض التغييرات",
         "revealInFolder": "إظهار في مدير الملفات",
-        "removed": "محذوف"
+        "removed": "محذوف",
+        "fileUnavailable": "الملف غير متاح أو لم يعد موجودًا: {filePath}"
       }
     },
     "diffPreview": {
