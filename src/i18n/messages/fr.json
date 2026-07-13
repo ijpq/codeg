@@ -2741,7 +2741,8 @@
         "openInEditor": "Ouvrir dans l'éditeur",
         "remove": "Retirer",
         "noDiffDataAvailable": "Aucune donnée de diff disponible pour {filePath}",
-        "downloadToPc": "Télécharger sur mon PC"
+        "downloadToPc": "Télécharger sur mon PC",
+        "fileUnavailable": "Fichier indisponible ou inexistant : {filePath}"
       },
       "askQuestion": {
         "title": "L'agent attend votre choix",
@@ -2814,7 +2815,8 @@
         "openFile": "Ouvrir {filePath}",
         "viewDiff": "Voir les modifications",
         "revealInFolder": "Afficher dans le gestionnaire de fichiers",
-        "removed": "supprimé"
+        "removed": "supprimé",
+        "fileUnavailable": "Fichier indisponible ou inexistant : {filePath}"
       }
     },
     "diffPreview": {

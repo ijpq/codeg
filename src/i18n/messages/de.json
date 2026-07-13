@@ -2741,7 +2741,8 @@
         "openInEditor": "Im Editor öffnen",
         "remove": "Entfernen",
         "noDiffDataAvailable": "Keine Diff-Daten verfügbar für {filePath}",
-        "downloadToPc": "Auf meinen PC herunterladen"
+        "downloadToPc": "Auf meinen PC herunterladen",
+        "fileUnavailable": "Datei nicht verfügbar oder nicht mehr vorhanden: {filePath}"
       },
       "askQuestion": {
         "title": "Der Agent benötigt deine Auswahl",
@@ -2814,7 +2815,8 @@
         "openFile": "{filePath} öffnen",
         "viewDiff": "Änderungen anzeigen",
         "revealInFolder": "Im Datei-Manager anzeigen",
-        "removed": "entfernt"
+        "removed": "entfernt",
+        "fileUnavailable": "Datei nicht verfügbar oder nicht mehr vorhanden: {filePath}"
       }
     },
     "diffPreview": {

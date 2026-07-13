@@ -2741,7 +2741,8 @@
         "openInEditor": "Open in editor",
         "remove": "Remove",
         "noDiffDataAvailable": "No diff data available for {filePath}",
-        "downloadToPc": "Download to my PC"
+        "downloadToPc": "Download to my PC",
+        "fileUnavailable": "File unavailable or no longer exists: {filePath}"
       },
       "askQuestion": {
         "title": "The agent needs your input",
@@ -2814,7 +2815,8 @@
         "openFile": "Open {filePath}",
         "viewDiff": "View changes",
         "revealInFolder": "Reveal in file manager",
-        "removed": "removed"
+        "removed": "removed",
+        "fileUnavailable": "File unavailable or no longer exists: {filePath}"
       }
     },
     "diffPreview": {
