@@ -1,5 +1,8 @@
 import { describe, it, expect } from "vitest"
 import {
+  countProducedFiles,
+  extractBlockedMentionFiles,
+  extractProducedFiles,
   extractReplyFileChanges,
   extractSessionFilesGrouped,
 } from "./session-files"
@@ -365,5 +368,49 @@ describe("extractReplyFileChanges", () => {
       "/repo/src/a.ts",
       "/repo/src/b.ts",
     ])
+  })
+})
+
+describe("blocked @mention files surface in the produced list", () => {
+  it("extracts @path [blocked] paths from user message text", () => {
+    const turns = [
+      userTurn(
+        "u1",
+        "look at @out/result.csv [blocked: outside sandbox] and @a/b.txt [blocked]"
+      ),
+    ]
+    expect(extractBlockedMentionFiles(turns).map((f) => f.path)).toEqual([
+      "out/result.csv",
+      "a/b.txt",
+    ])
+    // Referenced, not written: no diff, zero counts.
+    const [first] = extractBlockedMentionFiles(turns)
+    expect(first.diff).toBeNull()
+    expect(first.additions).toBe(0)
+  })
+
+  it("extractProducedFiles merges written + blocked (deduped); count matches", () => {
+    const turns = [
+      userTurn("u1", "check @out/result.csv [blocked: nope]"),
+      writeTurn("a1", "t1", "/repo/x.ts", "a\n"),
+    ]
+    const files = extractProducedFiles(turns)
+    expect(files.map((f) => f.path)).toEqual(["/repo/x.ts", "out/result.csv"])
+    // The written file carries a diff; the blocked mention does not.
+    expect(files.find((f) => f.path === "/repo/x.ts")?.diff).toBeTruthy()
+    expect(files.find((f) => f.path === "out/result.csv")?.diff).toBeNull()
+    expect(countProducedFiles(turns)).toBe(2)
+  })
+
+  it("ignores blocked mentions in assistant text (parser strips those)", () => {
+    const turns: MessageTurn[] = [
+      {
+        id: "a1",
+        role: "assistant",
+        blocks: [{ type: "text", text: "@x/y.ts [blocked: no]" }],
+        timestamp: "2024-01-01T00:00:01Z",
+      },
+    ]
+    expect(extractBlockedMentionFiles(turns)).toEqual([])
   })
 })
