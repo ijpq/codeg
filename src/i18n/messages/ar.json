@@ -3222,6 +3222,10 @@
         "revealInFolder": "إظهار في مدير الملفات",
         "removed": "محذوف",
         "fileUnavailable": "الملف غير متاح أو لم يعد موجودًا: {filePath}"
+      },
+      "userResources": {
+        "openFile": "فتح {filePath}",
+        "fileUnavailable": "الملف غير متاح أو لم يعد موجودًا: {filePath}"
       }
     },
     "diffPreview": {
