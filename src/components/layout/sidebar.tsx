@@ -105,7 +105,14 @@ function SidebarNavButton({
   )
 }
 
-export function Sidebar() {
+export function Sidebar({
+  headerChrome,
+}: {
+  /** Desktop-only window chrome (traffic-light inset + toggle + folder/remote/
+   *  pet) injected at the left of the header when the sidebar owns the window's
+   *  left edge. Absent on mobile, where the header keeps its title. */
+  headerChrome?: ReactNode
+} = {}) {
   const t = useTranslations("Folder.sidebar")
   const { isOpen, toggle } = useSidebarContext()
   const { activeFolder } = useActiveFolder()
@@ -193,12 +200,24 @@ export function Sidebar() {
 
   return (
     <aside className="@container/sidebar flex h-full min-h-0 flex-col overflow-hidden bg-sidebar text-sidebar-foreground select-none">
-      <div className="flex h-10 shrink-0 items-center justify-between gap-2 border-b border-border pl-4 pr-2">
-        <div className="flex min-w-0 items-center gap-4">
-          <h2 className="truncate text-[0.875rem] font-bold tracking-[-0.00625rem] text-sidebar-foreground">
-            {t("title")}
-          </h2>
-        </div>
+      <div
+        className={cn(
+          "flex h-10 shrink-0 items-center gap-2 border-b border-border pr-2",
+          // When window chrome is injected (desktop), it supplies the macOS
+          // traffic-light inset, so drop the header's own left padding.
+          headerChrome ? "pl-0" : "pl-4"
+        )}
+      >
+        {headerChrome ?? (
+          <div className="flex min-w-0 items-center gap-4">
+            <h2 className="truncate text-[0.875rem] font-bold tracking-[-0.00625rem] text-sidebar-foreground">
+              {t("title")}
+            </h2>
+          </div>
+        )}
+        {/* Draggable filler between the two clusters — the header is now the
+            window's top edge, so its empty space must move the window. */}
+        <div data-tauri-drag-region className="h-full min-w-0 flex-1" />
         <div className="flex items-center gap-0.5">
           <Button
             variant="ghost"

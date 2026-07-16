@@ -1,6 +1,6 @@
 "use client"
 
-import { useCallback, useEffect, useState } from "react"
+import { useCallback, useEffect, useState, type ReactNode } from "react"
 import { Folder, FolderPen, GitCommit, Info } from "lucide-react"
 import { useTranslations } from "next-intl"
 import {
@@ -38,7 +38,18 @@ export function resolveAuxTabView(
   }
 }
 
-export function AuxPanel() {
+export function AuxPanel({
+  headerChrome,
+  reserveWindowControls = false,
+}: {
+  /** Desktop-only right-edge window chrome (terminal + aux + settings) injected
+   *  at the right of the tab row when the aux panel owns the window's right edge
+   *  (macOS). Absent on mobile / Windows-Linux. */
+  headerChrome?: ReactNode
+  /** Reserve trailing width for the Windows/Linux caption buttons that overlay
+   *  the window's top-right corner above this header. */
+  reserveWindowControls?: boolean
+} = {}) {
   const t = useTranslations("Folder.auxPanel.tabs")
   const tDetails = useTranslations("Folder.sessionDetails")
   const { isOpen, activeTab, setActiveTab } = useAuxPanelContext()
@@ -123,6 +134,14 @@ export function AuxPanel() {
                 <GitCommit className="h-3.5 w-3.5" />
               </TabsTrigger>
             </>
+          )}
+          {/* Right-edge window chrome + Win/Linux caption reservation. The
+              draggable filler pushes them flush right and lets this header —
+              now the window's top edge — move the window. */}
+          <div data-tauri-drag-region className="h-full min-w-0 flex-1" />
+          {headerChrome}
+          {reserveWindowControls && (
+            <div data-tauri-drag-region className="h-full w-[138px] shrink-0" />
           )}
         </TabsList>
 
