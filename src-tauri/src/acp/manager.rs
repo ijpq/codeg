@@ -24,6 +24,7 @@ use crate::acp::types::{
     AcpEvent, AgentOptionsSnapshot, ConfigStaleKind, ConnectionInfo, ConnectionStatus,
     ForkResultInfo, PromptInputBlock,
 };
+use crate::artifact_tracker::{ArtifactTracker, ArtifactTurnFinishStatus};
 use crate::db::entities::conversation::{self, ConversationKind, ConversationStatus};
 use crate::db::service::conversation_service;
 use crate::db::AppDatabase;
@@ -210,6 +211,10 @@ pub struct ConnectionManager {
     /// no cap, no cumulative growth; entries are removed on answer / cancel /
     /// connection teardown.
     pending_questions: Arc<Mutex<HashMap<String, PendingQuestionEntry>>>,
+    /// Backend-owned per-turn filesystem capture. Shared across every
+    /// `clone_ref` so prompt start and lifecycle completion operate on the same
+    /// generation map.
+    artifact_tracker: Arc<ArtifactTracker>,
 }
 
 /// A parked `ask_user_question` awaiting its answer. The `sender` resolves the
@@ -236,6 +241,7 @@ impl ConnectionManager {
             delegation_injection: Arc::new(std::sync::OnceLock::new()),
             probe_locks: Arc::new(Mutex::new(HashMap::new())),
             pending_questions: Arc::new(Mutex::new(HashMap::new())),
+            artifact_tracker: Arc::new(ArtifactTracker::new()),
         }
     }
 
@@ -248,6 +254,7 @@ impl ConnectionManager {
             delegation_injection: self.delegation_injection.clone(),
             probe_locks: self.probe_locks.clone(),
             pending_questions: self.pending_questions.clone(),
+            artifact_tracker: self.artifact_tracker.clone(),
         }
     }
 
@@ -273,7 +280,25 @@ impl ConnectionManager {
             delegation_injection: Arc::new(std::sync::OnceLock::new()),
             probe_locks: Arc::new(Mutex::new(HashMap::new())),
             pending_questions: Arc::new(Mutex::new(HashMap::new())),
+            artifact_tracker: Arc::new(ArtifactTracker::new()),
         }
+    }
+
+    pub(crate) async fn finish_artifact_turn(
+        &self,
+        connection_id: &str,
+        completion_event_seq: u64,
+        status: ArtifactTurnFinishStatus,
+        stop_reason: Option<String>,
+    ) {
+        self.artifact_tracker
+            .finish_turn(
+                connection_id,
+                completion_event_seq,
+                status,
+                stop_reason,
+            )
+            .await;
     }
 
     /// Insert a synthetic `AgentConnection` for tests that need to exercise
@@ -1060,6 +1085,48 @@ impl ConnectionManager {
                 None
             };
 
+        // Arm filesystem capture BEFORE enqueueing the prompt. Once the
+        // connection loop receives `ConnectionCommand::Prompt`, the agent may
+        // create a file immediately; starting from UserMessage/TurnComplete in
+        // an async subscriber would leave a race window for that first write.
+        let (working_dir_for_artifacts, event_seq_before_prompt, state_folder_id) = {
+            let state = state_arc.read().await;
+            (state.working_dir.clone(), state.event_seq, state.folder_id)
+        };
+        let artifact_capture_started = if let (Some(cid), Some(root_path)) =
+            (conversation_id_for_status, working_dir_for_artifacts)
+        {
+            match self
+                .artifact_tracker
+                .begin_turn(
+                    &db.conn,
+                    conn_id,
+                    cid,
+                    user_message.as_ref().map(|(id, _)| id.clone()),
+                    folder_id.or(state_folder_id),
+                    root_path,
+                    emitter.clone(),
+                    event_seq_before_prompt,
+                )
+                .await
+            {
+                Ok(_) => true,
+                Err(err) => {
+                    // Artifact persistence is observability, not permission to
+                    // run the agent: keep the prompt usable and make the loss
+                    // loud in diagnostics.
+                    tracing::error!(
+                        "[artifact-tracker] failed to begin turn for connection {}: {}",
+                        conn_id,
+                        err
+                    );
+                    false
+                }
+            }
+        } else {
+            false
+        };
+
         // We hold `_prompt_guard` here, so call the lock-free inner helper —
         // re-entering `send_prompt` would try to acquire the same mutex and
         // deadlock. The helper reserves channel capacity FIRST and only then
@@ -1087,6 +1154,9 @@ impl ConnectionManager {
                 Ok(conversation_id_for_status)
             }
             Err(send_err) => {
+                if artifact_capture_started {
+                    self.artifact_tracker.cancel_unsent_turn(conn_id).await;
+                }
                 if let Some(cid) = conversation_id_for_status {
                     match conversation_service::update_status(
                         &db.conn,

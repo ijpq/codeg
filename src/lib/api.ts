@@ -78,6 +78,7 @@ import type {
   DirectoryItem,
   UploadAttachmentResult,
   FilePreviewContent,
+  WorkspaceFileStat,
   FileEditContent,
   FileSaveResult,
   WorkspaceSnapshotResponse,
@@ -2910,6 +2911,13 @@ export async function readFilePreview(
   path: string
 ): Promise<FilePreviewContent> {
   return getTransport().call("read_file_preview", { rootPath, path })
+}
+
+export async function statWorkspaceFile(
+  rootPath: string,
+  path: string
+): Promise<WorkspaceFileStat> {
+  return getTransport().call("stat_workspace_file", { rootPath, path })
 }
 
 export async function readFileForEdit(

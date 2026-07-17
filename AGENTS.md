@@ -2,6 +2,8 @@
 
 This file provides guidance to Code Agent when working with code in this repository.
 
+> **同步提醒**：本文件与根目录 `CLAUDE.md` 除首行标题外内容完全一致。修改其中一份时务必同步另一份，避免两套代理指令漂移。
+
 ## 项目概述
 
 Codeg（Code Generation）是一个多智能体编码工作台，它将多个智能体（Claude Code、Codex CLI、OpenCode、Gemini CLI、OpenClaw、Cline 等）统一到一个工作区中，支持会话聚合和多智能体协作，支持桌面安装，服务器/Docker 部署。
@@ -21,11 +23,13 @@ Codeg（Code Generation）是一个多智能体编码工作台，它将多个智
 ### 前端
 
 ```bash
-pnpm eslint .                  # lint
-pnpm test                      # vitest 全跑（CI 用同一条命令）
-pnpm test:watch                # 开发时增量重跑
-pnpm test:coverage             # 覆盖率报告（输出到 coverage/index.html）
-pnpm build                     # 静态导出构建
+pnpm eslint .                          # lint
+pnpm test                              # vitest 全跑（CI 用同一条命令）
+pnpm vitest run src/lib/utils.test.ts  # 跑单个测试文件
+pnpm vitest run -t "名称片段"          # 按用例名过滤（单条测试）
+pnpm test:watch                        # 开发时增量重跑
+pnpm test:coverage                     # 覆盖率报告（输出到 coverage/index.html）
+pnpm build                             # 静态导出构建
 ```
 
 ### 后端 Rust（在 `src-tauri/` 目录下执行）
@@ -34,6 +38,8 @@ pnpm build                     # 静态导出构建
 # 桌面模式（默认 feature）
 cargo check
 cargo test --features test-utils
+cargo test --features test-utils <name>                    # 跑单个单元测试
+cargo test --features test-utils --test parsers_snapshot   # 跑单个集成测试文件（解析器快照在此）
 cargo clippy --all-targets --features test-utils -- -D warnings
 
 # 服务器模式
@@ -45,7 +51,7 @@ cargo clippy --no-default-features --bin codeg-server --lib -- -D warnings
 cargo check --no-default-features --bin codeg-mcp
 cargo clippy --no-default-features --bin codeg-mcp -- -D warnings
 
-# 解析器快照评审（输出变化时）
+# 解析器快照评审（输出变化时；.snap 位于 src-tauri/tests/snapshots/）
 cargo insta review
 INSTA_UPDATE=auto cargo test --features test-utils     # 自动写新 .snap
 ```
@@ -112,6 +118,7 @@ INSTA_UPDATE=auto cargo test --features test-utils     # 自动写新 .snap
 - **路径别名**：`@/*` 映射到 `./src/*`，导入写法为 `@/lib/utils`、`@/components/ui/button`
 - **服务器部署**：通过环境变量配置（`CODEG_PORT`、`CODEG_HOST`、`CODEG_TOKEN`、`CODEG_DATA_DIR`、`CODEG_STATIC_DIR`）
 - **Docker 支持**：多阶段构建（Node.js + Rust），支持 `docker-compose` 一键部署
+- **构建前置步骤**：`pnpm install` 的 `postinstall` 会把 `monaco-editor` 复制到 `public/vs`（编辑器依赖）；桌面构建/开发前需 `pnpm tauri:prepare-sidecars` 准备各代理 CLI 的 sidecar 二进制——`pnpm tauri:before-dev` / `tauri:before-build` 已包含该步骤
 
 ## 代码风格
 

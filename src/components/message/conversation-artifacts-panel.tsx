@@ -12,8 +12,9 @@ import { toast } from "sonner"
 import { useTranslations } from "next-intl"
 import { useActiveFolder } from "@/contexts/active-folder-context"
 import { useWorkspaceActions } from "@/contexts/workspace-context"
-import { readFilePreview } from "@/lib/api"
+import { resolveAvailableArtifactPath } from "@/lib/artifact-file-target"
 import type { FileChangeStat } from "@/lib/session-files"
+import type { FolderDetail } from "@/lib/types"
 import { CollapsedOverlayChip } from "@/components/chat/collapsed-overlay-chip"
 import {
   CommitFileAdditions,
@@ -24,7 +25,6 @@ import { Button } from "@/components/ui/button"
 import {
   fileNameOf,
   isRemovedFileDiff,
-  normalizeSlashPath,
   toAbsoluteFilePath,
   toFolderRelativePath,
 } from "@/lib/file-path-display"
@@ -45,6 +45,9 @@ interface ConversationArtifactsPanelProps {
   /** The whole conversation's produced files, deduped by path. Only populated
    *  while `expanded` (computed lazily by the parent). */
   files: FileChangeStat[]
+  /** This conversation's actual workspace root. Chat mode supplies its hidden
+   *  per-conversation folder here, even though it is absent from folder lists. */
+  folder?: FolderDetail | null
 }
 
 /**
@@ -64,10 +67,12 @@ export const ConversationArtifactsPanel = memo(
     expanded,
     onToggle,
     files,
+    folder: sessionFolder,
   }: ConversationArtifactsPanelProps) {
     const t = useTranslations("Folder.chat.conversationArtifacts")
     const { openFilePreview, openSessionFileDiff } = useWorkspaceActions()
-    const { activeFolder: folder } = useActiveFolder()
+    const { activeFolder } = useActiveFolder()
+    const folder = sessionFolder === undefined ? activeFolder : sessionFolder
 
     if (count <= 0) return null
 
@@ -86,20 +91,15 @@ export const ConversationArtifactsPanel = memo(
     const folderPath = folder?.path
 
     const openInTab = async (file: FileChangeStat) => {
-      // `openFilePreview` silently no-ops when the path can't be resolved and
-      // shows an (easily-missed) error tab when the read fails. Probe existence
-      // first so a file that isn't on disk — e.g. a write the agent proposed
-      // but that was later removed — gives a clear toast instead of nothing.
       const rel = toFolderRelativePath(file.path, folderPath)
-      if (folderPath) {
-        try {
-          await readFilePreview(folderPath, rel)
-        } catch {
-          toast.error(t("fileUnavailable", { filePath: rel }))
-          return
-        }
+      let absolutePath: string
+      try {
+        absolutePath = await resolveAvailableArtifactPath(file.path, folderPath)
+      } catch {
+        toast.error(t("fileUnavailable", { filePath: rel }))
+        return
       }
-      void openFilePreview(normalizeSlashPath(file.path), {
+      void openFilePreview(absolutePath, {
         folderId: folder?.id,
       })
     }
