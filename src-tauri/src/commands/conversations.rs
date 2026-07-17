@@ -3,7 +3,9 @@ use std::collections::{HashMap, HashSet};
 use crate::app_error::AppCommandError;
 use crate::db::entities::conversation;
 use crate::db::entities::folder::FolderKind;
-use crate::db::service::{conversation_service, folder_service, import_service, tab_service};
+use crate::db::service::{
+    artifact_service, conversation_service, folder_service, import_service, tab_service,
+};
 #[cfg(feature = "tauri-runtime")]
 use crate::db::AppDatabase;
 use crate::models::*;
@@ -615,6 +617,9 @@ pub async fn get_folder_conversation_core(
         .await
         .unwrap_or_default();
     inject_delegation_meta(&mut turns, &children);
+    let artifact_runs = artifact_service::list_for_conversation(conn, conversation_id)
+        .await
+        .map_err(AppCommandError::from)?;
 
     Ok((
         DbConversationDetail {
@@ -623,6 +628,7 @@ pub async fn get_folder_conversation_core(
             session_stats,
             transcript_watermark,
             in_flight_user_turn_id: None,
+            artifact_runs,
         },
         parsed_title,
     ))

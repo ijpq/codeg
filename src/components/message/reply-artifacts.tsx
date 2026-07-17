@@ -13,7 +13,8 @@ import { useTranslations } from "next-intl"
 import { useActiveFolder } from "@/contexts/active-folder-context"
 import { useWorkspaceActions } from "@/contexts/workspace-context"
 import { toast } from "sonner"
-import { downloadWorkspaceFile, readFilePreview } from "@/lib/api"
+import { downloadWorkspaceFile } from "@/lib/api"
+import { resolveAvailableArtifactPath } from "@/lib/artifact-file-target"
 import {
   hasSyncedProducedFile,
   markProducedFileSynced,
@@ -43,7 +44,7 @@ import {
   type FileChangeStat,
 } from "@/lib/session-files"
 import { isLocalDesktop, revealItemInDir } from "@/lib/platform"
-import type { MessageTurn } from "@/lib/types"
+import type { FolderDetail, MessageTurn } from "@/lib/types"
 import { cn } from "@/lib/utils"
 
 /**
@@ -68,12 +69,18 @@ import { cn } from "@/lib/utils"
 export const ReplyArtifacts = memo(function ReplyArtifacts({
   sourceTurns,
   isResponseComplete,
+  folder: sessionFolder,
 }: {
   sourceTurns: MessageTurn[]
   isResponseComplete: boolean
+  /** The folder owned by this conversation (including hidden chat folders).
+   *  Omitted only by embedded viewers that intentionally fall back to the
+   *  globally active folder. */
+  folder?: FolderDetail | null
 }) {
   const t = useTranslations("Folder.chat.replyArtifacts")
-  const { activeFolder: folder } = useActiveFolder()
+  const { activeFolder } = useActiveFolder()
+  const folder = sessionFolder === undefined ? activeFolder : sessionFolder
   const { openFilePreview } = useWorkspaceActions()
   const [newFilesOpen, setNewFilesOpen] = useState(true)
   const [changedOpen, setChangedOpen] = useState(false)
@@ -93,7 +100,10 @@ export const ReplyArtifacts = memo(function ReplyArtifacts({
     const addedFiles: FileChangeStat[] = []
     const changedFiles: FileChangeStat[] = []
     for (const file of files) {
-      if (!isRemovedFileDiff(file.diff) && isAddedFileDiff(file.diff)) {
+      if (
+        !isRemovedFileDiff(file.diff) &&
+        (file.created || isAddedFileDiff(file.diff))
+      ) {
         addedFiles.push(file)
       } else {
         changedFiles.push(file)
@@ -130,20 +140,18 @@ export const ReplyArtifacts = memo(function ReplyArtifacts({
   if (files.length === 0) return null
 
   const openInTabs = async (file: FileChangeStat) => {
-    // Probe existence first so a produced entry that isn't on disk gives a
-    // clear toast instead of `openFilePreview`'s silent no-op / easily-missed
-    // error tab. openFilePreview accepts absolute paths and folder-relative
-    // paths, so hand the raw path over on success.
     const rel = toFolderRelativePath(file.path, folderPath)
-    if (folderPath) {
-      try {
-        await readFilePreview(folderPath, rel)
-      } catch {
-        toast.error(t("fileUnavailable", { filePath: rel }))
-        return
-      }
+    let absolutePath: string
+    try {
+      // Metadata-only probing is important here: Office artifacts are binary,
+      // so attempting to read them through the text-preview API falsely marks
+      // a perfectly valid .docx/.xlsx/.pptx as unavailable.
+      absolutePath = await resolveAvailableArtifactPath(file.path, folderPath)
+    } catch {
+      toast.error(t("fileUnavailable", { filePath: rel }))
+      return
     }
-    void openFilePreview(normalizeSlashPath(file.path), {
+    void openFilePreview(absolutePath, {
       folderId: folder?.id,
     })
   }
