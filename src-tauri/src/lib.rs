@@ -5,6 +5,7 @@ pub use acp::{
 pub use network::proxy::init_proxy_from_db;
 mod app_error;
 pub mod app_state;
+pub mod artifact_tracker;
 pub mod automation;
 pub mod backgrounds;
 pub mod chat_channel;
@@ -968,6 +969,7 @@ mod tauri_app {
                 folders::list_workspace_files,
                 folders::read_file_base64,
                 folders::read_workspace_file_base64,
+                folders::stat_workspace_file,
                 folders::read_file_preview,
                 folders::read_file_for_edit,
                 folders::save_file_content,

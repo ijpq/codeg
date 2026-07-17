@@ -1,7 +1,12 @@
-import type { ContentBlock, MessageTurn } from "./types"
+import type {
+  ContentBlock,
+  ConversationTurnArtifactRun,
+  MessageTurn,
+} from "./types"
 import { normalizeToolName } from "./tool-call-normalization"
 import { estimateChangedLineStats } from "./line-change-stats"
 import { generateUnifiedDiff } from "./unified-diff-generator"
+import { tokenizeReferenceLinks } from "./reference-link"
 
 export type FileOperation = "read" | "edit" | "write" | "apply_patch"
 
@@ -16,6 +21,11 @@ export interface FileChangeStat {
   additions: number
   deletions: number
   diff: string | null
+  /** Best-effort creation signal for files produced outside text-edit tools
+   * (for example a `.docx` emitted by Python in a shell command). Such binary
+   * files have no meaningful line diff, so the artifacts card cannot infer
+   * creation from `--- /dev/null` like it does for a normal Write call. */
+  created?: boolean
 }
 
 export interface UserMessageGroup {
@@ -42,6 +52,55 @@ interface DiffSection extends DiffStat {
 
 const WRITE_OPS = new Set<string>(["edit", "write", "apply_patch"])
 const FILE_OPS = new Set<string>(["read", "edit", "write", "apply_patch"])
+const SHELL_OPS = new Set<string>(["bash", "exec_command"])
+
+// Final-answer links are only a fallback for opaque shell runs (for example
+// `python build_report.py`, where the output path lives inside the script).
+// Keep this list to common generated artifacts so a shell-assisted code review
+// does not turn every linked source file into a claimed output.
+const LINK_FALLBACK_ARTIFACT_EXTENSIONS = new Set([
+  "7z",
+  "avi",
+  "bmp",
+  "bz2",
+  "csv",
+  "db",
+  "doc",
+  "docx",
+  "feather",
+  "gif",
+  "gz",
+  "html",
+  "jpeg",
+  "jpg",
+  "mov",
+  "mp3",
+  "mp4",
+  "ods",
+  "odt",
+  "ogg",
+  "odp",
+  "parquet",
+  "pdf",
+  "png",
+  "ppt",
+  "pptx",
+  "rar",
+  "rtf",
+  "sqlite",
+  "svg",
+  "tar",
+  "tgz",
+  "tif",
+  "tiff",
+  "tsv",
+  "wav",
+  "webm",
+  "webp",
+  "xls",
+  "xlsx",
+  "zip",
+])
 
 const NESTED_PAYLOAD_KEYS = ["input", "arguments", "params", "payload"]
 
@@ -604,6 +663,270 @@ function extractFilePaths(inputPreview: string | null): string[] {
   return Array.from(paths)
 }
 
+/** Turn a local `file://` URI into the path form used by the workspace APIs. */
+function pathFromFileUri(raw: string): string | null {
+  try {
+    const parsed = new URL(raw)
+    if (parsed.protocol.toLowerCase() !== "file:") return null
+    let path = decodeURIComponent(parsed.pathname)
+    if (parsed.host && parsed.host.toLowerCase() !== "localhost") {
+      path = `//${parsed.host}${path}`
+    } else if (/^\/[a-zA-Z]:\//.test(path)) {
+      // URL pathname form for a Windows drive: `/C:/repo/file.docx`.
+      path = path.slice(1)
+    }
+    return normalizePath(path)
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Clean a path literal recovered from a shell command/output or Markdown link.
+ * Dynamic expressions are deliberately rejected: `${out}/report.docx` and
+ * `$OUT/report.docx` cannot be opened reliably from a persisted transcript.
+ */
+function normalizeProducedPath(raw: string): string | null {
+  let value = raw.trim()
+  if (!value) return null
+
+  if (value.startsWith("<") && value.endsWith(">")) {
+    value = value.slice(1, -1).trim()
+  }
+  value = value.replace(/\\([<>\\])/g, "$1")
+
+  const fileUri = /^file:\/\//i.test(value) ? pathFromFileUri(value) : null
+  if (fileUri) value = fileUri
+  else if (
+    /^[a-zA-Z][a-zA-Z\d+.-]*:/.test(value) &&
+    !/^[a-zA-Z]:[\\/]/.test(value)
+  )
+    return null
+
+  value = value.replace(/[),;:]+$/g, "")
+  if (
+    !value ||
+    value === "/dev/null" ||
+    /[\r\n\0]/.test(value) ||
+    /(?:\$\{|\$[A-Za-z_(]|[*?{}])/u.test(value)
+  ) {
+    return null
+  }
+
+  const normalized = normalizePath(value)
+  const name = normalized.slice(normalized.lastIndexOf("/") + 1)
+  // A produced entry must name a file, not an output directory. Extensions are
+  // intentionally format-agnostic here: explicit `.save()` / `-o` syntax is
+  // already the strong write signal, so custom scientific formats still work.
+  if (!/\.[A-Za-z0-9][A-Za-z0-9._-]{0,15}$/.test(name)) return null
+  return normalized
+}
+
+function addCapturedPath(
+  out: Set<string>,
+  ...captures: Array<string | undefined>
+): void {
+  for (const capture of captures) {
+    if (!capture) continue
+    const path = normalizeProducedPath(capture)
+    if (path) out.add(path)
+    return
+  }
+}
+
+/** Extract path-looking tokens from a success message such as
+ * `Saved /repo/report.docx` or `已生成："out/report.docx"`. */
+function extractPathTokens(text: string): string[] {
+  const paths = new Set<string>()
+
+  for (const match of text.matchAll(/["'`]([^"'`\r\n]+)["'`]/g)) {
+    addCapturedPath(paths, match[1])
+  }
+
+  // Bare paths may be absolute, explicitly relative, or a simple filename.
+  // Stop at shell/Markdown punctuation so a following sentence is not folded
+  // into the path; quoted paths above handle whitespace in filenames.
+  const bare =
+    /(?:^|[\s=:])((?:[A-Za-z]:[\\/]|~?[\\/]|\.{1,2}[\\/])?[^\s"'`;|<>()\[\]]+\.[A-Za-z0-9][A-Za-z0-9._-]{0,15})(?=$|[\s,;)\]])/g
+  for (const match of text.matchAll(bare)) {
+    addCapturedPath(paths, match[1])
+  }
+
+  return Array.from(paths)
+}
+
+function shellCommandFromPreview(inputPreview: string | null): string {
+  if (!inputPreview) return ""
+  const parsed = parseInputObject(inputPreview)
+  if (!parsed) return inputPreview
+  return (
+    findStringFieldDeep(parsed, ["command", "cmd", "script"]) ?? inputPreview
+  )
+}
+
+/**
+ * Best-effort, deliberately conservative extraction of files a successful
+ * shell command wrote. This covers the dominant binary/document generation
+ * shapes without treating arbitrary command arguments (often input files) as
+ * outputs: Python/JS save APIs, writable `open`, CLI `-o/--output`, shell
+ * redirection, and explicit "saved/generated" result lines.
+ */
+function extractShellProducedPaths(
+  inputPreview: string | null,
+  outputPreview: string | null
+): string[] {
+  const command = shellCommandFromPreview(inputPreview)
+  const paths = new Set<string>()
+
+  const firstArgumentWrites =
+    /(?:\.|\b)(?:save|savefig|writeFileSync|writeFile|write_text|write_bytes|to_csv|to_excel|to_json|to_parquet|to_pickle|write_html|write_image|export)\s*\(\s*(?:[rubf]{0,2})?(?:"([^"]+)"|'([^']+)'|`([^`]+)`)/gi
+  for (const match of command.matchAll(firstArgumentWrites)) {
+    addCapturedPath(paths, match[1], match[2], match[3])
+  }
+
+  // `Path("out/report.docx").write_bytes(...)` keeps the destination in the
+  // receiver rather than the method's first argument.
+  const pathWrites =
+    /\bPath\s*\(\s*(?:[rubf]{0,2})?(?:"([^"]+)"|'([^']+)'|`([^`]+)`)\s*\)\s*\.\s*(?:write_text|write_bytes)\s*\(/gi
+  for (const match of command.matchAll(pathWrites)) {
+    addCapturedPath(paths, match[1], match[2], match[3])
+  }
+
+  // Writable Python-style open(path, "w"/"a"/"x"/"+"). A read-only open is
+  // not a production signal and is intentionally ignored.
+  const writableOpen =
+    /\bopen\s*\(\s*(?:[rubf]{0,2})?(?:"([^"]+)"|'([^']+)')\s*,\s*(?:[rubf]{0,2})?(?:"[^"]*[wax+][^"]*"|'[^']*[wax+][^']*')/gi
+  for (const match of command.matchAll(writableOpen)) {
+    addCapturedPath(paths, match[1], match[2])
+  }
+
+  const outputFlags =
+    /(?:^|\s)(?:-o|--output(?:-file)?|--outfile|--out)\s*(?:=\s*|\s+)(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))/gi
+  for (const match of command.matchAll(outputFlags)) {
+    addCapturedPath(paths, match[1], match[2], match[3])
+  }
+
+  const redirects = /(?:^|[\s)])>{1,2}\s*(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))/g
+  for (const match of command.matchAll(redirects)) {
+    addCapturedPath(paths, match[1], match[2], match[3])
+  }
+
+  if (outputPreview) {
+    const successMarker =
+      /\b(?:created|generated|saved|written|wrote|exported|produced|output(?:\s+file)?)\b|(?:已生成|生成成功|已创建|创建成功|已保存|已写入|已导出|产出|输出文件)/i
+    for (const line of outputPreview.split(/\r?\n/)) {
+      if (!successMarker.test(line)) continue
+      for (const path of extractPathTokens(line)) paths.add(path)
+    }
+  }
+
+  return Array.from(paths)
+}
+
+function matchingToolResult(
+  blocks: ContentBlock[],
+  toolUseId: string | null
+): Extract<ContentBlock, { type: "tool_result" }> | null {
+  if (!toolUseId) return null
+  return (
+    blocks.find(
+      (block): block is Extract<ContentBlock, { type: "tool_result" }> =>
+        block.type === "tool_result" && block.tool_use_id === toolUseId
+    ) ?? null
+  )
+}
+
+function linkDestinationToLocalPath(destination: string): string | null {
+  let value = destination.trim()
+  if (value.startsWith("<") && value.endsWith(">")) {
+    value = value.slice(1, -1).trim()
+  }
+  const isFileUri = /^file:\/\//i.test(value)
+  const isExplicitLocalPath =
+    (value.startsWith("/") && !value.startsWith("//")) ||
+    value.startsWith("./") ||
+    value.startsWith("../") ||
+    value.startsWith("~/") ||
+    /^[A-Za-z]:[\\/]/.test(value) ||
+    value.startsWith("\\\\")
+  const isBareRelativePath =
+    !value.startsWith("#") &&
+    !value.startsWith("//") &&
+    !/^[a-zA-Z][a-zA-Z\d+.-]*:/.test(value)
+  if (!isFileUri && !isExplicitLocalPath && !isBareRelativePath) return null
+
+  const path = normalizeProducedPath(value)
+  if (!path) return null
+  const extension = path.slice(path.lastIndexOf(".") + 1).toLowerCase()
+  return LINK_FALLBACK_ARTIFACT_EXTENSIONS.has(extension) ? path : null
+}
+
+/** Split supplied turns into user-request reply groups. `extractReply…` is
+ * normally passed one group already, while the conversation panel passes the
+ * entire timeline; grouping here prevents a shell call in an old request from
+ * blessing an unrelated file link in a later answer as a generated output. */
+function assistantReplyGroups(turns: MessageTurn[]): MessageTurn[][] {
+  const groups: MessageTurn[][] = []
+  let current: MessageTurn[] = []
+  const flush = () => {
+    if (current.length > 0) groups.push(current)
+    current = []
+  }
+  for (const turn of turns) {
+    if (turn.role === "user") {
+      flush()
+    } else if (turn.role === "assistant") {
+      current.push(turn)
+    }
+  }
+  flush()
+  return groups
+}
+
+/** Files created by opaque shell/tool execution, in first-seen order. */
+function extractExternalProducedPaths(turns: MessageTurn[]): string[] {
+  const all = new Set<string>()
+
+  for (const group of assistantReplyGroups(turns)) {
+    let hasSuccessfulShell = false
+
+    for (const turn of group) {
+      for (const block of turn.blocks) {
+        if (block.type !== "tool_use") continue
+        if (!SHELL_OPS.has(normalizeToolName(block.tool_name))) continue
+
+        const result = matchingToolResult(turn.blocks, block.tool_use_id)
+        if (result?.is_error) continue
+        hasSuccessfulShell = true
+        for (const path of extractShellProducedPaths(
+          block.input_preview,
+          result?.output_preview ?? null
+        )) {
+          all.add(path)
+        }
+      }
+    }
+
+    // Some generators hide the destination in a script and only the final
+    // answer exposes it. Accept common artifact links only when this same user
+    // request actually ran a successful shell tool.
+    if (hasSuccessfulShell) {
+      for (const turn of group) {
+        for (const block of turn.blocks) {
+          if (block.type !== "text" || !block.text) continue
+          for (const token of tokenizeReferenceLinks(block.text)) {
+            if (token.type !== "link") continue
+            const path = linkDestinationToLocalPath(token.destination)
+            if (path) all.add(path)
+          }
+        }
+      }
+    }
+  }
+
+  return Array.from(all)
+}
+
 /**
  * True when a tool input is an edit descriptor (`{file_path, old_string,
  * new_string}` or `{changes:{path:{...}}}`) rather than V4A/unified patch text.
@@ -757,9 +1080,29 @@ export function extractSessionFilesGrouped(
   const groups: UserMessageGroup[] = []
   let currentUserTurn: MessageTurn | null = null
   let currentFiles: FileChangeStat[] = []
+  let currentAssistantTurns: MessageTurn[] = []
 
   const flushGroup = () => {
     if (!currentUserTurn) return
+
+    // Supplement transcript-native Write/Edit operations with successful shell
+    // outputs (Office documents, images, archives, etc.). Keep the existing
+    // per-operation rows intact and only append paths not already represented.
+    const seen = new Set(currentFiles.map((file) => normalizePath(file.path)))
+    for (const path of extractExternalProducedPaths(currentAssistantTurns)) {
+      const normalized = normalizePath(path)
+      if (seen.has(normalized)) continue
+      seen.add(normalized)
+      currentFiles.push({
+        id: `${currentUserTurn.id}:external:${currentFiles.length}`,
+        path: normalized,
+        additions: 0,
+        deletions: 0,
+        diff: null,
+        created: true,
+      })
+    }
+
     // The message navigator needs a slot for every user turn (even ones with
     // no edits); the sidebar-style callers keep the default that drops empties.
     if (currentFiles.length === 0 && !includeEmpty) return
@@ -777,10 +1120,12 @@ export function extractSessionFilesGrouped(
       flushGroup()
       currentUserTurn = turn
       currentFiles = []
+      currentAssistantTurns = []
       continue
     }
 
     if (turn.role !== "assistant") continue
+    currentAssistantTurns.push(turn)
 
     for (const block of turn.blocks) {
       if (block.type !== "tool_use") continue
@@ -822,12 +1167,11 @@ export function extractSessionFilesGrouped(
 }
 
 /**
- * Aggregate an assistant reply's write operations into ONE `FileChangeStat`
- * per file path. Unlike `extractSessionFilesGrouped` (which groups by user
- * turn), this collects every edit/write/apply_patch across the supplied turns,
- * summing line counts and concatenating diff chunks per file — the shape the
- * per-reply "artifacts" card needs. Pass only the raw turns that compose a
- * single reply (the assistant sub-turns merged into one visual reply).
+ * Aggregate an assistant reply's produced files into ONE `FileChangeStat` per
+ * path. Text-native edit/write/apply_patch calls carry line stats and diffs;
+ * successful shell-created artifacts carry `created: true` with no line diff.
+ * Pass only one reply's raw turns for the per-reply card; passing the whole
+ * timeline is also supported (shell-link fallback remains user-group scoped).
  */
 export function extractReplyFileChanges(
   turns: MessageTurn[]
@@ -837,6 +1181,7 @@ export function extractReplyFileChanges(
     additions: number
     deletions: number
     diffs: string[]
+    created: boolean
   }
   const byPath = new Map<string, Acc>()
   const order: string[] = []
@@ -871,7 +1216,13 @@ export function extractReplyFileChanges(
 
         let acc = byPath.get(normalizedPath)
         if (!acc) {
-          acc = { path: normalizedPath, additions: 0, deletions: 0, diffs: [] }
+          acc = {
+            path: normalizedPath,
+            additions: 0,
+            deletions: 0,
+            diffs: [],
+            created: false,
+          }
           byPath.set(normalizedPath, acc)
           order.push(normalizedPath)
         }
@@ -882,6 +1233,19 @@ export function extractReplyFileChanges(
     }
   }
 
+  for (const path of extractExternalProducedPaths(turns)) {
+    const normalizedPath = normalizePath(path)
+    if (byPath.has(normalizedPath)) continue
+    byPath.set(normalizedPath, {
+      path: normalizedPath,
+      additions: 0,
+      deletions: 0,
+      diffs: [],
+      created: true,
+    })
+    order.push(normalizedPath)
+  }
+
   return order.map((path, index) => {
     const acc = byPath.get(path)!
     return {
@@ -890,6 +1254,7 @@ export function extractReplyFileChanges(
       additions: acc.additions,
       deletions: acc.deletions,
       diff: acc.diffs.length > 0 ? acc.diffs.join("\n\n") : null,
+      created: acc.created || undefined,
     }
   })
 }
@@ -941,9 +1306,9 @@ export function extractBlockedMentionFiles(
 }
 
 /**
- * The full produced-files list for the conversation panel: written files
- * (`extractReplyFileChanges`) plus blocked `@mention` files, deduped by path — a
- * written file wins (it carries a diff).
+ * The full produced-files list for the conversation panel: text/shell-produced
+ * files (`extractReplyFileChanges`) plus blocked `@mention` files, deduped by
+ * path — an actual produced file wins (and may carry a diff).
  */
 export function extractProducedFiles(turns: MessageTurn[]): FileChangeStat[] {
   const written = extractReplyFileChanges(turns)
@@ -959,12 +1324,10 @@ export function extractProducedFiles(turns: MessageTurn[]): FileChangeStat[] {
 }
 
 /**
- * Cheap distinct count for the collapsed chip: written files (Write/Edit/
- * apply_patch) UNION blocked `@mention` paths, WITHOUT generating any diffs — so
- * it can run outside the streaming hot path while the expensive per-file diff
- * parse stays gated behind the expanded panel.
+ * Cheap distinct count for the collapsed chip: text writes, shell-created
+ * artifacts, and blocked `@mention` paths, WITHOUT generating any diffs.
  */
-export function countProducedFiles(turns: MessageTurn[]): number {
+export function extractProducedFilePaths(turns: MessageTurn[]): string[] {
   const paths = new Set<string>()
   for (const turn of turns) {
     if (turn.role === "assistant") {
@@ -985,7 +1348,53 @@ export function countProducedFiles(turns: MessageTurn[]): number {
       }
     }
   }
-  return paths.size
+  for (const filePath of extractExternalProducedPaths(turns)) {
+    paths.add(normalizePath(filePath))
+  }
+  return Array.from(paths)
+}
+
+export function countProducedFiles(turns: MessageTurn[]): number {
+  return extractProducedFilePaths(turns).length
+}
+
+function absoluteArtifactPath(rootPath: string, relativePath: string): string {
+  const path = normalizePath(relativePath)
+  if (/^(?:[a-zA-Z]:\/|\/\/|\/)/.test(path)) return path
+  const normalizedRoot = normalizePath(rootPath)
+  const root = normalizedRoot === "/" ? "/" : normalizedRoot.replace(/\/+$/, "")
+  if (root === "/") return `/${path.replace(/^\/+/, "")}`
+  return root ? `${root}/${path.replace(/^\/+/, "")}` : path
+}
+
+/**
+ * Flatten durable watcher records into the same render shape as transcript
+ * artifacts. Confirmed-deleted/transient paths are retained in the database
+ * for diagnostics but omitted from the openable output list.
+ */
+export function extractPersistedArtifactFiles(
+  runs: ConversationTurnArtifactRun[]
+): FileChangeStat[] {
+  const byPath = new Map<string, FileChangeStat>()
+  for (const run of runs) {
+    for (const change of run.changes) {
+      if (change.final_exists === false || change.kind === "deleted") continue
+      const path = absoluteArtifactPath(run.root_path, change.path)
+      const key = normalizePath(path)
+      // A later turn is the authoritative conversation-level state and should
+      // also move the entry to the latest position in the panel.
+      byPath.delete(key)
+      byPath.set(key, {
+        id: `persisted-artifact:${run.id}:${change.id}`,
+        path,
+        additions: 0,
+        deletions: 0,
+        diff: null,
+        created: change.kind === "created" || undefined,
+      })
+    }
+  }
+  return Array.from(byPath.values())
 }
 
 /**

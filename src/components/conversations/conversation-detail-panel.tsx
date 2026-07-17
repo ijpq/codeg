@@ -34,6 +34,7 @@ import {
   useAcpEvent,
 } from "@/contexts/acp-connections-context"
 import { useAcpAgents } from "@/hooks/use-acp-agents"
+import { onTransportReconnect, subscribe } from "@/lib/platform"
 import { useActiveFolder } from "@/contexts/active-folder-context"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
 import { useTabActions, useTabStore } from "@/contexts/tab-context"
@@ -85,7 +86,9 @@ import {
 } from "@/lib/prompt-draft"
 import {
   AGENT_LABELS,
+  CONVERSATION_ARTIFACTS_CHANGED_EVENT,
   type AgentType,
+  type ConversationArtifactsChanged,
   type ContentBlock,
   type ConversationStatus,
   type EventEnvelope,
@@ -359,6 +362,39 @@ const ConversationTabView = memo(function ConversationTabView({
       setDbConversationId(effectiveConversationId, dbConversationId)
     }
   }, [dbConversationId, effectiveConversationId, setDbConversationId])
+
+  // Artifact finalization deliberately trails TurnComplete by one watcher
+  // debounce window. Its dedicated event triggers a fresh detail generation,
+  // superseding any earlier TurnComplete-driven fetch that raced the final
+  // filesystem batch. The runtime→DB id binding also makes this work for tabs
+  // that began under a virtual draft id.
+  useEffect(() => {
+    let disposed = false
+    let unlisten: (() => void) | undefined
+
+    void subscribe<ConversationArtifactsChanged>(
+      CONVERSATION_ARTIFACTS_CHANGED_EVENT,
+      (change) => {
+        if (change.conversation_id === dbConvIdRef.current) {
+          refetchDetail(effectiveConversationId)
+        }
+      }
+    ).then((dispose) => {
+      if (disposed) dispose()
+      else unlisten = dispose
+    })
+
+    const offReconnect = onTransportReconnect(() => {
+      if (dbConvIdRef.current != null) {
+        refetchDetail(effectiveConversationId)
+      }
+    })
+    return () => {
+      disposed = true
+      unlisten?.()
+      offReconnect?.()
+    }
+  }, [effectiveConversationId, refetchDetail])
 
   useEffect(() => {
     selectedAgentRef.current = selectedAgent
@@ -1461,6 +1497,8 @@ const ConversationTabView = memo(function ConversationTabView({
       onNewSession={
         canShowDetailErrorActions ? handleOpenNewSession : undefined
       }
+      folder={folder}
+      artifactRuns={detail?.artifact_runs}
     />
   )
 

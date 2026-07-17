@@ -362,6 +362,10 @@ pub fn build_router(
         .route("/clone_repository", post(handlers::git::clone_repository))
         // ─── Files ───
         .route(
+            "/stat_workspace_file",
+            post(handlers::files::stat_workspace_file),
+        )
+        .route(
             "/read_file_preview",
             post(handlers::files::read_file_preview),
         )

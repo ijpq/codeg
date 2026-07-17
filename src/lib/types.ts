@@ -521,7 +521,60 @@ export interface DbConversationDetail {
    * mid-stream, which would otherwise double-render against the live reply.
    */
   in_flight_user_turn_id?: string | null
+  /** Backend filesystem captures, grouped by accepted ACP turn. Older servers
+   * omit this field; callers must treat it as an empty list. */
+  artifact_runs?: ConversationTurnArtifactRun[]
 }
+
+export type ConversationTurnArtifactStatus =
+  | "running"
+  | "completed"
+  | "cancelled"
+  | "interrupted"
+
+export type ConversationTurnFileChangeKind =
+  | "created"
+  | "modified"
+  | "deleted"
+  | "renamed"
+
+export interface ConversationTurnFileChange {
+  id: number
+  path: string
+  old_path?: string | null
+  kind: ConversationTurnFileChangeKind
+  source: string
+  attribution: "exclusive" | "ambiguous" | string
+  first_seen_at: string
+  last_seen_at: string
+  event_count: number
+  final_exists: boolean | null
+  size_bytes?: number | null
+  modified_at?: string | null
+}
+
+export interface ConversationTurnArtifactRun {
+  id: string
+  conversation_id: number
+  connection_id: string
+  client_message_id?: string | null
+  folder_id?: number | null
+  root_path: string
+  status: ConversationTurnArtifactStatus
+  capture_incomplete: boolean
+  stop_reason?: string | null
+  started_at: string
+  completed_at?: string | null
+  changes: ConversationTurnFileChange[]
+}
+
+export interface ConversationArtifactsChanged {
+  conversation_id: number
+  turn_run_id: string
+}
+
+export const CONVERSATION_ARTIFACTS_CHANGED_EVENT =
+  "conversation://artifacts-changed"
 
 export type ConversationStatus =
   | "in_progress"
@@ -2404,6 +2457,12 @@ export interface UploadAttachmentResult {
 export interface FilePreviewContent {
   path: string
   content: string
+}
+
+export interface WorkspaceFileStat {
+  path: string
+  size: number
+  mtime_ms: number | null
 }
 
 export interface FileEditContent {

@@ -274,6 +274,17 @@ pub struct FilePreviewContent {
     pub content: String,
 }
 
+/// Encoding-agnostic metadata used to verify that an artifact still exists
+/// before opening it. Unlike `FilePreviewContent`, this deliberately reads no
+/// bytes, so binary Office documents are first-class files rather than being
+/// rejected by the text-preview probe.
+#[derive(Debug, Serialize)]
+pub struct WorkspaceFileStat {
+    pub path: String,
+    pub size: u64,
+    pub mtime_ms: Option<i64>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct FileEditContent {
     pub path: String,
@@ -3603,6 +3614,34 @@ pub async fn read_workspace_file_base64(
 }
 
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn stat_workspace_file(
+    root_path: String,
+    path: String,
+) -> Result<WorkspaceFileStat, AppCommandError> {
+    let root = PathBuf::from(&root_path);
+    if !root.exists() || !root.is_dir() {
+        return Err(AppCommandError::not_found("Folder does not exist"));
+    }
+
+    let target = resolve_tree_path(&root, &path)?;
+    let path_for_response = path;
+
+    run_file_io(move || {
+        ensure_path_in_workspace(&root, &target)?;
+        let metadata = std::fs::metadata(&target).map_err(AppCommandError::io)?;
+        if !metadata.is_file() {
+            return Err(AppCommandError::invalid_input("Path is not a file"));
+        }
+        Ok(WorkspaceFileStat {
+            path: path_for_response,
+            size: metadata.len(),
+            mtime_ms: file_mtime_ms(&metadata),
+        })
+    })
+    .await
+}
+
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn read_file_preview(
     root_path: String,
     path: String,
@@ -4843,6 +4882,24 @@ mod tests {
     use super::*;
     use crate::db::test_helpers::fresh_in_memory_db;
     use crate::models::agent::AgentType;
+
+    #[tokio::test]
+    async fn stat_workspace_file_accepts_binary_content() {
+        let root = tempfile::tempdir().expect("root");
+        let bytes = [0_u8, 159, 146, 150, 80, 75, 3, 4];
+        std::fs::write(root.path().join("report.docx"), bytes).expect("write binary");
+
+        let stat = stat_workspace_file(
+            root.path().to_string_lossy().into_owned(),
+            "report.docx".to_string(),
+        )
+        .await
+        .expect("binary files should be stat-able without a text decode");
+
+        assert_eq!(stat.path, "report.docx");
+        assert_eq!(stat.size, bytes.len() as u64);
+        assert!(stat.mtime_ms.is_some());
+    }
 
     #[test]
     fn git_author_match_pattern_anchors_and_escapes() {
