@@ -46,6 +46,7 @@ import type {
   FileTreeNode,
   DirectoryEntry,
   FilePreviewContent,
+  WorkspaceFileStat,
   FileEditContent,
   FileSaveResult,
   WorkspaceSnapshotResponse,
@@ -1158,6 +1159,13 @@ export async function readFilePreview(
   path: string
 ): Promise<FilePreviewContent> {
   return invoke("read_file_preview", { rootPath, path })
+}
+
+export async function statWorkspaceFile(
+  rootPath: string,
+  path: string
+): Promise<WorkspaceFileStat> {
+  return invoke("stat_workspace_file", { rootPath, path })
 }
 
 export async function readFileForEdit(
