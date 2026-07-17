@@ -24,6 +24,7 @@ use crate::acp::internal_bus::InternalEventBus;
 use crate::acp::manager::ConnectionManager;
 use crate::acp::session_state::SessionState;
 use crate::acp::types::{AcpEvent, ConnectionStatus, EventEnvelope};
+use crate::artifact_tracker::ArtifactTurnFinishStatus;
 use crate::db::entities::conversation::ConversationStatus;
 use crate::db::error::DbError;
 use crate::db::service::conversation_service;
@@ -198,6 +199,20 @@ pub(crate) async fn handle_event(
             Ok(())
         }
         AcpEvent::TurnComplete { stop_reason, .. } => {
+            let artifact_status = if stop_reason == "end_turn" {
+                ArtifactTurnFinishStatus::Completed
+            } else {
+                ArtifactTurnFinishStatus::Cancelled
+            };
+            manager
+                .finish_artifact_turn(
+                    &envelope.connection_id,
+                    envelope.seq,
+                    artifact_status,
+                    Some(stop_reason.clone()),
+                )
+                .await;
+
             // Centralized status transition: when the agent reports the turn
             // is done, flip the conversation row and re-broadcast the change
             // as `ConversationStatusChanged`. This lives in the lifecycle
@@ -1423,6 +1438,14 @@ async fn connection_worker_loop(
                 if terminal_dispatched {
                     continue;
                 }
+                manager
+                    .finish_artifact_turn(
+                        &connection_id,
+                        envelope.seq,
+                        ArtifactTurnFinishStatus::Interrupted,
+                        Some("connection_disconnected".to_string()),
+                    )
+                    .await;
                 if let Err(e) = handle_terminal_event(&db, &mut cache, &connection_id).await {
                     tracing::error!("[lifecycle][ERROR] terminal event for {connection_id}: {e}");
                 }
@@ -1455,6 +1478,18 @@ async fn connection_worker_loop(
                 if terminal_dispatched {
                     continue;
                 }
+                manager
+                    .finish_artifact_turn(
+                        &connection_id,
+                        envelope.seq,
+                        ArtifactTurnFinishStatus::Interrupted,
+                        Some(
+                            code.as_deref()
+                                .map(|code| format!("terminal_error:{code}"))
+                                .unwrap_or_else(|| "terminal_error".to_string()),
+                        ),
+                    )
+                    .await;
                 // Genuinely terminal (the `run_connection` failure path at
                 // `connection.rs:493`). Drain the broker NOW with the error
                 // detail instead of waiting for the trailing `Disconnected`.
