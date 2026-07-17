@@ -111,6 +111,13 @@ pub async fn read_file_preview(
     Ok(Json(result))
 }
 
+pub async fn stat_workspace_file(
+    Json(params): Json<ReadFilePreviewParams>,
+) -> Result<Json<folder_commands::WorkspaceFileStat>, AppCommandError> {
+    let result = folder_commands::stat_workspace_file(params.root_path, params.path).await?;
+    Ok(Json(result))
+}
+
 pub async fn read_file_base64(
     Json(params): Json<ReadFileBase64Params>,
 ) -> Result<Json<String>, AppCommandError> {

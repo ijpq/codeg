@@ -113,6 +113,55 @@ pub struct DbConversationDetail {
     /// mid-stream, which would otherwise double-render against the live reply.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub in_flight_user_turn_id: Option<String>,
+    /// Filesystem changes captured by the backend for each accepted ACP turn.
+    /// Unlike transcript-derived tool calls these rows survive frontend
+    /// disconnects and include opaque/binary outputs such as Word documents.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifact_runs: Vec<ConversationTurnArtifactRun>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationTurnFileChange {
+    pub id: i32,
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_path: Option<String>,
+    /// created | modified | deleted | renamed
+    pub kind: String,
+    pub source: String,
+    /// exclusive when only one turn watched the root; ambiguous when turns
+    /// overlapped in the same workspace and OS notifications cannot identify
+    /// the originating process.
+    pub attribution: String,
+    pub first_seen_at: DateTime<Utc>,
+    pub last_seen_at: DateTime<Utc>,
+    pub event_count: i32,
+    pub final_exists: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modified_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationTurnArtifactRun {
+    pub id: String,
+    pub conversation_id: i32,
+    pub connection_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_message_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub folder_id: Option<i32>,
+    pub root_path: String,
+    /// running | completed | cancelled | interrupted
+    pub status: String,
+    pub capture_incomplete: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+    pub started_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<DateTime<Utc>>,
+    pub changes: Vec<ConversationTurnFileChange>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

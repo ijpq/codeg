@@ -1,56 +1,84 @@
-import { describe, it, expect, vi, beforeEach } from "vitest"
-import { render, screen, fireEvent } from "@testing-library/react"
+import { fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { beforeEach, describe, expect, it, vi } from "vitest"
 import { ReplyArtifacts } from "./reply-artifacts"
 import type { FileChangeStat } from "@/lib/session-files"
-import type { MessageTurn } from "@/lib/types"
+import type { FolderDetail, MessageTurn } from "@/lib/types"
 
-// Stable `t` (per next-intl mock guidance) returns the key verbatim — enough to
-// address every label here (section headers, the per-file `viewDiff` /
-// `revealInFolder` actions, the `noDiffDataAvailable` fallback).
-const { stableT, mockOpenDiff, mockOpenFilePreview, mockReveal, mockExtract } =
-  vi.hoisted(() => ({
-    stableT: (key: string) => key,
-    mockOpenDiff: vi.fn(),
-    mockOpenFilePreview: vi.fn(),
-    mockReveal: vi.fn(),
-    mockExtract: vi.fn(),
-  }))
+const mocks = vi.hoisted(() => ({
+  stableT: (key: string) => key,
+  openDiff: vi.fn(),
+  openFilePreview: vi.fn(),
+  reveal: vi.fn(),
+  extract: vi.fn(),
+  statWorkspaceFile: vi.fn(),
+  downloadWorkspaceFile: vi.fn(),
+  getHomeDirectory: vi.fn(),
+}))
 
-vi.mock("next-intl", () => ({ useTranslations: () => stableT }))
-vi.mock("@/contexts/workspace-context", () => ({
-  useWorkspaceActions: () => ({
-    openFilePreview: mockOpenFilePreview,
-    openSessionFileDiff: mockOpenDiff,
-  }),
+vi.mock("next-intl", () => ({
+  useTranslations: () => mocks.stableT,
 }))
 vi.mock("@/contexts/active-folder-context", () => ({
-  useActiveFolder: () => ({ activeFolder: { path: "/repo" } }),
+  useActiveFolder: () => ({
+    activeFolder: { id: 99, path: "/wrong-active-folder" },
+  }),
+}))
+vi.mock("@/contexts/workspace-context", () => ({
+  useWorkspaceActions: () => ({
+    openFilePreview: mocks.openFilePreview,
+    openSessionFileDiff: mocks.openDiff,
+  }),
+}))
+vi.mock("@/lib/api", () => ({
+  statWorkspaceFile: mocks.statWorkspaceFile,
+  downloadWorkspaceFile: mocks.downloadWorkspaceFile,
+  getHomeDirectory: mocks.getHomeDirectory,
+}))
+vi.mock("@/lib/produced-file-sync-prefs", () => ({
+  hasSyncedProducedFile: () => false,
+  markProducedFileSynced: vi.fn(),
+  useAutoDownloadProduced: () => false,
 }))
 vi.mock("@/lib/platform", () => ({
   isLocalDesktop: () => true,
-  revealItemInDir: mockReveal,
+  revealItemInDir: mocks.reveal,
 }))
-// Drive the card's file list directly — the extractor itself is covered by
-// session-files' own tests; here we only wire the parsed shape into the UI.
 vi.mock("@/lib/session-files", () => ({
-  extractReplyFileChanges: (turns: unknown) => mockExtract(turns),
+  extractReplyFileChanges: (turns: unknown) => mocks.extract(turns),
 }))
 
 const MODIFIED_DIFF =
   "diff --git a/src/a.ts b/src/a.ts\n@@ -1,2 +1,2 @@\n-old\n+new"
 const DELETION_DIFF = "*** Delete File: src/gone.ts\n-a\n-b"
-
-// Only `sourceTurns[0].id` is read (it keys the diff tab); the file list comes
-// from the mocked extractor, so a bare id is all this fixture needs.
 const sourceTurns = [{ id: "reply-turn-1" }] as unknown as MessageTurn[]
 
-function renderCard(files: FileChangeStat[]) {
-  mockExtract.mockReturnValue(files)
-  return render(<ReplyArtifacts sourceTurns={sourceTurns} isResponseComplete />)
+const chatFolder: FolderDetail = {
+  id: 7,
+  name: "Chat",
+  path: "/app-data/chat-sessions/2026-07-17/session-1",
+  git_branch: null,
+  default_agent_type: null,
+  last_opened_at: "2026-07-17T00:00:00Z",
+  sort_order: 0,
+  color: "inherit",
+  parent_id: null,
+  kind: "chat",
 }
 
-// The "Files changed" section is collapsed by default — expand it so the
-// per-file action buttons mount.
+function renderCard(
+  files: FileChangeStat[],
+  folder?: FolderDetail | null
+) {
+  mocks.extract.mockReturnValue(files)
+  return render(
+    <ReplyArtifacts
+      sourceTurns={sourceTurns}
+      isResponseComplete
+      folder={folder}
+    />
+  )
+}
+
 function expandChanged() {
   fireEvent.click(screen.getByText("title"))
 }
@@ -74,7 +102,7 @@ describe("ReplyArtifacts — view diff action", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "viewDiff" }))
 
-    expect(mockOpenDiff).toHaveBeenCalledWith(
+    expect(mocks.openDiff).toHaveBeenCalledWith(
       "src/a.ts",
       MODIFIED_DIFF,
       "reply-turn-1"
@@ -89,7 +117,7 @@ describe("ReplyArtifacts — view diff action", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "viewDiff" }))
 
-    expect(mockOpenDiff).toHaveBeenCalledWith(
+    expect(mocks.openDiff).toHaveBeenCalledWith(
       "src/b.ts",
       "noDiffDataAvailable",
       "reply-turn-1"
@@ -110,14 +138,13 @@ describe("ReplyArtifacts — view diff action", () => {
 
     const viewDiffBtn = screen.getByRole("button", { name: "viewDiff" })
     const revealBtn = screen.getByRole("button", { name: "revealInFolder" })
-    // View Diff precedes the reveal button in document order.
     expect(
       viewDiffBtn.compareDocumentPosition(revealBtn) &
         Node.DOCUMENT_POSITION_FOLLOWING
     ).toBeTruthy()
   })
 
-  it("does not offer View Diff for a removed file (nothing to open)", () => {
+  it("does not offer View Diff for a removed file", () => {
     renderCard([
       {
         id: "f3",
@@ -132,7 +159,50 @@ describe("ReplyArtifacts — view diff action", () => {
     expect(
       screen.queryByRole("button", { name: "viewDiff" })
     ).not.toBeInTheDocument()
-    // The removed file still renders its static destructive badge.
     expect(screen.getByText("remove")).toBeInTheDocument()
+  })
+})
+
+describe("ReplyArtifacts binary artifacts", () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mocks.statWorkspaceFile.mockResolvedValue({
+      path: "out/report.docx",
+      size: 1_024,
+      mtime_ms: 1,
+    })
+    mocks.getHomeDirectory.mockResolvedValue("/home/me")
+  })
+
+  it("shows a shell-created Word file and opens it from the chat folder", async () => {
+    renderCard(
+      [
+        {
+          id: "docx-1",
+          path: "out/report.docx",
+          additions: 0,
+          deletions: 0,
+          diff: null,
+          created: true,
+        },
+      ],
+      chatFolder
+    )
+
+    expect(screen.getByText("report.docx")).toBeInTheDocument()
+    expect(screen.getByText("newFilesTitle")).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole("button", { name: "openFile" }))
+
+    await waitFor(() => {
+      expect(mocks.statWorkspaceFile).toHaveBeenCalledWith(
+        chatFolder.path,
+        "out/report.docx"
+      )
+      expect(mocks.openFilePreview).toHaveBeenCalledWith(
+        `${chatFolder.path}/out/report.docx`,
+        { folderId: chatFolder.id }
+      )
+    })
   })
 })
