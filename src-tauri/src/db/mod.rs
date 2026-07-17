@@ -86,6 +86,12 @@ pub async fn init_database(
     apply_sqlite_pragmas(&conn).await?;
 
     service::app_metadata_service::update_app_version(&conn, app_version).await?;
+    let recovered = service::artifact_service::recover_interrupted_runs(&conn).await?;
+    if recovered > 0 {
+        tracing::info!(
+            "[artifact-tracker] recovered {recovered} interrupted turn capture(s)"
+        );
+    }
 
     // Publish user-registered ACP agents into the process-global launch
     // registry before anything can ask for agent metadata. This is the single
