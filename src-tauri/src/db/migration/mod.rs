@@ -26,6 +26,7 @@ mod m20260621_000001_automation;
 mod m20260630_000001_conversation_parent_id_index;
 mod m20260703_000001_chat_channel_thread_binding;
 mod m20260717_000001_folder_alias;
+mod m20260717_000001_conversation_turn_artifacts;
 mod m20260726_000001_custom_agent;
 mod m20260727_000001_custom_agent_skills;
 mod m20260728_000001_custom_agent_skills_dir;
@@ -67,6 +68,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260630_000001_conversation_parent_id_index::Migration),
             Box::new(m20260703_000001_chat_channel_thread_binding::Migration),
             Box::new(m20260717_000001_folder_alias::Migration),
+            Box::new(m20260717_000001_conversation_turn_artifacts::Migration),
             Box::new(m20260726_000001_custom_agent::Migration),
             Box::new(m20260727_000001_custom_agent_skills::Migration),
             Box::new(m20260728_000001_custom_agent_skills_dir::Migration),
