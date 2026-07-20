@@ -83,6 +83,21 @@ impl codeg_lib::acp::session_info::SessionInfoAccess for NoSessionInfo {
     }
 }
 
+/// No-op deliverable access — this e2e suite never publishes deliverables.
+struct NoDeliverables;
+#[async_trait]
+impl codeg_lib::acp::deliverables::SessionDeliverableAccess for NoDeliverables {
+    async fn publish_deliverables(
+        &self,
+        _parent_connection_id: &str,
+        _conversation_id: i32,
+        _workspace_root: &std::path::Path,
+        _items: Vec<codeg_lib::acp::deliverables::DeliverableInput>,
+    ) -> codeg_lib::acp::deliverables::PublishDeliverablesOutcome {
+        codeg_lib::acp::deliverables::PublishDeliverablesOutcome::default()
+    }
+}
+
 fn unique_pipe(tag: &str) -> String {
     format!(
         r"\\.\pipe\codeg-e2e-{}-{}-{}",
@@ -171,6 +186,7 @@ async fn end_to_end_named_pipe_happy_path() {
         Arc::new(NoFeedback) as Arc<dyn codeg_lib::acp::feedback::SessionFeedbackAccess>,
         Arc::new(NoQuestions) as Arc<dyn SessionQuestionAccess>,
         Arc::new(NoSessionInfo) as Arc<dyn codeg_lib::acp::session_info::SessionInfoAccess>,
+        Arc::new(NoDeliverables) as Arc<dyn codeg_lib::acp::deliverables::SessionDeliverableAccess>,
     );
 
     let pipe = unique_pipe("happy");
@@ -272,6 +288,7 @@ async fn end_to_end_named_pipe_back_to_back_requests() {
         Arc::new(NoFeedback) as Arc<dyn codeg_lib::acp::feedback::SessionFeedbackAccess>,
         Arc::new(NoQuestions) as Arc<dyn SessionQuestionAccess>,
         Arc::new(NoSessionInfo) as Arc<dyn codeg_lib::acp::session_info::SessionInfoAccess>,
+        Arc::new(NoDeliverables) as Arc<dyn codeg_lib::acp::deliverables::SessionDeliverableAccess>,
     );
 
     let pipe = unique_pipe("repeat");
