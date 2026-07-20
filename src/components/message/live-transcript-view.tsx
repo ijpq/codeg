@@ -39,10 +39,13 @@ import { PermissionDialog } from "@/components/chat/permission-dialog"
 import { AskQuestionCard } from "@/components/chat/ask-question-card"
 import { PlanApprovalCard } from "@/components/chat/plan-approval-card"
 import {
+  CONVERSATION_DELIVERABLES_CHANGED_EVENT,
   type AgentType,
+  type ConversationDeliverablesChanged,
   type PlanApprovalAnswer,
   type QuestionAnswer,
 } from "@/lib/types"
+import { subscribe } from "@/lib/platform"
 
 export function useConnectionStateById(
   connectionId: string | null
@@ -250,9 +253,32 @@ export function LiveTranscriptView({
     refetchDetail(conversationId, { preserveLive: true })
   }, [conversationId, refetchDetail])
 
-  // Reader only — its built-in auto-fetch is disabled; the effect above is
-  // the sole fetch path.
-  const { loading, error, acpLoadError } = useConversationDetail(
+  // Final outputs may be published before the reply settles. Keep the shared
+  // viewer current without replacing its bridged live turn with a lagging DB
+  // transcript.
+  useEffect(() => {
+    let disposed = false
+    let unlisten: (() => void) | undefined
+    void subscribe<ConversationDeliverablesChanged>(
+      CONVERSATION_DELIVERABLES_CHANGED_EVENT,
+      (change) => {
+        if (change.conversation_id === conversationId) {
+          refetchDetail(conversationId, { preserveLive: true })
+        }
+      }
+    ).then((dispose) => {
+      if (disposed) dispose()
+      else unlisten = dispose
+    })
+    return () => {
+      disposed = true
+      unlisten?.()
+    }
+  }, [conversationId, refetchDetail])
+
+  // Reader only — its built-in auto-fetch is disabled; the effects above own
+  // fetch timing.
+  const { detail, loading, error, acpLoadError } = useConversationDetail(
     conversationId,
     { enabled: false }
   )
@@ -343,6 +369,7 @@ export function LiveTranscriptView({
           hideEmptyState={false}
           showMessageNav={false}
           userTurnHeader={userTurnHeader}
+          deliverables={detail?.deliverables}
         />
       </div>
     </div>
