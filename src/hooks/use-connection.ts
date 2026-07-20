@@ -30,6 +30,7 @@ const DEFAULT_PROMPT_CAPABILITIES: PromptCapabilitiesInfo = {
   audio: false,
   embedded_context: false,
 }
+const EMPTY_STEER_MESSAGES: PendingUserMessage[] = []
 
 export interface UseConnectionReturn {
   connectionId: string | null
@@ -49,6 +50,7 @@ export interface UseConnectionReturn {
   status: ConnectionStatus | null
   promptCapabilities: PromptCapabilitiesInfo
   supportsFork: boolean
+  supportsSteer: boolean
   selectorsReady: boolean
   hasCachedSelectors: boolean
   sessionId: string | null
@@ -61,6 +63,7 @@ export interface UseConnectionReturn {
   availableCommands: AvailableCommandInfo[] | null
   pendingPermission: PendingPermission | null
   pendingUserMessage: PendingUserMessage | null
+  steerMessages: PendingUserMessage[]
   pendingQuestion: PendingQuestion | null
   pendingAskQuestion: PendingQuestionState | null
   pendingPlanApproval: PendingPlanApprovalState | null
@@ -205,6 +208,7 @@ export function useConnection(contextKey: string): UseConnectionReturn {
   const promptCapabilities =
     connection?.promptCapabilities ?? DEFAULT_PROMPT_CAPABILITIES
   const supportsFork = connection?.supportsFork ?? false
+  const supportsSteer = connection?.supportsSteer ?? false
   const selectorsReady = connection?.selectorsReady ?? false
   const sessionId = connection?.sessionId ?? null
   const cached = connection?.agentType
@@ -218,6 +222,7 @@ export function useConnection(contextKey: string): UseConnectionReturn {
   const availableCommands = connection?.availableCommands ?? null
   const pendingPermission = connection?.pendingPermission ?? null
   const pendingUserMessage = connection?.pendingUserMessage ?? null
+  const steerMessages = connection?.steerMessages ?? EMPTY_STEER_MESSAGES
   const pendingQuestion = connection?.pendingQuestion ?? null
   const pendingAskQuestion = connection?.pendingAskQuestion ?? null
   const pendingPlanApproval = connection?.pendingPlanApproval ?? null
@@ -314,6 +319,7 @@ export function useConnection(contextKey: string): UseConnectionReturn {
       status,
       promptCapabilities,
       supportsFork,
+      supportsSteer,
       selectorsReady,
       hasCachedSelectors,
       sessionId,
@@ -323,6 +329,7 @@ export function useConnection(contextKey: string): UseConnectionReturn {
       availableCommands,
       pendingPermission,
       pendingUserMessage,
+      steerMessages,
       pendingQuestion,
       pendingAskQuestion,
       pendingPlanApproval,
@@ -353,6 +360,7 @@ export function useConnection(contextKey: string): UseConnectionReturn {
       status,
       promptCapabilities,
       supportsFork,
+      supportsSteer,
       selectorsReady,
       hasCachedSelectors,
       sessionId,
@@ -362,6 +370,7 @@ export function useConnection(contextKey: string): UseConnectionReturn {
       availableCommands,
       pendingPermission,
       pendingUserMessage,
+      steerMessages,
       pendingQuestion,
       pendingAskQuestion,
       pendingPlanApproval,

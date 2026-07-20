@@ -1,5 +1,6 @@
-use std::collections::BTreeMap;
-use std::collections::HashMap;
+#[cfg(any(test, feature = "test-utils"))]
+use std::collections::VecDeque;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,8 +16,8 @@ use crate::acp::connection::{
 };
 use crate::acp::error::AcpError;
 use crate::acp::feedback::{
-    bounded_feedback_batch, FeedbackItem, FeedbackStatus, PendingFeedback,
-    SessionFeedbackAccess, MAX_FEEDBACK_CHARS, MAX_FEEDBACK_RESPONSE_BYTES,
+    bounded_feedback_batch, FeedbackItem, FeedbackStatus, PendingFeedback, SessionFeedbackAccess,
+    MAX_FEEDBACK_CHARS, MAX_FEEDBACK_RESPONSE_BYTES,
 };
 use crate::acp::plan_approval::{
     PlanApprovalAnswer, RegisteredPlanApproval, SessionPlanApprovalAccess,
@@ -28,7 +29,7 @@ use crate::acp::question::{
 use crate::acp::terminal_runtime::TerminalShellRuntimeConfig;
 use crate::acp::types::{
     AcpEvent, AgentOptionsSnapshot, ConfigStaleKind, ConnectionInfo, ConnectionStatus,
-    ForkResultInfo, PromptCapabilitiesInfo, PromptInputBlock,
+    ForkResultInfo, PromptCapabilitiesInfo, PromptInputBlock, SteerResult,
 };
 use crate::artifact_tracker::{ArtifactTracker, ArtifactTurnFinishStatus};
 use crate::db::entities::conversation::{self, ConversationKind, ConversationStatus};
@@ -43,6 +44,8 @@ use crate::web::event_bridge::{emit_with_state, emit_with_state_gated, EventEmit
 /// event payload so a large paste can't bloat the ring buffer, the per-channel
 /// IM message, or the webhook body.
 const USER_PROMPT_PREVIEW_MAX_CHARS: usize = 500;
+const STEER_CLIENT_MESSAGE_ID_MAX_CHARS: usize = 256;
+const STEER_RESPONSE_TIMEOUT_SECS: u64 = 30;
 
 /// Grace window `disconnect_all` waits after firing every `Disconnect` before
 /// hard-killing surviving agent process trees. Long enough for a driver thread
@@ -339,12 +342,7 @@ impl ConnectionManager {
         stop_reason: Option<String>,
     ) {
         self.artifact_tracker
-            .finish_turn(
-                connection_id,
-                completion_event_seq,
-                status,
-                stop_reason,
-            )
+            .finish_turn(connection_id, completion_event_seq, status, stop_reason)
             .await;
     }
 
@@ -385,6 +383,8 @@ impl ConnectionManager {
             state: Arc::new(tokio::sync::RwLock::new(state)),
             emitter,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
+            steer_lock: Arc::new(tokio::sync::Mutex::new(())),
+            completed_steers: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
             config_fingerprint: String::new(),
             last_observed_fingerprint: String::new(),
             child_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -428,6 +428,8 @@ impl ConnectionManager {
             state: Arc::new(tokio::sync::RwLock::new(state)),
             emitter,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
+            steer_lock: Arc::new(tokio::sync::Mutex::new(())),
+            completed_steers: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
             config_fingerprint: String::new(),
             last_observed_fingerprint: String::new(),
             child_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -499,7 +501,9 @@ impl ConnectionManager {
         let connection_id = uuid::Uuid::new_v4().to_string();
         tracing::info!(
             "[ACP] spawning connection id={} owner_window={} agent={:?}",
-            connection_id, owner_window_label, agent_type
+            connection_id,
+            owner_window_label,
+            agent_type
         );
 
         // `spawn_agent_connection` inserts the entry into `self.connections`,
@@ -668,7 +672,12 @@ impl ConnectionManager {
             }
         }
         for (state, emitter, stale) in targets {
-            emit_with_state(&state, &emitter, AcpEvent::SessionConfigStale { stale, kind }).await;
+            emit_with_state(
+                &state,
+                &emitter,
+                AcpEvent::SessionConfigStale { stale, kind },
+            )
+            .await;
         }
         stale_count
     }
@@ -812,6 +821,89 @@ impl ConnectionManager {
         let prompt_lock = self.clone_prompt_lock(conn_id).await?;
         let _guard = prompt_lock.lock_owned().await;
         self.send_prompt_inner(conn_id, blocks, None).await
+    }
+
+    /// Inject additional user input into the current native Codex app-server
+    /// turn. This is deliberately separate from both `send_prompt` (which
+    /// starts a new turn) and live feedback (which waits for an MCP tool pull).
+    ///
+    /// Requests are serialized per connection and keyed by a caller-stable
+    /// message id. The connection loop records success before resolving the
+    /// one-shot, so a retry after a lost HTTP/Tauri response returns the cached
+    /// result instead of issuing `turn/steer` twice.
+    pub async fn steer(
+        &self,
+        conn_id: &str,
+        blocks: Vec<PromptInputBlock>,
+        client_message_id: String,
+    ) -> Result<SteerResult, AcpError> {
+        if blocks.is_empty() {
+            return Err(AcpError::InvalidSteer(
+                "message must contain at least one content block".into(),
+            ));
+        }
+        let client_message_id = client_message_id.trim().to_string();
+        if client_message_id.is_empty()
+            || client_message_id.chars().count() > STEER_CLIENT_MESSAGE_ID_MAX_CHARS
+            || is_reserved_turn_id(&client_message_id)
+        {
+            return Err(AcpError::InvalidSteer(
+                "client_message_id is empty, too long, or reserved".into(),
+            ));
+        }
+
+        let (cmd_tx, state, steer_lock, completion_cache) = {
+            let connections = self.connections.lock().await;
+            let conn = connections
+                .get(conn_id)
+                .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?;
+            (
+                conn.cmd_tx.clone(),
+                conn.state.clone(),
+                conn.steer_lock.clone(),
+                conn.completed_steers.clone(),
+            )
+        };
+
+        let _guard = steer_lock.lock_owned().await;
+        if let Some(previous) = completion_cache
+            .lock()
+            .await
+            .iter()
+            .find(|entry| entry.message_id == client_message_id)
+            .cloned()
+        {
+            return Ok(SteerResult {
+                deduplicated: true,
+                ..previous
+            });
+        }
+
+        {
+            let snapshot = state.read().await;
+            if !snapshot.supports_steer {
+                return Err(AcpError::SteerUnsupported);
+            }
+            if !snapshot.turn_in_flight {
+                return Err(AcpError::NoActiveSteerTurn);
+            }
+        }
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        cmd_tx
+            .send(ConnectionCommand::NativeSteer {
+                blocks,
+                client_message_id,
+                completion_cache,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| AcpError::ProcessExited)?;
+
+        tokio::time::timeout(Duration::from_secs(STEER_RESPONSE_TIMEOUT_SECS), reply_rx)
+            .await
+            .map_err(|_| AcpError::protocol("turn/steer response timed out"))?
+            .map_err(|_| AcpError::ProcessExited)?
     }
 
     /// Send a prompt while ensuring a `Conversation` DB row is bound to this
@@ -1577,7 +1669,9 @@ impl ConnectionManager {
             // Surface failures even when the caller is gone (the detached task's
             // Result would otherwise be dropped silently).
             if let Err(ref e) = outcome {
-                tracing::error!("[ACP][ERROR] fork persistence failed (conn={conn_id_for_task}): {e}");
+                tracing::error!(
+                    "[ACP][ERROR] fork persistence failed (conn={conn_id_for_task}): {e}"
+                );
             }
             outcome
         });
@@ -1993,7 +2087,8 @@ impl ConnectionManager {
         }
         tracing::info!(
             "[ACP] disconnect by owner window owner_window={} count={}",
-            owner_window_label, disconnected
+            owner_window_label,
+            disconnected
         );
         disconnected
     }
@@ -2123,8 +2218,7 @@ impl ConnectionManager {
         let mut out = Vec::new();
         for (id, conn) in connections.iter() {
             let state = conn.state.read().await;
-            let (Some(conversation_id), Some(folder_id)) =
-                (state.conversation_id, state.folder_id)
+            let (Some(conversation_id), Some(folder_id)) = (state.conversation_id, state.folder_id)
             else {
                 continue;
             };
@@ -2289,11 +2383,8 @@ impl ConnectionManager {
             return Self::submit_feedback_native(conn_id, state, cmd_tx, emitter, text).await;
         }
 
-        let item = FeedbackItem::new_pending(
-            uuid::Uuid::new_v4().to_string(),
-            text,
-            chrono::Utc::now(),
-        );
+        let item =
+            FeedbackItem::new_pending(uuid::Uuid::new_v4().to_string(), text, chrono::Utc::now());
         // Gate on `turn_in_flight` and append in ONE critical section (via the
         // gated emit): a `TurnComplete` (flips the flag) or `UserMessage`
         // (clears `feedback`) can't slip between the gate and the append+seq, so
@@ -2359,9 +2450,9 @@ impl ConnectionManager {
                     })
                     .await
                     .map_err(|_| AcpError::ProcessExited)?;
-                let steer = reply_rx.await.map_err(|_| {
-                    AcpError::protocol("Steer reply channel closed".to_string())
-                })??;
+                let steer = reply_rx
+                    .await
+                    .map_err(|_| AcpError::protocol("Steer reply channel closed".to_string()))??;
                 match steer {
                     // Honored opt-in: the content was NOT consumed and is
                     // still host-owned. Surface the frontend's existing
@@ -2582,7 +2673,12 @@ impl ConnectionManager {
         state: &std::sync::Arc<tokio::sync::RwLock<crate::acp::SessionState>>,
         emitter: &EventEmitter,
     ) -> bool {
-        if self.pending_questions.lock().await.contains_key(question_id) {
+        if self
+            .pending_questions
+            .lock()
+            .await
+            .contains_key(question_id)
+        {
             return false;
         }
         emit_with_state(
@@ -2620,7 +2716,9 @@ impl ConnectionManager {
         // (peer-close) at the same instant; the resolved-event below still clears
         // the card.
         let _ = entry.sender.send(outcome);
-        if let Some((state, emitter)) = self.get_state_and_emitter(&entry.parent_connection_id).await
+        if let Some((state, emitter)) = self
+            .get_state_and_emitter(&entry.parent_connection_id)
+            .await
         {
             emit_with_state(
                 &state,
@@ -2645,7 +2743,9 @@ impl ConnectionManager {
         let Some(entry) = removed else {
             return;
         };
-        if let Some((state, emitter)) = self.get_state_and_emitter(&entry.parent_connection_id).await
+        if let Some((state, emitter)) = self
+            .get_state_and_emitter(&entry.parent_connection_id)
+            .await
         {
             emit_with_state(
                 &state,
@@ -2766,7 +2866,12 @@ impl ConnectionManager {
         state: &std::sync::Arc<tokio::sync::RwLock<crate::acp::SessionState>>,
         emitter: &EventEmitter,
     ) -> bool {
-        if self.pending_plan_approvals.lock().await.contains_key(approval_id) {
+        if self
+            .pending_plan_approvals
+            .lock()
+            .await
+            .contains_key(approval_id)
+        {
             return false;
         }
         emit_with_state(
@@ -2803,8 +2908,9 @@ impl ConnectionManager {
         // (teardown) at the same instant; the resolved event below still clears
         // the card.
         let _ = entry.sender.send(answer);
-        if let Some((state, emitter)) =
-            self.get_state_and_emitter(&entry.parent_connection_id).await
+        if let Some((state, emitter)) = self
+            .get_state_and_emitter(&entry.parent_connection_id)
+            .await
         {
             emit_with_state(
                 &state,
@@ -2843,8 +2949,12 @@ impl ConnectionManager {
         // (disconnect removes it before this sweep), so tolerate `None`.
         if let Some((state, emitter)) = self.get_state_and_emitter(conn_id).await {
             for approval_id in drained {
-                emit_with_state(&state, &emitter, AcpEvent::PlanApprovalResolved { approval_id })
-                    .await;
+                emit_with_state(
+                    &state,
+                    &emitter,
+                    AcpEvent::PlanApprovalResolved { approval_id },
+                )
+                .await;
             }
         }
     }
@@ -3116,10 +3226,7 @@ pub struct ConnectionManagerFeedbackLookup {
 
 #[async_trait::async_trait]
 impl SessionFeedbackAccess for ConnectionManagerFeedbackLookup {
-    async fn read_pending_feedback(
-        &self,
-        parent_connection_id: &str,
-    ) -> Vec<PendingFeedback> {
+    async fn read_pending_feedback(&self, parent_connection_id: &str) -> Vec<PendingFeedback> {
         self.manager
             .read_pending_feedback(parent_connection_id)
             .await
@@ -3243,6 +3350,8 @@ mod tests {
             state: Arc::new(RwLock::new(state)),
             emitter: EventEmitter::Noop,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
+            steer_lock: Arc::new(tokio::sync::Mutex::new(())),
+            completed_steers: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
             config_fingerprint: String::new(),
             last_observed_fingerprint: String::new(),
             child_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -3261,7 +3370,10 @@ mod tests {
     async fn spawn_process_tree(pidfile: &std::path::Path) -> (std::process::Child, i32) {
         let mut child = std::process::Command::new("sh")
             .arg("-c")
-            .arg(format!("sleep 30 & echo $! > '{}'; wait", pidfile.display()))
+            .arg(format!(
+                "sleep 30 & echo $! > '{}'; wait",
+                pidfile.display()
+            ))
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -3573,6 +3685,8 @@ mod tests {
             state: Arc::new(RwLock::new(state)),
             emitter: EventEmitter::Noop,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
+            steer_lock: Arc::new(tokio::sync::Mutex::new(())),
+            completed_steers: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
             config_fingerprint: String::new(),
             last_observed_fingerprint: String::new(),
             child_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -3582,6 +3696,110 @@ mod tests {
             .await
             .insert(conn_id.to_string(), conn);
         rx
+    }
+
+    async fn mark_native_steer_ready(mgr: &ConnectionManager, conn_id: &str) {
+        let state = mgr.get_state(conn_id).await.expect("test connection");
+        let mut state = state.write().await;
+        state.supports_steer = true;
+        state.turn_in_flight = true;
+        state.status = ConnectionStatus::Prompting;
+    }
+
+    #[tokio::test]
+    async fn native_steer_is_idempotent_by_client_message_id() {
+        let mgr = ConnectionManager::new();
+        let mut cmd_rx = insert_live_connection(&mgr, "codex-steer", AgentType::Codex, None).await;
+        mark_native_steer_ready(&mgr, "codex-steer").await;
+
+        let worker = tokio::spawn(async move {
+            let Some(ConnectionCommand::NativeSteer {
+                blocks,
+                client_message_id,
+                completion_cache,
+                reply,
+            }) = cmd_rx.recv().await
+            else {
+                panic!("expected steer command")
+            };
+            assert_eq!(client_message_id, "optimistic-guide-1");
+            assert_eq!(
+                blocks,
+                vec![PromptInputBlock::Text {
+                    text: "check B instead".into()
+                }]
+            );
+            let result = SteerResult {
+                turn_id: "turn-active".into(),
+                message_id: client_message_id,
+                deduplicated: false,
+            };
+            completion_cache.lock().await.push_back(result.clone());
+            reply.send(Ok(result)).expect("manager still waiting");
+            // A retry must be answered from the manager/cache and never enqueue
+            // a second command on the adapter connection.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(cmd_rx.try_recv().is_err());
+        });
+
+        let first = mgr
+            .steer(
+                "codex-steer",
+                vec![PromptInputBlock::Text {
+                    text: "check B instead".into(),
+                }],
+                "optimistic-guide-1".into(),
+            )
+            .await
+            .expect("first guide succeeds");
+        assert_eq!(first.turn_id, "turn-active");
+        assert!(!first.deduplicated);
+
+        let retry = mgr
+            .steer(
+                "codex-steer",
+                vec![PromptInputBlock::Text {
+                    text: "check B instead".into(),
+                }],
+                "optimistic-guide-1".into(),
+            )
+            .await
+            .expect("retry returns cached success");
+        assert!(retry.deduplicated);
+        assert_eq!(retry.turn_id, first.turn_id);
+        worker.await.expect("worker completes");
+    }
+
+    #[tokio::test]
+    async fn native_steer_rejects_unsupported_and_finished_turns() {
+        let mgr = ConnectionManager::new();
+        let _cmd_rx =
+            insert_live_connection(&mgr, "codex-steer-gates", AgentType::Codex, None).await;
+
+        let unsupported = mgr
+            .steer(
+                "codex-steer-gates",
+                one_text_block(),
+                "guide-unsupported".into(),
+            )
+            .await
+            .expect_err("capability gate");
+        assert!(matches!(unsupported, AcpError::SteerUnsupported));
+
+        let state = mgr
+            .get_state("codex-steer-gates")
+            .await
+            .expect("test connection");
+        state.write().await.supports_steer = true;
+        let finished = mgr
+            .steer(
+                "codex-steer-gates",
+                one_text_block(),
+                "guide-finished".into(),
+            )
+            .await
+            .expect_err("turn gate");
+        assert!(matches!(finished, AcpError::NoActiveSteerTurn));
     }
 
     #[tokio::test]
@@ -3907,6 +4125,8 @@ mod tests {
             state: Arc::new(RwLock::new(state)),
             emitter: EventEmitter::Noop,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
+            steer_lock: Arc::new(tokio::sync::Mutex::new(())),
+            completed_steers: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
             config_fingerprint: String::new(),
             last_observed_fingerprint: String::new(),
             child_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -4244,10 +4464,10 @@ mod tests {
         // Empty / whitespace / image-only prompts seed no title (stays NULL,
         // backfilled on first detail load as before).
         assert!(delegation_child_title_seed(&[]).is_none());
-        assert!(
-            delegation_child_title_seed(&[PromptInputBlock::Text { text: "  \n ".into() }])
-                .is_none()
-        );
+        assert!(delegation_child_title_seed(&[PromptInputBlock::Text {
+            text: "  \n ".into()
+        }])
+        .is_none());
         let img = vec![PromptInputBlock::Image {
             data: "x".into(),
             mime_type: "image/png".into(),
@@ -5481,6 +5701,8 @@ mod tests {
             state: Arc::new(RwLock::new(state)),
             emitter: EventEmitter::Noop,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
+            steer_lock: Arc::new(tokio::sync::Mutex::new(())),
+            completed_steers: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
             config_fingerprint: String::new(),
             last_observed_fingerprint: String::new(),
             child_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -5578,7 +5800,10 @@ mod tests {
         .unwrap();
         let (mgr, join) =
             manager_with_fake_fork("c-restack", pre.id, "session-S2", "session-S1").await;
-        let result = mgr.fork_session(&db, "c-restack", None, None).await.unwrap();
+        let result = mgr
+            .fork_session(&db, "c-restack", None, None)
+            .await
+            .unwrap();
         let _ = join.await;
 
         let current = conversation_service::get_by_id(&db.conn, pre.id)
@@ -6083,6 +6308,8 @@ mod tests {
             state: Arc::new(RwLock::new(state)),
             emitter: EventEmitter::Noop,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
+            steer_lock: Arc::new(tokio::sync::Mutex::new(())),
+            completed_steers: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
             config_fingerprint: String::new(),
             last_observed_fingerprint: String::new(),
             child_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -6421,7 +6648,11 @@ mod tests {
         let at_bound = "y".repeat(MAX_FEEDBACK_CHARS);
         assert!(mgr.submit_feedback("c1", at_bound).await.is_ok());
         let state = mgr.get_state("c1").await.unwrap();
-        assert_eq!(state.read().await.feedback.len(), 1, "only the valid note stuck");
+        assert_eq!(
+            state.read().await.feedback.len(),
+            1,
+            "only the valid note stuck"
+        );
     }
 
     // --- native steering (push channel) ----------------------------------
@@ -6463,7 +6694,10 @@ mod tests {
         set_feedback_tool_available(&mgr, "c1").await;
         let fake_loop = answer_steer(rx, Ok(SteerOutcome::Injected));
 
-        let item = mgr.submit_feedback("c1", "  ship it  ".into()).await.unwrap();
+        let item = mgr
+            .submit_feedback("c1", "  ship it  ".into())
+            .await
+            .unwrap();
         assert_eq!(item.status, FeedbackStatus::Delivered);
         assert!(item.delivered_at.is_some());
         assert_eq!(item.text, "ship it");
@@ -6643,7 +6877,10 @@ mod tests {
         mark_native_steering_ready(&mgr, "c1").await;
         // feedback_tool_available stays false.
         let fake_loop = answer_steer(rx, Ok(SteerOutcome::Injected));
-        let item = mgr.submit_feedback("c1", "no tool needed".into()).await.unwrap();
+        let item = mgr
+            .submit_feedback("c1", "no tool needed".into())
+            .await
+            .unwrap();
         assert_eq!(item.status, FeedbackStatus::Delivered);
         let _ = fake_loop.await;
     }
@@ -6955,7 +7192,12 @@ mod tests {
         // The first is still the pending one and still answerable.
         let state = mgr.get_state("cc2").await.unwrap();
         assert_eq!(
-            state.read().await.pending_question.as_ref().map(|p| p.question_id.clone()),
+            state
+                .read()
+                .await
+                .pending_question
+                .as_ref()
+                .map(|p| p.question_id.clone()),
             Some(first.question_id.clone())
         );
         mgr.answer_question(
@@ -6991,12 +7233,7 @@ mod tests {
         assert_eq!(texts, vec!["a", "b"]);
         // A second read still returns them — read is non-destructive, so an
         // abandoned (peer-closed) call leaves the notes retryable.
-        assert_eq!(
-            mgr.read_pending_feedback("c1")
-                .await
-                .len(),
-            2
-        );
+        assert_eq!(mgr.read_pending_feedback("c1").await.len(), 2);
         {
             let state = mgr.get_state("c1").await.unwrap();
             assert!(state
@@ -7011,10 +7248,7 @@ mod tests {
         mgr.commit_feedback_delivered("c1", vec![a.id.clone(), b.id.clone()])
             .await;
         // Now READ returns nothing (delivered notes are filtered out).
-        assert!(mgr
-            .read_pending_feedback("c1")
-            .await
-            .is_empty());
+        assert!(mgr.read_pending_feedback("c1").await.is_empty());
         let state = mgr.get_state("c1").await.unwrap();
         assert!(state
             .read()
@@ -7030,12 +7264,9 @@ mod tests {
     #[tokio::test]
     async fn read_pending_missing_connection_returns_empty() {
         let mgr = ConnectionManager::new();
-        assert!(mgr
-            .read_pending_feedback("nope")
-            .await
-            .is_empty());
+        assert!(mgr.read_pending_feedback("nope").await.is_empty());
         // Commit on a missing connection is a safe no-op.
-        mgr.commit_feedback_delivered("nope", vec!["x".into()]).await;
+        mgr.commit_feedback_delivered("nope", vec!["x".into()])
+            .await;
     }
-
 }

@@ -603,9 +603,12 @@ export interface DbConversationDetail {
    * mid-stream, which would otherwise double-render against the live reply.
    */
   in_flight_user_turn_id?: string | null
-  /** Backend filesystem captures, grouped by accepted ACP turn. Older servers
-   * omit this field; callers must treat it as an empty list. */
+  /** Backend filesystem change diagnostics, grouped by accepted ACP turn.
+   * These are not final deliverables. Older servers omit this field. */
   artifact_runs?: ConversationTurnArtifactRun[]
+  /** Agent-declared final outputs that the backend verified inside the
+   * conversation workspace. */
+  deliverables?: ConversationDeliverable[]
   /**
    * Turn-window metadata, present only when the request asked for a window
    * (`tailTurns`/`fromIndex`); their absence marks a legacy full response
@@ -646,6 +649,24 @@ export interface ConversationTurnsPage {
    *  fingerprint for the page to legally join the loaded window. */
   prefix_hash_before_index: string
   uncovered_prefix_max_ts?: string | null
+}
+
+export interface ConversationDeliverable {
+  id: string
+  conversation_id: number
+  turn_run_id?: string | null
+  root_path: string
+  path: string
+  kind: "file" | "directory"
+  title: string
+  description?: string | null
+  role: "primary" | "supporting"
+  position: number
+  source: "agent_declared"
+  size_bytes?: number | null
+  verified_at: string
+  created_at: string
+  updated_at: string
 }
 
 export type ConversationTurnArtifactStatus =
@@ -697,6 +718,14 @@ export interface ConversationArtifactsChanged {
 
 export const CONVERSATION_ARTIFACTS_CHANGED_EVENT =
   "conversation://artifacts-changed"
+
+export interface ConversationDeliverablesChanged {
+  conversation_id: number
+  deliverable_ids: string[]
+}
+
+export const CONVERSATION_DELIVERABLES_CHANGED_EVENT =
+  "conversation://deliverables-changed"
 
 export type ConversationStatus =
   | "in_progress"
@@ -1139,6 +1168,13 @@ export type PromptInputBlock =
       mime_type?: string | null
       description?: string | null
     }
+
+/** Successful native Codex `turn/steer` injection. */
+export interface SteerResult {
+  turn_id: string
+  message_id: string
+  deduplicated: boolean
+}
 
 export interface PromptDraft {
   blocks: PromptInputBlock[]
@@ -1904,6 +1940,10 @@ export type AcpEvent =
       supported: boolean
     }
   | {
+      type: "steer_supported"
+      supported: boolean
+    }
+  | {
       type: "mode_changed"
       mode_id: string
     }
@@ -1914,6 +1954,12 @@ export type AcpEvent =
   | {
       type: "status_changed"
       status: ConnectionStatus
+    }
+  | {
+      type: "steer_message"
+      message_id: string
+      blocks: UserMessageBlock[]
+      turn_id: string
     }
   | {
       type: "error"
@@ -2302,6 +2348,15 @@ export interface LiveSessionSnapshot {
   prompt_capabilities: PromptCapabilitiesInfo | null
   usage: SessionUsageUpdateInfo | null
   fork_supported: boolean
+  /** Whether this concrete adapter/app-server connection supports native
+   *  in-turn steering. Absent on older Codeg servers. */
+  supports_steer?: boolean
+  /** Successfully injected guide messages still associated with the active
+   *  turn, recoverable after refresh/reconnect. */
+  steer_messages?: Array<{
+    message_id: string
+    blocks: UserMessageBlock[]
+  }>
   available_commands: AvailableCommandInfo[]
   selectors_ready: boolean
   /** Whether the running session is on stale (launch-time) config after a later

@@ -142,6 +142,8 @@ export interface ComposerInjectContent {
 
 interface MessageInputProps {
   onSend: (draft: PromptDraft, modeId?: string | null) => void
+  supportsSteer?: boolean
+  onSteer?: (draft: PromptDraft) => void | Promise<void>
   placeholder?: string
   defaultPath?: string
   disabled?: boolean
@@ -266,6 +268,8 @@ function modelPickerGroups(
 
 export function MessageInput({
   onSend,
+  supportsSteer = false,
+  onSteer,
   placeholder,
   defaultPath,
   disabled = false,
@@ -327,6 +331,8 @@ export function MessageInput({
   // The editor owns the content now; this mirror of its empty state drives the
   // send button and `hasSendableContent`.
   const [composerEmpty, setComposerEmpty] = useState(true)
+  const [steerSubmitting, setSteerSubmitting] = useState(false)
+  const steerSubmittingRef = useRef(false)
   // Flips true once the RichComposer's async (immediatelyRender:false) editor has
   // mounted, so the hydration effect can use the imperative handle.
   const [composerReady, setComposerReady] = useState(false)
@@ -659,6 +665,7 @@ export function MessageInput({
   const imageAttachments = attach.imageAttachments
   const hasAttachments = attachments.length > 0
   const hasSendableContent = !composerEmpty || hasAttachments
+  const isNativeGuide = isPrompting && supportsSteer && Boolean(onSteer)
 
   // ── Slash command autocomplete ──
   //
@@ -1119,6 +1126,29 @@ export function MessageInput({
       return
     }
 
+    if (isNativeGuide && onSteer) {
+      // Consume the draft synchronously so a double-click/key repeat cannot
+      // inject it twice. The parent owns failure recovery and always converts
+      // an unsuccessful guide into live feedback or the ordinary-message queue.
+      if (steerSubmittingRef.current) return
+      steerSubmittingRef.current = true
+      setSteerSubmitting(true)
+      if (effectiveDraftStorageKey) {
+        clearMessageInputDraftV2(effectiveDraftStorageKey)
+      }
+      resetComposer()
+      void Promise.resolve()
+        .then(() => onSteer(draft))
+        .catch(() => {
+          // The parent has already surfaced and recovered the failed draft.
+        })
+        .finally(() => {
+          steerSubmittingRef.current = false
+          setSteerSubmitting(false)
+        })
+      return
+    }
+
     // Prompting mode: enqueue instead of sending
     if (isPrompting && onEnqueue) {
       onEnqueue(draft, showModeSelector ? effectiveModeId : null)
@@ -1138,6 +1168,8 @@ export function MessageInput({
     buildDraft,
     isEditingQueueItem,
     isPrompting,
+    isNativeGuide,
+    onSteer,
     onSaveQueueEdit,
     onEnqueue,
     onSend,
@@ -1536,6 +1568,32 @@ export function MessageInput({
         <Check className="size-4" />
       </Button>
     </div>
+  ) : isNativeGuide && onCancel ? (
+    <div className="flex items-center gap-1">
+      <Button
+        onClick={onCancel}
+        variant="destructive"
+        size="icon"
+        className="h-8 w-8"
+        title={t("cancel")}
+      >
+        <Square className="size-4" />
+      </Button>
+      <Button
+        onClick={handleSend}
+        disabled={!hasSendableContent || steerSubmitting}
+        size="icon"
+        className="h-8 w-8"
+        title={steerSubmitting ? t("steerSending") : t("steer")}
+        aria-label={steerSubmitting ? t("steerSending") : t("steer")}
+      >
+        {steerSubmitting ? (
+          <Loader2 className="size-4 animate-spin" />
+        ) : (
+          <Send className="size-4" />
+        )}
+      </Button>
+    </div>
   ) : isPrompting && onCancel ? (
     onSteer && onEnqueue && hasSendableContent ? (
       // Native-steering sessions surface the mid-turn actions that already
@@ -1801,8 +1859,12 @@ export function MessageInput({
                 onPasteFiles={attach.handlePasteFiles}
                 onDropFiles={attach.handleEditorDrop}
                 onPlainPaste={handlePlainPasteShortcut}
-                submitShortcut={shortcuts.send_message}
-                newlineShortcut={shortcuts.newline_in_message}
+                submitShortcut={
+                  isNativeGuide ? "enter" : shortcuts.send_message
+                }
+                newlineShortcut={
+                  isNativeGuide ? "shift+enter" : shortcuts.newline_in_message
+                }
                 isExternalMenuOpen={slashMenuOpen && slashAutocompleteCount > 0}
                 onExternalMenuKeyDown={handleExternalMenuKeyDown}
                 className="min-h-0 flex-1"
