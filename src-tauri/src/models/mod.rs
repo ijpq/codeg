@@ -20,11 +20,11 @@ pub use automation::{
 #[allow(unused_imports)]
 pub use chat_channel::{ChannelStatusInfo, ChatChannelInfo, ChatChannelMessageLogInfo};
 pub use conversation::{
-    AgentConversationCount, AgentStats, ConversationDetail, ConversationSummary,
-    ConversationTurnArtifactRun, ConversationTurnFileChange, DbConversationDetail,
-    DbConversationSummary, FolderInfo, ImportFolderOutcome, ImportResult, ImportSelectedResult,
-    ScanFolder, ScanResult, ScanSession, ScanSessionStatus, SelectedSessionKey, SessionStats,
-    SidebarData,
+    AgentConversationCount, AgentStats, ConversationDeliverable, ConversationDetail,
+    ConversationSummary, ConversationTurnArtifactRun, ConversationTurnFileChange,
+    DbConversationDetail, DbConversationSummary, FolderInfo, ImportFolderOutcome, ImportResult,
+    ImportSelectedResult, ScanFolder, ScanResult, ScanSession, ScanSessionStatus,
+    SelectedSessionKey, SessionStats, SidebarData,
 };
 pub use folder::{
     FolderCommandInfo, FolderDetail, FolderHistoryEntry, OpenedTab, OpenedTabsSnapshot,
@@ -36,15 +36,15 @@ pub use message::{
 };
 pub use quick_message::QuickMessageInfo;
 pub use remote_workspace_connection::RemoteWorkspaceConnectionInfo;
-pub use work_task::{
-    WorkTaskChangedFile, WorkTaskConfig, WorkTaskDraft, WorkTaskEventInfo, WorkTaskFolderSettings,
-    WorkTaskInfo, WorkTaskMergeState, WorkTaskPreflight, WorkTaskStatus,
-    WorkTaskTemplateDraft, WorkTaskTemplateInfo, STAGE_PROMPT_ALL,
-};
 #[cfg(feature = "tauri-runtime")]
 pub use system::SystemRenderingSettings;
 pub use system::{
     AvailableTerminalShells, GitCredentials, GitDetectResult, GitHubAccountsSettings,
     GitHubTokenValidation, GitSettings, SystemLanguageSettings, SystemProxySettings,
     SystemTerminalSettings, TerminalShellOption,
+};
+pub use work_task::{
+    WorkTaskChangedFile, WorkTaskConfig, WorkTaskDraft, WorkTaskEventInfo, WorkTaskFolderSettings,
+    WorkTaskInfo, WorkTaskMergeState, WorkTaskPreflight, WorkTaskStatus, WorkTaskTemplateDraft,
+    WorkTaskTemplateInfo, STAGE_PROMPT_ALL,
 };

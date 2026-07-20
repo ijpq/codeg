@@ -5,15 +5,16 @@
 //! The companion speaks newline-delimited JSON-RPC 2.0 on stdio:
 //! one request → one response per line, with concurrent dispatch so
 //! `notifications/cancelled` can race an in-flight `tools/call`. It exposes up
-//! to six tools — `delegate_to_agent` (async; returns a `task_id` ack),
+//! to seven tools — `delegate_to_agent` (async; returns a `task_id` ack),
 //! `get_delegation_status` (poll/long-poll for the result), `cancel_delegation`,
 //! `check_user_feedback` (pull the user's mid-turn steering notes),
-//! `ask_user_question` (block on a multiple-choice card), and `get_session_info`
-//! (resolve a referenced session by id) — whose schemas are embedded at compile
-//! time from [`TOOL_SCHEMA_JSON`] and gated by the `--features` groups (delegation
-//! / feedback / ask / sessions). Only `delegate_to_agent` registers a broker-side
-//! cancel handle; canceling a status / cancel / feedback / session round-trip
-//! merely suppresses its response — and for `check_user_feedback` also skips the
+//! `ask_user_question` (block on a multiple-choice card), `get_session_info`
+//! (resolve a referenced session by id), and `publish_deliverables` (declare
+//! verified final outputs) — whose schemas are embedded at compile time from
+//! [`TOOL_SCHEMA_JSON`] and gated by the `--features` groups (delegation /
+//! feedback / ask / sessions / deliverables). Only `delegate_to_agent`
+//! registers a broker-side cancel handle. Canceling any other round-trip merely
+//! suppresses its response — and for `check_user_feedback` also skips the
 //! delivery commit, so a cancelled note stays pending.
 //!
 //! Notifications (id = None) produce no response, matching MCP's expectation
@@ -43,12 +44,14 @@ use tokio::sync::{oneshot, Mutex};
 
 use crate::acp::delegation::transport::{
     client_ask_round_trip, client_cancel, client_cancel_task_round_trip, client_commit_feedback,
-    client_feedback_round_trip, client_round_trip, client_session_round_trip,
-    client_status_round_trip, client_task_complete_round_trip, client_task_progress_round_trip,
-    BrokerAskRequest, BrokerCancelRequest, BrokerCancelTaskRequest, BrokerCommitFeedbackRequest,
+    client_deliverables_round_trip, client_feedback_round_trip, client_round_trip,
+    client_session_round_trip, client_status_round_trip, client_task_complete_round_trip,
+    client_task_progress_round_trip, BrokerAskRequest, BrokerCancelRequest,
+    BrokerCancelTaskRequest, BrokerCommitFeedbackRequest, BrokerDeliverablesRequest,
     BrokerFeedbackRequest, BrokerRequest, BrokerResponse, BrokerSessionRequest,
     BrokerStatusRequest, BrokerTaskCompleteRequest, BrokerTaskProgressRequest,
 };
+use crate::acp::deliverables::{PublishDeliverablesArgs, MAX_DELIVERABLES_PER_CALL};
 use crate::acp::question::parse_questions;
 use crate::acp::session_info::MAX_SESSION_MESSAGES;
 
@@ -129,10 +132,10 @@ pub fn err(id: Value, code: i64, message: impl Into<String>) -> JsonRpcResponse 
 }
 
 /// Which tool groups this companion exposes. One `codeg-mcp` process can carry
-/// the delegation tools, the feedback tool, or both — gated independently so
-/// each feature can be toggled in settings without the other. Passed in via the
-/// `--features` arg at launch; a tool whose group is off is hidden from
-/// `tools/list` and rejected on `tools/call`.
+/// all built-in tool groups, gated independently so each optional feature can
+/// be toggled without the others. Passed in via the `--features` arg at launch;
+/// a tool whose group is off is hidden from `tools/list` and rejected on
+/// `tools/call`.
 #[derive(Debug, Clone, Copy)]
 pub struct CompanionFeatures {
     pub delegation: bool,
@@ -142,14 +145,16 @@ pub struct CompanionFeatures {
     /// Work-task reporting tools (`task_progress` / `task_complete`) — injected
     /// only into spawns launched by the task engine.
     pub tasks: bool,
+    pub deliverables: bool,
 }
 
 impl CompanionFeatures {
     /// Parse the comma-joined `--features` value (e.g.
-    /// `delegation,feedback,ask,sessions`). Unknown tokens are ignored. An absent
-    /// value (`None`) defaults to delegation-only — backward compatible with a
-    /// parent that predates feature gating (companion + listener ship together, so
-    /// post-upgrade the parent always passes an explicit `--features`).
+    /// `deliverables,delegation,feedback,ask,sessions`). Unknown tokens are
+    /// ignored. An absent value (`None`) defaults to delegation-only — backward
+    /// compatible with a parent that predates feature gating (companion +
+    /// listener ship together, so post-upgrade the parent always passes an
+    /// explicit `--features`).
     pub fn parse(raw: Option<&str>) -> Self {
         let Some(s) = raw else {
             return Self {
@@ -158,6 +163,7 @@ impl CompanionFeatures {
                 ask: false,
                 sessions: false,
                 tasks: false,
+                deliverables: false,
             };
         };
         let mut f = Self {
@@ -166,6 +172,7 @@ impl CompanionFeatures {
             ask: false,
             sessions: false,
             tasks: false,
+            deliverables: false,
         };
         for tok in s.split(',').map(str::trim).filter(|t| !t.is_empty()) {
             match tok {
@@ -174,6 +181,7 @@ impl CompanionFeatures {
                 "ask" => f.ask = true,
                 "sessions" => f.sessions = true,
                 "tasks" => f.tasks = true,
+                "deliverables" => f.deliverables = true,
                 _ => {}
             }
         }
@@ -187,6 +195,7 @@ impl CompanionFeatures {
             "ask_user_question" => self.ask,
             "get_session_info" => self.sessions,
             "task_progress" | "task_complete" => self.tasks,
+            "publish_deliverables" => self.deliverables,
             "delegate_to_agent" | "get_delegation_status" | "cancel_delegation" => self.delegation,
             _ => false,
         }
@@ -675,6 +684,36 @@ async fn build_tools_call_spawn(
                 Box::pin(async move { client_task_complete_round_trip(&socket, &req).await });
             register_and_spawn(inflight, id, None, round_trip, render_task_ack).await
         }
+        "publish_deliverables" => {
+            let args: PublishDeliverablesArgs =
+                match serde_json::from_value::<PublishDeliverablesArgs>(arguments) {
+                    Ok(args) if args.deliverables.len() <= MAX_DELIVERABLES_PER_CALL => args,
+                    Ok(_) => {
+                        return LineAction::Respond(err(
+                            id,
+                            -32602,
+                            format!(
+                            "publish_deliverables accepts at most {MAX_DELIVERABLES_PER_CALL} items"
+                        ),
+                        ));
+                    }
+                    Err(error) => {
+                        return LineAction::Respond(err(
+                            id,
+                            -32602,
+                            format!("invalid publish_deliverables arguments: {error}"),
+                        ));
+                    }
+                };
+            let req = BrokerDeliverablesRequest {
+                token: ctx.token.clone(),
+                parent_connection_id: ctx.parent_connection_id.clone(),
+                deliverables: args.deliverables,
+            };
+            let round_trip =
+                Box::pin(async move { client_deliverables_round_trip(&socket, &req).await });
+            register_and_spawn(inflight, id, None, round_trip, render_deliverables_result).await
+        }
         other => LineAction::Respond(err(id, -32602, format!("unknown tool: {other}"))),
     }
 }
@@ -1093,7 +1132,10 @@ pub fn render_ask_result(outcome: &Value) -> Value {
             } else {
                 selected.join(", ")
             };
-            s.push_str(&format!("{}. [{header}] {question}\n   → {joined}\n", i + 1));
+            s.push_str(&format!(
+                "{}. [{header}] {question}\n   → {joined}\n",
+                i + 1
+            ));
         }
         s
     };
@@ -1190,12 +1232,67 @@ pub fn render_task_ack(outcome: &Value) -> Value {
     let text = outcome
         .get("note")
         .and_then(|v| v.as_str())
-        .unwrap_or(if recorded { "Recorded." } else { "Not recorded." })
+        .unwrap_or(if recorded {
+            "Recorded."
+        } else {
+            "Not recorded."
+        })
         .to_string();
     json!({
         "content": [{ "type": "text", "text": text }],
         "isError": false,
         "structuredContent": outcome.clone(),
+    })
+}
+
+/// Render the verified declaration back to the agent. Rejections stay in both
+/// text and structured content so the model can repair a bad path immediately;
+/// an atomic declaration is an MCP error when no complete set was accepted.
+pub fn render_deliverables_result(outcome: &Value) -> Value {
+    let published = outcome
+        .get("published")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let accepted = outcome
+        .get("accepted")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let rejected = outcome
+        .get("rejected")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut text = if published && accepted.is_empty() {
+        "Cleared the final deliverable set.".to_string()
+    } else if published {
+        format!("Published {} verified deliverable(s).", accepted.len())
+    } else {
+        "The final deliverable set was not changed.".to_string()
+    };
+    if !rejected.is_empty() {
+        text.push_str(&format!(" Rejected {} item(s):", rejected.len()));
+        for item in &rejected {
+            let path = item.get("path").and_then(Value::as_str).unwrap_or("");
+            let reason = item
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("validation failed");
+            if path.is_empty() {
+                text.push_str(&format!("\n- {reason}"));
+            } else {
+                text.push_str(&format!("\n- {path}: {reason}"));
+            }
+        }
+    }
+    json!({
+        "content": [{ "type": "text", "text": text }],
+        "isError": !published,
+        "structuredContent": {
+            "published": published,
+             "accepted": accepted,
+             "rejected": rejected,
+         },
     })
 }
 
@@ -1257,8 +1354,14 @@ fn render_session_summary_text(o: &Value) -> String {
             .get("truncated")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let suffix = if truncated { ", older turns omitted" } else { "" };
-        out.push_str(&format!("\nRecent messages ({included}/{total}{suffix}):\n"));
+        let suffix = if truncated {
+            ", older turns omitted"
+        } else {
+            ""
+        };
+        out.push_str(&format!(
+            "\nRecent messages ({included}/{total}{suffix}):\n"
+        ));
         if let Some(items) = messages.get("items").and_then(|v| v.as_array()) {
             for item in items {
                 let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("?");
@@ -1322,6 +1425,7 @@ mod tests {
             ask: false,
             sessions: false,
             tasks: false,
+            deliverables: false,
         })
     }
 
@@ -1895,6 +1999,7 @@ mod tests {
         ask: false,
         sessions: false,
         tasks: false,
+        deliverables: false,
     };
     const BOTH: CompanionFeatures = CompanionFeatures {
         delegation: true,
@@ -1902,6 +2007,7 @@ mod tests {
         ask: false,
         sessions: false,
         tasks: false,
+        deliverables: false,
     };
     const ASK_ONLY: CompanionFeatures = CompanionFeatures {
         delegation: false,
@@ -1909,6 +2015,7 @@ mod tests {
         ask: true,
         sessions: false,
         tasks: false,
+        deliverables: false,
     };
     const SESSIONS_ONLY: CompanionFeatures = CompanionFeatures {
         delegation: false,
@@ -1916,6 +2023,15 @@ mod tests {
         ask: false,
         sessions: true,
         tasks: false,
+        deliverables: false,
+    };
+    const DELIVERABLES_ONLY: CompanionFeatures = CompanionFeatures {
+        delegation: false,
+        feedback: false,
+        ask: false,
+        sessions: false,
+        tasks: false,
+        deliverables: true,
     };
 
     fn list_tool_names(action: LineAction) -> Vec<String> {
@@ -1935,9 +2051,12 @@ mod tests {
         assert!(def.delegation && !def.feedback);
         assert!(!def.ask);
         assert!(!def.sessions);
+        assert!(!def.deliverables);
         // Explicit list, whitespace + unknown tokens tolerated.
-        let all = CompanionFeatures::parse(Some(" delegation , feedback , ask , sessions ,bogus"));
-        assert!(all.delegation && all.feedback && all.ask && all.sessions);
+        let all = CompanionFeatures::parse(Some(
+            " deliverables, delegation , feedback , ask , sessions ,bogus",
+        ));
+        assert!(all.delegation && all.feedback && all.ask && all.sessions && all.deliverables);
         let fb = CompanionFeatures::parse(Some("feedback"));
         assert!(!fb.delegation && fb.feedback && !fb.ask);
         let ask = CompanionFeatures::parse(Some("ask"));
@@ -1946,7 +2065,97 @@ mod tests {
         assert!(!sessions.delegation && !sessions.feedback && !sessions.ask && sessions.sessions);
         // Empty string → nothing enabled.
         let none = CompanionFeatures::parse(Some(""));
-        assert!(!none.delegation && !none.feedback && !none.ask && !none.sessions);
+        assert!(
+            !none.delegation && !none.feedback && !none.ask && !none.sessions && !none.deliverables
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_deliverables_is_exposed_and_validated_independently() {
+        let names = list_tool_names(
+            dispatch_with_features(
+                DELIVERABLES_ONLY,
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            )
+            .await,
+        );
+        assert_eq!(names, vec!["publish_deliverables".to_string()]);
+
+        let valid = json!({
+            "jsonrpc": "2.0", "id": 41, "method": "tools/call",
+            "params": {
+                "name": "publish_deliverables",
+                "arguments": { "deliverables": [{ "path": "output/report.pdf" }] }
+            }
+        })
+        .to_string();
+        assert!(matches!(
+            dispatch_with_features(DELIVERABLES_ONLY, &valid).await,
+            LineAction::Spawn(_)
+        ));
+
+        let empty = json!({
+            "jsonrpc": "2.0", "id": 42, "method": "tools/call",
+            "params": {
+                "name": "publish_deliverables",
+                "arguments": { "deliverables": [] }
+            }
+        })
+        .to_string();
+        assert!(matches!(
+            dispatch_with_features(DELIVERABLES_ONLY, &empty).await,
+            LineAction::Spawn(_)
+        ));
+
+        let too_many_items = (0..=MAX_DELIVERABLES_PER_CALL)
+            .map(|index| json!({ "path": format!("output/{index}.txt") }))
+            .collect::<Vec<_>>();
+        let too_many = json!({
+            "jsonrpc": "2.0", "id": 43, "method": "tools/call",
+            "params": {
+                "name": "publish_deliverables",
+                "arguments": { "deliverables": too_many_items }
+            }
+        })
+        .to_string();
+        let response = unwrap_respond(dispatch_with_features(DELIVERABLES_ONLY, &too_many).await);
+        assert_eq!(response.error.unwrap().code, -32602);
+    }
+
+    #[test]
+    fn render_deliverables_reports_success_or_atomic_rejection() {
+        let rendered = render_deliverables_result(&json!({
+            "published": true,
+            "accepted": [{
+                "id": "d1", "path": "output/report.pdf", "kind": "file",
+                "title": "Report", "role": "primary"
+            }],
+            "rejected": []
+        }));
+        assert_eq!(rendered["isError"], false);
+        assert_eq!(rendered["structuredContent"]["accepted"][0]["id"], "d1");
+
+        let none = render_deliverables_result(&json!({
+            "published": false,
+            "accepted": [],
+            "rejected": [{ "path": "../secret", "reason": "outside workspace" }]
+        }));
+        assert_eq!(none["isError"], true);
+        assert!(none["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("outside workspace"));
+
+        let cleared = render_deliverables_result(&json!({
+            "published": true,
+            "accepted": [],
+            "rejected": []
+        }));
+        assert_eq!(cleared["isError"], false);
+        assert!(cleared["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Cleared"));
     }
 
     #[tokio::test]
@@ -2029,8 +2238,11 @@ mod tests {
         );
         assert!(!off.contains(&"ask_user_question".to_string()));
         let on = list_tool_names(
-            dispatch_with_features(ASK_ONLY, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#)
-                .await,
+            dispatch_with_features(
+                ASK_ONLY,
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            )
+            .await,
         );
         assert_eq!(on, vec!["ask_user_question".to_string()]);
     }
@@ -2161,7 +2373,11 @@ mod tests {
 
     #[tokio::test]
     async fn get_session_info_missing_or_bad_id_rejected_synchronously() {
-        for args in [json!({}), json!({ "session_id": "abc" }), json!({ "session_id": true })] {
+        for args in [
+            json!({}),
+            json!({ "session_id": "abc" }),
+            json!({ "session_id": true }),
+        ] {
             let line = json!({
                 "jsonrpc": "2.0", "id": 32, "method": "tools/call",
                 "params": { "name": "get_session_info", "arguments": args }
@@ -2217,10 +2433,7 @@ mod tests {
             parse_max_messages(&json!({ "max_messages": 4_294_967_296_u64 })),
             200
         );
-        assert_eq!(
-            parse_max_messages(&json!({ "max_messages": 1e30 })),
-            200
-        );
+        assert_eq!(parse_max_messages(&json!({ "max_messages": 1e30 })), 200);
         // Invalid / negative / fractional → default (optional knob, not an error).
         assert_eq!(parse_max_messages(&json!({ "max_messages": "abc" })), 20);
         assert_eq!(parse_max_messages(&json!({ "max_messages": -5 })), 20);
@@ -2353,8 +2566,12 @@ mod tests {
             let (mut c1, _) = listener.accept().await.unwrap();
             let _: BrokerResponse = match read_frame::<_, BrokerMessage>(&mut c1).await.unwrap() {
                 BrokerMessage::Feedback(_) => {
-                    write_frame(&mut c1, &feedback_resp_with_ids(&["f1"])).await.unwrap();
-                    BrokerResponse { outcome: Value::Null }
+                    write_frame(&mut c1, &feedback_resp_with_ids(&["f1"]))
+                        .await
+                        .unwrap();
+                    BrokerResponse {
+                        outcome: Value::Null,
+                    }
                 }
                 other => panic!("expected Feedback, got {other:?}"),
             };
@@ -2363,7 +2580,14 @@ mod tests {
             if let BrokerMessage::CommitFeedback(req) = read_frame(&mut c2).await.unwrap() {
                 committed2.lock().await.push(req.ids);
             }
-            write_frame(&mut c2, &BrokerResponse { outcome: Value::Null }).await.unwrap();
+            write_frame(
+                &mut c2,
+                &BrokerResponse {
+                    outcome: Value::Null,
+                },
+            )
+            .await
+            .unwrap();
         });
 
         let inflight = Arc::new(InflightCalls::new());
@@ -2372,7 +2596,9 @@ mod tests {
             Value::from(1),
             sock,
             "tok".into(),
-            BrokerFeedbackRequest { token: "tok".into() },
+            BrokerFeedbackRequest {
+                token: "tok".into(),
+            },
         )
         .await;
         let LineAction::Spawn(call) = action else {
@@ -2464,6 +2690,9 @@ mod tests {
         );
         server.abort();
         // Crucially: no commit was sent for a cancelled (undelivered) check.
-        assert!(!*saw_commit.lock().await, "a cancelled check must not commit");
+        assert!(
+            !*saw_commit.lock().await,
+            "a cancelled check must not commit"
+        );
     }
 }

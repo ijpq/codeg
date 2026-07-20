@@ -92,6 +92,7 @@ import type {
   FolderCommand,
   TerminalInfo,
   PromptInputBlock,
+  SteerResult,
   FileTreeNode,
   WorkspaceFileEntry,
   DirectoryEntry,
@@ -261,6 +262,18 @@ export async function acpPrompt(
     if (isTurnInProgressRejection(e)) throw new TurnBusyError()
     throw e
   }
+}
+
+export async function acpSteer(
+  connectionId: string,
+  blocks: PromptInputBlock[],
+  clientMessageId: string
+): Promise<SteerResult> {
+  return getTransport().call("acp_steer", {
+    connectionId,
+    blocks,
+    clientMessageId,
+  })
 }
 
 export async function acpSetMode(

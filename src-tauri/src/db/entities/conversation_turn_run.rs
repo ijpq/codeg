@@ -42,6 +42,8 @@ pub enum Relation {
     Conversation,
     #[sea_orm(has_many = "super::conversation_turn_file_change::Entity")]
     FileChanges,
+    #[sea_orm(has_many = "super::conversation_deliverable::Entity")]
+    Deliverables,
 }
 
 impl Related<super::conversation::Entity> for Entity {
@@ -53,6 +55,12 @@ impl Related<super::conversation::Entity> for Entity {
 impl Related<super::conversation_turn_file_change::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::FileChanges.def()
+    }
+}
+
+impl Related<super::conversation_deliverable::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Deliverables.def()
     }
 }
 

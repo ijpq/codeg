@@ -1525,6 +1525,11 @@
       "forkSession": "Bifurcar sesión",
       "forkSessionSuccess": "Sesión bifurcada exitosamente",
       "forkSessionFailed": "Error al bifurcar la sesión: {error}",
+      "steerInjected": "Instrucción inyectada en el turno actual",
+      "steerFallbackFeedback": "La guía nativa no está disponible; se envió como feedback en tiempo real",
+      "steerTurnEndedQueued": "El turno acaba de terminar; el mensaje quedó en cola para el siguiente turno",
+      "steerUnsupportedQueued": "La guía nativa no está disponible; el mensaje quedó en cola para el siguiente turno",
+      "steerFailedQueued": "Falló la guía; el mensaje quedó en cola para el siguiente turno",
       "exportConversation": "Exportar conversación",
       "exportImage": "Imagen",
       "exportMarkdown": "Markdown",
@@ -2454,6 +2459,7 @@
       "chatInput": {
         "connecting": "Conectando...",
         "agentResponding": "{agent} está respondiendo...",
+        "guideAgent": "Guiar el turno actual de {agent}...",
         "sendMessage": "Enviar un mensaje..."
       },
       "messageInput": {
@@ -2484,6 +2490,8 @@
         "noModels": "No se encontraron modelos",
         "cancel": "Cancelar",
         "send": "Enviar",
+        "steer": "Guiar turno actual",
+        "steerSending": "Inyectando instrucción...",
         "forkAndSend": "Fork y Enviar",
         "queueMessage": "Poner en cola",
         "steerIntoTurn": "Insertar en el turno actual",
@@ -3092,15 +3100,15 @@
         "title": "Plan propuesto",
         "planning": "Planificando…"
       },
-      "conversationArtifacts": {
-        "collapsedSummary": "Archivos {count}",
-        "title": "Archivos generados",
+      "conversationDeliverables": {
+        "collapsedSummary": "Entregables {count}",
+        "title": "Entregables finales",
         "collapse": "Contraer",
-        "empty": "Aún no hay archivos generados en esta conversación.",
         "openFile": "Abrir {filePath}",
-        "viewDiff": "Ver cambios",
         "revealInFolder": "Mostrar en el administrador de archivos",
-        "removed": "eliminado",
+        "primary": "Principal",
+        "supporting": "Complementario",
+        "downloadToPc": "Descargar en mi equipo",
         "fileUnavailable": "Archivo no disponible o que ya no existe: {filePath}"
       },
       "userResources": {
@@ -3649,8 +3657,8 @@
     },
     "autoPreviewLabel": "Abrir vista previa automáticamente",
     "autoPreviewHint": "Cuando un agente crea o edita un archivo de Word, Excel o PowerPoint, abre su vista previa en vivo automáticamente.",
-    "autoDownloadProducedLabel": "Descargar automáticamente los archivos generados",
-    "autoDownloadProducedHint": "Al usar el servidor web (p. ej., por Tailscale/LAN), descarga automáticamente a la carpeta de Descargas de este navegador los archivos que el agente crea o modifica."
+    "autoDownloadProducedLabel": "Descargar automáticamente los entregables finales",
+    "autoDownloadProducedHint": "Al usar el servidor web (p. ej., por Tailscale/LAN), descarga automáticamente a la carpeta de Descargas de este navegador los archivos de entrega final declarados por el agente y verificados."
   },
   "SkillPacksSettings": {
     "title": "Paquetes de habilidades",
