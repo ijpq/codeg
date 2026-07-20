@@ -345,7 +345,6 @@ impl WatchEventBatch {
 
         let event_kind = event.kind;
         let event_path_count = event.paths.len();
-        let mut has_relevant_path = false;
         for (path_index, path) in event.paths.into_iter().enumerate() {
             let Some(relative) = classify_watch_path(&path, root_canonical, git_watch_dirs) else {
                 continue;
@@ -379,16 +378,11 @@ impl WatchEventBatch {
                 .entry(relative)
                 .and_modify(|current| *current = merge_path_change(*current, incoming))
                 .or_insert(incoming);
-            has_relevant_path = true;
             if self.changed_paths.len() > WATCH_MAX_CHANGED_PATHS {
                 self.overflowed = true;
                 self.changed_paths.clear();
                 break;
             }
-        }
-
-        if !has_relevant_path {
-            return;
         }
 
     }

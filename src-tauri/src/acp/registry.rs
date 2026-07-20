@@ -82,6 +82,11 @@ impl BinaryDirEntry {
 #[derive(Debug, Clone)]
 pub struct AcpAgentMeta {
     pub agent_type: AgentType,
+    /// Whether this protocol adapter is expected to expose Codeg's
+    /// `session/steer` extension. Runtime preparation/negotiation can still
+    /// downgrade the connection (old adapter/app-server); the frontend consumes
+    /// that per-connection result rather than matching the agent name.
+    pub supports_steer: bool,
     /// 是否经 ACP 线缆（session/new 的 `mcpServers` 字段）向该 agent 转发 MCP
     /// 服务器——既包括用户配置的服务器，也包括内置 codeg-mcp 伴生进程。
     /// OpenClaw 拒绝 `mcpServers` 中的任何服务器条目（会使 session/new 失败），
@@ -190,6 +195,7 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
     match agent_type {
         AgentType::ClaudeCode => AcpAgentMeta {
             agent_type,
+            supports_steer: false,
             supports_mcp: true,
             name: "Claude Code",
             description: "ACP wrapper for Anthropic's Claude",
@@ -204,6 +210,7 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
         },
         AgentType::Codex => AcpAgentMeta {
             agent_type,
+            supports_steer: true,
             supports_mcp: true,
             name: "Codex CLI",
             description: "ACP adapter for OpenAI's coding assistant",
@@ -252,6 +259,7 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
         },
         AgentType::Gemini => AcpAgentMeta {
             agent_type,
+            supports_steer: false,
             supports_mcp: true,
             name: "Gemini CLI",
             description: "Google's official CLI for Gemini",
@@ -266,6 +274,7 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
         },
         AgentType::OpenClaw => AcpAgentMeta {
             agent_type,
+            supports_steer: false,
             // OpenClaw 拒绝 `mcpServers` 中的任何服务器条目（会使 session/new 失败），
             // 故不向其转发任何 MCP 条目（含 codeg-mcp 伴生进程）。详见 supports_mcp 字段注释。
             supports_mcp: false,
@@ -282,6 +291,7 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
         },
         AgentType::Cline => AcpAgentMeta {
             agent_type,
+            supports_steer: false,
             supports_mcp: true,
             name: "Cline",
             description: "Autonomous coding agent CLI",
@@ -296,6 +306,7 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
         },
         AgentType::OpenCode => AcpAgentMeta {
             agent_type,
+            supports_steer: false,
             supports_mcp: true,
             name: "OpenCode",
             description: "The open source coding agent",
@@ -335,6 +346,7 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
         },
         AgentType::Hermes => AcpAgentMeta {
             agent_type,
+            supports_steer: false,
             supports_mcp: true,
             name: "Hermes Agent",
             description: "Nous Research's self-improving agent (ACP via uvx)",
@@ -357,6 +369,7 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
         },
         AgentType::CodeBuddy => AcpAgentMeta {
             agent_type,
+            supports_steer: false,
             supports_mcp: true,
             name: "CodeBuddy",
             description: "Tencent Cloud's official AI coding assistant (ACP)",
@@ -371,6 +384,7 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
         },
         AgentType::KimiCode => AcpAgentMeta {
             agent_type,
+            supports_steer: false,
             supports_mcp: true,
             name: "Kimi Code",
             description: "Moonshot AI's official CLI coding assistant (ACP)",
@@ -385,6 +399,7 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
         },
         AgentType::Pi => AcpAgentMeta {
             agent_type,
+            supports_steer: false,
             // pi-acp accepts ACP-wire `mcpServers` but drops them (does not
             // forward to pi), and pi has no native MCP. supports_mcp stays
             // `true` only to satisfy the `only_openclaw_opts_out_of_mcp`
@@ -412,6 +427,7 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
         },
         AgentType::Grok => AcpAgentMeta {
             agent_type,
+            supports_steer: false,
             supports_mcp: true,
             name: "Grok",
             description: "xAI's official coding agent and CLI (ACP via grok agent stdio)",
@@ -451,6 +467,7 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
         },
         AgentType::Cursor => AcpAgentMeta {
             agent_type,
+            supports_steer: false,
             supports_mcp: true,
             name: "Cursor",
             description: "Cursor's coding agent (ACP via cursor-agent acp)",

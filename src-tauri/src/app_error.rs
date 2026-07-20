@@ -90,6 +90,10 @@ pub enum AppErrorCode {
     /// connection (a second, concurrent send). Maps to HTTP 409 — an expected,
     /// recoverable condition in multi-client co-control, not a server fault.
     TurnInProgress,
+    /// Native guide request raced a completed turn.
+    NoActiveSteerTurn,
+    /// The adapter/app-server does not implement native steering.
+    SteerUnsupported,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, thiserror::Error)]

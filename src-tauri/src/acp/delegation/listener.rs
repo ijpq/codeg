@@ -18,10 +18,13 @@ use tokio::sync::RwLock;
 use crate::acp::delegation::broker::{DelegationBroker, StatusWait};
 use crate::acp::delegation::transport::{
     read_frame, write_frame, BrokerAskRequest, BrokerCancelRequest, BrokerCancelTaskRequest,
-    BrokerCommitFeedbackRequest, BrokerFeedbackRequest, BrokerMessage, BrokerRequest,
-    BrokerResponse, BrokerSessionRequest, BrokerStatusRequest,
+    BrokerCommitFeedbackRequest, BrokerDeliverablesRequest, BrokerFeedbackRequest, BrokerMessage,
+    BrokerRequest, BrokerResponse, BrokerSessionRequest, BrokerStatusRequest,
 };
 use crate::acp::delegation::types::{DelegationRequest, DelegationTaskReport, TaskStatus};
+use crate::acp::deliverables::{
+    PublishDeliverablesOutcome, RejectedDeliverable, SessionDeliverableAccess,
+};
 use crate::acp::feedback::{PendingFeedback, SessionFeedbackAccess};
 use crate::acp::question::{QuestionOutcome, SessionQuestionAccess};
 use crate::acp::session_info::{SessionInfo, SessionInfoAccess};
@@ -33,7 +36,6 @@ use serde_json::Value;
 /// keeps running past this; the LLM simply re-issues the wait. An explicit
 /// `wait_ms = 0` opts out of the ceiling and blocks until the task is terminal.
 const STATUS_WAIT_MAX_MS: u64 = 60_000;
-
 
 /// Pluggable "what conversation is this parent currently in?" lookup. The
 /// production impl wraps `ConnectionManager.get_state`; tests use an
@@ -95,6 +97,8 @@ pub struct DelegationListener {
     /// other arms this is NOT parent-scoped — it looks any non-deleted session up
     /// by its codeg conversation id (still token-gated against an invalid caller).
     pub session_info: Arc<dyn SessionInfoAccess>,
+    /// Verifies and persists the agent's explicit final-output declaration.
+    pub deliverables: Arc<dyn SessionDeliverableAccess>,
 }
 
 impl DelegationListener {
@@ -106,6 +110,7 @@ impl DelegationListener {
         feedback: Arc<dyn SessionFeedbackAccess>,
         questions: Arc<dyn SessionQuestionAccess>,
         session_info: Arc<dyn SessionInfoAccess>,
+        deliverables: Arc<dyn SessionDeliverableAccess>,
     ) -> Arc<Self> {
         Arc::new(Self {
             broker,
@@ -114,6 +119,7 @@ impl DelegationListener {
             feedback,
             questions,
             session_info,
+            deliverables,
         })
     }
 
@@ -311,6 +317,9 @@ impl DelegationListener {
                 // and there is nothing to tear down on cancel.
                 session_response(self.process_session_info(req).await)?
             }
+            BrokerMessage::PublishDeliverables(req) => {
+                deliverables_response(self.process_deliverables(req).await)?
+            }
             BrokerMessage::Cancel(cancel) => {
                 self.process_cancel(cancel).await;
                 // Empty ack — the companion only uses this to detect the
@@ -486,6 +495,33 @@ impl DelegationListener {
             .await
     }
 
+    async fn process_deliverables(
+        &self,
+        req: BrokerDeliverablesRequest,
+    ) -> PublishDeliverablesOutcome {
+        let Some(entry) = self.tokens.lookup(&req.token).await else {
+            return publish_rejected("invalid or expired session token");
+        };
+        if entry.parent_connection_id != req.parent_connection_id {
+            return publish_rejected("token does not match the parent connection");
+        }
+        let Some(conversation_id) = self
+            .parent_lookup
+            .current_conversation_id(&req.parent_connection_id)
+            .await
+        else {
+            return publish_rejected("parent has no active conversation");
+        };
+        self.deliverables
+            .publish_deliverables(
+                &req.parent_connection_id,
+                conversation_id,
+                &entry.working_dir,
+                req.deliverables,
+            )
+            .await
+    }
+
     async fn process(&self, req: BrokerRequest) -> DelegationTaskReport {
         // 1. Token + parent_connection_id consistency check. Treat both as
         //    "canceled" since the LLM can't usefully react to either —
@@ -614,6 +650,27 @@ fn session_response(info: SessionInfo) -> std::io::Result<BrokerResponse> {
             std::io::Error::new(std::io::ErrorKind::InvalidData, format!("encode: {e}"))
         })?,
     })
+}
+
+fn deliverables_response(
+    outcome: PublishDeliverablesOutcome,
+) -> std::io::Result<BrokerResponse> {
+    Ok(BrokerResponse {
+        outcome: serde_json::to_value(outcome).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("encode: {e}"))
+        })?,
+    })
+}
+
+fn publish_rejected(reason: &str) -> PublishDeliverablesOutcome {
+    PublishDeliverablesOutcome {
+        published: false,
+        accepted: Vec::new(),
+        rejected: vec![RejectedDeliverable {
+            path: String::new(),
+            reason: reason.to_string(),
+        }],
+    }
 }
 
 /// The `declined` outcome — used when the token is invalid, the connection is
@@ -832,6 +889,22 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct StubDeliverables;
+
+    #[async_trait]
+    impl SessionDeliverableAccess for StubDeliverables {
+        async fn publish_deliverables(
+            &self,
+            _parent_connection_id: &str,
+            _conversation_id: i32,
+            _workspace_root: &Path,
+            _items: Vec<crate::acp::deliverables::DeliverableInput>,
+        ) -> PublishDeliverablesOutcome {
+            PublishDeliverablesOutcome::default()
+        }
+    }
+
     use tokio::sync::oneshot;
 
     async fn make_broker(mock: Arc<MockSpawner>) -> Arc<DelegationBroker> {
@@ -864,6 +937,7 @@ mod tests {
             Arc::new(StubFeedback::default()),
             Arc::new(StubQuestion::default()),
             Arc::new(StubSessionInfo::default()),
+            Arc::new(StubDeliverables),
         )
     }
 
@@ -884,6 +958,7 @@ mod tests {
             feedback,
             Arc::new(StubQuestion::default()),
             Arc::new(StubSessionInfo::default()),
+            Arc::new(StubDeliverables),
         )
     }
 
@@ -905,6 +980,7 @@ mod tests {
             Arc::new(StubFeedback::default()),
             questions,
             Arc::new(StubSessionInfo::default()),
+            Arc::new(StubDeliverables),
         )
     }
 
@@ -925,6 +1001,7 @@ mod tests {
             Arc::new(StubFeedback::default()),
             Arc::new(StubQuestion::default()),
             session_info,
+            Arc::new(StubDeliverables),
         )
     }
 

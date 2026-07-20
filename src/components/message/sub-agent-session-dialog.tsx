@@ -49,10 +49,13 @@ import { AskQuestionCard } from "@/components/chat/ask-question-card"
 import { PlanApprovalCard } from "@/components/chat/plan-approval-card"
 import {
   AGENT_LABELS,
+  CONVERSATION_DELIVERABLES_CHANGED_EVENT,
   type AgentType,
+  type ConversationDeliverablesChanged,
   type PlanApprovalAnswer,
   type QuestionAnswer,
 } from "@/lib/types"
+import { subscribe } from "@/lib/platform"
 
 interface Props {
   open: boolean
@@ -308,9 +311,32 @@ function SubAgentSessionBody({
     refetchDetail(childConversationId, { preserveLive: true })
   }, [childConversationId, refetchDetail])
 
-  // Reader only — its built-in auto-fetch is disabled; the effect above is
-  // the sole fetch path.
-  const { loading, error, acpLoadError } = useConversationDetail(
+  // Keep the read-only child viewer's final-output panel current while the
+  // child is still streaming. `preserveLive` updates the persisted declaration
+  // without replacing its bridged reply with a lagging transcript snapshot.
+  useEffect(() => {
+    let disposed = false
+    let unlisten: (() => void) | undefined
+    void subscribe<ConversationDeliverablesChanged>(
+      CONVERSATION_DELIVERABLES_CHANGED_EVENT,
+      (change) => {
+        if (change.conversation_id === childConversationId) {
+          refetchDetail(childConversationId, { preserveLive: true })
+        }
+      }
+    ).then((dispose) => {
+      if (disposed) dispose()
+      else unlisten = dispose
+    })
+    return () => {
+      disposed = true
+      unlisten?.()
+    }
+  }, [childConversationId, refetchDetail])
+
+  // Reader only — its built-in auto-fetch is disabled; the mount and
+  // deliverables effects above own the fetch timing.
+  const { detail, loading, error, acpLoadError } = useConversationDetail(
     childConversationId,
     { enabled: false }
   )
@@ -418,6 +444,7 @@ function SubAgentSessionBody({
           acpLoadError={acpLoadError}
           hideEmptyState={false}
           showMessageNav={false}
+          deliverables={detail?.deliverables}
         />
       </div>
     </div>

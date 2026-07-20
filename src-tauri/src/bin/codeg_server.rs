@@ -347,6 +347,10 @@ async fn async_main() -> ExitCode {
                     conn: state.db.conn.clone(),
                 }),
             )),
+            codeg_lib::acp::deliverables::shared_access(
+                state.db.conn.clone(),
+                state.emitter.clone(),
+            ),
         );
         let socket = delegation_socket_path.clone();
         tokio::spawn(async move {

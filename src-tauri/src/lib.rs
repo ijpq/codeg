@@ -590,6 +590,12 @@ mod tauri_app {
                                 }),
                             ),
                         ),
+                        crate::acp::deliverables::shared_access(
+                            db_conn.clone(),
+                            crate::web::event_bridge::EventEmitter::Tauri(
+                                app.handle().clone(),
+                            ),
+                        ),
                     );
                     tauri::async_runtime::spawn(async move {
                         if let Err(e) = listener.run(socket_path).await {
@@ -1098,6 +1104,7 @@ mod tauri_app {
                 acp_commands::acp_cursor_list_models,
                 acp_commands::acp_connect,
                 acp_commands::acp_prompt,
+                acp_commands::acp_steer,
                 acp_commands::acp_set_mode,
                 acp_commands::acp_set_config_option,
                 acp_commands::acp_goal_control,

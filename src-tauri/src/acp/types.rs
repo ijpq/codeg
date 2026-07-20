@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PromptInputBlock {
     Text {
@@ -37,6 +37,17 @@ pub struct PromptCapabilitiesInfo {
     pub image: bool,
     pub audio: bool,
     pub embedded_context: bool,
+}
+
+/// Successful native in-turn steering response. `turn_id` is returned by
+/// Codex app-server's `turn/steer`; it must be the same in-flight turn that the
+/// adapter supplied as `expectedTurnId`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SteerResult {
+    pub turn_id: String,
+    pub message_id: String,
+    #[serde(default)]
+    pub deduplicated: bool,
 }
 
 /// Image attached to a tool call on the ACP wire (e.g. codex-acp v0.14+
@@ -170,12 +181,23 @@ pub enum AcpEvent {
     },
     /// Whether the agent supports session/fork
     ForkSupported { supported: bool },
+    /// Per-connection native steering capability after adapter preparation.
+    /// May transition from true to false if the runtime returns method-not-found.
+    SteerSupported { supported: bool },
     /// Current session mode changed
     ModeChanged { mode_id: String },
     /// Agent reported plan update for current turn
     PlanUpdate { entries: Vec<PlanEntryInfo> },
     /// Connection status changed
     StatusChanged { status: ConnectionStatus },
+    /// A user message successfully injected into the current in-flight turn via
+    /// native `turn/steer`. Separate from `UserMessage`: it must not replace the
+    /// turn's original prompt or clear turn-scoped feedback state.
+    SteerMessage {
+        message_id: String,
+        blocks: Vec<UserMessageBlock>,
+        turn_id: String,
+    },
     /// Error occurred
     Error {
         message: String,

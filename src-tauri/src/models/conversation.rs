@@ -115,9 +115,40 @@ pub struct DbConversationDetail {
     pub in_flight_user_turn_id: Option<String>,
     /// Filesystem changes captured by the backend for each accepted ACP turn.
     /// Unlike transcript-derived tool calls these rows survive frontend
-    /// disconnects and include opaque/binary outputs such as Word documents.
+    /// disconnects. They are diagnostic change records, not user-facing final
+    /// deliverables.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifact_runs: Vec<ConversationTurnArtifactRun>,
+    /// User-facing final outputs explicitly declared by the agent and verified
+    /// against the conversation workspace by codeg.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deliverables: Vec<ConversationDeliverable>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationDeliverable {
+    pub id: String,
+    pub conversation_id: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_run_id: Option<String>,
+    pub root_path: String,
+    pub path: String,
+    /// file | directory
+    pub kind: String,
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// primary | supporting
+    pub role: String,
+    /// Zero-based order from the latest complete declaration.
+    pub position: i32,
+    /// agent_declared (reserved for future user-pinned declarations).
+    pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<i64>,
+    pub verified_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
