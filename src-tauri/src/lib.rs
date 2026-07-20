@@ -62,14 +62,13 @@ mod tauri_app {
     use crate::acp::manager::ConnectionManager;
     use crate::chat_channel::manager::ChatChannelManager;
     use crate::commands::{
-        acp as acp_commands, app_update as app_update_commands,
-        automation as automation_commands, background as background_commands, backup,
-        chat_channel as chat_channel_commands, conversations,
-        custom_skills as custom_skills_commands, delegation as delegation_commands,
+        acp as acp_commands, app_update as app_update_commands, automation as automation_commands,
+        background as background_commands, backup, chat_channel as chat_channel_commands,
+        conversations, custom_skills as custom_skills_commands, delegation as delegation_commands,
         experts as experts_commands, feedback as feedback_commands, file_io, folder_commands,
-        folder_links, office_tools as office_tools_commands,
-        folders, logging as logging_commands, mcp as mcp_commands,
-        model_provider as model_provider_commands, notification, pet as pet_commands, project_boot,
+        folder_links, folders, logging as logging_commands, mcp as mcp_commands,
+        model_provider as model_provider_commands, notification,
+        office_tools as office_tools_commands, pet as pet_commands, project_boot,
         question as question_commands, quick_messages as quick_messages_commands,
         remote_proxy as remote_proxy_commands,
         remote_workspace as remote_workspace_commands, science as science_commands,
@@ -597,6 +596,12 @@ mod tauri_app {
                             ),
                         ),
                         std::sync::Arc::new(crate::work_task::EngineWorkTaskTools),
+                        crate::acp::deliverables::shared_access(
+                            db_conn.clone(),
+                            crate::web::event_bridge::EventEmitter::Tauri(
+                                app.handle().clone(),
+                            ),
+                        ),
                     );
                     tauri::async_runtime::spawn(async move {
                         if let Err(e) = listener.run(socket_path).await {
@@ -1129,6 +1134,7 @@ mod tauri_app {
                 acp_commands::acp_cursor_list_models,
                 acp_commands::acp_connect,
                 acp_commands::acp_prompt,
+                acp_commands::acp_steer,
                 acp_commands::acp_set_mode,
                 acp_commands::acp_set_config_option,
                 acp_commands::acp_goal_control,
