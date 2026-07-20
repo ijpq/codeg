@@ -49,8 +49,12 @@ pub enum LiveContentBlock {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         parent_tool_use_id: Option<String>,
     },
-    ToolCallRef { tool_call_id: String },
-    Plan { entries: serde_json::Value },
+    ToolCallRef {
+        tool_call_id: String,
+    },
+    Plan {
+        entries: serde_json::Value,
+    },
 }
 
 /// 工具调用的运行态。turn 完成时统一 clear。
@@ -327,6 +331,8 @@ pub struct SessionState {
     pub grok_model_specs: Option<std::collections::HashMap<String, GrokModelSpec>>,
     pub prompt_capabilities: Option<PromptCapabilitiesInfo>,
     pub fork_supported: bool,
+    /// Native in-turn steering capability of this concrete adapter process.
+    pub supports_steer: bool,
     pub available_commands: Vec<AvailableCommandInfo>,
     pub usage: Option<UsageInfo>,
     /// True once the agent's initial selectors handshake (modes +
@@ -416,6 +422,11 @@ pub struct SessionState {
     /// replay for it. `None` outside an active turn.
     pub pending_user_message: Option<PendingUserMessage>,
 
+    /// Successfully injected guide messages for the current turn. Kept beside
+    /// the original pending prompt so a refresh/second viewer can reconstruct
+    /// every user intervention without replaying one-shot events.
+    pub steer_messages: Vec<PendingUserMessage>,
+
     /// Backend wall-clock instant the in-flight turn started, captured alongside
     /// `pending_user_message` from `AcpEvent::UserMessage` and cleared on
     /// `TurnComplete`. The detail endpoint uses it to tell the in-flight prompt
@@ -498,6 +509,7 @@ impl SessionState {
             grok_model_specs: None,
             prompt_capabilities: None,
             fork_supported: false,
+            supports_steer: false,
             available_commands: Vec::new(),
             usage: None,
             selectors_ready: false,
@@ -512,6 +524,7 @@ impl SessionState {
             native_steering_available: false,
             last_assistant_text: None,
             pending_user_message: None,
+            steer_messages: Vec::new(),
             pending_user_message_started_at: None,
             turn_in_flight: false,
             last_turn_ended_abnormally: false,
@@ -630,6 +643,9 @@ impl SessionState {
             }
             AcpEvent::ForkSupported { supported } => {
                 self.fork_supported = *supported;
+            }
+            AcpEvent::SteerSupported { supported } => {
+                self.supports_steer = *supported;
             }
             AcpEvent::AvailableCommands { commands } => {
                 self.available_commands = commands.clone();
@@ -862,6 +878,7 @@ impl SessionState {
                 // pending user message into a fresh attach.
                 self.pending_user_message = None;
                 self.pending_user_message_started_at = None;
+                self.steer_messages.clear();
                 // Turn finished: release the concurrency gate so the next prompt
                 // is accepted. (All connection-alive turn endings — normal,
                 // cancel, stop-reason — emit TurnComplete; disconnect/error
@@ -920,6 +937,20 @@ impl SessionState {
                 // queued prompt sent instead of answering) must not leave a dead
                 // approval in the snapshot for a mid-turn attach to render.
                 self.pending_plan_approval = None;
+            }
+            AcpEvent::SteerMessage {
+                message_id, blocks, ..
+            } => {
+                if !self
+                    .steer_messages
+                    .iter()
+                    .any(|message| message.message_id == *message_id)
+                {
+                    self.steer_messages.push(PendingUserMessage {
+                        message_id: message_id.clone(),
+                        blocks: blocks.clone(),
+                    });
+                }
             }
             AcpEvent::ConversationLinked {
                 conversation_id,
@@ -1359,6 +1390,8 @@ impl SessionState {
             prompt_capabilities: self.prompt_capabilities.clone(),
             usage: self.usage.clone(),
             fork_supported: self.fork_supported,
+            supports_steer: self.supports_steer,
+            steer_messages: self.steer_messages.clone(),
             available_commands: self.available_commands.clone(),
             selectors_ready: self.selectors_ready,
             config_stale: self.config_stale,
@@ -1455,6 +1488,12 @@ pub struct LiveSessionSnapshot {
     pub prompt_capabilities: Option<PromptCapabilitiesInfo>,
     pub usage: Option<UsageInfo>,
     pub fork_supported: bool,
+    /// Native `turn/steer` is available on this concrete live connection.
+    #[serde(default)]
+    pub supports_steer: bool,
+    /// Successfully injected guide messages in the current turn.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steer_messages: Vec<PendingUserMessage>,
     pub available_commands: Vec<AvailableCommandInfo>,
     pub selectors_ready: bool,
     /// Whether the running session is on stale (launch-time) config after a
@@ -1780,6 +1819,37 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_restores_accepted_steers_and_turn_complete_clears_them() {
+        let mut s = fresh_state();
+        s.apply_event(&AcpEvent::SteerSupported { supported: true });
+        let steer = AcpEvent::SteerMessage {
+            message_id: "guide-1".into(),
+            blocks: vec![UserMessageBlock::Text {
+                text: "check B instead".into(),
+            }],
+            turn_id: "turn-active".into(),
+        };
+        s.apply_event(&steer);
+        s.apply_event(&steer);
+
+        let snapshot = s.to_snapshot();
+        assert!(snapshot.supports_steer);
+        assert_eq!(snapshot.steer_messages.len(), 1, "message id deduplicates");
+        assert_eq!(snapshot.steer_messages[0].message_id, "guide-1");
+
+        s.apply_event(&AcpEvent::TurnComplete {
+            session_id: "sess".into(),
+            stop_reason: "end_turn".into(),
+            agent_type: "codex".into(),
+        });
+        assert!(s.steer_messages.is_empty());
+        assert!(
+            s.supports_steer,
+            "connection capability survives individual turns"
+        );
+    }
+
+    #[test]
     fn to_snapshot_carries_pending_user_message() {
         let mut s = fresh_state();
         s.apply_event(&text_user_message("user-7", "snapshot me"));
@@ -1950,7 +2020,10 @@ mod tests {
             text: "Answer ".into(),
             parent_tool_use_id: None,
         });
-        s.apply_event(&AcpEvent::Thinking { text: "hmm".into(), parent_tool_use_id: None });
+        s.apply_event(&AcpEvent::Thinking {
+            text: "hmm".into(),
+            parent_tool_use_id: None,
+        });
         s.apply_event(&AcpEvent::ContentDelta {
             text: "continues here".into(),
             parent_tool_use_id: None,
@@ -2146,9 +2219,18 @@ mod tests {
     #[test]
     fn thinking_delta_creates_separate_block_from_text() {
         let mut s = fresh_state();
-        s.apply_event(&AcpEvent::ContentDelta { text: "T".into(), parent_tool_use_id: None });
-        s.apply_event(&AcpEvent::Thinking { text: "X".into(), parent_tool_use_id: None });
-        s.apply_event(&AcpEvent::ContentDelta { text: "Y".into(), parent_tool_use_id: None });
+        s.apply_event(&AcpEvent::ContentDelta {
+            text: "T".into(),
+            parent_tool_use_id: None,
+        });
+        s.apply_event(&AcpEvent::Thinking {
+            text: "X".into(),
+            parent_tool_use_id: None,
+        });
+        s.apply_event(&AcpEvent::ContentDelta {
+            text: "Y".into(),
+            parent_tool_use_id: None,
+        });
         let live = s.live_message.as_ref().unwrap();
         assert_eq!(live.content.len(), 3);
         match &live.content[0] {
@@ -2464,7 +2546,10 @@ mod tests {
     #[test]
     fn turn_complete_clears_live_and_tool_calls_and_pending_permission() {
         let mut s = fresh_state();
-        s.apply_event(&AcpEvent::ContentDelta { text: "hi".into(), parent_tool_use_id: None });
+        s.apply_event(&AcpEvent::ContentDelta {
+            text: "hi".into(),
+            parent_tool_use_id: None,
+        });
         s.apply_event(&AcpEvent::ToolCall {
             tool_call_id: "tc-1".into(),
             title: "x".into(),
@@ -3429,7 +3514,10 @@ mod tests {
     fn plan_update_appends_at_end_replacing_existing() {
         use crate::acp::types::PlanEntryInfo;
         let mut s = fresh_state();
-        s.apply_event(&AcpEvent::ContentDelta { text: "A".into(), parent_tool_use_id: None });
+        s.apply_event(&AcpEvent::ContentDelta {
+            text: "A".into(),
+            parent_tool_use_id: None,
+        });
         s.apply_event(&AcpEvent::PlanUpdate {
             entries: vec![PlanEntryInfo {
                 content: "step v1".into(),
@@ -3437,7 +3525,10 @@ mod tests {
                 status: "pending".into(),
             }],
         });
-        s.apply_event(&AcpEvent::ContentDelta { text: "B".into(), parent_tool_use_id: None });
+        s.apply_event(&AcpEvent::ContentDelta {
+            text: "B".into(),
+            parent_tool_use_id: None,
+        });
         s.apply_event(&AcpEvent::PlanUpdate {
             entries: vec![PlanEntryInfo {
                 content: "step v2".into(),
@@ -3499,7 +3590,10 @@ mod tests {
     fn turn_complete_clears_plan_and_tool_refs() {
         use crate::acp::types::PlanEntryInfo;
         let mut s = fresh_state();
-        s.apply_event(&AcpEvent::ContentDelta { text: "x".into(), parent_tool_use_id: None });
+        s.apply_event(&AcpEvent::ContentDelta {
+            text: "x".into(),
+            parent_tool_use_id: None,
+        });
         s.apply_event(&tool_call_event("tc-1", "ls"));
         s.apply_event(&AcpEvent::PlanUpdate {
             entries: vec![PlanEntryInfo {
@@ -3529,7 +3623,10 @@ mod tests {
         let env = EventEnvelope {
             seq: 7,
             connection_id: "conn-x".into(),
-            payload: AcpEvent::ContentDelta { text: "abc".into(), parent_tool_use_id: None },
+            payload: AcpEvent::ContentDelta {
+                text: "abc".into(),
+                parent_tool_use_id: None,
+            },
         };
         let json = serde_json::to_string(&env).unwrap();
         let back: EventEnvelope = serde_json::from_str(&json).unwrap();

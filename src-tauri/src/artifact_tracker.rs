@@ -479,11 +479,7 @@ struct FinalizeStats {
     stat_errors: usize,
 }
 
-async fn finalize_paths(
-    db: &DatabaseConnection,
-    run_id: &str,
-    root_path: &Path,
-) -> FinalizeStats {
+async fn finalize_paths(db: &DatabaseConnection, run_id: &str, root_path: &Path) -> FinalizeStats {
     let changes = match artifact_service::list_changes_for_run(db, run_id).await {
         Ok(changes) => changes,
         Err(err) => {
@@ -511,14 +507,8 @@ async fn finalize_paths(
                 stats.available += 1;
                 let size = i64::try_from(metadata.len()).ok();
                 let modified_at = metadata.modified().ok().map(DateTime::<Utc>::from);
-                if let Err(err) = artifact_service::update_final_state(
-                    db,
-                    change,
-                    true,
-                    size,
-                    modified_at,
-                )
-                .await
+                if let Err(err) =
+                    artifact_service::update_final_state(db, change, true, size, modified_at).await
                 {
                     tracing::error!(
                         "[artifact-tracker] failed final file stat update for run {}: {}",
@@ -561,8 +551,7 @@ fn canonical_root_key(path: &Path) -> String {
 }
 
 fn normalize_relative_path(path: &str) -> String {
-    path.trim_start_matches(|ch| ch == '/' || ch == '\\')
-        .replace('\\', "/")
+    path.trim_start_matches(['/', '\\']).replace('\\', "/")
 }
 
 fn should_track_path(path: &str) -> bool {
@@ -572,7 +561,10 @@ fn should_track_path(path: &str) -> bool {
     }
     let parsed = Path::new(&normalized);
     if parsed.components().any(|component| {
-        matches!(component, Component::ParentDir | Component::RootDir | Component::Prefix(_))
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
     }) {
         return false;
     }
