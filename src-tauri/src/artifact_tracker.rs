@@ -561,7 +561,7 @@ fn canonical_root_key(path: &Path) -> String {
 }
 
 fn normalize_relative_path(path: &str) -> String {
-    path.trim_start_matches(|ch| ch == '/' || ch == '\\')
+    path.trim_start_matches(['/', '\\'])
         .replace('\\', "/")
 }
 

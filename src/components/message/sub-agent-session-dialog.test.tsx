@@ -6,6 +6,15 @@ import { SubAgentSessionDialog } from "./sub-agent-session-dialog"
 import enMessages from "@/i18n/messages/en.json"
 import type { ConnectionState } from "@/contexts/acp-connections-context"
 
+const mockSubscribe = vi.hoisted(() =>
+  vi.fn(async (event: string, listener: (change: unknown) => void) => {
+    void event
+    void listener
+    return () => {}
+  })
+)
+vi.mock("@/lib/platform", () => ({ subscribe: mockSubscribe }))
+
 // Runtime context — record dispatch calls so we can assert the bridge
 // runs at the right moments without booting the real reducer.
 const mockSetLiveMessage = vi.fn()
@@ -197,6 +206,8 @@ function makeConnState(overrides: Partial<ConnectionState>): ConnectionState {
     status: "connected",
     promptCapabilities: { image: false, audio: false, embedded_context: false },
     supportsFork: false,
+    supportsSteer: false,
+    steerCapabilityKnown: false,
     selectorsReady: true,
     sessionId: null,
     modes: null,
@@ -216,6 +227,7 @@ function makeConnState(overrides: Partial<ConnectionState>): ConnectionState {
     parentConnectionId: "p1",
     isViewer: false,
     pendingUserMessage: null,
+    steerMessages: [],
     configStale: false,
     configStaleKind: null,
     configStaleDismissed: false,
@@ -228,6 +240,8 @@ function makeConnState(overrides: Partial<ConnectionState>): ConnectionState {
 
 describe("SubAgentSessionDialog", () => {
   beforeEach(() => {
+    mockSubscribe.mockClear()
+    mockSubscribe.mockResolvedValue(() => {})
     mockSetLiveMessage.mockReset()
     mockCompleteTurn.mockReset()
     mockRemoveConversation.mockReset()
@@ -507,6 +521,27 @@ describe("SubAgentSessionDialog", () => {
     expect(mockSetLiveMessage).toHaveBeenCalledWith(99, liveMessage, true)
   })
 
+  it("refreshes a matching final-deliverables declaration without replacing live state", () => {
+    renderWithIntl(
+      <SubAgentSessionDialog
+        open
+        onOpenChange={() => {}}
+        childConversationId={99}
+        childConnectionId="c1"
+        agentType="codex"
+      />
+    )
+    mockRefetchDetail.mockClear()
+
+    const listener = mockSubscribe.mock.calls[0]?.[1]
+    expect(listener).toBeTypeOf("function")
+    act(() => {
+      listener?.({ conversation_id: 99, deliverable_ids: ["d1"] })
+    })
+
+    expect(mockRefetchDetail).toHaveBeenCalledWith(99, { preserveLive: true })
+  })
+
   it("does not refetch on the streaming → settled edge — the promoted local reply is kept, never replaced from the lagging DB", () => {
     const liveMessage = {
       id: "live-1",
@@ -762,7 +797,7 @@ describe("SubAgentSessionDialog", () => {
     // Second open: body re-mounts. refetchDetail MUST fire again so the
     // resurrected stale session (if any) is overwritten with the latest DB
     // state. The dialog disables useConversationDetail's auto-fetch, so this
-    // gated refetch is the sole fetch path.
+    // mount-owned refetch always establishes the cold-open snapshot.
     renderWithIntl(<SubAgentSessionDialog {...props} />)
     expect(mockRefetchDetail.mock.calls.length).toBeGreaterThan(firstCallCount)
     expect(mockRefetchDetail).toHaveBeenLastCalledWith(99, {

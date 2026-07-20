@@ -297,6 +297,8 @@ pub struct SessionState {
     pub grok_effort_specs: Option<std::collections::HashMap<String, GrokEffortSpec>>,
     pub prompt_capabilities: Option<PromptCapabilitiesInfo>,
     pub fork_supported: bool,
+    /// Native in-turn steering capability of this concrete adapter process.
+    pub supports_steer: bool,
     pub available_commands: Vec<AvailableCommandInfo>,
     pub usage: Option<UsageInfo>,
     /// True once the agent's initial selectors handshake (modes +
@@ -374,6 +376,11 @@ pub struct SessionState {
     /// mid-turn renders the user turn even though no `UserMessage` event will
     /// replay for it. `None` outside an active turn.
     pub pending_user_message: Option<PendingUserMessage>,
+
+    /// Successfully injected guide messages for the current turn. Kept beside
+    /// the original pending prompt so a refresh/second viewer can reconstruct
+    /// every user intervention without replaying one-shot events.
+    pub steer_messages: Vec<PendingUserMessage>,
 
     /// Backend wall-clock instant the in-flight turn started, captured alongside
     /// `pending_user_message` from `AcpEvent::UserMessage` and cleared on
@@ -456,6 +463,7 @@ impl SessionState {
             grok_effort_specs: None,
             prompt_capabilities: None,
             fork_supported: false,
+            supports_steer: false,
             available_commands: Vec::new(),
             usage: None,
             selectors_ready: false,
@@ -469,6 +477,7 @@ impl SessionState {
             feedback_tool_available: false,
             last_assistant_text: None,
             pending_user_message: None,
+            steer_messages: Vec::new(),
             pending_user_message_started_at: None,
             turn_in_flight: false,
             last_turn_ended_abnormally: false,
@@ -587,6 +596,9 @@ impl SessionState {
             }
             AcpEvent::ForkSupported { supported } => {
                 self.fork_supported = *supported;
+            }
+            AcpEvent::SteerSupported { supported } => {
+                self.supports_steer = *supported;
             }
             AcpEvent::AvailableCommands { commands } => {
                 self.available_commands = commands.clone();
@@ -771,6 +783,7 @@ impl SessionState {
                 // pending user message into a fresh attach.
                 self.pending_user_message = None;
                 self.pending_user_message_started_at = None;
+                self.steer_messages.clear();
                 // Turn finished: release the concurrency gate so the next prompt
                 // is accepted. (All connection-alive turn endings — normal,
                 // cancel, stop-reason — emit TurnComplete; disconnect/error
@@ -820,6 +833,20 @@ impl SessionState {
                 self.feedback.clear();
                 // A new user turn supersedes any stale pending question.
                 self.pending_question = None;
+            }
+            AcpEvent::SteerMessage {
+                message_id, blocks, ..
+            } => {
+                if !self
+                    .steer_messages
+                    .iter()
+                    .any(|message| message.message_id == *message_id)
+                {
+                    self.steer_messages.push(PendingUserMessage {
+                        message_id: message_id.clone(),
+                        blocks: blocks.clone(),
+                    });
+                }
             }
             AcpEvent::ConversationLinked {
                 conversation_id,
@@ -1225,6 +1252,8 @@ impl SessionState {
             prompt_capabilities: self.prompt_capabilities.clone(),
             usage: self.usage.clone(),
             fork_supported: self.fork_supported,
+            supports_steer: self.supports_steer,
+            steer_messages: self.steer_messages.clone(),
             available_commands: self.available_commands.clone(),
             selectors_ready: self.selectors_ready,
             config_stale: self.config_stale,
@@ -1308,6 +1337,12 @@ pub struct LiveSessionSnapshot {
     pub prompt_capabilities: Option<PromptCapabilitiesInfo>,
     pub usage: Option<UsageInfo>,
     pub fork_supported: bool,
+    /// Native `turn/steer` is available on this concrete live connection.
+    #[serde(default)]
+    pub supports_steer: bool,
+    /// Successfully injected guide messages in the current turn.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steer_messages: Vec<PendingUserMessage>,
     pub available_commands: Vec<AvailableCommandInfo>,
     pub selectors_ready: bool,
     /// Whether the running session is on stale (launch-time) config after a
@@ -1564,6 +1599,37 @@ mod tests {
         assert!(
             s.pending_user_message_started_at.is_none(),
             "the turn-start instant is cleared in lockstep with the pending prompt"
+        );
+    }
+
+    #[test]
+    fn snapshot_restores_accepted_steers_and_turn_complete_clears_them() {
+        let mut s = fresh_state();
+        s.apply_event(&AcpEvent::SteerSupported { supported: true });
+        let steer = AcpEvent::SteerMessage {
+            message_id: "guide-1".into(),
+            blocks: vec![UserMessageBlock::Text {
+                text: "check B instead".into(),
+            }],
+            turn_id: "turn-active".into(),
+        };
+        s.apply_event(&steer);
+        s.apply_event(&steer);
+
+        let snapshot = s.to_snapshot();
+        assert!(snapshot.supports_steer);
+        assert_eq!(snapshot.steer_messages.len(), 1, "message id deduplicates");
+        assert_eq!(snapshot.steer_messages[0].message_id, "guide-1");
+
+        s.apply_event(&AcpEvent::TurnComplete {
+            session_id: "sess".into(),
+            stop_reason: "end_turn".into(),
+            agent_type: "codex".into(),
+        });
+        assert!(s.steer_messages.is_empty());
+        assert!(
+            s.supports_steer,
+            "connection capability survives individual turns"
         );
     }
 

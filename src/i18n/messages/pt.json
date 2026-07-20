@@ -1391,6 +1391,11 @@
       "forkSession": "Bifurcar sessão",
       "forkSessionSuccess": "Sessão bifurcada com sucesso",
       "forkSessionFailed": "Falha ao bifurcar a sessão: {error}",
+      "steerInjected": "Orientação injetada no turno atual",
+      "steerFallbackFeedback": "A orientação nativa não está disponível; enviada como feedback em tempo real",
+      "steerTurnEndedQueued": "O turno acabou; a mensagem foi enfileirada para o próximo turno",
+      "steerUnsupportedQueued": "A orientação nativa não está disponível; a mensagem foi enfileirada para o próximo turno",
+      "steerFailedQueued": "Falha na orientação; a mensagem foi enfileirada para o próximo turno",
       "exportConversation": "Exportar conversa",
       "exportImage": "Imagem",
       "exportMarkdown": "Markdown",
@@ -2240,6 +2245,7 @@
       "chatInput": {
         "connecting": "Conectando...",
         "agentResponding": "{agent} está respondendo...",
+        "guideAgent": "Orientar o turno atual de {agent}...",
         "sendMessage": "Envie uma mensagem..."
       },
       "messageInput": {
@@ -2270,6 +2276,8 @@
         "noModels": "Nenhum modelo encontrado",
         "cancel": "Cancelar",
         "send": "Enviar",
+        "steer": "Orientar turno atual",
+        "steerSending": "Injetando orientação...",
         "forkAndSend": "Fork & Enviar",
         "slashCommands": "Comandos de barra",
         "slashSearchPlaceholder": "Buscar comandos...",
@@ -2807,15 +2815,15 @@
         "cardFinishedWithStatus": "Tarefa em segundo plano encerrada ({status})",
         "cardResultPending": "Resultado ainda não retornou"
       },
-      "conversationArtifacts": {
-        "collapsedSummary": "Arquivos {count}",
-        "title": "Arquivos produzidos",
+      "conversationDeliverables": {
+        "collapsedSummary": "Entregáveis {count}",
+        "title": "Entregáveis finais",
         "collapse": "Recolher",
-        "empty": "Ainda não há arquivos produzidos nesta conversa.",
         "openFile": "Abrir {filePath}",
-        "viewDiff": "Ver alterações",
         "revealInFolder": "Mostrar no gerenciador de arquivos",
-        "removed": "removido",
+        "primary": "Principal",
+        "supporting": "Complementar",
+        "downloadToPc": "Baixar para meu computador",
         "fileUnavailable": "Arquivo indisponível ou que não existe mais: {filePath}"
       },
       "userResources": {
@@ -3364,8 +3372,8 @@
     },
     "autoPreviewLabel": "Abrir visualização automaticamente",
     "autoPreviewHint": "Quando um agente cria ou edita um arquivo do Word, Excel ou PowerPoint, abre sua visualização ao vivo automaticamente.",
-    "autoDownloadProducedLabel": "Baixar automaticamente os arquivos produzidos",
-    "autoDownloadProducedHint": "Ao usar o servidor web (por ex., via Tailscale/LAN), baixa automaticamente para a pasta de Downloads deste navegador os arquivos que o agente cria ou altera."
+    "autoDownloadProducedLabel": "Baixar automaticamente os entregáveis finais",
+    "autoDownloadProducedHint": "Ao usar o servidor web (por ex., via Tailscale/LAN), baixa automaticamente para a pasta de Downloads deste navegador os arquivos de entregáveis finais declarados pelo agente e verificados."
   },
   "SkillPacksSettings": {
     "title": "Pacotes de habilidades",

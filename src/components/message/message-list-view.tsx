@@ -21,7 +21,6 @@ import {
 } from "@/lib/adapters/ai-elements-adapter"
 import { TurnStats } from "./turn-stats"
 import { LiveTurnStats } from "./live-turn-stats"
-import { ReplyArtifacts } from "./reply-artifacts"
 import { UserResourceLinks } from "./user-resource-links"
 import { UserImageAttachments } from "./user-image-attachments"
 import { AgentPlanOverlay } from "@/components/chat/agent-plan-overlay"
@@ -57,10 +56,9 @@ import {
 } from "@/lib/agent-plan"
 import type {
   AgentType,
-  ConversationTurnArtifactRun,
+  ConversationDeliverable,
   ConnectionStatus,
   FolderDetail,
-  MessageTurn,
   SessionStats,
 } from "@/lib/types"
 import { copyTextToClipboard } from "@/lib/utils"
@@ -69,20 +67,9 @@ import {
   ConversationMessageNav,
   type MessageNavEntry,
 } from "@/components/message/conversation-message-nav"
-import { ConversationArtifactsPanel } from "@/components/message/conversation-artifacts-panel"
+import { ConversationDeliverablesPanel } from "@/components/message/conversation-deliverables-panel"
 import type { MessageScrollContextValue } from "@/components/message/message-scroll-context"
-import {
-  countProducedFiles,
-  extractPersistedArtifactFiles,
-  extractProducedFiles,
-  extractProducedFilePaths,
-  extractSessionFilesGrouped,
-  type FileChangeStat,
-} from "@/lib/session-files"
-import {
-  normalizeSlashPath,
-  toFolderRelativePath,
-} from "@/lib/file-path-display"
+import { extractSessionFilesGrouped } from "@/lib/session-files"
 import { unescapeComposerText } from "@/lib/composer-copy-text"
 import { useStickToBottomContext } from "use-stick-to-bottom"
 
@@ -113,9 +100,8 @@ interface MessageListViewProps {
   /** Folder owned by this conversation, not necessarily the globally active
    *  one. Folderless chat mode passes its hidden scratch-folder record. */
   folder?: FolderDetail | null
-  /** Durable backend watcher records. Kept separate from `turns` because ACP
-   * client ids and parser turn ids intentionally use different namespaces. */
-  artifactRuns?: ConversationTurnArtifactRun[]
+  /** Explicit final outputs verified and persisted by the backend. */
+  deliverables?: ConversationDeliverable[]
 }
 
 export interface ResolvedMessageGroup {
@@ -145,9 +131,6 @@ export type ThreadRenderItem =
       showStats: boolean
       isRoleTransition: boolean
       previousUserIndex: number | null
-      /** Raw assistant sub-turn(s) that compose this reply — fed to the
-       *  per-reply artifacts card so it can list files changed this reply. */
-      sourceTurns: MessageTurn[]
     }
   | {
       key: string
@@ -165,25 +148,7 @@ const EMPTY_DELEGATIONS: DelegationCardSource[] = []
 // Stable empty reference so the navigator memo / equality checks don't churn
 // when a conversation has no user messages.
 const EMPTY_NAV_ENTRIES: MessageNavEntry[] = []
-// Same, for the produced-files panel while collapsed / empty.
-const EMPTY_ARTIFACT_FILES: FileChangeStat[] = []
-const EMPTY_ARTIFACT_RUNS: ConversationTurnArtifactRun[] = []
-
-// A single turn's `sourceTurns` is just `[turn]`. Cache the wrapper per turn
-// object so an unchanged historical turn keeps a stable `sourceTurns` reference
-// across streaming-token re-renders — that's the last prop preventing
-// `HistoricalMessageGroup`'s memo from bailing out (its `group` and the
-// phase-derived flags are already reference-/value-stable). The streaming turn
-// is rebuilt every token, so it gets a fresh wrapper and still re-renders.
-const sourceTurnsSingletonCache = new WeakMap<MessageTurn, MessageTurn[]>()
-export function singletonSourceTurns(turn: MessageTurn): MessageTurn[] {
-  let cached = sourceTurnsSingletonCache.get(turn)
-  if (!cached) {
-    cached = [turn]
-    sourceTurnsSingletonCache.set(turn, cached)
-  }
-  return cached
-}
+const EMPTY_DELIVERABLES: ConversationDeliverable[] = []
 
 // Collect the `delegate_to_agent` tool calls within a turn's adapted parts,
 // recursing through tool-groups and goal-runs (a delegate call is normally a
@@ -415,9 +380,6 @@ export function mergeConsecutiveAssistantTurns(
       const merged: AssistantTurnItem = {
         ...last,
         key: `merged-${first.key}`,
-        // Concatenate every sub-turn's raw turns so the artifacts card sees all
-        // file edits across the merged reply, not just the last sub-turn.
-        sourceTurns: buffer.flatMap((b) => b.sourceTurns),
         group: {
           ...last.group,
           id: first.group.id,
@@ -518,16 +480,12 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
   showStats = true,
   previousUserIndex = null,
   isResponseComplete = true,
-  sourceTurns,
-  folder,
 }: {
   group: ResolvedMessageGroup
   dimmed?: boolean
   showStats?: boolean
   previousUserIndex?: number | null
   isResponseComplete?: boolean
-  sourceTurns?: MessageTurn[]
-  folder?: FolderDetail | null
 }) {
   if (group.role === "system") {
     return <CollapsibleSystemMessage group={group} />
@@ -555,13 +513,6 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
           <UserResourceLinks resources={group.resources} className="self-end" />
         ) : null}
       </Message>
-      {showStats && group.role === "assistant" && sourceTurns && (
-        <ReplyArtifacts
-          sourceTurns={sourceTurns}
-          isResponseComplete={isResponseComplete}
-          folder={folder}
-        />
-      )}
       {showStats && group.role === "assistant" && (
         <TurnStats
           usage={group.usage}
@@ -630,7 +581,7 @@ export function MessageListView({
   onNewSession,
   showMessageNav = true,
   folder,
-  artifactRuns = EMPTY_ARTIFACT_RUNS,
+  deliverables = EMPTY_DELIVERABLES,
 }: MessageListViewProps) {
   const t = useTranslations("Folder.chat.messageList")
   const sharedT = useTranslations("Folder.chat.shared")
@@ -739,7 +690,6 @@ export function MessageListView({
         showStats: false,
         isRoleTransition: false,
         previousUserIndex: null,
-        sourceTurns: singletonSourceTurns(allTurns[i]),
       }
     })
 
@@ -811,33 +761,28 @@ export function MessageListView({
     [historicalPlanEntries]
   )
 
-  const renderThreadItem = useCallback(
-    (item: ThreadRenderItem) => {
-      switch (item.kind) {
-        case "turn": {
-          const pt = item.isRoleTransition ? 16 : 0
-          return (
-            <div style={pt > 0 ? { paddingTop: pt } : undefined}>
-              <HistoricalMessageGroup
-                group={item.group}
-                dimmed={item.phase === "optimistic"}
-                showStats={item.showStats}
-                previousUserIndex={item.previousUserIndex}
-                isResponseComplete={item.phase === "persisted"}
-                sourceTurns={item.sourceTurns}
-                folder={folder}
-              />
-            </div>
-          )
-        }
-        case "typing":
-          return <PendingTypingIndicator />
-        default:
-          return null
+  const renderThreadItem = useCallback((item: ThreadRenderItem) => {
+    switch (item.kind) {
+      case "turn": {
+        const pt = item.isRoleTransition ? 16 : 0
+        return (
+          <div style={pt > 0 ? { paddingTop: pt } : undefined}>
+            <HistoricalMessageGroup
+              group={item.group}
+              dimmed={item.phase === "optimistic"}
+              showStats={item.showStats}
+              previousUserIndex={item.previousUserIndex}
+              isResponseComplete={item.phase === "persisted"}
+            />
+          </div>
+        )
       }
-    },
-    [folder]
-  )
+      case "typing":
+        return <PendingTypingIndicator />
+      default:
+        return null
+    }
+  }, [])
 
   const emptyState = useMemo(
     () =>
@@ -950,65 +895,8 @@ export function MessageListView({
     return entries.length > 0 ? entries : EMPTY_NAV_ENTRIES
   }, [showMessageNav, navExpanded, timelineTurns, threadItems])
 
-  // --- Produced-files panel ---------------------------------------------------
-  const [artifactsExpanded, setArtifactsExpanded] = useState(false)
-  const persistedArtifactFiles = useMemo(
-    () => extractPersistedArtifactFiles(artifactRuns),
-    [artifactRuns]
-  )
-  const artifactIdentity = useCallback(
-    (path: string) =>
-      normalizeSlashPath(toFolderRelativePath(path, folder?.path)),
-    [folder?.path]
-  )
-
-  // Cheap count of distinct produced files for the collapsed chip —
-  // `countProducedFiles` (written files + blocked @mentions) without diffs.
-  const artifactFileCount = useMemo(() => {
-    if (!showMessageNav) return 0
-    if (persistedArtifactFiles.length === 0) {
-      return countProducedFiles(timelineTurns.map((item) => item.turn))
-    }
-    const paths = new Set(
-      persistedArtifactFiles.map((file) => artifactIdentity(file.path))
-    )
-    for (const path of extractProducedFilePaths(
-      timelineTurns.map((item) => item.turn)
-    )) {
-      paths.add(artifactIdentity(path))
-    }
-    return paths.size
-  }, [showMessageNav, timelineTurns, persistedArtifactFiles, artifactIdentity])
-
-  // Full deduped file list (with diffs) — computed lazily only while the panel
-  // is expanded, since `extractProducedFiles` parses every write's diff.
-  const artifactFiles = useMemo<FileChangeStat[]>(() => {
-    if (!showMessageNav || !artifactsExpanded) return EMPTY_ARTIFACT_FILES
-    const transcriptFiles = extractProducedFiles(
-      timelineTurns.map((item) => item.turn)
-    )
-    const merged = new Map<string, FileChangeStat>()
-    for (const file of persistedArtifactFiles) {
-      merged.set(artifactIdentity(file.path), file)
-    }
-    for (const file of transcriptFiles) {
-      const key = artifactIdentity(file.path)
-      const persisted = merged.get(key)
-      merged.set(key, {
-        ...persisted,
-        ...file,
-        created: persisted?.created || file.created || undefined,
-      })
-    }
-    const files = Array.from(merged.values())
-    return files.length > 0 ? files : EMPTY_ARTIFACT_FILES
-  }, [
-    showMessageNav,
-    artifactsExpanded,
-    timelineTurns,
-    persistedArtifactFiles,
-    artifactIdentity,
-  ])
+  // --- Explicit final-deliverables panel -------------------------------------
+  const [deliverablesExpanded, setDeliverablesExpanded] = useState(false)
 
   const hasRenderableContent = threadItems.length > 0 || Boolean(liveMessage)
 
@@ -1122,12 +1010,11 @@ export function MessageListView({
             scrollApiRef={scrollApiRef}
           />
         )}
-        {showMessageNav && artifactFileCount > 0 && (
-          <ConversationArtifactsPanel
-            count={artifactFileCount}
-            expanded={artifactsExpanded}
-            onToggle={setArtifactsExpanded}
-            files={artifactFiles}
+        {deliverables.length > 0 && (
+          <ConversationDeliverablesPanel
+            expanded={deliverablesExpanded}
+            onToggle={setDeliverablesExpanded}
+            deliverables={deliverables}
             folder={folder}
           />
         )}

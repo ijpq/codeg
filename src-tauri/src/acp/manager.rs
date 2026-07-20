@@ -1,5 +1,6 @@
-use std::collections::BTreeMap;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+#[cfg(any(test, feature = "test-utils"))]
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,7 +23,7 @@ use crate::acp::question::{
 };
 use crate::acp::types::{
     AcpEvent, AgentOptionsSnapshot, ConfigStaleKind, ConnectionInfo, ConnectionStatus,
-    ForkResultInfo, PromptInputBlock,
+    ForkResultInfo, PromptInputBlock, SteerResult,
 };
 use crate::artifact_tracker::{ArtifactTracker, ArtifactTurnFinishStatus};
 use crate::db::entities::conversation::{self, ConversationKind, ConversationStatus};
@@ -37,6 +38,8 @@ use crate::web::event_bridge::{emit_with_state, emit_with_state_gated, EventEmit
 /// event payload so a large paste can't bloat the ring buffer, the per-channel
 /// IM message, or the webhook body.
 const USER_PROMPT_PREVIEW_MAX_CHARS: usize = 500;
+const STEER_CLIENT_MESSAGE_ID_MAX_CHARS: usize = 256;
+const STEER_RESPONSE_TIMEOUT_SECS: u64 = 30;
 
 /// True for ids in the parsers' turn-id namespace (`turn-<digits>`), which every
 /// parser assigns via `format!("turn-{}", n)`. A broadcast `message_id` must
@@ -338,6 +341,8 @@ impl ConnectionManager {
             state: Arc::new(tokio::sync::RwLock::new(state)),
             emitter,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
+            steer_lock: Arc::new(tokio::sync::Mutex::new(())),
+            completed_steers: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
             config_fingerprint: String::new(),
             last_observed_fingerprint: String::new(),
         };
@@ -380,6 +385,8 @@ impl ConnectionManager {
             state: Arc::new(tokio::sync::RwLock::new(state)),
             emitter,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
+            steer_lock: Arc::new(tokio::sync::Mutex::new(())),
+            completed_steers: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
             config_fingerprint: String::new(),
             last_observed_fingerprint: String::new(),
         };
@@ -754,6 +761,92 @@ impl ConnectionManager {
         let prompt_lock = self.clone_prompt_lock(conn_id).await?;
         let _guard = prompt_lock.lock_owned().await;
         self.send_prompt_inner(conn_id, blocks, None).await
+    }
+
+    /// Inject additional user input into the current native Codex app-server
+    /// turn. This is deliberately separate from both `send_prompt` (which
+    /// starts a new turn) and live feedback (which waits for an MCP tool pull).
+    ///
+    /// Requests are serialized per connection and keyed by a caller-stable
+    /// message id. The connection loop records success before resolving the
+    /// one-shot, so a retry after a lost HTTP/Tauri response returns the cached
+    /// result instead of issuing `turn/steer` twice.
+    pub async fn steer(
+        &self,
+        conn_id: &str,
+        blocks: Vec<PromptInputBlock>,
+        client_message_id: String,
+    ) -> Result<SteerResult, AcpError> {
+        if blocks.is_empty() {
+            return Err(AcpError::InvalidSteer(
+                "message must contain at least one content block".into(),
+            ));
+        }
+        let client_message_id = client_message_id.trim().to_string();
+        if client_message_id.is_empty()
+            || client_message_id.chars().count() > STEER_CLIENT_MESSAGE_ID_MAX_CHARS
+            || is_reserved_turn_id(&client_message_id)
+        {
+            return Err(AcpError::InvalidSteer(
+                "client_message_id is empty, too long, or reserved".into(),
+            ));
+        }
+
+        let (cmd_tx, state, steer_lock, completion_cache) = {
+            let connections = self.connections.lock().await;
+            let conn = connections
+                .get(conn_id)
+                .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?;
+            (
+                conn.cmd_tx.clone(),
+                conn.state.clone(),
+                conn.steer_lock.clone(),
+                conn.completed_steers.clone(),
+            )
+        };
+
+        let _guard = steer_lock.lock_owned().await;
+        if let Some(previous) = completion_cache
+            .lock()
+            .await
+            .iter()
+            .find(|entry| entry.message_id == client_message_id)
+            .cloned()
+        {
+            return Ok(SteerResult {
+                deduplicated: true,
+                ..previous
+            });
+        }
+
+        {
+            let snapshot = state.read().await;
+            if !snapshot.supports_steer {
+                return Err(AcpError::SteerUnsupported);
+            }
+            if !snapshot.turn_in_flight {
+                return Err(AcpError::NoActiveSteerTurn);
+            }
+        }
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        cmd_tx
+            .send(ConnectionCommand::Steer {
+                blocks,
+                client_message_id,
+                completion_cache,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| AcpError::ProcessExited)?;
+
+        tokio::time::timeout(
+            Duration::from_secs(STEER_RESPONSE_TIMEOUT_SECS),
+            reply_rx,
+        )
+        .await
+        .map_err(|_| AcpError::protocol("turn/steer response timed out"))?
+        .map_err(|_| AcpError::ProcessExited)?
     }
 
     /// Send a prompt while ensuring a `Conversation` DB row is bound to this
@@ -2655,6 +2748,8 @@ mod tests {
             state: Arc::new(RwLock::new(state)),
             emitter: EventEmitter::Noop,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
+            steer_lock: Arc::new(tokio::sync::Mutex::new(())),
+            completed_steers: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
             config_fingerprint: String::new(),
             last_observed_fingerprint: String::new(),
         }
@@ -2827,6 +2922,8 @@ mod tests {
             state: Arc::new(RwLock::new(state)),
             emitter: EventEmitter::Noop,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
+            steer_lock: Arc::new(tokio::sync::Mutex::new(())),
+            completed_steers: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
             config_fingerprint: String::new(),
             last_observed_fingerprint: String::new(),
         };
@@ -2835,6 +2932,111 @@ mod tests {
             .await
             .insert(conn_id.to_string(), conn);
         rx
+    }
+
+    async fn mark_native_steer_ready(mgr: &ConnectionManager, conn_id: &str) {
+        let state = mgr.get_state(conn_id).await.expect("test connection");
+        let mut state = state.write().await;
+        state.supports_steer = true;
+        state.turn_in_flight = true;
+        state.status = ConnectionStatus::Prompting;
+    }
+
+    #[tokio::test]
+    async fn native_steer_is_idempotent_by_client_message_id() {
+        let mgr = ConnectionManager::new();
+        let mut cmd_rx =
+            insert_live_connection(&mgr, "codex-steer", AgentType::Codex, None).await;
+        mark_native_steer_ready(&mgr, "codex-steer").await;
+
+        let worker = tokio::spawn(async move {
+            let Some(ConnectionCommand::Steer {
+                blocks,
+                client_message_id,
+                completion_cache,
+                reply,
+            }) = cmd_rx.recv().await
+            else {
+                panic!("expected steer command")
+            };
+            assert_eq!(client_message_id, "optimistic-guide-1");
+            assert_eq!(
+                blocks,
+                vec![PromptInputBlock::Text {
+                    text: "check B instead".into()
+                }]
+            );
+            let result = SteerResult {
+                turn_id: "turn-active".into(),
+                message_id: client_message_id,
+                deduplicated: false,
+            };
+            completion_cache.lock().await.push_back(result.clone());
+            reply.send(Ok(result)).expect("manager still waiting");
+            // A retry must be answered from the manager/cache and never enqueue
+            // a second command on the adapter connection.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(cmd_rx.try_recv().is_err());
+        });
+
+        let first = mgr
+            .steer(
+                "codex-steer",
+                vec![PromptInputBlock::Text {
+                    text: "check B instead".into(),
+                }],
+                "optimistic-guide-1".into(),
+            )
+            .await
+            .expect("first guide succeeds");
+        assert_eq!(first.turn_id, "turn-active");
+        assert!(!first.deduplicated);
+
+        let retry = mgr
+            .steer(
+                "codex-steer",
+                vec![PromptInputBlock::Text {
+                    text: "check B instead".into(),
+                }],
+                "optimistic-guide-1".into(),
+            )
+            .await
+            .expect("retry returns cached success");
+        assert!(retry.deduplicated);
+        assert_eq!(retry.turn_id, first.turn_id);
+        worker.await.expect("worker completes");
+    }
+
+    #[tokio::test]
+    async fn native_steer_rejects_unsupported_and_finished_turns() {
+        let mgr = ConnectionManager::new();
+        let _cmd_rx =
+            insert_live_connection(&mgr, "codex-steer-gates", AgentType::Codex, None).await;
+
+        let unsupported = mgr
+            .steer(
+                "codex-steer-gates",
+                one_text_block(),
+                "guide-unsupported".into(),
+            )
+            .await
+            .expect_err("capability gate");
+        assert!(matches!(unsupported, AcpError::SteerUnsupported));
+
+        let state = mgr
+            .get_state("codex-steer-gates")
+            .await
+            .expect("test connection");
+        state.write().await.supports_steer = true;
+        let finished = mgr
+            .steer(
+                "codex-steer-gates",
+                one_text_block(),
+                "guide-finished".into(),
+            )
+            .await
+            .expect_err("turn gate");
+        assert!(matches!(finished, AcpError::NoActiveSteerTurn));
     }
 
     #[tokio::test]
@@ -3160,6 +3362,8 @@ mod tests {
             state: Arc::new(RwLock::new(state)),
             emitter: EventEmitter::Noop,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
+            steer_lock: Arc::new(tokio::sync::Mutex::new(())),
+            completed_steers: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
             config_fingerprint: String::new(),
             last_observed_fingerprint: String::new(),
         };
@@ -4732,6 +4936,8 @@ mod tests {
             state: Arc::new(RwLock::new(state)),
             emitter: EventEmitter::Noop,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
+            steer_lock: Arc::new(tokio::sync::Mutex::new(())),
+            completed_steers: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
             config_fingerprint: String::new(),
             last_observed_fingerprint: String::new(),
         };
@@ -5105,6 +5311,8 @@ mod tests {
             state: Arc::new(RwLock::new(state)),
             emitter: EventEmitter::Noop,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
+            steer_lock: Arc::new(tokio::sync::Mutex::new(())),
+            completed_steers: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
             config_fingerprint: String::new(),
             last_observed_fingerprint: String::new(),
         };

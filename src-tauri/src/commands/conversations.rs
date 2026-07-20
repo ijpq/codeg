@@ -4,7 +4,8 @@ use crate::app_error::AppCommandError;
 use crate::db::entities::conversation;
 use crate::db::entities::folder::FolderKind;
 use crate::db::service::{
-    artifact_service, conversation_service, folder_service, import_service, tab_service,
+    artifact_service, conversation_service, deliverable_service, folder_service, import_service,
+    tab_service,
 };
 #[cfg(feature = "tauri-runtime")]
 use crate::db::AppDatabase;
@@ -1038,6 +1039,9 @@ pub async fn get_folder_conversation_core(
     let artifact_runs = artifact_service::list_for_conversation(conn, conversation_id)
         .await
         .map_err(AppCommandError::from)?;
+    let deliverables = deliverable_service::list_for_conversation(conn, conversation_id)
+        .await
+        .map_err(AppCommandError::from)?;
 
     Ok((
         DbConversationDetail {
@@ -1047,6 +1051,7 @@ pub async fn get_folder_conversation_core(
             transcript_watermark,
             in_flight_user_turn_id: None,
             artifact_runs,
+            deliverables,
         },
         parsed_title,
     ))

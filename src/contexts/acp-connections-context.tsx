@@ -21,6 +21,7 @@ import {
   acpConnect,
   acpGetAgentStatus,
   acpPrompt,
+  acpSteer,
   acpSetMode,
   acpSetConfigOption,
   acpCancel,
@@ -56,6 +57,7 @@ import type {
   SessionUsageUpdateInfo,
   PromptCapabilitiesInfo,
   PromptInputBlock,
+  SteerResult,
   ToolCallImageWire,
   UserMessageBlock,
 } from "@/lib/types"
@@ -161,6 +163,11 @@ export interface ConnectionState {
   status: ConnectionStatus
   promptCapabilities: PromptCapabilitiesInfo
   supportsFork: boolean
+  /** Capability published by the concrete adapter connection. */
+  supportsSteer: boolean
+  /** Distinguishes an explicit false from the pre-handshake default, so a
+   * stale snapshot cannot resurrect steer after method-not-found. */
+  steerCapabilityKnown: boolean
   selectorsReady: boolean
   sessionId: string | null
   modes: SessionModeStateInfo | null
@@ -173,6 +180,8 @@ export interface ConnectionState {
    *  event or a snapshot's `pending_user_message`. A VIEWER mirrors this into
    *  the runtime as a synthesized user turn; `null` outside an active turn. */
   pendingUserMessage: PendingUserMessage | null
+  /** Native guide messages accepted into the current in-flight turn. */
+  steerMessages: PendingUserMessage[]
   pendingQuestion: PendingQuestion | null
   /** Awaiting-answer multiple-choice `ask_user_question` (the codeg-mcp blocking
    *  tool). Set from a `question_request` event or a snapshot's
@@ -480,6 +489,16 @@ type Action =
       type: "FORK_SUPPORTED"
       contextKey: string
       supported: boolean
+    }
+  | {
+      type: "STEER_SUPPORTED"
+      contextKey: string
+      supported: boolean
+    }
+  | {
+      type: "STEER_MESSAGE"
+      contextKey: string
+      message: PendingUserMessage
     }
   | { type: "MODE_CHANGED"; contextKey: string; modeId: string }
   | {
@@ -1123,6 +1142,8 @@ function connectionsReducer(
           embedded_context: false,
         },
         supportsFork: false,
+        supportsSteer: false,
+        steerCapabilityKnown: false,
         selectorsReady: false,
         sessionId: null,
         modes: null,
@@ -1132,6 +1153,7 @@ function connectionsReducer(
         liveMessage: null,
         pendingPermission: null,
         pendingUserMessage: null,
+        steerMessages: [],
         pendingQuestion: null,
         pendingAskQuestion: null,
         claudeApiRetry: null,
@@ -1179,6 +1201,8 @@ function connectionsReducer(
           embedded_context: false,
         },
         supportsFork: false,
+        supportsSteer: false,
+        steerCapabilityKnown: false,
         selectorsReady: true,
         sessionId: null,
         modes: null,
@@ -1188,6 +1212,7 @@ function connectionsReducer(
         liveMessage: null,
         pendingPermission: null,
         pendingUserMessage: null,
+        steerMessages: [],
         pendingQuestion: null,
         pendingAskQuestion: null,
         claudeApiRetry: null,
@@ -1241,6 +1266,10 @@ function connectionsReducer(
         action.patch.selectorsReady || current.selectorsReady
       const mergedSupportsFork =
         action.patch.supportsFork || current.supportsFork
+      const mergedSupportsSteer = current.steerCapabilityKnown
+        ? current.supportsSteer
+        : action.patch.supportsSteer
+      const mergedSteerCapabilityKnown = true
       const mergedModes = current.modes ?? action.patch.modes
       const mergedConfigOptions =
         current.configOptions ?? action.patch.configOptions
@@ -1263,6 +1292,8 @@ function connectionsReducer(
         if (
           mergedSelectorsReady === current.selectorsReady &&
           mergedSupportsFork === current.supportsFork &&
+          mergedSupportsSteer === current.supportsSteer &&
+          mergedSteerCapabilityKnown === current.steerCapabilityKnown &&
           mergedModes === current.modes &&
           mergedConfigOptions === current.configOptions &&
           mergedAvailableCommands === current.availableCommands &&
@@ -1279,6 +1310,8 @@ function connectionsReducer(
           promptCapabilities: mergedPromptCapabilities,
           selectorsReady: mergedSelectorsReady,
           supportsFork: mergedSupportsFork,
+          supportsSteer: mergedSupportsSteer,
+          steerCapabilityKnown: mergedSteerCapabilityKnown,
         })
         return next
       }
@@ -1301,9 +1334,12 @@ function connectionsReducer(
         pendingPermission: hydratedPendingPermission,
         pendingAskQuestion: action.patch.pendingAskQuestion,
         pendingUserMessage: action.patch.pendingUserMessage,
+        steerMessages: action.patch.steerMessages,
         promptCapabilities: mergedPromptCapabilities,
         selectorsReady: mergedSelectorsReady,
         supportsFork: mergedSupportsFork,
+        supportsSteer: action.patch.supportsSteer,
+        steerCapabilityKnown: true,
         // Staleness is a current-state field (like status): apply the snapshot's
         // value on the fresh path. `configStaleDismissed` is client-local and
         // preserved via `...current`.
@@ -1367,6 +1403,7 @@ function connectionsReducer(
         updated.pendingQuestion = null
         updated.claudeApiRetry = null
         updated.error = null
+        updated.steerMessages = []
         // The out-of-turn window ended: its tool-call contexts (kept only for
         // background permission enrichment) are stale for the new turn.
         updated.outOfTurnToolCalls = null
@@ -1377,6 +1414,7 @@ function connectionsReducer(
         // clears it via `question_resolved`; this is the safety net for a turn
         // that ended without one (agent error / abandoned block).
         updated.pendingAskQuestion = null
+        updated.steerMessages = []
       }
       next.set(action.contextKey, updated)
       return next
@@ -2014,6 +2052,42 @@ function connectionsReducer(
       return next
     }
 
+    case "STEER_SUPPORTED": {
+      const conn = state.get(action.contextKey)
+      if (!conn) return state
+      if (
+        conn.supportsSteer === action.supported &&
+        conn.steerCapabilityKnown
+      ) {
+        return state
+      }
+      const next = new Map(state)
+      next.set(action.contextKey, {
+        ...conn,
+        supportsSteer: action.supported,
+        steerCapabilityKnown: true,
+      })
+      return next
+    }
+
+    case "STEER_MESSAGE": {
+      const conn = state.get(action.contextKey)
+      if (!conn) return state
+      if (
+        conn.steerMessages.some(
+          (message) => message.messageId === action.message.messageId
+        )
+      ) {
+        return state
+      }
+      const next = new Map(state)
+      next.set(action.contextKey, {
+        ...conn,
+        steerMessages: [...conn.steerMessages, action.message],
+      })
+      return next
+    }
+
     case "MODE_CHANGED": {
       const conn = state.get(action.contextKey)
       if (!conn?.modes) return state
@@ -2256,6 +2330,11 @@ export interface AcpActionsValue {
       clientMessageId?: string | null
     }
   ): Promise<void>
+  steer(
+    contextKey: string,
+    blocks: PromptInputBlock[],
+    clientMessageId: string
+  ): Promise<SteerResult>
   setMode(contextKey: string, modeId: string): Promise<void>
   setConfigOption(
     contextKey: string,
@@ -3184,6 +3263,25 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             type: "FORK_SUPPORTED",
             contextKey,
             supported: e.supported,
+          })
+          break
+        case "steer_supported":
+          flushStreamingQueue()
+          dispatch({
+            type: "STEER_SUPPORTED",
+            contextKey,
+            supported: e.supported,
+          })
+          break
+        case "steer_message":
+          flushStreamingQueue()
+          dispatch({
+            type: "STEER_MESSAGE",
+            contextKey,
+            message: {
+              messageId: e.message_id,
+              blocks: e.blocks,
+            },
           })
           break
         case "mode_changed":
@@ -4383,6 +4481,22 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     []
   )
 
+  const steer = useCallback(
+    async (
+      contextKey: string,
+      blocks: PromptInputBlock[],
+      clientMessageId: string
+    ): Promise<SteerResult> => {
+      const conn = storeRef.current.connections.get(contextKey)
+      if (!conn) {
+        throw new Error(`No live connection for ${contextKey}`)
+      }
+      lastActivityRef.current.set(contextKey, Date.now())
+      return acpSteer(conn.connectionId, blocks, clientMessageId)
+    },
+    []
+  )
+
   const setMode = useCallback(async (contextKey: string, modeId: string) => {
     const conn = storeRef.current.connections.get(contextKey)
     if (!conn) return
@@ -4548,6 +4662,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       disconnect,
       disconnectAll,
       sendPrompt,
+      steer,
       setMode,
       setConfigOption,
       cancel,
@@ -4568,6 +4683,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       disconnect,
       disconnectAll,
       sendPrompt,
+      steer,
       setMode,
       setConfigOption,
       cancel,

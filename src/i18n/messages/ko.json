@@ -1391,6 +1391,11 @@
       "forkSession": "세션 포크",
       "forkSessionSuccess": "세션 포크 성공",
       "forkSessionFailed": "세션 포크 실패: {error}",
+      "steerInjected": "현재 턴에 지시를 주입했습니다",
+      "steerFallbackFeedback": "네이티브 안내를 사용할 수 없어 실시간 피드백으로 보냈습니다",
+      "steerTurnEndedQueued": "턴이 방금 끝나 다음 메시지로 대기열에 추가했습니다",
+      "steerUnsupportedQueued": "네이티브 안내를 사용할 수 없어 다음 메시지로 대기열에 추가했습니다",
+      "steerFailedQueued": "안내 전송에 실패해 다음 메시지로 대기열에 추가했습니다",
       "exportConversation": "대화 내보내기",
       "exportImage": "이미지",
       "exportMarkdown": "Markdown",
@@ -2240,6 +2245,7 @@
       "chatInput": {
         "connecting": "연결 중...",
         "agentResponding": "{agent} 응답 중...",
+        "guideAgent": "{agent}의 현재 턴 안내...",
         "sendMessage": "메시지 보내기..."
       },
       "messageInput": {
@@ -2270,6 +2276,8 @@
         "noModels": "모델을 찾을 수 없습니다",
         "cancel": "취소",
         "send": "보내기",
+        "steer": "현재 턴 안내",
+        "steerSending": "지시 주입 중...",
         "forkAndSend": "포크 & 전송",
         "slashCommands": "슬래시 명령",
         "slashSearchPlaceholder": "명령 검색...",
@@ -2807,15 +2815,15 @@
         "cardFinishedWithStatus": "백그라운드 작업 종료 ({status})",
         "cardResultPending": "결과가 아직 반환되지 않았습니다"
       },
-      "conversationArtifacts": {
-        "collapsedSummary": "파일 {count}",
-        "title": "생성된 파일",
+      "conversationDeliverables": {
+        "collapsedSummary": "결과물 {count}",
+        "title": "최종 결과물",
         "collapse": "접기",
-        "empty": "이 대화에는 아직 생성된 파일이 없습니다.",
         "openFile": "{filePath} 열기",
-        "viewDiff": "변경 사항 보기",
         "revealInFolder": "파일 관리자에서 표시",
-        "removed": "삭제됨",
+        "primary": "주요",
+        "supporting": "보조",
+        "downloadToPc": "내 PC에 다운로드",
         "fileUnavailable": "파일을 사용할 수 없거나 존재하지 않습니다: {filePath}"
       },
       "userResources": {
@@ -3364,8 +3372,8 @@
     },
     "autoPreviewLabel": "미리보기 자동 열기",
     "autoPreviewHint": "에이전트가 Word, Excel, PowerPoint 파일을 만들거나 편집하면 실시간 미리보기를 자동으로 엽니다.",
-    "autoDownloadProducedLabel": "생성된 파일 자동 다운로드",
-    "autoDownloadProducedHint": "웹 서버(예: Tailscale/LAN)로 사용할 때 에이전트가 만들거나 변경한 파일을 이 브라우저의 다운로드 폴더로 자동 다운로드합니다."
+    "autoDownloadProducedLabel": "최종 결과물 자동 다운로드",
+    "autoDownloadProducedHint": "웹 서버(예: Tailscale/LAN)로 사용할 때 에이전트가 선언하고 검증된 최종 결과물 파일을 이 브라우저의 다운로드 폴더로 자동 다운로드합니다."
   },
   "SkillPacksSettings": {
     "title": "스킬 팩",

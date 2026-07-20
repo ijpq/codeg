@@ -19,6 +19,17 @@ pub enum AcpError {
     /// message queue above the input box instead of surfacing an error.
     #[error("turn already in progress for this connection")]
     TurnInProgress,
+    /// Native steering is not available on this concrete adapter/app-server
+    /// connection. The frontend explicitly falls back to live feedback (when
+    /// available) or queues the message as the next ordinary prompt.
+    #[error("native turn steering is not supported by this connection")]
+    SteerUnsupported,
+    /// The active turn ended between the UI's guide-mode check and the adapter's
+    /// expectedTurnId-guarded `turn/steer` request.
+    #[error("no active turn to steer")]
+    NoActiveSteerTurn,
+    #[error("invalid steering message: {0}")]
+    InvalidSteer(String),
     /// Live feedback was submitted while no turn was in flight. Feedback only
     /// makes sense while the agent is working (it is pulled mid-turn via the
     /// `check_user_feedback` MCP tool); with no active turn there is nothing to
@@ -77,6 +88,9 @@ impl AcpError {
             Self::ProbeTimedOut => Some("probe_timed_out"),
             Self::ProcessExited => Some("process_exited"),
             Self::TurnInProgress => Some("turn_in_progress"),
+            Self::SteerUnsupported => Some("steer_unsupported"),
+            Self::NoActiveSteerTurn => Some("no_active_steer_turn"),
+            Self::InvalidSteer(_) => Some("invalid_steer"),
             Self::NoActiveTurn => Some("no_active_turn"),
             Self::FeedbackDisabled => Some("feedback_disabled"),
             Self::InvalidFeedback(_) => Some("invalid_feedback"),
