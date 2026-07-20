@@ -20,7 +20,8 @@ pub use automation::{
 pub use chat_channel::{ChannelStatusInfo, ChatChannelInfo, ChatChannelMessageLogInfo};
 pub use conversation::{
     AgentConversationCount, AgentStats, ConversationDetail, ConversationSummary,
-    ConversationTurnArtifactRun, ConversationTurnFileChange, DbConversationDetail,
+    ConversationDeliverable, ConversationTurnArtifactRun, ConversationTurnFileChange,
+    DbConversationDetail,
     DbConversationSummary, FolderInfo, ImportResult, SessionStats, SidebarData,
 };
 pub use folder::{

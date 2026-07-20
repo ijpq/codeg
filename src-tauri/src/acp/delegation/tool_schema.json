@@ -151,5 +151,46 @@
         }
       }
     }
+  },
+  {
+    "name": "publish_deliverables",
+    "description": "Declare the complete, small set of final, user-facing outputs produced by this task. A successful call atomically replaces the prior agent-declared set, and Codeg shows only the verified set in the Final deliverables panel. Call this near the end of the turn when there is at least one standalone file or directory the user should receive, inspect, open, or download. Do NOT publish the workspace root, ordinary source files, tests, configuration, lockfiles, caches, temporary/intermediate files, or every path you edited during routine coding work. Do NOT publish input files merely read from the user. For a normal code-change task with no standalone output, do not call this tool. To explicitly clear a previous declaration, submit an empty deliverables array. Paths may be absolute or relative to the session working directory and must already exist inside that workspace. Use role=primary for the main result and role=supporting only for genuinely useful companion outputs. If any item is rejected, nothing is changed; correct it and resubmit the complete set.",
+    "inputSchema": {
+      "type": "object",
+      "required": ["deliverables"],
+      "properties": {
+        "deliverables": {
+          "type": "array",
+          "maxItems": 20,
+          "description": "The complete final-output set intended for the user, not a change log. An empty array clears a previous declaration.",
+          "items": {
+            "type": "object",
+            "required": ["path"],
+            "properties": {
+              "path": {
+                "type": "string",
+                "description": "Existing file or directory inside the session working directory. Relative paths are preferred."
+              },
+              "title": {
+                "type": "string",
+                "maxLength": 160,
+                "description": "Short user-facing name. Defaults to the file or directory name."
+              },
+              "description": {
+                "type": "string",
+                "maxLength": 800,
+                "description": "Optional concise explanation of what this output contains."
+              },
+              "role": {
+                "type": "string",
+                "enum": ["primary", "supporting"],
+                "default": "primary",
+                "description": "Whether this is a main result or a useful companion output."
+              }
+            }
+          }
+        }
+      }
+    }
   }
 ]

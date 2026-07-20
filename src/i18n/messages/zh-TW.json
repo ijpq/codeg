@@ -1338,6 +1338,11 @@
       "forkSession": "分叉會話",
       "forkSessionSuccess": "會話分叉成功",
       "forkSessionFailed": "會話分叉失敗：{error}",
+      "steerInjected": "已將引導注入目前輪次",
+      "steerFallbackFeedback": "原生引導無法使用，已回退為即時回饋",
+      "steerTurnEndedQueued": "目前輪次剛剛結束，訊息已進入下一輪佇列",
+      "steerUnsupportedQueued": "原生引導無法使用，訊息已進入下一輪佇列",
+      "steerFailedQueued": "引導傳送失敗，訊息已進入下一輪佇列",
       "exportConversation": "匯出對話",
       "exportImage": "圖片",
       "exportMarkdown": "Markdown",
@@ -2167,6 +2172,7 @@
       "chatInput": {
         "connecting": "連線中...",
         "agentResponding": "{agent} 正在回應...",
+        "guideAgent": "引導 {agent} 的目前輪次...",
         "sendMessage": "傳送訊息..."
       },
       "messageInput": {
@@ -2197,6 +2203,8 @@
         "noModels": "找不到模型",
         "cancel": "取消",
         "send": "傳送",
+        "steer": "引導目前輪次",
+        "steerSending": "正在注入引導...",
         "forkAndSend": "分叉發送",
         "slashCommands": "斜線命令",
         "slashSearchPlaceholder": "搜尋命令...",
@@ -2732,15 +2740,15 @@
         "cardFinishedWithStatus": "背景任務已結束（{status}）",
         "cardResultPending": "結果尚未返回"
       },
-      "conversationArtifacts": {
-        "collapsedSummary": "檔案 {count}",
-        "title": "產出檔案",
+      "conversationDeliverables": {
+        "collapsedSummary": "產物 {count}",
+        "title": "最終產物",
         "collapse": "收合",
-        "empty": "此對話尚無產出檔案。",
         "openFile": "開啟 {filePath}",
-        "viewDiff": "檢視變更",
         "revealInFolder": "在檔案管理員中顯示",
-        "removed": "已刪除",
+        "primary": "主要",
+        "supporting": "附屬",
+        "downloadToPc": "下載到本機",
         "fileUnavailable": "檔案不可用或已不存在:{filePath}"
       },
       "userResources": {
@@ -3289,8 +3297,8 @@
     },
     "autoPreviewLabel": "自動開啟預覽",
     "autoPreviewHint": "當智慧代理建立或編輯 Word、Excel、PowerPoint 檔案時，自動開啟其即時預覽。",
-    "autoDownloadProducedLabel": "自動下載產出檔案到本機",
-    "autoDownloadProducedHint": "透過 web server(如經 Tailscale/區域網路)使用時,自動把 agent 建立或修改的檔案下載到此瀏覽器的下載目錄。"
+    "autoDownloadProducedLabel": "自動下載最終產物到本機",
+    "autoDownloadProducedHint": "透過 web server（如經 Tailscale/區域網路）使用時，自動把智慧代理宣告且經驗證的最終產物檔案下載到此瀏覽器的下載目錄。"
   },
   "SkillPacksSettings": {
     "title": "技能包",

@@ -2,16 +2,10 @@ import { describe, expect, it } from "vitest"
 
 import {
   mergeConsecutiveAssistantTurns,
-  singletonSourceTurns,
   type MergedAssistantRunCache,
   type ResolvedMessageGroup,
   type ThreadRenderItem,
 } from "./message-list-view"
-import type { MessageTurn } from "@/lib/types"
-
-function turn(id: string): MessageTurn {
-  return { id, role: "assistant", blocks: [], timestamp: "" }
-}
 
 type ThreadItem = Parameters<typeof mergeConsecutiveAssistantTurns>[0][number]
 type TurnItem = Extract<ThreadItem, { kind: "turn" }>
@@ -35,27 +29,8 @@ function assistantItem(
     showStats: false,
     isRoleTransition: false,
     previousUserIndex: null,
-    sourceTurns: [],
   }
 }
-
-describe("singletonSourceTurns", () => {
-  it("returns the same array reference for the same turn", () => {
-    const t = turn("t1")
-    const first = singletonSourceTurns(t)
-    const second = singletonSourceTurns(t)
-    // Reference stability is the whole point: it lets HistoricalMessageGroup's
-    // memo bail out when an unchanged historical turn re-renders per token.
-    expect(first).toBe(second)
-    expect(first).toEqual([t])
-  })
-
-  it("returns distinct arrays for distinct turns", () => {
-    const a = singletonSourceTurns(turn("a"))
-    const b = singletonSourceTurns(turn("b"))
-    expect(a).not.toBe(b)
-  })
-})
 
 describe("mergeConsecutiveAssistantTurns", () => {
   it("surfaces completion time patched onto a non-last sub-turn", () => {
@@ -96,7 +71,7 @@ function makeGroup(
 }
 
 // Fresh render-item objects per call, like the rawItems map in threadItems —
-// only `group`, `key`, and the sourceTurns wrapper carry identity.
+// only `group` and `key` carry identity.
 function makeItem(
   group: ResolvedMessageGroup,
   index: number,
@@ -110,7 +85,6 @@ function makeItem(
     showStats: false,
     isRoleTransition: false,
     previousUserIndex: null,
-    sourceTurns: singletonSourceTurns(turn(group.id)),
   }
 }
 
@@ -123,7 +97,7 @@ function makeUserItem(id: string, index: number): ThreadRenderItem {
 }
 
 describe("mergeConsecutiveAssistantTurns merged-run cache", () => {
-  it("reuses the merged item (group/parts/sourceTurns) when membership is unchanged", () => {
+  it("reuses the merged item and group when membership is unchanged", () => {
     const cache: MergedAssistantRunCache = new WeakMap()
     const g1 = makeGroup("assistant", "a1")
     const g2 = makeGroup("assistant", "a2")
@@ -146,7 +120,6 @@ describe("mergeConsecutiveAssistantTurns merged-run cache", () => {
     expect(second).toBe(first)
     expect(second.group).toBe(first.group)
     expect(second.group.parts).toBe(first.group.parts)
-    expect(second.sourceTurns).toBe(first.sourceTurns)
     expect(first.key).toBe("merged-persisted-a1-0")
     expect(first.group.id).toBe("a1")
   })

@@ -63,7 +63,10 @@ import {
   createChatDir,
   createConversation,
   openSettingsWindow,
+  submitSessionFeedback,
 } from "@/lib/api"
+import { toErrorMessage } from "@/lib/app-error"
+import { classifySteerFailure } from "@/lib/steer-errors"
 import {
   flushRetryDelayMs,
   forkSendBlockedByQueue,
@@ -86,9 +89,9 @@ import {
 } from "@/lib/prompt-draft"
 import {
   AGENT_LABELS,
-  CONVERSATION_ARTIFACTS_CHANGED_EVENT,
+  CONVERSATION_DELIVERABLES_CHANGED_EVENT,
   type AgentType,
-  type ConversationArtifactsChanged,
+  type ConversationDeliverablesChanged,
   type ContentBlock,
   type ConversationStatus,
   type EventEnvelope,
@@ -363,20 +366,18 @@ const ConversationTabView = memo(function ConversationTabView({
     }
   }, [dbConversationId, effectiveConversationId, setDbConversationId])
 
-  // Artifact finalization deliberately trails TurnComplete by one watcher
-  // debounce window. Its dedicated event triggers a fresh detail generation,
-  // superseding any earlier TurnComplete-driven fetch that raced the final
-  // filesystem batch. The runtime→DB id binding also makes this work for tabs
-  // that began under a virtual draft id.
+  // An agent may publish final outputs before its reply completes. Refresh on
+  // the declaration event so the verified cards appear immediately; the
+  // runtime→DB id binding also covers tabs that began under a virtual draft id.
   useEffect(() => {
     let disposed = false
     let unlisten: (() => void) | undefined
 
-    void subscribe<ConversationArtifactsChanged>(
-      CONVERSATION_ARTIFACTS_CHANGED_EVENT,
+    void subscribe<ConversationDeliverablesChanged>(
+      CONVERSATION_DELIVERABLES_CHANGED_EVENT,
       (change) => {
         if (change.conversation_id === dbConvIdRef.current) {
-          refetchDetail(effectiveConversationId)
+          refetchDetail(effectiveConversationId, { preserveLive: true })
         }
       }
     ).then((dispose) => {
@@ -834,6 +835,18 @@ const ConversationTabView = memo(function ConversationTabView({
       buildUserTurnFromMessageBlocks(pending.messageId, pending.blocks)
     )
   }, [conn.pendingUserMessage, effectiveConversationId, appendViewerUserTurn])
+
+  // Native guide messages are turn-scoped state, so the snapshot path restores
+  // them after a browser refresh/reconnect. Exact message ids dedup the sending
+  // client's optimistic bubble against this authoritative echo.
+  useEffect(() => {
+    for (const message of conn.steerMessages) {
+      appendViewerUserTurn(
+        effectiveConversationId,
+        buildUserTurnFromMessageBlocks(message.messageId, message.blocks)
+      )
+    }
+  }, [conn.steerMessages, effectiveConversationId, appendViewerUserTurn])
 
   // Cross-client VIEWER (Bug 2): a `user_message` event for THIS connection
   // that arrives while we're attached. The owner added its user turn
@@ -1507,7 +1520,7 @@ const ConversationTabView = memo(function ConversationTabView({
         canShowDetailErrorActions ? handleOpenNewSession : undefined
       }
       folder={folder}
-      artifactRuns={detail?.artifact_runs}
+      deliverables={detail?.deliverables}
     />
   )
 
@@ -1535,6 +1548,118 @@ const ConversationTabView = memo(function ConversationTabView({
     onResendAsPrompt: resendFeedbackAsPrompt,
   })
 
+  const handleSteer = useCallback(
+    async (draft: PromptDraft) => {
+      const queueAsNextPrompt = () => {
+        mqEnqueue(draft, selectedModeId)
+      }
+
+      // The status/capability may change after MessageInput rendered its Guide
+      // button but before this callback runs. Preserve the whole draft as the
+      // next ordinary turn rather than issuing a stale RPC.
+      if (
+        connStatus !== "prompting" ||
+        !conn.supportsSteer ||
+        !conn.connectionId
+      ) {
+        queueAsNextPrompt()
+        toast.info(t("steerTurnEndedQueued"))
+        return
+      }
+
+      const optimisticTurn = buildOptimisticUserTurnFromDraft(
+        draft,
+        sharedT("attachedResources")
+      )
+      appendOptimisticTurn(
+        effectiveConversationId,
+        optimisticTurn,
+        optimisticTurn.id
+      )
+      setSendSignal((previous) => previous + 1)
+
+      try {
+        await acpActions.steer(tabId, draft.blocks, optimisticTurn.id)
+        toast.success(t("steerInjected"))
+      } catch (initialError: unknown) {
+        let error = initialError
+        let failure = classifySteerFailure(error)
+
+        // A transport timeout/response loss is ambiguous: app-server may have
+        // accepted the steer even though this client missed the reply. Retry
+        // once with the SAME id. The backend success cache and app-server's
+        // clientUserMessageId make that retry idempotent; a disconnect or a
+        // deterministic protocol failure simply fails again and falls through
+        // to the explicit queue recovery below.
+        if (failure === "other") {
+          try {
+            await acpActions.steer(tabId, draft.blocks, optimisticTurn.id)
+            toast.success(t("steerInjected"))
+            return
+          } catch (retryError: unknown) {
+            error = retryError
+            failure = classifySteerFailure(retryError)
+          }
+        }
+
+        removeOptimisticTurn(effectiveConversationId, optimisticTurn.id)
+
+        if (failure === "unsupported") {
+          // Live feedback accepts text only. Never discard images/resources to
+          // force that fallback: preserve the full draft in the ordinary queue.
+          const feedbackText = draft.blocks.every(
+            (block) => block.type === "text"
+          )
+            ? draft.blocks
+                .map((block) => (block.type === "text" ? block.text : ""))
+                .join("\n")
+                .trim()
+            : ""
+          if (feedback.canSubmit && feedbackText) {
+            try {
+              await submitSessionFeedback(conn.connectionId, feedbackText)
+              toast.info(t("steerFallbackFeedback"))
+              return
+            } catch (feedbackError: unknown) {
+              queueAsNextPrompt()
+              toast.error(t("steerFailedQueued"), {
+                description: toErrorMessage(feedbackError),
+              })
+              return
+            }
+          }
+          queueAsNextPrompt()
+          toast.info(t("steerUnsupportedQueued"))
+          return
+        }
+
+        queueAsNextPrompt()
+        if (failure === "turn_ended") {
+          toast.info(t("steerTurnEndedQueued"))
+        } else {
+          toast.error(t("steerFailedQueued"), {
+            description: toErrorMessage(error),
+          })
+        }
+      }
+    },
+    [
+      acpActions,
+      appendOptimisticTurn,
+      conn.connectionId,
+      conn.supportsSteer,
+      connStatus,
+      effectiveConversationId,
+      feedback.canSubmit,
+      mqEnqueue,
+      removeOptimisticTurn,
+      selectedModeId,
+      sharedT,
+      t,
+      tabId,
+    ]
+  )
+
   return (
     <ConversationShell
       topBanner={
@@ -1554,6 +1679,8 @@ const ConversationTabView = memo(function ConversationTabView({
       pendingAskQuestion={conn.pendingAskQuestion}
       onFocus={handleFocus}
       onSend={handleSend}
+      supportsSteer={conn.supportsSteer}
+      onSteer={handleSteer}
       onCancel={handleCancel}
       onRespondPermission={handleRespondPermission}
       onAnswerQuestion={handleAnswerQuestion}

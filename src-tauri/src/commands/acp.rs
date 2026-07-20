@@ -6561,6 +6561,19 @@ pub async fn acp_prompt(
 
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn acp_steer(
+    connection_id: String,
+    blocks: Vec<PromptInputBlock>,
+    client_message_id: String,
+    manager: State<'_, ConnectionManager>,
+) -> Result<crate::acp::types::SteerResult, AcpError> {
+    manager
+        .steer(&connection_id, blocks, client_message_id)
+        .await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn acp_set_mode(
     connection_id: String,
     mode_id: String,

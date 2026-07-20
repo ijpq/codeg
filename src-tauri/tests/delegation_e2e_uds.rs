@@ -77,6 +77,21 @@ impl codeg_lib::acp::session_info::SessionInfoAccess for NoSessionInfo {
     }
 }
 
+/// No-op deliverable access — this e2e suite never publishes deliverables.
+struct NoDeliverables;
+#[async_trait]
+impl codeg_lib::acp::deliverables::SessionDeliverableAccess for NoDeliverables {
+    async fn publish_deliverables(
+        &self,
+        _parent_connection_id: &str,
+        _conversation_id: i32,
+        _workspace_root: &std::path::Path,
+        _items: Vec<codeg_lib::acp::deliverables::DeliverableInput>,
+    ) -> codeg_lib::acp::deliverables::PublishDeliverablesOutcome {
+        codeg_lib::acp::deliverables::PublishDeliverablesOutcome::default()
+    }
+}
+
 /// Controllable question access for the ask round-trip test: `register_question`
 /// parks a sender keyed by a freshly-minted id; the test pops it via
 /// `take_pending` and resolves it, exactly as a user answering the card would.
@@ -164,6 +179,8 @@ async fn end_to_end_uds_happy_path() {
         Arc::new(NoFeedback) as Arc<dyn codeg_lib::acp::feedback::SessionFeedbackAccess>,
         Arc::new(StubQuestions::default()) as Arc<dyn SessionQuestionAccess>,
         Arc::new(NoSessionInfo) as Arc<dyn codeg_lib::acp::session_info::SessionInfoAccess>,
+        Arc::new(NoDeliverables)
+            as Arc<dyn codeg_lib::acp::deliverables::SessionDeliverableAccess>,
     );
 
     // PID-scoped socket inside the OS temp dir — no clashes across test bins.
@@ -279,6 +296,8 @@ async fn end_to_end_uds_batch_status() {
         Arc::new(NoFeedback) as Arc<dyn codeg_lib::acp::feedback::SessionFeedbackAccess>,
         Arc::new(StubQuestions::default()) as Arc<dyn SessionQuestionAccess>,
         Arc::new(NoSessionInfo) as Arc<dyn codeg_lib::acp::session_info::SessionInfoAccess>,
+        Arc::new(NoDeliverables)
+            as Arc<dyn codeg_lib::acp::deliverables::SessionDeliverableAccess>,
     );
 
     let dir = tempfile::tempdir().unwrap();
@@ -365,6 +384,8 @@ async fn end_to_end_uds_invalid_token_rejected() {
         Arc::new(NoFeedback) as Arc<dyn codeg_lib::acp::feedback::SessionFeedbackAccess>,
         Arc::new(StubQuestions::default()) as Arc<dyn SessionQuestionAccess>,
         Arc::new(NoSessionInfo) as Arc<dyn codeg_lib::acp::session_info::SessionInfoAccess>,
+        Arc::new(NoDeliverables)
+            as Arc<dyn codeg_lib::acp::deliverables::SessionDeliverableAccess>,
     );
 
     let dir = tempfile::tempdir().unwrap();
@@ -430,6 +451,8 @@ async fn end_to_end_uds_ask_question_round_trip() {
         Arc::new(NoFeedback) as Arc<dyn codeg_lib::acp::feedback::SessionFeedbackAccess>,
         questions.clone() as Arc<dyn SessionQuestionAccess>,
         Arc::new(NoSessionInfo) as Arc<dyn codeg_lib::acp::session_info::SessionInfoAccess>,
+        Arc::new(NoDeliverables)
+            as Arc<dyn codeg_lib::acp::deliverables::SessionDeliverableAccess>,
     );
 
     let dir = tempfile::tempdir().unwrap();
@@ -568,6 +591,8 @@ async fn end_to_end_uds_ask_revoked_after_register_declines() {
         Arc::new(NoFeedback) as Arc<dyn codeg_lib::acp::feedback::SessionFeedbackAccess>,
         questions as Arc<dyn SessionQuestionAccess>,
         Arc::new(NoSessionInfo) as Arc<dyn codeg_lib::acp::session_info::SessionInfoAccess>,
+        Arc::new(NoDeliverables)
+            as Arc<dyn codeg_lib::acp::deliverables::SessionDeliverableAccess>,
     );
 
     let dir = tempfile::tempdir().unwrap();

@@ -37,6 +37,8 @@ interface ConversationShellProps {
   pendingAskQuestion: PendingQuestionState | null
   onFocus: () => void
   onSend: (draft: PromptDraft, modeId?: string | null) => void
+  supportsSteer?: boolean
+  onSteer?: (draft: PromptDraft) => void | Promise<void>
   onCancel: () => void
   onRespondPermission: (requestId: string, optionId: string) => void
   onAnswerQuestion: (answer: string) => void
@@ -101,6 +103,8 @@ export function ConversationShell({
   pendingAskQuestion,
   onFocus,
   onSend,
+  supportsSteer,
+  onSteer,
   onCancel,
   onRespondPermission,
   onAnswerQuestion,
@@ -233,6 +237,8 @@ export function ConversationShell({
               agentName={agentName}
               onFocus={onFocus}
               onSend={onSend}
+              supportsSteer={supportsSteer}
+              onSteer={onSteer}
               onCancel={onCancel}
               modes={modes}
               configOptions={configOptions}

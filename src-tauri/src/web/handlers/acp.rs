@@ -9,7 +9,7 @@ use crate::acp::opencode_plugins::PluginCheckSummary;
 use crate::acp::preflight::PreflightResult;
 use crate::acp::types::{
     AcpAgentInfo, AcpAgentStatus, AgentSkillContent, AgentSkillLayout, AgentSkillScope,
-    AgentSkillsListResult, ConnectionInfo, ForkResultInfo,
+    AgentSkillsListResult, ConnectionInfo, ForkResultInfo, SteerResult,
 };
 use crate::app_error::{AppCommandError, AppErrorCode};
 use crate::app_state::AppState;
@@ -168,6 +168,44 @@ pub async fn acp_prompt(
             }
         })?;
     Ok(Json(()))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpSteerParams {
+    pub connection_id: String,
+    pub blocks: Vec<crate::acp::types::PromptInputBlock>,
+    pub client_message_id: String,
+}
+
+pub async fn acp_steer(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<AcpSteerParams>,
+) -> Result<Json<SteerResult>, AppCommandError> {
+    let result = state
+        .connection_manager
+        .steer(
+            &params.connection_id,
+            params.blocks,
+            params.client_message_id,
+        )
+        .await
+        .map_err(|error| {
+            let message = error.to_string();
+            match error {
+                AcpError::NoActiveSteerTurn => {
+                    AppCommandError::new(AppErrorCode::NoActiveSteerTurn, message)
+                }
+                AcpError::SteerUnsupported => {
+                    AppCommandError::new(AppErrorCode::SteerUnsupported, message)
+                }
+                AcpError::InvalidSteer(_) => {
+                    AppCommandError::new(AppErrorCode::InvalidInput, message)
+                }
+                _ => AppCommandError::task_execution_failed(message),
+            }
+        })?;
+    Ok(Json(result))
 }
 
 // --- Pattern A: Pure function handlers ---

@@ -1338,6 +1338,11 @@
       "forkSession": "Fork Session",
       "forkSessionSuccess": "Session forked successfully",
       "forkSessionFailed": "Failed to fork session: {error}",
+      "steerInjected": "Guidance injected into the current turn",
+      "steerFallbackFeedback": "Native guidance is unavailable; sent as live feedback",
+      "steerTurnEndedQueued": "The turn just ended; queued as the next message",
+      "steerUnsupportedQueued": "Native guidance is unavailable; queued as the next message",
+      "steerFailedQueued": "Guidance failed; queued as the next message",
       "exportConversation": "Export Conversation",
       "exportImage": "Image",
       "exportMarkdown": "Markdown",
@@ -2167,6 +2172,7 @@
       "chatInput": {
         "connecting": "Connecting...",
         "agentResponding": "{agent} is responding...",
+        "guideAgent": "Guide {agent}'s current turn...",
         "sendMessage": "Send a message..."
       },
       "messageInput": {
@@ -2199,6 +2205,8 @@
         "noModels": "No models found",
         "cancel": "Cancel",
         "send": "Send",
+        "steer": "Guide current turn",
+        "steerSending": "Injecting guidance...",
         "forkAndSend": "Fork & Send",
         "slashCommands": "Slash commands",
         "slashSearchPlaceholder": "Search commands...",
@@ -2732,15 +2740,15 @@
         "cardFinishedWithStatus": "Background task finished ({status})",
         "cardResultPending": "Result not returned yet"
       },
-      "conversationArtifacts": {
-        "collapsedSummary": "Files {count}",
-        "title": "Produced files",
+      "conversationDeliverables": {
+        "collapsedSummary": "Deliverables {count}",
+        "title": "Final deliverables",
         "collapse": "Collapse",
-        "empty": "No produced files in this conversation yet.",
         "openFile": "Open {filePath}",
-        "viewDiff": "View changes",
         "revealInFolder": "Reveal in file manager",
-        "removed": "removed",
+        "primary": "Primary",
+        "supporting": "Supporting",
+        "downloadToPc": "Download to my PC",
         "fileUnavailable": "File unavailable or no longer exists: {filePath}"
       },
       "userResources": {
@@ -3301,8 +3309,8 @@
     },
     "autoPreviewLabel": "Auto-open preview",
     "autoPreviewHint": "When an agent creates or edits a Word, Excel, or PowerPoint file, open its live preview automatically.",
-    "autoDownloadProducedLabel": "Auto-download produced files",
-    "autoDownloadProducedHint": "When using the web server (e.g. over Tailscale/LAN), automatically download files the agent creates or changes to this browser's Downloads folder."
+    "autoDownloadProducedLabel": "Auto-download final deliverables",
+    "autoDownloadProducedHint": "When using the web server (e.g. over Tailscale/LAN), automatically download verified final-deliverable files declared by the agent to this browser's Downloads folder."
   },
   "SkillPacksSettings": {
     "title": "Skill Packs",

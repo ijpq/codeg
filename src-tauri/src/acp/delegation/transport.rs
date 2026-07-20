@@ -55,6 +55,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use crate::acp::deliverables::DeliverableInput;
 use crate::acp::question::QuestionSpec;
 
 /// One delegation call's worth of input forwarded from the companion to the
@@ -183,6 +184,16 @@ pub struct BrokerSessionRequest {
     pub max_messages: Option<u32>,
 }
 
+/// Persist the agent's explicit final-output declaration for its current
+/// conversation. The listener re-validates token/connection ownership, then
+/// verifies every path against this launch's registered working directory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrokerDeliverablesRequest {
+    pub token: String,
+    pub parent_connection_id: String,
+    pub deliverables: Vec<DeliverableInput>,
+}
+
 /// Tagged top-level message dispatched by the listener. Adding new variants
 /// is the wire-stable way to grow the broker protocol without touching the
 /// frame layer.
@@ -197,6 +208,7 @@ pub enum BrokerMessage {
     CommitFeedback(BrokerCommitFeedbackRequest),
     Ask(BrokerAskRequest),
     SessionInfo(BrokerSessionRequest),
+    PublishDeliverables(BrokerDeliverablesRequest),
 }
 
 /// The wrapped outcome the main process returns over the same socket.
@@ -346,6 +358,19 @@ pub async fn client_session_round_trip(
     message_round_trip(socket_path, &BrokerMessage::SessionInfo(req.clone())).await
 }
 
+/// Dispatch a `publish_deliverables` declaration and read back the accepted +
+/// rejected item lists after workspace validation and persistence.
+pub async fn client_deliverables_round_trip(
+    socket_path: &str,
+    req: &BrokerDeliverablesRequest,
+) -> io::Result<BrokerResponse> {
+    message_round_trip(
+        socket_path,
+        &BrokerMessage::PublishDeliverables(req.clone()),
+    )
+    .await
+}
+
 /// Total budget for `open()` retries on Windows named pipes. Has to be
 /// short enough that it nests comfortably inside the companion's
 /// `BROKER_CANCEL_BUDGET` (500 ms) — leaving ≥ 300 ms for the actual
@@ -467,6 +492,30 @@ mod tests {
                 assert_eq!(req.max_messages, Some(20));
             }
             other => panic!("expected SessionInfo variant, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn deliverables_message_round_trip_in_memory() {
+        let (mut a, mut b) = duplex(8 * 1024);
+        let msg = BrokerMessage::PublishDeliverables(BrokerDeliverablesRequest {
+            token: "tok".into(),
+            parent_connection_id: "parent-1".into(),
+            deliverables: vec![DeliverableInput {
+                path: "output/report.pdf".into(),
+                title: Some("Report".into()),
+                description: None,
+                role: Some("primary".into()),
+            }],
+        });
+        write_frame(&mut a, &msg).await.unwrap();
+        let got: BrokerMessage = read_frame(&mut b).await.unwrap();
+        match got {
+            BrokerMessage::PublishDeliverables(req) => {
+                assert_eq!(req.parent_connection_id, "parent-1");
+                assert_eq!(req.deliverables[0].path, "output/report.pdf");
+            }
+            other => panic!("expected PublishDeliverables variant, got {other:?}"),
         }
     }
 

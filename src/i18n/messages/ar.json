@@ -1338,6 +1338,11 @@
       "forkSession": "تفريع الجلسة",
       "forkSessionSuccess": "تم تفريع الجلسة بنجاح",
       "forkSessionFailed": "فشل في تفريع الجلسة: {error}",
+      "steerInjected": "تم حقن التوجيه في الجولة الحالية",
+      "steerFallbackFeedback": "التوجيه الأصلي غير متاح؛ أُرسل كملاحظات فورية",
+      "steerTurnEndedQueued": "انتهت الجولة للتو؛ أُضيفت الرسالة إلى قائمة الانتظار التالية",
+      "steerUnsupportedQueued": "التوجيه الأصلي غير متاح؛ أُضيفت الرسالة إلى قائمة الانتظار التالية",
+      "steerFailedQueued": "فشل التوجيه؛ أُضيفت الرسالة إلى قائمة الانتظار التالية",
       "exportConversation": "تصدير المحادثة",
       "exportImage": "صورة",
       "exportMarkdown": "Markdown",
@@ -2167,6 +2172,7 @@
       "chatInput": {
         "connecting": "جارٍ الاتصال...",
         "agentResponding": "{agent} يرد...",
+        "guideAgent": "وجّه الجولة الحالية لـ {agent}...",
         "sendMessage": "أرسل رسالة..."
       },
       "messageInput": {
@@ -2197,6 +2203,8 @@
         "noModels": "لم يتم العثور على نماذج",
         "cancel": "إلغاء",
         "send": "إرسال",
+        "steer": "توجيه الجولة الحالية",
+        "steerSending": "جارٍ حقن التوجيه...",
         "forkAndSend": "تفريع وإرسال",
         "slashCommands": "أوامر الشرطة المائلة",
         "slashSearchPlaceholder": "البحث عن الأوامر...",
@@ -2732,15 +2740,15 @@
         "cardFinishedWithStatus": "انتهت مهمة الخلفية ({status})",
         "cardResultPending": "لم تصل النتيجة بعد"
       },
-      "conversationArtifacts": {
-        "collapsedSummary": "ملفات {count}",
-        "title": "الملفات المُنتَجة",
+      "conversationDeliverables": {
+        "collapsedSummary": "مخرجات {count}",
+        "title": "المخرجات النهائية",
         "collapse": "طيّ",
-        "empty": "لا توجد ملفات مُنتَجة في هذه المحادثة بعد.",
         "openFile": "فتح {filePath}",
-        "viewDiff": "عرض التغييرات",
         "revealInFolder": "إظهار في مدير الملفات",
-        "removed": "محذوف",
+        "primary": "أساسي",
+        "supporting": "داعم",
+        "downloadToPc": "التنزيل إلى جهازي",
         "fileUnavailable": "الملف غير متاح أو لم يعد موجودًا: {filePath}"
       },
       "userResources": {
@@ -3289,8 +3297,8 @@
     },
     "autoPreviewLabel": "فتح المعاينة تلقائيًا",
     "autoPreviewHint": "عندما ينشئ وكيل ملف Word أو Excel أو PowerPoint أو يعدّله، افتح معاينته المباشرة تلقائيًا.",
-    "autoDownloadProducedLabel": "تنزيل الملفات المُنتَجة تلقائيًا",
-    "autoDownloadProducedHint": "عند استخدام خادم الويب (مثلًا عبر Tailscale/الشبكة المحلية)، ينزّل تلقائيًا الملفات التي ينشئها الوكيل أو يعدّلها إلى مجلد التنزيلات في هذا المتصفح."
+    "autoDownloadProducedLabel": "تنزيل المخرجات النهائية تلقائيًا",
+    "autoDownloadProducedHint": "عند استخدام خادم الويب (مثلًا عبر Tailscale/الشبكة المحلية)، ينزّل تلقائيًا ملفات المخرجات النهائية التي صرّح بها الوكيل وتم التحقق منها إلى مجلد التنزيلات في هذا المتصفح."
   },
   "SkillPacksSettings": {
     "title": "حزم المهارات",

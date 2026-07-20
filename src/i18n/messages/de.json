@@ -1338,6 +1338,11 @@
       "forkSession": "Sitzung forken",
       "forkSessionSuccess": "Sitzung erfolgreich geforkt",
       "forkSessionFailed": "Sitzung konnte nicht geforkt werden: {error}",
+      "steerInjected": "Anweisung in den aktuellen Turn eingefügt",
+      "steerFallbackFeedback": "Native Steuerung nicht verfügbar; als Live-Feedback gesendet",
+      "steerTurnEndedQueued": "Der Turn ist gerade beendet worden; Nachricht für den nächsten Turn eingereiht",
+      "steerUnsupportedQueued": "Native Steuerung nicht verfügbar; Nachricht für den nächsten Turn eingereiht",
+      "steerFailedQueued": "Steuerung fehlgeschlagen; Nachricht für den nächsten Turn eingereiht",
       "exportConversation": "Konversation exportieren",
       "exportImage": "Bild",
       "exportMarkdown": "Markdown",
@@ -2167,6 +2172,7 @@
       "chatInput": {
         "connecting": "Verbinden...",
         "agentResponding": "{agent} antwortet...",
+        "guideAgent": "Aktuellen Turn von {agent} steuern...",
         "sendMessage": "Nachricht senden..."
       },
       "messageInput": {
@@ -2197,6 +2203,8 @@
         "noModels": "Keine Modelle gefunden",
         "cancel": "Abbrechen",
         "send": "Senden",
+        "steer": "Aktuellen Turn steuern",
+        "steerSending": "Anweisung wird eingefügt...",
         "forkAndSend": "Fork & Senden",
         "slashCommands": "Slash-Befehle",
         "slashSearchPlaceholder": "Befehle suchen...",
@@ -2732,15 +2740,15 @@
         "cardFinishedWithStatus": "Hintergrundaufgabe beendet ({status})",
         "cardResultPending": "Ergebnis steht noch aus"
       },
-      "conversationArtifacts": {
-        "collapsedSummary": "Dateien {count}",
-        "title": "Erzeugte Dateien",
+      "conversationDeliverables": {
+        "collapsedSummary": "Ergebnisse {count}",
+        "title": "Endergebnisse",
         "collapse": "Einklappen",
-        "empty": "Noch keine erzeugten Dateien in dieser Unterhaltung.",
         "openFile": "{filePath} öffnen",
-        "viewDiff": "Änderungen anzeigen",
         "revealInFolder": "Im Datei-Manager anzeigen",
-        "removed": "entfernt",
+        "primary": "Primär",
+        "supporting": "Ergänzend",
+        "downloadToPc": "Auf meinen Computer herunterladen",
         "fileUnavailable": "Datei nicht verfügbar oder nicht mehr vorhanden: {filePath}"
       },
       "userResources": {
@@ -3289,8 +3297,8 @@
     },
     "autoPreviewLabel": "Vorschau automatisch öffnen",
     "autoPreviewHint": "Wenn ein Agent eine Word-, Excel- oder PowerPoint-Datei erstellt oder bearbeitet, wird die Live-Vorschau automatisch geöffnet.",
-    "autoDownloadProducedLabel": "Erzeugte Dateien automatisch herunterladen",
-    "autoDownloadProducedHint": "Bei Nutzung des Webservers (z. B. über Tailscale/LAN) Dateien, die der Agent erstellt oder ändert, automatisch in den Downloads-Ordner dieses Browsers herunterladen."
+    "autoDownloadProducedLabel": "Endergebnisse automatisch herunterladen",
+    "autoDownloadProducedHint": "Bei Nutzung des Webservers (z. B. über Tailscale/LAN) vom Agenten deklarierte und geprüfte Endergebnis-Dateien automatisch in den Downloads-Ordner dieses Browsers herunterladen."
   },
   "SkillPacksSettings": {
     "title": "Skill-Pakete",

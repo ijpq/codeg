@@ -1338,6 +1338,11 @@
       "forkSession": "Dupliquer la session",
       "forkSessionSuccess": "Session dupliquée avec succès",
       "forkSessionFailed": "Échec de la duplication de la session : {error}",
+      "steerInjected": "Instruction injectée dans le tour actuel",
+      "steerFallbackFeedback": "Le guidage natif est indisponible ; envoyé comme retour en direct",
+      "steerTurnEndedQueued": "Le tour vient de se terminer ; message placé dans la file du prochain tour",
+      "steerUnsupportedQueued": "Le guidage natif est indisponible ; message placé dans la file du prochain tour",
+      "steerFailedQueued": "Échec du guidage ; message placé dans la file du prochain tour",
       "exportConversation": "Exporter la conversation",
       "exportImage": "Image",
       "exportMarkdown": "Markdown",
@@ -2167,6 +2172,7 @@
       "chatInput": {
         "connecting": "Connexion...",
         "agentResponding": "{agent} répond...",
+        "guideAgent": "Guider le tour actuel de {agent}...",
         "sendMessage": "Envoyer un message..."
       },
       "messageInput": {
@@ -2197,6 +2203,8 @@
         "noModels": "Aucun modèle trouvé",
         "cancel": "Annuler",
         "send": "Envoyer",
+        "steer": "Guider le tour actuel",
+        "steerSending": "Injection de l’instruction...",
         "forkAndSend": "Fork & Envoyer",
         "slashCommands": "Commandes slash",
         "slashSearchPlaceholder": "Rechercher des commandes...",
@@ -2732,15 +2740,15 @@
         "cardFinishedWithStatus": "Tâche en arrière-plan terminée ({status})",
         "cardResultPending": "Résultat pas encore reçu"
       },
-      "conversationArtifacts": {
-        "collapsedSummary": "Fichiers {count}",
-        "title": "Fichiers produits",
+      "conversationDeliverables": {
+        "collapsedSummary": "Livrables {count}",
+        "title": "Livrables finaux",
         "collapse": "Réduire",
-        "empty": "Aucun fichier produit dans cette conversation pour l'instant.",
         "openFile": "Ouvrir {filePath}",
-        "viewDiff": "Voir les modifications",
         "revealInFolder": "Afficher dans le gestionnaire de fichiers",
-        "removed": "supprimé",
+        "primary": "Principal",
+        "supporting": "Complémentaire",
+        "downloadToPc": "Télécharger sur mon ordinateur",
         "fileUnavailable": "Fichier indisponible ou inexistant : {filePath}"
       },
       "userResources": {
@@ -3289,8 +3297,8 @@
     },
     "autoPreviewLabel": "Ouvrir l'aperçu automatiquement",
     "autoPreviewHint": "Lorsqu'un agent crée ou modifie un fichier Word, Excel ou PowerPoint, ouvrir automatiquement son aperçu en direct.",
-    "autoDownloadProducedLabel": "Télécharger automatiquement les fichiers produits",
-    "autoDownloadProducedHint": "Lors de l'utilisation du serveur web (par ex. via Tailscale/LAN), télécharge automatiquement dans le dossier Téléchargements de ce navigateur les fichiers que l'agent crée ou modifie."
+    "autoDownloadProducedLabel": "Télécharger automatiquement les livrables finaux",
+    "autoDownloadProducedHint": "Lors de l'utilisation du serveur web (par ex. via Tailscale/LAN), télécharge automatiquement dans le dossier Téléchargements de ce navigateur les fichiers de livrables finaux déclarés par l'agent et vérifiés."
   },
   "SkillPacksSettings": {
     "title": "Packs de compétences",

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -39,7 +39,7 @@ use crate::acp::types::{
     PermissionOptionInfo, PlanEntryInfo, PromptCapabilitiesInfo, PromptInputBlock,
     SessionConfigKindInfo, SessionConfigOptionInfo, SessionConfigSelectGroupInfo,
     SessionConfigSelectInfo, SessionConfigSelectOptionInfo, SessionModeInfo, SessionModeStateInfo,
-    ToolCallImageInfo, UserMessageBlock,
+    SteerResult, ToolCallImageInfo, UserMessageBlock,
 };
 use crate::models::agent::AgentType;
 use crate::network::proxy;
@@ -182,6 +182,12 @@ pub enum ConnectionCommand {
         /// empty prompts, unbound conversations, and non-linked senders.
         user_message: Option<(String, Vec<UserMessageBlock>)>,
     },
+    Steer {
+        blocks: Vec<PromptInputBlock>,
+        client_message_id: String,
+        completion_cache: Arc<tokio::sync::Mutex<VecDeque<SteerResult>>>,
+        reply: tokio::sync::oneshot::Sender<Result<SteerResult, AcpError>>,
+    },
     SetMode {
         mode_id: String,
     },
@@ -256,6 +262,13 @@ pub struct AgentConnection {
     /// conversation rows or a confused agent that received two prompts
     /// in the same turn.
     pub prompt_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes native steer requests per connection. Codex accepts multiple
+    /// guide messages, but preserving click order and checking the success cache
+    /// between calls prevents concurrent retry/double-click duplication.
+    pub steer_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Bounded successful client-message ids. A retry whose HTTP/Tauri response
+    /// was lost returns the original result without injecting twice.
+    pub completed_steers: Arc<tokio::sync::Mutex<VecDeque<SteerResult>>>,
 
     /// Canonical fingerprint of the agent's effective config (env vars + model
     /// provider creds + native config file content) captured at spawn. The
@@ -368,20 +381,46 @@ async fn build_agent(
                     merged_env.push(("APP_SERVER_LOGS".to_string(), dir));
                 }
             }
+            let resolved_launcher = crate::commands::acp::resolve_npx_command(cmd)
+                .await
+                .unwrap_or_else(|| PathBuf::from(crate::process::normalized_program(cmd)));
+
+            // Codex's upstream ACP adapter owns the app-server connection and
+            // active turn id. Prepare Codeg's anchor-verified compatibility
+            // copy so the connection loop can call its `session/steer`
+            // extension. Unknown/old adapters launch unchanged with capability
+            // false; the UI then keeps the existing feedback/queue behavior.
+            let prepared_steer = if meta.supports_steer {
+                match crate::acp::codex_steer_adapter::prepare(&resolved_launcher).await {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        // Steering is an additive capability. A read-only cache,
+                        // missing Node resolver, or another shim-preparation
+                        // problem must not make an otherwise usable Codex
+                        // connection fail to launch.
+                        tracing::warn!(
+                            "[ACP][Codex] native steer disabled: adapter preparation failed: {error}"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            if let Some(prepared) = prepared_steer.as_ref() {
+                merged_env.push(("NODE_PATH".to_string(), prepared.node_path.clone()));
+            }
+
             let mut parts: Vec<String> = Vec::new();
             for (k, v) in &merged_env {
                 parts.push(format!("{k}={v}"));
             }
-            parts.push(
-                crate::commands::acp::resolve_npx_command(cmd)
-                    .await
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_else(|| {
-                        crate::process::normalized_program(cmd)
-                            .to_string_lossy()
-                            .to_string()
-                    }),
-            );
+            if let Some(prepared) = prepared_steer {
+                parts.push(prepared.node.to_string_lossy().to_string());
+                parts.push(prepared.script.to_string_lossy().to_string());
+            } else {
+                parts.push(resolved_launcher.to_string_lossy().to_string());
+            }
             // Grok's root-level launch flags go BEFORE its `agent stdio`
             // subcommand (which rejects them):
             //  - `--no-auto-update`: codeg owns the pinned version, so suppress the
@@ -704,11 +743,12 @@ async fn build_agent(
     // alignment (process cwd == session cwd). Guard on an existing directory
     // so a not-yet-created working_dir (e.g. a worktree path) can't make the
     // spawn fail.
-    Ok(if cwd.is_dir() {
+    let agent = if cwd.is_dir() {
         agent.with_current_dir(cwd)
     } else {
         agent
-    })
+    };
+    Ok(agent)
 }
 
 /// Spawn an ACP agent process and run the connection loop in a background task.
@@ -820,6 +860,8 @@ pub async fn spawn_agent_connection(
             state: Arc::clone(&session_state),
             emitter: emitter.clone(),
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
+            steer_lock: Arc::new(tokio::sync::Mutex::new(())),
+            completed_steers: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
             last_observed_fingerprint: config_fingerprint.clone(),
             config_fingerprint,
         },
@@ -1970,18 +2012,16 @@ pub struct DelegationInjection {
     pub tokens: Arc<crate::acp::delegation::listener::TokenRegistry>,
     pub socket_path: PathBuf,
     /// Hot-swappable "is live-feedback enabled?" flag. Read at injection time
-    /// alongside the broker's delegation flag so `codeg-mcp` is injected when
-    /// EITHER feature is on, and the companion is told which tool groups to
-    /// expose. Shares the same `tokens` registry and UDS socket as delegation.
+    /// alongside the broker's delegation flag so the companion is told which
+    /// optional groups to expose. Shares the same token registry and socket.
     pub feedback: crate::acp::feedback::FeedbackRuntimeConfig,
     /// Hot-swappable "is ask-user-question enabled?" flag. Read at injection
-    /// time alongside delegation + feedback so `codeg-mcp` is injected when ANY
-    /// of the three is on, and the companion's `--features` lists `ask` to expose
-    /// the `ask_user_question` tool.
+    /// time alongside delegation + feedback; the companion's `--features` lists
+    /// `ask` to expose the `ask_user_question` tool.
     pub ask: crate::acp::question::QuestionRuntimeConfig,
     /// Hot-swappable "is get-session-info enabled?" flag. Read at injection time
-    /// alongside the other three so `codeg-mcp` is injected when ANY of the four
-    /// is on, and the companion's `--features` lists `sessions` to expose the
+    /// alongside the other groups; the companion's `--features` lists `sessions`
+    /// to expose the
     /// `get_session_info` tool. No teardown handle (the lookup is stateless).
     pub sessions: crate::acp::session_info::SessionInfoRuntimeConfig,
     /// Question registry handle for the teardown cascade. The `run_connection`
@@ -2059,21 +2099,22 @@ fn is_executable_file(path: &Path) -> bool {
     true
 }
 
-/// Append the built-in `codeg-mcp` MCP entry if delegation is enabled
-/// AND the companion binary is present on disk. Returns the per-launch token
-/// that was registered, or `None` when injection was skipped (disabled by
-/// config, or binary missing).
+/// Append the built-in `codeg-mcp` MCP entry when the companion binary is
+/// present on disk. Returns the per-launch token that was registered, or `None`
+/// when the binary is unavailable.
 ///
 /// When the binary is missing we log a single-line warning and skip
 /// injection rather than register the token + emit a phantom McpServerStdio
 /// pointing at a non-existent path. Phantom injection would have made every
 /// new ACP session ship a guaranteed-to-fail MCP server entry: stricter
-/// agents (Claude Code) refuse the whole session; lax agents lose the
-/// delegate tool silently. Skipping leaves the agent fully functional minus
-/// `delegate_to_agent`, which is the right degradation when codeg-mcp didn't
-/// make it into the install.
-/// The `--features` value for a companion launch given the four feature flags,
-/// or `None` when none is enabled (the companion isn't injected at all).
+/// agents (Claude Code) refuse the whole session; lax agents silently lose the
+/// codeg-specific tools. Skipping leaves the agent otherwise fully functional,
+/// which is the right degradation when codeg-mcp didn't make it into the install.
+///
+/// The `--features` value for a companion launch. Final-output declaration is a
+/// core capability and is always enabled; the remaining groups follow their
+/// independent settings.
+///
 /// Pulled out as a pure function so the inject/skip decision is unit-testable
 /// without a real binary on disk or a live broker.
 fn companion_features_arg(
@@ -2081,11 +2122,8 @@ fn companion_features_arg(
     feedback_enabled: bool,
     ask_enabled: bool,
     sessions_enabled: bool,
-) -> Option<String> {
-    if !delegation_enabled && !feedback_enabled && !ask_enabled && !sessions_enabled {
-        return None;
-    }
-    let mut features: Vec<&str> = Vec::new();
+) -> String {
+    let mut features: Vec<&str> = vec!["deliverables"];
     if delegation_enabled {
         features.push("delegation");
     }
@@ -2098,7 +2136,7 @@ fn companion_features_arg(
     if sessions_enabled {
         features.push("sessions");
     }
-    Some(features.join(","))
+    features.join(",")
 }
 
 /// Outcome of injecting the `codeg-mcp` companion: the per-launch token to
@@ -2115,21 +2153,20 @@ async fn inject_codeg_mcp(
     parent_connection_id: &str,
     working_dir: &Path,
 ) -> Option<CompanionInjection> {
-    // codeg-mcp carries BOTH the delegation tools and the live-feedback tool.
-    // Inject it when EITHER feature is enabled; the `--features` arg tells the
-    // companion which tool groups to expose so a disabled feature's tools never
-    // surface to the LLM. (Historically this was gated on delegation alone.)
+    // Final-output declaration is always available. The remaining groups are
+    // independently gated so disabled tools never surface to the LLM.
     let delegation_enabled = injection.broker.config_snapshot().await.enabled;
     let feedback_enabled = injection.feedback.is_enabled().await;
     let ask_enabled = injection.ask.is_enabled().await;
     let sessions_enabled = injection.sessions.is_enabled().await;
-    // `None` (no feature enabled) short-circuits the whole injection.
+    // Deliverables are always enabled, so normal sessions always receive the
+    // companion when its binary is installed.
     let features_arg = companion_features_arg(
         delegation_enabled,
         feedback_enabled,
         ask_enabled,
         sessions_enabled,
-    )?;
+    );
     let Some(binary_path) = locate_codeg_mcp_binary() else {
         tracing::warn!(
             "[delegation][WARN] codeg-mcp companion binary not found (checked CODEG_MCP_BIN, \
@@ -2164,7 +2201,7 @@ async fn inject_codeg_mcp(
         // (any platform).
         "--parent-pid".to_string(),
         std::process::id().to_string(),
-        // Tool groups to expose this launch (delegation / feedback / ask / sessions).
+        // Tool groups to expose this launch.
         "--features".to_string(),
         features_arg,
     ]);
@@ -2552,6 +2589,33 @@ async fn run_connection(
                 &state,
                 &emitter_clone,
                 &init_resp.agent_capabilities.prompt_capabilities,
+            )
+            .await;
+
+            // Capability comes from the concrete adapter handshake, not from
+            // the frontend or an agent-name check. Codeg's compatibility shim
+            // publishes this marker only when its `session/steer` request
+            // handler is installed; a future upstream adapter can publish the
+            // same extension without any Codeg-side launch special case.
+            let supports_steer = init_resp
+                .agent_capabilities
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.get("codeg/steer"))
+                .is_some_and(|capability| {
+                    capability.get("method").and_then(serde_json::Value::as_str)
+                        == Some("session/steer")
+                        && capability
+                            .get("version")
+                            .and_then(serde_json::Value::as_u64)
+                            .is_some_and(|version| version >= 1)
+                });
+            emit_with_state(
+                &state,
+                &emitter_clone,
+                AcpEvent::SteerSupported {
+                    supported: supports_steer,
+                },
             )
             .await;
 
@@ -3418,6 +3482,55 @@ async fn set_session_config_option_inner(
         })?;
 
     Ok(response.config_options)
+}
+
+fn classify_steer_wire_error(error: sacp::Error) -> AcpError {
+    let message = error.to_string();
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("method not found") || lower.contains("-32601") {
+        return AcpError::SteerUnsupported;
+    }
+    if message.contains("CODEG_STEER_NO_ACTIVE_TURN")
+        || lower.contains("expectedturnid")
+        || lower.contains("expected turn")
+        || lower.contains("active turn")
+    {
+        return AcpError::NoActiveSteerTurn;
+    }
+    AcpError::protocol(format!("turn/steer failed: {message}"))
+}
+
+/// Send Codeg's adapter extension. The adapter supplies the active Codex turn
+/// id as app-server's required `expectedTurnId`; the response is the app-server
+/// `{ turnId }`, never a newly-created ACP turn.
+async fn steer_session(
+    cx: &ConnectionTo<Agent>,
+    session_id: &SessionId,
+    blocks: Vec<PromptInputBlock>,
+    client_message_id: &str,
+) -> Result<String, AcpError> {
+    let prompt = map_prompt_blocks(blocks);
+    if prompt.is_empty() {
+        return Err(AcpError::InvalidSteer(
+            "message must contain at least one content block".into(),
+        ));
+    }
+    let request = serde_json::json!({
+        "sessionId": session_id,
+        "prompt": prompt,
+        "clientMessageId": client_message_id,
+    });
+    let untyped = UntypedMessage::new("session/steer", request)
+        .map_err(|error| AcpError::protocol(format!("invalid steer request: {error}")))?;
+    let raw = cx
+        .send_request_to(Agent, untyped)
+        .block_task()
+        .await
+        .map_err(classify_steer_wire_error)?;
+    raw.get("turnId")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| AcpError::protocol("turn/steer response missing turnId"))
 }
 
 /// Apply user-saved mode and config-option preferences to a freshly-attached
@@ -4804,6 +4917,84 @@ async fn run_conversation_loop<'a>(
                                         .await;
                                     }
                                 }
+                                Some(ConnectionCommand::Steer {
+                                    blocks,
+                                    client_message_id,
+                                    completion_cache,
+                                    reply,
+                                }) => {
+                                    if let Some(previous) = completion_cache
+                                        .lock()
+                                        .await
+                                        .iter()
+                                        .find(|entry| entry.message_id == client_message_id)
+                                        .cloned()
+                                    {
+                                        let _ = reply.send(Ok(SteerResult {
+                                            deduplicated: true,
+                                            ..previous
+                                        }));
+                                        continue;
+                                    }
+                                    let rendered_blocks =
+                                        crate::acp::user_blocks_from_prompt(&blocks);
+                                    let result = steer_session(
+                                        &cx,
+                                        &sid,
+                                        blocks,
+                                        &client_message_id,
+                                    )
+                                    .await;
+                                    match result {
+                                        Ok(turn_id) => {
+                                            tracing::info!(
+                                                "[ACP][Codex] turn/steer injected connection_id={} session_id={} turn_id={} client_message_id={}",
+                                                conn_id,
+                                                sid.0,
+                                                turn_id,
+                                                client_message_id
+                                            );
+                                            emit_with_state(
+                                                state,
+                                                emitter,
+                                                AcpEvent::SteerMessage {
+                                                    message_id: client_message_id.clone(),
+                                                    blocks: rendered_blocks,
+                                                    turn_id: turn_id.clone(),
+                                                },
+                                            )
+                                            .await;
+                                            let result = SteerResult {
+                                                turn_id,
+                                                message_id: client_message_id,
+                                                deduplicated: false,
+                                            };
+                                            {
+                                                let mut cache = completion_cache.lock().await;
+                                                cache.push_back(result.clone());
+                                                while cache.len() > 64 {
+                                                    cache.pop_front();
+                                                }
+                                            }
+                                            let _ = reply.send(Ok(result));
+                                        }
+                                        Err(error) => {
+                                            if matches!(&error, AcpError::SteerUnsupported) {
+                                                // A concrete method-not-found response wins over
+                                                // the launch-time adapter capability. Snapshot and
+                                                // every attached client immediately stop offering
+                                                // native guide mode.
+                                                emit_with_state(
+                                                    state,
+                                                    emitter,
+                                                    AcpEvent::SteerSupported { supported: false },
+                                                )
+                                                .await;
+                                            }
+                                            let _ = reply.send(Err(error));
+                                        }
+                                    }
+                                }
                                 Some(ConnectionCommand::SetMode { mode_id }) => {
                                     let req = SetSessionModeRequest::new(sid.clone(), mode_id.clone());
                                     match cx.send_request_to(Agent, req).block_task().await {
@@ -5039,6 +5230,28 @@ async fn run_conversation_loop<'a>(
                     )
                     .await;
                 }
+            }
+            Some(ConnectionCommand::Steer {
+                client_message_id,
+                completion_cache,
+                reply,
+                ..
+            }) => {
+                // The UI can race the exact turn-complete edge. Never queue a
+                // guide command for the next prompt and never claim success.
+                let cached = completion_cache
+                    .lock()
+                    .await
+                    .iter()
+                    .find(|entry| entry.message_id == client_message_id)
+                    .cloned();
+                let _ = match cached {
+                    Some(previous) => reply.send(Ok(SteerResult {
+                        deduplicated: true,
+                        ..previous
+                    })),
+                    None => reply.send(Err(AcpError::NoActiveSteerTurn)),
+                };
             }
             Some(ConnectionCommand::Cancel) => {
                 let cx = session.connection();
@@ -8588,121 +8801,42 @@ mod tests {
         ));
     }
 
-    // ─── inject_codeg_mcp: enabled=false short-circuit ──────────
+    // ─── companion_features_arg: core + optional --features value ─────────
     //
-    // Guards the "default off" product contract: when the broker config has
-    // `enabled: false` (the new production default for fresh installs), the
-    // delegate-MCP injection must not push a server entry and must not
-    // register a per-launch token. The early return at the top of
-    // `inject_codeg_mcp` is the single chokepoint that keeps a
-    // codeg-mcp stdio MCP out of every ACP session until the user
-    // opts in via the settings panel.
-    #[tokio::test]
-    async fn inject_codeg_delegate_skipped_when_broker_disabled() {
-        use crate::acp::delegation::broker::{ConversationDepthLookup, DelegationBroker};
-        use crate::acp::delegation::listener::TokenRegistry;
-        use crate::acp::delegation::spawner::{mock::MockSpawner, ConnectionSpawner};
-        use crate::acp::delegation::types::DelegationError;
-
-        struct EmptyLookup;
-        #[async_trait::async_trait]
-        impl ConversationDepthLookup for EmptyLookup {
-            async fn parent_of(&self, _id: i32) -> Result<Option<i32>, DelegationError> {
-                Ok(None)
-            }
-        }
-
-        let broker = Arc::new(DelegationBroker::new(
-            Arc::new(MockSpawner::default()) as Arc<dyn ConnectionSpawner>,
-            Arc::new(EmptyLookup) as Arc<dyn ConversationDepthLookup>,
-        ));
-        // No set_config call: broker carries its default config, which is
-        // `enabled: false` after the product-default flip. This is the
-        // exact state a fresh install reaches before the user touches the
-        // settings panel. Feedback is likewise disabled by default, so with
-        // BOTH features off the companion isn't injected at all.
-        struct NoQuestions;
-        #[async_trait::async_trait]
-        impl crate::acp::question::SessionQuestionAccess for NoQuestions {
-            async fn register_question(
-                &self,
-                _parent_connection_id: &str,
-                _questions: Vec<crate::acp::question::QuestionSpec>,
-            ) -> Option<crate::acp::question::RegisteredQuestion> {
-                None
-            }
-            async fn cancel_question(&self, _parent_connection_id: &str, _question_id: &str) {}
-            async fn cancel_questions_by_parent(&self, _parent_connection_id: &str) {}
-        }
-        let injection = DelegationInjection {
-            broker,
-            tokens: Arc::new(TokenRegistry::default()),
-            socket_path: std::path::PathBuf::from("/tmp/codeg-mcp.sock"),
-            feedback: crate::acp::feedback::FeedbackRuntimeConfig::new(),
-            ask: crate::acp::question::QuestionRuntimeConfig::new(),
-            sessions: crate::acp::session_info::SessionInfoRuntimeConfig::new(),
-            questions: Arc::new(NoQuestions)
-                as Arc<dyn crate::acp::question::SessionQuestionAccess>,
-        };
-
-        let mut servers: Vec<McpServer> = Vec::new();
-        let result = inject_codeg_mcp(
-            &mut servers,
-            &injection,
-            "parent-conn",
-            std::path::Path::new("/tmp"),
-        )
-        .await;
-
-        assert!(result.is_none(), "disabled broker must return None");
-        assert!(
-            servers.is_empty(),
-            "disabled broker must not push any MCP server entry; got {servers:?}"
-        );
-        // Token registry stays untouched — no lookup should resolve to a
-        // valid entry because nothing was registered.
-        assert!(
-            injection.tokens.lookup("any-token").await.is_none(),
-            "disabled broker must not register a delegate token"
-        );
-    }
-
-    // ─── companion_features_arg: inject/skip decision + --features value ──
-    //
-    // The companion now carries two independently-toggled tool groups. It is
-    // injected when EITHER is on, and the `--features` arg names exactly the
-    // enabled groups so the companion hides the rest. Crucially, feedback alone
-    // must still inject the companion (the historical delegation-only gate would
-    // have skipped it).
+    // Final-output declaration is always enabled; the four settings-controlled
+    // groups are appended independently so the companion hides disabled tools.
     #[test]
-    fn companion_features_arg_inject_skip_decision() {
-        // All off → no companion at all.
-        assert_eq!(companion_features_arg(false, false, false, false), None);
+    fn companion_features_arg_includes_core_and_optional_groups() {
+        // Optional groups off → declaration-only companion.
+        assert_eq!(
+            companion_features_arg(false, false, false, false),
+            "deliverables"
+        );
         // Delegation only.
         assert_eq!(
             companion_features_arg(true, false, false, false),
-            Some("delegation".to_string())
+            "deliverables,delegation"
         );
         // Feedback only — the decoupling: companion injected for feedback even
         // when delegation is off.
         assert_eq!(
             companion_features_arg(false, true, false, false),
-            Some("feedback".to_string())
+            "deliverables,feedback"
         );
         // Ask only — likewise injects the companion on its own.
         assert_eq!(
             companion_features_arg(false, false, true, false),
-            Some("ask".to_string())
+            "deliverables,ask"
         );
         // Sessions only — likewise injects the companion on its own.
         assert_eq!(
             companion_features_arg(false, false, false, true),
-            Some("sessions".to_string())
+            "deliverables,sessions"
         );
         // All on → comma-joined, in declaration order.
         assert_eq!(
             companion_features_arg(true, true, true, true),
-            Some("delegation,feedback,ask,sessions".to_string())
+            "deliverables,delegation,feedback,ask,sessions"
         );
     }
 }

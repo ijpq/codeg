@@ -182,6 +182,67 @@ describe("MessageInput (RichComposer integration)", () => {
     expect(card.className).toContain("codeg-composer-chrome")
     expect(fireEvent.mouseDown(card)).toBe(false)
   })
+
+  it("uses native guide mode while prompting instead of enqueueing a new turn", async () => {
+    const user = userEvent.setup()
+    const onSend = vi.fn()
+    const onEnqueue = vi.fn()
+    const onSteer = vi.fn().mockResolvedValue(undefined)
+    const { container } = renderInput({
+      onSend,
+      onEnqueue,
+      onSteer,
+      supportsSteer: true,
+      isPrompting: true,
+      onCancel: vi.fn(),
+    })
+    const textbox = await waitFor(() => {
+      const element = container.querySelector('[role="textbox"]')
+      expect(element).not.toBeNull()
+      return element as HTMLElement
+    })
+    await user.type(textbox, "check B instead")
+    await user.click(
+      screen.getByRole("button", {
+        name: enMessages.Folder.chat.messageInput.steer,
+      })
+    )
+
+    await waitFor(() => expect(onSteer).toHaveBeenCalledTimes(1))
+    expect(onSteer.mock.calls[0][0].blocks).toEqual([
+      { type: "text", text: "check B instead" },
+    ])
+    expect(onSend).not.toHaveBeenCalled()
+    expect(onEnqueue).not.toHaveBeenCalled()
+  })
+
+  it("uses Enter to guide and keeps Shift+Enter as a newline", async () => {
+    const user = userEvent.setup()
+    const onSteer = vi.fn().mockResolvedValue(undefined)
+    const { container } = renderInput({
+      onSteer,
+      supportsSteer: true,
+      isPrompting: true,
+      onCancel: vi.fn(),
+    })
+    const textbox = await waitFor(() => {
+      const element = container.querySelector('[role="textbox"]')
+      expect(element).not.toBeNull()
+      return element as HTMLElement
+    })
+    await user.type(textbox, "first line")
+
+    fireEvent.keyDown(textbox, {
+      key: "Enter",
+      code: "Enter",
+      shiftKey: true,
+    })
+    expect(onSteer).not.toHaveBeenCalled()
+
+    fireEvent.keyDown(textbox, { key: "Enter", code: "Enter" })
+    await waitFor(() => expect(onSteer).toHaveBeenCalledTimes(1))
+    expect(onSteer.mock.calls[0][0].displayText).toContain("first line")
+  })
 })
 
 describe("MessageInput attach-to-chat insertion position", () => {

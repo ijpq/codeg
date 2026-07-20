@@ -97,3 +97,33 @@ describe("denormalizeSnapshot — last_error", () => {
     expect(patch.status).toBe("connected")
   })
 })
+
+describe("denormalizeSnapshot — native steering", () => {
+  it("restores capability and accepted guide messages after reconnect", () => {
+    const patch = denormalizeSnapshot(
+      baseSnapshot({
+        status: "prompting",
+        supports_steer: true,
+        steer_messages: [
+          {
+            message_id: "optimistic-guide-1",
+            blocks: [{ type: "text", text: "check B instead" }],
+          },
+        ],
+      })
+    )
+    expect(patch.supportsSteer).toBe(true)
+    expect(patch.steerMessages).toEqual([
+      {
+        messageId: "optimistic-guide-1",
+        blocks: [{ type: "text", text: "check B instead" }],
+      },
+    ])
+  })
+
+  it("defaults to unsupported with no guide messages for older servers", () => {
+    const patch = denormalizeSnapshot(baseSnapshot())
+    expect(patch.supportsSteer).toBe(false)
+    expect(patch.steerMessages).toEqual([])
+  })
+})

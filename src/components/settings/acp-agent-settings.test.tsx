@@ -34,6 +34,8 @@ function makeAgent(overrides: Partial<AcpAgentInfo>): AcpAgentInfo {
     grok_config_toml: null,
     grok_settings: null,
     hermes_config_yaml: null,
+    cursor_cli_config_json: null,
+    cursor_settings: null,
     model_provider_id: null,
     ...overrides,
   }

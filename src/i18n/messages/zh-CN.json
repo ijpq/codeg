@@ -1338,6 +1338,11 @@
       "forkSession": "分叉会话",
       "forkSessionSuccess": "会话分叉成功",
       "forkSessionFailed": "会话分叉失败：{error}",
+      "steerInjected": "已将引导注入当前轮次",
+      "steerFallbackFeedback": "原生引导不可用，已回退为实时反馈",
+      "steerTurnEndedQueued": "当前轮次刚刚结束，消息已进入下一轮队列",
+      "steerUnsupportedQueued": "原生引导不可用，消息已进入下一轮队列",
+      "steerFailedQueued": "引导发送失败，消息已进入下一轮队列",
       "exportConversation": "导出会话",
       "exportImage": "图片",
       "exportMarkdown": "Markdown",
@@ -2167,6 +2172,7 @@
       "chatInput": {
         "connecting": "连接中...",
         "agentResponding": "{agent} 正在响应...",
+        "guideAgent": "引导 {agent} 的当前轮次...",
         "sendMessage": "发送消息..."
       },
       "messageInput": {
@@ -2199,6 +2205,8 @@
         "noModels": "未找到模型",
         "cancel": "取消",
         "send": "发送",
+        "steer": "引导当前轮次",
+        "steerSending": "正在注入引导...",
         "forkAndSend": "分叉发送",
         "slashCommands": "斜杠命令",
         "slashSearchPlaceholder": "搜索命令...",
@@ -2732,15 +2740,15 @@
         "cardFinishedWithStatus": "后台任务已结束（{status}）",
         "cardResultPending": "结果尚未返回"
       },
-      "conversationArtifacts": {
-        "collapsedSummary": "文件 {count}",
-        "title": "产出文件",
+      "conversationDeliverables": {
+        "collapsedSummary": "产物 {count}",
+        "title": "最终产物",
         "collapse": "收起",
-        "empty": "本次对话暂无产出文件。",
         "openFile": "打开 {filePath}",
-        "viewDiff": "查看改动",
         "revealInFolder": "在文件管理器中显示",
-        "removed": "已删除",
+        "primary": "主要",
+        "supporting": "附属",
+        "downloadToPc": "下载到本机",
         "fileUnavailable": "文件不可用或已不存在:{filePath}"
       },
       "userResources": {
@@ -3301,8 +3309,8 @@
     },
     "autoPreviewLabel": "自动打开预览",
     "autoPreviewHint": "当智能体创建或编辑 Word、Excel、PowerPoint 文件时，自动打开其实时预览。",
-    "autoDownloadProducedLabel": "自动下载产出文件到本机",
-    "autoDownloadProducedHint": "通过 web server(如经 Tailscale/局域网)使用时,自动把 agent 创建或修改的文件下载到此浏览器的下载目录。"
+    "autoDownloadProducedLabel": "自动下载最终产物到本机",
+    "autoDownloadProducedHint": "通过 web server（如经 Tailscale/局域网）使用时，自动把智能体声明且经验证的最终产物文件下载到此浏览器的下载目录。"
   },
   "SkillPacksSettings": {
     "title": "技能包",

@@ -1338,6 +1338,11 @@
       "forkSession": "セッションをフォーク",
       "forkSessionSuccess": "セッションのフォークに成功しました",
       "forkSessionFailed": "セッションのフォークに失敗しました：{error}",
+      "steerInjected": "現在のターンに指示を注入しました",
+      "steerFallbackFeedback": "ネイティブ誘導が利用できないため、リアルタイムフィードバックとして送信しました",
+      "steerTurnEndedQueued": "ターンが終了したため、次のメッセージとしてキューに追加しました",
+      "steerUnsupportedQueued": "ネイティブ誘導が利用できないため、次のメッセージとしてキューに追加しました",
+      "steerFailedQueued": "誘導に失敗したため、次のメッセージとしてキューに追加しました",
       "exportConversation": "会話をエクスポート",
       "exportImage": "画像",
       "exportMarkdown": "Markdown",
@@ -2167,6 +2172,7 @@
       "chatInput": {
         "connecting": "接続中...",
         "agentResponding": "{agent} が応答中...",
+        "guideAgent": "{agent} の現在のターンを誘導...",
         "sendMessage": "メッセージを送信..."
       },
       "messageInput": {
@@ -2197,6 +2203,8 @@
         "noModels": "モデルが見つかりません",
         "cancel": "キャンセル",
         "send": "送信",
+        "steer": "現在のターンを誘導",
+        "steerSending": "指示を注入中...",
         "forkAndSend": "フォークして送信",
         "slashCommands": "スラッシュコマンド",
         "slashSearchPlaceholder": "コマンドを検索...",
@@ -2732,15 +2740,15 @@
         "cardFinishedWithStatus": "バックグラウンドタスクが終了しました（{status}）",
         "cardResultPending": "結果はまだ返っていません"
       },
-      "conversationArtifacts": {
-        "collapsedSummary": "ファイル {count}",
-        "title": "生成されたファイル",
+      "conversationDeliverables": {
+        "collapsedSummary": "成果物 {count}",
+        "title": "最終成果物",
         "collapse": "折りたたむ",
-        "empty": "この会話にはまだ生成されたファイルがありません。",
         "openFile": "{filePath} を開く",
-        "viewDiff": "変更を表示",
         "revealInFolder": "ファイルマネージャーで表示",
-        "removed": "削除",
+        "primary": "メイン",
+        "supporting": "補足",
+        "downloadToPc": "PC にダウンロード",
         "fileUnavailable": "ファイルが利用できないか、存在しません: {filePath}"
       },
       "userResources": {
@@ -3289,8 +3297,8 @@
     },
     "autoPreviewLabel": "プレビューを自動で開く",
     "autoPreviewHint": "エージェントが Word、Excel、PowerPoint ファイルを作成または編集したときに、ライブプレビューを自動で開きます。",
-    "autoDownloadProducedLabel": "生成ファイルを自動ダウンロード",
-    "autoDownloadProducedHint": "Web サーバー(Tailscale/LAN 経由など)で使用する際、エージェントが作成・変更したファイルをこのブラウザーのダウンロードフォルダーに自動ダウンロードします。"
+    "autoDownloadProducedLabel": "最終成果物を自動ダウンロード",
+    "autoDownloadProducedHint": "Web サーバー（Tailscale/LAN 経由など）で使用する際、エージェントが宣言し検証された最終成果物ファイルを、このブラウザーのダウンロードフォルダーに自動ダウンロードします。"
   },
   "SkillPacksSettings": {
     "title": "スキルパック",
