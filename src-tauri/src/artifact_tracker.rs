@@ -19,10 +19,60 @@ use tokio::sync::{broadcast, oneshot, Mutex};
 use crate::db::entities::conversation_turn_file_change::ConversationTurnFileChangeKind;
 use crate::db::entities::conversation_turn_run::ConversationTurnRunStatus;
 use crate::db::service::artifact_service::{self, NewTurnRun, PendingFileChange};
+use crate::db::service::deliverable_service;
 use crate::web::event_bridge::{emit_event, EventEmitter};
 use crate::workspace_state::{
     self, WorkspaceChangeSubscription, WorkspacePathChangeBatch, WorkspacePathChangeKind,
 };
+
+/// Extract real workspace file attachments from the structured prompt blocks.
+/// This is exclusion metadata for conservative fallback inference only; it is
+/// never used to *create* a deliverable. Plain assistant/user text is
+/// intentionally ignored.
+pub(crate) fn input_paths_from_prompt(
+    blocks: &[crate::acp::types::PromptInputBlock],
+    root_path: &Path,
+) -> Vec<String> {
+    fn file_uri_path(uri: &str) -> Option<PathBuf> {
+        let raw = uri.strip_prefix("file://")?.split('#').next()?;
+        let decoded = urlencoding::decode(raw).ok()?.into_owned();
+        #[cfg(windows)]
+        let decoded = {
+            let bytes = decoded.as_bytes();
+            if bytes.len() >= 3 && bytes[0] == b'/' && bytes[2] == b':' {
+                decoded[1..].to_string()
+            } else if !decoded.starts_with('/') {
+                format!("//{decoded}")
+            } else {
+                decoded
+            }
+        };
+        Some(PathBuf::from(decoded))
+    }
+
+    let canonical_root = std::fs::canonicalize(root_path).unwrap_or_else(|_| root_path.into());
+    let mut seen = std::collections::HashSet::new();
+    let mut paths = Vec::new();
+    for uri in blocks.iter().filter_map(|block| match block {
+        crate::acp::types::PromptInputBlock::Image { uri, .. } => uri.as_deref(),
+        crate::acp::types::PromptInputBlock::Resource { uri, .. }
+        | crate::acp::types::PromptInputBlock::ResourceLink { uri, .. } => Some(uri.as_str()),
+        crate::acp::types::PromptInputBlock::Text { .. } => None,
+    }) {
+        let Some(path) = file_uri_path(uri) else {
+            continue;
+        };
+        let canonical = std::fs::canonicalize(&path).unwrap_or(path);
+        let Ok(relative) = canonical.strip_prefix(&canonical_root) else {
+            continue;
+        };
+        let normalized = normalize_relative_path(&relative.to_string_lossy());
+        if !normalized.is_empty() && seen.insert(normalized.clone()) {
+            paths.push(normalized);
+        }
+    }
+    paths
+}
 
 pub const CONVERSATION_ARTIFACTS_CHANGED_EVENT: &str = "conversation://artifacts-changed";
 
@@ -88,6 +138,7 @@ impl ArtifactTracker {
         client_message_id: Option<String>,
         folder_id: Option<i32>,
         root_path: PathBuf,
+        input_paths: Vec<String>,
         emitter: EventEmitter,
         event_seq_before_prompt: u64,
     ) -> Result<String, crate::db::error::DbError> {
@@ -151,6 +202,8 @@ impl ArtifactTracker {
                 folder_id,
                 root_path: stored_root.clone(),
                 capture_incomplete,
+                input_paths_json: serde_json::to_string(&input_paths)
+                    .unwrap_or_else(|_| "[]".to_string()),
             },
         )
         .await
@@ -401,6 +454,25 @@ async fn capture_loop(args: CaptureLoopArgs) {
         );
     }
 
+    // The declaration marker is persisted while the turn is running. The
+    // fallback therefore cannot overwrite an explicit set (including an
+    // explicit empty set) once the terminal event arrives.
+    match deliverable_service::infer_for_turn(&db, conversation_id, &run_id).await {
+        Ok(inferred) if !inferred.is_empty() => {
+            crate::acp::deliverables::emit_deliverables_changed(
+                &emitter,
+                conversation_id,
+                inferred.into_iter().map(|item| item.id).collect(),
+            );
+        }
+        Ok(_) => {}
+        Err(err) => tracing::error!(
+            "[artifact-tracker] fallback deliverable inference failed for run {}: {}",
+            run_id,
+            err
+        ),
+    }
+
     tracing::info!(
         "[artifact-tracker] finish run={} conversation={} status={:?} reason={} observed={} available={} removed={} stat_errors={}",
         run_id,
@@ -479,11 +551,7 @@ struct FinalizeStats {
     stat_errors: usize,
 }
 
-async fn finalize_paths(
-    db: &DatabaseConnection,
-    run_id: &str,
-    root_path: &Path,
-) -> FinalizeStats {
+async fn finalize_paths(db: &DatabaseConnection, run_id: &str, root_path: &Path) -> FinalizeStats {
     let changes = match artifact_service::list_changes_for_run(db, run_id).await {
         Ok(changes) => changes,
         Err(err) => {
@@ -511,14 +579,8 @@ async fn finalize_paths(
                 stats.available += 1;
                 let size = i64::try_from(metadata.len()).ok();
                 let modified_at = metadata.modified().ok().map(DateTime::<Utc>::from);
-                if let Err(err) = artifact_service::update_final_state(
-                    db,
-                    change,
-                    true,
-                    size,
-                    modified_at,
-                )
-                .await
+                if let Err(err) =
+                    artifact_service::update_final_state(db, change, true, size, modified_at).await
                 {
                     tracing::error!(
                         "[artifact-tracker] failed final file stat update for run {}: {}",
@@ -561,8 +623,7 @@ fn canonical_root_key(path: &Path) -> String {
 }
 
 fn normalize_relative_path(path: &str) -> String {
-    path.trim_start_matches(['/', '\\'])
-        .replace('\\', "/")
+    path.trim_start_matches(['/', '\\']).replace('\\', "/")
 }
 
 fn should_track_path(path: &str) -> bool {
@@ -572,7 +633,10 @@ fn should_track_path(path: &str) -> bool {
     }
     let parsed = Path::new(&normalized);
     if parsed.components().any(|component| {
-        matches!(component, Component::ParentDir | Component::RootDir | Component::Prefix(_))
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
     }) {
         return false;
     }

@@ -8,6 +8,7 @@ pub mod chat_channel_sender_context;
 pub mod chat_channel_thread_binding;
 pub mod conversation;
 pub mod conversation_deliverable;
+pub mod conversation_turn_deliverable;
 pub mod conversation_turn_file_change;
 pub mod conversation_turn_run;
 pub mod folder;

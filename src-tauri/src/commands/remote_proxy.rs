@@ -1131,6 +1131,44 @@ pub async fn remote_download_workspace_dir(
     .await
 }
 
+/// Stream a deliverable ticket from the selected Codeg Server into a file on
+/// the desktop client. Only database ids cross this boundary; the remote
+/// server remains responsible for resolving and revalidating every path.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn remote_download_deliverables(
+    app: AppHandle,
+    db: State<'_, AppDatabase>,
+    proxy: State<'_, Arc<RemoteProxyState>>,
+    transfers: State<'_, Arc<WorkspaceTransferManager>>,
+    connection_id: i32,
+    conversation_id: i32,
+    deliverable_ids: Vec<String>,
+    archive: bool,
+    save_path: String,
+) -> Result<RemoteWorkspaceDownloadResult, AppCommandError> {
+    if deliverable_ids.is_empty() || deliverable_ids.len() > 100 {
+        return Err(AppCommandError::invalid_input(
+            "Select between 1 and 100 deliverables",
+        ));
+    }
+    remote_ticket_download_stream(
+        app,
+        db,
+        proxy,
+        transfers,
+        connection_id,
+        "/api/create_deliverable_download_ticket",
+        serde_json::json!({
+            "conversationId": conversation_id,
+            "deliverableIds": deliverable_ids,
+            "archive": archive,
+        }),
+        save_path,
+    )
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn remote_workspace_download_stream(
     app: AppHandle,
@@ -1141,6 +1179,34 @@ async fn remote_workspace_download_stream(
     kind: &str,
     root_path: String,
     path: String,
+    save_path: String,
+) -> Result<RemoteWorkspaceDownloadResult, AppCommandError> {
+    remote_ticket_download_stream(
+        app,
+        db,
+        proxy,
+        transfers,
+        connection_id,
+        "/api/workspace_download_ticket",
+        serde_json::json!({
+            "rootPath": root_path,
+            "path": path,
+            "kind": kind,
+        }),
+        save_path,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn remote_ticket_download_stream(
+    app: AppHandle,
+    db: State<'_, AppDatabase>,
+    proxy: State<'_, Arc<RemoteProxyState>>,
+    transfers: State<'_, Arc<WorkspaceTransferManager>>,
+    connection_id: i32,
+    ticket_path: &str,
+    ticket_payload: serde_json::Value,
     save_path: String,
 ) -> Result<RemoteWorkspaceDownloadResult, AppCommandError> {
     let conn = remote_workspace_connection_service::get(&db.conn, connection_id)
@@ -1162,19 +1228,12 @@ async fn remote_workspace_download_stream(
                 )
             })?;
 
-        let ticket_url = format!(
-            "{}/api/workspace_download_ticket",
-            conn.base_url.trim_end_matches('/')
-        );
+        let ticket_url = format!("{}{}", conn.base_url.trim_end_matches('/'), ticket_path);
         let ticket_response = proxy
             .workspace_http
             .post(ticket_url)
             .bearer_auth(conn.token.trim())
-            .json(&serde_json::json!({
-                "rootPath": root_path,
-                "path": path,
-                "kind": kind,
-            }))
+            .json(&ticket_payload)
             .send()
             .await
             .map_err(|e| {
