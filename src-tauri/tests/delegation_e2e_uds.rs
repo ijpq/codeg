@@ -23,8 +23,9 @@ use codeg_lib::acp::delegation::listener::{
 };
 use codeg_lib::acp::delegation::spawner::{mock::MockSpawner, ConnectionSpawner};
 use codeg_lib::acp::delegation::transport::{
-    client_ask_round_trip, client_round_trip, client_status_round_trip, BrokerAskRequest,
-    BrokerRequest, BrokerStatusRequest,
+    client_ask_round_trip, client_deliverables_round_trip, client_round_trip,
+    client_status_round_trip, BrokerAskRequest, BrokerDeliverablesRequest, BrokerRequest,
+    BrokerStatusRequest,
 };
 use codeg_lib::acp::delegation::types::{DelegationError, DelegationOutcome, DelegationSuccess};
 use codeg_lib::acp::question::{
@@ -34,6 +35,13 @@ use codeg_lib::acp::question::{
 use codeg_lib::models::AgentType;
 use serde_json::json;
 use tokio::sync::oneshot;
+
+#[cfg(feature = "test-utils")]
+use codeg_lib::acp::deliverables::{DbSessionDeliverableAccess, DeliverableInput};
+#[cfg(feature = "test-utils")]
+use codeg_lib::db::service::artifact_service::{self, NewTurnRun};
+#[cfg(feature = "test-utils")]
+use codeg_lib::web::event_bridge::EventEmitter;
 
 struct AlwaysRoot;
 #[async_trait]
@@ -162,6 +170,133 @@ impl SessionQuestionAccess for StubQuestions {
             .await
             .retain(|_, (parent, _)| parent != parent_connection_id);
     }
+}
+
+/// Real MCP broker transport → listener → workspace verification → SQLite
+/// persistence. The companion's JSON-RPC tool dispatch is covered separately
+/// in `companion::tests`; this test covers the process boundary that previously
+/// dropped or globally replaced declarations.
+#[cfg(feature = "test-utils")]
+#[tokio::test]
+async fn end_to_end_uds_publish_deliverables_replaces_only_the_active_turn() {
+    let db = codeg_lib::db::test_helpers::fresh_in_memory_db().await;
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(workspace.path().join("报告 (最终).docx"), b"docx").unwrap();
+    std::fs::write(workspace.path().join("报告.pdf"), b"pdf").unwrap();
+    let root = std::fs::canonicalize(workspace.path()).unwrap();
+    let folder_id = codeg_lib::db::test_helpers::seed_folder(&db, &root.to_string_lossy()).await;
+    let conversation_id =
+        codeg_lib::db::test_helpers::seed_conversation(&db, folder_id, AgentType::Codex).await;
+    artifact_service::create_run(
+        &db.conn,
+        NewTurnRun {
+            id: "run-publish".into(),
+            conversation_id,
+            connection_id: "p1".into(),
+            client_message_id: Some("optimistic-publish".into()),
+            folder_id: Some(folder_id),
+            root_path: root.to_string_lossy().to_string(),
+            capture_incomplete: false,
+            input_paths_json: "[]".into(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let mock = Arc::new(MockSpawner::new());
+    let broker = Arc::new(DelegationBroker::new(
+        mock as Arc<dyn ConnectionSpawner>,
+        Arc::new(AlwaysRoot) as Arc<dyn ConversationDepthLookup>,
+    ));
+    let tokens = Arc::new(TokenRegistry::default());
+    tokens
+        .register(
+            "tok".into(),
+            TokenEntry {
+                parent_connection_id: "p1".into(),
+                working_dir: root,
+            },
+        )
+        .await;
+    let listener = DelegationListener::new(
+        broker,
+        tokens,
+        Arc::new(FixedParent(conversation_id)) as Arc<dyn ParentSessionLookup>,
+        Arc::new(NoFeedback) as Arc<dyn codeg_lib::acp::feedback::SessionFeedbackAccess>,
+        Arc::new(StubQuestions::default()) as Arc<dyn SessionQuestionAccess>,
+        Arc::new(NoSessionInfo) as Arc<dyn codeg_lib::acp::session_info::SessionInfoAccess>,
+        Arc::new(DbSessionDeliverableAccess::new(
+            db.conn.clone(),
+            EventEmitter::Noop,
+        )) as Arc<dyn codeg_lib::acp::deliverables::SessionDeliverableAccess>,
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("codeg-e2e-deliverables.sock");
+    let socket_for_listener = socket.clone();
+    let listener_task = tokio::spawn(async move {
+        let _ = listener.run(socket_for_listener).await;
+    });
+    for _ in 0..50 {
+        if socket.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(socket.exists(), "listener never bound the socket");
+
+    let request = |deliverables| BrokerDeliverablesRequest {
+        token: "tok".into(),
+        parent_connection_id: "p1".into(),
+        deliverables,
+    };
+    let first = client_deliverables_round_trip(
+        &socket.to_string_lossy(),
+        &request(vec![
+            DeliverableInput {
+                path: "报告 (最终).docx".into(),
+                title: Some("主报告".into()),
+                description: Some("可直接发送".into()),
+                role: Some("primary".into()),
+            },
+            DeliverableInput {
+                path: "报告.pdf".into(),
+                title: Some("PDF 版本".into()),
+                description: None,
+                role: Some("supporting".into()),
+            },
+        ]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.outcome["published"], true);
+    assert_eq!(first.outcome["accepted"].as_array().unwrap().len(), 2);
+
+    let second = client_deliverables_round_trip(
+        &socket.to_string_lossy(),
+        &request(vec![DeliverableInput {
+            path: "报告.pdf".into(),
+            title: Some("最终 PDF".into()),
+            description: None,
+            role: Some("primary".into()),
+        }]),
+    )
+    .await
+    .unwrap();
+    listener_task.abort();
+    assert_eq!(second.outcome["published"], true);
+
+    let turn = codeg_lib::db::service::deliverable_service::list_for_turn(
+        &db.conn,
+        conversation_id,
+        "run-publish",
+    )
+    .await
+    .unwrap();
+    assert_eq!(turn.len(), 1);
+    assert_eq!(turn[0].file_name, "报告.pdf");
+    assert_eq!(turn[0].title, "最终 PDF");
+    assert_eq!(turn[0].source, "declared");
 }
 
 #[tokio::test]

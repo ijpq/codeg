@@ -6,9 +6,7 @@ use sea_orm::{
     IntoActiveModel, QueryFilter, QueryOrder, Set, TransactionTrait,
 };
 
-use crate::db::entities::conversation_turn_file_change::{
-    self, ConversationTurnFileChangeKind,
-};
+use crate::db::entities::conversation_turn_file_change::{self, ConversationTurnFileChangeKind};
 use crate::db::entities::conversation_turn_run::{self, ConversationTurnRunStatus};
 use crate::db::error::DbError;
 use crate::models::{ConversationTurnArtifactRun, ConversationTurnFileChange};
@@ -22,6 +20,7 @@ pub struct NewTurnRun {
     pub folder_id: Option<i32>,
     pub root_path: String,
     pub capture_incomplete: bool,
+    pub input_paths_json: String,
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +47,8 @@ pub async fn create_run(
         stop_reason: Set(None),
         started_at: Set(now),
         completed_at: Set(None),
+        deliverables_declared_at: Set(None),
+        input_paths_json: Set(input.input_paths_json),
     }
     .insert(conn)
     .await?;
@@ -86,9 +87,7 @@ pub async fn upsert_changes(
     let now = Utc::now();
     for change in changes {
         let existing = conversation_turn_file_change::Entity::find()
-            .filter(
-                conversation_turn_file_change::Column::TurnRunId.eq(turn_run_id.to_string()),
-            )
+            .filter(conversation_turn_file_change::Column::TurnRunId.eq(turn_run_id.to_string()))
             .filter(conversation_turn_file_change::Column::Path.eq(change.path.clone()))
             .one(&txn)
             .await?;
@@ -147,10 +146,7 @@ pub async fn mark_capture_incomplete(
     Ok(())
 }
 
-pub async fn mark_run_ambiguous(
-    conn: &DatabaseConnection,
-    run_id: &str,
-) -> Result<(), DbError> {
+pub async fn mark_run_ambiguous(conn: &DatabaseConnection, run_id: &str) -> Result<(), DbError> {
     let rows = conversation_turn_file_change::Entity::find()
         .filter(conversation_turn_file_change::Column::TurnRunId.eq(run_id.to_string()))
         .all(conn)
@@ -348,6 +344,7 @@ mod tests {
                 folder_id: Some(folder_id),
                 root_path: "/tmp/artifacts".into(),
                 capture_incomplete: false,
+                input_paths_json: "[]".into(),
             },
         )
         .await

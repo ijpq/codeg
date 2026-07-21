@@ -22,10 +22,10 @@ pub use automation::{
 pub use chat_channel::{ChannelStatusInfo, ChatChannelInfo, ChatChannelMessageLogInfo};
 pub use conversation::{
     AgentConversationCount, AgentStats, ConversationDeliverable, ConversationDetail,
-    ConversationSummary, ConversationTurnArtifactRun, ConversationTurnFileChange,
-    DbConversationDetail, DbConversationSummary, FolderInfo, ImportFolderOutcome, ImportResult,
-    ImportSelectedResult, ScanFolder, ScanResult, ScanSession, ScanSessionStatus,
-    SelectedSessionKey, SessionStats, SidebarData,
+    ConversationSummary, ConversationTurnArtifactRun, ConversationTurnDeliverableSet,
+    ConversationTurnFileChange, DbConversationDetail, DbConversationSummary, FolderInfo,
+    ImportFolderOutcome, ImportResult, ImportSelectedResult, ScanFolder, ScanResult, ScanSession,
+    ScanSessionStatus, SelectedSessionKey, SessionStats, SidebarData,
 };
 pub use folder::{
     FolderCommandInfo, FolderDetail, FolderHistoryEntry, OpenedTab, OpenedTabsSnapshot,
