@@ -4,10 +4,17 @@ on:
   push:
     tags:
       - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing release tag whose server assets should be rebuilt"
+        required: true
+        type: string
 
 env:
   RUST_BACKTRACE: short
   HUSKY: 0
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
 
 concurrency:
   group: release-${{ github.ref }}
@@ -27,12 +34,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ env.RELEASE_TAG }}
 
       - id: meta
         name: Resolve release channel
         shell: bash
         run: |
-          if [[ "${GITHUB_REF_NAME}" == *"-rc"* ]]; then
+          if [[ "${RELEASE_TAG}" == *"-rc"* ]]; then
             echo "prerelease=true" >> "$GITHUB_OUTPUT"
           else
             echo "prerelease=false" >> "$GITHUB_OUTPUT"
@@ -43,12 +51,14 @@ jobs:
         run: |
           DEFAULT_BRANCH="${{ github.event.repository.default_branch }}"
           git fetch origin "${DEFAULT_BRANCH}"
+          git fetch --force origin \
+            "+refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
 
-          TAG_COMMIT=$(git rev-list -n 1 "${GITHUB_REF_NAME}")
+          TAG_COMMIT=$(git rev-list -n 1 "${RELEASE_TAG}")
           if git merge-base --is-ancestor "${TAG_COMMIT}" "origin/${DEFAULT_BRANCH}"; then
-            echo "Tag ${GITHUB_REF_NAME} is based on ${DEFAULT_BRANCH}"
+            echo "Tag ${RELEASE_TAG} is based on ${DEFAULT_BRANCH}"
           else
-            echo "Tag ${GITHUB_REF_NAME} is not based on ${DEFAULT_BRANCH}"
+            echo "Tag ${RELEASE_TAG} is not based on ${DEFAULT_BRANCH}"
             exit 1
           fi
 
@@ -61,8 +71,8 @@ jobs:
         shell: bash
         run: |
           APP_VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
-          if [[ "v$APP_VERSION" != "${GITHUB_REF_NAME}" ]]; then
-            echo "Tag ${GITHUB_REF_NAME} does not match app version v$APP_VERSION"
+          if [[ "v$APP_VERSION" != "${RELEASE_TAG}" ]]; then
+            echo "Tag ${RELEASE_TAG} does not match app version v$APP_VERSION"
             exit 1
           fi
 
@@ -71,11 +81,13 @@ jobs:
         uses: actions/github-script@v7
         env:
           PRERELEASE: ${{ steps.meta.outputs.prerelease }}
+          SERVER_ONLY: ${{ github.event_name == 'workflow_dispatch' }}
         with:
           script: |
-            const tag = context.ref.replace("refs/tags/", "");
+            const tag = process.env.RELEASE_TAG;
             const { owner, repo } = context.repo;
             const prerelease = process.env.PRERELEASE === "true";
+            const serverOnly = process.env.SERVER_ONLY === "true";
             const releaseName = `codeg ${tag}`;
             const { data: tagRef } = await github.rest.git.getRef({
               owner,
@@ -124,33 +136,45 @@ jobs:
                 tag,
               });
 
-              if (!existing.data.draft) {
-                core.setFailed(
-                  `Release for tag ${tag} already exists and is not a draft.`,
-                );
-                return;
-              }
-
               release = existing.data;
-              if (
-                release.prerelease !== prerelease ||
-                release.name !== releaseName ||
-                (release.body ?? "").trim() !== releaseBody
-              ) {
-                const updated = await github.rest.repos.updateRelease({
-                  owner,
-                  repo,
-                  release_id: release.id,
-                  name: releaseName,
-                  prerelease,
-                  body: releaseBody,
-                });
-                release = updated.data;
+              if (!release.draft) {
+                if (!serverOnly) {
+                  core.setFailed(
+                    `Release for tag ${tag} already exists and is not a draft.`,
+                  );
+                  return;
+                }
+                core.info(
+                  `Reusing published release #${release.id} for server asset repair`,
+                );
+              } else {
+                if (
+                  release.prerelease !== prerelease ||
+                  release.name !== releaseName ||
+                  (release.body ?? "").trim() !== releaseBody
+                ) {
+                  const updated = await github.rest.repos.updateRelease({
+                    owner,
+                    repo,
+                    release_id: release.id,
+                    name: releaseName,
+                    prerelease,
+                    body: releaseBody,
+                  });
+                  release = updated.data;
+                }
+                core.info(`Reusing existing draft release #${release.id}`);
               }
-              core.info(`Reusing existing draft release #${release.id}`);
             } catch (error) {
               if (error.status !== 404) {
                 throw error;
+              }
+
+              if (serverOnly) {
+                core.setFailed(
+                  `Release for tag ${tag} does not exist; server-only mode only repairs an existing release.`,
+                );
+                return;
               }
 
               const created = await github.rest.repos.createRelease({
@@ -169,10 +193,11 @@ jobs:
 
             core.setOutput("release_id", String(release.id));
             core.setOutput("release_url", release.html_url);
-            core.setOutput("release_body", releaseBody);
+            core.setOutput("release_body", release.body ?? releaseBody);
 
   build-tauri:
     needs: create-draft-release
+    if: github.event_name == 'push'
     name: Build ${{ matrix.name }}
     permissions:
       contents: write
@@ -202,6 +227,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ env.RELEASE_TAG }}
           fetch-depth: 0
 
       - name: Setup pnpm
@@ -667,25 +693,32 @@ jobs:
             runner: "ubuntu-22.04"
             target: "x86_64-unknown-linux-gnu"
             artifact: "codeg-server-linux-x64"
+            archive: "codeg-server-linux-x64.tar.gz"
           - name: "Linux arm64"
             runner: "ubuntu-22.04"
             target: "aarch64-unknown-linux-gnu"
             artifact: "codeg-server-linux-arm64"
+            archive: "codeg-server-linux-arm64.tar.gz"
           - name: "macOS x64"
             runner: "macos-latest"
             target: "x86_64-apple-darwin"
             artifact: "codeg-server-darwin-x64"
+            archive: "codeg-server-darwin-x64.tar.gz"
           - name: "macOS arm64"
             runner: "macos-latest"
             target: "aarch64-apple-darwin"
             artifact: "codeg-server-darwin-arm64"
+            archive: "codeg-server-darwin-arm64.tar.gz"
           - name: "Windows x64"
             runner: "windows-2022"
             target: "x86_64-pc-windows-msvc"
             artifact: "codeg-server-windows-x64"
+            archive: "codeg-server-windows-x64.zip"
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -861,45 +894,139 @@ jobs:
           $hash = (Get-FileHash -Algorithm SHA256 "dist/${{ matrix.artifact }}.zip").Hash.ToLower()
           "$hash  ${{ matrix.artifact }}.zip" | Out-File -Encoding ascii "dist/${{ matrix.artifact }}.zip.sha256"
 
-      - name: Upload signed release bundle (Unix)
-        if: runner.os != 'Windows' && github.event.repository.fork == false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Keep release files as immutable workflow artifacts while desktop
+      # matrix jobs are still mutating the draft release. A single collector
+      # uploads the complete server set after every desktop job has finished.
+      - name: Stage signed upstream release assets
+        if: github.event.repository.fork == false
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-server-${{ matrix.artifact }}
+          path: |
+            dist/${{ matrix.archive }}
+            dist/${{ matrix.archive }}.sig
+            dist/${{ matrix.archive }}.sha256
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Stage unsigned fork release assets
+        if: github.event.repository.fork == true
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-server-${{ matrix.artifact }}
+          path: |
+            dist/${{ matrix.archive }}
+            dist/${{ matrix.archive }}.sha256
+          retention-days: 7
+          if-no-files-found: error
+
+  upload-server-assets:
+    needs:
+      - create-draft-release
+      - build-tauri
+      - build-server
+    if: >-
+      always() &&
+      needs.create-draft-release.result == 'success' &&
+      needs.build-server.result == 'success' &&
+      (github.event_name == 'workflow_dispatch' || needs.build-tauri.result == 'success')
+    name: Upload complete server asset set
+    runs-on: ubuntu-22.04
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Download server release assets
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-server-*
+          path: server-release-assets
+          merge-multiple: true
+
+      - name: Validate complete server asset set
+        shell: bash
         run: |
-          gh release upload "${{ github.ref_name }}" \
-            "dist/${{ matrix.artifact }}.tar.gz" \
-            "dist/${{ matrix.artifact }}.tar.gz.sig" \
-            "dist/${{ matrix.artifact }}.tar.gz.sha256" \
-            --clobber
+          set -euo pipefail
 
-      - name: Upload signed release bundle (Windows)
-        if: runner.os == 'Windows' && github.event.repository.fork == false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${{ github.ref_name }}" "dist/${{ matrix.artifact }}.zip" "dist/${{ matrix.artifact }}.zip.sig" "dist/${{ matrix.artifact }}.zip.sha256" --clobber
+          archives=(
+            codeg-server-linux-x64.tar.gz
+            codeg-server-linux-arm64.tar.gz
+            codeg-server-darwin-x64.tar.gz
+            codeg-server-darwin-arm64.tar.gz
+            codeg-server-windows-x64.zip
+          )
 
-      - name: Upload unsigned fork bundle (Unix)
-        if: runner.os != 'Windows' && github.event.repository.fork == true
+          for archive in "${archives[@]}"; do
+            test -s "server-release-assets/$archive"
+            test -s "server-release-assets/$archive.sha256"
+            if [ "${{ github.event.repository.fork }}" = "false" ]; then
+              test -s "server-release-assets/$archive.sig"
+            fi
+          done
+
+          expected_count=10
+          if [ "${{ github.event.repository.fork }}" = "false" ]; then
+            expected_count=15
+          fi
+          actual_count="$(find server-release-assets -maxdepth 1 -type f | wc -l)"
+          if [ "$actual_count" -ne "$expected_count" ]; then
+            echo "Expected $expected_count server release files, found $actual_count"
+            find server-release-assets -maxdepth 1 -type f -printf '%f\n' | sort
+            exit 1
+          fi
+
+          (
+            cd server-release-assets
+            for checksum in *.sha256; do
+              sha256sum --check "$checksum"
+            done
+          )
+
+      - name: Upload complete server asset set to release
+        shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release upload "$RELEASE_TAG"
+          server-release-assets/*
+          --clobber
+          --repo "$GITHUB_REPOSITORY"
+
+      - name: Verify server assets persisted on release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          gh release upload "${{ github.ref_name }}" \
-            "dist/${{ matrix.artifact }}.tar.gz" \
-            "dist/${{ matrix.artifact }}.tar.gz.sha256" \
-            --clobber
+          set -euo pipefail
 
-      - name: Upload unsigned fork bundle (Windows)
-        if: runner.os == 'Windows' && github.event.repository.fork == true
-        shell: pwsh
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${{ github.ref_name }}" "dist/${{ matrix.artifact }}.zip" "dist/${{ matrix.artifact }}.zip.sha256" --clobber
+          remote_assets="$(
+            gh release view "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json assets \
+              --jq '.assets[].name'
+          )"
+          archives=(
+            codeg-server-linux-x64.tar.gz
+            codeg-server-linux-arm64.tar.gz
+            codeg-server-darwin-x64.tar.gz
+            codeg-server-darwin-arm64.tar.gz
+            codeg-server-windows-x64.zip
+          )
+
+          for archive in "${archives[@]}"; do
+            grep -Fqx "$archive" <<< "$remote_assets"
+            grep -Fqx "$archive.sha256" <<< "$remote_assets"
+            if [ "${{ github.event.repository.fork }}" = "false" ]; then
+              grep -Fqx "$archive.sig" <<< "$remote_assets"
+            fi
+          done
 
   build-docker:
     needs:
       - create-draft-release
       - build-server
     name: Build Docker image
+    if: github.event_name == 'push'
     runs-on: ubuntu-22.04
     permissions:
       contents: read
@@ -991,8 +1118,14 @@ jobs:
       - create-draft-release
       - build-tauri
       - build-server
+      - upload-server-assets
       - build-docker
-    if: ${{ needs.build-tauri.result == 'success' && needs.build-server.result == 'success' && needs.build-docker.result == 'success' }}
+    if: >-
+      github.event_name == 'push' &&
+      needs.build-tauri.result == 'success' &&
+      needs.build-server.result == 'success' &&
+      needs.upload-server-assets.result == 'success' &&
+      needs.build-docker.result == 'success'
     runs-on: ubuntu-22.04
     permissions:
       contents: write
