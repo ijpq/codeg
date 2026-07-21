@@ -1048,6 +1048,7 @@ dependencies = [
  "kill_tree",
  "libc",
  "mac-notification-sys",
+ "mime_guess",
  "minisign-verify",
  "notify",
  "portable-pty",
