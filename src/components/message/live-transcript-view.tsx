@@ -370,6 +370,7 @@ export function LiveTranscriptView({
           showMessageNav={false}
           userTurnHeader={userTurnHeader}
           deliverables={detail?.deliverables}
+          deliverableRuns={detail?.deliverable_runs}
         />
       </div>
     </div>
