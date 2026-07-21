@@ -2,170 +2,147 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
 const mocks = vi.hoisted(() => ({
-  autoDownload: false,
-  desktop: true,
-  downloadWorkspaceDir: vi.fn(),
-  downloadWorkspaceFile: vi.fn(),
-  getHomeDirectory: vi.fn(),
-  markProducedFileSynced: vi.fn(),
-  openFilePreview: vi.fn(),
-  statWorkspaceFile: vi.fn(),
+  copyDeliverableFiles: vi.fn(),
+  downloadDeliverables: vi.fn(),
+  hideDeliverables: vi.fn(),
+  revealDeliverable: vi.fn(),
 }))
 
 vi.mock("next-intl", () => ({
   useTranslations: () => (key: string) => key,
 }))
-vi.mock("@/contexts/workspace-context", () => ({
-  useWorkspaceActions: () => ({ openFilePreview: mocks.openFilePreview }),
+vi.mock("@/hooks/use-deliverable-capabilities", () => ({
+  useDeliverableCapabilities: () => ({
+    hostOs: "windows",
+    copyFiles: true,
+    revealInFolder: true,
+    hostActionNotice: true,
+  }),
 }))
 vi.mock("@/lib/api", () => ({
-  downloadWorkspaceDir: mocks.downloadWorkspaceDir,
-  downloadWorkspaceFile: mocks.downloadWorkspaceFile,
-  getHomeDirectory: mocks.getHomeDirectory,
-  statWorkspaceFile: mocks.statWorkspaceFile,
-}))
-vi.mock("@/lib/produced-file-sync-prefs", () => ({
-  hasSyncedProducedFile: () => false,
-  markProducedFileSynced: mocks.markProducedFileSynced,
-  useAutoDownloadProduced: () => mocks.autoDownload,
-}))
-vi.mock("@/lib/platform", () => ({
-  isLocalDesktop: () => mocks.desktop,
-  revealItemInDir: vi.fn(),
+  copyDeliverableFiles: mocks.copyDeliverableFiles,
+  downloadDeliverables: mocks.downloadDeliverables,
+  hideDeliverables: mocks.hideDeliverables,
+  revealDeliverable: mocks.revealDeliverable,
 }))
 
 import { ConversationDeliverablesPanel } from "./conversation-deliverables-panel"
-import type { ConversationDeliverable, FolderDetail } from "@/lib/types"
+import type { ConversationDeliverable } from "@/lib/types"
 
-const folder: FolderDetail = {
-  id: 7,
-  name: "Project",
-  path: "/repo",
-  git_branch: null,
-  default_agent_type: null,
-  last_opened_at: "2026-07-18T00:00:00Z",
-  sort_order: 0,
-  color: "inherit",
-  parent_id: null,
-  kind: "regular",
-  alias: null,
-}
-
-const deliverables: ConversationDeliverable[] = [
-  {
-    id: "supporting",
+function deliverable(
+  id: string,
+  fileName: string,
+  overrides: Partial<ConversationDeliverable> = {}
+): ConversationDeliverable {
+  return {
+    id,
     conversation_id: 1,
+    turn_run_id: "run-1",
     root_path: "/repo",
-    path: "out/assets",
-    kind: "directory",
-    title: "Assets",
-    role: "supporting",
-    position: 0,
-    source: "agent_declared",
-    verified_at: "2026-07-18T00:00:00Z",
-    created_at: "2026-07-18T00:00:00Z",
-    updated_at: "2026-07-18T00:00:00Z",
-  },
-  {
-    id: "primary",
-    conversation_id: 1,
-    root_path: "/repo",
-    path: "out/report.pdf",
+    path: `out/${fileName}`,
     kind: "file",
-    title: "Final report",
-    description: "Ready to share",
+    title: fileName,
     role: "primary",
-    position: 1,
-    source: "agent_declared",
+    position: 0,
+    source: "declared",
+    file_name: fileName,
+    extension: fileName.split(".").pop() ?? null,
+    size_bytes: 1024,
+    is_valid: true,
     verified_at: "2026-07-18T00:00:00Z",
+    produced_at: "2026-07-18T00:00:00Z",
     created_at: "2026-07-18T00:00:00Z",
     updated_at: "2026-07-18T00:00:00Z",
-  },
-]
+    ...overrides,
+  }
+}
 
 describe("ConversationDeliverablesPanel", () => {
   beforeEach(() => {
     vi.clearAllMocks()
-    mocks.autoDownload = false
-    mocks.desktop = true
-    mocks.downloadWorkspaceDir.mockResolvedValue(undefined)
-    mocks.downloadWorkspaceFile.mockResolvedValue(undefined)
-    mocks.statWorkspaceFile.mockResolvedValue({
-      path: "out/report.pdf",
-      size: 1_024,
-      mtime_ms: 1,
-    })
+    mocks.copyDeliverableFiles.mockResolvedValue({ affected: 1 })
+    mocks.downloadDeliverables.mockResolvedValue({ status: "started" })
+    mocks.hideDeliverables.mockResolvedValue({ affected: 1 })
+    mocks.revealDeliverable.mockResolvedValue({ affected: 1 })
   })
 
-  it("renders only the declared set, with primary outputs first", () => {
+  it("keeps a fixed conversation entry even when the list is empty", () => {
     render(
       <ConversationDeliverablesPanel
-        expanded
+        conversationId={1}
+        expanded={false}
         onToggle={vi.fn()}
-        deliverables={deliverables}
-        folder={folder}
+        deliverables={[]}
       />
     )
 
-    const primary = screen.getByText("Final report")
-    const supporting = screen.getByText("Assets")
-    expect(
-      primary.compareDocumentPosition(supporting) &
-        Node.DOCUMENT_POSITION_FOLLOWING
-    ).toBeTruthy()
-    expect(screen.getByText("Ready to share")).toBeInTheDocument()
+    expect(screen.getByText("collapsedSummary")).toBeInTheDocument()
+  })
+
+  it("renders only persisted deliverables and marks inferred and missing files", () => {
+    render(
+      <ConversationDeliverablesPanel
+        conversationId={1}
+        expanded
+        onToggle={vi.fn()}
+        deliverables={[
+          deliverable("docx", "报告.docx"),
+          deliverable("pdf", "报告.pdf", {
+            source: "inferred",
+            is_valid: false,
+            invalid_reason: "file_not_found",
+          }),
+        ]}
+      />
+    )
+
+    expect(screen.getByText("报告.docx")).toBeInTheDocument()
+    expect(screen.getByText("报告.pdf")).toBeInTheDocument()
+    expect(screen.getByText("inferred")).toBeInTheDocument()
+    expect(screen.getByText("missing")).toBeInTheDocument()
     expect(screen.queryByText("package.json")).not.toBeInTheDocument()
   })
 
-  it("opens a verified file against its persisted root", async () => {
+  it("downloads by deliverable id without sending a source path", async () => {
     render(
       <ConversationDeliverablesPanel
+        conversationId={7}
         expanded
         onToggle={vi.fn()}
-        deliverables={[deliverables[1]]}
-        folder={folder}
+        deliverables={[deliverable("docx-id", "交付 文档.docx")]}
       />
     )
 
-    fireEvent.click(screen.getByRole("button", { name: "openFile" }))
-
+    fireEvent.click(screen.getByRole("button", { name: "download" }))
     await waitFor(() => {
-      expect(mocks.statWorkspaceFile).toHaveBeenCalledWith(
-        "/repo",
-        "out/report.pdf"
-      )
-      expect(mocks.openFilePreview).toHaveBeenCalledWith(
-        "/repo/out/report.pdf",
-        { folderId: folder.id }
-      )
+      expect(mocks.downloadDeliverables).toHaveBeenCalledWith({
+        conversationId: 7,
+        deliverableIds: ["docx-id"],
+        archive: false,
+        suggestedName: "交付 文档.docx",
+      })
     })
   })
 
-  it("auto-downloads verified files and directories in web mode", async () => {
-    mocks.autoDownload = true
-    mocks.desktop = false
-
+  it("copies selected files as one host clipboard operation", async () => {
     render(
       <ConversationDeliverablesPanel
+        conversationId={9}
         expanded
         onToggle={vi.fn()}
-        deliverables={deliverables}
-        folder={folder}
+        deliverables={[deliverable("a", "A.pdf"), deliverable("b", "B.pdf")]}
       />
     )
 
+    for (const checkbox of screen.getAllByRole("checkbox", {
+      name: "selectFile",
+    })) {
+      fireEvent.click(checkbox)
+    }
+    fireEvent.click(screen.getByRole("button", { name: "copySelectedHost" }))
+
     await waitFor(() => {
-      expect(mocks.downloadWorkspaceFile).toHaveBeenCalledTimes(1)
-      expect(mocks.downloadWorkspaceFile).toHaveBeenCalledWith(
-        "/repo",
-        "out/report.pdf",
-        "report.pdf"
-      )
-      expect(mocks.downloadWorkspaceDir).toHaveBeenCalledWith(
-        "/repo",
-        "out/assets",
-        "assets"
-      )
+      expect(mocks.copyDeliverableFiles).toHaveBeenCalledWith(9, ["a", "b"])
     })
   })
 })

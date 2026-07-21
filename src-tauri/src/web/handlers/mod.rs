@@ -7,6 +7,7 @@ pub mod chat_channel;
 pub mod conversations;
 pub mod custom_skills;
 pub mod delegation;
+pub mod deliverables;
 mod error;
 pub mod event_metrics;
 pub mod experts;

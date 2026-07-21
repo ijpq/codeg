@@ -1,11 +1,16 @@
 import { describe, expect, it } from "vitest"
 
 import {
+  associateDeliverablesWithUserTurns,
   mergeConsecutiveAssistantTurns,
   type MergedAssistantRunCache,
   type ResolvedMessageGroup,
   type ThreadRenderItem,
 } from "./message-list-view"
+import type {
+  ConversationDeliverable,
+  ConversationTurnDeliverableSet,
+} from "@/lib/types"
 
 type ThreadItem = Parameters<typeof mergeConsecutiveAssistantTurns>[0][number]
 type TurnItem = Extract<ThreadItem, { kind: "turn" }>
@@ -60,6 +65,80 @@ describe("mergeConsecutiveAssistantTurns", () => {
     expect(merged).toHaveLength(1)
     const item = merged[0] as TurnItem
     expect(item.group.completed_at).toBe("2026-07-19T05:25:22.851Z")
+  })
+})
+
+describe("associateDeliverablesWithUserTurns", () => {
+  const deliverable = (id: string) => ({ id }) as ConversationDeliverable
+  const run = (
+    id: string,
+    clientMessageId: string | null,
+    startedAt: string,
+    completedAt: string,
+    outputId: string
+  ): ConversationTurnDeliverableSet => ({
+    turn_run_id: id,
+    conversation_id: 1,
+    client_message_id: clientMessageId,
+    started_at: startedAt,
+    completed_at: completedAt,
+    deliverables: [deliverable(outputId)],
+  })
+
+  it("uses the exact live client message id when it still exists", () => {
+    const mapped = associateDeliverablesWithUserTurns(
+      [
+        run(
+          "run-1",
+          "optimistic-1",
+          "2026-07-20T10:00:00Z",
+          "2026-07-20T10:01:00Z",
+          "output-1"
+        ),
+      ],
+      [{ id: "optimistic-1", timestamp: "2026-07-20T10:00:01Z" }]
+    )
+    expect(mapped.get("optimistic-1")?.[0].id).toBe("output-1")
+  })
+
+  it("recovers the producing reply by timestamp after a cold parser reload", () => {
+    const mapped = associateDeliverablesWithUserTurns(
+      [
+        run(
+          "run-1",
+          "optimistic-gone",
+          "2026-07-20T10:00:00Z",
+          "2026-07-20T10:05:00Z",
+          "output-1"
+        ),
+      ],
+      [
+        { id: "old-turn", timestamp: "2026-07-20T09:00:00Z" },
+        { id: "parsed-user-turn", timestamp: "2026-07-20T10:00:01Z" },
+        // A steer recorded later in the same run must not steal the card from
+        // the initial user prompt.
+        { id: "parsed-steer", timestamp: "2026-07-20T10:03:00Z" },
+      ]
+    )
+    expect(mapped.get("parsed-user-turn")?.[0].id).toBe("output-1")
+    expect(mapped.has("old-turn")).toBe(false)
+    expect(mapped.has("parsed-steer")).toBe(false)
+  })
+
+  it("does not guess when every user turn is outside the run window", () => {
+    const mapped = associateDeliverablesWithUserTurns(
+      [
+        run(
+          "run-1",
+          "optimistic-gone",
+          "2026-07-20T10:00:00Z",
+          "2026-07-20T10:01:00Z",
+          "output-1"
+        ),
+      ],
+      [{ id: "unrelated", timestamp: "2026-07-20T12:00:00Z" }]
+    )
+    expect(mapped.size).toBe(0)
   })
 })
 

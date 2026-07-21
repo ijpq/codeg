@@ -1189,6 +1189,8 @@ impl ConnectionManager {
         let artifact_capture_started = if let (Some(cid), Some(root_path)) =
             (conversation_id_for_status, working_dir_for_artifacts)
         {
+            let input_paths =
+                crate::artifact_tracker::input_paths_from_prompt(&blocks, &root_path);
             match self
                 .artifact_tracker
                 .begin_turn(
@@ -1198,6 +1200,7 @@ impl ConnectionManager {
                     user_message.as_ref().map(|(id, _)| id.clone()),
                     folder_id.or(state_folder_id),
                     root_path,
+                    input_paths,
                     emitter.clone(),
                     event_seq_before_prompt,
                 )

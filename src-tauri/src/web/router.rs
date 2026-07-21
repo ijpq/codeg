@@ -96,6 +96,33 @@ pub fn build_router(
             "/get_folder_conversation",
             post(handlers::conversations::get_folder_conversation),
         )
+        // ─── Confirmed deliverables ───
+        // JSON operations are authenticated and accept database ids only. A
+        // short-lived one-use ticket is the sole unauthenticated download
+        // capability so browsers can stream large files without buffering.
+        .route(
+            "/deliverable_capabilities",
+            post(handlers::deliverables::capabilities),
+        )
+        .route(
+            "/list_conversation_deliverables",
+            post(handlers::deliverables::list_for_conversation),
+        )
+        .route(
+            "/list_turn_deliverables",
+            post(handlers::deliverables::list_for_turn),
+        )
+        .route(
+            "/list_conversation_deliverable_runs",
+            post(handlers::deliverables::list_runs_for_conversation),
+        )
+        .route(
+            "/create_deliverable_download_ticket",
+            post(handlers::deliverables::create_download_ticket),
+        )
+        .route("/copy_deliverables", post(handlers::deliverables::copy))
+        .route("/reveal_deliverable", post(handlers::deliverables::reveal))
+        .route("/hide_deliverables", post(handlers::deliverables::hide))
         .route(
             "/list_opened_tabs",
             post(handlers::conversations::list_opened_tabs),
@@ -1227,6 +1254,10 @@ pub fn build_router(
         .route(
             "/workspace_download/{ticket}",
             get(handlers::workspace_files::consume_download_ticket),
+        )
+        .route(
+            "/deliverable_download/{ticket}",
+            get(handlers::deliverables::consume_download_ticket),
         )
         .route(
             "/backup_download/{ticket}",

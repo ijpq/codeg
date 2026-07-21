@@ -49,7 +49,9 @@ use crate::acp::delegation::transport::{
     BrokerCancelTaskRequest, BrokerCommitFeedbackRequest, BrokerDeliverablesRequest,
     BrokerFeedbackRequest, BrokerRequest, BrokerResponse, BrokerSessionRequest, BrokerStatusRequest,
 };
-use crate::acp::deliverables::{PublishDeliverablesArgs, MAX_DELIVERABLES_PER_CALL};
+use crate::acp::deliverables::PublishDeliverablesArgs;
+#[cfg(test)]
+use crate::acp::deliverables::MAX_DELIVERABLES_PER_CALL;
 use crate::acp::question::parse_questions;
 use crate::acp::session_info::MAX_SESSION_MESSAGES;
 
@@ -550,24 +552,15 @@ async fn build_tools_call_spawn(
         "publish_deliverables" => {
             let args: PublishDeliverablesArgs =
                 match serde_json::from_value::<PublishDeliverablesArgs>(arguments) {
-                Ok(args) if args.deliverables.len() <= MAX_DELIVERABLES_PER_CALL => args,
-                Ok(_) => {
-                    return LineAction::Respond(err(
-                        id,
-                        -32602,
-                        format!(
-                            "publish_deliverables accepts at most {MAX_DELIVERABLES_PER_CALL} items"
-                        ),
-                    ));
-                }
-                Err(error) => {
-                    return LineAction::Respond(err(
-                        id,
-                        -32602,
-                        format!("invalid publish_deliverables arguments: {error}"),
-                    ));
-                }
-            };
+                    Ok(args) => args,
+                    Err(error) => {
+                        return LineAction::Respond(err(
+                            id,
+                            -32602,
+                            format!("invalid publish_deliverables arguments: {error}"),
+                        ));
+                    }
+                };
             let req = BrokerDeliverablesRequest {
                 token: ctx.token.clone(),
                 parent_connection_id: ctx.parent_connection_id.clone(),
@@ -1845,10 +1838,14 @@ mod tests {
             }
         })
         .to_string();
-        let response = unwrap_respond(
+        // Structurally valid declarations reach the Server even when they are
+        // over the item limit. The Server records that the tool was invoked,
+        // then rejects it atomically so fallback inference cannot guess a
+        // different output set for this turn.
+        assert!(matches!(
             dispatch_with_features(DELIVERABLES_ONLY, &too_many).await,
-        );
-        assert_eq!(response.error.unwrap().code, -32602);
+            LineAction::Spawn(_)
+        ));
     }
 
     #[test]

@@ -1,29 +1,18 @@
 use sea_orm::entity::prelude::*;
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
-#[sea_orm(table_name = "conversation_deliverable")]
+#[sea_orm(table_name = "conversation_turn_deliverable")]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: String,
     pub conversation_id: i32,
-    pub turn_run_id: Option<String>,
-    pub root_path: String,
-    pub path: String,
-    pub kind: String,
+    pub turn_run_id: String,
+    pub deliverable_id: String,
+    pub source: String,
     pub title: String,
     pub description: Option<String>,
     pub role: String,
     pub position: i32,
-    pub source: String,
-    pub file_name: String,
-    pub extension: Option<String>,
-    pub size_bytes: Option<i64>,
-    pub modified_at: Option<DateTimeUtc>,
-    pub is_valid: bool,
-    pub invalid_reason: Option<String>,
-    pub is_hidden: bool,
-    pub verified_at: DateTimeUtc,
-    pub last_checked_at: Option<DateTimeUtc>,
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
 }
@@ -42,8 +31,12 @@ pub enum Relation {
         to = "super::conversation_turn_run::Column::Id"
     )]
     TurnRun,
-    #[sea_orm(has_many = "super::conversation_turn_deliverable::Entity")]
-    TurnAssociations,
+    #[sea_orm(
+        belongs_to = "super::conversation_deliverable::Entity",
+        from = "Column::DeliverableId",
+        to = "super::conversation_deliverable::Column::Id"
+    )]
+    Deliverable,
 }
 
 impl Related<super::conversation::Entity> for Entity {
@@ -58,9 +51,9 @@ impl Related<super::conversation_turn_run::Entity> for Entity {
     }
 }
 
-impl Related<super::conversation_turn_deliverable::Entity> for Entity {
+impl Related<super::conversation_deliverable::Entity> for Entity {
     fn to() -> RelationDef {
-        Relation::TurnAssociations.def()
+        Relation::Deliverable.def()
     }
 }
 

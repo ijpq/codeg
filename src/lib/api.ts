@@ -1,5 +1,6 @@
 import {
   getActiveRemoteConnectionId,
+  getServerBaseUrl,
   getShellTransport,
   getTransport,
   isDesktop,
@@ -56,6 +57,8 @@ import type {
   WorktreeResolution,
   DbConversationSummary,
   ImportResult,
+  ConversationDeliverable,
+  ConversationTurnDeliverableSet,
   OpenedTab,
   OpenedTabsSnapshot,
   SaveTabsOutcome,
@@ -3763,4 +3766,168 @@ export async function scanExternalConflictsWeb(
     { uploadId, passphrase: passphrase ?? null },
     { timeoutMs: BACKUP_LONG_CALL_TIMEOUT_MS }
   )
+}
+
+// ─── Confirmed deliverables ───
+
+export interface DeliverableCapabilities {
+  hostOs: string
+  copyFiles: boolean
+  revealInFolder: boolean
+  /** Native copy/reveal actions affect the Codeg host, not this browser. */
+  hostActionNotice: boolean
+}
+
+export interface DeliverableOperationResult {
+  affected: number
+}
+
+export interface DeliverableSaveResult {
+  savedPath: string
+  bytes: number
+}
+
+export async function getDeliverableCapabilities(): Promise<DeliverableCapabilities> {
+  return getTransport().call<DeliverableCapabilities>(
+    "deliverable_capabilities",
+    {}
+  )
+}
+
+export async function listConversationDeliverables(
+  conversationId: number
+): Promise<ConversationDeliverable[]> {
+  return getTransport().call<ConversationDeliverable[]>(
+    "list_conversation_deliverables",
+    { conversationId }
+  )
+}
+
+export async function listTurnDeliverables(
+  conversationId: number,
+  turnRunId: string
+): Promise<ConversationDeliverable[]> {
+  return getTransport().call<ConversationDeliverable[]>(
+    "list_turn_deliverables",
+    { conversationId, turnRunId }
+  )
+}
+
+export async function listConversationDeliverableRuns(
+  conversationId: number
+): Promise<ConversationTurnDeliverableSet[]> {
+  return getTransport().call<ConversationTurnDeliverableSet[]>(
+    "list_conversation_deliverable_runs",
+    { conversationId }
+  )
+}
+
+export async function copyDeliverableFiles(
+  conversationId: number,
+  deliverableIds: string[]
+): Promise<DeliverableOperationResult> {
+  return getTransport().call<DeliverableOperationResult>("copy_deliverables", {
+    conversationId,
+    deliverableIds,
+  })
+}
+
+export async function revealDeliverable(
+  conversationId: number,
+  deliverableId: string
+): Promise<DeliverableOperationResult> {
+  return getTransport().call<DeliverableOperationResult>("reveal_deliverable", {
+    conversationId,
+    deliverableId,
+  })
+}
+
+export async function hideDeliverables(
+  conversationId: number,
+  deliverableIds: string[]
+): Promise<DeliverableOperationResult> {
+  return getTransport().call<DeliverableOperationResult>("hide_deliverables", {
+    conversationId,
+    deliverableIds,
+  })
+}
+
+export async function downloadDeliverables(args: {
+  conversationId: number
+  deliverableIds: string[]
+  archive?: boolean
+  suggestedName?: string
+}): Promise<WorkspaceDownloadResult> {
+  const archive = Boolean(args.archive || args.deliverableIds.length !== 1)
+  const suggestedName =
+    args.suggestedName ??
+    (archive ? `codeg-deliverables-${args.conversationId}.zip` : "deliverable")
+
+  if (isDesktop() && !isRemoteDesktopMode()) {
+    const { save } = await import("@tauri-apps/plugin-dialog")
+    const destination = await save({ defaultPath: suggestedName })
+    if (!destination) return { status: WORKSPACE_DOWNLOAD_CANCELLED }
+    const result = await getShellTransport().call<DeliverableSaveResult>(
+      "save_deliverables",
+      {
+        conversationId: args.conversationId,
+        deliverableIds: args.deliverableIds,
+        archive,
+        destination,
+      },
+      { timeoutMs: 600_000 }
+    )
+    return {
+      status: "done",
+      savedPath: result.savedPath,
+      bytes: result.bytes,
+    }
+  }
+
+  if (isRemoteDesktopMode()) {
+    const connectionId = getActiveRemoteConnectionId()
+    if (connectionId === null) {
+      throw new Error("downloadDeliverables (remote): no active connection")
+    }
+    const { save } = await import("@tauri-apps/plugin-dialog")
+    const savePath = await save({ defaultPath: suggestedName })
+    if (!savePath) return { status: WORKSPACE_DOWNLOAD_CANCELLED }
+    const { invoke } = await import("@tauri-apps/api/core")
+    try {
+      const result = await invoke<{ transferId: string; bytes: number }>(
+        "remote_download_deliverables",
+        {
+          connectionId,
+          conversationId: args.conversationId,
+          deliverableIds: args.deliverableIds,
+          archive,
+          savePath,
+        }
+      )
+      return {
+        status: "done",
+        savedPath: savePath,
+        bytes: result.bytes,
+        transferId: result.transferId,
+      }
+    } catch (error) {
+      if (isRemoteAuthenticationFailed(error)) {
+        notifyRemoteDesktopUnauthorized()
+      }
+      throw error
+    }
+  }
+
+  const ticket = await getTransport().call<WorkspaceDownloadTicket>(
+    "create_deliverable_download_ticket",
+    {
+      conversationId: args.conversationId,
+      deliverableIds: args.deliverableIds,
+      archive,
+    }
+  )
+  const base = getServerBaseUrl() || window.location.origin
+  const url = new URL(ticket.url, `${base.replace(/\/+$/, "")}/`).toString()
+  openBrowserDownloadUrl(url, ticket.filename || suggestedName)
+  return { status: "started" }
 }

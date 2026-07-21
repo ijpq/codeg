@@ -8,6 +8,7 @@ pub mod chat_channel;
 pub mod conversations;
 pub mod custom_skills;
 pub mod delegation;
+pub mod deliverables;
 pub mod experts;
 pub mod feedback;
 #[cfg(feature = "tauri-runtime")]

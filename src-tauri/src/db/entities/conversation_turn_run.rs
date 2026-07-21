@@ -30,6 +30,8 @@ pub struct Model {
     pub stop_reason: Option<String>,
     pub started_at: DateTimeUtc,
     pub completed_at: Option<DateTimeUtc>,
+    pub deliverables_declared_at: Option<DateTimeUtc>,
+    pub input_paths_json: String,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -44,6 +46,8 @@ pub enum Relation {
     FileChanges,
     #[sea_orm(has_many = "super::conversation_deliverable::Entity")]
     Deliverables,
+    #[sea_orm(has_many = "super::conversation_turn_deliverable::Entity")]
+    DeliverableAssociations,
 }
 
 impl Related<super::conversation::Entity> for Entity {
@@ -61,6 +65,12 @@ impl Related<super::conversation_turn_file_change::Entity> for Entity {
 impl Related<super::conversation_deliverable::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::Deliverables.def()
+    }
+}
+
+impl Related<super::conversation_turn_deliverable::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::DeliverableAssociations.def()
     }
 }
 

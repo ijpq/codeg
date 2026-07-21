@@ -420,6 +420,7 @@ function SubAgentSessionBody({
           hideEmptyState={false}
           showMessageNav={false}
           deliverables={detail?.deliverables}
+          deliverableRuns={detail?.deliverable_runs}
         />
       </div>
     </div>
