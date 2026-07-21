@@ -21,6 +21,7 @@ import { useActiveFolder } from "@/contexts/active-folder-context"
 import { useAuxPanelContext } from "@/contexts/aux-panel-context"
 import { useTabStore } from "@/contexts/tab-context"
 import { useTerminalContext } from "@/contexts/terminal-context"
+import { useIsMobile } from "@/hooks/use-mobile"
 import {
   useWorkspaceActions,
   useWorkspaceFileTabs,
@@ -1088,7 +1089,12 @@ function RenderNode({
 export function FileTreeTab() {
   const t = useTranslations("Folder.fileTreeTab")
   const tCommon = useTranslations("Folder.common")
-  const { pendingRevealPath, consumePendingRevealPath } = useAuxPanelContext()
+  const {
+    pendingRevealPath,
+    consumePendingRevealPath,
+    setOpen: setAuxOpen,
+  } = useAuxPanelContext()
+  const isMobile = useIsMobile()
   // Defer the folder so a cross-folder conversation-tab switch commits first and
   // this tab's heavy tree rebuild (remount, applyLazyTreeOverrides, per-row
   // ContextMenus) runs in a non-blocking transition a frame later instead of
@@ -1664,8 +1670,11 @@ export function FileTreeTab() {
       treeContainerRef.current?.focus({ preventScroll: true })
       if (!filePathSet.has(path)) return
       void openFilePreview(path)
+      // On mobile the file tree lives in a Sheet overlay — close it so the
+      // opened file is visible in the main pane.
+      if (isMobile) setAuxOpen(false)
     },
-    [filePathSet, openFilePreview]
+    [filePathSet, openFilePreview, isMobile, setAuxOpen]
   )
 
   // ─── File-tree keyboard navigation (IDEA-style project tree) ───

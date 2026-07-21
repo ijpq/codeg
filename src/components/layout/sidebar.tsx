@@ -188,6 +188,10 @@ export function Sidebar() {
   }, [allExpanded])
 
   const handleNewConversation = useCallback(() => {
+    // On mobile the sidebar is a Sheet overlay — close it so the new
+    // conversation is visible (mirrors tapping a conversation card, which the
+    // list wrapper already closes on).
+    if (isMobile) toggle()
     // Starting a conversation always returns to the conversation workspace (in
     // case a route like Automations was taking over the content region).
     openConversations()
@@ -199,7 +203,14 @@ export function Sidebar() {
       return
     }
     openNewConversationTab(activeFolder.id, activeFolder.path)
-  }, [activeFolder, openChatModeTab, openNewConversationTab, openConversations])
+  }, [
+    activeFolder,
+    openChatModeTab,
+    openNewConversationTab,
+    openConversations,
+    isMobile,
+    toggle,
+  ])
 
   if (!isOpen) return null
 

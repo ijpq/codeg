@@ -10,12 +10,7 @@ import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
 import { resolveActiveSessionDetails } from "@/components/conversations/active-session-details"
 import { SessionDetailsContent } from "@/components/conversations/session-details-content"
 import { ScrollArea } from "@/components/ui/scroll-area"
-import { useActiveFolder } from "@/contexts/active-folder-context"
-import { useIsActiveChatMode } from "@/hooks/use-is-active-chat-mode"
-import { useIsMobile } from "@/hooks/use-mobile"
 import { useAuxPanelContext } from "@/contexts/aux-panel-context"
-import { BranchDropdown } from "./branch-dropdown"
-import { CommandDropdown } from "./command-dropdown"
 
 // Stable empty-turns reference so the `useShallow` slice below stays
 // reference-equal when there's no active session — otherwise a fresh `[]` each
@@ -25,9 +20,9 @@ const EMPTY_TURNS: MessageTurn[] = []
 
 /**
  * The aux-panel "Session Details" tab. Shows the active conversation's metadata
- * and token usage (via the shared `SessionDetailsContent`), with a folder-scoped
- * actions bar hosting the branch selector + command launcher relocated here from
- * the top title bar.
+ * and token usage (via the shared `SessionDetailsContent`). The branch selector
+ * + command launcher that used to sit atop this tab now live in the bottom
+ * status bar on both platforms, so the tab shows the details alone.
  *
  * Details are resolved from live runtime state exactly the way the conversation
  * detail panel does it (`resolveActiveSessionDetails`), so no network fetch is
@@ -36,9 +31,6 @@ const EMPTY_TURNS: MessageTurn[] = []
 export function SessionDetailsTab() {
   const t = useTranslations("Folder.sessionDetails")
   const { isOpen, activeTab } = useAuxPanelContext()
-  const { activeFolderId } = useActiveFolder()
-  const isChatMode = useIsActiveChatMode()
-  const isMobile = useIsMobile()
 
   const tabs = useTabStore((s) => s.tabs)
   const activeTabId = useTabStore((s) => s.activeTabId)
@@ -83,22 +75,8 @@ export function SessionDetailsTab() {
     conversations
   )
 
-  // Branch + command are folder-scoped and self-hide in chat mode / without a
-  // folder. This actions bar is now MOBILE-ONLY: on desktop the branch selector
-  // moved to the bottom status bar and the folder chip to the conversation
-  // header, so the desktop aux "session details" tab shows the details alone.
-  // The mobile Sheet has no status bar / header to host them, so it keeps this
-  // bar unchanged.
-  const showFolderActions = isMobile && activeFolderId != null && !isChatMode
-
   return (
     <div className="flex h-full min-h-0 flex-col overflow-hidden">
-      {showFolderActions && (
-        <div className="flex shrink-0 items-center justify-between gap-2 border-b border-border px-3 py-2">
-          <BranchDropdown />
-          <CommandDropdown />
-        </div>
-      )}
       {summary ? (
         <ScrollArea className="min-h-0 flex-1">
           <div className="p-3">

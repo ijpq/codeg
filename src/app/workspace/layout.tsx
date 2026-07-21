@@ -337,7 +337,7 @@ function WorkspaceContent({ children }: { children: React.ReactNode }) {
                 )}
                 <div className="flex min-w-0 flex-1 items-stretch">
                   {hasConvTabs ? (
-                    <TabBar embedded />
+                    <TabBar />
                   ) : (
                     // No tabs → TabBar renders null; keep a drag region so the
                     // empty bar can still move the window.
@@ -427,7 +427,7 @@ function WorkspaceContent({ children }: { children: React.ReactNode }) {
                   />
                 )}
                 <div className="flex min-w-0 flex-1 items-stretch">
-                  <FileWorkspaceTabBar embedded />
+                  <FileWorkspaceTabBar />
                 </div>
                 {fileReservesRight && (
                   <div
@@ -479,15 +479,19 @@ function MobileWorkspaceContent({ children }: { children: React.ReactNode }) {
     <div className="relative h-full min-h-0 overflow-hidden">
       <div className="h-full min-h-0" inert={!isConversations || undefined}>
         {showConversation ? (
+          // Mobile mirrors the desktop chrome: no tab strip — the conversation
+          // detail header (folder › title) renders inside {children}, and tabs
+          // are navigated from the sidebar (single active conversation at a time).
           <section className="flex h-full min-h-0 flex-col overflow-hidden">
-            <TabBar />
             <div className="relative flex-1 min-h-0 overflow-hidden">
               {children}
             </div>
           </section>
         ) : (
+          // File view: the shared FileWorkspaceHeader (folder › file breadcrumb)
+          // replaces the file tab strip, matching the desktop file column.
           <section className="flex h-full min-h-0 flex-col overflow-hidden">
-            <FileWorkspaceTabBar />
+            <FileWorkspaceHeader />
             <div className="flex-1 min-h-0 overflow-hidden">
               <FileWorkspacePanel />
             </div>
