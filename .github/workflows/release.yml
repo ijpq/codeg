@@ -892,7 +892,7 @@ jobs:
         shell: pwsh
         run: |
           $hash = (Get-FileHash -Algorithm SHA256 "dist/${{ matrix.artifact }}.zip").Hash.ToLower()
-          "$hash  ${{ matrix.artifact }}.zip" | Out-File -Encoding ascii "dist/${{ matrix.artifact }}.zip.sha256"
+          "$hash  ${{ matrix.artifact }}.zip`n" | Out-File -Encoding ascii -NoNewline "dist/${{ matrix.artifact }}.zip.sha256"
 
       # Keep release files as immutable workflow artifacts while desktop
       # matrix jobs are still mutating the draft release. A single collector
@@ -974,6 +974,11 @@ jobs:
             find server-release-assets -maxdepth 1 -type f -printf '%f\n' | sort
             exit 1
           fi
+
+          # PowerShell-produced checksum files from older workflow runs may
+          # use CRLF. Normalize before feeding them to GNU sha256sum so the
+          # trailing CR is not interpreted as part of the archive filename.
+          sed -i 's/\r$//' server-release-assets/*.sha256
 
           (
             cd server-release-assets
