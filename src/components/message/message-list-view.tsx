@@ -57,8 +57,8 @@ import {
 import type {
   AgentType,
   ConversationDeliverable,
+  ConversationTurnDeliverableSet,
   ConnectionStatus,
-  FolderDetail,
   SessionStats,
 } from "@/lib/types"
 import { copyTextToClipboard } from "@/lib/utils"
@@ -68,6 +68,7 @@ import {
   type MessageNavEntry,
 } from "@/components/message/conversation-message-nav"
 import { ConversationDeliverablesPanel } from "@/components/message/conversation-deliverables-panel"
+import { ReplyDeliverables } from "@/components/message/reply-deliverables"
 import type { MessageScrollContextValue } from "@/components/message/message-scroll-context"
 import { extractSessionFilesGrouped } from "@/lib/session-files"
 import { unescapeComposerText } from "@/lib/composer-copy-text"
@@ -97,16 +98,18 @@ interface MessageListViewProps {
    * conversation view; disabled in compact embeds (e.g. the sub-agent dialog).
    */
   showMessageNav?: boolean
-  /** Folder owned by this conversation, not necessarily the globally active
-   *  one. Folderless chat mode passes its hidden scratch-folder record. */
-  folder?: FolderDetail | null
   /** Explicit final outputs verified and persisted by the backend. */
   deliverables?: ConversationDeliverable[]
+  /** Per-turn output associations used at the producing assistant reply. */
+  deliverableRuns?: ConversationTurnDeliverableSet[]
 }
 
 export interface ResolvedMessageGroup {
   id: string
   role: "user" | "assistant" | "system"
+  /** Source turn timestamp, retained so durable backend run ids can be
+   * correlated after optimistic client ids disappear on a cold reload. */
+  timestamp?: string
   parts: AdaptedContentPart[]
   resources: UserResourceDisplay[]
   images: UserImageDisplay[]
@@ -131,6 +134,7 @@ export type ThreadRenderItem =
       showStats: boolean
       isRoleTransition: boolean
       previousUserIndex: number | null
+      previousUserId?: string | null
     }
   | {
       key: string
@@ -149,6 +153,75 @@ const EMPTY_DELEGATIONS: DelegationCardSource[] = []
 // when a conversation has no user messages.
 const EMPTY_NAV_ENTRIES: MessageNavEntry[] = []
 const EMPTY_DELIVERABLES: ConversationDeliverable[] = []
+
+export interface DeliverableUserTurnRef {
+  id: string
+  timestamp?: string
+}
+
+/**
+ * Prefer the exact optimistic client message id while a session is live. On a
+ * cold parser reload that id is no longer present in the transcript, so match
+ * the durable turn-run start to the nearest user turn inside the run's time
+ * window. This deliberately refuses distant guesses: the conversation-level
+ * panel remains available even when a historical reply cannot be correlated
+ * safely.
+ */
+export function associateDeliverablesWithUserTurns(
+  runs: ConversationTurnDeliverableSet[],
+  userTurns: DeliverableUserTurnRef[]
+): Map<string, ConversationDeliverable[]> {
+  const result = new Map<string, ConversationDeliverable[]>()
+  const userIds = new Set(userTurns.map((turn) => turn.id))
+  const used = new Set<string>()
+  const unresolved: ConversationTurnDeliverableSet[] = []
+
+  for (const run of runs) {
+    if (run.client_message_id && userIds.has(run.client_message_id)) {
+      result.set(run.client_message_id, run.deliverables)
+      used.add(run.client_message_id)
+    } else {
+      unresolved.push(run)
+    }
+  }
+
+  const candidates = userTurns
+    .filter((turn) => !used.has(turn.id))
+    .map((turn) => ({ ...turn, time: Date.parse(turn.timestamp ?? "") }))
+    .filter((turn) => Number.isFinite(turn.time))
+
+  for (const run of [...unresolved].sort(
+    (left, right) => Date.parse(left.started_at) - Date.parse(right.started_at)
+  )) {
+    const started = Date.parse(run.started_at)
+    if (!Number.isFinite(started)) continue
+    const completed = Date.parse(run.completed_at ?? "")
+    const latest = Number.isFinite(completed)
+      ? completed + 60_000
+      : started + 5 * 60_000
+    let best: (typeof candidates)[number] | null = null
+    for (const candidate of candidates) {
+      if (
+        used.has(candidate.id) ||
+        candidate.time < started - 60_000 ||
+        candidate.time > latest
+      ) {
+        continue
+      }
+      if (
+        best === null ||
+        Math.abs(candidate.time - started) < Math.abs(best.time - started)
+      ) {
+        best = candidate
+      }
+    }
+    if (best) {
+      result.set(best.id, run.deliverables)
+      used.add(best.id)
+    }
+  }
+  return result
+}
 
 // Collect the `delegate_to_agent` tool calls within a turn's adapted parts,
 // recursing through tool-groups and goal-runs (a delegate call is normally a
@@ -479,13 +552,19 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
   dimmed = false,
   showStats = true,
   previousUserIndex = null,
+  previousUserId = null,
   isResponseComplete = true,
+  conversationId,
+  deliverables = EMPTY_DELIVERABLES,
 }: {
   group: ResolvedMessageGroup
   dimmed?: boolean
   showStats?: boolean
   previousUserIndex?: number | null
+  previousUserId?: string | null
   isResponseComplete?: boolean
+  conversationId: number
+  deliverables?: ConversationDeliverable[]
 }) {
   if (group.role === "system") {
     return <CollapsibleSystemMessage group={group} />
@@ -513,6 +592,12 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
           <UserResourceLinks resources={group.resources} className="self-end" />
         ) : null}
       </Message>
+      {group.role === "assistant" && previousUserId && (
+        <ReplyDeliverables
+          conversationId={conversationId}
+          deliverables={deliverables}
+        />
+      )}
       {showStats && group.role === "assistant" && (
         <TurnStats
           usage={group.usage}
@@ -580,8 +665,8 @@ export function MessageListView({
   onReload,
   onNewSession,
   showMessageNav = true,
-  folder,
   deliverables = EMPTY_DELIVERABLES,
+  deliverableRuns = [],
 }: MessageListViewProps) {
   const t = useTranslations("Folder.chat.messageList")
   const sharedT = useTranslations("Folder.chat.shared")
@@ -668,6 +753,7 @@ export function MessageListView({
         group = {
           id: msg.id,
           role,
+          timestamp: msg.timestamp,
           parts: msg.content,
           resources: msg.userResources ?? [],
           images: msg.userImages ?? [],
@@ -690,6 +776,7 @@ export function MessageListView({
         showStats: false,
         isRoleTransition: false,
         previousUserIndex: null,
+        previousUserId: null,
       }
     })
 
@@ -701,6 +788,7 @@ export function MessageListView({
     // previousUserIndex points at the closest preceding user turn (used by the
     // post-stream stats row's "jump to previous user message" button).
     let lastUserIdx: number | null = null
+    let lastUserId: string | null = null
     for (let idx = 0; idx < items.length; idx++) {
       const item = items[idx]
       if (item.kind !== "turn") continue
@@ -710,6 +798,7 @@ export function MessageListView({
       item.showStats = false
       item.isRoleTransition = false
       item.previousUserIndex = null
+      item.previousUserId = null
 
       // isRoleTransition: role differs from previous turn item
       if (idx > 0) {
@@ -721,6 +810,7 @@ export function MessageListView({
 
       if (item.group.role === "user") {
         lastUserIdx = idx
+        lastUserId = item.group.id
       }
 
       // showStats: only on the last assistant turn before a non-assistant or end
@@ -729,6 +819,7 @@ export function MessageListView({
         if (!next || next.kind !== "turn" || next.group.role !== "assistant") {
           item.showStats = true
           item.previousUserIndex = lastUserIdx
+          item.previousUserId = lastUserId
         }
       }
     }
@@ -761,28 +852,51 @@ export function MessageListView({
     [historicalPlanEntries]
   )
 
-  const renderThreadItem = useCallback((item: ThreadRenderItem) => {
-    switch (item.kind) {
-      case "turn": {
-        const pt = item.isRoleTransition ? 16 : 0
-        return (
-          <div style={pt > 0 ? { paddingTop: pt } : undefined}>
-            <HistoricalMessageGroup
-              group={item.group}
-              dimmed={item.phase === "optimistic"}
-              showStats={item.showStats}
-              previousUserIndex={item.previousUserIndex}
-              isResponseComplete={item.phase === "persisted"}
-            />
-          </div>
+  const deliverablesByUserId = useMemo(
+    () =>
+      associateDeliverablesWithUserTurns(
+        deliverableRuns,
+        threadItems.flatMap((item) =>
+          item.kind === "turn" && item.group.role === "user"
+            ? [{ id: item.group.id, timestamp: item.group.timestamp }]
+            : []
         )
+      ),
+    [deliverableRuns, threadItems]
+  )
+
+  const renderThreadItem = useCallback(
+    (item: ThreadRenderItem) => {
+      switch (item.kind) {
+        case "turn": {
+          const pt = item.isRoleTransition ? 16 : 0
+          return (
+            <div style={pt > 0 ? { paddingTop: pt } : undefined}>
+              <HistoricalMessageGroup
+                group={item.group}
+                dimmed={item.phase === "optimistic"}
+                showStats={item.showStats}
+                previousUserIndex={item.previousUserIndex}
+                previousUserId={item.previousUserId}
+                isResponseComplete={item.phase === "persisted"}
+                conversationId={conversationId}
+                deliverables={
+                  item.previousUserId
+                    ? deliverablesByUserId.get(item.previousUserId)
+                    : undefined
+                }
+              />
+            </div>
+          )
+        }
+        case "typing":
+          return <PendingTypingIndicator />
+        default:
+          return null
       }
-      case "typing":
-        return <PendingTypingIndicator />
-      default:
-        return null
-    }
-  }, [])
+    },
+    [conversationId, deliverablesByUserId]
+  )
 
   const emptyState = useMemo(
     () =>
@@ -1000,7 +1114,7 @@ export function MessageListView({
           edge), rounded on the end side — that expand toward the inline-end on
           hover. Logical `start-0` + `items-start` keep the anchor and the bullet
           on the same side, so the whole stack mirrors cleanly in RTL. */}
-      <div className="pointer-events-none absolute start-0 top-4 z-20 flex max-w-[min(22rem,calc(100%-2rem))] flex-col items-start gap-2">
+      <div className="pointer-events-none absolute start-0 top-4 z-20 flex max-w-[min(30rem,calc(100%-2rem))] flex-col items-start gap-2">
         {showMessageNav && userMessageCount > 0 && (
           <ConversationMessageNav
             count={userMessageCount}
@@ -1010,14 +1124,13 @@ export function MessageListView({
             scrollApiRef={scrollApiRef}
           />
         )}
-        {deliverables.length > 0 && (
-          <ConversationDeliverablesPanel
-            expanded={deliverablesExpanded}
-            onToggle={setDeliverablesExpanded}
-            deliverables={deliverables}
-            folder={folder}
-          />
-        )}
+        <ConversationDeliverablesPanel
+          conversationId={conversationId}
+          expanded={deliverablesExpanded}
+          onToggle={setDeliverablesExpanded}
+          deliverables={deliverables}
+          deliverableRuns={deliverableRuns}
+        />
         <AgentPlanOverlay
           key={agentPlanOverlayKey}
           message={liveMessage ?? null}

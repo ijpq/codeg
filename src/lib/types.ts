@@ -527,6 +527,8 @@ export interface DbConversationDetail {
   /** Agent-declared final outputs that the backend verified inside the
    * conversation workspace. */
   deliverables?: ConversationDeliverable[]
+  /** Confirmed outputs grouped by the producing backend turn run. */
+  deliverable_runs?: ConversationTurnDeliverableSet[]
 }
 
 export interface ConversationDeliverable {
@@ -540,11 +542,29 @@ export interface ConversationDeliverable {
   description?: string | null
   role: "primary" | "supporting"
   position: number
-  source: "agent_declared"
+  source: "declared" | "inferred"
+  file_name: string
+  extension?: string | null
   size_bytes?: number | null
+  modified_at?: string | null
+  is_valid: boolean
+  invalid_reason?: string | null
   verified_at: string
+  last_checked_at?: string | null
+  turn_client_message_id?: string | null
+  turn_started_at?: string | null
+  produced_at: string
   created_at: string
   updated_at: string
+}
+
+export interface ConversationTurnDeliverableSet {
+  turn_run_id: string
+  conversation_id: number
+  client_message_id?: string | null
+  started_at: string
+  completed_at?: string | null
+  deliverables: ConversationDeliverable[]
 }
 
 export type ConversationTurnArtifactStatus =

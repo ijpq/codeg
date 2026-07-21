@@ -22,6 +22,7 @@ pub struct NewTurnRun {
     pub folder_id: Option<i32>,
     pub root_path: String,
     pub capture_incomplete: bool,
+    pub input_paths_json: String,
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +49,8 @@ pub async fn create_run(
         stop_reason: Set(None),
         started_at: Set(now),
         completed_at: Set(None),
+        deliverables_declared_at: Set(None),
+        input_paths_json: Set(input.input_paths_json),
     }
     .insert(conn)
     .await?;
@@ -348,6 +351,7 @@ mod tests {
                 folder_id: Some(folder_id),
                 root_path: "/tmp/artifacts".into(),
                 capture_incomplete: false,
+                input_paths_json: "[]".into(),
             },
         )
         .await

@@ -199,7 +199,7 @@ fn header_safe_filename(name: &str) -> String {
         .collect()
 }
 
-fn attachment_header(name: &str) -> Option<HeaderValue> {
+pub(crate) fn attachment_header(name: &str) -> Option<HeaderValue> {
     HeaderValue::from_str(&format!(
         "attachment; filename=\"{}\"; filename*=UTF-8''{}",
         header_safe_filename(name),
@@ -687,10 +687,10 @@ pub(crate) async fn stream_file_response(
     let body = Body::from_stream(body_stream);
 
     let mut headers = HeaderMap::new();
-    headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/octet-stream"),
-    );
+    let content_type = mime_guess::from_path(target).first_or_octet_stream();
+    if let Ok(value) = HeaderValue::from_str(content_type.as_ref()) {
+        headers.insert(header::CONTENT_TYPE, value);
+    }
     if let Ok(v) = HeaderValue::from_str(&size.to_string()) {
         headers.insert(header::CONTENT_LENGTH, v);
     }

@@ -9,6 +9,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use async_trait::async_trait;
 use sea_orm::DatabaseConnection;
@@ -62,9 +63,24 @@ pub struct PublishDeliverablesOutcome {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct ConversationDeliverablesChanged {
+pub(crate) struct ConversationDeliverablesChanged {
     conversation_id: i32,
     deliverable_ids: Vec<String>,
+}
+
+pub(crate) fn emit_deliverables_changed(
+    emitter: &EventEmitter,
+    conversation_id: i32,
+    deliverable_ids: Vec<String>,
+) {
+    emit_event(
+        emitter,
+        CONVERSATION_DELIVERABLES_CHANGED_EVENT,
+        ConversationDeliverablesChanged {
+            conversation_id,
+            deliverable_ids,
+        },
+    );
 }
 
 #[async_trait]
@@ -167,6 +183,48 @@ impl SessionDeliverableAccess for DbSessionDeliverableAccess {
         items: Vec<DeliverableInput>,
     ) -> PublishDeliverablesOutcome {
         let mut outcome = PublishDeliverablesOutcome::default();
+        let turn_run_id = match deliverable_service::active_turn_run_id(
+            &self.db,
+            conversation_id,
+            parent_connection_id,
+        )
+        .await
+        {
+            Ok(Some(id)) => id,
+            Ok(None) => {
+                outcome.rejected.push(rejected(
+                    "",
+                    "the target turn is no longer running; no deliverables were changed",
+                ));
+                return outcome;
+            }
+            Err(err) => {
+                outcome.rejected.push(rejected(
+                    "",
+                    format!("failed to resolve the active turn: {err}"),
+                ));
+                return outcome;
+            }
+        };
+        match deliverable_service::mark_declaration_attempt(&self.db, conversation_id, &turn_run_id)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                outcome.rejected.push(rejected(
+                    "",
+                    "the target turn ended before the declaration was accepted",
+                ));
+                return outcome;
+            }
+            Err(err) => {
+                outcome.rejected.push(rejected(
+                    "",
+                    format!("failed to record the declaration attempt: {err}"),
+                ));
+                return outcome;
+            }
+        }
         if items.len() > MAX_DELIVERABLES_PER_CALL {
             outcome.rejected.push(rejected(
                 "",
@@ -267,6 +325,25 @@ impl SessionDeliverableAccess for DbSessionDeliverableAccess {
                 ));
                 continue;
             };
+            let file_name = canonical
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| default_title(&canonical, &root));
+            let extension = canonical
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .map(|extension| extension.to_ascii_lowercase());
+            let modified_at = metadata
+                .modified()
+                .ok()
+                .and_then(|modified| modified.duration_since(SystemTime::UNIX_EPOCH).ok())
+                .and_then(|duration| {
+                    chrono::DateTime::<chrono::Utc>::from_timestamp(
+                        i64::try_from(duration.as_secs()).ok()?,
+                        duration.subsec_nanos(),
+                    )
+                });
 
             let title = match bounded_text(item.title, MAX_TITLE_CHARS) {
                 Ok(Some(title)) => title,
@@ -303,7 +380,10 @@ impl SessionDeliverableAccess for DbSessionDeliverableAccess {
                 title,
                 description,
                 role: role.to_string(),
+                file_name,
+                extension,
                 size_bytes,
+                modified_at,
             });
         }
 
@@ -317,26 +397,10 @@ impl SessionDeliverableAccess for DbSessionDeliverableAccess {
             .iter()
             .map(|item| item.path.clone())
             .collect::<Vec<_>>();
-        let turn_run_id = match deliverable_service::active_turn_run_id(
+        let saved = match deliverable_service::replace_declared_for_turn(
             &self.db,
             conversation_id,
-            parent_connection_id,
-        )
-        .await
-        {
-            Ok(id) => id,
-            Err(err) => {
-                outcome.rejected.push(rejected(
-                    "",
-                    format!("failed to resolve the active turn: {err}"),
-                ));
-                return outcome;
-            }
-        };
-        let saved = match deliverable_service::upsert_verified(
-            &self.db,
-            conversation_id,
-            turn_run_id,
+            &turn_run_id,
             verified,
         )
         .await
@@ -358,13 +422,10 @@ impl SessionDeliverableAccess for DbSessionDeliverableAccess {
 
         outcome.published = true;
         outcome.accepted = saved.iter().map(to_accepted).collect();
-        emit_event(
+        emit_deliverables_changed(
             &self.emitter,
-            CONVERSATION_DELIVERABLES_CHANGED_EVENT,
-            ConversationDeliverablesChanged {
-                conversation_id,
-                deliverable_ids: saved.into_iter().map(|item| item.id).collect(),
-            },
+            conversation_id,
+            saved.into_iter().map(|item| item.id).collect(),
         );
         outcome
     }
@@ -380,7 +441,9 @@ pub fn shared_access(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::service::artifact_service::{self, NewTurnRun};
     use crate::models::AgentType;
+    use sea_orm::EntityTrait;
 
     #[test]
     fn relative_path_rejects_sibling_workspace() {
@@ -420,6 +483,24 @@ mod tests {
         let folder_id = crate::db::test_helpers::seed_folder(&db, &workspace_path).await;
         let conversation_id =
             crate::db::test_helpers::seed_conversation(&db, folder_id, AgentType::Codex).await;
+        artifact_service::create_run(
+            &db.conn,
+            NewTurnRun {
+                id: "run-1".into(),
+                conversation_id,
+                connection_id: "connection-1".into(),
+                client_message_id: Some("message-1".into()),
+                folder_id: Some(folder_id),
+                root_path: std::fs::canonicalize(workspace.path())
+                    .expect("canonical workspace")
+                    .to_string_lossy()
+                    .to_string(),
+                capture_incomplete: false,
+                input_paths_json: "[]".into(),
+            },
+        )
+        .await
+        .expect("active run");
         let access = DbSessionDeliverableAccess::new(db.conn.clone(), EventEmitter::Noop);
         let result = access
             .publish_deliverables(
@@ -451,6 +532,15 @@ mod tests {
         assert!(result.accepted.is_empty());
         assert_eq!(result.rejected.len(), 1);
         assert!(result.rejected[0].reason.contains("outside"));
+        let run = crate::db::entities::conversation_turn_run::Entity::find_by_id("run-1")
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            run.deliverables_declared_at.is_some(),
+            "a rejected publish call must still suppress fallback inference"
+        );
 
         let persisted = deliverable_service::list_for_conversation(&db.conn, conversation_id)
             .await

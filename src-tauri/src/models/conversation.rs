@@ -123,6 +123,10 @@ pub struct DbConversationDetail {
     /// against the conversation workspace by codeg.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deliverables: Vec<ConversationDeliverable>,
+    /// Per-turn associations for rendering the confirmed outputs directly
+    /// below the assistant reply that produced them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deliverable_runs: Vec<ConversationTurnDeliverableSet>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -142,13 +146,43 @@ pub struct ConversationDeliverable {
     pub role: String,
     /// Zero-based order from the latest complete declaration.
     pub position: i32,
-    /// agent_declared (reserved for future user-pinned declarations).
+    /// `declared` for publish_deliverables, `inferred` for the conservative
+    /// filesystem-event compatibility fallback.
     pub source: String,
+    pub file_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size_bytes: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modified_at: Option<DateTime<Utc>>,
+    pub is_valid: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invalid_reason: Option<String>,
     pub verified_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_checked_at: Option<DateTime<Utc>>,
+    /// Client-side user message id associated with the producing turn. This is
+    /// the stable bridge from backend turn-run rows to transcript rendering.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_client_message_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_started_at: Option<DateTime<Utc>>,
+    pub produced_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationTurnDeliverableSet {
+    pub turn_run_id: String,
+    pub conversation_id: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_message_id: Option<String>,
+    pub started_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<DateTime<Utc>>,
+    pub deliverables: Vec<ConversationDeliverable>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

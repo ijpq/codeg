@@ -10,6 +10,7 @@ pub use super::chat_channel_sender_context::Entity as ChatChannelSenderContext;
 pub use super::chat_channel_thread_binding::Entity as ChatChannelThreadBinding;
 pub use super::conversation::Entity as Conversation;
 pub use super::conversation_deliverable::Entity as ConversationDeliverable;
+pub use super::conversation_turn_deliverable::Entity as ConversationTurnDeliverable;
 pub use super::conversation_turn_file_change::Entity as ConversationTurnFileChange;
 pub use super::conversation_turn_run::Entity as ConversationTurnRun;
 pub use super::folder::Entity as Folder;
