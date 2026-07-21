@@ -10,6 +10,7 @@ pub mod conversations;
 pub mod custom_agents;
 pub mod custom_skills;
 pub mod delegation;
+pub mod deliverables;
 pub mod experts;
 pub mod feedback;
 #[cfg(feature = "tauri-runtime")]
@@ -20,9 +21,9 @@ pub mod folders;
 pub mod logging;
 pub mod mcp;
 pub mod model_provider;
-pub mod office_tools;
 #[cfg(feature = "tauri-runtime")]
 pub mod notification;
+pub mod office_tools;
 pub mod pet;
 pub mod project_boot;
 pub mod question;
