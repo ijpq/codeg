@@ -2011,7 +2011,9 @@
 /* Browser-style tab separators (embedded desktop title-bar tab strips).
    Each tab draws a hairline on its LEFT edge; the line is suppressed for the
    first tab and around any active / hovered tab (Chrome behavior) using only
-   adjacent-sibling selectors — no :has(), so it is robust across webviews. */
+   adjacent-sibling selectors — no :has(), so it is robust across webviews.
+   Tone: `--border` off-image; boosted to `--ws-chrome-border` under a workspace
+   background so it matches the tab arch / strip-line border (rule below). */
 .browser-tab-item {
   position: relative;
 }
@@ -2046,9 +2048,10 @@
    the flush-pinned button wrapper begins, has none. Same hairline geometry as
    `.browser-tab-item::before` (the wrapper shares the tabs' flex box, so the
    `calc(50% - 3px)` nudge centers it on the strip midline identically) and the
-   same `var(--border)` tone, so it reads as just another inter-tab separator.
-   Suppressed when the last tab is active or hovered, mirroring how a tab drops
-   the separators flanking the active/hovered tab. */
+   same tone (`--border` off-image, `--ws-chrome-border` on — see below), so it
+   reads as just another inter-tab separator. Suppressed when the last tab is
+   active or hovered, mirroring how a tab drops the separators flanking the
+   active/hovered tab. */
 .tab-strip-tail::before {
   content: "";
   position: absolute;
@@ -2065,6 +2068,16 @@
 .browser-tab-item[data-active="true"] + .tab-strip-tail::before,
 .browser-tab-item:hover + .tab-strip-tail::before {
   opacity: 0;
+}
+
+/* Under a workspace background image, lift the inter-tab separators (and the
+   trailing new-conversation divider) to the boosted `--ws-chrome-border` so they
+   match the tab's own arch / strip-line border color instead of the faint
+   theme `--border`, which washes out on the frosted strip. Off-image they stay
+   `--border` (above). Covers both the conversation and file tab strips. */
+[data-workspace-bg="on"] .browser-tab-item::before,
+[data-workspace-bg="on"] .tab-strip-tail::before {
+  background: var(--ws-chrome-border);
 }
 
 /* Embedded tab label — no ellipsis: fade the right edge so an overflowing title
@@ -2155,16 +2168,18 @@
    detail header. A dedicated span hosts these because the tab's own surface is
    `overflow-hidden` (it would clip the outboard flares) and its ::before is
    already the separator hairline. It is rendered for every embedded tab but
-   stays invisible (opacity 0) until the tab is active OR hovered — so hovering
-   a tab reveals the same reverse corners. The fill matches the tab surface:
-   solid `var(--background)` for the active tab, and the translucent hover shade
-   (`bg-background/60`) for a hovered non-active tab, so the concave never pops
-   as solid white. The radial-gradient mask carves the concave quarter (no color
-   seam). Since the item has no horizontal padding, the seat spans the surface
-   flush (`left/right: 0`) and each flare reaches 0.5rem outward; that fits
-   exactly within the group's `px-2` padding, so `overflow-hidden` never clips
-   the first/last tab's flare. The active tab is elevated (`z-10` on the item),
-   so a hovered neighbour's flare can never paint over the active tab's corner. */
+   stays invisible (opacity 0) until the tab is ACTIVE. Only the active tab's
+   solid `var(--background)` body reaches the strip bottom, so its feet flare from
+   real corners and read cleanly. A hovered non-active tab instead shows a
+   floating inset pill (`browser-tab-hover`, inset 2/2/8/2) that stops 8px short
+   of the bottom; revealing the feet under it left two concave nubs disconnected
+   from the pill at the bottom corners, so hover no longer reveals the seat. The
+   radial-gradient mask carves the concave quarter (no color seam). Since the item
+   has no horizontal padding, the seat spans the surface flush (`left/right: 0`)
+   and each flare reaches 0.5rem outward; that fits exactly within the group's
+   `px-2` padding, so `overflow-hidden` never clips the first/last tab's flare.
+   The active tab is elevated (`z-10` on the item), so a hovered neighbour's flare
+   can never paint over the active tab's corner. */
 .browser-tab-seat {
   position: absolute;
   bottom: 0;
@@ -2180,8 +2195,7 @@
     transition: none;
   }
 }
-.browser-tab-item[data-active="true"] .browser-tab-seat,
-.browser-tab-item:hover .browser-tab-seat {
+.browser-tab-item[data-active="true"] .browser-tab-seat {
   opacity: 1;
 }
 .browser-tab-seat::before,
@@ -2192,12 +2206,6 @@
   height: 0.5rem;
   width: 0.5rem;
   background-color: var(--background);
-}
-/* Hovered (non-active) tab: match its translucent hover fill so the concave
-   corner blends with the hover surface instead of popping solid white. */
-.browser-tab-item:not([data-active="true"]):hover .browser-tab-seat::before,
-.browser-tab-item:not([data-active="true"]):hover .browser-tab-seat::after {
-  background-color: color-mix(in oklab, var(--background) 60%, transparent);
 }
 .browser-tab-seat::before {
   left: -0.5rem;
@@ -2218,17 +2226,10 @@
   mask-image: radial-gradient(circle at top right, transparent 7px, #000 8px);
 }
 /* Workspace 背景图开启：所有 tab 全透明，seat 反向圆角默认不显示（否则透明 tab 会挂
-   var(--background) 白色小圆角）；hover 的非激活 tab 也抑制其填充凹角，保持全透明基调。 */
+   var(--background) 白色小圆角）。非激活 tab 的 seat 已不随 hover 显示（见上「仅激活」），
+   激活 tab 的脚在下方用真实 border 重画。 */
 [data-workspace-bg="on"] .browser-tab-seat::before,
 [data-workspace-bg="on"] .browser-tab-seat::after {
-  background-color: transparent;
-}
-[data-workspace-bg="on"]
-  .browser-tab-item:not([data-active="true"]):hover
-  .browser-tab-seat::before,
-[data-workspace-bg="on"]
-  .browser-tab-item:not([data-active="true"]):hover
-  .browser-tab-seat::after {
   background-color: transparent;
 }
 /* 激活 tab 的两个反向圆角脚（bg-on）：用**真实 border + border-radius** 画 1px 凹弧描边，
