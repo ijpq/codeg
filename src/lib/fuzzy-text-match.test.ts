@@ -58,14 +58,51 @@ describe("rankByTextMatch", () => {
     expect(short.map((c) => c.name)).toContain("bmad-help")
   })
 
-  it("ranks exact/prefix above subsequence", () => {
+  it("ranks exact > prefix > subsequence (shorter wins ties)", () => {
     const items = [
-      { name: "bh" },
-      { name: "bmad-help" },
-      { name: "batch" },
+      { name: "batch" }, // subsequence b..h
+      { name: "bh-tool" }, // prefix
+      { name: "bh" }, // exact
+      { name: "bmad-help" }, // subsequence, longer than batch
     ]
     const ranked = rankByTextMatch("bh", items, (i) => i.name)
-    expect(ranked[0].name).toBe("bh")
+    expect(ranked.map((i) => i.name)).toEqual([
+      "bh",
+      "bh-tool",
+      "batch",
+      "bmad-help",
+    ])
+  })
+
+  it("keeps any primary match above any secondary match", () => {
+    const items = [
+      { name: "zzz", tag: "bh" }, // secondary exact
+      { name: "batch", tag: "zzz" }, // primary subsequence (b..h)
+    ]
+    // Weakest primary (subsequence) still outranks strongest secondary (exact).
+    const ranked = rankByTextMatch(
+      "bh",
+      items,
+      (i) => i.name,
+      (i) => i.tag
+    )
+    expect(ranked.map((i) => i.name)).toEqual(["batch", "zzz"])
+  })
+
+  it("preserves input order for equally-scored matches (stable sort)", () => {
+    const items = [
+      { id: 1, name: "abc" },
+      { id: 2, name: "abc" },
+      { id: 3, name: "abc" },
+    ]
+    const ranked = rankByTextMatch("abc", items, (i) => i.name)
+    expect(ranked.map((i) => i.id)).toEqual([1, 2, 3])
+  })
+
+  it("skips items with empty primary text without matching", () => {
+    const items = [{ name: "" }, { name: "bmad-help" }]
+    const ranked = rankByTextMatch("bmad", items, (i) => i.name)
+    expect(ranked.map((i) => i.name)).toEqual(["bmad-help"])
   })
 
   it("falls back to secondary field below primary hits", () => {
