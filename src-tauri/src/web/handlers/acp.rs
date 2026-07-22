@@ -9,7 +9,8 @@ use crate::acp::opencode_plugins::PluginCheckSummary;
 use crate::acp::preflight::PreflightResult;
 use crate::acp::types::{
     AcpAgentInfo, AcpAgentStatus, AgentDiagnosticsReport, AgentSkillContent, AgentSkillLayout,
-    AgentSkillScope, AgentSkillsListResult, ConnectionInfo, ForkResultInfo, SteerResult,
+    AgentSkillScope, AgentSkillsListResult, ConnectionInfo, ForkResultInfo,
+    RestoredConversationConnectionInfo, SteerResult,
 };
 use crate::app_error::{AppCommandError, AppErrorCode};
 use crate::app_state::AppState;
@@ -112,6 +113,43 @@ pub async fn acp_connect(
         .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
 
     Ok(Json(connection_id))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpRestoreConversationParams {
+    pub conversation_id: i32,
+    #[serde(default)]
+    pub preferred_mode_id: Option<String>,
+    #[serde(default)]
+    pub preferred_config_values: Option<BTreeMap<String, String>>,
+}
+
+pub async fn acp_restore_conversation(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<AcpRestoreConversationParams>,
+) -> Result<Json<RestoredConversationConnectionInfo>, AppCommandError> {
+    let result = acp_commands::acp_restore_conversation_core(
+        params.conversation_id,
+        params.preferred_mode_id,
+        params.preferred_config_values.unwrap_or_default(),
+        &state.connection_manager,
+        &state.db,
+        &state.data_dir,
+        "web".to_string(),
+        state.emitter.clone(),
+    )
+    .await
+    .map_err(|error| {
+        let message = error.to_string();
+        match error {
+            AcpError::TurnInProgress => {
+                AppCommandError::new(AppErrorCode::TurnInProgress, message)
+            }
+            _ => AppCommandError::task_execution_failed(message),
+        }
+    })?;
+    Ok(Json(result))
 }
 
 #[derive(Deserialize)]

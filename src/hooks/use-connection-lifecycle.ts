@@ -187,7 +187,13 @@ export function useConnectionLifecycle({
   }, [isActive, contextKey, setActiveKey, touchActivity])
 
   // Auto-connect when tab becomes active and workingDir is available.
-  // Depends on isActive + workingDir + agentType so that connections wait
+  // Depends on isActive + workingDir + agentType + persisted identities so
+  // that a detail/runtime load resolving `sessionId` cannot strand the early
+  // `session_id=None` connection. `connect()` deduplicates an identical target,
+  // while a newly-resolved session/conversation id enters the backend atomic
+  // restore path.
+  //
+  // The working-directory dependency ensures connections wait
   // for folder info to load (workingDir transitions from undefined →
   // folder.path), and so that changing folders or agents on an already-
   // connected tab triggers a reconnect. The context's connect() dedups
@@ -225,7 +231,7 @@ export function useConnectionLifecycle({
     return () => {
       cancelled = true
     }
-  }, [isActive, workingDir, agentType])
+  }, [isActive, workingDir, agentType, sessionId, conversationId])
 
   // Manage task status for connection progress
   const taskIdRef = useRef<string | null>(null)
