@@ -75,6 +75,15 @@ impl ConnectionEventStream {
         self.sender.subscribe()
     }
 
+    /// Number of live per-connection consumers. Today these receivers are the
+    /// WebSocket attach forwarders, so a non-zero value is a server-observed
+    /// lease proving at least one browser still has the conversation open.
+    /// The ACP idle sweep uses this instead of relying solely on browser
+    /// JavaScript timers, which can be suspended while a tab or device sleeps.
+    pub fn receiver_count(&self) -> usize {
+        self.sender.receiver_count()
+    }
+
     /// Broadcast an envelope. Failure (no subscribers) is ignored — the
     /// event is already recorded in `SessionState.recent_events` for the
     /// next attach to pick up via replay.
@@ -1142,5 +1151,18 @@ mod tests {
             let env = rx.try_recv().expect("event delivered");
             assert_eq!(env.seq, s);
         }
+    }
+
+    #[test]
+    fn receiver_count_tracks_live_attach_leases() {
+        let stream = ConnectionEventStream::new();
+        assert_eq!(stream.receiver_count(), 0);
+        let rx1 = stream.subscribe();
+        let rx2 = stream.subscribe();
+        assert_eq!(stream.receiver_count(), 2);
+        drop(rx1);
+        assert_eq!(stream.receiver_count(), 1);
+        drop(rx2);
+        assert_eq!(stream.receiver_count(), 0);
     }
 }

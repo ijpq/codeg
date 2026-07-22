@@ -58,6 +58,15 @@ export function reconnectWebNow(): void {
 }
 
 /**
+ * Verify an apparently healthy WebSocket without blindly tearing it down.
+ * The transport sends an application heartbeat when connected, or performs
+ * the existing authenticated reconnect probe when already disconnected.
+ */
+export function verifyWebConnectionNow(): void {
+  webTransport()?.verifyNow()
+}
+
+/**
  * Funnel a definitive HTTP 401 (e.g. from a raw file-upload fetch in
  * `lib/api.ts` that bypasses `WebTransport.call`) into the same unauthorized
  * dialog state, rather than an abrupt redirect. No-op off the web shell.

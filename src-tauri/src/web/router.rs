@@ -630,6 +630,10 @@ pub fn build_router(
             post(handlers::acp::acp_env_diagnostics),
         )
         .route("/acp_connect", post(handlers::acp::acp_connect))
+        .route(
+            "/acp_restore_conversation",
+            post(handlers::acp::acp_restore_conversation),
+        )
         .route("/acp_disconnect", post(handlers::acp::acp_disconnect))
         .route(
             "/acp_touch_connection",

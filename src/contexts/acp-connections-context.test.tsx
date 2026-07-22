@@ -36,7 +36,10 @@ const h = vi.hoisted(() => {
     acpGetAgentStatus: vi.fn(),
     acpFindConnectionForConversation: vi.fn(),
     acpConnect: vi.fn(),
+    acpRestoreConversation: vi.fn(),
+    acpPrompt: vi.fn(),
     acpDisconnect: vi.fn(),
+    acpTouchConnection: vi.fn(),
     acpGetSessionSnapshot: vi.fn(),
     buildDelegationSeedEnvelopes: vi.fn(() => []),
     denormalizeSnapshot: vi.fn(),
@@ -82,14 +85,15 @@ vi.mock("@/lib/api", () => ({
   acpGetAgentStatus: h.acpGetAgentStatus,
   acpFindConnectionForConversation: h.acpFindConnectionForConversation,
   acpConnect: h.acpConnect,
+  acpRestoreConversation: h.acpRestoreConversation,
   acpDisconnect: h.acpDisconnect,
   acpGetSessionSnapshot: h.acpGetSessionSnapshot,
-  acpPrompt: vi.fn(),
+  acpPrompt: h.acpPrompt,
   acpSetMode: vi.fn(),
   acpSetConfigOption: vi.fn(),
   acpCancel: vi.fn(),
   acpRespondPermission: vi.fn(),
-  acpTouchConnection: vi.fn(),
+  acpTouchConnection: h.acpTouchConnection,
   // Imported by the conversation runtime store (a real dependency of the
   // provider via the background-activity bridge). The settled path no longer
   // refetches (it flips the launch card in-memory); reject any stray call so a
@@ -131,7 +135,10 @@ beforeEach(() => {
   h.acpGetAgentStatus.mockReset()
   h.acpFindConnectionForConversation.mockReset()
   h.acpConnect.mockReset()
+  h.acpRestoreConversation.mockReset()
+  h.acpPrompt.mockReset()
   h.acpDisconnect.mockReset()
+  h.acpTouchConnection.mockReset()
   h.acpGetSessionSnapshot.mockReset()
   h.denormalizeSnapshot.mockReset()
   h.denormalizeSnapshot.mockReturnValue({
@@ -163,7 +170,17 @@ beforeEach(() => {
     installed_version: "1.0.0",
   })
   h.acpConnect.mockResolvedValue("spawned-conn")
+  h.acpRestoreConversation.mockResolvedValue({
+    connectionId: "restored-conn",
+    externalSessionId: "sess-1",
+    reusedExisting: false,
+    codegMcpAvailable: true,
+    mcpServerCount: 1,
+    replacedConnectionIds: [],
+  })
+  h.acpPrompt.mockResolvedValue(undefined)
   h.acpDisconnect.mockResolvedValue(undefined)
+  h.acpTouchConnection.mockResolvedValue(true)
   h.acpGetSessionSnapshot.mockResolvedValue(null)
 })
 
@@ -349,6 +366,305 @@ describe("AcpConnectionsProvider cross-client viewer lifecycle", () => {
     expect(h.buildDelegationSeedEnvelopes).not.toHaveBeenCalled()
     // And teardown never killed the owner's connection.
     expect(h.acpDisconnect).not.toHaveBeenCalled()
+  })
+})
+
+describe("AcpConnectionsProvider persisted Codex restore lifecycle", () => {
+  const CODEX_TAB = "conv-1-codex-42"
+
+  async function mountLegacyCodexConnection() {
+    h.acpConnect.mockResolvedValueOnce("legacy-codex-conn")
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(CODEX_TAB, "codex", "/tmp/x", "sess-1")
+    })
+    const legacyHandlers = latestAttachHandlers()
+    emitAcpEvent(legacyHandlers, {
+      seq: 1,
+      connection_id: "legacy-codex-conn",
+      type: "session_started",
+      session_id: "sess-1",
+    })
+    expect(h.store!.getConnection(CODEX_TAB)).toMatchObject({
+      connectionId: "legacy-codex-conn",
+      sessionId: "sess-1",
+      codegMcpAvailable: false,
+    })
+  }
+
+  it("records the backend conversation binding when a new session becomes persisted", async () => {
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect("new-codex-tab", "codex", "/tmp/x")
+    })
+    const handlers = latestAttachHandlers()
+    emitAcpEvent(handlers, {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "conversation_linked",
+      conversation_id: 77,
+      folder_id: 1,
+      parent_conversation_id: null,
+      parent_tool_use_id: null,
+    })
+
+    expect(h.store!.getConnection("new-codex-tab")?.conversationId).toBe(77)
+  })
+
+  it("replaces a legacy no-MCP connection, resumes the session, and routes the next prompt to the replacement", async () => {
+    await mountLegacyCodexConnection()
+    h.acpRestoreConversation.mockResolvedValueOnce({
+      connectionId: "restored-codex-conn",
+      externalSessionId: "sess-1",
+      reusedExisting: false,
+      codegMcpAvailable: true,
+      mcpServerCount: 3,
+      replacedConnectionIds: ["legacy-codex-conn"],
+    })
+
+    await act(async () => {
+      await h.actions!.connect(CODEX_TAB, "codex", "/tmp/x", "sess-1", 42)
+    })
+
+    expect(h.acpRestoreConversation).toHaveBeenCalledWith(42, undefined, {})
+    expect(h.acpDisconnect).not.toHaveBeenCalledWith("legacy-codex-conn")
+    expect(h.store!.getConnection(CODEX_TAB)).toMatchObject({
+      connectionId: "restored-codex-conn",
+      conversationId: 42,
+      codegMcpAvailable: true,
+      mcpServerCount: 3,
+      isViewer: false,
+    })
+
+    const restoredHandlers = latestAttachHandlers()
+    emitAcpEvent(restoredHandlers, {
+      seq: 1,
+      connection_id: "restored-codex-conn",
+      type: "session_started",
+      session_id: "sess-1",
+    })
+    await act(async () => {
+      await h.actions!.sendPrompt(
+        CODEX_TAB,
+        [{ type: "text", text: "continue" }],
+        { folderId: 1, conversationId: 42 }
+      )
+    })
+    expect(h.acpPrompt).toHaveBeenCalledWith(
+      "restored-codex-conn",
+      [{ type: "text", text: "continue" }],
+      1,
+      42,
+      null
+    )
+  })
+
+  it("deduplicates concurrent repeat restores for one tab", async () => {
+    let resolveRestore: (value: unknown) => void = () => {}
+    h.acpRestoreConversation.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveRestore = resolve
+        })
+    )
+    await mountProvider()
+
+    let first: Promise<void> | undefined
+    await act(async () => {
+      first = h.actions!.connect(CODEX_TAB, "codex", "/tmp/x", "sess-1", 42)
+      await h.actions!.connect(CODEX_TAB, "codex", "/tmp/x", "sess-1", 42)
+    })
+    expect(h.acpRestoreConversation).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      resolveRestore({
+        connectionId: "restored-once",
+        externalSessionId: "sess-1",
+        reusedExisting: false,
+        codegMcpAvailable: true,
+        mcpServerCount: 1,
+        replacedConnectionIds: [],
+      })
+      await first
+    })
+    expect(h.acpRestoreConversation).toHaveBeenCalledTimes(1)
+    expect(h.store!.getConnection(CODEX_TAB)?.connectionId).toBe(
+      "restored-once"
+    )
+  })
+
+  it("does not overwrite the legacy binding when restore fails", async () => {
+    await mountLegacyCodexConnection()
+    h.acpRestoreConversation.mockRejectedValueOnce(new Error("resume failed"))
+
+    await expect(
+      act(async () => {
+        await h.actions!.connect(CODEX_TAB, "codex", "/tmp/x", "sess-1", 42)
+      })
+    ).rejects.toThrow("resume failed")
+
+    expect(h.store!.getConnection(CODEX_TAB)?.connectionId).toBe(
+      "legacy-codex-conn"
+    )
+    expect(h.acpDisconnect).not.toHaveBeenCalledWith("legacy-codex-conn")
+
+    await expect(
+      h.actions!.sendPrompt(
+        CODEX_TAB,
+        [{ type: "text", text: "must not use the legacy session" }],
+        { folderId: 1, conversationId: 42 }
+      )
+    ).rejects.toThrow("Codeg MCP is not ready")
+    expect(h.acpPrompt).not.toHaveBeenCalled()
+  })
+
+  it("retries a deferred no-MCP restore when the legacy in-flight turn completes", async () => {
+    await mountLegacyCodexConnection()
+    h.acpRestoreConversation.mockRejectedValueOnce({
+      code: "turn_in_progress",
+      message: "turn already in progress for this connection",
+    })
+
+    await act(async () => {
+      await h.actions!.connect(CODEX_TAB, "codex", "/tmp/x", "sess-1", 42)
+    })
+    expect(h.acpRestoreConversation).toHaveBeenCalledTimes(1)
+    expect(h.store!.getConnection(CODEX_TAB)?.connectionId).toBe(
+      "legacy-codex-conn"
+    )
+
+    h.acpRestoreConversation.mockResolvedValueOnce({
+      connectionId: "restored-after-turn",
+      externalSessionId: "sess-1",
+      reusedExisting: false,
+      codegMcpAvailable: true,
+      mcpServerCount: 1,
+      replacedConnectionIds: ["legacy-codex-conn"],
+    })
+    const legacyHandlers = latestAttachHandlers()
+    await act(async () => {
+      emitAcpEvent(legacyHandlers, {
+        seq: 2,
+        connection_id: "legacy-codex-conn",
+        type: "turn_complete",
+        session_id: "sess-1",
+        stop_reason: "end_turn",
+      })
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(h.acpRestoreConversation).toHaveBeenCalledTimes(2)
+    expect(h.store!.getConnection(CODEX_TAB)).toMatchObject({
+      connectionId: "restored-after-turn",
+      conversationId: 42,
+      codegMcpAvailable: true,
+    })
+  })
+
+  it("reuses a compatible restored connection as a viewer and never disconnects its owner", async () => {
+    h.acpRestoreConversation.mockResolvedValueOnce({
+      connectionId: "other-client-codex",
+      externalSessionId: "sess-1",
+      reusedExisting: true,
+      codegMcpAvailable: true,
+      mcpServerCount: 2,
+      replacedConnectionIds: [],
+    })
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(CODEX_TAB, "codex", "/tmp/x", "sess-1", 42)
+    })
+    expect(h.store!.getConnection(CODEX_TAB)?.isViewer).toBe(true)
+
+    await act(async () => {
+      await h.actions!.disconnect(CODEX_TAB)
+    })
+    expect(h.acpDisconnect).not.toHaveBeenCalledWith("other-client-codex")
+  })
+
+  it("restores distinct conversations to distinct connection ids", async () => {
+    h.acpRestoreConversation.mockImplementation(async (conversationId) => ({
+      connectionId: `restored-${conversationId}`,
+      externalSessionId: `sess-${conversationId}`,
+      reusedExisting: false,
+      codegMcpAvailable: true,
+      mcpServerCount: 1,
+      replacedConnectionIds: [],
+    }))
+    await mountProvider()
+    await act(async () => {
+      await Promise.all([
+        h.actions!.connect("codex-42", "codex", "/tmp/x", "sess-42", 42),
+        h.actions!.connect("codex-43", "codex", "/tmp/x", "sess-43", 43),
+      ])
+    })
+    expect(h.store!.getConnection("codex-42")?.connectionId).toBe("restored-42")
+    expect(h.store!.getConnection("codex-43")?.connectionId).toBe("restored-43")
+  })
+
+  it("re-runs the same atomic restore after Server restart reports connection_gone", async () => {
+    h.acpRestoreConversation.mockResolvedValueOnce({
+      connectionId: "before-server-restart",
+      externalSessionId: "sess-1",
+      reusedExisting: false,
+      codegMcpAvailable: true,
+      mcpServerCount: 1,
+      replacedConnectionIds: [],
+    })
+    await mountProvider()
+    h.actions!.registerOpenTabKeys(new Set([CODEX_TAB]))
+    await act(async () => {
+      await h.actions!.connect(CODEX_TAB, "codex", "/tmp/x", "sess-1", 42)
+    })
+    const oldHandlers = latestAttachHandlers()
+    h.acpRestoreConversation.mockResolvedValueOnce({
+      connectionId: "after-server-restart",
+      externalSessionId: "sess-1",
+      reusedExisting: false,
+      codegMcpAvailable: true,
+      mcpServerCount: 1,
+      replacedConnectionIds: [],
+    })
+
+    await act(async () => {
+      oldHandlers.onDetached("connection_gone")
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(h.acpRestoreConversation).toHaveBeenCalledTimes(2)
+    expect(h.store!.getConnection(CODEX_TAB)?.connectionId).toBe(
+      "after-server-restart"
+    )
+  })
+})
+
+describe("AcpConnectionsProvider wake keepalive", () => {
+  it("touches an open connected ACP immediately when the tab wakes", async () => {
+    await mountProvider()
+    h.actions!.registerOpenTabKeys(new Set([TAB]))
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1")
+    })
+    emitAcpEvent(latestAttachHandlers(), {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "status_changed",
+      status: "connected",
+    })
+    h.acpTouchConnection.mockClear()
+    const visibility = vi
+      .spyOn(document, "visibilityState", "get")
+      .mockReturnValue("visible")
+
+    await act(async () => {
+      document.dispatchEvent(new Event("visibilitychange"))
+      await Promise.resolve()
+    })
+
+    expect(h.acpTouchConnection).toHaveBeenCalledWith("spawned-conn")
+    visibility.mockRestore()
   })
 })
 

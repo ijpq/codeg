@@ -1103,6 +1103,7 @@ mod tauri_app {
                 acp_commands::acp_cursor_auth_status,
                 acp_commands::acp_cursor_list_models,
                 acp_commands::acp_connect,
+                acp_commands::acp_restore_conversation,
                 acp_commands::acp_prompt,
                 acp_commands::acp_steer,
                 acp_commands::acp_set_mode,
