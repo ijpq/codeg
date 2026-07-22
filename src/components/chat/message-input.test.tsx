@@ -72,8 +72,6 @@ vi.mock("@/components/chat/conversation-context-bar", () => ({
   }: {
     extraContent?: React.ReactNode
   }) => <div data-testid="ctx-bar">{extraContent}</div>,
-  ConversationFolderBranchPicker: () => null,
-  useConversationFolderBranchPickerVisible: () => false,
 }))
 vi.mock("@/lib/platform", () => ({
   isDesktop: () => false,

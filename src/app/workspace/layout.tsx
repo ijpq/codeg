@@ -52,7 +52,7 @@ import {
 } from "@/contexts/workspace-context"
 import { RemoteConnectionGate } from "@/contexts/remote-connection-context"
 import { UpdateProvider } from "@/components/providers/update-provider"
-import { useWorkspaceBackground } from "@/hooks/use-appearance"
+import { useWorkspaceBackground, useZoomLevel } from "@/hooks/use-appearance"
 import { FILL_MODE_STYLE } from "@/lib/workspace-background"
 import { TabBar } from "@/components/tabs/tab-bar"
 import { TerminalPanel } from "@/components/terminal/terminal-panel"
@@ -264,14 +264,16 @@ function WorkspaceContent({ children }: { children: React.ReactNode }) {
   const { isOpen: sidebarOpen } = useSidebarContext()
   const { isOpen: auxOpen } = useAuxPanelContext()
   const { isMac, isWindows, isLinux } = usePlatform()
+  const { zoomLevel } = useZoomLevel()
   const hasConvTabs = useTabStore((s) => s.tabs.length > 0)
   const winLinuxControls = isDesktop() && (isWindows || isLinux)
   // The window chrome (toggle/remote left, terminal/aux/settings right) now
   // lives in fixed corner overlays (see FolderLayoutShell) that never move on
   // panel toggles. Each edge column just reserves the overlay's width so its
-  // tabs never render underneath.
-  const leftReserve = leftChromeReserve(isMac && isDesktop())
-  const rightReserve = rightChromeReserve(winLinuxControls)
+  // tabs never render underneath. The reserve scales with the app zoom so it
+  // tracks the rem-sized overlay buttons (which grow with zoom).
+  const leftReserve = leftChromeReserve(isMac && isDesktop(), zoomLevel)
+  const rightReserve = rightChromeReserve(winLinuxControls, zoomLevel)
   // A middle column reserves the right overlay only when it (not the aux panel)
   // is the window's right edge: the file column in fusion, else conversation.
   const convReservesRight = !auxOpen && mode === "conversation"
@@ -335,7 +337,7 @@ function WorkspaceContent({ children }: { children: React.ReactNode }) {
                 )}
                 <div className="flex min-w-0 flex-1 items-stretch">
                   {hasConvTabs ? (
-                    <TabBar embedded />
+                    <TabBar />
                   ) : (
                     // No tabs → TabBar renders null; keep a drag region so the
                     // empty bar can still move the window.
@@ -425,7 +427,7 @@ function WorkspaceContent({ children }: { children: React.ReactNode }) {
                   />
                 )}
                 <div className="flex min-w-0 flex-1 items-stretch">
-                  <FileWorkspaceTabBar embedded />
+                  <FileWorkspaceTabBar />
                 </div>
                 {fileReservesRight && (
                   <div
@@ -477,15 +479,19 @@ function MobileWorkspaceContent({ children }: { children: React.ReactNode }) {
     <div className="relative h-full min-h-0 overflow-hidden">
       <div className="h-full min-h-0" inert={!isConversations || undefined}>
         {showConversation ? (
+          // Mobile mirrors the desktop chrome: no tab strip — the conversation
+          // detail header (folder › title) renders inside {children}, and tabs
+          // are navigated from the sidebar (single active conversation at a time).
           <section className="flex h-full min-h-0 flex-col overflow-hidden">
-            <TabBar />
             <div className="relative flex-1 min-h-0 overflow-hidden">
               {children}
             </div>
           </section>
         ) : (
+          // File view: the shared FileWorkspaceHeader (folder › file breadcrumb)
+          // replaces the file tab strip, matching the desktop file column.
           <section className="flex h-full min-h-0 flex-col overflow-hidden">
-            <FileWorkspaceTabBar />
+            <FileWorkspaceHeader />
             <div className="flex-1 min-h-0 overflow-hidden">
               <FileWorkspacePanel />
             </div>

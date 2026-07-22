@@ -6,6 +6,7 @@ import {
   useConversationRuntimeStore,
 } from "@/stores/conversation-runtime-store"
 import { ContentPartsRenderer } from "./content-parts-renderer"
+import { CollapsibleUserMessage } from "./collapsible-user-message"
 import {
   createMessageTurnAdapter,
   groupGoalRuns,
@@ -581,7 +582,7 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
           <div className="group/user-msg flex w-fit ml-auto max-w-full items-start gap-1">
             <UserMessageCopyButton parts={group.parts} />
             <MessageContent>
-              <ContentPartsRenderer parts={group.parts} role={group.role} />
+              <CollapsibleUserMessage parts={group.parts} />
             </MessageContent>
           </div>
         ) : (

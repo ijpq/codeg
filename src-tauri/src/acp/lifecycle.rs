@@ -28,6 +28,7 @@ use crate::artifact_tracker::ArtifactTurnFinishStatus;
 use crate::db::entities::conversation::ConversationStatus;
 use crate::db::error::DbError;
 use crate::db::service::conversation_service;
+use crate::logging::throttle::{LagLogThrottle, LAG_LOG_WINDOW};
 use crate::models::AgentType;
 use crate::web::event_bridge::{emit_with_state, EventEmitter};
 use tokio::sync::RwLock;
@@ -1547,6 +1548,7 @@ pub fn lifecycle_subscriber_task(
         // connection's first relevant event and torn down after a terminal
         // event by dropping the sender (worker drains its queue and exits).
         let mut workers: HashMap<String, mpsc::Sender<Arc<EventEnvelope>>> = HashMap::new();
+        let mut lag_throttle = LagLogThrottle::new(LAG_LOG_WINDOW);
         loop {
             match rx.recv().await {
                 Ok(envelope_arc) => {
@@ -1627,12 +1629,19 @@ pub fn lifecycle_subscriber_task(
                     // Lagged at the bus level. Now that the dispatcher
                     // filters and only blocks on the rare relevant events,
                     // this should only fire under genuine emit-rate spikes
-                    // exceeding the 4096 broadcast capacity.
-                    tracing::warn!(
-                        "[lifecycle][WARN] internal bus lagged, dropped {skipped} events \
-                         (emit rate exceeded broadcast capacity)"
-                    );
+                    // exceeding the 4096 broadcast capacity. The metric is the
+                    // authoritative loss record (unthrottled); the log line is
+                    // throttled to at most one per window.
                     metrics.lagged_count.fetch_add(skipped, Ordering::Relaxed);
+                    if let Some(s) = lag_throttle.record(skipped) {
+                        tracing::warn!(
+                            "[lifecycle][WARN] internal bus lagged: dropped {} events across \
+                             {} occurrence(s) in the last {}s (emit rate exceeded broadcast capacity)",
+                            s.dropped,
+                            s.occurrences,
+                            LAG_LOG_WINDOW.as_secs()
+                        );
+                    }
                 }
                 Err(broadcast::error::RecvError::Closed) => {
                     tracing::info!("[lifecycle] internal bus closed; dispatcher exiting");

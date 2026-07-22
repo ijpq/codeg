@@ -59,6 +59,9 @@ import type {
   ImportResult,
   ConversationDeliverable,
   ConversationTurnDeliverableSet,
+  ImportSelectedResult,
+  ScanResult,
+  SelectedSessionKey,
   OpenedTab,
   OpenedTabsSnapshot,
   SaveTabsOutcome,
@@ -81,6 +84,7 @@ import type {
   PromptInputBlock,
   SteerResult,
   FileTreeNode,
+  WorkspaceFileEntry,
   DirectoryEntry,
   DirectoryItem,
   UploadAttachmentResult,
@@ -1452,6 +1456,23 @@ export async function importLocalConversations(
   return getTransport().call("import_local_conversations", { folderId })
 }
 
+/** Walk every local agent's session store and reconcile against the DB for the
+ *  import picker. Slow (filesystem-bound); per-agent progress arrives on the
+ *  `import-scan://progress` side-channel while this call is in flight. */
+export async function scanImportableSessions(): Promise<ScanResult> {
+  return getTransport().call("scan_importable_sessions", {})
+}
+
+/** Batch-import the selected scanned sessions. The backend re-walks the local
+ *  stores (disk is the source of truth), creates or reopens each target folder,
+ *  and broadcasts `folder://changed` + one `conversations://bulk-changed` so
+ *  every window's sidebar converges. Rejected while another import runs. */
+export async function importSelectedSessions(
+  selections: SelectedSessionKey[]
+): Promise<ImportSelectedResult> {
+  return getTransport().call("import_selected_sessions", { selections })
+}
+
 export async function getFolderConversation(
   conversationId: number
 ): Promise<DbConversationDetail> {
@@ -1972,6 +1993,30 @@ export async function openSettingsWindow(
     }
   )
   window.open(result.path, `settings-${section ?? "general"}`)
+}
+
+export interface OpenImportSessionsWindowOptions {
+  /** Folder path the picker should scroll to and preselect once the scan
+   *  completes (the sidebar folder context-menu entry passes its own path). */
+  focusPath?: string | null
+}
+
+export async function openImportSessionsWindow(
+  options?: OpenImportSessionsWindowOptions
+): Promise<void> {
+  const focusPath = options?.focusPath ?? null
+  if (isDesktop()) {
+    return getShellTransport().call("open_import_sessions_window", {
+      focusPath,
+      locale: getCurrentEffectiveAppLocale(),
+      remoteConnectionId: getActiveRemoteConnectionId(),
+    })
+  }
+  const result = await getTransport().call<{ path: string }>(
+    "open_import_sessions_window",
+    { focusPath }
+  )
+  window.open(result.path, "import-sessions")
 }
 
 export async function openProjectBootWindow(source?: string): Promise<void> {
@@ -2903,6 +2948,17 @@ export async function getFileTree(
   })
 }
 
+/**
+ * Flat, gitignore-aware listing of every file/dir under `path`. Ignored
+ * directories are pruned during the backend walk (no depth cap), so deeply
+ * nested files are reachable while the payload stays small. Used by file search.
+ */
+export async function listWorkspaceFiles(
+  path: string
+): Promise<WorkspaceFileEntry[]> {
+  return getTransport().call("list_workspace_files", { path })
+}
+
 export async function startWorkspaceStateStream(
   rootPath: string,
   wantsTreeGit = true
@@ -3060,13 +3116,15 @@ export async function gitLog(
   path: string,
   limit?: number,
   branch?: string,
-  remote?: string
+  remote?: string,
+  skip?: number
 ): Promise<GitLogResult> {
   return getTransport().call("git_log", {
     path,
     limit: limit ?? null,
     branch: branch ?? null,
     remote: remote ?? null,
+    skip: skip ?? null,
   })
 }
 

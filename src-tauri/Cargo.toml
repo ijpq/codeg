@@ -1,6 +1,6 @@
 [package]
 name = "codeg"
-version = "0.21.3"
+version = "0.21.4"
 description = "Agent Code Generation App"
 authors = ["feitao"]
 edition = "2021"
@@ -68,6 +68,7 @@ thiserror = "2"
 dirs = "6"
 if-addrs = "0.13"
 walkdir = "2"
+ignore = "0.4"
 sacp = "11.0.0"
 sacp-tokio = "11.0.0"
 tokio = { version = "1", features = ["process", "io-util", "sync", "macros", "rt", "net", "rt-multi-thread"] }

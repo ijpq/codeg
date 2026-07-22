@@ -129,9 +129,13 @@ export const ChatInput = memo(function ChatInput({
   const isConnecting = status === "connecting"
   const isNativeGuide = isPrompting && supportsSteer && Boolean(onSteer)
 
+  // Active/historical conversations dock the composer at the very bottom of the
+  // message list, so it gets a bit more bottom breathing room (pb-4) than the
+  // compact default. The welcome/draft composer (`flush`) keeps its tighter pb-1
+  // — it sits in a roomy empty state and supplies its own px-4 gutter.
   return (
     <div
-      className={cn("pt-0 pb-1", !flush && "px-4")}
+      className={cn("pt-0", flush ? "pb-1" : "px-4 pb-4")}
       onContextMenu={(event) => event.stopPropagation()}
     >
       {queue &&

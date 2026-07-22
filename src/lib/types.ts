@@ -412,6 +412,100 @@ export interface ImportResult {
   skipped: number
 }
 
+/** Mirrors Rust `ScanSessionStatus` — how one locally-discovered session
+ *  reconciles against the DB by `(external_id, agent_type)`. `deleted` means
+ *  only soft-deleted rows exist; import never resurrects those. */
+export type ScanSessionStatus = "new" | "imported" | "deleted"
+
+/** Mirrors Rust `ScanSession`: one locally-discovered agent session in the
+ *  import-picker scan. */
+export interface ScanSession {
+  external_id: string
+  agent_type: AgentType
+  title: string | null
+  started_at: string
+  ended_at: string | null
+  message_count: number
+  model: string | null
+  git_branch: string | null
+  status: ScanSessionStatus
+}
+
+/** Mirrors Rust `ScanFolder`: sessions sharing a normalize-matched cwd, plus
+ *  how that path reconciles against the folder table. `exists_in_codeg: false`
+ *  with a `folder_id` means the row is soft-deleted and import will reopen it. */
+export interface ScanFolder {
+  path: string
+  name: string
+  exists_in_codeg: boolean
+  folder_id: number | null
+  agent_types: AgentType[]
+  sessions: ScanSession[]
+}
+
+/** Mirrors Rust `ScanResult` — response of `scan_importable_sessions`. */
+export interface ScanResult {
+  folders: ScanFolder[]
+  /** Sessions with no cwd in their transcript — not importable, count only. */
+  no_folder_count: number
+  total_sessions: number
+  importable_count: number
+}
+
+/** Mirrors Rust `SelectedSessionKey` (camelCase over the wire): identifies one
+ *  scanned session for `import_selected_sessions`. */
+export interface SelectedSessionKey {
+  agentType: AgentType
+  externalId: string
+}
+
+/** Mirrors Rust `ImportFolderOutcome`: per-folder tally of one batch import. */
+export interface ImportFolderOutcome {
+  path: string
+  folder_id: number
+  created: boolean
+  imported: number
+  updated: number
+  skipped: number
+}
+
+/** Mirrors Rust `ImportSelectedResult` — response of
+ *  `import_selected_sessions`. */
+export interface ImportSelectedResult {
+  imported: number
+  updated: number
+  skipped: number
+  not_found: number
+  failed: number
+  created_folders: number
+  folders: ImportFolderOutcome[]
+  errors: string[]
+}
+
+/** Mirrors Rust `ImportScanProgress` — payload of the per-agent
+ *  `import-scan://progress` broadcast while `scan_importable_sessions` walks
+ *  the local session stores. */
+export interface ImportScanProgress {
+  agent_type: AgentType
+  done: number
+  total: number
+  session_count: number
+}
+
+export const IMPORT_SCAN_PROGRESS_EVENT = "import-scan://progress"
+
+/** Payload of the one-shot `conversations://bulk-changed` nudge a batch import
+ *  broadcasts on completion. Clients respond with a single full conversation
+ *  refetch (covers inserted rows and refreshed titles alike) instead of
+ *  applying thousands of per-row upserts. */
+export interface ConversationsBulkChanged {
+  imported: number
+  updated: number
+  folder_ids: number[]
+}
+
+export const CONVERSATIONS_BULK_CHANGED_EVENT = "conversations://bulk-changed"
+
 export interface DbConversationDetail {
   summary: DbConversationSummary
   turns: MessageTurn[]
@@ -2372,6 +2466,14 @@ export interface GitStashEntry {
 export type FileTreeNode =
   | { kind: "file"; name: string; path: string }
   | { kind: "dir"; name: string; path: string; children: FileTreeNode[] }
+
+/** Flat gitignore-aware workspace entry returned by `list_workspace_files`. */
+export interface WorkspaceFileEntry {
+  name: string
+  /** Path relative to the workspace root, always forward-slashed. */
+  path: string
+  kind: "file" | "dir"
+}
 
 export interface DirectoryEntry {
   name: string

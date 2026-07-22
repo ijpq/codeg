@@ -112,11 +112,7 @@ import {
   type AttachFileToSessionDetail,
   type AppendTextToSessionDetail,
 } from "@/lib/session-attachment-events"
-import {
-  ConversationContextBar,
-  ConversationFolderBranchPicker,
-  useConversationFolderBranchPickerVisible,
-} from "@/components/chat/conversation-context-bar"
+import { ConversationContextBar } from "@/components/chat/conversation-context-bar"
 import { InlineModeSelector } from "@/components/chat/mode-selector"
 import { InlineSessionConfigSelector } from "@/components/chat/session-config-selector"
 import { ModelOptionPicker } from "@/components/chat/model-option-picker"
@@ -976,9 +972,6 @@ export function MessageInput({
   const hasAnySelector =
     showConfigLoading || hasConfigOptions || showModeLoading || showModeSelector
   const hasInlineSelectors = hasConfigOptions || showModeSelector
-  const hasFolderBranchPicker =
-    useConversationFolderBranchPickerVisible(attachmentTabId)
-  const folderBranchPickerAttached = hasFolderBranchPicker
   const imageAttachments = useMemo(
     () =>
       attachments.filter(
@@ -3071,16 +3064,10 @@ export function MessageInput({
           </div>
         </div>
       )}
-      <div
-        className={cn(
-          folderBranchPickerAttached
-            ? "overflow-hidden rounded-xl transition-colors"
-            : "contents",
-          folderBranchPickerAttached &&
-            showDragActive &&
-            "ring-1 ring-primary/40"
-        )}
-      >
+      {/* Layout-neutral group (`display:contents`): it once clipped the attached
+          mobile folder/branch row, which is retired, so it just wraps the
+          composer's context menu without affecting layout. */}
+      <div className="contents">
         <ContextMenu onOpenChange={handleContextMenuOpenChange}>
           {/* Disabled in non-secure web (no async clipboard read) so the native
               context menu — whose Paste still works over the editor text — is
@@ -3097,18 +3084,17 @@ export function MessageInput({
                 // the default `border-input`, which is near-invisible at rest and
                 // vanishes over a workspace background image); it adapts per theme
                 // (dark ink in light mode, light ink in dark) and stays legible.
-                // Focus still swaps to `border-ring` below.
-                "codeg-composer-chrome @container relative flex flex-col rounded-xl border border-foreground/20 bg-transparent transition-colors",
-                // Standard focus ring — always shown when the composer is
-                // focused (the plain default input style). `bg-background
+                // Focus still swaps to `border-ring` below. `bg-background
                 // ws-transparent-bg`: opaque surface normally, but with a
                 // workspace-bg image the composer goes transparent to reveal the
                 // real image like the rest of the canvas (no frosted treatment) —
-                // the border stays. Off (no image) it's the plain background,
-                // unchanged.
-                folderBranchPickerAttached
-                  ? "bg-background ws-transparent-bg focus-within:border-ring focus-within:ring-[3px] focus-within:ring-inset focus-within:ring-ring/50"
-                  : "focus-within:border-ring focus-within:ring-[3px] focus-within:ring-ring/50",
+                // the border stays. The surface lives on the composer itself —
+                // the old below-composer folder/branch row that used to wrap it
+                // is gone.
+                "codeg-composer-chrome @container relative flex flex-col rounded-xl border border-foreground/20 bg-background ws-transparent-bg transition-colors",
+                // Standard focus ring — always shown when the composer is focused
+                // (the plain default input style).
+                "focus-within:border-ring focus-within:ring-[3px] focus-within:ring-ring/50",
                 // Active session, tiled across multiple sessions: a gradient
                 // flows around the border to mark which tile is active — but ONLY
                 // while the composer itself is not focused. Focusing it hides the
@@ -3116,9 +3102,7 @@ export function MessageInput({
                 // A lone/non-tiled session (showActiveFlow=false) and inactive
                 // tiles show the plain default border.
                 showActiveFlow && "codeg-composer-flow",
-                !folderBranchPickerAttached &&
-                  showDragActive &&
-                  "ring-1 ring-primary/40",
+                showDragActive && "ring-1 ring-primary/40",
                 className
               )}
             >
@@ -3665,21 +3649,6 @@ export function MessageInput({
             </ContextMenuSub>
           </ContextMenuContent>
         </ContextMenu>
-        {hasFolderBranchPicker && (
-          // `pl-2` mirrors the action bar's `px-2` so this row lines up with the
-          // composer above. Kept on the rem scale (no px literals) so it tracks
-          // UI zoom; the folder icon then aligns with the centered "+" icon
-          // because both buttons add the same 1px transparent border (paired
-          // with the picker buttons' `px-1.5`).
-          <div
-            className={cn(
-              "flex items-center gap-1 pl-2 text-xs text-muted-foreground",
-              folderBranchPickerAttached ? "rounded-b-xl pt-1 pr-2" : "mt-1.5"
-            )}
-          >
-            <ConversationFolderBranchPicker tabId={attachmentTabId} />
-          </div>
-        )}
       </div>
       <ImagePreviewDialog
         src={

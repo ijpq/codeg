@@ -10,7 +10,12 @@ import { getActiveRemoteConnectionId } from "@/lib/transport"
 import { useSidebarContext } from "@/contexts/sidebar-context"
 import { useAuxPanelContext } from "@/contexts/aux-panel-context"
 import { useTerminalContext } from "@/contexts/terminal-context"
-import { useTabActions } from "@/contexts/tab-context"
+import { useTabActions, useTabStore } from "@/contexts/tab-context"
+import {
+  useWorkspaceActions,
+  useWorkspaceFileTabs,
+  useWorkspaceView,
+} from "@/contexts/workspace-context"
 import { useWorkbenchRoute } from "@/contexts/workbench-route-context"
 import { useSearchDialog } from "@/contexts/search-dialog-context"
 import { useShortcutSettings } from "@/hooks/use-shortcut-settings"
@@ -33,7 +38,15 @@ export function WorkspaceChromeController() {
   const { toggle } = useSidebarContext()
   const { toggle: toggleAuxPanel } = useAuxPanelContext()
   const { toggle: toggleTerminal } = useTerminalContext()
-  const { openNewConversationTab } = useTabActions()
+  const { openNewConversationTab, switchTab, closeTab } = useTabActions()
+  const tabs = useTabStore((s) => s.tabs)
+  const activeTabId = useTabStore((s) => s.activeTabId)
+  // Tab-close/navigation shortcuts used to live in the visible tab strips.
+  // Mobile no longer mounts those strips, so this always-mounted controller now
+  // owns them too (see the keydown handler below).
+  const { mode, activePane, filesMaximized } = useWorkspaceView()
+  const { activeFileTabId } = useWorkspaceFileTabs()
+  const { closeFileTab, closeAllFileTabs } = useWorkspaceActions()
   const { openConversations } = useWorkbenchRoute()
   const { shortcuts } = useShortcutSettings()
   // Search open-state is shared (see search-dialog-context): the trigger lives
@@ -111,6 +124,51 @@ export function WorkspaceChromeController() {
       if (matchShortcutEvent(e, shortcuts.open_settings)) {
         e.preventDefault()
         handleOpenSettings()
+        return
+      }
+
+      // Tab navigation + close. These once lived in the visible tab strips,
+      // which mobile no longer mounts; owning them here keeps mod+w / mod+tab /
+      // mod+shift+tab working at every width — and, crucially, keeps
+      // preventDefault firing so mod+w never falls through to closing the OS
+      // window. Routing mirrors the old split: conversation pane vs files pane.
+      const conversationPaneActive =
+        mode === "conversation" ||
+        (mode === "fusion" && activePane === "conversation" && !filesMaximized)
+      const filesPaneActive =
+        mode === "fusion" && (activePane === "files" || filesMaximized)
+
+      const isNextTab = matchShortcutEvent(e, shortcuts.next_tab)
+      const isPrevTab = matchShortcutEvent(e, shortcuts.prev_tab)
+      if (isNextTab || isPrevTab) {
+        if (!conversationPaneActive) return
+        if (tabs.length < 2 || !activeTabId) return
+        const currentIndex = tabs.findIndex((tab) => tab.id === activeTabId)
+        if (currentIndex === -1) return
+        e.preventDefault()
+        const offset = isNextTab ? 1 : -1
+        const nextIndex = (currentIndex + offset + tabs.length) % tabs.length
+        switchTab(tabs[nextIndex].id)
+        return
+      }
+
+      if (matchShortcutEvent(e, shortcuts.close_all_file_tabs)) {
+        if (!filesPaneActive) return
+        e.preventDefault()
+        closeAllFileTabs()
+        return
+      }
+
+      if (matchShortcutEvent(e, shortcuts.close_current_tab)) {
+        if (conversationPaneActive) {
+          if (!activeTabId) return
+          e.preventDefault()
+          closeTab(activeTabId)
+        } else if (filesPaneActive) {
+          if (!activeFileTabId) return
+          e.preventDefault()
+          closeFileTab(activeFileTabId)
+        }
       }
     }
     document.addEventListener("keydown", handleKeyDown)
@@ -127,6 +185,16 @@ export function WorkspaceChromeController() {
     toggleAuxPanel,
     toggleTerminal,
     isChatMode,
+    tabs,
+    activeTabId,
+    switchTab,
+    closeTab,
+    mode,
+    activePane,
+    filesMaximized,
+    activeFileTabId,
+    closeFileTab,
+    closeAllFileTabs,
   ])
 
   return (

@@ -135,6 +135,14 @@ pub fn build_router(
             "/import_local_conversations",
             post(handlers::conversations::import_local_conversations),
         )
+        .route(
+            "/scan_importable_sessions",
+            post(handlers::conversations::scan_importable_sessions),
+        )
+        .route(
+            "/import_selected_sessions",
+            post(handlers::conversations::import_selected_sessions),
+        )
         .route("/list_folders", post(handlers::conversations::list_folders))
         .route("/get_stats", post(handlers::conversations::get_stats))
         .route(
@@ -249,6 +257,10 @@ pub fn build_router(
         )
         .route("/get_file_tree", post(handlers::folders::get_file_tree))
         .route(
+            "/list_workspace_files",
+            post(handlers::folders::list_workspace_files),
+        )
+        .route(
             "/start_workspace_state_stream",
             post(handlers::workspace_state::start_workspace_state_stream),
         )
@@ -268,6 +280,10 @@ pub fn build_router(
         .route(
             "/open_commit_window",
             post(handlers::folders::open_commit_window),
+        )
+        .route(
+            "/open_import_sessions_window",
+            post(handlers::folders::open_import_sessions_window),
         )
         .route(
             "/open_merge_window",

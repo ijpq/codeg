@@ -37,6 +37,7 @@ import {
 import { useIsMobile } from "@/hooks/use-mobile"
 import { useIsMac } from "@/hooks/use-is-mac"
 import { usePlatform } from "@/hooks/use-platform"
+import { useZoomLevel } from "@/hooks/use-appearance"
 import { useShortcutSettings } from "@/hooks/use-shortcut-settings"
 import { formatShortcutLabel } from "@/lib/keyboard-shortcuts"
 import { isDesktop } from "@/lib/platform"
@@ -119,13 +120,15 @@ export function Sidebar() {
   const { routeId, setRoute, openConversations } = useWorkbenchRoute()
   const isMac = useIsMac()
   const { isMac: platformIsMac } = usePlatform()
+  const { zoomLevel } = useZoomLevel()
   const { shortcuts } = useShortcutSettings()
   const isMobile = useIsMobile()
   const listRef = useRef<SidebarConversationListHandle>(null)
   // On desktop the header's top-left is owned by the fixed window-chrome overlay
   // (sidebar toggle + remote); reserve exactly its width so the view controls
-  // and drag region clear it. Mobile has no overlay (the sidebar is a Sheet).
-  const leftReserve = leftChromeReserve(platformIsMac && isDesktop())
+  // and drag region clear it. The reserve scales with the app zoom to track the
+  // rem-sized overlay buttons. Mobile has no overlay (the sidebar is a Sheet).
+  const leftReserve = leftChromeReserve(platformIsMac && isDesktop(), zoomLevel)
 
   const [showCompleted, setShowCompleted] = useState(false)
   const [sortMode, setSortMode] = useState<SidebarSortMode>("created")
@@ -185,6 +188,10 @@ export function Sidebar() {
   }, [allExpanded])
 
   const handleNewConversation = useCallback(() => {
+    // On mobile the sidebar is a Sheet overlay — close it so the new
+    // conversation is visible (mirrors tapping a conversation card, which the
+    // list wrapper already closes on).
+    if (isMobile) toggle()
     // Starting a conversation always returns to the conversation workspace (in
     // case a route like Automations was taking over the content region).
     openConversations()
@@ -196,7 +203,14 @@ export function Sidebar() {
       return
     }
     openNewConversationTab(activeFolder.id, activeFolder.path)
-  }, [activeFolder, openChatModeTab, openNewConversationTab, openConversations])
+  }, [
+    activeFolder,
+    openChatModeTab,
+    openNewConversationTab,
+    openConversations,
+    isMobile,
+    toggle,
+  ])
 
   if (!isOpen) return null
 
@@ -206,14 +220,17 @@ export function Sidebar() {
         className={cn(
           "flex h-10 shrink-0 items-center gap-2 pr-2",
           // Desktop: the fixed left window-chrome overlay (reserved below) owns
-          // the top-left, so drop the header's own left padding. A subtle bottom
-          // divider (border-border/50) matches the conversation detail header's
-          // bottom border so the two align as one bar across the app's top edge.
-          // Mobile (Sheet): keep the original title padding + a full-strength
-          // divider — mobile is unchanged.
+          // the top-left, so drop the header's own left padding. Off-image the
+          // divider is border-border/50, matching the conversation / file detail
+          // headers. But the sidebar sits on a FROSTED surface (ws-surface-sidebar)
+          // while those headers sit on the transparent canvas: with a workspace
+          // background image on, a border-border/50 hairline washes out against the
+          // frosted shade, so it takes the boosted `ws-chrome-border` (like the
+          // frosted status bar) to stay legible. Mobile (Sheet): keep the original
+          // title padding + a full-strength divider — mobile is unchanged.
           isMobile
             ? "border-b border-border pl-4"
-            : "border-b border-border/50 pl-0"
+            : "border-b border-border/50 ws-chrome-border pl-0"
         )}
       >
         {isMobile ? (

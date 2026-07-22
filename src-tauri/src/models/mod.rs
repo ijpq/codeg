@@ -21,9 +21,10 @@ pub use chat_channel::{ChannelStatusInfo, ChatChannelInfo, ChatChannelMessageLog
 pub use conversation::{
     AgentConversationCount, AgentStats, ConversationDetail, ConversationSummary,
     ConversationDeliverable, ConversationTurnArtifactRun, ConversationTurnDeliverableSet,
-    ConversationTurnFileChange,
-    DbConversationDetail,
-    DbConversationSummary, FolderInfo, ImportResult, SessionStats, SidebarData,
+    ConversationTurnFileChange, DbConversationDetail, DbConversationSummary, FolderInfo,
+    ImportFolderOutcome, ImportResult,
+    ImportSelectedResult, ScanFolder, ScanResult, ScanSession, ScanSessionStatus,
+    SelectedSessionKey, SessionStats, SidebarData,
 };
 pub use folder::{
     FolderCommandInfo, FolderDetail, FolderHistoryEntry, OpenedTab, OpenedTabsSnapshot,
