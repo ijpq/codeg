@@ -39,6 +39,12 @@ class MockWebSocket {
       data: JSON.stringify({ channel: "__ready__", payload: null }),
     })
   }
+  message(value: unknown) {
+    this.onmessage?.({ data: JSON.stringify(value) })
+  }
+  pong() {
+    this.message({ type: "pong" })
+  }
   drop() {
     this.readyState = MockWebSocket.CLOSED
     this.onclose?.()
@@ -82,6 +88,65 @@ const ok200 = () => ({ status: 200, ok: true, json: async () => ({}) })
 const resp401 = () => ({ status: 401, ok: false, json: async () => ({}) })
 
 describe("WebTransport connection state machine", () => {
+  it("heartbeats a ready socket and accepts pong as liveness", async () => {
+    const { t, ws } = connectReady()
+
+    expect(JSON.parse(ws.sent.at(-1)!)).toEqual({ action: "ping" })
+    ws.pong()
+
+    await vi.advanceTimersByTimeAsync(20_000)
+    expect(JSON.parse(ws.sent.at(-1)!)).toEqual({ action: "ping" })
+    ws.pong()
+    await vi.advanceTimersByTimeAsync(10_000)
+
+    expect(t.getConnectionSnapshot()).toBe("connected")
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it("retires a half-open socket when heartbeat pong never arrives", async () => {
+    const { t, ws } = connectReady()
+    fetchMock.mockResolvedValue(ok200())
+
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(t.getConnectionSnapshot()).toBe("reconnecting")
+    expect(ws.readyState).toBe(MockWebSocket.CLOSED)
+
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://localhost/api/health",
+      expect.objectContaining({ method: "POST" })
+    )
+    expect(lastWs()).not.toBe(ws)
+  })
+
+  it("verifies an apparently connected socket immediately on tab wake", () => {
+    const { t, ws } = connectReady()
+    ws.pong() // acknowledge the eager ready-time heartbeat
+    const before = ws.sent.length
+
+    t.verifyNow()
+
+    expect(ws.sent).toHaveLength(before + 1)
+    expect(JSON.parse(ws.sent.at(-1)!)).toEqual({ action: "ping" })
+  })
+
+  it("rebuilds the transport immediately after an HTTP network failure", async () => {
+    const { t, ws } = connectReady()
+    ws.pong()
+    fetchMock
+      .mockRejectedValueOnce(new TypeError("Failed to fetch"))
+      .mockResolvedValueOnce(ok200())
+
+    await expect(t.call("get_folder_conversation", {})).rejects.toThrow(
+      "Failed to fetch"
+    )
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(t.getConnectionSnapshot()).toBe("reconnecting")
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(lastWs()).not.toBe(ws)
+  })
+
   it("starts connected and the first __ready__ does not fire reconnect callbacks", () => {
     const t = new WebTransport("http://localhost")
     const onReconnect = vi.fn()

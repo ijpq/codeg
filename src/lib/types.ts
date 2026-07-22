@@ -2222,6 +2222,10 @@ export interface LiveSessionSnapshot {
    *  version proof — the frontend must NOT re-derive it from agent type).
    *  Absent → `false`. */
   native_steering_available?: boolean
+  /** Built-in codeg-mcp was included in this connection's session request. */
+  codeg_mcp_available?: boolean
+  /** User MCP servers plus the built-in companion; diagnostic only. */
+  mcp_server_count?: number
   modes: SessionModeStateInfo | null
   current_mode: string | null
   config_options: SessionConfigOptionInfo[] | null
@@ -2264,6 +2268,17 @@ export interface ConnectionInfo {
 export interface ConversationConnectionInfo {
   connection_id: string
   event_seq: number
+}
+
+/** Atomic persisted-conversation restore result. Camel-cased by the Rust wire
+ * type so desktop invoke and Server HTTP return the same shape. */
+export interface RestoredConversationConnectionInfo {
+  connectionId: string
+  externalSessionId: string
+  reusedExisting: boolean
+  codegMcpAvailable: boolean
+  mcpServerCount: number
+  replacedConnectionIds: string[]
 }
 
 // ACP agent info returned by acp_list_agents
