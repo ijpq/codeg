@@ -12,10 +12,10 @@ use crate::acp::manager::ConnectionManager;
 
 /// Default idle threshold (3 minutes). Override at startup via
 /// `CODEG_ACP_IDLE_TIMEOUT_SECS`. The sweep only runs against
-/// connections in `Connected` state with no `pending_permission`, and
-/// `last_activity_at` is bumped on every emit and on every frontend
-/// keepalive touch (~30s cadence for open tabs), so an actively-used
-/// or visible connection never qualifies.
+/// connections in `Connected` state with no `pending_permission` and no live
+/// WebSocket attach lease. `last_activity_at` is also bumped on every emit and
+/// frontend keepalive touch (~30s cadence), so both actively-used and currently
+/// open conversations are protected even when a browser throttles JS timers.
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 180;
 /// Sweep cadence — runs once per minute. Each tick is a brief lock on the
 /// connections map plus per-state `try_read`s, so a 1-minute interval is
