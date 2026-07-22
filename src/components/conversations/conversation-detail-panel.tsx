@@ -42,6 +42,7 @@ import { SessionConfigStaleBanner } from "@/components/chat/session-config-stale
 import { BackgroundTasksChip } from "@/components/chat/background-tasks-chip"
 import { FeedbackNotesDisplay } from "@/components/chat/feedback-notes-display"
 import { FeedbackDialog } from "@/components/chat/feedback-dialog"
+import { AgentDiagnosticsDialog } from "@/components/settings/agent-diagnostics-dialog"
 import { useFeedbackEnabled } from "@/hooks/use-feedback-enabled"
 import { useSessionFeedback } from "@/hooks/use-session-feedback"
 import { AgentSelector } from "@/components/chat/agent-selector"
@@ -204,6 +205,7 @@ const ConversationTabView = memo(function ConversationTabView({
 }: ConversationTabViewProps) {
   const t = useTranslations("Folder.conversation")
   const tWelcome = useTranslations("Folder.chat.welcomeInputPanel")
+  const tDiag = useTranslations("DiagnosticsSettings")
   const sharedT = useTranslations("Folder.chat.shared")
   const refreshConversations = useAppWorkspaceStore(
     (s) => s.refreshConversations
@@ -286,6 +288,7 @@ const ConversationTabView = memo(function ConversationTabView({
   const [sendSignal, setSendSignal] = useState(0)
   const [agentsLoaded, setAgentsLoaded] = useState(false)
   const [usableAgentCount, setUsableAgentCount] = useState(0)
+  const [composerDiagnosticsOpen, setComposerDiagnosticsOpen] = useState(false)
   const [agentConnectError, setAgentConnectError] = useState<string | null>(
     null
   )
@@ -1553,18 +1556,25 @@ const ConversationTabView = memo(function ConversationTabView({
               />
             </div>
             {composerBlockedMessage ? (
-              <button
-                type="button"
-                onClick={handleOpenAgentsSettings}
-                className="w-full cursor-pointer rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-center text-xs text-destructive transition-colors hover:bg-destructive/10"
-              >
-                <div
-                  className="overflow-hidden text-ellipsis whitespace-nowrap text-center"
+              <div className="flex w-full items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+                <button
+                  type="button"
+                  onClick={handleOpenAgentsSettings}
                   title={composerBlockedMessage}
+                  className="min-w-0 flex-1 cursor-pointer overflow-hidden text-ellipsis whitespace-nowrap text-left transition-colors hover:text-destructive/80"
                 >
                   {composerBlockedMessage}
-                </div>
-              </button>
+                </button>
+                {selectedAgentNotInstalled ? (
+                  <button
+                    type="button"
+                    onClick={() => setComposerDiagnosticsOpen(true)}
+                    className="shrink-0 rounded border border-destructive/40 px-2 py-0.5 font-medium transition-colors hover:bg-destructive/10"
+                  >
+                    {tDiag("button")}
+                  </button>
+                ) : null}
+              </div>
             ) : null}
             <ChatInput
               // composerConnStatus (not connStatus): a chat draft mid-reconnect
@@ -1624,18 +1634,25 @@ const ConversationTabView = memo(function ConversationTabView({
               disabled={isConnecting || dbConversationId != null}
             />
             {composerBlockedMessage ? (
-              <button
-                type="button"
-                onClick={handleOpenAgentsSettings}
-                className="mt-2 w-full cursor-pointer rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-center text-xs text-destructive transition-colors hover:bg-destructive/10"
-              >
-                <div
-                  className="overflow-hidden text-ellipsis whitespace-nowrap text-center"
+              <div className="mt-2 flex w-full items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+                <button
+                  type="button"
+                  onClick={handleOpenAgentsSettings}
                   title={composerBlockedMessage}
+                  className="min-w-0 flex-1 cursor-pointer overflow-hidden text-ellipsis whitespace-nowrap text-left transition-colors hover:text-destructive/80"
                 >
                   {composerBlockedMessage}
-                </div>
-              </button>
+                </button>
+                {selectedAgentNotInstalled ? (
+                  <button
+                    type="button"
+                    onClick={() => setComposerDiagnosticsOpen(true)}
+                    className="shrink-0 rounded border border-destructive/40 px-2 py-0.5 font-medium transition-colors hover:bg-destructive/10"
+                  >
+                    {tDiag("button")}
+                  </button>
+                ) : null}
+              </div>
             ) : null}
           </div>
           <div className="min-h-0 flex-1">{messageListNode}</div>
@@ -1652,6 +1669,11 @@ const ConversationTabView = memo(function ConversationTabView({
         onSubmit={feedback.submit}
         submitting={feedback.submitting}
         agentName={AGENT_LABELS[selectedAgent]}
+      />
+      <AgentDiagnosticsDialog
+        open={composerDiagnosticsOpen}
+        onOpenChange={setComposerDiagnosticsOpen}
+        agentType={selectedAgent}
       />
     </ConversationShell>
   )
