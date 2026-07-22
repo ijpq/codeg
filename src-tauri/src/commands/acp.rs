@@ -16,11 +16,11 @@ use crate::acp::registry;
 use crate::acp::types::{
     AcpAgentInfo, AgentSkillContent, AgentSkillItem, AgentSkillLayout, AgentSkillLocation,
     AgentSkillScope, AgentSkillsListResult, ConfigStaleKind, ConnectionStatus, GrokSettings,
-    GrokStructuredConfig,
+    GrokStructuredConfig, RestoredConversationConnectionInfo,
 };
 #[cfg(feature = "tauri-runtime")]
 use crate::acp::types::{ConnectionInfo, ForkResultInfo, PromptInputBlock};
-use crate::db::service::agent_setting_service;
+use crate::db::service::{agent_setting_service, conversation_service, folder_service};
 use crate::db::service::model_provider_service;
 use crate::db::AppDatabase;
 use crate::models::agent::AgentType;
@@ -6487,6 +6487,174 @@ pub(crate) async fn acp_update_agent_preferences_and_refresh(
     Ok(refresh_config_staleness(manager, db, data_dir, &[agent_type], ConfigStaleKind::AgentConfig).await)
 }
 
+/// Restore an existing DB conversation onto a fully initialized ACP
+/// connection, then atomically replace its previous live binding. The DB row is
+/// authoritative for agent, folder and external session identity; callers only
+/// supply the conversation id and selector preferences.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn acp_restore_conversation_core(
+    conversation_id: i32,
+    preferred_mode_id: Option<String>,
+    preferred_config_values: BTreeMap<String, String>,
+    manager: &ConnectionManager,
+    db: &AppDatabase,
+    data_dir: &Path,
+    owner_window_label: String,
+    emitter: EventEmitter,
+) -> Result<RestoredConversationConnectionInfo, AcpError> {
+    let conversation = conversation_service::get_by_id(&db.conn, conversation_id)
+        .await
+        .map_err(|e| AcpError::protocol(e.to_string()))?;
+    let external_session_id = conversation
+        .external_id
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            AcpError::protocol(format!(
+                "conversation {conversation_id} has no external session to restore"
+            ))
+        })?;
+    let folder = folder_service::get_folder_by_id(&db.conn, conversation.folder_id)
+        .await
+        .map_err(|e| AcpError::protocol(e.to_string()))?
+        .ok_or_else(|| {
+            AcpError::protocol(format!(
+                "folder {} for conversation {conversation_id} was not found",
+                conversation.folder_id
+            ))
+        })?;
+    let agent_type = conversation.agent_type;
+    let require_codeg_mcp = agent_type == AgentType::Codex;
+
+    let old_connection_id = manager
+        .find_connection_by_conversation_id(conversation_id)
+        .await;
+    let mut old_mcp_server_count = 0;
+    let mut old_codeg_mcp_available = false;
+    let mut old_status = None;
+    let mut old_turn_in_flight = false;
+    if let Some(old_id) = old_connection_id.as_deref() {
+        if let Some(state) = manager.get_state(old_id).await {
+            let state = state.read().await;
+            old_mcp_server_count = state.mcp_server_count;
+            old_codeg_mcp_available = state.codeg_mcp_available;
+            old_status = Some(state.status.clone());
+            old_turn_in_flight = state.turn_in_flight;
+        }
+    }
+    tracing::info!(
+        conversation_id,
+        external_session_id = %external_session_id,
+        old_connection_id = ?old_connection_id,
+        old_mcp_server_count,
+        old_codeg_mcp_available,
+        old_turn_in_flight,
+        require_codeg_mcp,
+        "[ACP] persisted conversation restore starting"
+    );
+
+    // Never interrupt an active turn merely to upgrade its MCP surface. Once
+    // the turn settles, the same open/reconnect path can safely retry.
+    if require_codeg_mcp
+        && !old_codeg_mcp_available
+        && (old_turn_in_flight || old_status == Some(ConnectionStatus::Prompting))
+    {
+        tracing::warn!(
+            conversation_id,
+            external_session_id = %external_session_id,
+            old_connection_id = ?old_connection_id,
+            "[ACP] restore deferred because the incompatible connection has an active turn"
+        );
+        return Err(AcpError::TurnInProgress);
+    }
+
+    let runtime_env = build_session_runtime_env(
+        db,
+        agent_type,
+        Some(external_session_id.as_str()),
+        data_dir,
+    )
+    .await?;
+    verify_agent_installed(agent_type).await?;
+
+    tracing::info!(
+        conversation_id,
+        external_session_id = %external_session_id,
+        old_connection_id = ?old_connection_id,
+        "[ACP] session resume/load requested"
+    );
+    let spawned = manager
+        .spawn_agent_for_restore(
+            agent_type,
+            Some(folder.path.clone()),
+            external_session_id.clone(),
+            runtime_env,
+            owner_window_label,
+            emitter,
+            preferred_mode_id,
+            preferred_config_values,
+            require_codeg_mcp,
+            conversation_id,
+        )
+        .await?;
+
+    let activation = manager
+        .activate_restored_conversation(
+            &spawned.connection_id,
+            conversation_id,
+            conversation.folder_id,
+            &external_session_id,
+            require_codeg_mcp,
+            conversation.parent_id,
+            conversation.parent_tool_use_id.clone(),
+        )
+        .await;
+    let activation = match activation {
+        Ok(value) => value,
+        Err(error) => {
+            // A newly spawned, not-yet-published connection is ours to reclaim.
+            // A reused connection belongs to an existing client and remains
+            // untouched because no binding mutation passed validation.
+            if !spawned.reused_existing {
+                let _ = manager.disconnect(&spawned.connection_id).await;
+            }
+            tracing::warn!(
+                conversation_id,
+                external_session_id = %external_session_id,
+                old_connection_id = ?old_connection_id,
+                new_connection_id = %spawned.connection_id,
+                reused_existing = spawned.reused_existing,
+                error = %error,
+                binding_updated = false,
+                "[ACP] persisted conversation restore failed"
+            );
+            return Err(error);
+        }
+    };
+
+    tracing::info!(
+        conversation_id,
+        external_session_id = %external_session_id,
+        old_connection_id = ?old_connection_id,
+        new_connection_id = %spawned.connection_id,
+        reused_existing = spawned.reused_existing,
+        mcp_server_count = activation.mcp_server_count,
+        codeg_mcp_available = activation.codeg_mcp_available,
+        replaced_connection_ids = ?activation.replaced_connection_ids,
+        binding_updated = true,
+        "[ACP] persisted conversation restore completed"
+    );
+
+    Ok(RestoredConversationConnectionInfo {
+        connection_id: spawned.connection_id,
+        external_session_id,
+        reused_existing: spawned.reused_existing,
+        codeg_mcp_available: activation.codeg_mcp_available,
+        mcp_server_count: activation.mcp_server_count,
+        replaced_connection_ids: activation.replaced_connection_ids,
+    })
+}
+
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
 #[allow(clippy::too_many_arguments)]
@@ -6532,6 +6700,36 @@ pub async fn acp_connect(
             preferred_config_values.unwrap_or_default(),
         )
         .await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn acp_restore_conversation(
+    conversation_id: i32,
+    preferred_mode_id: Option<String>,
+    preferred_config_values: Option<BTreeMap<String, String>>,
+    manager: State<'_, ConnectionManager>,
+    db: State<'_, AppDatabase>,
+    app_handle: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+) -> Result<RestoredConversationConnectionInfo, AcpError> {
+    let app_data_dir = app_handle
+        .path()
+        .app_data_dir()
+        .map(|p| crate::paths::resolve_effective_data_dir(&p))
+        .unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let emitter = EventEmitter::Tauri(app_handle);
+    acp_restore_conversation_core(
+        conversation_id,
+        preferred_mode_id,
+        preferred_config_values.unwrap_or_default(),
+        &manager,
+        &db,
+        &app_data_dir,
+        window.label().to_string(),
+        emitter,
+    )
+    .await
 }
 
 #[cfg(feature = "tauri-runtime")]

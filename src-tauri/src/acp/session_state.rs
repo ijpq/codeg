@@ -354,6 +354,18 @@ pub struct SessionState {
     /// keep round-tripping after the parent session ends.
     pub delegation_token: Option<String>,
 
+    /// Whether the built-in `codeg-mcp` companion was successfully added to
+    /// this connection's session new/load/resume request. This is fixed at
+    /// launch and is the compatibility bit used when reopening a historical
+    /// Codex conversation: a pre-deliverables connection must never be reused
+    /// just because its external session id happens to match.
+    pub codeg_mcp_available: bool,
+
+    /// Number of MCP server entries accepted into this connection's session
+    /// establishment request (user-configured servers plus `codeg-mcp`).
+    /// Diagnostic only; no server configuration or secrets are serialized.
+    pub mcp_server_count: u32,
+
     /// Whether the `check_user_feedback` MCP tool was exposed to THIS agent at
     /// launch (the `feedback` feature was on when its companion was injected).
     /// Fixed for the connection's lifetime — tool exposure can't change after
@@ -474,6 +486,8 @@ impl SessionState {
             event_stream: Arc::new(ConnectionEventStream::new()),
             recent_events: RecentEventsBuffer::new(),
             delegation_token: None,
+            codeg_mcp_available: false,
+            mcp_server_count: 0,
             feedback_tool_available: false,
             last_assistant_text: None,
             pending_user_message: None,
@@ -1246,6 +1260,8 @@ impl SessionState {
             feedback: self.feedback.clone(),
             background_outstanding: self.background_outstanding,
             feedback_tool_available: self.feedback_tool_available,
+            codeg_mcp_available: self.codeg_mcp_available,
+            mcp_server_count: self.mcp_server_count,
             modes: self.modes.clone(),
             current_mode: self.current_mode.clone(),
             config_options: self.config_options.clone(),
@@ -1331,6 +1347,13 @@ pub struct LiveSessionSnapshot {
     /// it. Always serialized (a plain bool) so the frontend can rely on it.
     #[serde(default)]
     pub feedback_tool_available: bool,
+    /// Whether `codeg-mcp` was included in the session establishment request.
+    /// Defaults false for snapshots emitted by older Codeg versions.
+    #[serde(default)]
+    pub codeg_mcp_available: bool,
+    /// Total MCP server entries on this concrete connection. Diagnostic only.
+    #[serde(default)]
+    pub mcp_server_count: u32,
     pub modes: Option<SessionModeStateInfo>,
     pub current_mode: Option<String>,
     pub config_options: Option<Vec<SessionConfigOptionInfo>>,

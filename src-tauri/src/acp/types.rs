@@ -633,6 +633,25 @@ pub struct ConversationConnectionInfo {
     pub event_seq: u64,
 }
 
+/// Result of atomically restoring a persisted conversation onto a live ACP
+/// connection. The backend does not publish this result until the requested
+/// external session is active, the required Codeg MCP companion is configured,
+/// and the conversation mapping has switched to `connection_id`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoredConversationConnectionInfo {
+    pub connection_id: String,
+    pub external_session_id: String,
+    /// True when a compatible live connection already represented this logical
+    /// session. A client that did not already own it attaches as a viewer.
+    pub reused_existing: bool,
+    pub codeg_mcp_available: bool,
+    pub mcp_server_count: u32,
+    /// Connections removed from the manager during the atomic switchover.
+    /// Their process loops are asked to stop immediately after the map update.
+    pub replaced_connection_ids: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct AcpAgentInfo {
     pub agent_type: crate::models::agent::AgentType,

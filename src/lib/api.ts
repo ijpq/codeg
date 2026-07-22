@@ -27,6 +27,7 @@ import type {
   SidebarData,
   ConnectionInfo,
   ConversationConnectionInfo,
+  RestoredConversationConnectionInfo,
   LiveSessionSnapshot,
   FeedbackItem,
   QuestionAnswer,
@@ -176,6 +177,23 @@ export async function acpConnect(
     agentType,
     workingDir: workingDir ?? null,
     sessionId: sessionId ?? null,
+    preferredModeId: preferredModeId ?? null,
+    preferredConfigValues: preferredConfigValues ?? null,
+  })
+}
+
+/**
+ * Restore a persisted conversation using the DB row's authoritative agent,
+ * folder and external session id. The backend returns only after resume/load,
+ * MCP configuration and the conversation→connection switchover all succeed.
+ */
+export async function acpRestoreConversation(
+  conversationId: number,
+  preferredModeId?: string | null,
+  preferredConfigValues?: Record<string, string> | null
+): Promise<RestoredConversationConnectionInfo> {
+  return getTransport().call("acp_restore_conversation", {
+    conversationId,
     preferredModeId: preferredModeId ?? null,
     preferredConfigValues: preferredConfigValues ?? null,
   })

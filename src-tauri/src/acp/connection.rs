@@ -2727,13 +2727,28 @@ async fn run_connection(
             } else {
                 None
             };
-            if let Some(ref injected) = delegate_injection {
+            let codeg_mcp_available = delegate_injection.is_some();
+            let mcp_server_count = u32::try_from(mcp_servers.len()).unwrap_or(u32::MAX);
+            {
                 let mut s = state.write().await;
-                s.delegation_token = Some(injected.token.clone());
-                // The agent's actual feedback capability for this session — the
-                // authoritative gate for submit + UI, fixed at launch.
-                s.feedback_tool_available = injected.feedback_available;
+                s.codeg_mcp_available = codeg_mcp_available;
+                s.mcp_server_count = mcp_server_count;
+                if let Some(ref injected) = delegate_injection {
+                    s.delegation_token = Some(injected.token.clone());
+                    // The agent's actual feedback capability for this session — the
+                    // authoritative gate for submit + UI, fixed at launch.
+                    s.feedback_tool_available = injected.feedback_available;
+                }
             }
+            let conversation_id_for_log = state.read().await.conversation_id;
+            tracing::info!(
+                conversation_id = ?conversation_id_for_log,
+                external_session_id = ?session_id,
+                connection_id = %conn_id,
+                mcp_server_count,
+                codeg_mcp_available,
+                "[ACP] MCP session configuration prepared"
+            );
 
             // Emit fork support capability
             emit_with_state(
@@ -7205,6 +7220,36 @@ mod tests {
         );
 
         assert!(req.meta.is_none());
+    }
+
+    #[test]
+    fn codex_resume_request_preserves_codeg_mcp_deliverables_companion() {
+        let cwd = std::path::PathBuf::from("/tmp/codeg");
+        let companion = McpServer::Stdio(
+            McpServerStdio::new("codeg-mcp", std::path::PathBuf::from("/opt/codeg-mcp"))
+                .args(vec![
+                    "--features".to_string(),
+                    "deliverables,feedback,ask,sessions".to_string(),
+                ]),
+        );
+        let req = build_resume_session_request(
+            AgentType::Codex,
+            SessionId::new("codex-session".to_string()),
+            &cwd,
+            vec![companion],
+        );
+
+        assert_eq!(req.mcp_servers.len(), 1);
+        let json = serde_json::to_value(&req).unwrap();
+        let server = &json["mcpServers"][0];
+        assert_eq!(server["name"], "codeg-mcp");
+        assert!(server["args"]
+            .as_array()
+            .expect("stdio args")
+            .iter()
+            .any(|value| value
+                .as_str()
+                .is_some_and(|arg| arg.contains("deliverables"))));
     }
 
     // Unlike NewSessionRequest/LoadSessionRequest (whose `mcp_servers` has no

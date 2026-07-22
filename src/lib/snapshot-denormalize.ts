@@ -36,8 +36,11 @@ export interface SnapshotPatch {
   // eventSeq race window allows an old connection's snapshot to overwrite
   // a freshly-started replacement at the same contextKey.
   connectionId: string
+  conversationId: number | null
   status: ConnectionStatus
   sessionId: string | null
+  codegMcpAvailable: boolean
+  mcpServerCount: number
   modes: SessionModeStateInfo | null
   configOptions: SessionConfigOptionInfo[] | null
   availableCommands: AvailableCommandInfo[] | null
@@ -93,8 +96,11 @@ export function denormalizeSnapshot(wire: LiveSessionSnapshot): SnapshotPatch {
 
   return {
     connectionId: wire.connection_id,
+    conversationId: wire.conversation_id,
     status: wire.status,
     sessionId: wire.external_id,
+    codegMcpAvailable: wire.codeg_mcp_available ?? false,
+    mcpServerCount: wire.mcp_server_count ?? 0,
     modes: wire.modes,
     configOptions: wire.config_options,
     availableCommands: wire.available_commands ?? null,

@@ -152,6 +152,27 @@ enum HandshakeWaitOutcome {
     TimedOut,
 }
 
+/// Spawn result used by the persisted-conversation restore path. The ordinary
+/// `spawn_agent` API intentionally keeps returning only the id for compatibility;
+/// restore additionally needs ownership information so a second browser can
+/// attach as a viewer instead of later killing a connection it did not create.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SpawnAgentOutcome {
+    pub connection_id: String,
+    pub reused_existing: bool,
+}
+
+/// Result of switching the backend's authoritative conversation mapping to a
+/// restored connection. Old connections have already been removed from the
+/// manager (so no subsequent prompt can race through them) and have received a
+/// best-effort Disconnect command when this is returned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConversationActivationOutcome {
+    pub codeg_mcp_available: bool,
+    pub mcp_server_count: u32,
+    pub replaced_connection_ids: Vec<String>,
+}
+
 impl HandshakeWaitOutcome {
     fn as_str(self) -> &'static str {
         match self {
@@ -187,6 +208,10 @@ pub struct ConnectionManager {
     /// process lifetime — bounded by the number of distinct sessions ever
     /// connected.
     spawn_locks: Arc<Mutex<HashMap<SpawnDedupKey, Arc<Mutex<()>>>>>,
+    /// Per-conversation switchover mutex. Session spawn is deduplicated by
+    /// `spawn_locks`; this second lock serializes the shorter authoritative
+    /// mapping update + old-connection removal phase.
+    restore_locks: Arc<Mutex<HashMap<i32, Arc<Mutex<()>>>>>,
     /// Bound on how long `spawn_agent` waits for the agent's handshake
     /// before releasing the dedup lock. Configurable per-instance for
     /// tests; in production initialized from env via
@@ -240,6 +265,7 @@ impl ConnectionManager {
         Self {
             connections: Arc::new(Mutex::new(HashMap::new())),
             spawn_locks: Arc::new(Mutex::new(HashMap::new())),
+            restore_locks: Arc::new(Mutex::new(HashMap::new())),
             spawn_handshake_timeout: spawn_handshake_timeout_from_env(),
             delegation_injection: Arc::new(std::sync::OnceLock::new()),
             probe_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -253,6 +279,7 @@ impl ConnectionManager {
         Self {
             connections: self.connections.clone(),
             spawn_locks: self.spawn_locks.clone(),
+            restore_locks: self.restore_locks.clone(),
             spawn_handshake_timeout: self.spawn_handshake_timeout,
             delegation_injection: self.delegation_injection.clone(),
             probe_locks: self.probe_locks.clone(),
@@ -279,6 +306,7 @@ impl ConnectionManager {
         Self {
             connections: Arc::new(Mutex::new(HashMap::new())),
             spawn_locks: Arc::new(Mutex::new(HashMap::new())),
+            restore_locks: Arc::new(Mutex::new(HashMap::new())),
             spawn_handshake_timeout: timeout,
             delegation_injection: Arc::new(std::sync::OnceLock::new()),
             probe_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -406,6 +434,69 @@ impl ConnectionManager {
         preferred_mode_id: Option<String>,
         preferred_config_values: BTreeMap<String, String>,
     ) -> Result<String, AcpError> {
+        Ok(self
+            .spawn_agent_with_requirements(
+                agent_type,
+                working_dir,
+                session_id,
+                runtime_env,
+                owner_window_label,
+                emitter,
+                preferred_mode_id,
+                preferred_config_values,
+                false,
+                None,
+            )
+            .await?
+            .connection_id)
+    }
+
+    /// Spawn or reuse a connection for an atomic persisted-conversation
+    /// restore. When `require_codeg_mcp` is true, an older connection without
+    /// the built-in companion is deliberately ineligible for reuse.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn spawn_agent_for_restore(
+        &self,
+        agent_type: AgentType,
+        working_dir: Option<String>,
+        session_id: String,
+        runtime_env: BTreeMap<String, String>,
+        owner_window_label: String,
+        emitter: EventEmitter,
+        preferred_mode_id: Option<String>,
+        preferred_config_values: BTreeMap<String, String>,
+        require_codeg_mcp: bool,
+        conversation_id: i32,
+    ) -> Result<SpawnAgentOutcome, AcpError> {
+        self.spawn_agent_with_requirements(
+            agent_type,
+            working_dir,
+            Some(session_id),
+            runtime_env,
+            owner_window_label,
+            emitter,
+            preferred_mode_id,
+            preferred_config_values,
+            require_codeg_mcp,
+            Some(conversation_id),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_agent_with_requirements(
+        &self,
+        agent_type: AgentType,
+        working_dir: Option<String>,
+        session_id: Option<String>,
+        runtime_env: BTreeMap<String, String>,
+        owner_window_label: String,
+        emitter: EventEmitter,
+        preferred_mode_id: Option<String>,
+        preferred_config_values: BTreeMap<String, String>,
+        require_codeg_mcp: bool,
+        target_conversation_id: Option<i32>,
+    ) -> Result<SpawnAgentOutcome, AcpError> {
         // Connection dedup: when resuming an agent session (session_id is
         // Some), look for a live AgentConnection that already represents
         // the same external session in the same working_dir for the same
@@ -443,15 +534,25 @@ impl ConnectionManager {
         };
 
         if let Some(existing) = self
-            .find_connection_for_reuse(agent_type, working_dir_path.as_ref(), session_id.as_deref())
+            .find_connection_for_reuse_with_requirements(
+                agent_type,
+                working_dir_path.as_ref(),
+                session_id.as_deref(),
+                require_codeg_mcp,
+                target_conversation_id,
+            )
             .await
         {
             tracing::info!(
-                "[ACP] reusing connection id={} for session_id={}",
-                existing,
-                session_id.as_deref().unwrap_or("")
+                connection_id = %existing,
+                external_session_id = session_id.as_deref().unwrap_or(""),
+                require_codeg_mcp,
+                "[ACP] reusing compatible connection"
             );
-            return Ok(existing);
+            return Ok(SpawnAgentOutcome {
+                connection_id: existing,
+                reused_existing: true,
+            });
         }
 
         let connection_id = uuid::Uuid::new_v4().to_string();
@@ -503,7 +604,10 @@ impl ConnectionManager {
 
         drop(dedup_lock);
 
-        Ok(connection_id)
+        Ok(SpawnAgentOutcome {
+            connection_id,
+            reused_existing: false,
+        })
     }
 
     /// Bump `last_activity_at` for a live connection so the idle sweep
@@ -533,12 +637,12 @@ impl ConnectionManager {
     }
 
     /// Disconnect connections that have been idle longer than `idle_timeout`.
-    /// "Idle" means: status is `Connected`, no `pending_permission`, no
-    /// launched-but-unresolved background work (async sub-agent / background
-    /// shell — disconnecting kills the agent CLI and the background work with
-    /// it), and no activity (no events, no commands) for at least
-    /// `idle_timeout`. `Prompting` connections are always preserved (a turn is
-    /// in flight). Returns the number of connections that were disconnected.
+    /// "Idle" means: status is `Connected`, no live WebSocket attach lease, no
+    /// `pending_permission`, no launched-but-unresolved background work (async
+    /// sub-agent / background shell — disconnecting kills the agent CLI and the
+    /// background work with it), and no activity (no events, no commands) for
+    /// at least `idle_timeout`. `Prompting` connections and conversations open
+    /// in any web client are always preserved. Returns the number disconnected.
     pub async fn sweep_idle(&self, idle_timeout: Duration) -> usize {
         let now = chrono::Utc::now();
         let timeout = match chrono::Duration::from_std(idle_timeout) {
@@ -559,6 +663,13 @@ impl ConnectionManager {
                     continue;
                 }
                 if state.pending_permission.is_some() {
+                    continue;
+                }
+                // An attach receiver lives for exactly as long as its browser
+                // WebSocket subscription. Treat it as a server-side lease so a
+                // background-throttled tab does not lose its ACP process merely
+                // because its 30s JavaScript touch interval was suspended.
+                if state.event_stream.receiver_count() > 0 {
                     continue;
                 }
                 if state.has_active_background_work(now) {
@@ -637,6 +748,8 @@ impl ConnectionManager {
     /// - the connection's `agent_type` equals the requested one
     /// - the connection's `working_dir` equals the requested one (compared as
     ///   `Option<PathBuf>` so canonicalization is the caller's concern)
+    /// - when restoring a persisted conversation, the connection is unbound or
+    ///   already bound to that same conversation
     /// - the connection's `state.status` is neither `Disconnected` nor `Error`
     ///
     /// Per-session state is acquired via `read().await` rather than `try_read`:
@@ -647,11 +760,30 @@ impl ConnectionManager {
     /// for an imperceptible latency win. The connections-map mutex is held
     /// across the awaits — fine because no path takes `state.write()` while
     /// holding the connections mutex (no lock-cycle).
+    #[cfg(test)]
     pub(crate) async fn find_connection_for_reuse(
         &self,
         agent_type: AgentType,
         working_dir: Option<&PathBuf>,
         session_id: Option<&str>,
+    ) -> Option<String> {
+        self.find_connection_for_reuse_with_requirements(
+            agent_type,
+            working_dir,
+            session_id,
+            false,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn find_connection_for_reuse_with_requirements(
+        &self,
+        agent_type: AgentType,
+        working_dir: Option<&PathBuf>,
+        session_id: Option<&str>,
+        require_codeg_mcp: bool,
+        target_conversation_id: Option<i32>,
     ) -> Option<String> {
         // No session_id → caller is opening a fresh session; never dedup.
         let session_id = session_id?;
@@ -662,6 +794,16 @@ impl ConnectionManager {
             }
             let state = conn.state.read().await;
             if state.external_id.as_deref() != Some(session_id) {
+                continue;
+            }
+            if require_codeg_mcp && !state.codeg_mcp_available {
+                continue;
+            }
+            if target_conversation_id.is_some_and(|expected| {
+                state
+                    .conversation_id
+                    .is_some_and(|bound| bound != expected)
+            }) {
                 continue;
             }
             if state.working_dir.as_ref() != working_dir {
@@ -676,6 +818,201 @@ impl ConnectionManager {
             return Some(id.clone());
         }
         None
+    }
+
+    /// Make `connection_id` the sole live connection for a persisted
+    /// conversation after session resume/load has completed.
+    ///
+    /// The old connections' prompt mutexes are held while the map and all
+    /// SessionState bindings change. Consequently a stale `/acp_prompt` either
+    /// completes before this method (and makes the old connection busy, causing
+    /// us to abort without changing anything) or looks up the old id after it
+    /// has been removed and fails with ConnectionNotFound. It can never silently
+    /// re-bind the superseded connection after the switch.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn activate_restored_conversation(
+        &self,
+        connection_id: &str,
+        conversation_id: i32,
+        folder_id: i32,
+        expected_session_id: &str,
+        require_codeg_mcp: bool,
+        parent_conversation_id: Option<i32>,
+        parent_tool_use_id: Option<String>,
+    ) -> Result<ConversationActivationOutcome, AcpError> {
+        let restore_lock = {
+            let mut locks = self.restore_locks.lock().await;
+            locks
+                .entry(conversation_id)
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let _restore_guard = restore_lock.lock_owned().await;
+
+        // Lock the target and every connection currently mapped to this
+        // conversation in deterministic id order. send_prompt_linked takes the
+        // same per-connection lock before reading/writing the mapping.
+        let mut prompt_locks: Vec<(String, Arc<tokio::sync::Mutex<()>>)> = {
+            let connections = self.connections.lock().await;
+            if !connections.contains_key(connection_id) {
+                return Err(AcpError::ConnectionNotFound(connection_id.into()));
+            }
+            let mut locks = Vec::new();
+            for (id, conn) in connections.iter() {
+                let is_target = id == connection_id;
+                let is_current = if is_target {
+                    false
+                } else {
+                    conn.state.read().await.conversation_id == Some(conversation_id)
+                };
+                if is_target || is_current {
+                    locks.push((id.clone(), Arc::clone(&conn.prompt_lock)));
+                }
+            }
+            locks
+        };
+        prompt_locks.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut prompt_guards = Vec::with_capacity(prompt_locks.len());
+        for (_, lock) in prompt_locks {
+            prompt_guards.push(lock.lock_owned().await);
+        }
+
+        let (
+            target_state,
+            target_emitter,
+            codeg_mcp_available,
+            mcp_server_count,
+            replaced,
+        ) = {
+            let mut connections = self.connections.lock().await;
+            let target = connections
+                .get(connection_id)
+                .ok_or_else(|| AcpError::ConnectionNotFound(connection_id.into()))?;
+            let target_state = Arc::clone(&target.state);
+            let target_emitter = target.emitter.clone();
+
+            let (codeg_mcp_available, mcp_server_count) = {
+                let state = target_state.read().await;
+                if state.external_id.as_deref() != Some(expected_session_id) {
+                    return Err(AcpError::protocol(format!(
+                        "restored session mismatch for conversation {conversation_id}: expected {expected_session_id}, got {}",
+                        state.external_id.as_deref().unwrap_or("none")
+                    )));
+                }
+                if !matches!(
+                    state.status,
+                    ConnectionStatus::Connected | ConnectionStatus::Prompting
+                ) {
+                    return Err(AcpError::protocol(format!(
+                        "restored connection {connection_id} is not ready"
+                    )));
+                }
+                if require_codeg_mcp && !state.codeg_mcp_available {
+                    return Err(AcpError::protocol(
+                        "restored Codex session did not configure the required codeg-mcp companion",
+                    ));
+                }
+                if let Some(bound) = state.conversation_id {
+                    if bound != conversation_id {
+                        return Err(AcpError::protocol(format!(
+                            "restored connection {connection_id} is already bound to conversation {bound}"
+                        )));
+                    }
+                }
+                (state.codeg_mcp_available, state.mcp_server_count)
+            };
+
+            let mut old_ids = Vec::new();
+            let mut old_states = Vec::new();
+            for (id, conn) in connections.iter() {
+                if id == connection_id {
+                    continue;
+                }
+                let state = conn.state.read().await;
+                if state.conversation_id != Some(conversation_id) {
+                    continue;
+                }
+                if state.turn_in_flight || state.status == ConnectionStatus::Prompting {
+                    return Err(AcpError::TurnInProgress);
+                }
+                old_ids.push(id.clone());
+                old_states.push(Arc::clone(&conn.state));
+            }
+
+            // All validation is complete. These writes happen while the
+            // connections map is exclusively locked, so every manager lookup
+            // observes either the old mapping or the complete new mapping.
+            {
+                let mut state = target_state.write().await;
+                state.conversation_id = Some(conversation_id);
+                state.folder_id = Some(folder_id);
+            }
+            for state in old_states {
+                let mut state = state.write().await;
+                state.conversation_id = None;
+                state.folder_id = None;
+            }
+
+            let mut removed = Vec::with_capacity(old_ids.len());
+            for old_id in old_ids {
+                if let Some(old) = connections.remove(&old_id) {
+                    removed.push((old_id, old.cmd_tx));
+                }
+            }
+            (
+                target_state,
+                target_emitter,
+                codeg_mcp_available,
+                mcp_server_count,
+                removed,
+            )
+        };
+
+        // Publish the already-applied binding so attached clients and internal
+        // lifecycle consumers converge without waiting for the first prompt.
+        emit_with_state(
+            &target_state,
+            &target_emitter,
+            AcpEvent::ConversationLinked {
+                conversation_id,
+                folder_id,
+                parent_conversation_id,
+                parent_tool_use_id,
+            },
+        )
+        .await;
+
+        let mut replaced_connection_ids = Vec::with_capacity(replaced.len());
+        for (old_id, cmd_tx) in replaced {
+            replaced_connection_ids.push(old_id.clone());
+            if cmd_tx.send(ConnectionCommand::Disconnect).await.is_err() {
+                tracing::warn!(
+                    conversation_id,
+                    old_connection_id = %old_id,
+                    new_connection_id = %connection_id,
+                    "[ACP] superseded connection command channel already closed"
+                );
+            }
+        }
+        drop(prompt_guards);
+
+        tracing::info!(
+            conversation_id,
+            external_session_id = expected_session_id,
+            new_connection_id = connection_id,
+            old_connection_ids = ?replaced_connection_ids,
+            mcp_server_count,
+            codeg_mcp_available,
+            binding_updated = true,
+            old_connections_cleaned = true,
+            "[ACP] restored conversation binding activated"
+        );
+
+        Ok(ConversationActivationOutcome {
+            codeg_mcp_available,
+            mcp_server_count,
+            replaced_connection_ids,
+        })
     }
 
     /// Forwards a prompt to the connection's command channel without
@@ -948,23 +1285,48 @@ impl ConnectionManager {
         // Snapshot what we need from the connection map under one short lock.
         // The conversation-linked check happens INSIDE the prompt lock so
         // any racing send sees a consistent post-link state.
-        let (state_arc, emitter, agent_type, already_linked, turn_in_flight) = {
+        let (
+            state_arc,
+            emitter,
+            agent_type,
+            linked_conversation_id,
+            turn_in_flight,
+        ) = {
             let connections = self.connections.lock().await;
             let conn = connections
                 .get(conn_id)
                 .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?;
-            let (already, in_flight) = {
+            let (linked_conversation_id, in_flight) = {
                 let s = conn.state.read().await;
-                (s.conversation_id.is_some(), s.turn_in_flight)
+                (s.conversation_id, s.turn_in_flight)
             };
             (
                 conn.state.clone(),
                 conn.emitter.clone(),
                 conn.agent_type,
-                already,
+                linked_conversation_id,
                 in_flight,
             )
         };
+        let already_linked = linked_conversation_id.is_some();
+
+        // A stale tab must never use a still-live connection from a different
+        // conversation. Before the restore fix the already-linked branch simply
+        // ignored the caller's id, which made `/acp_prompt` appear successful
+        // while writing into whichever session the old connection owned.
+        if let (Some(expected), Some(actual)) = (conversation_id, linked_conversation_id) {
+            if expected != actual {
+                tracing::warn!(
+                    requested_conversation_id = expected,
+                    bound_conversation_id = actual,
+                    connection_id = conn_id,
+                    "[ACP] rejecting prompt on mismatched conversation binding"
+                );
+                return Err(AcpError::protocol(format!(
+                    "connection {conn_id} is bound to conversation {actual}, not {expected}"
+                )));
+            }
+        }
 
         // Reject a concurrent prompt while a turn is already in flight, BEFORE
         // any side effects (row creation, InProgress emit, user-message
@@ -977,6 +1339,14 @@ impl ConnectionManager {
         if turn_in_flight {
             return Err(AcpError::TurnInProgress);
         }
+
+        let routed_external_session_id = state_arc.read().await.external_id.clone();
+        tracing::info!(
+            conversation_id = ?conversation_id.or(linked_conversation_id),
+            connection_id = conn_id,
+            external_session_id = ?routed_external_session_id,
+            "[ACP] prompt routing resolved"
+        );
 
         if !already_linked {
             match (conversation_id, folder_id) {
@@ -4141,6 +4511,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn send_prompt_linked_rejects_connection_bound_to_another_conversation() {
+        use crate::db::test_helpers;
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/prompt-binding-guard").await;
+        let first = conversation_service::create(
+            &db.conn,
+            folder_id,
+            AgentType::Codex,
+            Some("first".into()),
+            None,
+        )
+        .await
+        .unwrap();
+        let second = conversation_service::create(
+            &db.conn,
+            folder_id,
+            AgentType::Codex,
+            Some("second".into()),
+            None,
+        )
+        .await
+        .unwrap();
+        let mgr = ConnectionManager::new();
+        let mut rx = insert_live_connection(&mgr, "wrong-binding", AgentType::Codex, None).await;
+        mgr.get_state("wrong-binding")
+            .await
+            .unwrap()
+            .write()
+            .await
+            .conversation_id = Some(first.id);
+
+        let error = mgr
+            .send_prompt_linked(
+                &db,
+                "wrong-binding",
+                one_text_block(),
+                Some(folder_id),
+                Some(second.id),
+                None,
+            )
+            .await
+            .expect_err("mismatched conversation must be rejected");
+        assert!(error.to_string().contains("not"));
+        assert!(rx.try_recv().is_err(), "no prompt may reach the old session");
+    }
+
+    #[tokio::test]
     async fn send_prompt_linked_caller_id_is_noop_when_already_linked() {
         use crate::db::test_helpers;
         let db = test_helpers::fresh_in_memory_db().await;
@@ -4440,6 +4857,191 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persisted_codex_restore_does_not_reuse_connection_without_codeg_mcp() {
+        let mgr = ConnectionManager::new();
+        let working_dir = PathBuf::from("/tmp/codex-restore-mcp");
+        let _rx = insert_live_connection(
+            &mgr,
+            "legacy-codex",
+            AgentType::Codex,
+            Some(working_dir.clone()),
+        )
+        .await;
+        let state = mgr.get_state("legacy-codex").await.unwrap();
+        {
+            let mut state = state.write().await;
+            state.external_id = Some("codex-session-1".into());
+            state.codeg_mcp_available = false;
+        }
+
+        assert_eq!(
+            mgr.find_connection_for_reuse_with_requirements(
+                AgentType::Codex,
+                Some(&working_dir),
+                Some("codex-session-1"),
+                false,
+                None,
+            )
+            .await
+            .as_deref(),
+            Some("legacy-codex"),
+            "ordinary compatibility lookup may reuse the legacy connection"
+        );
+        assert!(
+            mgr.find_connection_for_reuse_with_requirements(
+                AgentType::Codex,
+                Some(&working_dir),
+                Some("codex-session-1"),
+                true,
+                Some(42),
+            )
+            .await
+            .is_none(),
+            "historical Codex restore must require the built-in MCP companion"
+        );
+
+        state.write().await.codeg_mcp_available = true;
+        assert_eq!(
+            mgr.find_connection_for_reuse_with_requirements(
+                AgentType::Codex,
+                Some(&working_dir),
+                Some("codex-session-1"),
+                true,
+                Some(42),
+            )
+            .await
+            .as_deref(),
+            Some("legacy-codex")
+        );
+
+        state.write().await.conversation_id = Some(41);
+        assert!(
+            mgr.find_connection_for_reuse_with_requirements(
+                AgentType::Codex,
+                Some(&working_dir),
+                Some("codex-session-1"),
+                true,
+                Some(42),
+            )
+            .await
+            .is_none(),
+            "a connection owned by another conversation must not be reused"
+        );
+        assert_eq!(
+            mgr.find_connection_for_reuse_with_requirements(
+                AgentType::Codex,
+                Some(&working_dir),
+                Some("codex-session-1"),
+                true,
+                Some(41),
+            )
+            .await
+            .as_deref(),
+            Some("legacy-codex")
+        );
+    }
+
+    #[tokio::test]
+    async fn activate_restored_conversation_atomically_rebinds_and_stops_old_connection() {
+        let mgr = ConnectionManager::new();
+        let mut old_rx =
+            insert_live_connection(&mgr, "old", AgentType::Codex, None).await;
+        let _new_rx = insert_live_connection(&mgr, "new", AgentType::Codex, None).await;
+        {
+            let old = mgr.get_state("old").await.unwrap();
+            let mut state = old.write().await;
+            state.conversation_id = Some(42);
+            state.folder_id = Some(7);
+            state.external_id = Some("session-42".into());
+        }
+        {
+            let new = mgr.get_state("new").await.unwrap();
+            let mut state = new.write().await;
+            state.external_id = Some("session-42".into());
+            state.codeg_mcp_available = true;
+            state.mcp_server_count = 3;
+        }
+
+        let outcome = mgr
+            .activate_restored_conversation(
+                "new",
+                42,
+                7,
+                "session-42",
+                true,
+                None,
+                None,
+            )
+            .await
+            .expect("atomic activation");
+        assert_eq!(outcome.replaced_connection_ids, vec!["old"]);
+        assert!(outcome.codeg_mcp_available);
+        assert_eq!(outcome.mcp_server_count, 3);
+        assert!(mgr.get_state("old").await.is_none());
+        let new = mgr.get_state("new").await.unwrap();
+        let new = new.read().await;
+        assert_eq!(new.conversation_id, Some(42));
+        assert_eq!(new.folder_id, Some(7));
+        drop(new);
+        assert!(matches!(
+            old_rx.recv().await,
+            Some(ConnectionCommand::Disconnect)
+        ));
+    }
+
+    #[tokio::test]
+    async fn activate_restored_conversation_failure_preserves_existing_binding() {
+        let mgr = ConnectionManager::new();
+        let _old_rx = insert_live_connection(&mgr, "old", AgentType::Codex, None).await;
+        let _new_rx = insert_live_connection(&mgr, "new", AgentType::Codex, None).await;
+        {
+            let old = mgr.get_state("old").await.unwrap();
+            let mut state = old.write().await;
+            state.conversation_id = Some(42);
+            state.folder_id = Some(7);
+            state.external_id = Some("session-42".into());
+        }
+        {
+            let new = mgr.get_state("new").await.unwrap();
+            let mut state = new.write().await;
+            state.external_id = Some("session-42".into());
+            state.codeg_mcp_available = false;
+        }
+
+        let error = mgr
+            .activate_restored_conversation(
+                "new",
+                42,
+                7,
+                "session-42",
+                true,
+                None,
+                None,
+            )
+            .await
+            .expect_err("missing MCP must reject restore");
+        assert!(error.to_string().contains("codeg-mcp"));
+        assert_eq!(
+            mgr.get_state("old")
+                .await
+                .unwrap()
+                .read()
+                .await
+                .conversation_id,
+            Some(42)
+        );
+        assert_eq!(
+            mgr.get_state("new")
+                .await
+                .unwrap()
+                .read()
+                .await
+                .conversation_id,
+            None
+        );
+    }
+
+    #[tokio::test]
     async fn find_connection_for_reuse_skips_disconnected_or_errored() {
         let mgr = ConnectionManager::new();
         let (broadcaster, _rx) = make_test_broadcaster();
@@ -4531,6 +5133,43 @@ mod tests {
         let n = mgr.sweep_idle(Duration::from_secs(300)).await;
         assert_eq!(n, 0);
         assert!(mgr.connections.lock().await.contains_key("fresh"));
+    }
+
+    #[tokio::test]
+    async fn sweep_idle_treats_live_web_attach_as_a_lease() {
+        let mgr = ConnectionManager::new();
+        insert_fake_connection(
+            &mgr,
+            "open-in-browser",
+            AgentType::ClaudeCode,
+            None,
+            EventEmitter::Noop,
+        )
+        .await;
+        backdate_last_activity(&mgr, "open-in-browser", 600).await;
+
+        let stream = {
+            let state = mgr.get_state("open-in-browser").await.unwrap();
+            let stream = state.read().await.event_stream();
+            stream
+        };
+        let lease = stream.subscribe();
+
+        let n = mgr.sweep_idle(Duration::from_secs(300)).await;
+        assert_eq!(
+            n, 0,
+            "an open web conversation must survive timer suspension"
+        );
+        assert!(mgr.connections.lock().await.contains_key("open-in-browser"));
+
+        // Closing the WebSocket drops its receiver. With no other activity,
+        // the same connection is eligible on the next sweep.
+        drop(lease);
+        let n = mgr.sweep_idle(Duration::from_secs(300)).await;
+        assert_eq!(
+            n, 1,
+            "a released attach lease must not leak the ACP process"
+        );
     }
 
     #[tokio::test]

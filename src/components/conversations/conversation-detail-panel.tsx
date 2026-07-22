@@ -630,8 +630,15 @@ const ConversationTabView = memo(function ConversationTabView({
   // No-op for normal conversations, whose connected cwd always equals intended.
   // A connection still bound to a different agent is never "ready" for the
   // selected one — it would otherwise let a send reach the previous agent.
+  const restoredIdentityReady =
+    !hasPersistedConversation ||
+    !externalId ||
+    (conn.sessionId === externalId &&
+      conn.conversationId === dbConversationId &&
+      (selectedAgent !== "codex" || conn.codegMcpAvailable))
   const connectionReady =
     !connIsForOtherAgent &&
+    restoredIdentityReady &&
     isConnectionReady(
       connStatus,
       conn.connectedWorkingDir,

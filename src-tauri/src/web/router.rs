@@ -620,6 +620,10 @@ pub fn build_router(
         )
         .route("/acp_list_agents", post(handlers::acp::acp_list_agents))
         .route("/acp_connect", post(handlers::acp::acp_connect))
+        .route(
+            "/acp_restore_conversation",
+            post(handlers::acp::acp_restore_conversation),
+        )
         .route("/acp_disconnect", post(handlers::acp::acp_disconnect))
         .route(
             "/acp_touch_connection",

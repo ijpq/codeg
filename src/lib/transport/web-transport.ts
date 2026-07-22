@@ -31,6 +31,14 @@ const READY_TIMEOUT_MS = 5_000
 // not as a reason to discard the token and bounce to /login.
 const WS_BACKOFF_INITIAL_MS = 1_000
 const WS_BACKOFF_MAX_MS = 32_000
+// Application-level heartbeat. Browser WebSocket objects don't expose native
+// protocol ping frames, and a TCP path that disappears during sleep / subnet
+// route changes can remain OPEN locally without ever firing onclose. The
+// server already understands `{ action: "ping" }` and replies with a typed
+// `pong`; actively exercising the path lets us turn that half-open socket into
+// the normal authenticated reconnect flow instead of leaving the UI frozen.
+const WS_HEARTBEAT_INTERVAL_MS = 20_000
+const WS_HEARTBEAT_TIMEOUT_MS = 10_000
 // Upper bound on the `/api/health` probe that classifies a dropped WS. The
 // browser's native WebSocket can't read the HTTP status of a rejected
 // handshake (onclose only reports code 1006), so we can't tell "token
@@ -97,6 +105,13 @@ export class WebTransport implements Transport {
   // a late 200 can't reopen the socket behind the session-expired dialog.
   private probeEpoch = 0
   private probeController: AbortController | null = null
+  // Heartbeat state is intentionally independent from the reconnect backoff.
+  // At most one ping is outstanding; any inbound WS frame proves the path is
+  // alive and acknowledges it (not only pong — a busy event stream is stronger
+  // evidence than a dedicated heartbeat response).
+  private heartbeatInterval: ReturnType<typeof setInterval> | null = null
+  private heartbeatTimeout: ReturnType<typeof setTimeout> | null = null
+  private heartbeatSentAt: number | null = null
 
   constructor(baseUrl: string) {
     this.baseUrl = baseUrl
@@ -169,6 +184,12 @@ export class WebTransport implements Transport {
       if (err instanceof DOMException && err.name === "AbortError") {
         throw new Error("Request timed out")
       }
+      // A fetch-level network error means no HTTP response was received at
+      // all. Rebuild the possibly-half-open WebSocket immediately and let the
+      // authenticated health probe distinguish server outage from recovery.
+      // HTTP 4xx/5xx responses do not enter this branch and therefore never
+      // churn a healthy socket merely because one handler failed.
+      this.beginReconnect("http_network_error", true)
       throw err
     } finally {
       window.clearTimeout(timeout)
@@ -263,6 +284,28 @@ export class WebTransport implements Transport {
     this.wsFailCount = 0
     this.setConnState("reconnecting")
     void this.probeHealth()
+  }
+
+  /**
+   * Exercise an apparently healthy connection now. Used on tab wake and the
+   * browser `online` signal, where a socket can still report OPEN even though
+   * its old TCP/Tailscale path is gone. Reconnecting/unauthorized states keep
+   * their existing semantics; an initial socket that has never readied is left
+   * alone because its normal handshake is still in progress.
+   */
+  verifyNow(): void {
+    if (this.destroyed || this.connState === "unauthorized") return
+    if (this.connState === "reconnecting") {
+      this.reconnectNow()
+      return
+    }
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.sendHeartbeatPing()
+      return
+    }
+    if (this.hasReadiedOnce && this.ws?.readyState !== WebSocket.CONNECTING) {
+      this.beginReconnect("foreground_socket_missing", true)
+    }
   }
 
   /**
@@ -377,6 +420,10 @@ export class WebTransport implements Transport {
     }
 
     this.ws.onmessage = (msg) => {
+      // Any inbound frame proves the complete server→browser path is alive.
+      // Clear the outstanding heartbeat before parsing so even a future frame
+      // type or malformed application payload cannot trigger a false timeout.
+      this.noteInboundActivity()
       try {
         const parsed = JSON.parse(msg.data) as unknown
         // Attach-protocol frames carry a `type` discriminator; legacy
@@ -387,6 +434,7 @@ export class WebTransport implements Transport {
           typeof parsed === "object" &&
           "type" in (parsed as object)
         ) {
+          if ((parsed as { type?: unknown }).type === "pong") return
           this.eventStreamInstance?.handleServerFrame(parsed)
           return
         }
@@ -399,6 +447,7 @@ export class WebTransport implements Transport {
           // keeps growing its backoff instead of restarting from 1s.
           this.wsFailCount = 0
           this.setConnState("connected")
+          this.startHeartbeat()
           if (this.hasReadiedOnce) {
             // Reconnect path: server-side receiver_count was 0 during the
             // disconnect window, so any event fired in that gap was dropped.
@@ -428,6 +477,7 @@ export class WebTransport implements Transport {
     }
 
     this.ws.onclose = () => {
+      this.stopHeartbeat()
       this.ws = null
       this.wsOpen = false
       // New subscribers (and any concurrent subscribe() calls in flight)
@@ -448,6 +498,89 @@ export class WebTransport implements Transport {
     }
 
     return true
+  }
+
+  private startHeartbeat() {
+    this.stopHeartbeat()
+    // Verify the freshly-readied path immediately. This also gives tests and
+    // diagnostics a deterministic first heartbeat instead of waiting 20s.
+    this.sendHeartbeatPing()
+    this.heartbeatInterval = setInterval(
+      () => this.sendHeartbeatPing(),
+      WS_HEARTBEAT_INTERVAL_MS
+    )
+  }
+
+  private sendHeartbeatPing() {
+    if (
+      this.destroyed ||
+      this.connState !== "connected" ||
+      !this.ws ||
+      this.ws.readyState !== WebSocket.OPEN
+    ) {
+      return
+    }
+
+    // A visibility/online nudge may race the periodic interval. Never fan out
+    // multiple pings or timeout handles for the same socket.
+    if (this.heartbeatSentAt !== null) {
+      if (Date.now() - this.heartbeatSentAt >= WS_HEARTBEAT_TIMEOUT_MS) {
+        this.beginReconnect("heartbeat_overdue", false)
+      }
+      return
+    }
+
+    if (!this.sendWsFrame({ action: "ping" })) {
+      this.beginReconnect("heartbeat_send_failed", false)
+      return
+    }
+
+    this.heartbeatSentAt = Date.now()
+    this.heartbeatTimeout = setTimeout(() => {
+      if (this.heartbeatSentAt === null) return
+      this.beginReconnect("heartbeat_timeout", false)
+    }, WS_HEARTBEAT_TIMEOUT_MS)
+  }
+
+  private noteInboundActivity() {
+    this.heartbeatSentAt = null
+    if (this.heartbeatTimeout) {
+      clearTimeout(this.heartbeatTimeout)
+      this.heartbeatTimeout = null
+    }
+  }
+
+  private stopHeartbeat() {
+    if (this.heartbeatInterval) {
+      clearInterval(this.heartbeatInterval)
+      this.heartbeatInterval = null
+    }
+    this.noteInboundActivity()
+  }
+
+  /**
+   * Deterministically retire a dead/half-open socket. `teardownWs` detaches
+   * onclose before closing, so this method owns the state transition and probe
+   * scheduling exactly once — no duplicate reconnect loop from a late close.
+   */
+  private beginReconnect(reason: string, probeImmediately: boolean) {
+    if (this.destroyed || this.connState === "unauthorized") return
+    console.warn("[WebTransport] connection unhealthy; reconnecting", {
+      reason,
+      wsReadyState: this.ws?.readyState ?? null,
+    })
+    this.teardownWs()
+    this.resetReady()
+    this.setConnState("reconnecting")
+    if (probeImmediately) {
+      if (this.reconnectTimer) {
+        clearTimeout(this.reconnectTimer)
+        this.reconnectTimer = null
+      }
+      void this.probeHealth()
+    } else {
+      this.scheduleReconnect()
+    }
   }
 
   // Schedule the next reconnect attempt with exponential backoff. Each failed
@@ -533,6 +666,7 @@ export class WebTransport implements Transport {
   // Shared by connectWs (pre-rebuild), reconnectNow, markUnauthorized, and
   // destroy. Idempotent — a no-op when there's no live socket.
   private teardownWs() {
+    this.stopHeartbeat()
     if (this.ws) {
       this.ws.onopen = null
       this.ws.onmessage = null
