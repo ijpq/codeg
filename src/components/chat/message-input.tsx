@@ -128,6 +128,7 @@ import { ComposerAddMenu } from "@/components/chat/composer/composer-add-menu"
 import { ComposerImageThumbnails } from "@/components/chat/composer/composer-image-thumbnails"
 import { useComposerAttachments } from "@/components/chat/composer/use-composer-attachments"
 import { useComposerShortcuts } from "@/components/chat/composer/use-composer-shortcuts"
+import { draftSupportsNativeSteer } from "@/lib/prompt-delivery-state"
 
 /**
  * Payload pushed into the composer from outside (e.g. a welcome-page quick
@@ -143,7 +144,7 @@ export interface ComposerInjectContent {
 interface MessageInputProps {
   onSend: (draft: PromptDraft, modeId?: string | null) => void
   supportsSteer?: boolean
-  onSteer?: (draft: PromptDraft) => void | Promise<void>
+  onGuide?: (draft: PromptDraft) => void | Promise<void>
   placeholder?: string
   defaultPath?: string
   disabled?: boolean
@@ -269,7 +270,7 @@ function modelPickerGroups(
 export function MessageInput({
   onSend,
   supportsSteer = false,
-  onSteer,
+  onGuide,
   placeholder,
   defaultPath,
   disabled = false,
@@ -665,7 +666,7 @@ export function MessageInput({
   const imageAttachments = attach.imageAttachments
   const hasAttachments = attachments.length > 0
   const hasSendableContent = !composerEmpty || hasAttachments
-  const isNativeGuide = isPrompting && supportsSteer && Boolean(onSteer)
+  const isNativeGuide = isPrompting && supportsSteer && Boolean(onGuide)
 
   // ── Slash command autocomplete ──
   //
@@ -1126,7 +1127,7 @@ export function MessageInput({
       return
     }
 
-    if (isNativeGuide && onSteer) {
+    if (isNativeGuide && onGuide && draftSupportsNativeSteer(draft)) {
       // Consume the draft synchronously so a double-click/key repeat cannot
       // inject it twice. The parent owns failure recovery and always converts
       // an unsuccessful guide into live feedback or the ordinary-message queue.
@@ -1138,7 +1139,7 @@ export function MessageInput({
       }
       resetComposer()
       void Promise.resolve()
-        .then(() => onSteer(draft))
+        .then(() => onGuide(draft))
         .catch(() => {
           // The parent has already surfaced and recovered the failed draft.
         })
@@ -1169,7 +1170,7 @@ export function MessageInput({
     isEditingQueueItem,
     isPrompting,
     isNativeGuide,
-    onSteer,
+    onGuide,
     onSaveQueueEdit,
     onEnqueue,
     onSend,

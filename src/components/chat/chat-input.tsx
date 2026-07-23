@@ -28,7 +28,7 @@ interface ChatInputProps {
   onFocus?: () => void
   onSend: (draft: PromptDraft, modeId?: string | null) => void
   supportsSteer?: boolean
-  onSteer?: (draft: PromptDraft) => void | Promise<void>
+  onGuide?: (draft: PromptDraft) => void | Promise<void>
   onCancel: () => void
   modes?: SessionModeInfo[]
   configOptions?: SessionConfigOptionInfo[]
@@ -93,7 +93,7 @@ export const ChatInput = memo(function ChatInput({
   onFocus,
   onSend,
   supportsSteer = false,
-  onSteer,
+  onGuide,
   onCancel,
   modes,
   configOptions,
@@ -134,7 +134,7 @@ export const ChatInput = memo(function ChatInput({
   const isConnected = status === "connected"
   const isPrompting = status === "prompting"
   const isConnecting = status === "connecting"
-  const isNativeGuide = isPrompting && supportsSteer && Boolean(onSteer)
+  const isNativeGuide = isPrompting && supportsSteer && Boolean(onGuide)
 
   // Active/historical conversations dock the composer at the very bottom of the
   // message list. The attached folder/branch selector row now sits at the
@@ -174,7 +174,7 @@ export const ChatInput = memo(function ChatInput({
       <MessageInput
         onSend={onSend}
         supportsSteer={supportsSteer}
-        onSteer={onSteer}
+        onGuide={onGuide}
         promptCapabilities={promptCapabilities}
         onFocus={onFocus}
         defaultPath={defaultPath}
