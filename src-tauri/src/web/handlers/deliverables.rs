@@ -34,7 +34,7 @@ pub struct TurnRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct RevealRequest {
+pub struct SingleDeliverableRequest {
     pub conversation_id: i32,
     pub deliverable_id: String,
 }
@@ -106,10 +106,24 @@ pub async fn copy(
 
 pub async fn reveal(
     Extension(state): Extension<Arc<AppState>>,
-    Json(request): Json<RevealRequest>,
+    Json(request): Json<SingleDeliverableRequest>,
 ) -> Result<Json<deliverables::DeliverableOperationResult>, AppCommandError> {
     Ok(Json(
         deliverables::reveal_deliverable_core(
+            &state.db.conn,
+            request.conversation_id,
+            request.deliverable_id,
+        )
+        .await?,
+    ))
+}
+
+pub async fn open(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(request): Json<SingleDeliverableRequest>,
+) -> Result<Json<deliverables::DeliverableOperationResult>, AppCommandError> {
+    Ok(Json(
+        deliverables::open_deliverable_core(
             &state.db.conn,
             request.conversation_id,
             request.deliverable_id,

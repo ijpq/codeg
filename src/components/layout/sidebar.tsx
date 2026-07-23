@@ -131,7 +131,7 @@ export function Sidebar() {
   const leftReserve = leftChromeReserve(platformIsMac && isDesktop(), zoomLevel)
 
   const [showCompleted, setShowCompleted] = useState(false)
-  const [sortMode, setSortMode] = useState<SidebarSortMode>("created")
+  const [sortMode, setSortMode] = useState<SidebarSortMode>("updated")
   const [sectionOrder, setSectionOrder] =
     useState<SidebarSectionOrder>("folders-first")
   const [allExpanded, setAllExpanded] = useState(true)

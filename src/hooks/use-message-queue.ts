@@ -6,6 +6,8 @@ import { randomUUID } from "@/lib/utils"
 
 export interface QueuedMessage {
   id: string
+  /** Stable id reused when this item is retried after Busy/reconnect. */
+  clientMessageId: string
   draft: PromptDraft
   modeId: string | null
 }
@@ -27,13 +29,26 @@ function loadPersistedQueue(storageKey: string | null): QueuedMessage[] {
     if (!raw) return []
     const parsed: unknown = JSON.parse(raw)
     if (!Array.isArray(parsed)) return []
-    return parsed.filter(
-      (x): x is QueuedMessage =>
-        !!x &&
-        typeof x === "object" &&
-        typeof (x as QueuedMessage).id === "string" &&
-        !!(x as QueuedMessage).draft
-    )
+    return parsed
+      .filter(
+        (
+          x
+        ): x is Omit<QueuedMessage, "clientMessageId"> & {
+          clientMessageId?: string
+        } =>
+          !!x &&
+          typeof x === "object" &&
+          typeof (x as QueuedMessage).id === "string" &&
+          !!(x as QueuedMessage).draft
+      )
+      .map((item) => ({
+        ...item,
+        clientMessageId:
+          typeof item.clientMessageId === "string" &&
+          item.clientMessageId.length > 0
+            ? item.clientMessageId
+            : `optimistic-${item.id}`,
+      }))
   } catch {
     return []
   }
@@ -54,13 +69,21 @@ function persistQueue(storageKey: string | null, queue: QueuedMessage[]): void {
 
 export interface UseMessageQueueReturn {
   queue: QueuedMessage[]
-  enqueue: (draft: PromptDraft, modeId: string | null) => void
+  enqueue: (
+    draft: PromptDraft,
+    modeId: string | null,
+    clientMessageId?: string
+  ) => void
   /**
    * Put a draft back at the FRONT of the queue. Used when an auto-flushed item
    * was dequeued, sent, and bounced (TurnBusyError): it must return to the head
    * so it retries before items that were already behind it (FIFO preserved).
    */
-  requeueFront: (draft: PromptDraft, modeId: string | null) => void
+  requeueFront: (
+    draft: PromptDraft,
+    modeId: string | null,
+    clientMessageId?: string
+  ) => void
   dequeue: () => QueuedMessage | undefined
   remove: (id: string) => void
   reorder: (items: QueuedMessage[]) => void
@@ -112,15 +135,29 @@ export function useMessageQueue(
   )
 
   const enqueue = useCallback(
-    (draft: PromptDraft, modeId: string | null) => {
-      commit([...queueRef.current, { id: randomUUID(), draft, modeId }])
+    (
+      draft: PromptDraft,
+      modeId: string | null,
+      clientMessageId = `optimistic-${randomUUID()}`
+    ) => {
+      commit([
+        ...queueRef.current,
+        { id: randomUUID(), clientMessageId, draft, modeId },
+      ])
     },
     [commit]
   )
 
   const requeueFront = useCallback(
-    (draft: PromptDraft, modeId: string | null) => {
-      commit([{ id: randomUUID(), draft, modeId }, ...queueRef.current])
+    (
+      draft: PromptDraft,
+      modeId: string | null,
+      clientMessageId = `optimistic-${randomUUID()}`
+    ) => {
+      commit([
+        { id: randomUUID(), clientMessageId, draft, modeId },
+        ...queueRef.current,
+      ])
     },
     [commit]
   )

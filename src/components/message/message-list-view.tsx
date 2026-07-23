@@ -23,6 +23,7 @@ import { TurnStats } from "./turn-stats"
 import { LiveTurnStats } from "./live-turn-stats"
 import { UserResourceLinks } from "./user-resource-links"
 import { UserImageAttachments } from "./user-image-attachments"
+import type { LiveMessage } from "@/contexts/acp-connections-context"
 import { AgentPlanOverlay } from "@/components/chat/agent-plan-overlay"
 import { SubAgentOverlay } from "@/components/chat/sub-agent-overlay"
 import { normalizeToolName } from "@/lib/tool-call-normalization"
@@ -59,9 +60,8 @@ import type {
   ConversationDeliverable,
   ConversationTurnDeliverableSet,
   ConnectionStatus,
-  SessionStats,
 } from "@/lib/types"
-import { copyTextToClipboard } from "@/lib/utils"
+import { cn, copyTextToClipboard } from "@/lib/utils"
 import { VirtualizedMessageThread } from "@/components/message/virtualized-message-thread"
 import {
   ConversationMessageNav,
@@ -73,6 +73,42 @@ import type { MessageScrollContextValue } from "@/components/message/message-scr
 import { extractSessionFilesGrouped } from "@/lib/session-files"
 import { unescapeComposerText } from "@/lib/composer-copy-text"
 import { useStickToBottomContext } from "use-stick-to-bottom"
+import type {
+  PromptDeliveryPhase,
+  PromptDeliveryState,
+} from "@/lib/prompt-delivery-state"
+
+type DeliveryLabelKey =
+  | "delivery.submitting"
+  | "delivery.accepted"
+  | "delivery.running"
+  | "delivery.failed"
+  | "delivery.queued"
+  | "delivery.persisted"
+  | "delivery.completed"
+
+function deliveryPhaseLabel(
+  phase: PromptDeliveryPhase,
+  t: (key: DeliveryLabelKey) => string
+): string {
+  switch (phase) {
+    case "draft":
+    case "submitting":
+      return t("delivery.submitting")
+    case "accepted":
+      return t("delivery.accepted")
+    case "running":
+      return t("delivery.running")
+    case "persisted":
+      return t("delivery.persisted")
+    case "completed":
+      return t("delivery.completed")
+    case "failed":
+      return t("delivery.failed")
+    case "queued":
+      return t("delivery.queued")
+  }
+}
 
 interface MessageListViewProps {
   conversationId: number
@@ -153,6 +189,7 @@ const EMPTY_DELEGATIONS: DelegationCardSource[] = []
 // when a conversation has no user messages.
 const EMPTY_NAV_ENTRIES: MessageNavEntry[] = []
 const EMPTY_DELIVERABLES: ConversationDeliverable[] = []
+const EMPTY_PROMPT_DELIVERIES: Record<string, PromptDeliveryState> = {}
 
 export interface DeliverableUserTurnRef {
   id: string
@@ -556,6 +593,7 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
   isResponseComplete = true,
   conversationId,
   deliverables = EMPTY_DELIVERABLES,
+  delivery = null,
 }: {
   group: ResolvedMessageGroup
   dimmed?: boolean
@@ -565,7 +603,9 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
   isResponseComplete?: boolean
   conversationId: number
   deliverables?: ConversationDeliverable[]
+  delivery?: PromptDeliveryState | null
 }) {
+  const t = useTranslations("Folder.chat.messageList")
   if (group.role === "system") {
     return <CollapsibleSystemMessage group={group} />
   }
@@ -591,6 +631,21 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
         {group.role === "user" && group.resources.length > 0 ? (
           <UserResourceLinks resources={group.resources} className="self-end" />
         ) : null}
+        {group.role === "user" &&
+          delivery &&
+          delivery.phase !== "completed" &&
+          delivery.phase !== "persisted" && (
+            <span
+              aria-live="polite"
+              className={cn(
+                "self-end text-[11px] text-muted-foreground",
+                delivery.phase === "failed" && "text-destructive"
+              )}
+              title={delivery.error ?? undefined}
+            >
+              {deliveryPhaseLabel(delivery.phase, t)}
+            </span>
+          )}
       </Message>
       {group.role === "assistant" && previousUserId && (
         <ReplyDeliverables
@@ -678,9 +733,43 @@ export function MessageListView({
     (s) => s.byConversationId.get(conversationId) ?? null
   )
   const liveMessage = session?.liveMessage ?? null
+  const promptDeliveries = session?.promptDeliveries ?? EMPTY_PROMPT_DELIVERIES
+  const activeDelivery = session?.activeTurnToken
+    ? (promptDeliveries[session.activeTurnToken] ?? null)
+    : null
   const timelineTurns = useConversationRuntimeStore((s) =>
     selectTimelineTurns(s, conversationId)
   )
+  const pendingUserStartedAt = useMemo(() => {
+    for (let index = timelineTurns.length - 1; index >= 0; index -= 1) {
+      const turn = timelineTurns[index].turn
+      if (turn.role !== "user") continue
+      const parsed = Date.parse(turn.timestamp)
+      return Number.isFinite(parsed) ? parsed : null
+    }
+    return null
+  }, [timelineTurns])
+  const statsMessage = useMemo<LiveMessage | null>(() => {
+    if (connStatus !== "prompting") return null
+    if (liveMessage) return liveMessage
+    const startedAt =
+      activeDelivery?.acceptedAt ??
+      activeDelivery?.submittedAt ??
+      pendingUserStartedAt
+    if (startedAt === null) return null
+    return {
+      id: `pending-${conversationId}`,
+      role: "assistant",
+      content: [],
+      startedAt,
+    }
+  }, [
+    activeDelivery,
+    connStatus,
+    conversationId,
+    liveMessage,
+    pendingUserStartedAt,
+  ])
 
   const shouldUseSmoothResize = !(
     isActive &&
@@ -880,6 +969,7 @@ export function MessageListView({
                 previousUserId={item.previousUserId}
                 isResponseComplete={item.phase === "persisted"}
                 conversationId={conversationId}
+                delivery={promptDeliveries[item.group.id] ?? null}
                 deliverables={
                   item.previousUserId
                     ? deliverablesByUserId.get(item.previousUserId)
@@ -895,7 +985,7 @@ export function MessageListView({
           return null
       }
     },
-    [conversationId, deliverablesByUserId]
+    [conversationId, deliverablesByUserId, promptDeliveries]
   )
 
   const emptyState = useMemo(
@@ -1098,9 +1188,9 @@ export function MessageListView({
         />
         <MessageThreadScrollButton />
       </MessageThread>
-      {liveMessage && connStatus === "prompting" && (
+      {statsMessage && connStatus === "prompting" && (
         <LiveTurnStats
-          message={liveMessage}
+          message={statsMessage}
           agentType={agentType}
           isStreaming={connStatus === "prompting"}
         />

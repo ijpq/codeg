@@ -187,6 +187,7 @@ import {
   type InputAttachment,
   type ResourceInputAttachment,
 } from "./message-input-attachments"
+import { draftSupportsNativeSteer } from "@/lib/prompt-delivery-state"
 
 /**
  * Payload pushed into the composer from outside (e.g. a welcome-page quick
@@ -354,6 +355,23 @@ function blobToBase64(blob: Blob): Promise<string> {
     }
     reader.readAsDataURL(blob)
   })
+}
+
+function createObjectPreviewUrl(blob: Blob): string | undefined {
+  return typeof URL !== "undefined" && typeof URL.createObjectURL === "function"
+    ? URL.createObjectURL(blob)
+    : undefined
+}
+
+function revokeObjectPreviewUrl(attachment: InputAttachment): void {
+  if (
+    attachment.type === "image" &&
+    attachment.previewUrl &&
+    typeof URL !== "undefined" &&
+    typeof URL.revokeObjectURL === "function"
+  ) {
+    URL.revokeObjectURL(attachment.previewUrl)
+  }
 }
 
 function getFilePath(file: File): string | null {
@@ -586,6 +604,7 @@ export function MessageInput({
   // embedded/data-uri badge, keyed by its synthetic `file://` sentinel uri, and
   // is reconciled into the outgoing blocks by `buildDraft`.
   const [attachments, setAttachments] = useState<InputAttachment[]>([])
+  const attachmentsRef = useRef<InputAttachment[]>([])
   const embeddedPayloadsRef = useRef<Map<string, PromptInputBlock>>(new Map())
   const [isDragActive, setIsDragActive] = useState(false)
   // Collapsed (narrow) selectors live in a controlled Popover holding a
@@ -645,6 +664,19 @@ export function MessageInput({
   useEffect(() => {
     isPromptingRef.current = isPrompting
   }, [isPrompting])
+
+  useEffect(() => {
+    attachmentsRef.current = attachments
+  }, [attachments])
+
+  useEffect(
+    () => () => {
+      for (const attachment of attachmentsRef.current) {
+        revokeObjectPreviewUrl(attachment)
+      }
+    },
+    []
+  )
 
   useEffect(() => {
     // navigator.clipboard is undefined at runtime in non-secure contexts even
@@ -726,9 +758,14 @@ export function MessageInput({
     (editor: Editor, blocks: PromptInputBlock[]) => {
       embeddedPayloadsRef.current.clear()
       const restored = restoreBlocksIntoEditor(editor, blocks)
-      setAttachments(
-        restored.filter((a): a is ImageInputAttachment => a.type === "image")
-      )
+      setAttachments((previous) => {
+        for (const attachment of previous) {
+          revokeObjectPreviewUrl(attachment)
+        }
+        return restored.filter(
+          (a): a is ImageInputAttachment => a.type === "image"
+        )
+      })
       const resources = restored.filter(
         (a): a is ResourceInputAttachment => a.type === "resource"
       )
@@ -1520,6 +1557,7 @@ export function MessageInput({
           uri: null,
           name: file.name || `image-${Date.now()}-${index + 1}`,
           mimeType,
+          previewUrl: createObjectPreviewUrl(file),
         }
       })
     )
@@ -2420,7 +2458,11 @@ export function MessageInput({
   }, [setDragActiveIfChanged])
 
   const removeAttachment = useCallback((id: string) => {
-    setAttachments((prev) => prev.filter((item) => item.id !== id))
+    setAttachments((previous) => {
+      const removed = previous.find((item) => item.id === id)
+      if (removed) revokeObjectPreviewUrl(removed)
+      return previous.filter((item) => item.id !== id)
+    })
   }, [])
 
   const buildDraft = useCallback((): PromptDraft | null => {
@@ -2488,7 +2530,12 @@ export function MessageInput({
   const resetComposer = useCallback(() => {
     editorRef.current?.clear()
     setComposerEmpty(true)
-    setAttachments([])
+    setAttachments((previous) => {
+      for (const attachment of previous) {
+        revokeObjectPreviewUrl(attachment)
+      }
+      return []
+    })
     embeddedPayloadsRef.current.clear()
     closeSlashMenu()
   }, [closeSlashMenu])
@@ -2508,7 +2555,7 @@ export function MessageInput({
       return
     }
 
-    if (isNativeGuide && onSteer) {
+    if (isNativeGuide && onSteer && draftSupportsNativeSteer(draft)) {
       // Consume the draft synchronously so a double-click/key repeat cannot
       // inject it twice. The parent owns failure recovery and always converts
       // an unsuccessful guide into live feedback or the ordinary-message queue.
@@ -3135,7 +3182,10 @@ export function MessageInput({
                           className="cursor-pointer transition-opacity hover:opacity-80"
                         >
                           <Image
-                            src={`data:${attachment.mimeType};base64,${attachment.data}`}
+                            src={
+                              attachment.previewUrl ??
+                              `data:${attachment.mimeType};base64,${attachment.data}`
+                            }
                             alt={attachment.name}
                             width={56}
                             height={56}
@@ -3684,7 +3734,8 @@ export function MessageInput({
       <ImagePreviewDialog
         src={
           previewAttachment
-            ? `data:${previewAttachment.mimeType};base64,${previewAttachment.data}`
+            ? (previewAttachment.previewUrl ??
+              `data:${previewAttachment.mimeType};base64,${previewAttachment.data}`)
             : ""
         }
         alt={previewAttachment?.name ?? ""}

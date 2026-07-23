@@ -130,13 +130,52 @@ describe("useMessageQueue persistence (offline survival across reload)", () => {
 
   it("persists the queue and rehydrates it on a fresh mount (reload)", () => {
     const first = renderHook(() => useMessageQueue(42))
-    act(() => first.result.current.enqueue(draft("offline message"), "modeA"))
+    act(() =>
+      first.result.current.enqueue(
+        draft("offline message"),
+        "modeA",
+        "optimistic-stable"
+      )
+    )
     expect(JSON.parse(localStorage.getItem(KEY)!)).toHaveLength(1)
 
     // A fresh mount (page reload during the outage) restores the queue.
     const reloaded = renderHook(() => useMessageQueue(42))
     expect(texts(reloaded.result.current.queue)).toEqual(["offline message"])
     expect(reloaded.result.current.queue[0].modeId).toBe("modeA")
+    expect(reloaded.result.current.queue[0].clientMessageId).toBe(
+      "optimistic-stable"
+    )
+  })
+
+  it("preserves client_message_id across dequeue and Busy requeue", () => {
+    const { result } = renderHook(() => useMessageQueue())
+    act(() =>
+      result.current.enqueue(draft("image prompt"), null, "optimistic-image")
+    )
+    let item: ReturnType<typeof result.current.dequeue>
+    act(() => {
+      item = result.current.dequeue()
+    })
+    act(() =>
+      result.current.requeueFront(
+        item!.draft,
+        item!.modeId,
+        item!.clientMessageId
+      )
+    )
+    expect(result.current.queue[0].clientMessageId).toBe("optimistic-image")
+  })
+
+  it("backfills stable ids for legacy persisted queue entries", () => {
+    localStorage.setItem(
+      KEY,
+      JSON.stringify([
+        { id: "legacy-id", draft: draft("legacy"), modeId: null },
+      ])
+    )
+    const { result } = renderHook(() => useMessageQueue(42))
+    expect(result.current.queue[0].clientMessageId).toBe("optimistic-legacy-id")
   })
 
   it("clears the persisted slot when the queue drains", () => {

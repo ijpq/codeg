@@ -1394,6 +1394,8 @@
       "steerInjected": "Instrucción inyectada en el turno actual",
       "steerFallbackFeedback": "La guía nativa no está disponible; se envió como feedback en tiempo real",
       "steerTurnEndedQueued": "El turno acaba de terminar; el mensaje quedó en cola para el siguiente turno",
+      "imageSteerQueued": "No se pueden inyectar imágenes durante un turno; mensaje en cola para el siguiente",
+      "promptAcceptanceUnknown": "Conexión interrumpida; comprobando si el servidor aceptó el mensaje",
       "steerUnsupportedQueued": "La guía nativa no está disponible; el mensaje quedó en cola para el siguiente turno",
       "steerFailedQueued": "Falló la guía; el mensaje quedó en cola para el siguiente turno",
       "exportConversation": "Exportar conversación",
@@ -2505,11 +2507,23 @@
         "completedAt": "Completado a las",
         "jumpToPreviousUserMessage": "Ir al mensaje del usuario",
         "showMore": "Mostrar más",
-        "showLess": "Mostrar menos"
+        "showLess": "Mostrar menos",
+        "delivery": {
+          "submitting": "Enviando…",
+          "accepted": "Enviado",
+          "running": "Procesando en el servidor",
+          "persisted": "Guardado",
+          "completed": "Completado",
+          "failed": "Estado de envío desconocido",
+          "queued": "En cola"
+        }
       },
       "liveTurnStats": {
         "thinking": "Pensando...",
         "streaming": "Transmitiendo",
+        "sent": "Enviado",
+        "backendProcessing": "Procesando en el servidor",
+        "stillProcessing": "El servidor sigue procesando",
         "elapsedHours": "{value} h",
         "elapsedMinutes": "{value} min",
         "elapsedSeconds": "{value} s",
@@ -2827,12 +2841,14 @@
         "fileUnavailable": "Archivo no disponible o que ya no existe: {filePath}",
         "turnTitle": "Outputs from this turn",
         "download": "Download to this device",
+        "openWithDefaultAppHost": "Open with default app (Codeg host)",
         "copyFileHost": "Copy file object (Codeg host)",
         "copyPath": "Copy path",
         "revealOnHost": "Reveal on the Codeg host",
         "fileCopied": "File copied; you can paste it directly",
         "pathCopied": "Path copied",
         "filesCopied": "Files copied; you can paste them together",
+        "opened": "Opened with the Codeg host's default app",
         "operationFailed": "Deliverable operation failed",
         "declared": "Declared",
         "inferred": "Automatically inferred",
@@ -2862,7 +2878,7 @@
         "producedAt": "Produced",
         "empty": "This conversation has no confirmed deliverables yet",
         "noFilterResults": "No deliverables match these filters",
-        "hostActionNotice": "Copy file and reveal actions affect the Windows host running Codeg Server; downloads always go to the current device."
+        "hostActionNotice": "Open, copy file, and reveal actions affect the host running Codeg Server; downloads always go to the current device."
       },
       "userResources": {
         "openFile": "Abrir {filePath}",

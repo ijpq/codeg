@@ -1394,6 +1394,8 @@
       "steerInjected": "已將引導注入目前輪次",
       "steerFallbackFeedback": "原生引導無法使用，已回退為即時回饋",
       "steerTurnEndedQueued": "目前輪次剛剛結束，訊息已進入下一輪佇列",
+      "imageSteerQueued": "執行中的輪次不支援注入圖片，已排入下一輪一般訊息",
+      "promptAcceptanceUnknown": "連線中斷，正在確認後端是否已接收此訊息",
       "steerUnsupportedQueued": "原生引導無法使用，訊息已進入下一輪佇列",
       "steerFailedQueued": "引導傳送失敗，訊息已進入下一輪佇列",
       "exportConversation": "匯出對話",
@@ -2505,11 +2507,23 @@
         "completedAt": "完成時間",
         "jumpToPreviousUserMessage": "跳轉到上一條使用者訊息",
         "showMore": "展開",
-        "showLess": "收合"
+        "showLess": "收合",
+        "delivery": {
+          "submitting": "傳送中…",
+          "accepted": "已傳送",
+          "running": "後端處理中",
+          "persisted": "已儲存",
+          "completed": "已完成",
+          "failed": "傳送狀態待確認",
+          "queued": "已排隊"
+        }
       },
       "liveTurnStats": {
         "thinking": "思考中...",
         "streaming": "生成中",
+        "sent": "已傳送",
+        "backendProcessing": "後端處理中",
+        "stillProcessing": "後台仍在處理中",
         "elapsedHours": "{value} 小時",
         "elapsedMinutes": "{value} 分鐘",
         "elapsedSeconds": "{value} 秒",
@@ -2827,12 +2841,14 @@
         "fileUnavailable": "檔案不可用或已不存在:{filePath}",
         "turnTitle": "本輪產物",
         "download": "下載到目前裝置",
+        "openWithDefaultAppHost": "使用 Codeg 主機的預設應用程式開啟",
         "copyFileHost": "複製檔案本體（Codeg 主機）",
         "copyPath": "複製路徑",
         "revealOnHost": "在 Codeg 主機的資料夾中顯示",
         "fileCopied": "檔案已複製，可直接貼上",
         "pathCopied": "路徑已複製",
         "filesCopied": "檔案已複製，可一次貼上",
+        "opened": "已使用 Codeg 主機的預設應用程式開啟",
         "operationFailed": "產物操作失敗",
         "declared": "明確宣告",
         "inferred": "自動推斷",
@@ -2862,7 +2878,7 @@
         "producedAt": "產生於",
         "empty": "目前對話尚無確認的產物",
         "noFilterResults": "沒有符合篩選條件的產物",
-        "hostActionNotice": "「複製檔案」與「開啟資料夾」作用於執行 Codeg Server 的 Windows 主機；下載一律傳送到目前裝置。"
+        "hostActionNotice": "「開啟檔案」、「複製檔案」與「開啟資料夾」作用於執行 Codeg Server 的主機；下載一律傳送到目前裝置。"
       },
       "userResources": {
         "openFile": "開啟 {filePath}",

@@ -292,6 +292,9 @@ pub struct AgentConnection {
     /// Bounded successful client-message ids. A retry whose HTTP/Tauri response
     /// was lost returns the original result without injecting twice.
     pub completed_steers: Arc<tokio::sync::Mutex<VecDeque<SteerResult>>>,
+    /// Bounded accepted ordinary-prompt ids. A retry after a lost web response
+    /// returns success without enqueueing a second agent turn.
+    pub accepted_prompt_ids: Arc<tokio::sync::Mutex<VecDeque<String>>>,
 
     /// Canonical fingerprint of the agent's effective config (env vars + model
     /// provider creds + native config file content) captured at spawn. The
@@ -887,6 +890,7 @@ pub async fn spawn_agent_connection(
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
             steer_lock: Arc::new(tokio::sync::Mutex::new(())),
             completed_steers: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
+            accepted_prompt_ids: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
             last_observed_fingerprint: config_fingerprint.clone(),
             config_fingerprint,
         },

@@ -1690,6 +1690,9 @@ mod tests {
             completed_steers: Arc::new(tokio::sync::Mutex::new(
                 std::collections::VecDeque::new(),
             )),
+            accepted_prompt_ids: Arc::new(tokio::sync::Mutex::new(
+                std::collections::VecDeque::new(),
+            )),
             config_fingerprint: String::new(),
             last_observed_fingerprint: String::new(),
         }

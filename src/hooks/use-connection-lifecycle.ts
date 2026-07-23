@@ -43,14 +43,16 @@ export interface UseConnectionLifecycleReturn {
        * draft instead of treating it as an error.
        */
       onTurnInProgress?: () => void
+      /** Fired only after `/acp_prompt` returned success (backend accepted). */
+      onAccepted?: () => void
       /**
-       * Called when the send failed on a network/offline error (not a genuine
-       * backend error). The caller re-queues the draft for auto-resend on
-       * reconnect — the same recovery path as `onTurnInProgress`.
+       * Called for a non-Busy failure. `ambiguous=true` means the transport
+       * response was lost and the backend may already have accepted the prompt;
+       * callers must keep the optimistic message and reconcile by id.
        */
-      onSendFailed?: () => void
+      onSendFailed?: (error: unknown, ambiguous: boolean) => void
     }
-  ) => void
+  ) => Promise<void>
   handleSetConfigOption: (configId: string, valueId: string) => void
   handleCancel: () => void
   handleRespondPermission: (requestId: string, optionId: string) => void
@@ -398,18 +400,20 @@ export function useConnectionLifecycle({
         conversationId?: number | null
         clientMessageId?: string | null
         onTurnInProgress?: () => void
+        onAccepted?: () => void
         /**
-         * Called when the send fails on a network/offline error (not a genuine
-         * backend error). The caller re-queues the draft so it auto-resends on
-         * reconnect — the same recovery path as `onTurnInProgress`.
+         * Called for every non-Busy failure. The boolean marks an ambiguous
+         * network/offline loss, where the backend may already have accepted
+         * the prompt and the optimistic message must remain visible.
          */
-        onSendFailed?: () => void
+        onSendFailed?: (error: unknown, ambiguous: boolean) => void
       }
-    ) => {
+    ): Promise<void> => {
       touchActivity(contextKey)
       const onTurnInProgress = opts?.onTurnInProgress
+      const onAccepted = opts?.onAccepted
       const onSendFailed = opts?.onSendFailed
-      void (async () => {
+      return (async () => {
         const currentModeId = modeIdRef.current
         if (modeId && modeId !== currentModeId) {
           await connSetMode(modeId)
@@ -418,6 +422,7 @@ export function useConnectionLifecycle({
           modeIdRef.current = modeId
         }
         await sendPrompt(draft.blocks, opts)
+        onAccepted?.()
       })().catch((e: unknown) => {
         if (e instanceof TurnBusyError) {
           // A turn was already in flight on the connection (another
@@ -428,11 +433,7 @@ export function useConnectionLifecycle({
           return
         }
         console.error("[ConnLifecycle] sendPrompt:", e)
-        if (isNetworkOrOfflineError(e)) {
-          // Lost the link mid-send (web mode): don't drop the user's message —
-          // hand it back to the caller to re-queue for auto-resend on reconnect.
-          onSendFailed?.()
-        }
+        onSendFailed?.(e, isNetworkOrOfflineError(e))
       })
     },
     [connSetMode, sendPrompt, contextKey, touchActivity]

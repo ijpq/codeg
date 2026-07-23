@@ -1394,6 +1394,8 @@
       "steerInjected": "現在のターンに指示を注入しました",
       "steerFallbackFeedback": "ネイティブ誘導が利用できないため、リアルタイムフィードバックとして送信しました",
       "steerTurnEndedQueued": "ターンが終了したため、次のメッセージとしてキューに追加しました",
+      "imageSteerQueued": "実行中のターンには画像を追加できないため、次のメッセージとしてキューに追加しました",
+      "promptAcceptanceUnknown": "接続が中断されました。バックエンドの受信状況を確認しています",
       "steerUnsupportedQueued": "ネイティブ誘導が利用できないため、次のメッセージとしてキューに追加しました",
       "steerFailedQueued": "誘導に失敗したため、次のメッセージとしてキューに追加しました",
       "exportConversation": "会話をエクスポート",
@@ -2505,11 +2507,23 @@
         "completedAt": "完了時刻",
         "jumpToPreviousUserMessage": "前のユーザーメッセージへ",
         "showMore": "もっと見る",
-        "showLess": "折りたたむ"
+        "showLess": "折りたたむ",
+        "delivery": {
+          "submitting": "送信中…",
+          "accepted": "送信済み",
+          "running": "バックエンド処理中",
+          "persisted": "保存済み",
+          "completed": "完了",
+          "failed": "送信状態を確認中",
+          "queued": "キュー済み"
+        }
       },
       "liveTurnStats": {
         "thinking": "考え中...",
         "streaming": "ストリーミング中",
+        "sent": "送信済み",
+        "backendProcessing": "バックエンド処理中",
+        "stillProcessing": "バックエンドで処理を継続中",
         "elapsedHours": "{value}時間",
         "elapsedMinutes": "{value}分",
         "elapsedSeconds": "{value}秒",
@@ -2827,12 +2841,14 @@
         "fileUnavailable": "ファイルが利用できないか、存在しません: {filePath}",
         "turnTitle": "Outputs from this turn",
         "download": "Download to this device",
+        "openWithDefaultAppHost": "Open with default app (Codeg host)",
         "copyFileHost": "Copy file object (Codeg host)",
         "copyPath": "Copy path",
         "revealOnHost": "Reveal on the Codeg host",
         "fileCopied": "File copied; you can paste it directly",
         "pathCopied": "Path copied",
         "filesCopied": "Files copied; you can paste them together",
+        "opened": "Opened with the Codeg host's default app",
         "operationFailed": "Deliverable operation failed",
         "declared": "Declared",
         "inferred": "Automatically inferred",
@@ -2862,7 +2878,7 @@
         "producedAt": "Produced",
         "empty": "This conversation has no confirmed deliverables yet",
         "noFilterResults": "No deliverables match these filters",
-        "hostActionNotice": "Copy file and reveal actions affect the Windows host running Codeg Server; downloads always go to the current device."
+        "hostActionNotice": "Open, copy file, and reveal actions affect the host running Codeg Server; downloads always go to the current device."
       },
       "userResources": {
         "openFile": "{filePath} を開く",

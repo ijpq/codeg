@@ -1394,6 +1394,8 @@
       "steerInjected": "Orientação injetada no turno atual",
       "steerFallbackFeedback": "A orientação nativa não está disponível; enviada como feedback em tempo real",
       "steerTurnEndedQueued": "O turno acabou; a mensagem foi enfileirada para o próximo turno",
+      "imageSteerQueued": "Imagens não podem ser injetadas durante um turno; mensagem enfileirada para o próximo",
+      "promptAcceptanceUnknown": "Conexão interrompida; verificando se o servidor recebeu a mensagem",
       "steerUnsupportedQueued": "A orientação nativa não está disponível; a mensagem foi enfileirada para o próximo turno",
       "steerFailedQueued": "Falha na orientação; a mensagem foi enfileirada para o próximo turno",
       "exportConversation": "Exportar conversa",
@@ -2505,11 +2507,23 @@
         "completedAt": "Concluído às",
         "jumpToPreviousUserMessage": "Ir para a mensagem do usuário",
         "showMore": "Mostrar mais",
-        "showLess": "Mostrar menos"
+        "showLess": "Mostrar menos",
+        "delivery": {
+          "submitting": "Enviando…",
+          "accepted": "Enviado",
+          "running": "Processando no servidor",
+          "persisted": "Salvo",
+          "completed": "Concluído",
+          "failed": "Status de envio desconhecido",
+          "queued": "Na fila"
+        }
       },
       "liveTurnStats": {
         "thinking": "Pensando...",
         "streaming": "Transmitindo",
+        "sent": "Enviado",
+        "backendProcessing": "Processando no servidor",
+        "stillProcessing": "O servidor ainda está processando",
         "elapsedHours": "{value} h",
         "elapsedMinutes": "{value} min",
         "elapsedSeconds": "{value} s",
@@ -2827,12 +2841,14 @@
         "fileUnavailable": "Arquivo indisponível ou que não existe mais: {filePath}",
         "turnTitle": "Outputs from this turn",
         "download": "Download to this device",
+        "openWithDefaultAppHost": "Open with default app (Codeg host)",
         "copyFileHost": "Copy file object (Codeg host)",
         "copyPath": "Copy path",
         "revealOnHost": "Reveal on the Codeg host",
         "fileCopied": "File copied; you can paste it directly",
         "pathCopied": "Path copied",
         "filesCopied": "Files copied; you can paste them together",
+        "opened": "Opened with the Codeg host's default app",
         "operationFailed": "Deliverable operation failed",
         "declared": "Declared",
         "inferred": "Automatically inferred",
@@ -2862,7 +2878,7 @@
         "producedAt": "Produced",
         "empty": "This conversation has no confirmed deliverables yet",
         "noFilterResults": "No deliverables match these filters",
-        "hostActionNotice": "Copy file and reveal actions affect the Windows host running Codeg Server; downloads always go to the current device."
+        "hostActionNotice": "Open, copy file, and reveal actions affect the host running Codeg Server; downloads always go to the current device."
       },
       "userResources": {
         "openFile": "Abrir {filePath}",

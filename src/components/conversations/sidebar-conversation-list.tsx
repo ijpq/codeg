@@ -626,7 +626,7 @@ export interface SidebarConversationListProps {
 export function SidebarConversationList({
   ref,
   showCompleted = true,
-  sortMode = "created",
+  sortMode = "updated",
   sectionOrder = "folders-first",
 }: SidebarConversationListProps & {
   ref?: Ref<SidebarConversationListHandle>

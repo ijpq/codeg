@@ -358,6 +358,14 @@ export function LiveTurnStats({
     lastBlock?.type === "thinking"
 
   const elapsedLabel = formatElapsedLabel(elapsed, t)
+  const waitingForFirstEvent = message.content.length === 0
+  const activityLabel = waitingForFirstEvent
+    ? elapsed >= 10_000
+      ? t("stillProcessing")
+      : t("backendProcessing")
+    : isThinking
+      ? t("thinking")
+      : t("streaming")
 
   // --- Streaming diagnostics: is data flowing, and is the link up? ----------
   // "Time since the live message last advanced": a stall (network OR model)
@@ -427,11 +435,11 @@ export function LiveTurnStats({
           agentType={agentType}
           className="h-3.5 w-3.5 animate-pulse"
         />
-        {isThinking ? (
-          <span>{t("thinking")}</span>
-        ) : (
-          <span>{t("streaming")}</span>
-        )}
+        <span>
+          {waitingForFirstEvent
+            ? `${t("sent")} · ${activityLabel}`
+            : activityLabel}
+        </span>
         <span className="text-border leading-none">|</span>
         <span className="inline-flex items-center gap-1 leading-none">
           <Timer className="h-3 w-3 shrink-0" />

@@ -102,6 +102,32 @@ describe("groupByFolderWithReuse", () => {
     expect(grouped.get(10)!.map((c) => c.id)).toEqual([2, 1])
   })
 
+  it("moves a conversation to the top when a later task or reply updates it", () => {
+    const older = conv(1, 10, {
+      updated_at: new Date(1000).toISOString(),
+    })
+    const current = conv(2, 10, {
+      updated_at: new Date(2000).toISOString(),
+    })
+    const first = groupByFolderWithReuse([older, current], "updated", new Map())
+    expect(first.get(10)!.map((c) => c.id)).toEqual([2, 1])
+
+    // A turn-boundary status event replaces the touched summary and advances
+    // updated_at. The same folder must immediately re-sort without a refetch.
+    const olderAfterReply = {
+      ...older,
+      status: "pending_review",
+      updated_at: new Date(3000).toISOString(),
+    }
+    const second = groupByFolderWithReuse(
+      [olderAfterReply, current],
+      "updated",
+      first
+    )
+    expect(second.get(10)!.map((c) => c.id)).toEqual([1, 2])
+    expect(second.get(10)).not.toBe(first.get(10))
+  })
+
   it("reuses the prior bucket array for folders whose membership is unchanged", () => {
     const a1 = conv(1, 10)
     const a2 = conv(2, 10)

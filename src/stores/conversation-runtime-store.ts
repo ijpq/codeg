@@ -23,6 +23,12 @@ import { collapseLiveCollabBlocks } from "@/lib/collab-collapse"
 import { kimiTodoWriteEntries } from "@/lib/plan-parse"
 import { toErrorMessage } from "@/lib/app-error"
 import { BACKGROUND_TASK_MARKER } from "@/lib/background-agent"
+import {
+  createPromptDeliveryState,
+  transitionPromptDelivery,
+  type PromptDeliveryPhase,
+  type PromptDeliveryState,
+} from "@/lib/prompt-delivery-state"
 
 /**
  * Conversation-runtime shared state as a Zustand store — the per-conversation
@@ -141,6 +147,8 @@ export interface ConversationRuntimeSession {
   // Temporary state
   optimisticTurns: MessageTurn[]
   liveMessage: LiveMessage | null
+  /** Per-user-message delivery lifecycle, keyed by stable client_message_id. */
+  promptDeliveries: Record<string, PromptDeliveryState>
 
   // Sync
   syncState: ConversationSyncState
@@ -304,6 +312,13 @@ type Action =
       turn: MessageTurn
     }
   | {
+      type: "SET_PROMPT_DELIVERY_PHASE"
+      conversationId: number
+      clientMessageId: string
+      phase: Exclude<PromptDeliveryPhase, "draft">
+      error?: string | null
+    }
+  | {
       type: "SET_LIVE_MESSAGE"
       conversationId: number
       liveMessage: LiveMessage | null
@@ -381,6 +396,7 @@ function createEmptySession(
     pendingBackgroundSettlements: [],
     optimisticTurns: [],
     liveMessage: null,
+    promptDeliveries: {},
     syncState: "idle",
     activeTurnToken: null,
     lastTurnOwned: false,
@@ -1238,6 +1254,97 @@ function userTurnContentKey(turn: MessageTurn): string {
   )
 }
 
+const PROMPT_DELIVERY_HISTORY_LIMIT = 64
+
+function boundedPromptDeliveries(
+  deliveries: Record<string, PromptDeliveryState>
+): Record<string, PromptDeliveryState> {
+  const entries = Object.entries(deliveries)
+  if (entries.length <= PROMPT_DELIVERY_HISTORY_LIMIT) return deliveries
+  entries.sort(([, a], [, b]) => b.lastEventAt - a.lastEventAt)
+  return Object.fromEntries(entries.slice(0, PROMPT_DELIVERY_HISTORY_LIMIT))
+}
+
+function activeClientMessageIdFromDetail(
+  detail: DbConversationDetail
+): string | null {
+  const inFlightId = detail.in_flight_user_turn_id?.trim()
+  if (inFlightId) return inFlightId
+
+  let latestId: string | null = null
+  let latestStartedAt = Number.NEGATIVE_INFINITY
+  for (const run of detail.artifact_runs ?? []) {
+    const id = run.client_message_id?.trim()
+    if (run.status !== "running" || !id) continue
+    const startedAt = Date.parse(run.started_at)
+    const comparableStartedAt = Number.isFinite(startedAt)
+      ? startedAt
+      : Number.NEGATIVE_INFINITY
+    if (latestId === null || comparableStartedAt >= latestStartedAt) {
+      latestId = id
+      latestStartedAt = comparableStartedAt
+    }
+  }
+  return latestId
+}
+
+function reconcilePromptDeliveriesFromDetail(
+  current: ConversationRuntimeSession,
+  detail: DbConversationDetail
+): Record<string, PromptDeliveryState> {
+  const runsByClientId = new Map(
+    (detail.artifact_runs ?? [])
+      .filter((run) => Boolean(run.client_message_id))
+      .map((run) => [run.client_message_id!, run])
+  )
+  const activeId = activeClientMessageIdFromDetail(detail)
+  const ids = new Set(Object.keys(current.promptDeliveries))
+  if (activeId) ids.add(activeId)
+  for (const [id, run] of runsByClientId) {
+    if (run.status === "running") ids.add(id)
+  }
+  if (ids.size === 0) return current.promptDeliveries
+
+  const assistantCount = detail.turns.filter(
+    (turn) => turn.role === "assistant"
+  ).length
+  const baseline = current.historyAssistantBaseline ?? 0
+  let changed = false
+  const next = { ...current.promptDeliveries }
+
+  for (const id of ids) {
+    const existing = next[id]
+    const run = runsByClientId.get(id)
+    const startedAt = run ? Date.parse(run.started_at) : Number.NaN
+    const delivery =
+      existing ??
+      createPromptDeliveryState(
+        id,
+        Number.isFinite(startedAt) ? startedAt : Date.now()
+      )
+    if (!existing) {
+      next[id] = delivery
+      changed = true
+    }
+    let phase: Exclude<PromptDeliveryPhase, "draft"> | null = null
+    if (run?.status === "running" || activeId === id) {
+      phase = "running"
+    } else if (run) {
+      phase = assistantCount > baseline ? "completed" : "persisted"
+    }
+    if (!phase) continue
+    const updated = transitionPromptDelivery(delivery, phase, {
+      now: existing ? undefined : delivery.submittedAt,
+    })
+    if (updated !== delivery) {
+      next[id] = updated
+      changed = true
+    }
+  }
+
+  return changed ? boundedPromptDeliveries(next) : current.promptDeliveries
+}
+
 /**
  * Rewrite the launching tool call's `[[codeg-background-task]]` marker in a turn
  * list so `AgentToolCallPart` flips from "running in background" to its
@@ -1356,6 +1463,13 @@ function reducer(
         externalId: nextExternalId ?? current.externalId,
         sessionStats: action.detail.session_stats ?? current.sessionStats,
         backgroundTurns: nextBackgroundTurns,
+        promptDeliveries: reconcilePromptDeliveriesFromDetail(
+          current,
+          action.detail
+        ),
+        activeTurnToken:
+          activeClientMessageIdFromDetail(action.detail) ??
+          (isActivelyInteracting ? current.activeTurnToken : null),
         ...(isActivelyInteracting
           ? keepAllLiveBuffers
             ? {}
@@ -1487,6 +1601,25 @@ function reducer(
             : stillPending
       }
 
+      const completedDeliveryIds = new Set(
+        current.optimisticTurns.map((turn) => turn.id)
+      )
+      if (current.activeTurnToken) {
+        completedDeliveryIds.add(current.activeTurnToken)
+      }
+      let completedDeliveries = current.promptDeliveries
+      for (const id of completedDeliveryIds) {
+        const delivery = completedDeliveries[id]
+        if (!delivery) continue
+        if (completedDeliveries === current.promptDeliveries) {
+          completedDeliveries = { ...current.promptDeliveries }
+        }
+        completedDeliveries[id] = transitionPromptDelivery(
+          delivery,
+          "completed"
+        )
+      }
+
       return updateSessionInState(state, action.conversationId, () => ({
         ...current,
         localTurns: promoted,
@@ -1501,6 +1634,7 @@ function reducer(
         // reply is already persisted.
         lastTurnOwned: current.syncState === "awaiting_persist",
         pendingBackgroundSettlements: remainingSettlements,
+        promptDeliveries: boundedPromptDeliveries(completedDeliveries),
       }))
     }
 
@@ -1613,6 +1747,10 @@ function reducer(
       return updateSessionInState(state, action.conversationId, (current) => ({
         ...current,
         optimisticTurns: [...current.optimisticTurns, action.turn],
+        promptDeliveries: boundedPromptDeliveries({
+          ...current.promptDeliveries,
+          [action.turn.id]: createPromptDeliveryState(action.turn.id),
+        }),
         syncState: "awaiting_persist",
         activeTurnToken: action.turnToken,
         historyAssistantBaseline: batchStartHistoryBaseline(
@@ -1637,8 +1775,29 @@ function reducer(
         // suppress the next detail reconciliation. Concurrent optimistic turns
         // (if any) keep us awaiting_persist.
         syncState: remaining.length === 0 ? "idle" : s.syncState,
+        activeTurnToken:
+          s.activeTurnToken === action.id
+            ? (remaining[remaining.length - 1]?.id ?? null)
+            : s.activeTurnToken,
       }))
     }
+
+    case "SET_PROMPT_DELIVERY_PHASE":
+      return updateSessionInState(state, action.conversationId, (current) => {
+        const existing =
+          current.promptDeliveries[action.clientMessageId] ??
+          createPromptDeliveryState(action.clientMessageId)
+        const updated = transitionPromptDelivery(existing, action.phase, {
+          error: action.error,
+        })
+        return {
+          ...current,
+          promptDeliveries: boundedPromptDeliveries({
+            ...current.promptDeliveries,
+            [action.clientMessageId]: updated,
+          }),
+        }
+      })
 
     case "APPEND_VIEWER_USER_TURN": {
       const current =
@@ -1770,9 +1929,24 @@ function reducer(
         return state
       }
 
+      const activeDelivery = session.activeTurnToken
+        ? session.promptDeliveries[session.activeTurnToken]
+        : null
+      const nextDeliveries =
+        action.liveMessage && session.activeTurnToken && activeDelivery
+          ? {
+              ...session.promptDeliveries,
+              [session.activeTurnToken]: transitionPromptDelivery(
+                activeDelivery,
+                "running"
+              ),
+            }
+          : session.promptDeliveries
+
       return updateSessionInState(state, action.conversationId, () => ({
         ...session,
         liveMessage: action.liveMessage,
+        promptDeliveries: nextDeliveries,
       }))
     }
 
@@ -1996,6 +2170,17 @@ export interface RuntimeActions {
     dbConversationId: number,
     runtimeConversationId?: number
   ) => () => void
+  /**
+   * Poll the authoritative transcript after turn_complete until the final
+   * assistant record is present, then replace volatile stream buffers. This
+   * heals missed deltas without reintroducing the transcript-flush race.
+   */
+  reconcileCompletedTurn: (
+    dbConversationId: number,
+    runtimeConversationId?: number,
+    clientMessageId?: string | null,
+    onReconciled?: () => void
+  ) => () => void
   completeTurn: (
     conversationId: number,
     liveMessage?: LiveMessage | null
@@ -2006,6 +2191,12 @@ export interface RuntimeActions {
     turnToken: string
   ) => void
   removeOptimisticTurn: (conversationId: number, id: string) => void
+  setPromptDeliveryPhase: (
+    conversationId: number,
+    clientMessageId: string,
+    phase: Exclude<PromptDeliveryPhase, "draft">,
+    error?: string | null
+  ) => void
   appendViewerUserTurn: (conversationId: number, turn: MessageTurn) => void
   applyBackgroundActivity: (
     conversationId: number,
@@ -2151,15 +2342,23 @@ function isLatestGeneration(
 // trailing USER turn (Claude/Codex append the assistant reply to the JSONL only
 // on completion, so a trailing user turn means the reply is still mid-flush).
 const VIEWER_DETAIL_SYNC_DELAYS_MS = [0, 300, 700, 1500, 2500] as const
+const COMPLETED_TURN_RECONCILE_DELAYS_MS = [
+  80, 220, 500, 1000, 2000, 4000,
+] as const
 
 // Active viewer-sync polls, keyed by conversationId, so a fresh nudge supersedes
 // an in-flight poll (never stacks) and `removeConversation` / store reset can
 // cancel a poll whose tab has closed.
 const viewerDetailSyncCancels = new Map<number, () => void>()
+const completedTurnReconcileCancels = new Map<number, () => void>()
 
 function cancelViewerDetailSync(conversationId: number): void {
   const cancel = viewerDetailSyncCancels.get(conversationId)
   if (cancel) cancel()
+}
+
+function cancelCompletedTurnReconcile(conversationId: number): void {
+  completedTurnReconcileCancels.get(conversationId)?.()
 }
 
 // Resolve the RUNTIME-session key for a `conversation://changed` nudge, which
@@ -2367,10 +2566,8 @@ function computeTimelinePrefix(
     hasLiveMessage: session.liveMessage !== null,
     liveStartedAt: session.liveMessage?.startedAt ?? null,
   }
-  if (detail) {
-    const cached = timelinePrefixCache.get(detail)
-    if (cached && timelinePrefixDepsEqual(cached.deps, deps)) return cached
-  }
+  const cached = detail ? timelinePrefixCache.get(detail) : undefined
+  if (cached && timelinePrefixDepsEqual(cached.deps, deps)) return cached
 
   // Phase 1: DB historical turns.
   // When liveOwnsActiveTurn is set (sub-agent dialog), the live/local reply
@@ -2521,7 +2718,24 @@ function computeTimelinePrefix(
   // resolve identically with or without a streaming tail, so the result is
   // reusable across batches.
   const rawPrefix = [...persisted, ...localAndBackground, ...optimistic]
-  const prefix = dedupeTimeline(rawPrefix)
+  let prefix = dedupeTimeline(rawPrefix)
+  if (cached) {
+    // A prefix dependency can change without changing most rows — the first
+    // live event toggles `hasLiveMessage`, and appending one optimistic image
+    // changes only the tail. Reuse every unchanged row object so React/virtua
+    // do not reconcile a long historical transcript just because the prefix
+    // array itself had to be rebuilt.
+    const cachedByKey = new Map(cached.prefix.map((item) => [item.key, item]))
+    prefix = prefix.map((item) => {
+      const previous = cachedByKey.get(item.key)
+      return previous &&
+        previous.turn === item.turn &&
+        previous.phase === item.phase &&
+        previous.inProgressToolCallIds === item.inProgressToolCallIds
+        ? previous
+        : item
+    })
+  }
   const prefixKeys = new Set<string>()
   for (const item of prefix) {
     prefixKeys.add(retainKey(item.turn))
@@ -2802,6 +3016,128 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     attempt(0)
   }
 
+  const reconcileCompletedTurn = (
+    dbConversationId: number,
+    runtimeConversationId?: number,
+    clientMessageId?: string | null,
+    onReconciled?: () => void
+  ): (() => void) => {
+    const runtimeId = runtimeConversationId ?? dbConversationId
+    cancelCompletedTurnReconcile(runtimeId)
+
+    const initial = get().byConversationId.get(runtimeId)
+    const assistantBaseline =
+      initial?.historyAssistantBaseline ??
+      initial?.detail?.turns.filter((turn) => turn.role === "assistant")
+        .length ??
+      0
+    let cancelled = false
+    let timer: ReturnType<typeof setTimeout> | null = null
+
+    const cancel = (): void => {
+      cancelled = true
+      if (timer) clearTimeout(timer)
+      if (completedTurnReconcileCancels.get(runtimeId) === cancel) {
+        completedTurnReconcileCancels.delete(runtimeId)
+      }
+    }
+    completedTurnReconcileCancels.set(runtimeId, cancel)
+
+    const schedule = (attempt: number): void => {
+      if (cancelled) return
+      const delay = COMPLETED_TURN_RECONCILE_DELAYS_MS[attempt]
+      timer = setTimeout(() => {
+        if (cancelled) return
+        const before = get().byConversationId.get(runtimeId)
+        if (!before) {
+          cancel()
+          return
+        }
+        // A queued follow-up already started. Its own completion will reconcile
+        // the combined tail; never let this older poll erase the new buffers.
+        if (
+          before.syncState === "awaiting_persist" &&
+          before.activeTurnToken !== clientMessageId
+        ) {
+          cancel()
+          return
+        }
+
+        getFolderConversation(dbConversationId)
+          .then((detail) => {
+            if (cancelled) return
+            const current = get().byConversationId.get(runtimeId)
+            if (
+              !current ||
+              (current.syncState === "awaiting_persist" &&
+                current.activeTurnToken !== clientMessageId)
+            ) {
+              cancel()
+              return
+            }
+            const assistantCount = detail.turns.filter(
+              (turn) => turn.role === "assistant"
+            ).length
+            const lastTurn = detail.turns[detail.turns.length - 1]
+            const run = clientMessageId
+              ? (detail.artifact_runs ?? []).find(
+                  (candidate) => candidate.client_message_id === clientMessageId
+                )
+              : null
+            const runSettled = Boolean(run && run.status !== "running")
+            const finalReplyPersisted =
+              detail.in_flight_user_turn_id == null &&
+              lastTurn?.role === "assistant" &&
+              (assistantCount > assistantBaseline ||
+                // A refresh/reconnect can begin after the final assistant was
+                // already present in the first detail snapshot. Only use this
+                // fallback when no local client id exists; otherwise an
+                // unaccepted failed send must not mistake the PREVIOUS reply
+                // for its own and disappear.
+                (clientMessageId == null && current.localTurns.length === 0))
+            const terminalWithoutReply =
+              runSettled &&
+              attempt === COMPLETED_TURN_RECONCILE_DELAYS_MS.length - 1 &&
+              detail.in_flight_user_turn_id == null &&
+              lastTurn?.role !== "user"
+
+            if (finalReplyPersisted || terminalWithoutReply) {
+              dispatch({
+                type: "FETCH_DETAIL_SUCCESS",
+                conversationId: runtimeId,
+                detail,
+                preserveLive: false,
+              })
+              cancel()
+              onReconciled?.()
+              return
+            }
+            if (attempt + 1 < COMPLETED_TURN_RECONCILE_DELAYS_MS.length) {
+              schedule(attempt + 1)
+            } else {
+              // Keep the promoted in-memory reply rather than replacing it with
+              // an incomplete transcript. A later reopen still cold-loads the
+              // authoritative file.
+              cancel()
+            }
+          })
+          .catch(() => {
+            if (
+              !cancelled &&
+              attempt + 1 < COMPLETED_TURN_RECONCILE_DELAYS_MS.length
+            ) {
+              schedule(attempt + 1)
+            } else {
+              cancel()
+            }
+          })
+      }, delay)
+    }
+
+    schedule(0)
+    return cancel
+  }
+
   const syncTurnMetadata = (
     dbConversationId: number,
     runtimeConversationId?: number
@@ -2896,30 +3232,14 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     fetchDetail,
     refetchDetail,
     syncViewerDetail,
+    reconcileCompletedTurn,
     syncTurnMetadata,
     completeTurn: (conversationId, liveMessage) => {
-      // Deliberately NO refetchDetail here (tried and reverted — see git
-      // history). It used to exist
-      // to fold a held-open turn's (claude-agent-acp v0.59.0's #870) content
-      // into the persisted view, since the backend transcript watcher had no
-      // visibility into what the wire already rendered. That's no longer
-      // needed: `background_watch.rs` suppresses the overlay turn for a held
-      // turn's own launched tasks, and the async sub-agent launch card is now
-      // flipped in-memory from the `settled` event (RESOLVE_BACKGROUND_TASK /
-      // the COMPLETE_TURN drain below) — so there's nothing left for a
-      // post-completion refetch to reconcile. Worse, the refetch actively lost
-      // content: it races the transcript file's own last write against this
-      // very `TurnComplete` event — real hardware evidence showed the final
-      // assistant record's timestamp only 8ms before turn_complete fired, well
-      // inside the file-flush's own margin — and `preserveLive: false`
-      // unconditionally discarded the already-correct `localTurns`/`liveMessage`
-      // in favor of whatever that (sometimes-incomplete) fresh read returned,
-      // visibly dropping the turn's trailing content. The dispatch below already
-      // promotes `liveMessage`/`optimisticTurns` into `localTurns`
-      // synchronously, with no read from disk and therefore no race — that IS
-      // the complete, correct render; a later cold detail fetch (opening the tab
-      // again, etc.) reconciles it against the DB whenever that naturally
-      // happens.
+      // Never issue a synchronous blind refetch here: `TurnComplete` can precede
+      // the transcript's final file write by a few milliseconds, and replacing
+      // the already-correct stream at that point loses content. Promote first.
+      // The panel then calls `reconcileCompletedTurn`, whose bounded poll commits
+      // only after the final assistant record is actually present on disk.
       dispatch({ type: "COMPLETE_TURN", conversationId, liveMessage })
     },
     appendOptimisticTurn: (conversationId, turn, turnToken) =>
@@ -2931,6 +3251,14 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       }),
     removeOptimisticTurn: (conversationId, id) =>
       dispatch({ type: "REMOVE_OPTIMISTIC_TURN", conversationId, id }),
+    setPromptDeliveryPhase: (conversationId, clientMessageId, phase, error) =>
+      dispatch({
+        type: "SET_PROMPT_DELIVERY_PHASE",
+        conversationId,
+        clientMessageId,
+        phase,
+        error,
+      }),
     appendViewerUserTurn: (conversationId, turn) =>
       dispatch({ type: "APPEND_VIEWER_USER_TURN", conversationId, turn }),
     applyBackgroundActivity: (conversationId, turns, watermark) =>
@@ -2989,6 +3317,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       // also stop it on the next fire, but cancelling now drops the pending
       // timer immediately).
       cancelViewerDetailSync(conversationId)
+      cancelCompletedTurnReconcile(conversationId)
       dispatch({ type: "REMOVE_CONVERSATION", conversationId })
     },
     reset: () => dispatch({ type: "RESET" }),
@@ -3068,6 +3397,7 @@ export function resetConversationRuntimeStore(): void {
   // backend epoch here. See `RemoteConnectionGate`.
   fetchGeneration.clear()
   for (const cancel of viewerDetailSyncCancels.values()) cancel()
+  for (const cancel of completedTurnReconcileCancels.values()) cancel()
   viewerDetailSyncCancels.clear()
   timelineCache = new WeakMap()
   timelinePrefixCache = new WeakMap()

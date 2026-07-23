@@ -1394,6 +1394,8 @@
       "steerInjected": "تم حقن التوجيه في الجولة الحالية",
       "steerFallbackFeedback": "التوجيه الأصلي غير متاح؛ أُرسل كملاحظات فورية",
       "steerTurnEndedQueued": "انتهت الجولة للتو؛ أُضيفت الرسالة إلى قائمة الانتظار التالية",
+      "imageSteerQueued": "لا يمكن إدخال الصور أثناء الجولة؛ أُضيفت الرسالة إلى قائمة الجولة التالية",
+      "promptAcceptanceUnknown": "انقطع الاتصال؛ جارٍ التحقق مما إذا كان الخادم قد استلم الرسالة",
       "steerUnsupportedQueued": "التوجيه الأصلي غير متاح؛ أُضيفت الرسالة إلى قائمة الانتظار التالية",
       "steerFailedQueued": "فشل التوجيه؛ أُضيفت الرسالة إلى قائمة الانتظار التالية",
       "exportConversation": "تصدير المحادثة",
@@ -2505,11 +2507,23 @@
         "completedAt": "وقت الإنجاز",
         "jumpToPreviousUserMessage": "الانتقال إلى رسالة المستخدم",
         "showMore": "عرض المزيد",
-        "showLess": "طي"
+        "showLess": "طي",
+        "delivery": {
+          "submitting": "جارٍ الإرسال…",
+          "accepted": "تم الإرسال",
+          "running": "المعالجة في الخادم",
+          "persisted": "تم الحفظ",
+          "completed": "مكتمل",
+          "failed": "حالة الإرسال غير معروفة",
+          "queued": "في قائمة الانتظار"
+        }
       },
       "liveTurnStats": {
         "thinking": "جارٍ التفكير...",
         "streaming": "جارٍ البث",
+        "sent": "تم الإرسال",
+        "backendProcessing": "المعالجة في الخادم",
+        "stillProcessing": "الخادم ما زال يعالج الطلب",
         "elapsedHours": "{value}س",
         "elapsedMinutes": "{value}د",
         "elapsedSeconds": "{value}ث",
@@ -2827,12 +2841,14 @@
         "fileUnavailable": "الملف غير متاح أو لم يعد موجودًا: {filePath}",
         "turnTitle": "Outputs from this turn",
         "download": "Download to this device",
+        "openWithDefaultAppHost": "Open with default app (Codeg host)",
         "copyFileHost": "Copy file object (Codeg host)",
         "copyPath": "Copy path",
         "revealOnHost": "Reveal on the Codeg host",
         "fileCopied": "File copied; you can paste it directly",
         "pathCopied": "Path copied",
         "filesCopied": "Files copied; you can paste them together",
+        "opened": "Opened with the Codeg host's default app",
         "operationFailed": "Deliverable operation failed",
         "declared": "Declared",
         "inferred": "Automatically inferred",
@@ -2862,7 +2878,7 @@
         "producedAt": "Produced",
         "empty": "This conversation has no confirmed deliverables yet",
         "noFilterResults": "No deliverables match these filters",
-        "hostActionNotice": "Copy file and reveal actions affect the Windows host running Codeg Server; downloads always go to the current device."
+        "hostActionNotice": "Open, copy file, and reveal actions affect the host running Codeg Server; downloads always go to the current device."
       },
       "userResources": {
         "openFile": "فتح {filePath}",

@@ -49,21 +49,19 @@ mod tauri_app {
     use crate::acp::manager::ConnectionManager;
     use crate::chat_channel::manager::ChatChannelManager;
     use crate::commands::{
-        acp as acp_commands, app_update as app_update_commands,
-        automation as automation_commands, background as background_commands, backup,
-        chat_channel as chat_channel_commands, conversations,
-        custom_skills as custom_skills_commands, delegation as delegation_commands,
-        deliverables as deliverable_commands,
-        experts as experts_commands, feedback as feedback_commands, file_io, folder_commands,
-        office_tools as office_tools_commands,
-        folders, logging as logging_commands, mcp as mcp_commands,
-        model_provider as model_provider_commands, notification, pet as pet_commands, project_boot,
+        acp as acp_commands, app_update as app_update_commands, automation as automation_commands,
+        background as background_commands, backup, chat_channel as chat_channel_commands,
+        conversations, custom_skills as custom_skills_commands, delegation as delegation_commands,
+        deliverables as deliverable_commands, experts as experts_commands,
+        feedback as feedback_commands, file_io, folder_commands, folders,
+        logging as logging_commands, mcp as mcp_commands,
+        model_provider as model_provider_commands, notification,
+        office_tools as office_tools_commands, pet as pet_commands, project_boot,
         question as question_commands, quick_messages as quick_messages_commands,
-        remote_proxy as remote_proxy_commands,
-        remote_workspace as remote_workspace_commands, science as science_commands,
-        session_info as session_info_commands,
-        system_settings, terminal as terminal_commands,
-        version_control, windows, workspace_state as workspace_state_commands,
+        remote_proxy as remote_proxy_commands, remote_workspace as remote_workspace_commands,
+        science as science_commands, session_info as session_info_commands, system_settings,
+        terminal as terminal_commands, version_control, windows,
+        workspace_state as workspace_state_commands,
     };
     use crate::terminal::manager::TerminalManager;
     use crate::{db, git_credential, network, paths, process, web};
@@ -908,6 +906,7 @@ mod tauri_app {
                 deliverable_commands::list_turn_deliverables,
                 deliverable_commands::list_conversation_deliverable_runs,
                 deliverable_commands::copy_deliverables,
+                deliverable_commands::open_deliverable,
                 deliverable_commands::reveal_deliverable,
                 deliverable_commands::hide_deliverables,
                 deliverable_commands::save_deliverables,

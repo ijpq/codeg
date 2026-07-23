@@ -36,6 +36,7 @@ pub struct DeliverableDownloadRequest {
 #[serde(rename_all = "camelCase")]
 pub struct DeliverableCapabilities {
     pub host_os: &'static str,
+    pub open_with_default_app: bool,
     pub copy_files: bool,
     pub reveal_in_folder: bool,
     pub host_action_notice: bool,
@@ -86,14 +87,16 @@ fn validate_ids(ids: &[String]) -> Result<(), AppCommandError> {
 }
 
 pub fn deliverable_capabilities_core() -> DeliverableCapabilities {
+    let open_with_default_app = can_open_with_default_app();
     DeliverableCapabilities {
         host_os: std::env::consts::OS,
+        open_with_default_app,
         copy_files: cfg!(target_os = "windows"),
         reveal_in_folder: cfg!(target_os = "windows"),
-        // These native operations intentionally target the Windows Codeg
-        // host, not a remote browser/device. Other hosts expose neither the
-        // buttons nor an inapplicable Windows notice.
-        host_action_notice: cfg!(target_os = "windows"),
+        // Native operations intentionally target the Codeg host, not a
+        // remote browser/device. Only show the notice when this host exposes
+        // at least one such operation.
+        host_action_notice: open_with_default_app || cfg!(target_os = "windows"),
     }
 }
 
@@ -199,6 +202,29 @@ pub async fn reveal_deliverable_core(
     .await
     .map_err(map_db_error)?;
     reveal_path_on_host(&resolved[0].absolute_path)?;
+    Ok(DeliverableOperationResult { affected: 1 })
+}
+
+pub async fn open_deliverable_core(
+    conn: &DatabaseConnection,
+    conversation_id: i32,
+    deliverable_id: String,
+) -> Result<DeliverableOperationResult, AppCommandError> {
+    validate_ids(std::slice::from_ref(&deliverable_id))?;
+    let resolved = deliverable_service::resolve_for_access(
+        conn,
+        conversation_id,
+        std::slice::from_ref(&deliverable_id),
+    )
+    .await
+    .map_err(map_db_error)?;
+    let path = resolved[0].absolute_path.clone();
+    tokio::task::spawn_blocking(move || open_path_with_default_app(&path))
+        .await
+        .map_err(|error| {
+            AppCommandError::task_execution_failed("Default application launcher stopped")
+                .with_detail(error.to_string())
+        })??;
     Ok(DeliverableOperationResult { affected: 1 })
 }
 
@@ -499,6 +525,41 @@ fn reveal_path_on_host(_path: &Path) -> Result<(), AppCommandError> {
     ))
 }
 
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn can_open_with_default_app() -> bool {
+    true
+}
+
+#[cfg(target_os = "linux")]
+fn can_open_with_default_app() -> bool {
+    let has_graphical_session = std::env::var_os("DISPLAY").is_some()
+        || std::env::var_os("WAYLAND_DISPLAY").is_some()
+        || std::env::var_os("WSL_DISTRO_NAME").is_some();
+    has_graphical_session
+        && ["xdg-open", "gio", "gnome-open", "kde-open", "wslview"]
+            .iter()
+            .any(|launcher| which::which(launcher).is_ok())
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+fn can_open_with_default_app() -> bool {
+    false
+}
+
+fn open_path_with_default_app(path: &Path) -> Result<(), AppCommandError> {
+    if !can_open_with_default_app() {
+        return Err(AppCommandError::configuration_invalid(
+            "No graphical default-application launcher is available on the Codeg host",
+        ));
+    }
+    open::that_detached(path).map_err(|error| {
+        AppCommandError::external_command(
+            "Failed to open deliverable with its default application",
+            error.to_string(),
+        )
+    })
+}
+
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub fn deliverable_capabilities() -> DeliverableCapabilities {
@@ -558,6 +619,16 @@ pub async fn reveal_deliverable(
     db: tauri::State<'_, crate::db::AppDatabase>,
 ) -> Result<DeliverableOperationResult, AppCommandError> {
     reveal_deliverable_core(&db.conn, conversation_id, deliverable_id).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn open_deliverable(
+    conversation_id: i32,
+    deliverable_id: String,
+    db: tauri::State<'_, crate::db::AppDatabase>,
+) -> Result<DeliverableOperationResult, AppCommandError> {
+    open_deliverable_core(&db.conn, conversation_id, deliverable_id).await
 }
 
 #[cfg(feature = "tauri-runtime")]
@@ -743,5 +814,11 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn capabilities_serialize_the_default_application_flag() {
+        let value = serde_json::to_value(deliverable_capabilities_core()).unwrap();
+        assert!(value.get("openWithDefaultApp").is_some());
     }
 }

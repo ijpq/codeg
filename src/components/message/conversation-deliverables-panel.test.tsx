@@ -5,6 +5,7 @@ const mocks = vi.hoisted(() => ({
   copyDeliverableFiles: vi.fn(),
   downloadDeliverables: vi.fn(),
   hideDeliverables: vi.fn(),
+  openDeliverable: vi.fn(),
   revealDeliverable: vi.fn(),
 }))
 
@@ -14,6 +15,7 @@ vi.mock("next-intl", () => ({
 vi.mock("@/hooks/use-deliverable-capabilities", () => ({
   useDeliverableCapabilities: () => ({
     hostOs: "windows",
+    openWithDefaultApp: true,
     copyFiles: true,
     revealInFolder: true,
     hostActionNotice: true,
@@ -23,6 +25,7 @@ vi.mock("@/lib/api", () => ({
   copyDeliverableFiles: mocks.copyDeliverableFiles,
   downloadDeliverables: mocks.downloadDeliverables,
   hideDeliverables: mocks.hideDeliverables,
+  openDeliverable: mocks.openDeliverable,
   revealDeliverable: mocks.revealDeliverable,
 }))
 
@@ -63,6 +66,7 @@ describe("ConversationDeliverablesPanel", () => {
     mocks.copyDeliverableFiles.mockResolvedValue({ affected: 1 })
     mocks.downloadDeliverables.mockResolvedValue({ status: "started" })
     mocks.hideDeliverables.mockResolvedValue({ affected: 1 })
+    mocks.openDeliverable.mockResolvedValue({ affected: 1 })
     mocks.revealDeliverable.mockResolvedValue({ affected: 1 })
   })
 
@@ -121,6 +125,24 @@ describe("ConversationDeliverablesPanel", () => {
         archive: false,
         suggestedName: "交付 文档.docx",
       })
+    })
+  })
+
+  it("opens with the host default application by deliverable id", async () => {
+    render(
+      <ConversationDeliverablesPanel
+        conversationId={7}
+        expanded
+        onToggle={vi.fn()}
+        deliverables={[deliverable("pdf-id", "最终 报告.pdf")]}
+      />
+    )
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "openWithDefaultAppHost" })
+    )
+    await waitFor(() => {
+      expect(mocks.openDeliverable).toHaveBeenCalledWith(7, "pdf-id")
     })
   })
 

@@ -1394,6 +1394,8 @@
       "steerInjected": "已将引导注入当前轮次",
       "steerFallbackFeedback": "原生引导不可用，已回退为实时反馈",
       "steerTurnEndedQueued": "当前轮次刚刚结束，消息已进入下一轮队列",
+      "imageSteerQueued": "运行中的轮次不支持注入图片，已作为下一轮普通消息排队",
+      "promptAcceptanceUnknown": "连接中断，正在核对后端是否已接收此消息",
       "steerUnsupportedQueued": "原生引导不可用，消息已进入下一轮队列",
       "steerFailedQueued": "引导发送失败，消息已进入下一轮队列",
       "exportConversation": "导出会话",
@@ -2505,11 +2507,23 @@
         "completedAt": "完成时间",
         "jumpToPreviousUserMessage": "跳转到上一条用户消息",
         "showMore": "展开",
-        "showLess": "收起"
+        "showLess": "收起",
+        "delivery": {
+          "submitting": "发送中…",
+          "accepted": "已发送",
+          "running": "后端处理中",
+          "persisted": "已保存",
+          "completed": "已完成",
+          "failed": "发送状态待确认",
+          "queued": "已排队"
+        }
       },
       "liveTurnStats": {
         "thinking": "思考中...",
         "streaming": "生成中",
+        "sent": "已发送",
+        "backendProcessing": "后端处理中",
+        "stillProcessing": "后台仍在处理中",
         "elapsedHours": "{value} 小时",
         "elapsedMinutes": "{value} 分钟",
         "elapsedSeconds": "{value} 秒",
@@ -2827,12 +2841,14 @@
         "fileUnavailable": "文件不可用或已不存在:{filePath}",
         "turnTitle": "本轮产物",
         "download": "下载到当前设备",
+        "openWithDefaultAppHost": "使用 Codeg 主机的默认应用打开",
         "copyFileHost": "复制文件本体（Codeg 主机）",
         "copyPath": "复制路径",
         "revealOnHost": "在 Codeg 主机的文件夹中显示",
         "fileCopied": "文件已复制，可直接粘贴",
         "pathCopied": "路径已复制",
         "filesCopied": "文件已复制，可一次性粘贴",
+        "opened": "已使用 Codeg 主机的默认应用打开",
         "operationFailed": "产物操作失败",
         "declared": "显式声明",
         "inferred": "自动推断",
@@ -2862,7 +2878,7 @@
         "producedAt": "产生于",
         "empty": "当前对话还没有确认的产物",
         "noFilterResults": "没有符合筛选条件的产物",
-        "hostActionNotice": "“复制文件”和“打开文件夹”作用于运行 Codeg Server 的 Windows 主机；下载始终发送到当前访问设备。"
+        "hostActionNotice": "“打开文件”“复制文件”和“打开文件夹”作用于运行 Codeg Server 的主机；下载始终发送到当前访问设备。"
       },
       "userResources": {
         "openFile": "打开 {filePath}",
