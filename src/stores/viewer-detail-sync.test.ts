@@ -95,6 +95,7 @@ function emptySession(conversationId: number): ConversationRuntimeSession {
     pendingBackgroundSettlements: [],
     optimisticTurns: [],
     liveMessage: null,
+    promptDeliveries: {},
     syncState: "idle",
     activeTurnToken: null,
     lastTurnOwned: false,
@@ -127,6 +128,83 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.useRealTimers()
+})
+
+describe("detail hydration — refresh recovery", () => {
+  it("restores the active client message and running phase after a cold refresh", async () => {
+    const clientMessageId = "optimistic-image-refresh"
+    const startedAt = "2026-07-18T00:05:00.000Z"
+    mockGet.mockResolvedValue({
+      ...detail(
+        [userTurn(clientMessageId, "image + text")],
+        null,
+        clientMessageId
+      ),
+      artifact_runs: [
+        {
+          id: "artifact-run-1",
+          conversation_id: CID,
+          connection_id: "connection-1",
+          client_message_id: clientMessageId,
+          folder_id: 1,
+          root_path: "/tmp/codeg",
+          status: "running",
+          capture_incomplete: false,
+          stop_reason: null,
+          started_at: startedAt,
+          completed_at: null,
+          changes: [],
+        },
+      ],
+    })
+
+    useConversationRuntimeStore.getState().actions.fetchDetail(CID)
+    await vi.waitFor(() => {
+      expect(session()?.detailLoading).toBe(false)
+    })
+
+    expect(session()?.activeTurnToken).toBe(clientMessageId)
+    expect(session()?.promptDeliveries[clientMessageId]).toMatchObject({
+      clientMessageId,
+      phase: "running",
+      submittedAt: Date.parse(startedAt),
+      acceptedAt: Date.parse(startedAt),
+    })
+  })
+
+  it("does not resurrect a completed historical run as active", async () => {
+    const clientMessageId = "optimistic-completed"
+    mockGet.mockResolvedValue({
+      ...detail([
+        userTurn(clientMessageId, "done"),
+        assistantTurn("answer", "finished"),
+      ]),
+      artifact_runs: [
+        {
+          id: "artifact-run-completed",
+          conversation_id: CID,
+          connection_id: "connection-1",
+          client_message_id: clientMessageId,
+          folder_id: 1,
+          root_path: "/tmp/codeg",
+          status: "completed",
+          capture_incomplete: false,
+          stop_reason: "end_turn",
+          started_at: "2026-07-18T00:01:00.000Z",
+          completed_at: "2026-07-18T00:02:00.000Z",
+          changes: [],
+        },
+      ],
+    })
+
+    useConversationRuntimeStore.getState().actions.fetchDetail(CID)
+    await vi.waitFor(() => {
+      expect(session()?.detailLoading).toBe(false)
+    })
+
+    expect(session()?.activeTurnToken).toBeNull()
+    expect(session()?.promptDeliveries).toEqual({})
+  })
 })
 
 describe("syncViewerDetail — owner/guard no-ops", () => {
@@ -239,6 +317,98 @@ describe("syncViewerDetail — owner/guard no-ops", () => {
       "user",
       "assistant",
     ])
+  })
+})
+
+describe("reconcileCompletedTurn — lost stream recovery", () => {
+  it("polls past a trailing user record and folds the persisted final reply", async () => {
+    vi.useFakeTimers()
+    const stale = detail([userTurn("u", "image + text")])
+    const settled = detail([
+      userTurn("u", "image + text"),
+      assistantTurn("a", "final reply"),
+    ])
+    seed({
+      detail: stale,
+      localTurns: [userTurn("optimistic-image", "image + text")],
+      historyAssistantBaseline: 0,
+      lastTurnOwned: true,
+    })
+    mockGet.mockResolvedValueOnce(stale).mockResolvedValue(settled)
+    const reconciled = vi.fn()
+
+    useConversationRuntimeStore
+      .getState()
+      .actions.reconcileCompletedTurn(CID, CID, "optimistic-image", reconciled)
+    await vi.advanceTimersByTimeAsync(10_000)
+
+    expect(mockGet).toHaveBeenCalledTimes(2)
+    expect(session()?.localTurns).toEqual([])
+    const turns = session()?.detail?.turns ?? []
+    expect(turns[turns.length - 1]?.role).toBe("assistant")
+    expect(reconciled).toHaveBeenCalledTimes(1)
+  })
+
+  it("never replaces a promoted reply with an incompletely flushed transcript", async () => {
+    vi.useFakeTimers()
+    const stale = detail([userTurn("u", "prompt")])
+    const promotedReply = assistantTurn("live-a", "complete stream reply")
+    seed({
+      detail: stale,
+      localTurns: [userTurn("optimistic-1", "prompt"), promotedReply],
+      historyAssistantBaseline: 0,
+      lastTurnOwned: true,
+    })
+    mockGet.mockResolvedValue(stale)
+
+    useConversationRuntimeStore
+      .getState()
+      .actions.reconcileCompletedTurn(CID, CID, "optimistic-1")
+    await vi.advanceTimersByTimeAsync(20_000)
+
+    expect(session()?.localTurns).toContainEqual(promotedReply)
+    expect(session()?.detail).toBe(stale)
+  })
+
+  it("does not erase an unaccepted optimistic prompt by mistaking the previous reply for its final", async () => {
+    vi.useFakeTimers()
+    const oldDetail = detail([
+      userTurn("old-u", "old prompt"),
+      assistantTurn("old-a", "old reply"),
+    ])
+    const failedPrompt = userTurn("optimistic-failed", "image prompt")
+    seed({
+      detail: oldDetail,
+      optimisticTurns: [failedPrompt],
+      activeTurnToken: failedPrompt.id,
+      syncState: "idle",
+      historyAssistantBaseline: 1,
+    })
+    mockGet.mockResolvedValue(oldDetail)
+
+    useConversationRuntimeStore
+      .getState()
+      .actions.reconcileCompletedTurn(CID, CID, failedPrompt.id)
+    await vi.advanceTimersByTimeAsync(20_000)
+
+    expect(session()?.optimisticTurns).toContainEqual(failedPrompt)
+    expect(session()?.detail).toBe(oldDetail)
+  })
+
+  it("stops an older reconciliation when a queued follow-up starts", async () => {
+    vi.useFakeTimers()
+    seed({
+      detail: detail([userTurn("u", "first")]),
+      localTurns: [assistantTurn("a", "first reply")],
+      syncState: "awaiting_persist",
+    })
+
+    useConversationRuntimeStore
+      .getState()
+      .actions.reconcileCompletedTurn(CID, CID, "optimistic-first")
+    await vi.advanceTimersByTimeAsync(100)
+
+    expect(mockGet).not.toHaveBeenCalled()
   })
 })
 

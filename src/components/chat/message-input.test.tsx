@@ -83,8 +83,21 @@ vi.mock("@/lib/platform", () => ({
   openFileDialog: vi.fn(),
 }))
 vi.mock("@/lib/transport", () => ({
+  isDesktop: () => false,
   getActiveRemoteConnectionId: () => null,
 }))
+vi.mock("@/lib/api", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/api")>()
+  return {
+    ...actual,
+    uploadAttachment: vi.fn(async (file: File) => ({
+      path: `/tmp/${file.name}`,
+      name: file.name,
+      size: file.size,
+      mimeType: file.type || null,
+    })),
+  }
+})
 // Real classifier only recognizes actual backend NoActiveTurn payloads; the
 // steering tests flip this per-case to drive the enqueue fallback.
 vi.mock("@/lib/turn-busy", () => ({
@@ -195,11 +208,11 @@ describe("MessageInput (RichComposer integration)", () => {
     const user = userEvent.setup()
     const onSend = vi.fn()
     const onEnqueue = vi.fn()
-    const onSteer = vi.fn().mockResolvedValue(undefined)
+    const onGuide = vi.fn().mockResolvedValue(undefined)
     const { container } = renderInput({
       onSend,
       onEnqueue,
-      onSteer,
+      onGuide,
       supportsSteer: true,
       isPrompting: true,
       onCancel: vi.fn(),
@@ -216,8 +229,8 @@ describe("MessageInput (RichComposer integration)", () => {
       })
     )
 
-    await waitFor(() => expect(onSteer).toHaveBeenCalledTimes(1))
-    expect(onSteer.mock.calls[0][0].blocks).toEqual([
+    await waitFor(() => expect(onGuide).toHaveBeenCalledTimes(1))
+    expect(onGuide.mock.calls[0][0].blocks).toEqual([
       { type: "text", text: "check B instead" },
     ])
     expect(onSend).not.toHaveBeenCalled()
@@ -226,9 +239,9 @@ describe("MessageInput (RichComposer integration)", () => {
 
   it("uses Enter to guide and keeps Shift+Enter as a newline", async () => {
     const user = userEvent.setup()
-    const onSteer = vi.fn().mockResolvedValue(undefined)
+    const onGuide = vi.fn().mockResolvedValue(undefined)
     const { container } = renderInput({
-      onSteer,
+      onGuide,
       supportsSteer: true,
       isPrompting: true,
       onCancel: vi.fn(),
@@ -245,11 +258,60 @@ describe("MessageInput (RichComposer integration)", () => {
       code: "Enter",
       shiftKey: true,
     })
-    expect(onSteer).not.toHaveBeenCalled()
+    expect(onGuide).not.toHaveBeenCalled()
 
     fireEvent.keyDown(textbox, { key: "Enter", code: "Enter" })
-    await waitFor(() => expect(onSteer).toHaveBeenCalledTimes(1))
-    expect(onSteer.mock.calls[0][0].displayText).toContain("first line")
+    await waitFor(() => expect(onGuide).toHaveBeenCalledTimes(1))
+    expect(onGuide.mock.calls[0][0].displayText).toContain("first line")
+  })
+
+  it("queues image + text during a running turn instead of steering it", async () => {
+    const user = userEvent.setup()
+    const onSend = vi.fn()
+    const onEnqueue = vi.fn()
+    const onGuide = vi.fn().mockResolvedValue(undefined)
+    const { container } = renderInput({
+      onSend,
+      onEnqueue,
+      onGuide,
+      supportsSteer: true,
+      isPrompting: true,
+      onCancel: vi.fn(),
+    })
+    const textbox = await waitFor(() => {
+      const element = container.querySelector('[role="textbox"]')
+      expect(element).not.toBeNull()
+      return element as HTMLElement
+    })
+    await user.type(textbox, "inspect this screenshot")
+    const image = new File([new Uint8Array([137, 80, 78, 71])], "shot.png", {
+      type: "image/png",
+    })
+    fireEvent.paste(textbox, {
+      clipboardData: {
+        files: [image],
+        items: [],
+        getData: () => "",
+      },
+    })
+    await waitFor(() =>
+      expect(screen.getByAltText("shot.png")).toBeInTheDocument()
+    )
+
+    await user.click(
+      screen.getByRole("button", {
+        name: enMessages.Folder.chat.messageInput.steer,
+      })
+    )
+
+    await waitFor(() => expect(onEnqueue).toHaveBeenCalledTimes(1))
+    const queued = onEnqueue.mock.calls[0][0]
+    expect(queued.blocks.map((block: { type: string }) => block.type)).toEqual([
+      "text",
+      "image",
+    ])
+    expect(onGuide).not.toHaveBeenCalled()
+    expect(onSend).not.toHaveBeenCalled()
   })
 })
 

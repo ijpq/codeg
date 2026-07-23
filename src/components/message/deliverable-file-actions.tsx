@@ -5,6 +5,7 @@ import {
   ClipboardCopy,
   Copy,
   Download,
+  ExternalLink,
   FolderSearch,
   Loader2,
 } from "lucide-react"
@@ -21,13 +22,14 @@ import { useDeliverableCapabilities } from "@/hooks/use-deliverable-capabilities
 import {
   copyDeliverableFiles,
   downloadDeliverables,
+  openDeliverable,
   revealDeliverable,
 } from "@/lib/api"
 import { toAbsoluteFilePath } from "@/lib/file-path-display"
 import type { ConversationDeliverable } from "@/lib/types"
 import { copyTextToClipboard } from "@/lib/utils"
 
-type Action = "download" | "copyFile" | "copyPath" | "reveal"
+type Action = "download" | "open" | "copyFile" | "copyPath" | "reveal"
 
 export function DeliverableFileActions({
   conversationId,
@@ -45,6 +47,7 @@ export function DeliverableFileActions({
     setPending(action)
     try {
       await operation()
+      if (action === "open") toast.success(t("opened"))
       if (action === "copyFile") toast.success(t("fileCopied"))
       if (action === "copyPath") toast.success(t("pathCopied"))
     } catch (error) {
@@ -74,6 +77,13 @@ export function DeliverableFileActions({
               ? `${item.file_name}.zip`
               : item.file_name,
         }),
+    },
+    {
+      id: "open" as const,
+      label: t("openWithDefaultAppHost"),
+      icon: ExternalLink,
+      visible: capabilities?.openWithDefaultApp === true,
+      operation: () => openDeliverable(conversationId, item.id),
     },
     {
       id: "copyFile" as const,

@@ -4446,9 +4446,10 @@ export async function scanExternalConflictsWeb(
 
 export interface DeliverableCapabilities {
   hostOs: string
+  openWithDefaultApp: boolean
   copyFiles: boolean
   revealInFolder: boolean
-  /** Native copy/reveal actions affect the Codeg host, not this browser. */
+  /** Native open/copy/reveal actions affect the Codeg host, not this browser. */
   hostActionNotice: boolean
 }
 
@@ -4503,6 +4504,16 @@ export async function copyDeliverableFiles(
   return getTransport().call<DeliverableOperationResult>("copy_deliverables", {
     conversationId,
     deliverableIds,
+  })
+}
+
+export async function openDeliverable(
+  conversationId: number,
+  deliverableId: string
+): Promise<DeliverableOperationResult> {
+  return getTransport().call<DeliverableOperationResult>("open_deliverable", {
+    conversationId,
+    deliverableId,
   })
 }
 
