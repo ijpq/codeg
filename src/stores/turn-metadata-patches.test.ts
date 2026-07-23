@@ -272,6 +272,7 @@ function seedDetail(turns: MessageTurn[], inFlightUserTurnId?: string) {
       pendingBackgroundSettlements: [],
       optimisticTurns: [],
       liveMessage: null,
+      promptDeliveries: {},
       syncState: "idle" as const,
       activeTurnToken: null,
       lastTurnOwned: false,

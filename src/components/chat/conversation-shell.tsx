@@ -43,7 +43,7 @@ interface ConversationShellProps {
   onFocus: () => void
   onSend: (draft: PromptDraft, modeId?: string | null) => void
   supportsSteer?: boolean
-  onSteer?: (draft: PromptDraft) => void | Promise<void>
+  onGuide?: (draft: PromptDraft) => void | Promise<void>
   onCancel: () => void
   onRespondPermission: (requestId: string, optionId: string) => void
   onAnswerQuestion: (answer: string) => void
@@ -118,7 +118,7 @@ export function ConversationShell({
   onFocus,
   onSend,
   supportsSteer,
-  onSteer,
+  onGuide,
   onCancel,
   onRespondPermission,
   onAnswerQuestion,
@@ -265,7 +265,7 @@ export function ConversationShell({
               onFocus={onFocus}
               onSend={onSend}
               supportsSteer={supportsSteer}
-              onSteer={onSteer}
+              onGuide={onGuide}
               onCancel={onCancel}
               modes={modes}
               configOptions={configOptions}

@@ -192,6 +192,7 @@ import {
   type InputAttachment,
   type ResourceInputAttachment,
 } from "./message-input-attachments"
+import { draftSupportsNativeSteer } from "@/lib/prompt-delivery-state"
 
 /**
  * Payload pushed into the composer from outside (e.g. a welcome-page quick
@@ -207,7 +208,7 @@ export interface ComposerInjectContent {
 interface MessageInputProps {
   onSend: (draft: PromptDraft, modeId?: string | null) => void
   supportsSteer?: boolean
-  onSteer?: (draft: PromptDraft) => void | Promise<void>
+  onGuide?: (draft: PromptDraft) => void | Promise<void>
   placeholder?: string
   defaultPath?: string
   disabled?: boolean
@@ -368,6 +369,23 @@ function blobToBase64(blob: Blob): Promise<string> {
   })
 }
 
+function createObjectPreviewUrl(blob: Blob): string | undefined {
+  return typeof URL !== "undefined" && typeof URL.createObjectURL === "function"
+    ? URL.createObjectURL(blob)
+    : undefined
+}
+
+function revokeObjectPreviewUrl(attachment: InputAttachment): void {
+  if (
+    attachment.type === "image" &&
+    attachment.previewUrl &&
+    typeof URL !== "undefined" &&
+    typeof URL.revokeObjectURL === "function"
+  ) {
+    URL.revokeObjectURL(attachment.previewUrl)
+  }
+}
+
 function getFilePath(file: File): string | null {
   const withPath = file as File & { path?: string; webkitRelativePath?: string }
   if (typeof withPath.path === "string" && withPath.path.trim().length > 0) {
@@ -503,7 +521,7 @@ function modelPickerGroups(
 export function MessageInput({
   onSend,
   supportsSteer = false,
-  onSteer,
+  onGuide,
   placeholder,
   defaultPath,
   disabled = false,
@@ -599,6 +617,7 @@ export function MessageInput({
   // embedded/data-uri badge, keyed by its synthetic `file://` sentinel uri, and
   // is reconciled into the outgoing blocks by `buildDraft`.
   const [attachments, setAttachments] = useState<InputAttachment[]>([])
+  const attachmentsRef = useRef<InputAttachment[]>([])
   const embeddedPayloadsRef = useRef<Map<string, PromptInputBlock>>(new Map())
   const [isDragActive, setIsDragActive] = useState(false)
   // Collapsed (narrow) selectors live in a controlled Popover holding a
@@ -658,6 +677,19 @@ export function MessageInput({
   useEffect(() => {
     isPromptingRef.current = isPrompting
   }, [isPrompting])
+
+  useEffect(() => {
+    attachmentsRef.current = attachments
+  }, [attachments])
+
+  useEffect(
+    () => () => {
+      for (const attachment of attachmentsRef.current) {
+        revokeObjectPreviewUrl(attachment)
+      }
+    },
+    []
+  )
 
   useEffect(() => {
     // navigator.clipboard is undefined at runtime in non-secure contexts even
@@ -721,9 +753,14 @@ export function MessageInput({
     (editor: Editor, blocks: PromptInputBlock[]) => {
       embeddedPayloadsRef.current.clear()
       const restored = restoreBlocksIntoEditor(editor, blocks)
-      setAttachments(
-        restored.filter((a): a is ImageInputAttachment => a.type === "image")
-      )
+      setAttachments((previous) => {
+        for (const attachment of previous) {
+          revokeObjectPreviewUrl(attachment)
+        }
+        return restored.filter(
+          (a): a is ImageInputAttachment => a.type === "image"
+        )
+      })
       const resources = restored.filter(
         (a): a is ResourceInputAttachment => a.type === "resource"
       )
@@ -994,7 +1031,7 @@ export function MessageInput({
   )
   const hasAttachments = attachments.length > 0
   const hasSendableContent = !composerEmpty || hasAttachments
-  const isNativeGuide = isPrompting && supportsSteer && Boolean(onSteer)
+  const isNativeGuide = isPrompting && supportsSteer && Boolean(onGuide)
 
   // ── Slash command autocomplete ──
   //
@@ -1513,19 +1550,7 @@ export function MessageInput({
       // limit and the workspace has no uploads dir.
       const uploadImages = !showNativePaperclip
 
-      const oversized = uploadImages
-        ? files.filter((f) => f.size > UPLOAD_MAX_BYTES)
-        : []
-      if (oversized.length > 0) {
-        toast.error(
-          tAttach("attachUploadTooLarge", {
-            limit: Math.round(UPLOAD_MAX_BYTES / (1024 * 1024)),
-            names: oversized.map((f) => f.name).join(", "),
-          })
-        )
-      }
       const accepted = files.filter((file) => {
-        if (uploadImages && file.size > UPLOAD_MAX_BYTES) return false
         if (uploadImages && file.size === 0) {
           // Matches `uploadAttachment`'s EmptyAttachmentError semantics:
           // dropped silently, no toast, no broken thumbnail.
@@ -1553,6 +1578,7 @@ export function MessageInput({
               uri: null,
               name: file.name || `image-${Date.now()}-${index + 1}`,
               mimeType,
+              previewUrl: createObjectPreviewUrl(file),
               ...(uploadImages ? { uploading: true } : {}),
             },
             file,
@@ -1583,9 +1609,15 @@ export function MessageInput({
                 )
               )
             } catch (error) {
-              setAttachments((prev) =>
-                prev.filter((a) => a.id !== attachment.id)
-              )
+              setAttachments((prev) => {
+                const failedAttachment = prev.find(
+                  (a) => a.id === attachment.id
+                )
+                if (failedAttachment) {
+                  revokeObjectPreviewUrl(failedAttachment)
+                }
+                return prev.filter((a) => a.id !== attachment.id)
+              })
               if (isEmptyAttachmentError(error)) {
                 console.warn(
                   `[MessageInput] skipping empty image attachment: ${attachment.name}`
@@ -1740,7 +1772,7 @@ export function MessageInput({
               if (canAttachImages && mimeType.startsWith("image/")) {
                 const previewData = await readLocalFileBase64(
                   path,
-                  UPLOAD_MAX_BYTES
+                  DRAG_DROP_IMAGE_MAX_BYTES
                 )
                 imageAttachmentsToAdd.push({
                   id: `image:${Date.now()}:${idx}:${randomUUID()}`,
@@ -2552,7 +2584,11 @@ export function MessageInput({
   }, [setDragActiveIfChanged])
 
   const removeAttachment = useCallback((id: string) => {
-    setAttachments((prev) => prev.filter((item) => item.id !== id))
+    setAttachments((previous) => {
+      const removed = previous.find((item) => item.id === id)
+      if (removed) revokeObjectPreviewUrl(removed)
+      return previous.filter((item) => item.id !== id)
+    })
   }, [])
 
   const buildDraft = useCallback((): PromptDraft | null => {
@@ -2620,7 +2656,12 @@ export function MessageInput({
   const resetComposer = useCallback(() => {
     editorRef.current?.clear()
     setComposerEmpty(true)
-    setAttachments([])
+    setAttachments((previous) => {
+      for (const attachment of previous) {
+        revokeObjectPreviewUrl(attachment)
+      }
+      return []
+    })
     embeddedPayloadsRef.current.clear()
     closeSlashMenu()
   }, [closeSlashMenu])
@@ -2649,7 +2690,7 @@ export function MessageInput({
       return
     }
 
-    if (isNativeGuide && onSteer) {
+    if (isNativeGuide && onGuide && draftSupportsNativeSteer(draft)) {
       // Consume the draft synchronously so a double-click/key repeat cannot
       // inject it twice. The parent owns failure recovery and always converts
       // an unsuccessful guide into live feedback or the ordinary-message queue.
@@ -2661,7 +2702,7 @@ export function MessageInput({
       }
       resetComposer()
       void Promise.resolve()
-        .then(() => onSteer(draft))
+        .then(() => onGuide(draft))
         .catch(() => {
           // The parent has already surfaced and recovered the failed draft.
         })
@@ -2692,7 +2733,7 @@ export function MessageInput({
     isEditingQueueItem,
     isPrompting,
     isNativeGuide,
-    onSteer,
+    onGuide,
     onSaveQueueEdit,
     onEnqueue,
     onSend,
@@ -3397,7 +3438,10 @@ export function MessageInput({
                           className="cursor-pointer transition-opacity hover:opacity-80"
                         >
                           <Image
-                            src={`data:${attachment.mimeType};base64,${attachment.data}`}
+                            src={
+                              attachment.previewUrl ??
+                              `data:${attachment.mimeType};base64,${attachment.data}`
+                            }
                             alt={attachment.name}
                             width={56}
                             height={56}
@@ -3959,7 +4003,8 @@ export function MessageInput({
       <ImagePreviewDialog
         src={
           previewAttachment
-            ? `data:${previewAttachment.mimeType};base64,${previewAttachment.data}`
+            ? (previewAttachment.previewUrl ??
+              `data:${previewAttachment.mimeType};base64,${previewAttachment.data}`)
             : ""
         }
         alt={previewAttachment?.name ?? ""}

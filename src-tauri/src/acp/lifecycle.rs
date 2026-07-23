@@ -1687,7 +1687,12 @@ mod tests {
             emitter: EventEmitter::Noop,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
             steer_lock: Arc::new(tokio::sync::Mutex::new(())),
-            completed_steers: Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::new())),
+            completed_steers: Arc::new(tokio::sync::Mutex::new(
+                std::collections::VecDeque::new(),
+            )),
+            accepted_prompt_ids: Arc::new(tokio::sync::Mutex::new(
+                std::collections::VecDeque::new(),
+            )),
             config_fingerprint: String::new(),
             last_observed_fingerprint: String::new(),
             child_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),

@@ -54,16 +54,17 @@ export interface UseConnectionLifecycleReturn {
        * draft instead of treating it as an error.
        */
       onTurnInProgress?: () => void
+      /** Fired only after `/acp_prompt` returned success (backend accepted). */
+      onAccepted?: () => void
       /**
-       * Called for every OTHER send failure (413, hydration failure, network
-       * drop) after the error toast is shown. The caller settles optimistic
-       * state and may re-queue only recoverable transport failures; the error
-       * argument distinguishes those from deterministic failures that would
-       * otherwise retry forever.
+       * Called for every non-Busy failure after the error toast is shown.
+       * `ambiguous=true` means the transport
+       * response was lost and the backend may already have accepted the prompt;
+       * callers must keep the optimistic message and reconcile by id.
        */
-      onSendFailed?: (error: unknown) => void
+      onSendFailed?: (error: unknown, ambiguous: boolean) => void
     }
-  ) => void
+  ) => Promise<void>
   handleSetConfigOption: (configId: string, valueId: string) => void
   handleCancel: () => void
   handleRespondPermission: (requestId: string, optionId: string) => void
@@ -424,13 +425,20 @@ export function useConnectionLifecycle({
         conversationId?: number | null
         clientMessageId?: string | null
         onTurnInProgress?: () => void
-        onSendFailed?: (error: unknown) => void
+        onAccepted?: () => void
+        /**
+         * Called for every non-Busy failure. The boolean marks an ambiguous
+         * network/offline loss, where the backend may already have accepted
+         * the prompt and the optimistic message must remain visible.
+         */
+        onSendFailed?: (error: unknown, ambiguous: boolean) => void
       }
-    ) => {
+    ): Promise<void> => {
       touchActivity(contextKey)
       const onTurnInProgress = opts?.onTurnInProgress
+      const onAccepted = opts?.onAccepted
       const onSendFailed = opts?.onSendFailed
-      void (async () => {
+      return (async () => {
         const currentModeId = modeIdRef.current
         if (modeId && modeId !== currentModeId) {
           await connSetMode(modeId)
@@ -439,6 +447,7 @@ export function useConnectionLifecycle({
           modeIdRef.current = modeId
         }
         await sendPrompt(draft.blocks, opts)
+        onAccepted?.()
       })().catch((e: unknown) => {
         if (e instanceof TurnBusyError) {
           // A turn was already in flight on the connection (another
@@ -459,11 +468,9 @@ export function useConnectionLifecycle({
           appError?.message ??
           (e instanceof Error ? e.message : String(e ?? "unknown error"))
         toast.error(t("errors.sendPromptFailed", { error: message }))
-        // Let the caller settle its optimistic state (roll back the phantom
-        // user turn, drop out of awaiting_persist so the queue keeps
-        // flushing). Runs after the toast so the state rollback can't hide
-        // the failure.
-        onSendFailed?.(e)
+        // Let the caller distinguish a transport loss (the backend may have
+        // accepted the id) from a deterministic rejection.
+        onSendFailed?.(e, isNetworkOrOfflineError(e))
       })
     },
     [connSetMode, sendPrompt, contextKey, touchActivity, t]
