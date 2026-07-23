@@ -246,6 +246,55 @@ describe("MessageInput (RichComposer integration)", () => {
     await waitFor(() => expect(onSteer).toHaveBeenCalledTimes(1))
     expect(onSteer.mock.calls[0][0].displayText).toContain("first line")
   })
+
+  it("queues image + text during a running turn instead of steering it", async () => {
+    const user = userEvent.setup()
+    const onSend = vi.fn()
+    const onEnqueue = vi.fn()
+    const onSteer = vi.fn().mockResolvedValue(undefined)
+    const { container } = renderInput({
+      onSend,
+      onEnqueue,
+      onSteer,
+      supportsSteer: true,
+      isPrompting: true,
+      onCancel: vi.fn(),
+    })
+    const textbox = await waitFor(() => {
+      const element = container.querySelector('[role="textbox"]')
+      expect(element).not.toBeNull()
+      return element as HTMLElement
+    })
+    await user.type(textbox, "inspect this screenshot")
+    const image = new File([new Uint8Array([137, 80, 78, 71])], "shot.png", {
+      type: "image/png",
+    })
+    fireEvent.paste(textbox, {
+      clipboardData: {
+        files: [image],
+        items: [],
+        getData: () => "",
+      },
+    })
+    await waitFor(() =>
+      expect(screen.getByAltText("shot.png")).toBeInTheDocument()
+    )
+
+    await user.click(
+      screen.getByRole("button", {
+        name: enMessages.Folder.chat.messageInput.steer,
+      })
+    )
+
+    await waitFor(() => expect(onEnqueue).toHaveBeenCalledTimes(1))
+    const queued = onEnqueue.mock.calls[0][0]
+    expect(queued.blocks.map((block: { type: string }) => block.type)).toEqual([
+      "text",
+      "image",
+    ])
+    expect(onSteer).not.toHaveBeenCalled()
+    expect(onSend).not.toHaveBeenCalled()
+  })
 })
 
 describe("MessageInput attach-to-chat insertion position", () => {

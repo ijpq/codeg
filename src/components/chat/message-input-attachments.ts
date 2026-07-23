@@ -38,6 +38,8 @@ export interface ImageInputAttachment {
   uri: string | null
   name: string
   mimeType: string
+  /** UI-only thumbnail URL. Never serialized into a PromptInputBlock. */
+  previewUrl?: string
 }
 
 export type InputAttachment = ResourceInputAttachment | ImageInputAttachment

@@ -138,7 +138,7 @@ export function Sidebar() {
   // preference is applied.
   const [showCompleted, setShowCompleted] = useState(false)
   const [showWorktrees, setShowWorktrees] = useState(true)
-  const [sortMode, setSortMode] = useState<SidebarSortMode>("created")
+  const [sortMode, setSortMode] = useState<SidebarSortMode>("updated")
   const [sectionOrder, setSectionOrder] =
     useState<SidebarSectionOrder>("folders-first")
   const [allExpanded, setAllExpanded] = useState(true)
