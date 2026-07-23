@@ -63,6 +63,7 @@ function seedSession(
     pendingBackgroundSettlements: [],
     optimisticTurns: [],
     liveMessage: null,
+    promptDeliveries: {},
     syncState: "idle" as const,
     activeTurnToken: null,
     lastTurnOwned: false,
@@ -91,6 +92,63 @@ afterEach(() => {
 })
 
 describe("timeline prefix cache across streaming batches", () => {
+  it("keeps a 1,985-message image prompt timeline complete and stable while streaming", () => {
+    const history = Array.from({ length: 1_984 }, (_, index) =>
+      turn(
+        `history-${index}`,
+        index % 2 === 0 ? "user" : "assistant",
+        new Date(Date.UTC(2026, 6, 19, 0, 0, index)).toISOString()
+      )
+    )
+    seedSession(CID, { detail: makeDetail(history) })
+
+    const optimisticImageTurn: MessageTurn = {
+      id: "optimistic-long-image",
+      role: "user",
+      blocks: [
+        { type: "text", text: "inspect this screenshot" },
+        {
+          type: "image",
+          data: "iVBORw0KGgo=",
+          mime_type: "image/png",
+          uri: null,
+        },
+      ],
+      timestamp: "2026-07-19T01:00:00.000Z",
+    }
+    useConversationRuntimeStore
+      .getState()
+      .actions.appendOptimisticTurn(
+        CID,
+        optimisticImageTurn,
+        optimisticImageTurn.id
+      )
+
+    const accepted = getTimelineTurns(CID)
+    expect(accepted).toHaveLength(1_985)
+    expect(
+      accepted.slice(0, history.length).map((entry) => entry.turn.id)
+    ).toEqual(history.map((entry) => entry.id))
+    expect(accepted[accepted.length - 1]).toMatchObject({
+      phase: "optimistic",
+      turn: { id: optimisticImageTurn.id, blocks: optimisticImageTurn.blocks },
+    })
+
+    useConversationRuntimeStore
+      .getState()
+      .actions.setLiveMessage(CID, liveMsg("long-reply", "working"), true)
+    const streaming = getTimelineTurns(CID)
+
+    expect(streaming).toHaveLength(1_986)
+    expect(
+      streaming.filter((entry) => entry.turn.id === optimisticImageTurn.id)
+    ).toHaveLength(1)
+    for (let index = 0; index < accepted.length; index += 1) {
+      expect(streaming[index]).toBe(accepted[index])
+    }
+    expect(streaming[streaming.length - 1].phase).toBe("streaming")
+  })
+
   it("keeps prefix entry references stable across SET_LIVE_MESSAGE batches; only the tail is rebuilt", () => {
     const detail = makeDetail([
       turn("u1", "user"),

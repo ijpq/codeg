@@ -121,6 +121,7 @@ pub fn build_router(
             post(handlers::deliverables::create_download_ticket),
         )
         .route("/copy_deliverables", post(handlers::deliverables::copy))
+        .route("/open_deliverable", post(handlers::deliverables::open))
         .route("/reveal_deliverable", post(handlers::deliverables::reveal))
         .route("/hide_deliverables", post(handlers::deliverables::hide))
         .route(
