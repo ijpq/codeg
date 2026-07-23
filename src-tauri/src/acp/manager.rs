@@ -45,6 +45,7 @@ use crate::web::event_bridge::{emit_with_state, emit_with_state_gated, EventEmit
 const USER_PROMPT_PREVIEW_MAX_CHARS: usize = 500;
 const STEER_CLIENT_MESSAGE_ID_MAX_CHARS: usize = 256;
 const STEER_RESPONSE_TIMEOUT_SECS: u64 = 30;
+const ACCEPTED_PROMPT_ID_CACHE_LIMIT: usize = 128;
 
 /// Grace window `disconnect_all` waits after firing every `Disconnect` before
 /// hard-killing surviving agent process trees. Long enough for a driver thread
@@ -398,6 +399,7 @@ impl ConnectionManager {
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
             steer_lock: Arc::new(tokio::sync::Mutex::new(())),
             completed_steers: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
+            accepted_prompt_ids: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
             config_fingerprint: String::new(),
             last_observed_fingerprint: String::new(),
             child_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -443,6 +445,7 @@ impl ConnectionManager {
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
             steer_lock: Arc::new(tokio::sync::Mutex::new(())),
             completed_steers: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
+            accepted_prompt_ids: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
             config_fingerprint: String::new(),
             last_observed_fingerprint: String::new(),
             child_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -1285,6 +1288,17 @@ impl ConnectionManager {
         delegation: Option<crate::acp::delegation::spawner::DelegationLink>,
         client_message_id: Option<String>,
     ) -> Result<Option<i32>, AcpError> {
+        // Normalize the caller-stable id once. Invalid/untrusted ids retain the
+        // legacy fallback behavior (a connection-scoped event id), while valid
+        // ids also key the accepted-prompt idempotency cache below.
+        let client_message_id = client_message_id
+            .map(|id| id.trim().to_string())
+            .filter(|id| {
+                !id.is_empty()
+                    && id.chars().count() <= STEER_CLIENT_MESSAGE_ID_MAX_CHARS
+                    && !is_reserved_turn_id(id)
+            });
+
         // Reject an empty prompt up front, BEFORE any side effects: linking /
         // creating the conversation row, flipping it to InProgress, or emitting
         // events. An empty prompt is never accepted, so it must not mutate
@@ -1332,6 +1346,7 @@ impl ConnectionManager {
             agent_type,
             linked_conversation_id,
             turn_in_flight,
+            accepted_prompt_ids,
         ) = {
             let connections = self.connections.lock().await;
             let conn = connections
@@ -1347,6 +1362,7 @@ impl ConnectionManager {
                 conn.agent_type,
                 linked_conversation_id,
                 in_flight,
+                conn.accepted_prompt_ids.clone(),
             )
         };
         let already_linked = linked_conversation_id.is_some();
@@ -1366,6 +1382,21 @@ impl ConnectionManager {
                 return Err(AcpError::protocol(format!(
                     "connection {conn_id} is bound to conversation {actual}, not {expected}"
                 )));
+            }
+        }
+
+        // The original request reached `send_prompt_inner` and was accepted,
+        // but its HTTP/Tauri response may have been lost. The same id is a
+        // status recovery request, not a second turn — return after validating
+        // the conversation binding, but before Busy/DB/event side effects.
+        if let Some(id) = client_message_id.as_ref() {
+            if accepted_prompt_ids.lock().await.contains(id) {
+                tracing::info!(
+                    connection_id = conn_id,
+                    client_message_id = id,
+                    "[ACP] deduplicated already-accepted prompt"
+                );
+                return Ok(linked_conversation_id.or(conversation_id));
             }
         }
 
@@ -1602,8 +1633,8 @@ impl ConnectionManager {
                     // untrusted (the web/Tauri prompt API accepts it verbatim), so
                     // reject that shape and fall back to a connection-scoped id;
                     // legitimate UI senders use `optimistic-<uuid>`.
-                    let message_id = match client_message_id {
-                        Some(id) if !is_reserved_turn_id(&id) => id,
+                    let message_id = match client_message_id.clone() {
+                        Some(id) => id,
                         _ => format!("user-{}-{}", conn_id, state_arc.read().await.event_seq),
                     };
                     Some((message_id, user_blocks))
@@ -1669,6 +1700,15 @@ impl ConnectionManager {
         // row would be stuck until a follow-up `send_prompt_linked` re-flipped it.
         match self.send_prompt_inner(conn_id, blocks, user_message).await {
             Ok(()) => {
+                if let Some(id) = client_message_id {
+                    let mut cache = accepted_prompt_ids.lock().await;
+                    if !cache.contains(&id) {
+                        cache.push_back(id);
+                        while cache.len() > ACCEPTED_PROMPT_ID_CACHE_LIMIT {
+                            cache.pop_front();
+                        }
+                    }
+                }
                 // The prompt reached the agent: surface it to the chat-channel
                 // "user message" event feed. Notification-only — never gates the
                 // send result.
@@ -3624,6 +3664,7 @@ mod tests {
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
             steer_lock: Arc::new(tokio::sync::Mutex::new(())),
             completed_steers: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
+            accepted_prompt_ids: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
             config_fingerprint: String::new(),
             last_observed_fingerprint: String::new(),
             child_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -3959,6 +4000,7 @@ mod tests {
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
             steer_lock: Arc::new(tokio::sync::Mutex::new(())),
             completed_steers: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
+            accepted_prompt_ids: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
             config_fingerprint: String::new(),
             last_observed_fingerprint: String::new(),
             child_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -4399,6 +4441,7 @@ mod tests {
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
             steer_lock: Arc::new(tokio::sync::Mutex::new(())),
             completed_steers: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
+            accepted_prompt_ids: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
             config_fingerprint: String::new(),
             last_observed_fingerprint: String::new(),
             child_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -4567,6 +4610,59 @@ mod tests {
                 .map(|(id, _)| id.as_str()),
             Some("optimistic-abc"),
             "Prompt's user_message must carry the client-supplied message_id verbatim"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_prompt_linked_is_idempotent_by_client_message_id() {
+        use crate::db::test_helpers;
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/prompt-idem").await;
+        let mgr = ConnectionManager::new();
+        let conn_id = "conn-prompt-idem";
+        let mut cmd_rx = insert_live_connection(
+            &mgr,
+            conn_id,
+            AgentType::Codex,
+            Some(PathBuf::from("/tmp/prompt-idem")),
+        )
+        .await;
+        let blocks = vec![PromptInputBlock::Text {
+            text: "image context and instructions".into(),
+        }];
+        let message_id = Some("optimistic-stable-id".to_string());
+
+        let first = mgr
+            .send_prompt_linked_with_message_id(
+                &db,
+                conn_id,
+                blocks.clone(),
+                Some(folder_id),
+                None,
+                None,
+                message_id.clone(),
+            )
+            .await
+            .expect("first prompt accepted");
+        let retry = mgr
+            .send_prompt_linked_with_message_id(
+                &db,
+                conn_id,
+                blocks,
+                Some(folder_id),
+                first,
+                None,
+                message_id,
+            )
+            .await
+            .expect("same-id retry recovers accepted status");
+
+        assert_eq!(retry, first);
+        let prompts = drain_prompt_user_messages(&mut cmd_rx);
+        assert_eq!(
+            prompts.len(),
+            1,
+            "same client_message_id must enqueue exactly one agent turn"
         );
     }
 
@@ -6243,6 +6339,7 @@ mod tests {
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
             steer_lock: Arc::new(tokio::sync::Mutex::new(())),
             completed_steers: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
+            accepted_prompt_ids: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
             config_fingerprint: String::new(),
             last_observed_fingerprint: String::new(),
             child_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -6622,6 +6719,7 @@ mod tests {
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
             steer_lock: Arc::new(tokio::sync::Mutex::new(())),
             completed_steers: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
+            accepted_prompt_ids: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
             config_fingerprint: String::new(),
             last_observed_fingerprint: String::new(),
             child_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
