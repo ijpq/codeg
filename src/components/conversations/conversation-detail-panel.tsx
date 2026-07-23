@@ -92,6 +92,10 @@ import { isWindowedDetail } from "@/lib/turn-window"
 import { toErrorMessage } from "@/lib/app-error"
 import { classifySteerFailure } from "@/lib/steer-errors"
 import {
+  draftSupportsNativeSteer,
+  shouldQueuePromptFailure,
+} from "@/lib/prompt-delivery-state"
+import {
   flushRetryDelayMs,
   forkSendBlockedByQueue,
   isConnectionReady,
@@ -99,7 +103,6 @@ import {
   shouldRejectDuplicateCreate,
 } from "@/lib/queue-flush"
 import { TurnBusyError } from "@/lib/turn-busy"
-import { isNetworkOrOfflineError } from "@/lib/network-error"
 import {
   getConversationIdByExternalIdFromStore,
   getRuntimeSession,
@@ -179,7 +182,8 @@ interface ConversationTabViewProps {
 
 function buildOptimisticUserTurnFromDraft(
   draft: PromptDraft,
-  attachedResourcesFallback: string
+  attachedResourcesFallback: string,
+  clientMessageId = `optimistic-${randomUUID()}`
 ): MessageTurn {
   // `draft.displayText` is the composer's full Markdown, which already renders
   // every inline file/resource badge as a `[label](uri)` link (see
@@ -200,7 +204,7 @@ function buildOptimisticUserTurnFromDraft(
   blocks.push({ type: "text", text })
 
   return {
-    id: `optimistic-${randomUUID()}`,
+    id: clientMessageId,
     role: "user",
     blocks,
     timestamp: new Date().toISOString(),
@@ -293,13 +297,14 @@ const ConversationTabView = memo(function ConversationTabView({
     appendViewerUserTurn,
     completeTurn,
     refetchDetail,
-    syncTurnMetadata,
+    reconcileCompletedTurn,
     removeConversation,
     setAcpLoadError,
     setDbConversationId,
     setExternalId,
     setLiveMessage,
     setPendingCleanup,
+    setPromptDeliveryPhase,
     setSyncState,
   } = useConversationRuntimeActions()
   const acpActions = useAcpActions()
@@ -379,6 +384,7 @@ const ConversationTabView = memo(function ConversationTabView({
   const mountedRef = useRef(true)
   const selectedAgentRef = useRef(selectedAgent)
   const createConversationPendingRef = useRef(false)
+  const promptSubmitPendingRef = useRef(false)
   // Single-flight guard for the eager scratch-dir prepare (on chat-mode select).
   const prepareChatDirPendingRef = useRef(false)
   const sessionIdRef = useRef<string | null>(null)
@@ -420,16 +426,31 @@ const ConversationTabView = memo(function ConversationTabView({
     })
 
     const offReconnect = onTransportReconnect(() => {
-      if (dbConvIdRef.current != null) {
-        refetchDetail(effectiveConversationId)
+      const persistedId = dbConvIdRef.current
+      if (persistedId == null) return
+      if (connStatusRef.current === "prompting") {
+        // Snapshot/detail refresh while the turn is active must retain the
+        // optimistic image and any stream chunks already received.
+        refetchDetail(effectiveConversationId, { preserveLive: true })
+        return
       }
+      // We may have missed both deltas and turn_complete while disconnected.
+      // Poll the settled transcript and fold the authoritative final reply.
+      const runtime = getRuntimeSession(effectiveConversationId)
+      syncCancelRef.current?.()
+      syncCancelRef.current = reconcileCompletedTurn(
+        persistedId,
+        effectiveConversationId,
+        runtime?.activeTurnToken ?? null,
+        () => setSendSignal((previous) => previous + 1)
+      )
     })
     return () => {
       disposed = true
       unlisten?.()
       offReconnect?.()
     }
-  }, [effectiveConversationId, refetchDetail])
+  }, [effectiveConversationId, reconcileCompletedTurn, refetchDetail])
 
   useEffect(() => {
     selectedAgentRef.current = selectedAgent
@@ -749,6 +770,15 @@ const ConversationTabView = memo(function ConversationTabView({
     }
   }, [connSessionId])
 
+  useEffect(() => {
+    if (connStatus !== "prompting") return
+    const clientMessageId = getRuntimeSession(
+      effectiveConversationId
+    )?.activeTurnToken
+    if (!clientMessageId) return
+    setPromptDeliveryPhase(effectiveConversationId, clientMessageId, "running")
+  }, [connStatus, effectiveConversationId, setPromptDeliveryPhase])
+
   // Mirror the connection's load failure (set on `session_load_failed` from
   // the agent) onto the per-conversation runtime session so the detail UI
   // can surface it next to detail-load errors. Cleared automatically when
@@ -768,6 +798,8 @@ const ConversationTabView = memo(function ConversationTabView({
     prevConnStatusRef.current = connStatus
     if (!wasPrompting || connStatus === "prompting") return
 
+    const completedClientMessageId =
+      getRuntimeSession(effectiveConversationId)?.activeTurnToken ?? null
     // Turn completed — promote liveMessage + optimisticTurns to localTurns.
     // Don't pass conn.liveMessage: this panel no longer subscribes to it (the
     // connection snapshot is stable across streaming tokens — see useConnection),
@@ -776,19 +808,30 @@ const ConversationTabView = memo(function ConversationTabView({
     // synchronously as the final chunk landed (turn_complete flushes the stream
     // queue BEFORE the status change), so it already holds the final message.
     completeTurn(effectiveConversationId)
+    promptSubmitPendingRef.current = false
 
-    // Cancel previous metadata sync (handles rapid consecutive turns)
+    // Cancel a previous completion reconciliation (handles rapid consecutive
+    // turns), then poll until the transcript contains the final assistant
+    // record. This heals dropped stream deltas without letting an immediate
+    // pre-flush read erase the correct in-memory reply.
     syncCancelRef.current?.()
     syncCancelRef.current = null
 
     const persistedId = dbConvIdRef.current
     if (persistedId && persistedId > 0) {
-      syncCancelRef.current = syncTurnMetadata(
+      syncCancelRef.current = reconcileCompletedTurn(
         persistedId,
-        effectiveConversationId
+        effectiveConversationId,
+        completedClientMessageId,
+        () => setSendSignal((previous) => previous + 1)
       )
     }
-  }, [completeTurn, connStatus, effectiveConversationId, syncTurnMetadata])
+  }, [
+    completeTurn,
+    connStatus,
+    effectiveConversationId,
+    reconcileCompletedTurn,
+  ])
 
   // Auto-send queued messages when agent finishes responding.
   // Refs are synced via useEffect; the auto-send effect is declared
@@ -801,7 +844,7 @@ const ConversationTabView = memo(function ConversationTabView({
     (
       draft: PromptDraft,
       modeId?: string | null,
-      opts?: { fromQueueFlush?: boolean }
+      opts?: { fromQueueFlush?: boolean; clientMessageId?: string }
     ) => void
   >(() => {})
   // Timestamp of the last send that bounced with TurnBusyError. The flush below
@@ -852,7 +895,10 @@ const ConversationTabView = memo(function ConversationTabView({
       if (next) {
         // Mark this as the queue auto-flush: it sends the dequeued head now and,
         // on a bounce, returns it to the FRONT (vs a direct send → tail).
-        handleSendRef.current(next.draft, next.modeId, { fromQueueFlush: true })
+        handleSendRef.current(next.draft, next.modeId, {
+          fromQueueFlush: true,
+          clientMessageId: next.clientMessageId,
+        })
       }
     }, wait)
     return () => clearTimeout(timer)
@@ -1002,7 +1048,7 @@ const ConversationTabView = memo(function ConversationTabView({
       // input send (no flag) must NOT jump ahead of already-queued items: when
       // a queue exists it tail-enqueues instead of sending, and on a bounce it
       // re-queues at the TAIL.
-      opts?: { fromQueueFlush?: boolean }
+      opts?: { fromQueueFlush?: boolean; clientMessageId?: string }
     ) => {
       // Capture the tab's chat-draft state + eager scratch dir synchronously,
       // before any await. A folderless chat draft is NOT special-cased here:
@@ -1041,14 +1087,13 @@ const ConversationTabView = memo(function ConversationTabView({
         return
       }
 
-      // Single-flight the unbound new-tab create. A second direct submit fired
-      // before the first create resolves (a double Enter / double click) would
-      // otherwise append an optimistic turn it can never deliver: the
-      // createConversationPendingRef guard further down returns AFTER the
-      // optimistic append. Reject the duplicate here, before any optimistic
-      // mutation. Only the unbound path (no persisted id yet) is single-flighted,
-      // so persisted sends keep their concurrent queued-send behavior. Applies
-      // equally to chat and normal new conversations.
+      // Single-flight every ordinary prompt until the backend has answered the
+      // submission request. This closes the double Enter/click window for an
+      // existing conversation as well as a new tab.
+      if (promptSubmitPendingRef.current) return
+
+      // Keep the existing unbound-create guard too: conversation creation can
+      // outlive the submission guard and must never run twice.
       if (
         shouldRejectDuplicateCreate(
           dbConvIdRef.current != null,
@@ -1057,10 +1102,14 @@ const ConversationTabView = memo(function ConversationTabView({
       ) {
         return
       }
+      promptSubmitPendingRef.current = true
 
+      const clientMessageId =
+        opts?.clientMessageId ?? `optimistic-${randomUUID()}`
       const optimisticTurn = buildOptimisticUserTurnFromDraft(
         draft,
-        sharedT("attachedResources")
+        sharedT("attachedResources"),
+        clientMessageId
       )
       appendOptimisticTurn(
         effectiveConversationId,
@@ -1077,30 +1126,58 @@ const ConversationTabView = memo(function ConversationTabView({
       // into the queue above the input box — it auto-sends when the current
       // turn completes, identical to enqueuing while already prompting. Stamp
       // the bounce so the flush backs off instead of immediately retrying.
+      let accepted = false
       const onTurnInProgress = () => {
+        promptSubmitPendingRef.current = false
+        if (
+          !shouldQueuePromptFailure({
+            backendBusy: true,
+            accepted,
+            activeClientMessageId: conn.pendingUserMessage?.messageId ?? null,
+            clientMessageId,
+          })
+        ) {
+          return
+        }
         lastFlushBounceAtRef.current = Date.now()
         removeOptimisticTurn(effectiveConversationId, optimisticTurn.id)
+        setPromptDeliveryPhase(
+          effectiveConversationId,
+          clientMessageId,
+          "queued"
+        )
         // FIFO: the auto-flush draft WAS the queue head → return it to the
         // front; a direct send (queue was empty when it left) → tail.
         if (fromQueueFlush) {
-          mqRequeueFront(draft, selectedModeIdArg ?? null)
+          mqRequeueFront(draft, selectedModeIdArg ?? null, clientMessageId)
         } else {
-          mqEnqueue(draft, selectedModeIdArg ?? null)
+          mqEnqueue(draft, selectedModeIdArg ?? null, clientMessageId)
         }
       }
-
-      // Every non-busy failure rolls back the optimistic turn. A network drop
-      // additionally returns the draft to the persisted queue for reconnect;
-      // deterministic failures stay out so they cannot retry forever.
-      const onSendFailed = (error: unknown) => {
-        removeOptimisticTurn(effectiveConversationId, optimisticTurn.id)
-        if (!isNetworkOrOfflineError(error)) return
-        lastFlushBounceAtRef.current = Date.now()
-        if (fromQueueFlush) {
-          mqRequeueFront(draft, selectedModeIdArg ?? null)
-        } else {
-          mqEnqueue(draft, selectedModeIdArg ?? null)
+      const onAccepted = () => {
+        accepted = true
+        promptSubmitPendingRef.current = false
+        setPromptDeliveryPhase(
+          effectiveConversationId,
+          clientMessageId,
+          "accepted"
+        )
+      }
+      const onSendFailed = (error: unknown, ambiguous: boolean) => {
+        promptSubmitPendingRef.current = false
+        setPromptDeliveryPhase(
+          effectiveConversationId,
+          clientMessageId,
+          "failed",
+          ambiguous ? t("promptAcceptanceUnknown") : toErrorMessage(error)
+        )
+        // A transport loss is ambiguous: the backend may already be running
+        // this exact id. Keep that optimistic message for reconnect/detail
+        // reconciliation; deterministic failures roll it back immediately.
+        if (!ambiguous) {
+          removeOptimisticTurn(effectiveConversationId, optimisticTurn.id)
         }
+        setSyncState(effectiveConversationId, "idle")
       }
 
       // Pin the tab if it was a temporary preview (single-click opened)
@@ -1121,6 +1198,7 @@ const ConversationTabView = memo(function ConversationTabView({
           // turn by exact id (and never suppresses a different sender's prompt).
           clientMessageId: optimisticTurn.id,
           onTurnInProgress,
+          onAccepted,
           onSendFailed,
         })
         return
@@ -1225,9 +1303,11 @@ const ConversationTabView = memo(function ConversationTabView({
             conversationId: newConversationId,
             clientMessageId: optimisticTurn.id,
             onTurnInProgress,
+            onAccepted,
             onSendFailed,
           })
         } catch (e) {
+          promptSubmitPendingRef.current = false
           console.error("[ConversationTabView] create conversation:", e)
           // A failed create (chat OR normal) must fully restore the pre-send
           // state, not strand the user behind a blank panel:
@@ -1239,6 +1319,12 @@ const ConversationTabView = memo(function ConversationTabView({
           //      send, so without this the user's prompt is lost on failure,
           //   5. surface the error on the welcome banner so it isn't silent.
           removeOptimisticTurn(effectiveConversationId, optimisticTurn.id)
+          setPromptDeliveryPhase(
+            effectiveConversationId,
+            clientMessageId,
+            "failed",
+            toErrorMessage(e)
+          )
           setSyncState(effectiveConversationId, "idle")
           setHasSentMessage(false)
           const draftText = draft.displayText.trim()
@@ -1265,6 +1351,7 @@ const ConversationTabView = memo(function ConversationTabView({
       bindConversationTab,
       canAutoConnect,
       connectionReady,
+      conn.pendingUserMessage,
       effectiveConversationId,
       folderId,
       hasPersistedConversation,
@@ -1275,10 +1362,12 @@ const ConversationTabView = memo(function ConversationTabView({
       setDbConversationId,
       setExternalId,
       setPendingCleanup,
+      setPromptDeliveryPhase,
       setSyncState,
       sharedT,
       ownTab,
       tWelcome,
+      t,
       tabId,
       upsertFolder,
     ]
@@ -1466,26 +1555,40 @@ const ConversationTabView = memo(function ConversationTabView({
       )
       setSendSignal((prev) => prev + 1)
       setSyncState(effectiveConversationId, "awaiting_persist")
-      // Rolled back + re-queued on BOTH a turn-in-flight rejection and a
-      // network/offline failure, so a direct answer is never stranded or lost.
-      const onSendRecovery = () => {
+      const onTurnInProgress = () => {
         lastFlushBounceAtRef.current = Date.now()
         removeOptimisticTurn(effectiveConversationId, optimisticTurn.id)
+        setPromptDeliveryPhase(
+          effectiveConversationId,
+          optimisticTurn.id,
+          "queued"
+        )
         // A direct answer (never dequeued from the queue) re-queues at the
         // TAIL — it was sent after any already-queued items, so FIFO keeps it
         // behind them. (Only the auto-flush path, whose draft WAS the head,
         // re-queues at the front.)
-        mqEnqueue(draft, null)
+        mqEnqueue(draft, null, optimisticTurn.id)
       }
       lifecycleSend(draft, null, {
         clientMessageId: optimisticTurn.id,
-        onTurnInProgress: onSendRecovery,
-        onSendFailed: (error) => {
-          if (isNetworkOrOfflineError(error)) {
-            onSendRecovery()
-          } else {
+        onTurnInProgress,
+        onAccepted: () =>
+          setPromptDeliveryPhase(
+            effectiveConversationId,
+            optimisticTurn.id,
+            "accepted"
+          ),
+        onSendFailed: (error, ambiguous) => {
+          setPromptDeliveryPhase(
+            effectiveConversationId,
+            optimisticTurn.id,
+            "failed",
+            ambiguous ? t("promptAcceptanceUnknown") : toErrorMessage(error)
+          )
+          if (!ambiguous) {
             removeOptimisticTurn(effectiveConversationId, optimisticTurn.id)
           }
+          setSyncState(effectiveConversationId, "idle")
         },
       })
     },
@@ -1496,7 +1599,9 @@ const ConversationTabView = memo(function ConversationTabView({
       connStatus,
       effectiveConversationId,
       lifecycleSend,
+      setPromptDeliveryPhase,
       setSyncState,
+      t,
     ]
   )
 
@@ -1770,17 +1875,26 @@ const ConversationTabView = memo(function ConversationTabView({
   // MessageInput owns the enqueue fallback and draft-preservation policy, so
   // this wrapper must not swallow the turn-end race the way `submit` does.
   const feedbackSteer = feedback.steer
-  const handleSteer = useCallback(
+  const handleFeedbackSteer = useCallback(
     async (text: string) => {
       await feedbackSteer(text)
     },
     [feedbackSteer]
   )
 
-  const handleSteer = useCallback(
+  const handleGuide = useCallback(
     async (draft: PromptDraft) => {
       const queueAsNextPrompt = () => {
         mqEnqueue(draft, selectedModeId)
+      }
+
+      // Codex app-server steering is routed as incremental text. Images and
+      // embedded resources must remain intact and start the next ordinary turn;
+      // never attempt a partial steer that silently drops their bytes.
+      if (!draftSupportsNativeSteer(draft)) {
+        queueAsNextPrompt()
+        toast.info(t("imageSteerQueued"))
+        return
       }
 
       // The status/capability may change after MessageInput rendered its Guide
@@ -1915,7 +2029,7 @@ const ConversationTabView = memo(function ConversationTabView({
       onFocus={handleFocus}
       onSend={handleSend}
       supportsSteer={conn.supportsSteer}
-      onSteer={handleSteer}
+      onGuide={handleGuide}
       onCancel={handleCancel}
       onRespondPermission={handleRespondPermission}
       onAnswerQuestion={handleAnswerQuestion}
@@ -1968,7 +2082,7 @@ const ConversationTabView = memo(function ConversationTabView({
         // stay pixel-identical (Stop button alone). The prompting scope
         // itself is enforced where the button renders.
         feedback.featureEnabled && feedback.channel === "native"
-          ? handleSteer
+          ? handleFeedbackSteer
           : undefined
       }
     >

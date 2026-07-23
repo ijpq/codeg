@@ -1051,6 +1051,7 @@ dependencies = [
  "mime_guess",
  "minisign-verify",
  "notify",
+ "open",
  "portable-pty",
  "prost",
  "qrcode",

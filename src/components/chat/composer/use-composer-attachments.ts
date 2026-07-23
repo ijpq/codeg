@@ -22,7 +22,6 @@ import {
   UPLOAD_I18N_KEY_NOT_A_FILE,
   UPLOAD_I18N_KEY_QUOTA_EXCEEDED,
   UPLOAD_I18N_KEY_TOO_LARGE,
-  UPLOAD_MAX_BYTES,
 } from "@/lib/api"
 // Local-IPC file read (never proxied to a remote workspace). Used for the
 // thumbnail preview of a locally-dropped image whose BYTES were uploaded to
@@ -73,6 +72,23 @@ import {
   mimeTypeFromPath,
   pointWithinElement,
 } from "@/components/chat/composer/attachment-files"
+
+function createObjectPreviewUrl(blob: Blob): string | undefined {
+  return typeof URL !== "undefined" && typeof URL.createObjectURL === "function"
+    ? URL.createObjectURL(blob)
+    : undefined
+}
+
+function revokeObjectPreviewUrl(attachment: InputAttachment): void {
+  if (
+    attachment.type === "image" &&
+    attachment.previewUrl &&
+    typeof URL !== "undefined" &&
+    typeof URL.revokeObjectURL === "function"
+  ) {
+    URL.revokeObjectURL(attachment.previewUrl)
+  }
+}
 
 /**
  * The composer's attachment engine, shared by the conversation composer and the
@@ -206,6 +222,7 @@ export function useComposerAttachments({
     promptCapabilities.image || promptCapabilities.embedded_context
 
   const [attachments, setAttachments] = useState<InputAttachment[]>([])
+  const attachmentsRef = useRef<InputAttachment[]>([])
   const embeddedPayloadsRef = useRef<Map<string, PromptInputBlock>>(new Map())
   const [isDragActive, setIsDragActive] = useState(false)
   const dragActiveRef = useRef(false)
@@ -216,6 +233,19 @@ export function useComposerAttachments({
   useEffect(() => {
     disabledRef.current = disabled
   }, [disabled])
+
+  useEffect(() => {
+    attachmentsRef.current = attachments
+  }, [attachments])
+
+  useEffect(
+    () => () => {
+      for (const attachment of attachmentsRef.current) {
+        revokeObjectPreviewUrl(attachment)
+      }
+    },
+    []
+  )
 
   const setDragActiveIfChanged = useCallback((next: boolean) => {
     if (dragActiveRef.current === next) return
@@ -597,19 +627,7 @@ export function useComposerAttachments({
       // limit and the workspace has no uploads dir.
       const uploadImages = !showNativePaperclip
 
-      const oversized = uploadImages
-        ? files.filter((f) => f.size > UPLOAD_MAX_BYTES)
-        : []
-      if (oversized.length > 0) {
-        toast.error(
-          tAttach("attachUploadTooLarge", {
-            limit: Math.round(UPLOAD_MAX_BYTES / (1024 * 1024)),
-            names: oversized.map((f) => f.name).join(", "),
-          })
-        )
-      }
       const accepted = files.filter((file) => {
-        if (uploadImages && file.size > UPLOAD_MAX_BYTES) return false
         if (uploadImages && file.size === 0) {
           // Matches `uploadAttachment`'s EmptyAttachmentError semantics:
           // dropped silently, no toast, no broken thumbnail.
@@ -637,6 +655,7 @@ export function useComposerAttachments({
               uri: null,
               name: file.name || `image-${Date.now()}-${index + 1}`,
               mimeType,
+              previewUrl: createObjectPreviewUrl(file),
               ...(uploadImages ? { uploading: true } : {}),
             },
             file,
@@ -667,9 +686,13 @@ export function useComposerAttachments({
                 )
               )
             } catch (error) {
-              setAttachments((prev) =>
-                prev.filter((a) => a.id !== attachment.id)
-              )
+              setAttachments((prev) => {
+                const failedAttachment = prev.find(
+                  (a) => a.id === attachment.id
+                )
+                if (failedAttachment) revokeObjectPreviewUrl(failedAttachment)
+                return prev.filter((a) => a.id !== attachment.id)
+              })
               if (isEmptyAttachmentError(error)) {
                 console.warn(
                   `[${logLabel}] skipping empty image attachment: ${attachment.name}`
@@ -824,7 +847,7 @@ export function useComposerAttachments({
               if (canAttachImages && mimeType.startsWith("image/")) {
                 const previewData = await readLocalFileBase64(
                   path,
-                  UPLOAD_MAX_BYTES
+                  DRAG_DROP_IMAGE_MAX_BYTES
                 )
                 imageAttachmentsToAdd.push({
                   id: `image:${Date.now()}:${idx}:${randomUUID()}`,
@@ -1278,9 +1301,14 @@ export function useComposerAttachments({
     (editor: Editor, blocks: PromptInputBlock[]) => {
       embeddedPayloadsRef.current.clear()
       const restored = restoreBlocksIntoEditor(editor, blocks)
-      setAttachments(
-        restored.filter((a): a is ImageInputAttachment => a.type === "image")
-      )
+      setAttachments((previous) => {
+        for (const attachment of previous) {
+          revokeObjectPreviewUrl(attachment)
+        }
+        return restored.filter(
+          (a): a is ImageInputAttachment => a.type === "image"
+        )
+      })
       const resources = restored.filter(
         (a): a is ResourceInputAttachment => a.type === "resource"
       )
@@ -1321,11 +1349,20 @@ export function useComposerAttachments({
   )
 
   const removeAttachment = useCallback((id: string) => {
-    setAttachments((prev) => prev.filter((item) => item.id !== id))
+    setAttachments((previous) => {
+      const removed = previous.find((item) => item.id === id)
+      if (removed) revokeObjectPreviewUrl(removed)
+      return previous.filter((item) => item.id !== id)
+    })
   }, [])
 
   const clearAttachments = useCallback(() => {
-    setAttachments([])
+    setAttachments((previous) => {
+      for (const attachment of previous) {
+        revokeObjectPreviewUrl(attachment)
+      }
+      return []
+    })
     embeddedPayloadsRef.current.clear()
   }, [])
 
