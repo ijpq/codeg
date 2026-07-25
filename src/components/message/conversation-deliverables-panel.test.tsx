@@ -107,6 +107,34 @@ describe("ConversationDeliverablesPanel", () => {
     expect(screen.queryByText("package.json")).not.toBeInTheDocument()
   })
 
+  it("shows code change and deleted badges for reconciled files", () => {
+    render(
+      <ConversationDeliverablesPanel
+        conversationId={1}
+        expanded
+        onToggle={vi.fn()}
+        deliverables={[
+          deliverable("source", "lib.rs", {
+            path: "src/lib.rs",
+            category: "code_change",
+            change_kind: "modified",
+          }),
+          deliverable("deleted", "old.rs", {
+            path: "src/old.rs",
+            category: "code_change",
+            change_kind: "deleted",
+            is_valid: false,
+            invalid_reason: "deleted",
+          }),
+        ]}
+      />
+    )
+
+    expect(screen.getAllByText("codeChange")).toHaveLength(2)
+    expect(screen.getByText("deleted")).toBeInTheDocument()
+    expect(screen.queryByText("missing")).not.toBeInTheDocument()
+  })
+
   it("downloads by deliverable id without sending a source path", async () => {
     render(
       <ConversationDeliverablesPanel

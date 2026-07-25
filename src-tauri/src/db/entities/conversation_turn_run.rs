@@ -32,6 +32,13 @@ pub struct Model {
     pub completed_at: Option<DateTimeUtc>,
     pub deliverables_declared_at: Option<DateTimeUtc>,
     pub input_paths_json: String,
+    pub declaration_status: String,
+    pub declaration_attempted_at: Option<DateTimeUtc>,
+    pub declaration_error: Option<String>,
+    pub expectation_json: String,
+    pub settlement_status: String,
+    pub settled_at: Option<DateTimeUtc>,
+    pub missing_expected_paths_json: String,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -48,6 +55,8 @@ pub enum Relation {
     Deliverables,
     #[sea_orm(has_many = "super::conversation_turn_deliverable::Entity")]
     DeliverableAssociations,
+    #[sea_orm(has_many = "super::deliverable_declaration::Entity")]
+    Declarations,
 }
 
 impl Related<super::conversation::Entity> for Entity {
@@ -71,6 +80,12 @@ impl Related<super::conversation_deliverable::Entity> for Entity {
 impl Related<super::conversation_turn_deliverable::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::DeliverableAssociations.def()
+    }
+}
+
+impl Related<super::deliverable_declaration::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Declarations.def()
     }
 }
 

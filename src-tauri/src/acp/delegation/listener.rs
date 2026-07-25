@@ -24,7 +24,8 @@ use crate::acp::delegation::transport::{
 };
 use crate::acp::delegation::types::{DelegationRequest, DelegationTaskReport, TaskStatus};
 use crate::acp::deliverables::{
-    PublishDeliverablesOutcome, RejectedDeliverable, SessionDeliverableAccess,
+    PublishDeliverablesArgs, PublishDeliverablesOutcome, RejectedDeliverable,
+    SessionDeliverableAccess,
 };
 use crate::acp::feedback::{PendingFeedback, SessionFeedbackAccess};
 use crate::acp::question::{QuestionOutcome, SessionQuestionAccess};
@@ -603,12 +604,22 @@ impl DelegationListener {
         else {
             return publish_rejected("parent has no active conversation");
         };
+        let request_id = if req.request_id.trim().is_empty() {
+            uuid::Uuid::new_v4().to_string()
+        } else {
+            req.request_id
+        };
+        let args = req.args.unwrap_or_else(|| PublishDeliverablesArgs {
+            deliverables: req.deliverables,
+            ..Default::default()
+        });
         self.deliverables
             .publish_deliverables(
+                &request_id,
                 &req.parent_connection_id,
                 conversation_id,
                 &entry.working_dir,
-                req.deliverables,
+                args,
             )
             .await
     }
@@ -775,6 +786,8 @@ fn deliverables_response(outcome: PublishDeliverablesOutcome) -> std::io::Result
 
 fn publish_rejected(reason: &str) -> PublishDeliverablesOutcome {
     PublishDeliverablesOutcome {
+        request_id: String::new(),
+        declaration_status: "failed".to_string(),
         published: false,
         accepted: Vec::new(),
         rejected: vec![RejectedDeliverable {
@@ -1059,10 +1072,11 @@ mod tests {
     impl SessionDeliverableAccess for StubDeliverables {
         async fn publish_deliverables(
             &self,
+            _request_id: &str,
             _parent_connection_id: &str,
             _conversation_id: i32,
             _workspace_root: &Path,
-            _items: Vec<crate::acp::deliverables::DeliverableInput>,
+            _args: crate::acp::deliverables::PublishDeliverablesArgs,
         ) -> PublishDeliverablesOutcome {
             PublishDeliverablesOutcome::default()
         }

@@ -12,6 +12,7 @@ pub mod conversation_turn_deliverable;
 pub mod conversation_turn_file_change;
 pub mod conversation_turn_run;
 pub mod custom_agent;
+pub mod deliverable_declaration;
 pub mod folder;
 pub mod folder_command;
 pub mod folder_link;

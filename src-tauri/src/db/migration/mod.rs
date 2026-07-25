@@ -29,6 +29,7 @@ mod m20260717_000001_conversation_turn_artifacts;
 mod m20260717_000001_folder_alias;
 mod m20260718_000001_conversation_deliverables;
 mod m20260720_000001_deliverable_management;
+mod m20260725_000001_deliverable_reconciliation;
 mod m20260726_000001_custom_agent;
 mod m20260727_000001_custom_agent_skills;
 mod m20260728_000001_custom_agent_skills_dir;
@@ -74,6 +75,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260717_000001_conversation_turn_artifacts::Migration),
             Box::new(m20260718_000001_conversation_deliverables::Migration),
             Box::new(m20260720_000001_deliverable_management::Migration),
+            Box::new(m20260725_000001_deliverable_reconciliation::Migration),
             Box::new(m20260726_000001_custom_agent::Migration),
             Box::new(m20260727_000001_custom_agent_skills::Migration),
             Box::new(m20260728_000001_custom_agent_skills_dir::Migration),
