@@ -89,10 +89,11 @@ struct NoDeliverables;
 impl codeg_lib::acp::deliverables::SessionDeliverableAccess for NoDeliverables {
     async fn publish_deliverables(
         &self,
+        _request_id: &str,
         _parent_connection_id: &str,
         _conversation_id: i32,
         _workspace_root: &std::path::Path,
-        _items: Vec<codeg_lib::acp::deliverables::DeliverableInput>,
+        _args: codeg_lib::acp::deliverables::PublishDeliverablesArgs,
     ) -> codeg_lib::acp::deliverables::PublishDeliverablesOutcome {
         codeg_lib::acp::deliverables::PublishDeliverablesOutcome::default()
     }
