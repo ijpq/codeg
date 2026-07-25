@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use sea_orm::DatabaseConnection;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, oneshot, Mutex};
 
 use crate::db::entities::conversation_turn_file_change::ConversationTurnFileChangeKind;
@@ -75,6 +75,193 @@ pub(crate) fn input_paths_from_prompt(
 }
 
 pub const CONVERSATION_ARTIFACTS_CHANGED_EVENT: &str = "conversation://artifacts-changed";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TurnDeliverableExpectation {
+    pub publish_required: bool,
+    pub expects_code_changes: bool,
+    pub requested_paths: Vec<String>,
+}
+
+impl Default for TurnDeliverableExpectation {
+    fn default() -> Self {
+        Self {
+            publish_required: true,
+            expects_code_changes: false,
+            requested_paths: Vec::new(),
+        }
+    }
+}
+
+fn prompt_text(blocks: &[crate::acp::types::PromptInputBlock]) -> String {
+    blocks
+        .iter()
+        .filter_map(|block| match block {
+            crate::acp::types::PromptInputBlock::Text { text } => Some(text.trim()),
+            _ => None,
+        })
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn contains_bounded_ascii_marker(text: &str, marker: &str) -> bool {
+    text.match_indices(marker).any(|(start, _)| {
+        let end = start + marker.len();
+        let left_boundary = start == 0
+            || text[..start]
+                .chars()
+                .next_back()
+                .is_some_and(|character| !character.is_ascii_alphanumeric());
+        let right_boundary = end == text.len()
+            || text[end..]
+                .chars()
+                .next()
+                .is_some_and(|character| !character.is_ascii_alphanumeric());
+        left_boundary && right_boundary
+    })
+}
+
+fn expected_path_candidate(
+    raw: &str,
+    root_path: &Path,
+    allow_extensionless: bool,
+) -> Option<String> {
+    let trimmed = raw.trim_matches(|character: char| {
+        character.is_whitespace()
+            || matches!(
+                character,
+                '`' | '"'
+                    | '\''
+                    | '('
+                    | ')'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | '<'
+                    | '>'
+                    | ','
+                    | ';'
+                    | ':'
+                    | '!'
+                    | '?'
+                    | '，'
+                    | '。'
+                    | '；'
+                    | '：'
+            )
+    });
+    let trimmed = trimmed.strip_suffix('.').unwrap_or(trimmed);
+    if trimmed.is_empty()
+        || trimmed.contains("://")
+        || trimmed.starts_with('-')
+        || trimmed.contains('\n')
+    {
+        return None;
+    }
+    let parsed = PathBuf::from(trimmed);
+    if parsed.extension().is_none() && !allow_extensionless {
+        return None;
+    }
+    let relative = if parsed.is_absolute() {
+        parsed.strip_prefix(root_path).ok()?.to_path_buf()
+    } else {
+        parsed
+    };
+    if relative.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        return None;
+    }
+    let normalized = normalize_relative_path(&relative.to_string_lossy());
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+/// Capture the user's output contract before the prompt is sent. Natural
+/// language can only provide expectation candidates; settlement still requires
+/// a verified declaration or a real filesystem change.
+pub(crate) fn expectation_from_prompt(
+    blocks: &[crate::acp::types::PromptInputBlock],
+    root_path: &Path,
+) -> TurnDeliverableExpectation {
+    let text = prompt_text(blocks);
+    let lower = text.to_lowercase();
+    let expects_code_changes = [
+        "implement",
+        "fix",
+        "modify",
+        "edit",
+        "update",
+        "refactor",
+        "add test",
+        "change code",
+        "add",
+        "delete",
+        "remove",
+        "rename",
+        "upgrade",
+    ]
+    .iter()
+    .any(|marker| contains_bounded_ascii_marker(&lower, marker))
+        || [
+            "实现",
+            "修复",
+            "修改",
+            "更新",
+            "重构",
+            "编写代码",
+            "添加测试",
+            "新增",
+            "删除",
+            "移除",
+            "重命名",
+            "调整",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker));
+    let has_output_intent = expects_code_changes
+        || [
+            "create", "generate", "export", "produce", "write", "save", "output", "deliver",
+        ]
+        .iter()
+        .any(|marker| contains_bounded_ascii_marker(&lower, marker))
+        || ["创建", "生成", "导出", "产出", "输出", "保存", "交付"]
+            .iter()
+            .any(|marker| lower.contains(marker));
+
+    let mut candidates = Vec::new();
+    let mut in_backticks = false;
+    for segment in text.split('`') {
+        if in_backticks {
+            candidates.push((segment, true));
+        }
+        in_backticks = !in_backticks;
+    }
+    candidates.extend(text.split_whitespace().map(|candidate| (candidate, false)));
+
+    let mut seen = std::collections::HashSet::new();
+    let requested_paths = if has_output_intent {
+        candidates
+            .into_iter()
+            .filter_map(|(candidate, allow_extensionless)| {
+                expected_path_candidate(candidate, root_path, allow_extensionless)
+            })
+            .filter(|path| seen.insert(path.clone()))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    TurnDeliverableExpectation {
+        publish_required: true,
+        expects_code_changes,
+        requested_paths,
+    }
+}
 
 /// Wait past the workspace watcher's 300ms debounce when a turn completes, so
 /// the final atomic rename/write reaches the persistent batch before releasing
@@ -139,6 +326,7 @@ impl ArtifactTracker {
         folder_id: Option<i32>,
         root_path: PathBuf,
         input_paths: Vec<String>,
+        expectation: TurnDeliverableExpectation,
         emitter: EventEmitter,
         event_seq_before_prompt: u64,
     ) -> Result<String, crate::db::error::DbError> {
@@ -204,6 +392,10 @@ impl ArtifactTracker {
                 capture_incomplete,
                 input_paths_json: serde_json::to_string(&input_paths)
                     .unwrap_or_else(|_| "[]".to_string()),
+                expectation_json: serde_json::to_string(&expectation).unwrap_or_else(|_| {
+                    r#"{"publish_required":true,"expects_code_changes":false,"requested_paths":[]}"#
+                        .to_string()
+                }),
             },
         )
         .await
@@ -454,9 +646,9 @@ async fn capture_loop(args: CaptureLoopArgs) {
         );
     }
 
-    // The declaration marker is persisted while the turn is running. The
-    // fallback therefore cannot overwrite an explicit set (including an
-    // explicit empty set) once the terminal event arrives.
+    // Terminal settlement always runs. It preserves accepted declarations and
+    // merges verified filesystem changes that the declaration missed; failed
+    // or empty declarations therefore cannot suppress recovery.
     match deliverable_service::infer_for_turn(&db, conversation_id, &run_id).await {
         Ok(inferred) if !inferred.is_empty() => {
             crate::acp::deliverables::emit_deliverables_changed(
@@ -670,7 +862,6 @@ fn should_track_path(path: &str) -> bool {
         || lower.ends_with(".swp")
         || lower.ends_with(".swo")
         || lower.ends_with(".tmp")
-        || lower.ends_with(".lock")
         || lower.starts_with(".~lock.")
     {
         return false;
@@ -681,6 +872,7 @@ fn should_track_path(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acp::types::PromptInputBlock;
 
     #[test]
     fn artifact_filter_drops_metadata_caches_and_office_lock_files() {
@@ -688,7 +880,55 @@ mod tests {
         assert!(!should_track_path("node_modules/pkg/index.js"));
         assert!(!should_track_path("reports/~$quarterly.docx"));
         assert!(!should_track_path("../outside.txt"));
+        assert!(should_track_path("Cargo.lock"));
+        assert!(should_track_path("yarn.lock"));
         assert!(should_track_path("reports/quarterly.docx"));
         assert!(should_track_path("dist/release.zip"));
+    }
+
+    #[test]
+    fn expectation_extracts_code_intent_and_explicit_paths_in_both_languages() {
+        let root = Path::new("/workspace/project");
+        let english = expectation_from_prompt(
+            &[PromptInputBlock::Text {
+                text: "Implement the fix in `src/lib.rs` and update tests/api.test.ts".into(),
+            }],
+            root,
+        );
+        assert!(english.publish_required);
+        assert!(english.expects_code_changes);
+        assert_eq!(
+            english.requested_paths,
+            vec!["src/lib.rs", "tests/api.test.ts"]
+        );
+
+        let chinese = expectation_from_prompt(
+            &[PromptInputBlock::Text {
+                text: "请实现这个功能，并生成 `docs/交付说明.md`。".into(),
+            }],
+            root,
+        );
+        assert!(chinese.expects_code_changes);
+        assert_eq!(chinese.requested_paths, vec!["docs/交付说明.md"]);
+    }
+
+    #[test]
+    fn expectation_does_not_treat_incidental_paths_as_an_output_contract() {
+        let expectation = expectation_from_prompt(
+            &[PromptInputBlock::Text {
+                text: "What fixtures does src/lib.rs currently use?".into(),
+            }],
+            Path::new("/workspace/project"),
+        );
+        assert!(!expectation.expects_code_changes);
+        assert!(expectation.requested_paths.is_empty());
+
+        let prose = expectation_from_prompt(
+            &[PromptInputBlock::Text {
+                text: "Create a comparison of and/or semantics.".into(),
+            }],
+            Path::new("/workspace/project"),
+        );
+        assert!(prose.requested_paths.is_empty());
     }
 }

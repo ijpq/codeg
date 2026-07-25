@@ -187,15 +187,15 @@
   },
   {
     "name": "publish_deliverables",
-    "description": "Declare the complete, small set of final, user-facing outputs produced by this task. A successful call atomically replaces the prior agent-declared set, and Codeg shows only the verified set in the Final deliverables panel. Call this near the end of the turn when there is at least one standalone file or directory the user should receive, inspect, open, or download. Do NOT publish the workspace root, ordinary source files, tests, configuration, lockfiles, caches, temporary/intermediate files, or every path you edited during routine coding work. Do NOT publish input files merely read from the user. For a normal code-change task with no standalone output, do not call this tool. To explicitly clear a previous declaration, submit an empty deliverables array. Paths may be absolute or relative to the session working directory and must already exist inside that workspace. Use role=primary for the main result and role=supporting only for genuinely useful companion outputs. If any item is rejected, nothing is changed; correct it and resubmit the complete set.",
+    "description": "Publish the user-relevant files changed or produced by this turn. You MUST call this at least once near the end of every turn before the final response, including ordinary code-change turns. Include meaningful source, test, documentation, and necessary configuration changes with category=code_change, plus standalone files the user should open or download with category=standalone_output. Exclude files merely read, caches, logs, dependencies, build intermediates, editor temporaries, and the workspace root. If the turn changed no files, call with an empty deliverables array. The default merge mode preserves earlier accepted items and supports additional calls for large sets or corrections; use replace only for an intentional complete replacement and clear only to explicitly clear the turn set. Existing created/modified files and directories are verified inside the workspace. A deleted code path may be declared with change_kind=deleted only when Codeg observed that deletion in this turn. Rejected merge items do not discard accepted items; correct and resubmit rejected paths before the final response.",
     "inputSchema": {
       "type": "object",
       "required": ["deliverables"],
       "properties": {
         "deliverables": {
           "type": "array",
-          "maxItems": 20,
-          "description": "The complete final-output set intended for the user, not a change log. An empty array clears a previous declaration.",
+          "maxItems": 200,
+          "description": "User-relevant changed code files and standalone outputs. An empty array confirms that this call adds no files; it does not clear prior items in merge mode.",
           "items": {
             "type": "object",
             "required": ["path"],
@@ -219,9 +219,33 @@
                 "enum": ["primary", "supporting"],
                 "default": "primary",
                 "description": "Whether this is a main result or a useful companion output."
+              },
+              "category": {
+                "type": "string",
+                "enum": ["code_change", "standalone_output"],
+                "description": "Use code_change for source, tests, docs, and necessary config; standalone_output for reports, media, archives, and other files intended to be opened or downloaded."
+              },
+              "change_kind": {
+                "type": "string",
+                "enum": ["created", "modified", "deleted", "renamed"],
+                "description": "How this turn changed the path. Defaults from Codeg filesystem evidence when available."
               }
             }
           }
+        },
+        "mode": {
+          "type": "string",
+          "enum": ["merge", "replace", "clear"],
+          "default": "merge",
+          "description": "merge upserts the submitted paths; replace intentionally replaces this turn's set; clear requires empty deliverables/remove arrays and clears the set."
+        },
+        "remove": {
+          "type": "array",
+          "maxItems": 200,
+          "items": {
+            "type": "string"
+          },
+          "description": "Paths to remove from this turn's declared set without deleting files from disk."
         }
       }
     }

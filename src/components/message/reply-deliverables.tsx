@@ -63,7 +63,7 @@ export function ReplyDeliverables({
                   <span className="truncate text-xs font-medium">
                     {item.file_name || item.title}
                   </span>
-                  {!item.is_valid && (
+                  {!item.is_valid && item.change_kind !== "deleted" && (
                     <Badge
                       variant="destructive"
                       className="h-4 gap-0.5 px-1 text-[9px]"
@@ -75,6 +75,19 @@ export function ReplyDeliverables({
                   <Badge variant="outline" className="h-4 px-1 text-[9px]">
                     {t(item.role === "supporting" ? "supporting" : "primary")}
                   </Badge>
+                  {item.category === "code_change" && (
+                    <Badge variant="outline" className="h-4 px-1 text-[9px]">
+                      {t("codeChange")}
+                    </Badge>
+                  )}
+                  {item.change_kind === "deleted" && (
+                    <Badge
+                      variant="destructive"
+                      className="h-4 px-1 text-[9px]"
+                    >
+                      {t("deleted")}
+                    </Badge>
+                  )}
                   {item.source === "inferred" && (
                     <Badge variant="outline" className="h-4 px-1 text-[9px]">
                       {t("inferred")}

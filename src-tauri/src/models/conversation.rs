@@ -149,6 +149,10 @@ pub struct ConversationDeliverable {
     pub description: Option<String>,
     /// primary | supporting
     pub role: String,
+    /// code_change | standalone_output
+    pub category: String,
+    /// created | modified | deleted | renamed
+    pub change_kind: String,
     /// Zero-based order from the latest complete declaration.
     pub position: i32,
     /// `declared` for publish_deliverables, `inferred` for the conservative
@@ -231,6 +235,22 @@ pub struct ConversationTurnArtifactRun {
     pub started_at: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<DateTime<Utc>>,
+    /// not_called | success | success_empty | partial | failed
+    pub declaration_status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub declaration_attempted_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deliverables_declared_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub declaration_error: Option<String>,
+    /// Structured turn-level expectation captured before the prompt is sent.
+    pub expectation_json: String,
+    /// pending | settled | settled_incomplete
+    pub settlement_status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settled_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_expected_paths: Vec<String>,
     pub changes: Vec<ConversationTurnFileChange>,
 }
 

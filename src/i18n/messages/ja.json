@@ -3137,6 +3137,8 @@
         "operationFailed": "Deliverable operation failed",
         "declared": "Declared",
         "inferred": "Automatically inferred",
+        "codeChange": "コード変更",
+        "deleted": "削除済み",
         "allTypes": "All types",
         "allSources": "All sources",
         "allTurns": "All turns",

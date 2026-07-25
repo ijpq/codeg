@@ -14,6 +14,7 @@ pub use super::conversation_turn_deliverable::Entity as ConversationTurnDelivera
 pub use super::conversation_turn_file_change::Entity as ConversationTurnFileChange;
 pub use super::conversation_turn_run::Entity as ConversationTurnRun;
 pub use super::custom_agent::Entity as CustomAgent;
+pub use super::deliverable_declaration::Entity as DeliverableDeclaration;
 pub use super::folder::Entity as Folder;
 pub use super::folder_command::Entity as FolderCommand;
 pub use super::folder_link::Entity as FolderLink;
