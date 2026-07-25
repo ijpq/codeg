@@ -13,6 +13,8 @@ pub struct Model {
     pub title: String,
     pub description: Option<String>,
     pub role: String,
+    pub category: String,
+    pub change_kind: String,
     pub position: i32,
     pub source: String,
     pub file_name: String,

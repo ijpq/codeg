@@ -3154,6 +3154,8 @@
         "operationFailed": "Deliverable operation failed",
         "declared": "Declared",
         "inferred": "Automatically inferred",
+        "codeChange": "코드 변경",
+        "deleted": "삭제됨",
         "allTypes": "All types",
         "allSources": "All sources",
         "allTurns": "All turns",

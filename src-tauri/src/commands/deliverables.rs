@@ -697,6 +697,8 @@ mod tests {
                 title: name.into(),
                 description: None,
                 role: "primary".into(),
+                category: "standalone_output".into(),
+                change_kind: "created".into(),
                 position: 0,
                 source: "declared".into(),
                 file_name: name.into(),

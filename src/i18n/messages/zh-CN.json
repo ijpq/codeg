@@ -3154,6 +3154,8 @@
         "operationFailed": "产物操作失败",
         "declared": "显式声明",
         "inferred": "自动推断",
+        "codeChange": "代码变更",
+        "deleted": "已删除",
         "allTypes": "全部类型",
         "allSources": "全部来源",
         "allTurns": "全部轮次",
