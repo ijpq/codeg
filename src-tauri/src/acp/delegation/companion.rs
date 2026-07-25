@@ -564,10 +564,25 @@ async fn build_tools_call_spawn(
             let req = BrokerDeliverablesRequest {
                 token: ctx.token.clone(),
                 parent_connection_id: ctx.parent_connection_id.clone(),
-                deliverables: args.deliverables,
+                request_id: uuid::Uuid::new_v4().to_string(),
+                deliverables: args.deliverables.clone(),
+                args: Some(args),
             };
-            let round_trip =
-                Box::pin(async move { client_deliverables_round_trip(&socket, &req).await });
+            let round_trip = Box::pin(async move {
+                match client_deliverables_round_trip(&socket, &req).await {
+                    Ok(response) => Ok(response),
+                    Err(first_error) => client_deliverables_round_trip(&socket, &req)
+                        .await
+                        .map_err(|second_error| {
+                            std::io::Error::new(
+                                second_error.kind(),
+                                format!(
+                                    "deliverables retry failed after {first_error}: {second_error}"
+                                ),
+                            )
+                        }),
+                }
+            });
             register_and_spawn(inflight, id, None, round_trip, render_deliverables_result).await
         }
         other => LineAction::Respond(err(id, -32602, format!("unknown tool: {other}"))),
@@ -1075,7 +1090,8 @@ pub fn render_session_result(outcome: &Value) -> Value {
 
 /// Render the verified declaration back to the agent. Rejections stay in both
 /// text and structured content so the model can repair a bad path immediately;
-/// an atomic declaration is an MCP error when no complete set was accepted.
+/// partial acceptance is also marked as an MCP error so the model retries the
+/// rejected paths while the valid merge remains durable.
 pub fn render_deliverables_result(outcome: &Value) -> Value {
     let published = outcome
         .get("published")
@@ -1092,7 +1108,7 @@ pub fn render_deliverables_result(outcome: &Value) -> Value {
         .cloned()
         .unwrap_or_default();
     let mut text = if published && accepted.is_empty() {
-        "Cleared the final deliverable set.".to_string()
+        "Recorded the deliverables update with no newly accepted items.".to_string()
     } else if published {
         format!("Published {} verified deliverable(s).", accepted.len())
     } else {
@@ -1115,12 +1131,8 @@ pub fn render_deliverables_result(outcome: &Value) -> Value {
     }
     json!({
         "content": [{ "type": "text", "text": text }],
-        "isError": !published,
-        "structuredContent": {
-            "published": published,
-            "accepted": accepted,
-            "rejected": rejected,
-        },
+        "isError": !published || !rejected.is_empty(),
+        "structuredContent": outcome.clone(),
     })
 }
 
@@ -1838,10 +1850,9 @@ mod tests {
             }
         })
         .to_string();
-        // Structurally valid declarations reach the Server even when they are
-        // over the item limit. The Server records that the tool was invoked,
-        // then rejects it atomically so fallback inference cannot guess a
-        // different output set for this turn.
+        // Structurally valid declarations reach the server even when they are
+        // over the per-call limit. The server records the failed attempt, and
+        // terminal settlement remains free to recover verified file changes.
         assert!(matches!(
             dispatch_with_features(DELIVERABLES_ONLY, &too_many).await,
             LineAction::Spawn(_)
@@ -1849,7 +1860,7 @@ mod tests {
     }
 
     #[test]
-    fn render_deliverables_reports_success_or_atomic_rejection() {
+    fn render_deliverables_reports_success_or_rejection() {
         let rendered = render_deliverables_result(&json!({
             "published": true,
             "accepted": [{
@@ -1872,6 +1883,22 @@ mod tests {
             .unwrap()
             .contains("outside workspace"));
 
+        let partial = render_deliverables_result(&json!({
+            "request_id": "request-1",
+            "declaration_status": "partial",
+            "published": true,
+            "accepted": [{
+                "id": "d1", "path": "output/report.pdf", "kind": "file",
+                "title": "Report", "role": "primary"
+            }],
+            "rejected": [{ "path": "output/missing.pdf", "reason": "not found" }]
+        }));
+        assert_eq!(partial["isError"], true);
+        assert_eq!(
+            partial["structuredContent"]["declaration_status"],
+            "partial"
+        );
+
         let cleared = render_deliverables_result(&json!({
             "published": true,
             "accepted": [],
@@ -1881,7 +1908,7 @@ mod tests {
         assert!(cleared["content"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("Cleared"));
+            .contains("Recorded"));
     }
 
     #[tokio::test]

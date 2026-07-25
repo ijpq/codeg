@@ -11,6 +11,7 @@ pub mod conversation_deliverable;
 pub mod conversation_turn_deliverable;
 pub mod conversation_turn_file_change;
 pub mod conversation_turn_run;
+pub mod deliverable_declaration;
 pub mod folder;
 pub mod folder_command;
 pub mod model_provider;

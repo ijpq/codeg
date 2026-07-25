@@ -13,6 +13,7 @@ pub use super::conversation_deliverable::Entity as ConversationDeliverable;
 pub use super::conversation_turn_deliverable::Entity as ConversationTurnDeliverable;
 pub use super::conversation_turn_file_change::Entity as ConversationTurnFileChange;
 pub use super::conversation_turn_run::Entity as ConversationTurnRun;
+pub use super::deliverable_declaration::Entity as DeliverableDeclaration;
 pub use super::folder::Entity as Folder;
 pub use super::folder_command::Entity as FolderCommand;
 pub use super::model_provider::Entity as ModelProvider;

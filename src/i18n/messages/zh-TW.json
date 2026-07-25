@@ -2879,6 +2879,8 @@
         "operationFailed": "產物操作失敗",
         "declared": "明確宣告",
         "inferred": "自動推斷",
+        "codeChange": "程式碼變更",
+        "deleted": "已刪除",
         "allTypes": "全部類型",
         "allSources": "全部來源",
         "allTurns": "全部輪次",

@@ -1,20 +1,15 @@
 use sea_orm::entity::prelude::*;
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
-#[sea_orm(table_name = "conversation_turn_deliverable")]
+#[sea_orm(table_name = "deliverable_declaration")]
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
-    pub id: String,
+    pub request_id: String,
     pub conversation_id: i32,
     pub turn_run_id: String,
-    pub deliverable_id: String,
-    pub source: String,
-    pub title: String,
-    pub description: Option<String>,
-    pub role: String,
-    pub category: String,
-    pub change_kind: String,
-    pub position: i32,
+    pub status: String,
+    pub payload_json: String,
+    pub outcome_json: String,
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
 }
@@ -33,12 +28,6 @@ pub enum Relation {
         to = "super::conversation_turn_run::Column::Id"
     )]
     TurnRun,
-    #[sea_orm(
-        belongs_to = "super::conversation_deliverable::Entity",
-        from = "Column::DeliverableId",
-        to = "super::conversation_deliverable::Column::Id"
-    )]
-    Deliverable,
 }
 
 impl Related<super::conversation::Entity> for Entity {
@@ -50,12 +39,6 @@ impl Related<super::conversation::Entity> for Entity {
 impl Related<super::conversation_turn_run::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::TurnRun.def()
-    }
-}
-
-impl Related<super::conversation_deliverable::Entity> for Entity {
-    fn to() -> RelationDef {
-        Relation::Deliverable.def()
     }
 }
 

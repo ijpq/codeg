@@ -1616,6 +1616,8 @@ impl ConnectionManager {
         {
             let input_paths =
                 crate::artifact_tracker::input_paths_from_prompt(&blocks, &root_path);
+            let expectation =
+                crate::artifact_tracker::expectation_from_prompt(&blocks, &root_path);
             match self
                 .artifact_tracker
                 .begin_turn(
@@ -1626,6 +1628,7 @@ impl ConnectionManager {
                     folder_id.or(state_folder_id),
                     root_path,
                     input_paths,
+                    expectation,
                     emitter.clone(),
                     event_seq_before_prompt,
                 )

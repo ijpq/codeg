@@ -2879,6 +2879,8 @@
         "operationFailed": "Deliverable operation failed",
         "declared": "Declared",
         "inferred": "Automatically inferred",
+        "codeChange": "تغيير في الكود",
+        "deleted": "محذوف",
         "allTypes": "All types",
         "allSources": "All sources",
         "allTurns": "All turns",
