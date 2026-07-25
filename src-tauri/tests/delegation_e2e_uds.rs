@@ -37,7 +37,9 @@ use serde_json::json;
 use tokio::sync::oneshot;
 
 #[cfg(feature = "test-utils")]
-use codeg_lib::acp::deliverables::{DbSessionDeliverableAccess, DeliverableInput};
+use codeg_lib::acp::deliverables::{
+    DbSessionDeliverableAccess, DeliverableInput, PublishDeliverablesArgs,
+};
 #[cfg(feature = "test-utils")]
 use codeg_lib::db::service::artifact_service::{self, NewTurnRun};
 #[cfg(feature = "test-utils")]
@@ -133,10 +135,11 @@ struct NoDeliverables;
 impl codeg_lib::acp::deliverables::SessionDeliverableAccess for NoDeliverables {
     async fn publish_deliverables(
         &self,
+        _request_id: &str,
         _parent_connection_id: &str,
         _conversation_id: i32,
         _workspace_root: &std::path::Path,
-        _items: Vec<codeg_lib::acp::deliverables::DeliverableInput>,
+        _args: codeg_lib::acp::deliverables::PublishDeliverablesArgs,
     ) -> codeg_lib::acp::deliverables::PublishDeliverablesOutcome {
         codeg_lib::acp::deliverables::PublishDeliverablesOutcome::default()
     }
@@ -219,6 +222,9 @@ async fn end_to_end_uds_publish_deliverables_replaces_only_the_active_turn() {
             root_path: root.to_string_lossy().to_string(),
             capture_incomplete: false,
             input_paths_json: "[]".into(),
+            expectation_json:
+                r#"{"publish_required":true,"expects_code_changes":false,"requested_paths":[]}"#
+                    .into(),
         },
     )
     .await
@@ -266,27 +272,41 @@ async fn end_to_end_uds_publish_deliverables_replaces_only_the_active_turn() {
     }
     assert!(socket.exists(), "listener never bound the socket");
 
-    let request = |deliverables| BrokerDeliverablesRequest {
-        token: "tok".into(),
-        parent_connection_id: "p1".into(),
-        deliverables,
-    };
+    let request =
+        |request_id: &str, deliverables: Vec<DeliverableInput>| BrokerDeliverablesRequest {
+            token: "tok".into(),
+            parent_connection_id: "p1".into(),
+            request_id: request_id.into(),
+            args: Some(PublishDeliverablesArgs {
+                deliverables: deliverables.clone(),
+                mode: Some("replace".into()),
+                remove: Vec::new(),
+            }),
+            deliverables,
+        };
     let first = client_deliverables_round_trip(
         &socket.to_string_lossy(),
-        &request(vec![
-            DeliverableInput {
-                path: "报告 (最终).docx".into(),
-                title: Some("主报告".into()),
-                description: Some("可直接发送".into()),
-                role: Some("primary".into()),
-            },
-            DeliverableInput {
-                path: "报告.pdf".into(),
-                title: Some("PDF 版本".into()),
-                description: None,
-                role: Some("supporting".into()),
-            },
-        ]),
+        &request(
+            "publish-first",
+            vec![
+                DeliverableInput {
+                    path: "报告 (最终).docx".into(),
+                    title: Some("主报告".into()),
+                    description: Some("可直接发送".into()),
+                    role: Some("primary".into()),
+                    category: None,
+                    change_kind: None,
+                },
+                DeliverableInput {
+                    path: "报告.pdf".into(),
+                    title: Some("PDF 版本".into()),
+                    description: None,
+                    role: Some("supporting".into()),
+                    category: None,
+                    change_kind: None,
+                },
+            ],
+        ),
     )
     .await
     .unwrap();
@@ -295,12 +315,17 @@ async fn end_to_end_uds_publish_deliverables_replaces_only_the_active_turn() {
 
     let second = client_deliverables_round_trip(
         &socket.to_string_lossy(),
-        &request(vec![DeliverableInput {
-            path: "报告.pdf".into(),
-            title: Some("最终 PDF".into()),
-            description: None,
-            role: Some("primary".into()),
-        }]),
+        &request(
+            "publish-second",
+            vec![DeliverableInput {
+                path: "报告.pdf".into(),
+                title: Some("最终 PDF".into()),
+                description: None,
+                role: Some("primary".into()),
+                category: None,
+                change_kind: None,
+            }],
+        ),
     )
     .await
     .unwrap();
