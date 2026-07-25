@@ -72,4 +72,27 @@ describe("ReplyDeliverables", () => {
     expect(screen.getByText("missing")).toBeInTheDocument()
     expect(screen.queryByText("input.pdf")).not.toBeInTheDocument()
   })
+
+  it("labels code changes and deletions without calling them missing", () => {
+    render(
+      <ReplyDeliverables
+        conversationId={11}
+        deliverables={[
+          item("source", "src/lib.rs", {
+            category: "code_change",
+            change_kind: "modified",
+          }),
+          item("deleted", "src/old.rs", {
+            category: "code_change",
+            change_kind: "deleted",
+            is_valid: false,
+            invalid_reason: "deleted",
+          }),
+        ]}
+      />
+    )
+    expect(screen.getAllByText("codeChange")).toHaveLength(2)
+    expect(screen.getByText("deleted")).toBeInTheDocument()
+    expect(screen.queryByText("missing")).not.toBeInTheDocument()
+  })
 })

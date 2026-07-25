@@ -3377,6 +3377,8 @@
         "operationFailed": "Deliverable operation failed",
         "declared": "Declared",
         "inferred": "Automatically inferred",
+        "codeChange": "Modification du code",
+        "deleted": "Supprimé",
         "allTypes": "All types",
         "allSources": "All sources",
         "allTurns": "All turns",
