@@ -55,7 +55,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::acp::deliverables::DeliverableInput;
+use crate::acp::deliverables::{DeliverableInput, PublishDeliverablesArgs};
 use crate::acp::question::QuestionSpec;
 
 /// One delegation call's worth of input forwarded from the companion to the
@@ -212,6 +212,16 @@ pub struct BrokerTaskCompleteRequest {
 pub struct BrokerDeliverablesRequest {
     pub token: String,
     pub parent_connection_id: String,
+    /// Idempotency key added in v0.22. An empty value identifies a legacy
+    /// companion request and remains valid without retry guarantees.
+    #[serde(default)]
+    pub request_id: String,
+    /// New merge/replace/remove envelope.
+    #[serde(default)]
+    pub args: Option<PublishDeliverablesArgs>,
+    /// Compatibility copy for older Codeg listeners, which know only the
+    /// original complete-set field and ignore `args`.
+    #[serde(default)]
     pub deliverables: Vec<DeliverableInput>,
 }
 
@@ -540,22 +550,48 @@ mod tests {
         let msg = BrokerMessage::PublishDeliverables(BrokerDeliverablesRequest {
             token: "tok".into(),
             parent_connection_id: "parent-1".into(),
-            deliverables: vec![DeliverableInput {
-                path: "output/report.pdf".into(),
-                title: Some("Report".into()),
-                description: None,
-                role: Some("primary".into()),
-            }],
+            request_id: "request-1".into(),
+            args: Some(PublishDeliverablesArgs {
+                deliverables: vec![crate::acp::deliverables::DeliverableInput {
+                    path: "output/report.pdf".into(),
+                    title: Some("Report".into()),
+                    description: None,
+                    role: Some("primary".into()),
+                    category: Some("standalone_output".into()),
+                    change_kind: Some("created".into()),
+                }],
+                mode: None,
+                remove: Vec::new(),
+            }),
+            deliverables: Vec::new(),
         });
         write_frame(&mut a, &msg).await.unwrap();
         let got: BrokerMessage = read_frame(&mut b).await.unwrap();
         match got {
             BrokerMessage::PublishDeliverables(req) => {
                 assert_eq!(req.parent_connection_id, "parent-1");
-                assert_eq!(req.deliverables[0].path, "output/report.pdf");
+                assert_eq!(req.request_id, "request-1");
+                assert_eq!(req.args.unwrap().deliverables[0].path, "output/report.pdf");
             }
             other => panic!("expected PublishDeliverables variant, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn deliverables_request_accepts_the_legacy_wire_shape() {
+        let message: BrokerMessage = serde_json::from_value(serde_json::json!({
+            "kind": "publish_deliverables",
+            "token": "legacy-token",
+            "parent_connection_id": "parent-1",
+            "deliverables": [{ "path": "src/lib.rs" }]
+        }))
+        .expect("legacy request");
+        let BrokerMessage::PublishDeliverables(request) = message else {
+            panic!("expected publish_deliverables");
+        };
+        assert!(request.request_id.is_empty());
+        assert!(request.args.is_none());
+        assert_eq!(request.deliverables[0].path, "src/lib.rs");
     }
 
     #[tokio::test]

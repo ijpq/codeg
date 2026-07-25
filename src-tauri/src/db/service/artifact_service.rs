@@ -21,6 +21,7 @@ pub struct NewTurnRun {
     pub root_path: String,
     pub capture_incomplete: bool,
     pub input_paths_json: String,
+    pub expectation_json: String,
 }
 
 #[derive(Debug, Clone)]
@@ -49,6 +50,13 @@ pub async fn create_run(
         completed_at: Set(None),
         deliverables_declared_at: Set(None),
         input_paths_json: Set(input.input_paths_json),
+        declaration_status: Set("not_called".to_string()),
+        declaration_attempted_at: Set(None),
+        declaration_error: Set(None),
+        expectation_json: Set(input.expectation_json),
+        settlement_status: Set("pending".to_string()),
+        settled_at: Set(None),
+        missing_expected_paths_json: Set("[]".to_string()),
     }
     .insert(conn)
     .await?;
@@ -221,6 +229,27 @@ pub async fn finish_run(
     Ok(())
 }
 
+pub async fn mark_settled(
+    conn: &DatabaseConnection,
+    run_id: &str,
+    status: &str,
+    missing_expected_paths: &[String],
+) -> Result<(), DbError> {
+    let Some(model) = conversation_turn_run::Entity::find_by_id(run_id.to_string())
+        .one(conn)
+        .await?
+    else {
+        return Ok(());
+    };
+    let mut active = model.into_active_model();
+    active.settlement_status = Set(status.to_string());
+    active.settled_at = Set(Some(Utc::now()));
+    active.missing_expected_paths_json =
+        Set(serde_json::to_string(missing_expected_paths).unwrap_or_else(|_| "[]".to_string()));
+    active.update(conn).await?;
+    Ok(())
+}
+
 /// Any `running` row predates this process: active captures live only in memory,
 /// so after a restart no future event can complete them. Preserve their already
 /// persisted paths but mark the capture explicitly incomplete/interrupted.
@@ -318,6 +347,15 @@ pub async fn list_for_conversation(
             stop_reason: run.stop_reason,
             started_at: run.started_at,
             completed_at: run.completed_at,
+            declaration_status: run.declaration_status,
+            declaration_attempted_at: run.declaration_attempted_at,
+            deliverables_declared_at: run.deliverables_declared_at,
+            declaration_error: run.declaration_error,
+            expectation_json: run.expectation_json,
+            settlement_status: run.settlement_status,
+            settled_at: run.settled_at,
+            missing_expected_paths: serde_json::from_str(&run.missing_expected_paths_json)
+                .unwrap_or_default(),
         })
         .collect())
 }
@@ -345,6 +383,7 @@ mod tests {
                 root_path: "/tmp/artifacts".into(),
                 capture_incomplete: false,
                 input_paths_json: "[]".into(),
+                expectation_json: r#"{"publish_required":true,"expects_code_changes":true,"requested_paths":[]}"#.into(),
             },
         )
         .await

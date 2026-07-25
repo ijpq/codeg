@@ -3154,6 +3154,8 @@
         "operationFailed": "Deliverable operation failed",
         "declared": "Declared",
         "inferred": "Automatically inferred",
+        "codeChange": "Cambio de código",
+        "deleted": "Eliminado",
         "allTypes": "All types",
         "allSources": "All sources",
         "allTurns": "All turns",
