@@ -663,6 +663,8 @@ export interface ConversationDeliverable {
   title: string
   description?: string | null
   role: "primary" | "supporting"
+  category?: "code_change" | "standalone_output"
+  change_kind?: ConversationTurnFileChangeKind
   position: number
   source: "declared" | "inferred"
   file_name: string
@@ -728,6 +730,20 @@ export interface ConversationTurnArtifactRun {
   stop_reason?: string | null
   started_at: string
   completed_at?: string | null
+  declaration_status?:
+    | "not_called"
+    | "success"
+    | "success_empty"
+    | "partial"
+    | "failed"
+    | string
+  declaration_attempted_at?: string | null
+  deliverables_declared_at?: string | null
+  declaration_error?: string | null
+  expectation_json?: string
+  settlement_status?: "pending" | "settled" | "settled_incomplete" | string
+  settled_at?: string | null
+  missing_expected_paths?: string[]
   changes: ConversationTurnFileChange[]
 }
 
