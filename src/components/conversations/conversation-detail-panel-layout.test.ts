@@ -56,14 +56,11 @@ describe("ConversationDetailPanel new conversation layout", () => {
     expect(welcomeBranch).toContain("tall")
   })
 
-  it("snaps the hidden keep-alive tab so `transition-all` descendants don't ghost", () => {
-    // Inactive tabs stay mounted and hide with `visibility: hidden` (`invisible`).
-    // In Tailwind v4 `transition-all` transitions `visibility` too, so welcome
-    // controls (agent pills, quick-action tabs, composer buttons) would linger
-    // 150–300ms as ghosts over the newly-active conversation. The wrapper must
-    // carry `conversation-tab-hidden` next to `invisible`, and globals.css must
-    // drop transitions for that subtree so visibility snaps. Both halves are
-    // required — assert they stay coupled.
+  it("snaps the hidden controller wrapper so transitions cannot ghost", () => {
+    // The inactive tab's lightweight controller stays mounted while its heavy
+    // content subtree is suspended. Keep the visibility snap coupled to the
+    // wrapper so a just-deactivated subtree cannot transition over the newly
+    // active conversation during the same commit.
     expect(source).toContain(
       '"conversation-tab-hidden absolute inset-0 invisible pointer-events-none"'
     )
@@ -79,6 +76,36 @@ describe("ConversationDetailPanel new conversation layout", () => {
     expect(source).toContain("shouldLoadDetail={canTile || active}")
     expect(source).toContain(
       "useConversationDetail(effectiveConversationId, {\n    enabled: shouldLoadDetail,"
+    )
+  })
+
+  it("suspends hidden heavy UI while keeping the tab controller mounted", () => {
+    expect(source).toContain("shouldRenderContent={canTile || active}")
+    expect(source).toContain("if (!shouldRenderContent) {")
+
+    const controllerStart = source.indexOf(
+      "const ConversationTabView = memo(function ConversationTabView"
+    )
+    const connectionController = source.indexOf(
+      "useConnectionLifecycle({",
+      controllerStart
+    )
+    const contentGate = source.indexOf(
+      "if (!shouldRenderContent) {",
+      controllerStart
+    )
+    const heavyContent = source.indexOf("<ConversationShell", contentGate)
+
+    expect(connectionController).toBeGreaterThan(controllerStart)
+    expect(contentGate).toBeGreaterThan(connectionController)
+    expect(heavyContent).toBeGreaterThan(contentGate)
+  })
+
+  it("flushes the active draft before its composer is suspended", () => {
+    expect(messageInputSource).toContain("const persistDraftNow = useCallback(")
+    expect(messageInputSource).toContain("onBlur={persistDraftNow}")
+    expect(messageInputSource).toContain(
+      "saveMessageInputDraft(effectiveDraftStorageKey, text)"
     )
   })
 

@@ -16,6 +16,10 @@ import { afterEach, describe, expect, it, vi } from "vitest"
 import type { RichComposerHandle } from "./composer/rich-composer"
 import { serializeDocToText } from "./composer/to-prompt-blocks"
 import { emitAttachFileToSession } from "@/lib/session-attachment-events"
+import {
+  clearMessageInputDraftV2,
+  loadMessageInputDraftV2,
+} from "@/lib/message-input-draft"
 
 // MessageInput holds its RichComposer handle internally and does not forward a
 // ref, so capture that handle through a partial mock that still renders the real
@@ -167,6 +171,30 @@ describe("MessageInput (RichComposer integration)", () => {
     )
     expect(sendButton).not.toBeNull()
     expect(sendButton).toBeDisabled()
+  })
+
+  it("keeps the latest draft when the visible composer is suspended immediately", async () => {
+    const draftKey = "suspend-visible-composer"
+    clearMessageInputDraftV2(draftKey)
+    const user = userEvent.setup()
+    const { container, unmount } = renderInput({ draftStorageKey: draftKey })
+    const textbox = await waitFor(() => {
+      const element = container.querySelector('[role="textbox"]')
+      expect(element).not.toBeNull()
+      return element as HTMLElement
+    })
+
+    await user.type(textbox, "survives tab suspension")
+    unmount()
+
+    const saved = loadMessageInputDraftV2(draftKey)
+    expect(saved).not.toBeNull()
+    if (saved?.kind === "legacyMarkdown") {
+      expect(saved.markdown).toContain("survives tab suspension")
+    } else {
+      expect(JSON.stringify(saved?.doc)).toContain("survives tab suspension")
+    }
+    clearMessageInputDraftV2(draftKey)
   })
 
   it("claims a mousedown on the input's empty chrome (P8d focus wiring)", async () => {
