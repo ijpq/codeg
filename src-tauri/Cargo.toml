@@ -107,7 +107,7 @@ open = { version = "5", features = ["shellexecute-on-windows"] }
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"], optional = true }
 axum = { version = "0.8", features = ["ws", "multipart"] }
 async_zip = { version = "0.0.18", features = ["tokio", "deflate"] }
-tower-http = { version = "0.6", features = ["fs", "cors"] }
+tower-http = { version = "0.6", features = ["fs", "cors", "compression-br", "compression-gzip"] }
 tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
 futures-util = "0.3"
 tokio-util = { version = "0.7", features = ["io", "rt"] }
