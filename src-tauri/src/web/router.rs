@@ -9,6 +9,7 @@ use axum::{
     Json, Router,
 };
 
+use tower_http::compression::CompressionLayer;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
 
@@ -94,7 +95,8 @@ pub fn build_router(
         )
         .route(
             "/get_folder_conversation",
-            post(handlers::conversations::get_folder_conversation),
+            post(handlers::conversations::get_folder_conversation)
+                .layer(history_response_compression()),
         )
         // ─── Confirmed deliverables ───
         // JSON operations are authenticated and accept database ids only. A
@@ -1402,6 +1404,13 @@ pub fn build_router(
         .layer(Extension(shutdown_signal))
 }
 
+fn history_response_compression() -> CompressionLayer {
+    // Historical detail is text-heavy JSON and can be several megabytes. Keep
+    // compression scoped to this route so archives and other already-compressed
+    // API downloads are never compressed a second time.
+    CompressionLayer::new()
+}
+
 async fn health_check() -> impl IntoResponse {
     // Include the running version so the upgrade UI can confirm — using only a
     // local signal — that a restart actually landed on the new version (and
@@ -1423,4 +1432,35 @@ async fn api_not_found(uri: axum::http::Uri) -> impl IntoResponse {
             "message": format!("API endpoint '{}' is not available in web mode", command),
         })),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::header::{ACCEPT_ENCODING, CONTENT_ENCODING};
+    use axum_test::TestServer;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn history_response_compression_negotiates_gzip() {
+        let app = Router::new()
+            .route(
+                "/history",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "turns": vec!["compressible historical turn"; 512],
+                    }))
+                }),
+            )
+            .layer(history_response_compression());
+        let server = TestServer::new(app).expect("test server should start");
+
+        let response = server
+            .get("/history")
+            .add_header(ACCEPT_ENCODING, "gzip")
+            .await;
+
+        response.assert_status_ok();
+        response.assert_header(CONTENT_ENCODING, "gzip");
+    }
 }
