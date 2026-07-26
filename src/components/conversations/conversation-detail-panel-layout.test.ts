@@ -124,6 +124,13 @@ describe("ConversationDetailPanel new conversation layout", () => {
     )
   })
 
+  it("loads persisted history only for visible keep-alive tabs", () => {
+    expect(source).toContain("shouldLoadDetail={canTile || active}")
+    expect(source).toContain(
+      "useConversationDetail(effectiveConversationId, {\n    enabled: shouldLoadDetail,"
+    )
+  })
+
   it("does not render a decorative welcome backdrop", () => {
     expect(welcomeHeroSource).not.toContain("export function WelcomeBackdrop")
     expect(welcomeHeroSource).not.toContain("bg-gradient-to-r")
