@@ -95,6 +95,7 @@ import { useScrollbarSafeDismiss } from "@/hooks/use-scrollbar-safe-dismiss"
 import {
   clearMessageInputDraftV2,
   loadMessageInputDraftV2,
+  saveMessageInputDraft,
   saveMessageInputDraftV2,
 } from "@/lib/message-input-draft"
 import { rankByTextMatch } from "@/lib/fuzzy-text-match"
@@ -431,6 +432,21 @@ export function MessageInput({
   // Markdown) ~300ms after the last change so inline reference badges survive a
   // reload — a Markdown round-trip would downgrade them to plain links.
   const draftSaveTimerRef = useRef<number | null>(null)
+  const persistDraftNow = useCallback(() => {
+    if (typeof window === "undefined") return
+    if (!effectiveDraftStorageKey || isEditingQueueItem) return
+    const ed = editorRef.current
+    if (!ed) return
+    if (ed.isEmpty()) {
+      clearMessageInputDraftV2(effectiveDraftStorageKey)
+    } else {
+      saveMessageInputDraftV2(
+        effectiveDraftStorageKey,
+        stripEmbeddedReferences(ed.getJSON())
+      )
+    }
+  }, [effectiveDraftStorageKey, isEditingQueueItem])
+
   const scheduleDraftSave = useCallback(() => {
     if (typeof window === "undefined") return
     if (!effectiveDraftStorageKey || isEditingQueueItem) return
@@ -439,18 +455,9 @@ export function MessageInput({
     }
     draftSaveTimerRef.current = window.setTimeout(() => {
       draftSaveTimerRef.current = null
-      const ed = editorRef.current
-      if (!ed || !effectiveDraftStorageKey) return
-      if (ed.isEmpty()) {
-        clearMessageInputDraftV2(effectiveDraftStorageKey)
-      } else {
-        saveMessageInputDraftV2(
-          effectiveDraftStorageKey,
-          stripEmbeddedReferences(ed.getJSON())
-        )
-      }
+      persistDraftNow()
     }, 300)
-  }, [effectiveDraftStorageKey, isEditingQueueItem])
+  }, [effectiveDraftStorageKey, isEditingQueueItem, persistDraftNow])
 
   useEffect(() => {
     return () => {
@@ -625,11 +632,27 @@ export function MessageInput({
     return () => cancelAnimationFrame(raf)
   }, [skillPrefix, composerReady])
 
-  const handleComposerChange = useCallback(() => {
-    syncComposerEmpty()
-    scheduleDraftSave()
-    detectSlashTriggerRef.current?.()
-  }, [syncComposerEmpty, scheduleDraftSave])
+  const handleComposerChange = useCallback(
+    (text: string) => {
+      syncComposerEmpty()
+      // Keep an O(1) plain-text fallback current on every edit. The richer v2
+      // Tiptap document remains debounced below, but this synchronous cache
+      // update guarantees that an immediate tab suspension cannot lose the last
+      // 300ms of typing even if removing the focused DOM node does not dispatch
+      // blur in a particular webview/browser.
+      if (effectiveDraftStorageKey && !isEditingQueueItem) {
+        saveMessageInputDraft(effectiveDraftStorageKey, text)
+      }
+      scheduleDraftSave()
+      detectSlashTriggerRef.current?.()
+    },
+    [
+      effectiveDraftStorageKey,
+      isEditingQueueItem,
+      scheduleDraftSave,
+      syncComposerEmpty,
+    ]
+  )
 
   const handleComposerReady = useCallback(() => {
     setComposerReady(true)
@@ -1857,6 +1880,7 @@ export function MessageInput({
                 onReady={handleComposerReady}
                 onSubmit={handleSend}
                 onFocus={onFocus}
+                onBlur={persistDraftNow}
                 onPasteFiles={attach.handlePasteFiles}
                 onDropFiles={attach.handleEditorDrop}
                 onPlainPaste={handlePlainPasteShortcut}

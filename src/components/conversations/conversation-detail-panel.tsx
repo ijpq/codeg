@@ -171,6 +171,11 @@ interface ConversationTabViewProps {
    *  normal single-tab layout that means the active tab; tiled layouts pass
    *  true for every visible tile. */
   shouldLoadDetail: boolean
+  /** Mount the expensive message/composer subtree only while this tab is
+   *  visible. The surrounding controller remains mounted for every open tab so
+   *  background agent connections, turn completion, queues, and event handling
+   *  keep working while hidden. */
+  shouldRenderContent: boolean
   /** Drive the composer's flowing active-session border. True only for the
    *  active tab while several sessions are visible (tiled within a group
    *  and/or split across groups) — the places the flow serves as the "which
@@ -252,6 +257,7 @@ const ConversationTabView = memo(function ConversationTabView({
   workingDir,
   isActive,
   shouldLoadDetail,
+  shouldRenderContent,
   showActiveFlow,
   reloadSignal,
   groupId,
@@ -2010,6 +2016,15 @@ const ConversationTabView = memo(function ConversationTabView({
     ]
   )
 
+  // Keep the per-tab controller above alive for background agents and events,
+  // but do not mount a hidden tab's message thread and rich composer. CSS
+  // visibility alone still initializes the entire React subtree (including a
+  // Tiptap editor and skill/expert hooks) for every restored tab, which makes a
+  // remote web client scale with the desktop client's full open-tab count.
+  if (!shouldRenderContent) {
+    return null
+  }
+
   return (
     <ConversationShell
       topBanner={
@@ -2712,6 +2727,7 @@ export function ConversationDetailPanel() {
         workingDir={tab.workingDir ?? folderPath}
         isActive={active}
         shouldLoadDetail={visible}
+        shouldRenderContent={visible}
         showActiveFlow={(isSplit || canTileG) && active}
         reloadSignal={reloadByTabId[tab.id] ?? 0}
         groupId={groupId}
