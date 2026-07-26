@@ -31,7 +31,7 @@ use tokio::sync::{mpsc, RwLock};
 
 use crate::acp::background_watch;
 use crate::acp::error::AcpError;
-use crate::acp::file_system_runtime::{FileSystemRuntime, FileSystemRuntimeError};
+use crate::acp::file_system_runtime::{FileSystemRuntime, FileSystemRuntimeError, FsAccessPolicy};
 use crate::acp::registry::{self, AgentDistribution};
 use crate::acp::session_state::SessionState;
 use crate::acp::terminal_runtime::{TerminalRuntime, TerminalRuntimeError};
@@ -895,6 +895,13 @@ pub async fn spawn_agent_connection(
     let launch_cwd = resolve_working_dir(working_dir.as_deref());
     let agent = build_agent(agent_type, &runtime_env, &launch_cwd).await?;
 
+    // Path policy for the ACP `fs/*` channel. Built HERE rather than inside
+    // `run_connection` because it needs the full `runtime_env` (only the git
+    // credential keys survive into `terminal_base_env` below), and a per-agent
+    // relocation like `GROK_HOME` must move the allowed root along with the
+    // agent's state. Uses the same `launch_cwd` the process and ACP session get.
+    let fs_policy = FsAccessPolicy::from_env(&launch_cwd, agent_type, &runtime_env);
+
     // Forward only the codeg git credential helper keys into the terminal
     // runtime — not the agent's API tokens or model provider credentials.
     // This makes `git fetch`/`git push` issued through the ACP
@@ -986,6 +993,7 @@ pub async fn spawn_agent_connection(
             preferred_mode_id,
             preferred_config_values,
             delegation_injection,
+            fs_policy,
         )
         .await;
 
@@ -2507,6 +2515,7 @@ async fn run_connection(
     preferred_mode_id: Option<String>,
     preferred_config_values: BTreeMap<String, String>,
     delegation_injection: Option<DelegationInjection>,
+    fs_policy: FsAccessPolicy,
 ) -> Result<(), AcpError> {
     let pending_perms: PendingPermissions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     // `terminal_base_env` already filtered to just the credential helper
@@ -2520,7 +2529,8 @@ async fn run_connection(
         TerminalRuntime::with_base_env(terminal_base_env).with_default_cwd(Some(cwd.clone())),
     );
     let cwd_string = cwd.to_string_lossy().to_string();
-    let file_system_runtime = Arc::new(FileSystemRuntime::new(cwd.clone()));
+    tracing::info!("[ACP] fs policy {}", fs_policy.describe());
+    let file_system_runtime = Arc::new(FileSystemRuntime::with_policy(fs_policy));
 
     let conn_id = connection_id.clone();
     let emitter_clone = emitter.clone();

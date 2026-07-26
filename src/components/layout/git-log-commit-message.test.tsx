@@ -3,9 +3,8 @@ import { fireEvent, render, screen } from "@testing-library/react"
 import { NextIntlClientProvider } from "next-intl"
 import { afterEach, describe, expect, it } from "vitest"
 
-import { CollapsibleUserMessage } from "./collapsible-user-message"
+import { GitLogCommitMessage } from "./git-log-commit-message"
 import enMessages from "@/i18n/messages/en.json"
-import type { AdaptedContentPart } from "@/lib/adapters/ai-elements-adapter"
 
 function renderWithIntl(ui: ReactElement) {
   return render(
@@ -15,15 +14,14 @@ function renderWithIntl(ui: ReactElement) {
   )
 }
 
-const TEXT_PART: AdaptedContentPart[] = [{ type: "text", text: "hello world" }]
+const MESSAGE = "feat: add a thing\n\nWith a body."
 
-// jsdom does no layout: scrollHeight/clientHeight (defined on Element, per
-// Element-impl.js) both default to 0, which already reads as "not
-// overflowing" for the short-content case below. The overflow cases patch
-// both onto Element.prototype *before* rendering, so the component's
-// synchronous mount-time measurement — it doesn't wait on a ResizeObserver
-// callback, since the global jsdom stub in test-setup.ts never invokes one —
-// picks up the mocked heights on its first read.
+// jsdom does no layout: scrollHeight/clientHeight both default to 0, which
+// already reads as "not overflowing" for the short-message case. The overflow
+// cases patch both onto Element.prototype *before* rendering so the
+// synchronous mount-time measurement picks them up (the global ResizeObserver
+// stub in test-setup.ts never invokes its callback). Mirrors
+// collapsible-user-message.test.tsx.
 function mockScrollMetrics(scrollHeight: number, clientHeight: number) {
   const scrollHeightDescriptor = Object.getOwnPropertyDescriptor(
     Element.prototype,
@@ -59,7 +57,7 @@ function mockScrollMetrics(scrollHeight: number, clientHeight: number) {
   }
 }
 
-describe("CollapsibleUserMessage", () => {
+describe("GitLogCommitMessage", () => {
   let restoreMetrics: (() => void) | null = null
 
   afterEach(() => {
@@ -67,43 +65,42 @@ describe("CollapsibleUserMessage", () => {
     restoreMetrics = null
   })
 
-  it("renders short content with no toggle", () => {
-    renderWithIntl(<CollapsibleUserMessage parts={TEXT_PART} />)
+  it("renders a short message clamped but with no toggle", () => {
+    renderWithIntl(<GitLogCommitMessage message={MESSAGE} />)
 
-    expect(screen.getByText("hello world")).toBeInTheDocument()
+    const content = screen.getByTestId("git-log-commit-message-content")
+    expect(content).toHaveTextContent("feat: add a thing")
     expect(
-      screen.queryByTestId("collapsible-user-message-toggle")
+      screen.queryByTestId("git-log-commit-message-toggle")
     ).not.toBeInTheDocument()
-    expect(
-      screen.getByTestId("collapsible-user-message-content")
-    ).not.toHaveClass("collapsed-content-fade")
+    expect(content).not.toHaveClass("collapsed-content-fade")
   })
 
-  it("shows a Show more toggle when content overflows the collapsed height", () => {
-    restoreMetrics = mockScrollMetrics(600, 240)
+  it("shows a Show more toggle when the message overflows the cap", () => {
+    restoreMetrics = mockScrollMetrics(900, 192)
 
-    renderWithIntl(<CollapsibleUserMessage parts={TEXT_PART} />)
+    renderWithIntl(<GitLogCommitMessage message={MESSAGE} />)
 
-    const content = screen.getByTestId("collapsible-user-message-content")
-    const toggle = screen.getByTestId("collapsible-user-message-toggle")
+    const content = screen.getByTestId("git-log-commit-message-content")
+    const toggle = screen.getByTestId("git-log-commit-message-toggle")
     expect(toggle).toHaveAttribute("aria-expanded", "false")
     expect(toggle).toHaveTextContent("Show more")
     expect(toggle).toHaveAttribute("aria-controls", content.id)
-    expect(content).toHaveClass("max-h-60", "collapsed-content-fade")
+    expect(content).toHaveClass("max-h-48", "collapsed-content-fade")
   })
 
   it("expands to Show less on click and removes the clamp", () => {
-    restoreMetrics = mockScrollMetrics(600, 240)
+    restoreMetrics = mockScrollMetrics(900, 192)
 
-    renderWithIntl(<CollapsibleUserMessage parts={TEXT_PART} />)
+    renderWithIntl(<GitLogCommitMessage message={MESSAGE} />)
 
-    fireEvent.click(screen.getByTestId("collapsible-user-message-toggle"))
+    fireEvent.click(screen.getByTestId("git-log-commit-message-toggle"))
 
-    const toggle = screen.getByTestId("collapsible-user-message-toggle")
+    const toggle = screen.getByTestId("git-log-commit-message-toggle")
     expect(toggle).toHaveAttribute("aria-expanded", "true")
     expect(toggle).toHaveTextContent("Show less")
-    const content = screen.getByTestId("collapsible-user-message-content")
-    expect(content).not.toHaveClass("max-h-60")
+    const content = screen.getByTestId("git-log-commit-message-content")
+    expect(content).not.toHaveClass("max-h-48")
     expect(content).not.toHaveClass("collapsed-content-fade")
 
     // Clicking again re-collapses.
