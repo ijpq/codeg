@@ -167,6 +167,10 @@ interface ConversationTabViewProps {
   agentType: AgentType
   workingDir?: string
   isActive: boolean
+  /** Fetch persisted history only when this keep-alive view is visible. In the
+   *  normal single-tab layout that means the active tab; tiled layouts pass
+   *  true for every visible tile. */
+  shouldLoadDetail: boolean
   /** Drive the composer's flowing active-session border. True only for the
    *  active tab while several sessions are visible (tiled within a group
    *  and/or split across groups) — the places the flow serves as the "which
@@ -247,6 +251,7 @@ const ConversationTabView = memo(function ConversationTabView({
   agentType,
   workingDir,
   isActive,
+  shouldLoadDetail,
   showActiveFlow,
   reloadSignal,
   groupId,
@@ -517,7 +522,9 @@ const ConversationTabView = memo(function ConversationTabView({
     loading: detailLoading,
     error: detailError,
     acpLoadError,
-  } = useConversationDetail(effectiveConversationId)
+  } = useConversationDetail(effectiveConversationId, {
+    enabled: shouldLoadDetail,
+  })
 
   // Subscribe to only the fields this panel actually reads from its runtime
   // session — NOT the whole session object. The live-message sink rewrites the
@@ -2704,6 +2711,7 @@ export function ConversationDetailPanel() {
         agentType={tab.agentType}
         workingDir={tab.workingDir ?? folderPath}
         isActive={active}
+        shouldLoadDetail={visible}
         showActiveFlow={(isSplit || canTileG) && active}
         reloadSignal={reloadByTabId[tab.id] ?? 0}
         groupId={groupId}
