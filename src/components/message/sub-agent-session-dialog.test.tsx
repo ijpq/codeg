@@ -522,7 +522,7 @@ describe("SubAgentSessionDialog", () => {
     expect(mockSetLiveMessage).toHaveBeenCalledWith(99, liveMessage, true)
   })
 
-  it("refreshes a matching final-deliverables declaration without replacing live state", () => {
+  it("refreshes matching declarations and terminal artifact settlement without replacing live state", () => {
     renderWithIntl(
       <SubAgentSessionDialog
         open
@@ -534,13 +534,23 @@ describe("SubAgentSessionDialog", () => {
     )
     mockRefetchDetail.mockClear()
 
-    const listener = mockSubscribe.mock.calls[0]?.[1]
-    expect(listener).toBeTypeOf("function")
+    const declarationListener = mockSubscribe.mock.calls.find(
+      ([event]) => event === "conversation://deliverables-changed"
+    )?.[1]
+    const settlementListener = mockSubscribe.mock.calls.find(
+      ([event]) => event === "conversation://artifacts-changed"
+    )?.[1]
+    expect(declarationListener).toBeTypeOf("function")
+    expect(settlementListener).toBeTypeOf("function")
     act(() => {
-      listener?.({ conversation_id: 99, deliverable_ids: ["d1"] })
+      declarationListener?.({ conversation_id: 99, deliverable_ids: ["d1"] })
+      settlementListener?.({ conversation_id: 99, turn_run_id: "run-1" })
     })
 
-    expect(mockRefetchDetail).toHaveBeenCalledWith(99, { preserveLive: true })
+    expect(mockRefetchDetail).toHaveBeenCalledTimes(2)
+    expect(mockRefetchDetail).toHaveBeenLastCalledWith(99, {
+      preserveLive: true,
+    })
   })
 
   it("does not refetch on the streaming → settled edge — the promoted local reply is kept, never replaced from the lagging DB", () => {

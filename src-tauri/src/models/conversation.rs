@@ -188,6 +188,11 @@ pub struct ConversationTurnDeliverableSet {
     pub conversation_id: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_message_id: Option<String>,
+    /// Parser-stable id of the user turn that opened this run. New runs are
+    /// resolved by prompt fingerprint; older rows may omit it and let the
+    /// frontend use the guarded timestamp fallback.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_turn_id: Option<String>,
     pub started_at: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<DateTime<Utc>>,
