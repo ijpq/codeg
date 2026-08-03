@@ -1149,7 +1149,11 @@ pub async fn get_folder_conversation_core(
     let deliverables = deliverable_service::list_for_conversation(conn, conversation_id)
         .await
         .map_err(AppCommandError::from)?;
-    let deliverable_runs = deliverable_service::list_sets_for_conversation(conn, conversation_id)
+    let mut deliverable_runs =
+        deliverable_service::list_sets_for_conversation(conn, conversation_id)
+            .await
+            .map_err(AppCommandError::from)?;
+    deliverable_service::associate_sets_with_user_turns(conn, &mut deliverable_runs, &turns)
         .await
         .map_err(AppCommandError::from)?;
 

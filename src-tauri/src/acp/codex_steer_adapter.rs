@@ -1,4 +1,4 @@
-//! Runtime compatibility shim for Codeg's pinned `codex-acp` adapter.
+//! Runtime compatibility shim for older `codex-acp` adapters.
 //!
 //! `@agentclientprotocol/codex-acp` 1.1.2 already tracks the active Codex
 //! app-server turn internally, but does not expose app-server's native
@@ -6,6 +6,9 @@
 //! to that exact installed bundle and runs the derived copy from Codeg's cache.
 //! The installed npm package, Codex configuration, credentials, transcripts,
 //! and user settings are never modified.
+//!
+//! codex-acp 1.1.6+ exposes its own `_session/steering` protocol. Those versions
+//! launch unchanged; `connection.rs` negotiates the capability from initialize.
 
 use std::path::{Path, PathBuf};
 
@@ -14,6 +17,7 @@ use sha2::{Digest, Sha256};
 use crate::acp::error::AcpError;
 
 const SUPPORTED_ADAPTER_VERSION: &str = "1.1.2";
+const NATIVE_STEERING_MIN_VERSION: (u64, u64, u64) = (1, 1, 6);
 const PATCH_REVISION: &str = "codeg-steer-v1";
 
 #[derive(Debug, Clone)]
@@ -174,6 +178,21 @@ fn adapter_version(bundle: &Path) -> Option<String> {
     value.get("version")?.as_str().map(str::to_string)
 }
 
+fn version_triplet(version: &str) -> Option<(u64, u64, u64)> {
+    let core = version.split_once('-').map_or(version, |(core, _)| core);
+    let mut parts = core.split('.');
+    let triplet = (
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+    );
+    parts.next().is_none().then_some(triplet)
+}
+
+fn has_upstream_steering(version: &str) -> bool {
+    version_triplet(version).is_some_and(|version| version >= NATIVE_STEERING_MIN_VERSION)
+}
+
 fn module_search_path(bundle: &Path, prefix: Option<&Path>) -> String {
     let mut paths = Vec::<PathBuf>::new();
     if let Some(package_root) = bundle.parent().and_then(Path::parent) {
@@ -195,8 +214,8 @@ fn module_search_path(bundle: &Path, prefix: Option<&Path>) -> String {
 }
 
 /// Prepare the derived adapter in Codeg's cache. `Ok(None)` means the installed
-/// adapter/version cannot be patched; callers launch it unchanged and publish
-/// `supports_steer=false`, preserving the existing live-feedback path.
+/// adapter launches unchanged: either it has upstream native steering, or it
+/// does not match the one legacy version this compatibility patch supports.
 pub async fn prepare(
     resolved_launcher: &Path,
 ) -> Result<Option<PreparedCodexSteerAdapter>, AcpError> {
@@ -230,9 +249,16 @@ pub async fn prepare(
     };
 
     let version = adapter_version(&bundle);
+    if version.as_deref().is_some_and(has_upstream_steering) {
+        tracing::info!(
+            "[ACP][Codex] codex-acp {} has upstream _session/steering; launching unchanged",
+            version.as_deref().unwrap_or_default()
+        );
+        return Ok(None);
+    }
     if version.as_deref() != Some(SUPPORTED_ADAPTER_VERSION) {
         tracing::warn!(
-            "[ACP][Codex] native steer disabled: installed codex-acp version {:?}, supported {}",
+            "[ACP][Codex] legacy steer compatibility unavailable: installed codex-acp version {:?}, patchable {}",
             version,
             SUPPORTED_ADAPTER_VERSION
         );
@@ -328,6 +354,16 @@ mod tests {
         assert!(patch_bundle("unknown").is_err());
         let once = patch_bundle(&fixture_bundle()).expect("first patch");
         assert!(patch_bundle(&once).is_err());
+    }
+
+    #[test]
+    fn recognizes_versions_with_upstream_steering() {
+        assert!(!has_upstream_steering("1.1.5"));
+        assert!(has_upstream_steering("1.1.6"));
+        assert!(has_upstream_steering("1.1.7"));
+        assert!(has_upstream_steering("1.2.0-beta.1"));
+        assert!(has_upstream_steering("2.0.0"));
+        assert!(!has_upstream_steering("not-a-version"));
     }
 
     #[cfg(not(windows))]

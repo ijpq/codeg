@@ -18,6 +18,7 @@ import type {
 import { randomUUID } from "@/lib/utils"
 import { inferLiveToolName } from "@/lib/tool-call-normalization"
 import { isTurnInProgressRejection } from "@/lib/turn-busy"
+import { extractAppCommandError } from "@/lib/app-error"
 import {
   acpConnect,
   acpRestoreConversation,
@@ -2699,6 +2700,25 @@ function normalizeErrorMessage(error: unknown): string {
   return String(error)
 }
 
+/** A deterministic pre-accept failure: unlike a timeout/network loss, these
+ * errors guarantee that this concrete ACP connection cannot receive the
+ * prompt, so restoring and retrying the same client id cannot duplicate it. */
+export function isRecoverablePromptConnectionLoss(error: unknown): boolean {
+  const code = extractAppCommandError(error)?.code
+  if (code === "connection_not_found" || code === "process_exited") {
+    return true
+  }
+  const message =
+    error instanceof Error
+      ? error.message
+      : typeof error === "string"
+        ? error
+        : ""
+  return /^(connection not found:|agent process exited unexpectedly)/i.test(
+    message.trim()
+  )
+}
+
 type AlertedError = Error & { alerted: true }
 
 function createAlertedError(message: string): AlertedError {
@@ -3431,6 +3451,15 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           break
         case "session_started":
           flushStreamingQueue()
+          {
+            const desired = desiredConnectRequestsRef.current.get(contextKey)
+            if (desired && desired.sessionId !== e.session_id) {
+              desiredConnectRequestsRef.current.set(contextKey, {
+                ...desired,
+                sessionId: e.session_id,
+              })
+            }
+          }
           dispatch({
             type: "SESSION_STARTED",
             contextKey,
@@ -3447,6 +3476,15 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             contextKey,
             conversationId: e.conversation_id,
           })
+          {
+            const desired = desiredConnectRequestsRef.current.get(contextKey)
+            if (desired && desired.conversationId !== e.conversation_id) {
+              desiredConnectRequestsRef.current.set(contextKey, {
+                ...desired,
+                conversationId: e.conversation_id,
+              })
+            }
+          }
           console.log("[acp-context] conversation_linked", {
             contextKey,
             connectionId: e.connection_id,
@@ -5047,6 +5085,70 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     dispatch({ type: "REMOVE_ALL" })
   }, [dispatch, teardownAttachSubscription])
 
+  const recoverPromptConnection = useCallback(
+    async (contextKey: string, staleConnectionId?: string) => {
+      const desired = desiredConnectRequestsRef.current.get(contextKey)
+      if (!desired) {
+        throw new Error(`No restorable connection target for ${contextKey}`)
+      }
+
+      const before = storeRef.current.connections.get(contextKey)
+      if (
+        staleConnectionId &&
+        before &&
+        before.connectionId !== staleConnectionId
+      ) {
+        return before
+      }
+      if (
+        before &&
+        (!staleConnectionId || before.connectionId === staleConnectionId)
+      ) {
+        reverseMapRef.current.delete(before.connectionId)
+        teardownAttachSubscription(contextKey)
+        pendingUnmappedEventsRef.current.delete(before.connectionId)
+        lastActivityRef.current.delete(contextKey)
+        boundConnectRequestsRef.current.delete(contextKey)
+        deferredRestoreKeysRef.current.delete(contextKey)
+        dispatch({ type: "CONNECTION_REMOVED", contextKey })
+      }
+
+      const reconnect = connectRef.current
+      if (!reconnect) {
+        throw new Error(`Connection recovery is not ready for ${contextKey}`)
+      }
+      await reconnect(
+        contextKey,
+        desired.agentType,
+        desired.workingDir,
+        desired.sessionId,
+        desired.conversationId
+      )
+
+      // `connect()` coalesces concurrent calls. If connection_gone already
+      // started the restore, our call returns early and waits here for that
+      // single authoritative attempt instead of spawning another process.
+      const deadline = Date.now() + 70_000
+      while (
+        connectingKeysRef.current.has(contextKey) &&
+        Date.now() < deadline
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 25))
+      }
+      const recovered = storeRef.current.connections.get(contextKey)
+      if (
+        !recovered ||
+        (staleConnectionId && recovered.connectionId === staleConnectionId)
+      ) {
+        throw new Error(
+          `ACP connection recovery did not complete for ${contextKey}`
+        )
+      }
+      return recovered
+    },
+    [dispatch, teardownAttachSubscription]
+  )
+
   const sendPrompt = useCallback(
     async (
       contextKey: string,
@@ -5057,9 +5159,9 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         clientMessageId?: string | null
       }
     ) => {
-      const conn = storeRef.current.connections.get(contextKey)
+      let conn = storeRef.current.connections.get(contextKey)
       if (!conn) {
-        throw new Error(`No live connection for ${contextKey}`)
+        conn = await recoverPromptConnection(contextKey)
       }
       const desired = desiredConnectRequestsRef.current.get(contextKey)
       const requestedConversationId = opts?.conversationId ?? null
@@ -5106,15 +5208,32 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         mcpServerCount: conn.mcpServerCount,
       })
       lastActivityRef.current.set(contextKey, Date.now())
-      await acpPrompt(
-        conn.connectionId,
-        blocks,
-        opts?.folderId ?? null,
-        opts?.conversationId ?? null,
-        opts?.clientMessageId ?? null
-      )
+      const submit = (connectionId: string) =>
+        acpPrompt(
+          connectionId,
+          blocks,
+          opts?.folderId ?? null,
+          opts?.conversationId ?? null,
+          opts?.clientMessageId ?? null
+        )
+      try {
+        await submit(conn.connectionId)
+      } catch (error) {
+        if (!isRecoverablePromptConnectionLoss(error)) throw error
+        const staleConnectionId = conn.connectionId
+        console.warn(
+          "[acp-context] prompt target disappeared; restoring and retrying once",
+          {
+            conversationId: requestedConversationId,
+            staleConnectionId,
+            clientMessageId: opts?.clientMessageId ?? null,
+          }
+        )
+        conn = await recoverPromptConnection(contextKey, staleConnectionId)
+        await submit(conn.connectionId)
+      }
     },
-    []
+    [recoverPromptConnection]
   )
 
   const steer = useCallback(

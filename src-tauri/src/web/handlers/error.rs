@@ -9,7 +9,8 @@ use crate::app_error::{AppCommandError, AppErrorCode};
 fn status_for_app_error_code(code: AppErrorCode) -> StatusCode {
     match code {
         AppErrorCode::InvalidInput => StatusCode::BAD_REQUEST,
-        AppErrorCode::NotFound => StatusCode::NOT_FOUND,
+        AppErrorCode::NotFound | AppErrorCode::ConnectionNotFound => StatusCode::NOT_FOUND,
+        AppErrorCode::ProcessExited => StatusCode::GONE,
         AppErrorCode::AlreadyExists
         | AppErrorCode::TurnInProgress
         | AppErrorCode::NoActiveSteerTurn => StatusCode::CONFLICT,
