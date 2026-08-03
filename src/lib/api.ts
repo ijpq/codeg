@@ -267,18 +267,31 @@ export async function acpPrompt(
   clientMessageId: string | null = null
 ): Promise<void> {
   try {
-    await getTransport().call("acp_prompt", {
-      connectionId,
-      // Strip in every mode where the prompt leaves through an HTTP body:
-      // pure web (`!isDesktop`) and desktop-attached-to-remote-workspace.
-      blocks: stripUploadedImagePayloads(
-        blocks,
-        !isDesktop() || getActiveRemoteConnectionId() !== null
-      ),
-      folderId,
-      conversationId,
-      clientMessageId,
-    })
+    const transport = getTransport()
+    // A remote-desktop window can retain a healthy HTTP path while its event
+    // WebSocket is still re-attaching. Wait for the stream first so the
+    // cross-client UserMessage acknowledgement cannot fall into that gap.
+    await transport.waitForReady?.()
+    await transport.call(
+      "acp_prompt",
+      {
+        connectionId,
+        // Strip in every mode where the prompt leaves through an HTTP body:
+        // pure web (`!isDesktop`) and desktop-attached-to-remote-workspace.
+        blocks: stripUploadedImagePayloads(
+          blocks,
+          !isDesktop() || getActiveRemoteConnectionId() !== null
+        ),
+        folderId,
+        conversationId,
+        clientMessageId,
+      },
+      // RemoteDesktopTransport otherwise cancels the request after 30s. Cold
+      // recursive workspace watcher setup happens before prompt enqueue so a
+      // large/network workspace can legitimately need longer; cancellation in
+      // that window means the agent never receives the message.
+      { timeoutMs: 120_000 }
+    )
   } catch (e) {
     if (isTurnInProgressRejection(e)) throw new TurnBusyError()
     throw e
