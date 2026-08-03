@@ -14,7 +14,7 @@ use crate::db::entities::{
     conversation_turn_file_change, deliverable_declaration, folder,
 };
 use crate::db::error::DbError;
-use crate::models::{ConversationDeliverable, ConversationTurnDeliverableSet};
+use crate::models::{ConversationDeliverable, ConversationTurnDeliverableSet, MessageTurn};
 
 pub const SOURCE_DECLARED: &str = "declared";
 pub const SOURCE_INFERRED: &str = "inferred";
@@ -794,8 +794,18 @@ pub async fn infer_for_turn(
     for change in &changes {
         observed_paths.insert(change.path.clone());
         let explicitly_expected = expected_paths.contains(&change.path);
+        let extension = clean_extension(Path::new(&change.path));
+        // A standalone file is still useful in the inclusive conversation
+        // ledger when concurrent turns made process-level attribution
+        // impossible. It remains supporting (never reply-tail primary) unless
+        // the user named this exact path. Ambiguous source/config churn stays
+        // out to avoid cross-conversation noise.
+        let ambiguous_standalone_candidate = change.kind != ConversationTurnFileChangeKind::Deleted
+            && standalone_output_extension(extension.as_deref());
         if change.source != "watcher"
-            || (change.attribution != "exclusive" && !explicitly_expected)
+            || (change.attribution != "exclusive"
+                && !explicitly_expected
+                && !ambiguous_standalone_candidate)
             || existing_paths.contains(&change.path)
             || (inputs.contains(&change.path)
                 && change.kind == ConversationTurnFileChangeKind::Created)
@@ -809,7 +819,6 @@ pub async fn infer_for_turn(
         if !is_deleted && change.final_exists != Some(true) {
             continue;
         }
-        let extension = clean_extension(Path::new(&change.path));
         if !matches!(
             change.kind,
             ConversationTurnFileChangeKind::Created
@@ -857,7 +866,7 @@ pub async fn infer_for_turn(
             kind: "file".into(),
             title: file_name.clone(),
             description: None,
-            role: if expected_paths.contains(&change.path) || inferred.is_empty() {
+            role: if expected_paths.contains(&change.path) {
                 "primary".into()
             } else {
                 "supporting".into()
@@ -1108,12 +1117,76 @@ pub async fn list_sets_for_conversation(
                 turn_run_id: run.id,
                 conversation_id,
                 client_message_id: run.client_message_id,
+                user_turn_id: None,
                 started_at: run.started_at,
                 completed_at: run.completed_at,
                 deliverables,
             })
         })
         .collect())
+}
+
+/// Bind deliverable runs to parser-stable user-turn ids before a detail is sent
+/// to any client. The sender-only optimistic id remains useful during the live
+/// turn, but a prompt fingerprint is the authoritative cross-device bridge
+/// after reload. Matching is one-to-one; repeated identical prompts are
+/// disambiguated by the nearest run start time.
+pub async fn associate_sets_with_user_turns(
+    conn: &DatabaseConnection,
+    sets: &mut [ConversationTurnDeliverableSet],
+    turns: &[MessageTurn],
+) -> Result<(), DbError> {
+    if sets.is_empty() || turns.is_empty() {
+        return Ok(());
+    }
+    let run_ids = sets
+        .iter()
+        .map(|set| set.turn_run_id.clone())
+        .collect::<Vec<_>>();
+    let runs = conversation_turn_run::Entity::find()
+        .filter(conversation_turn_run::Column::Id.is_in(run_ids))
+        .all(conn)
+        .await?;
+    let fingerprints = runs
+        .into_iter()
+        .filter_map(|run| Some((run.id, run.prompt_fingerprint?)))
+        .collect::<HashMap<_, _>>();
+    let candidates = turns
+        .iter()
+        .filter_map(|turn| Some((turn, crate::artifact_tracker::user_turn_fingerprint(turn)?)))
+        .collect::<Vec<_>>();
+    let mut used = HashSet::new();
+
+    // A live detail may already have had its parser id patched to the exact
+    // client id. Claim those first before fingerprint matching duplicate text.
+    for set in sets.iter_mut() {
+        let Some(client_id) = set.client_message_id.as_deref() else {
+            continue;
+        };
+        if turns.iter().any(|turn| turn.id == client_id) {
+            set.user_turn_id = Some(client_id.to_string());
+            used.insert(client_id.to_string());
+        }
+    }
+
+    for set in sets.iter_mut().filter(|set| set.user_turn_id.is_none()) {
+        let Some(fingerprint) = fingerprints.get(&set.turn_run_id) else {
+            continue;
+        };
+        let best = candidates
+            .iter()
+            .filter(|(turn, candidate)| candidate == fingerprint && !used.contains(&turn.id))
+            .min_by_key(|(turn, _)| {
+                turn.timestamp
+                    .timestamp_millis()
+                    .abs_diff(set.started_at.timestamp_millis())
+            });
+        if let Some((turn, _)) = best {
+            set.user_turn_id = Some(turn.id.clone());
+            used.insert(turn.id.clone());
+        }
+    }
+    Ok(())
 }
 
 pub async fn hide_for_conversation(
@@ -1242,8 +1315,9 @@ pub async fn resolve_for_access(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acp::types::PromptInputBlock;
     use crate::db::service::artifact_service::{self, NewTurnRun, PendingFileChange};
-    use crate::models::AgentType;
+    use crate::models::{AgentType, ContentBlock, MessageTurn, TurnRole};
 
     async fn seed_run(
         db: &crate::db::AppDatabase,
@@ -1260,6 +1334,7 @@ mod tests {
                 conversation_id,
                 connection_id: format!("conn-{run_id}"),
                 client_message_id: Some(format!("message-{run_id}")),
+                prompt_fingerprint: None,
                 folder_id: Some(folder_id),
                 root_path: root.to_string_lossy().to_string(),
                 capture_incomplete: false,
@@ -1271,6 +1346,66 @@ mod tests {
         )
         .await
         .expect("run");
+    }
+
+    #[tokio::test]
+    async fn prompt_fingerprint_links_deliverables_to_a_durable_user_turn() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let workspace = tempfile::tempdir().unwrap();
+        let folder_id =
+            crate::db::test_helpers::seed_folder(&db, &workspace.path().to_string_lossy()).await;
+        let conversation_id =
+            crate::db::test_helpers::seed_conversation(&db, folder_id, AgentType::Codex).await;
+        let text = "生成 output/report.pdf";
+        let fingerprint = crate::artifact_tracker::prompt_fingerprint(&[PromptInputBlock::Text {
+            text: text.into(),
+        }]);
+        let run = artifact_service::create_run(
+            &db.conn,
+            NewTurnRun {
+                id: "run-linked".into(),
+                conversation_id,
+                connection_id: "conn-linked".into(),
+                client_message_id: Some("optimistic-only-on-sender".into()),
+                prompt_fingerprint: fingerprint,
+                folder_id: Some(folder_id),
+                root_path: workspace.path().to_string_lossy().to_string(),
+                capture_incomplete: false,
+                input_paths_json: "[]".into(),
+                expectation_json: r#"{"publish_required":true,"expects_code_changes":false,"requested_paths":["output/report.pdf"]}"#.into(),
+            },
+        )
+        .await
+        .unwrap();
+        let mut sets = vec![ConversationTurnDeliverableSet {
+            turn_run_id: run.id,
+            conversation_id,
+            client_message_id: run.client_message_id,
+            user_turn_id: None,
+            // Deliberately far from the parser timestamp: this association is
+            // content-based and therefore stable across clients/clocks.
+            started_at: run.started_at,
+            completed_at: None,
+            deliverables: Vec::new(),
+        }];
+        let turns = vec![MessageTurn {
+            id: "parser-stable-user-id".into(),
+            role: TurnRole::User,
+            blocks: vec![ContentBlock::Text { text: text.into() }],
+            timestamp: run.started_at + chrono::Duration::hours(8),
+            usage: None,
+            duration_ms: None,
+            model: None,
+            completed_at: None,
+        }];
+
+        associate_sets_with_user_turns(&db.conn, &mut sets, &turns)
+            .await
+            .unwrap();
+        assert_eq!(
+            sets[0].user_turn_id.as_deref(),
+            Some("parser-stable-user-id")
+        );
     }
 
     fn verified(root: &Path, path: &str, title: &str) -> VerifiedDeliverable {
@@ -1608,6 +1743,7 @@ mod tests {
                 conversation_id,
                 connection_id: "conn-missing".into(),
                 client_message_id: Some("message-missing".into()),
+                prompt_fingerprint: None,
                 folder_id: Some(folder_id),
                 root_path: workspace.path().to_string_lossy().to_string(),
                 capture_incomplete: false,
@@ -1659,6 +1795,7 @@ mod tests {
                 conversation_id,
                 connection_id: "conn-ambiguous-expected".into(),
                 client_message_id: Some("message-ambiguous-expected".into()),
+                prompt_fingerprint: None,
                 folder_id: Some(folder_id),
                 root_path: workspace.path().to_string_lossy().to_string(),
                 capture_incomplete: false,
@@ -1709,6 +1846,67 @@ mod tests {
         assert_eq!(settled.len(), 1);
         assert_eq!(settled[0].path, "src/lib.rs");
         assert_eq!(settled[0].category, "code_change");
+    }
+
+    #[tokio::test]
+    async fn ambiguous_standalone_output_is_kept_as_a_supporting_ledger_item() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("report.pdf"), b"report").unwrap();
+        let folder_id =
+            crate::db::test_helpers::seed_folder(&db, &workspace.path().to_string_lossy()).await;
+        let conversation_id =
+            crate::db::test_helpers::seed_conversation(&db, folder_id, AgentType::Codex).await;
+        seed_run(
+            &db,
+            conversation_id,
+            folder_id,
+            workspace.path(),
+            "run-ambiguous-output",
+            &[],
+        )
+        .await;
+        artifact_service::upsert_changes(
+            &db.conn,
+            "run-ambiguous-output",
+            vec![PendingFileChange {
+                path: "report.pdf".into(),
+                kind: ConversationTurnFileChangeKind::Created,
+                attribution: "ambiguous".into(),
+            }],
+        )
+        .await
+        .unwrap();
+        let change = artifact_service::list_changes_for_run(&db.conn, "run-ambiguous-output")
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let metadata = std::fs::metadata(workspace.path().join("report.pdf")).unwrap();
+        artifact_service::update_final_state(
+            &db.conn,
+            change,
+            true,
+            i64::try_from(metadata.len()).ok(),
+            metadata.modified().ok().map(DateTime::<Utc>::from),
+        )
+        .await
+        .unwrap();
+        artifact_service::finish_run(
+            &db.conn,
+            "run-ambiguous-output",
+            ConversationTurnRunStatus::Completed,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let settled = infer_for_turn(&db.conn, conversation_id, "run-ambiguous-output")
+            .await
+            .unwrap();
+        assert_eq!(settled.len(), 1);
+        assert_eq!(settled[0].category, "standalone_output");
+        assert_eq!(settled[0].role, "supporting");
     }
 
     #[tokio::test]

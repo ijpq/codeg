@@ -169,6 +169,33 @@ async fn acp_find_connection_for_conversation_returns_null_when_none_live() {
     );
 }
 
+#[tokio::test]
+async fn acp_prompt_accepts_image_payload_larger_than_axum_default() {
+    let (server, _data, _static) = build_test_server().await;
+    // A 1,687,739-byte image expands to 2,250,320 base64 bytes, already above
+    // Axum's default 2 MiB JSON limit before the surrounding prompt envelope.
+    let image_data = "A".repeat(2_250_320);
+    let resp = server
+        .post("/api/acp_prompt")
+        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+        .json(&json!({
+            "connectionId": "missing-test-connection",
+            "blocks": [{
+                "type": "image",
+                "data": image_data,
+                "mime_type": "image/png"
+            }]
+        }))
+        .await;
+
+    // There is intentionally no ACP connection in this router fixture. Reaching
+    // the handler's typed connection error proves the JSON extractor accepted
+    // the payload instead of rejecting it with 413 Payload Too Large.
+    assert_eq!(resp.status_code(), 404, "body: {}", resp.text());
+    let body: Value = resp.json();
+    assert_eq!(body["code"], "connection_not_found");
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Field naming sanity (snake_case ↔ camelCase boundary)
 // ────────────────────────────────────────────────────────────────────────────
