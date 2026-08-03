@@ -4,6 +4,7 @@ import { useTranslations } from "next-intl"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import {
   AcpConnectionsProvider,
+  isRecoverablePromptConnectionLoss,
   useAcpActions,
   useConnectionStore,
 } from "@/contexts/acp-connections-context"
@@ -338,6 +339,57 @@ describe("AcpConnectionsProvider cross-client viewer lifecycle", () => {
     })
 
     expect(h.acpDisconnect).toHaveBeenCalledWith("spawned-conn")
+  })
+
+  it("restores a stale remote viewer connection and retries the same prompt id once", async () => {
+    h.acpFindConnectionForConversation
+      .mockResolvedValueOnce({ connection_id: "owner-conn", event_seq: 0 })
+      .mockResolvedValueOnce({ connection_id: "recovered-conn", event_seq: 0 })
+    h.acpPrompt
+      .mockRejectedValueOnce({
+        code: "connection_not_found",
+        message: "connection not found: owner-conn",
+      })
+      .mockResolvedValueOnce(undefined)
+    await mountProvider()
+
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 42)
+    })
+    emitAcpEvent(latestAttachHandlers(), {
+      seq: 1,
+      connection_id: "owner-conn",
+      type: "session_started",
+      session_id: "sess-1",
+    })
+
+    const blocks = [{ type: "text" as const, text: "remote prompt" }]
+    await act(async () => {
+      await h.actions!.sendPrompt(TAB, blocks, {
+        folderId: 1,
+        conversationId: 42,
+        clientMessageId: "optimistic-stable-id",
+      })
+    })
+
+    expect(h.acpPrompt).toHaveBeenNthCalledWith(
+      1,
+      "owner-conn",
+      blocks,
+      1,
+      42,
+      "optimistic-stable-id"
+    )
+    expect(h.acpPrompt).toHaveBeenNthCalledWith(
+      2,
+      "recovered-conn",
+      blocks,
+      1,
+      42,
+      "optimistic-stable-id"
+    )
+    expect(h.store!.getConnection(TAB)?.connectionId).toBe("recovered-conn")
+    expect(h.acpDisconnect).not.toHaveBeenCalledWith("owner-conn")
   })
 
   it("desktop viewer torn down DURING snapshot fetch does not seed delegations or route", async () => {
@@ -1012,6 +1064,25 @@ describe("AcpConnectionsProvider abandoned connect tears down only what it creat
     })
 
     expect(h.acpDisconnect).toHaveBeenCalledWith("fresh-conn")
+  })
+})
+
+describe("prompt connection loss classification", () => {
+  it("retries only deterministic connection loss, never ambiguous timeout", () => {
+    expect(
+      isRecoverablePromptConnectionLoss({
+        code: "connection_not_found",
+        message: "missing",
+      })
+    ).toBe(true)
+    expect(
+      isRecoverablePromptConnectionLoss(
+        new Error("agent process exited unexpectedly")
+      )
+    ).toBe(true)
+    expect(
+      isRecoverablePromptConnectionLoss(new Error("Request timed out"))
+    ).toBe(false)
   })
 })
 

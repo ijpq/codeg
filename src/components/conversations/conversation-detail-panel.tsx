@@ -116,8 +116,10 @@ import {
   getPromptDraftDisplayText,
 } from "@/lib/prompt-draft"
 import {
+  CONVERSATION_ARTIFACTS_CHANGED_EVENT,
   CONVERSATION_DELIVERABLES_CHANGED_EVENT,
   type AgentType,
+  type ConversationArtifactsChanged,
   type ConversationDeliverablesChanged,
   type ContentBlock,
   type ConversationStatus,
@@ -418,23 +420,34 @@ const ConversationTabView = memo(function ConversationTabView({
   }, [dbConversationId, effectiveConversationId, setDbConversationId])
 
   // An agent may publish final outputs before its reply completes. Refresh on
-  // the declaration event so the verified cards appear immediately; the
-  // runtime→DB id binding also covers tabs that began under a virtual draft id.
+  // declarations immediately and again on terminal artifact settlement; the
+  // latter is a redundant cross-device nudge after inference has committed.
+  // The runtime→DB id binding also covers tabs begun under a virtual draft id.
   useEffect(() => {
     let disposed = false
-    let unlisten: (() => void) | undefined
-
-    void subscribe<ConversationDeliverablesChanged>(
-      CONVERSATION_DELIVERABLES_CHANGED_EVENT,
-      (change) => {
-        if (change.conversation_id === dbConvIdRef.current) {
-          refetchDetail(effectiveConversationId, { preserveLive: true })
-        }
+    const unlistens: (() => void)[] = []
+    const scheduleRefresh = (conversationId: number) => {
+      if (conversationId === dbConvIdRef.current) {
+        refetchDetail(effectiveConversationId, { preserveLive: true })
       }
-    ).then((dispose) => {
-      if (disposed) dispose()
-      else unlisten = dispose
-    })
+    }
+
+    const installSubscription = <T extends { conversation_id: number }>(
+      event: string
+    ) => {
+      void subscribe<T>(event, (change) =>
+        scheduleRefresh(change.conversation_id)
+      ).then((dispose) => {
+        if (disposed) dispose()
+        else unlistens.push(dispose)
+      })
+    }
+    installSubscription<ConversationDeliverablesChanged>(
+      CONVERSATION_DELIVERABLES_CHANGED_EVENT
+    )
+    installSubscription<ConversationArtifactsChanged>(
+      CONVERSATION_ARTIFACTS_CHANGED_EVENT
+    )
 
     const offReconnect = onTransportReconnect(() => {
       const persistedId = dbConvIdRef.current
@@ -458,7 +471,7 @@ const ConversationTabView = memo(function ConversationTabView({
     })
     return () => {
       disposed = true
-      unlisten?.()
+      unlistens.forEach((dispose) => dispose())
       offReconnect?.()
     }
   }, [effectiveConversationId, reconcileCompletedTurn, refetchDetail])

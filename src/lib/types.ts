@@ -57,6 +57,8 @@ export type AppErrorCode =
   | "external_command_failed"
   | "window_operation_failed"
   | "task_execution_failed"
+  | "connection_not_found"
+  | "process_exited"
   | (string & {})
 
 export interface AppCommandError {
@@ -686,6 +688,10 @@ export interface ConversationTurnDeliverableSet {
   turn_run_id: string
   conversation_id: number
   client_message_id?: string | null
+  /** Durable parser user-turn id resolved by the backend from the accepted
+   * prompt fingerprint. Present on new runs so every viewing machine attaches
+   * the output card to the same reply. */
+  user_turn_id?: string | null
   started_at: string
   completed_at?: string | null
   deliverables: ConversationDeliverable[]
@@ -1205,9 +1211,10 @@ export type PromptInputBlock =
       description?: string | null
     }
 
-/** Successful native Codex `turn/steer` injection. */
+/** Successful native Codex steering injection. */
 export interface SteerResult {
-  turn_id: string
+  /** Present only for the legacy `turn/steer` compatibility protocol. */
+  turn_id: string | null
   message_id: string
   deduplicated: boolean
 }
@@ -1995,7 +2002,7 @@ export type AcpEvent =
       type: "steer_message"
       message_id: string
       blocks: UserMessageBlock[]
-      turn_id: string
+      turn_id: string | null
     }
   | {
       type: "error"

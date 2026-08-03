@@ -855,9 +855,7 @@ impl ConnectionManager {
                 continue;
             }
             if target_conversation_id.is_some_and(|expected| {
-                state
-                    .conversation_id
-                    .is_some_and(|bound| bound != expected)
+                state.conversation_id.is_some_and(|bound| bound != expected)
             }) {
                 continue;
             }
@@ -932,13 +930,7 @@ impl ConnectionManager {
             prompt_guards.push(lock.lock_owned().await);
         }
 
-        let (
-            target_state,
-            target_emitter,
-            codeg_mcp_available,
-            mcp_server_count,
-            replaced,
-        ) = {
+        let (target_state, target_emitter, codeg_mcp_available, mcp_server_count, replaced) = {
             let mut connections = self.connections.lock().await;
             let target = connections
                 .get(connection_id)
@@ -1670,10 +1662,9 @@ impl ConnectionManager {
         let artifact_capture_started = if let (Some(cid), Some(root_path)) =
             (conversation_id_for_status, working_dir_for_artifacts)
         {
-            let input_paths =
-                crate::artifact_tracker::input_paths_from_prompt(&blocks, &root_path);
-            let expectation =
-                crate::artifact_tracker::expectation_from_prompt(&blocks, &root_path);
+            let input_paths = crate::artifact_tracker::input_paths_from_prompt(&blocks, &root_path);
+            let expectation = crate::artifact_tracker::expectation_from_prompt(&blocks, &root_path);
+            let prompt_fingerprint = crate::artifact_tracker::prompt_fingerprint(&blocks);
             match self
                 .artifact_tracker
                 .begin_turn(
@@ -1681,6 +1672,7 @@ impl ConnectionManager {
                     conn_id,
                     cid,
                     user_message.as_ref().map(|(id, _)| id.clone()),
+                    prompt_fingerprint,
                     folder_id.or(state_folder_id),
                     root_path,
                     input_paths,
@@ -2794,11 +2786,9 @@ impl ConnectionManager {
         if !native && !tool_available {
             return Err(AcpError::FeedbackDisabled);
         }
-
         if native {
             return Self::submit_feedback_native(conn_id, state, cmd_tx, emitter, text).await;
         }
-
         let item =
             FeedbackItem::new_pending(uuid::Uuid::new_v4().to_string(), text, chrono::Utc::now());
         // Gate on `turn_in_flight` and append in ONE critical section (via the
@@ -4148,7 +4138,7 @@ mod tests {
                 }]
             );
             let result = SteerResult {
-                turn_id: "turn-active".into(),
+                turn_id: Some("turn-active".into()),
                 message_id: client_message_id,
                 deduplicated: false,
             };
@@ -4170,7 +4160,7 @@ mod tests {
             )
             .await
             .expect("first guide succeeds");
-        assert_eq!(first.turn_id, "turn-active");
+        assert_eq!(first.turn_id.as_deref(), Some("turn-active"));
         assert!(!first.deduplicated);
 
         let retry = mgr
@@ -5417,7 +5407,10 @@ mod tests {
             .await
             .expect_err("mismatched conversation must be rejected");
         assert!(error.to_string().contains("not"));
-        assert!(rx.try_recv().is_err(), "no prompt may reach the old session");
+        assert!(
+            rx.try_recv().is_err(),
+            "no prompt may reach the old session"
+        );
     }
 
     #[tokio::test]
@@ -5807,8 +5800,7 @@ mod tests {
     #[tokio::test]
     async fn activate_restored_conversation_atomically_rebinds_and_stops_old_connection() {
         let mgr = ConnectionManager::new();
-        let mut old_rx =
-            insert_live_connection(&mgr, "old", AgentType::Codex, None).await;
+        let mut old_rx = insert_live_connection(&mgr, "old", AgentType::Codex, None).await;
         let _new_rx = insert_live_connection(&mgr, "new", AgentType::Codex, None).await;
         {
             let old = mgr.get_state("old").await.unwrap();
@@ -5826,15 +5818,7 @@ mod tests {
         }
 
         let outcome = mgr
-            .activate_restored_conversation(
-                "new",
-                42,
-                7,
-                "session-42",
-                true,
-                None,
-                None,
-            )
+            .activate_restored_conversation("new", 42, 7, "session-42", true, None, None)
             .await
             .expect("atomic activation");
         assert_eq!(outcome.replaced_connection_ids, vec!["old"]);
@@ -5872,15 +5856,7 @@ mod tests {
         }
 
         let error = mgr
-            .activate_restored_conversation(
-                "new",
-                42,
-                7,
-                "session-42",
-                true,
-                None,
-                None,
-            )
+            .activate_restored_conversation("new", 42, 7, "session-42", true, None, None)
             .await
             .expect_err("missing MCP must reject restore");
         assert!(error.to_string().contains("codeg-mcp"));
