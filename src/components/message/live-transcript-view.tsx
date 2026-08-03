@@ -39,8 +39,10 @@ import { PermissionDialog } from "@/components/chat/permission-dialog"
 import { AskQuestionCard } from "@/components/chat/ask-question-card"
 import { PlanApprovalCard } from "@/components/chat/plan-approval-card"
 import {
+  CONVERSATION_ARTIFACTS_CHANGED_EVENT,
   CONVERSATION_DELIVERABLES_CHANGED_EVENT,
   type AgentType,
+  type ConversationArtifactsChanged,
   type ConversationDeliverablesChanged,
   type PlanApprovalAnswer,
   type QuestionAnswer,
@@ -258,21 +260,28 @@ export function LiveTranscriptView({
   // transcript.
   useEffect(() => {
     let disposed = false
-    let unlisten: (() => void) | undefined
-    void subscribe<ConversationDeliverablesChanged>(
-      CONVERSATION_DELIVERABLES_CHANGED_EVENT,
-      (change) => {
+    const unlistens: (() => void)[] = []
+    const installSubscription = <T extends { conversation_id: number }>(
+      event: string
+    ) => {
+      void subscribe<T>(event, (change) => {
         if (change.conversation_id === conversationId) {
           refetchDetail(conversationId, { preserveLive: true })
         }
-      }
-    ).then((dispose) => {
-      if (disposed) dispose()
-      else unlisten = dispose
-    })
+      }).then((dispose) => {
+        if (disposed) dispose()
+        else unlistens.push(dispose)
+      })
+    }
+    installSubscription<ConversationDeliverablesChanged>(
+      CONVERSATION_DELIVERABLES_CHANGED_EVENT
+    )
+    installSubscription<ConversationArtifactsChanged>(
+      CONVERSATION_ARTIFACTS_CHANGED_EVENT
+    )
     return () => {
       disposed = true
-      unlisten?.()
+      unlistens.forEach((dispose) => dispose())
     }
   }, [conversationId, refetchDetail])
 

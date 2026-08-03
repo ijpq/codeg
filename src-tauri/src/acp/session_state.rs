@@ -1850,7 +1850,7 @@ mod tests {
             blocks: vec![UserMessageBlock::Text {
                 text: "check B instead".into(),
             }],
-            turn_id: "turn-active".into(),
+            turn_id: Some("turn-active".into()),
         };
         s.apply_event(&steer);
         s.apply_event(&steer);

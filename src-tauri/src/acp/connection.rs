@@ -822,10 +822,9 @@ async fn build_agent(
                 .unwrap_or_else(|| PathBuf::from(crate::process::normalized_program(cmd)));
 
             // Codex's upstream ACP adapter owns the app-server connection and
-            // active turn id. Prepare Codeg's anchor-verified compatibility
-            // copy so the connection loop can call its `session/steer`
-            // extension. Unknown/old adapters launch unchanged with capability
-            // false; the UI then keeps the existing feedback/queue behavior.
+            // active turn id. codex-acp 1.1.6+ launches unchanged and negotiates
+            // `_session/steering` during initialize. Only the older 1.1.2 bundle
+            // needs Codeg's anchor-verified compatibility copy.
             let prepared_steer = if meta.supports_steer {
                 match crate::acp::codex_steer_adapter::prepare(&resolved_launcher).await {
                     Ok(prepared) => prepared,
@@ -835,7 +834,7 @@ async fn build_agent(
                         // problem must not make an otherwise usable Codex
                         // connection fail to launch.
                         tracing::warn!(
-                            "[ACP][Codex] native steer disabled: adapter preparation failed: {error}"
+                            "[ACP][Codex] legacy steer adapter preparation failed: {error}"
                         );
                         None
                     }
@@ -3658,24 +3657,22 @@ async fn run_connection(
             )
             .await;
 
-            // Capability comes from the concrete adapter handshake, not from
-            // the frontend or an agent-name check. Codeg's compatibility shim
-            // publishes this marker only when its `session/steer` request
-            // handler is installed; a future upstream adapter can publish the
-            // same extension without any Codeg-side launch special case.
-            let supports_steer = init_resp
-                .agent_capabilities
-                .meta
-                .as_ref()
-                .and_then(|meta| meta.get("codeg/steer"))
-                .is_some_and(|capability| {
-                    capability.get("method").and_then(serde_json::Value::as_str)
-                        == Some("session/steer")
-                        && capability
-                            .get("version")
-                            .and_then(serde_json::Value::as_u64)
-                            .is_some_and(|version| version >= 1)
-                });
+            // Negotiate against the concrete initialize handshake. codex-acp
+            // 1.1.6+ advertises `_meta.steering.supported` and serves
+            // `_session/steering`; the old Codeg compatibility copy advertises
+            // `_meta["codeg/steer"]` and serves `session/steer`. Prefer the
+            // upstream protocol when both markers are ever present.
+            let steer_protocol = negotiate_steer_protocol(
+                init_resp.meta.as_ref(),
+                init_resp.agent_capabilities.meta.as_ref(),
+            );
+            let supports_steer = steer_protocol.is_some();
+            if let Some(protocol) = steer_protocol {
+                tracing::info!(
+                    "[ACP][{agent_name_for_log}] negotiated native steering protocol {}",
+                    protocol.method()
+                );
+            }
             emit_with_state(
                 &state,
                 &emitter_clone,
@@ -3928,6 +3925,7 @@ async fn run_connection(
                                 terminal_runtime.clone(),
                                 &cwd_string,
                                 supports_fork,
+                                steer_protocol,
                                 &prompt_ledger,
                                 delegation_injection.as_ref(),
                                 &stderr_tail,
@@ -3950,6 +3948,7 @@ async fn run_connection(
                                 terminal_runtime.clone(),
                                 &cwd,
                                 &cwd_string,
+                                steer_protocol,
                                 &prompt_ledger,
                                 delegation_injection.as_ref(),
                                 &stderr_tail,
@@ -4150,6 +4149,7 @@ async fn run_connection(
                             terminal_runtime.clone(),
                             &cwd_string,
                             supports_fork,
+                            steer_protocol,
                             &prompt_ledger,
                             delegation_injection.as_ref(),
                             &stderr_tail,
@@ -4168,6 +4168,7 @@ async fn run_connection(
                             terminal_runtime.clone(),
                             &cwd,
                             &cwd_string,
+                            steer_protocol,
                             &prompt_ledger,
                             delegation_injection.as_ref(),
                             &stderr_tail,
@@ -4328,6 +4329,7 @@ async fn run_connection(
                             terminal_runtime.clone(),
                             &cwd_string,
                             supports_fork,
+                            steer_protocol,
                             &prompt_ledger,
                             delegation_injection.as_ref(),
                             &stderr_tail,
@@ -4348,6 +4350,7 @@ async fn run_connection(
                             terminal_runtime.clone(),
                             &cwd,
                             &cwd_string,
+                            steer_protocol,
                             &prompt_ledger,
                             delegation_injection.as_ref(),
                             &stderr_tail,
@@ -4410,6 +4413,7 @@ async fn run_connection(
                     terminal_runtime.clone(),
                     &cwd_string,
                     supports_fork,
+                    steer_protocol,
                     &prompt_ledger,
                     delegation_injection.as_ref(),
                     &stderr_tail,
@@ -4428,6 +4432,7 @@ async fn run_connection(
                     terminal_runtime.clone(),
                     &cwd,
                     &cwd_string,
+                    steer_protocol,
                     &prompt_ledger,
                     delegation_injection.as_ref(),
                     &stderr_tail,
@@ -5152,40 +5157,150 @@ fn classify_steer_wire_error(error: sacp::Error) -> AcpError {
     {
         return AcpError::NoActiveSteerTurn;
     }
-    AcpError::protocol(format!("turn/steer failed: {message}"))
+    AcpError::protocol(format!("native steering failed: {message}"))
 }
 
-/// Send Codeg's adapter extension. The adapter supplies the active Codex turn
-/// id as app-server's required `expectedTurnId`; the response is the app-server
-/// `{ turnId }`, never a newly-created ACP turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SteerProtocol {
+    /// Codeg's derived codex-acp 1.1.2 compatibility copy.
+    LegacyCodegV1,
+    /// Upstream codex-acp 1.1.6+ protocol.
+    CodexNative,
+}
+
+impl SteerProtocol {
+    fn method(self) -> &'static str {
+        match self {
+            Self::LegacyCodegV1 => "session/steer",
+            Self::CodexNative => "_session/steering",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SteerWireOutcome {
+    Injected,
+    StartedNewTurn,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SteerWireResult {
+    turn_id: Option<String>,
+    outcome: SteerWireOutcome,
+}
+
+fn negotiate_steer_protocol(
+    initialize_meta: Option<&serde_json::Map<String, serde_json::Value>>,
+    capabilities_meta: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Option<SteerProtocol> {
+    // codex-acp 1.1.6+ publishes this on InitializeResponse._meta (not inside
+    // agentCapabilities). Accepting the capabilities location too is harmless
+    // and keeps the client tolerant of adapters that scoped the marker there.
+    let native = |meta: &serde_json::Map<String, serde_json::Value>| {
+        meta.get("steering")
+            .and_then(|capability| capability.get("supported"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    };
+    if initialize_meta.is_some_and(native) || capabilities_meta.is_some_and(native) {
+        return Some(SteerProtocol::CodexNative);
+    }
+    if capabilities_meta
+        .and_then(|meta| meta.get("codeg/steer"))
+        .is_some_and(|capability| {
+            capability.get("method").and_then(serde_json::Value::as_str) == Some("session/steer")
+                && capability
+                    .get("version")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|version| version >= 1)
+        })
+    {
+        return Some(SteerProtocol::LegacyCodegV1);
+    }
+    None
+}
+
+fn parse_steer_wire_response(
+    protocol: SteerProtocol,
+    raw: serde_json::Value,
+) -> Result<SteerWireResult, AcpError> {
+    match protocol {
+        SteerProtocol::LegacyCodegV1 => {
+            let turn_id = raw
+                .get("turnId")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| AcpError::protocol("turn/steer response missing turnId"))?;
+            Ok(SteerWireResult {
+                turn_id: Some(turn_id),
+                outcome: SteerWireOutcome::Injected,
+            })
+        }
+        SteerProtocol::CodexNative => {
+            match raw.get("outcome").and_then(serde_json::Value::as_str) {
+                Some("injected") => Ok(SteerWireResult {
+                    turn_id: None,
+                    outcome: SteerWireOutcome::Injected,
+                }),
+                // A turn can finish between Codeg's in-flight gate and codex-acp
+                // handling the request. Upstream deliberately starts a new turn in
+                // that race. Treat it as accepted so the frontend never queues and
+                // sends the same user message a second time.
+                Some("startedNewTurn") => Ok(SteerWireResult {
+                    turn_id: None,
+                    outcome: SteerWireOutcome::StartedNewTurn,
+                }),
+                Some("failed") => Err(AcpError::protocol(
+                    "_session/steering reported a failed outcome",
+                )),
+                Some(outcome) => Err(AcpError::protocol(format!(
+                    "_session/steering returned unknown outcome {outcome:?}"
+                ))),
+                None => Err(AcpError::protocol(
+                    "_session/steering response missing outcome",
+                )),
+            }
+        }
+    }
+}
+
+/// Send whichever steering extension was negotiated during initialize.
+///
+/// The legacy adapter supplies the active Codex turn id as app-server's
+/// required `expectedTurnId` and returns `{ turnId }`. Upstream codex-acp owns
+/// that detail and returns only `{ outcome }`.
 async fn steer_session(
     cx: &ConnectionTo<Agent>,
     session_id: &SessionId,
     blocks: Vec<PromptInputBlock>,
     client_message_id: &str,
-) -> Result<String, AcpError> {
+    protocol: SteerProtocol,
+) -> Result<SteerWireResult, AcpError> {
     let prompt = map_prompt_blocks(blocks);
     if prompt.is_empty() {
         return Err(AcpError::InvalidSteer(
             "message must contain at least one content block".into(),
         ));
     }
-    let request = serde_json::json!({
-        "sessionId": session_id,
-        "prompt": prompt,
-        "clientMessageId": client_message_id,
-    });
-    let untyped = UntypedMessage::new("session/steer", request)
+    let request = match protocol {
+        SteerProtocol::LegacyCodegV1 => serde_json::json!({
+            "sessionId": session_id,
+            "prompt": prompt,
+            "clientMessageId": client_message_id,
+        }),
+        SteerProtocol::CodexNative => serde_json::json!({
+            "sessionId": session_id,
+            "prompt": prompt,
+        }),
+    };
+    let untyped = UntypedMessage::new(protocol.method(), request)
         .map_err(|error| AcpError::protocol(format!("invalid steer request: {error}")))?;
     let raw = cx
         .send_request_to(Agent, untyped)
         .block_task()
         .await
         .map_err(classify_steer_wire_error)?;
-    raw.get("turnId")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string)
-        .ok_or_else(|| AcpError::protocol("turn/steer response missing turnId"))
+    parse_steer_wire_response(protocol, raw)
 }
 
 /// Apply user-saved mode and config-option preferences to a freshly-attached
@@ -5924,6 +6039,7 @@ async fn handle_fork_or_exit(
     terminal_runtime: Arc<TerminalRuntime>,
     _cwd: &std::path::Path,
     cwd_string: &str,
+    steer_protocol: Option<SteerProtocol>,
     // Threaded through from run_connection: the connection-scoped prompt
     // ledger (the forked session's loop keeps fingerprinting into the SAME
     // ledger the still-running watcher consumes from).
@@ -6019,6 +6135,7 @@ async fn handle_fork_or_exit(
         terminal_runtime.clone(),
         cwd_string,
         true, // fork already succeeded on this process
+        steer_protocol,
         prompt_ledger,
         delegation_injection,
         stderr_tail,
@@ -6039,6 +6156,7 @@ async fn handle_fork_or_exit(
         terminal_runtime,
         _cwd,
         cwd_string,
+        steer_protocol,
         prompt_ledger,
         delegation_injection,
         stderr_tail,
@@ -6529,6 +6647,7 @@ async fn run_conversation_loop<'a>(
     terminal_runtime: Arc<TerminalRuntime>,
     cwd: &str,
     supports_fork: bool,
+    steer_protocol: Option<SteerProtocol>,
     // Connection-scoped (created once in `run_connection`, shared across fork
     // restarts of this loop): outgoing prompts are fingerprinted here so the
     // transcript watcher can classify their turns as wire-rendered foreground.
@@ -7072,20 +7191,30 @@ async fn run_conversation_loop<'a>(
                                     }
                                     let rendered_blocks =
                                         crate::acp::user_blocks_from_prompt(&blocks);
-                                    let result = steer_session(
-                                        &cx,
-                                        &sid,
-                                        blocks,
-                                        &client_message_id,
-                                    )
-                                    .await;
+                                    let result = match steer_protocol {
+                                        Some(protocol) => {
+                                            steer_session(
+                                                &cx,
+                                                &sid,
+                                                blocks,
+                                                &client_message_id,
+                                                protocol,
+                                            )
+                                            .await
+                                        }
+                                        None => Err(AcpError::SteerUnsupported),
+                                    };
                                     match result {
-                                        Ok(turn_id) => {
+                                        Ok(wire_result) => {
                                             tracing::info!(
-                                                "[ACP][Codex] turn/steer injected connection_id={} session_id={} turn_id={} client_message_id={}",
+                                                "[ACP][Codex] native steer accepted connection_id={} session_id={} method={} outcome={:?} turn_id={:?} client_message_id={}",
                                                 conn_id,
                                                 sid.0,
-                                                turn_id,
+                                                steer_protocol
+                                                    .map(SteerProtocol::method)
+                                                    .unwrap_or("<unavailable>"),
+                                                wire_result.outcome,
+                                                wire_result.turn_id,
                                                 client_message_id
                                             );
                                             emit_with_state(
@@ -7094,12 +7223,12 @@ async fn run_conversation_loop<'a>(
                                                 AcpEvent::SteerMessage {
                                                     message_id: client_message_id.clone(),
                                                     blocks: rendered_blocks,
-                                                    turn_id: turn_id.clone(),
+                                                    turn_id: wire_result.turn_id.clone(),
                                                 },
                                             )
                                             .await;
                                             let result = SteerResult {
-                                                turn_id,
+                                                turn_id: wire_result.turn_id,
                                                 message_id: client_message_id,
                                                 deduplicated: false,
                                             };
@@ -9892,6 +10021,96 @@ mod tests {
     }
 
     #[test]
+    fn steering_negotiation_prefers_upstream_protocol_and_keeps_legacy_support() {
+        let native = meta_map(serde_json::json!({
+            "steering": { "supported": true }
+        }));
+        assert_eq!(
+            negotiate_steer_protocol(Some(&native), None),
+            Some(SteerProtocol::CodexNative)
+        );
+        assert_eq!(SteerProtocol::CodexNative.method(), "_session/steering");
+
+        let legacy = meta_map(serde_json::json!({
+            "codeg/steer": { "method": "session/steer", "version": 1 }
+        }));
+        assert_eq!(
+            negotiate_steer_protocol(None, Some(&legacy)),
+            Some(SteerProtocol::LegacyCodegV1)
+        );
+        assert_eq!(SteerProtocol::LegacyCodegV1.method(), "session/steer");
+
+        let both = meta_map(serde_json::json!({
+            "steering": { "supported": true },
+            "codeg/steer": { "method": "session/steer", "version": 1 }
+        }));
+        assert_eq!(
+            negotiate_steer_protocol(Some(&both), Some(&both)),
+            Some(SteerProtocol::CodexNative)
+        );
+
+        let disabled = meta_map(serde_json::json!({
+            "steering": { "supported": false },
+            "codeg/steer": { "method": "wrong", "version": 1 }
+        }));
+        assert_eq!(
+            negotiate_steer_protocol(Some(&disabled), Some(&disabled)),
+            None
+        );
+        assert_eq!(negotiate_steer_protocol(None, None), None);
+    }
+
+    #[test]
+    fn parses_upstream_steering_outcomes_without_inventing_turn_ids() {
+        assert_eq!(
+            parse_steer_wire_response(
+                SteerProtocol::CodexNative,
+                serde_json::json!({ "outcome": "injected" }),
+            )
+            .expect("injected response"),
+            SteerWireResult {
+                turn_id: None,
+                outcome: SteerWireOutcome::Injected,
+            }
+        );
+        assert_eq!(
+            parse_steer_wire_response(
+                SteerProtocol::CodexNative,
+                serde_json::json!({ "outcome": "startedNewTurn" }),
+            )
+            .expect("turn-end race remains accepted"),
+            SteerWireResult {
+                turn_id: None,
+                outcome: SteerWireOutcome::StartedNewTurn,
+            }
+        );
+        assert!(parse_steer_wire_response(
+            SteerProtocol::CodexNative,
+            serde_json::json!({ "outcome": "failed" }),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn parses_legacy_steer_turn_id() {
+        assert_eq!(
+            parse_steer_wire_response(
+                SteerProtocol::LegacyCodegV1,
+                serde_json::json!({ "turnId": "turn-live" }),
+            )
+            .expect("legacy response"),
+            SteerWireResult {
+                turn_id: Some("turn-live".into()),
+                outcome: SteerWireOutcome::Injected,
+            }
+        );
+        assert!(
+            parse_steer_wire_response(SteerProtocol::LegacyCodegV1, serde_json::json!({}),)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn codex_subagent_activity_detected_only_for_codex_subagent_meta() {
         // codex-acp #304: `_meta.codex.subagent` marks the suppressed activity.
         let sub = meta_map(serde_json::json!({
@@ -11870,11 +12089,12 @@ mod tests {
     fn codex_resume_request_preserves_codeg_mcp_deliverables_companion() {
         let cwd = std::path::PathBuf::from("/tmp/codeg");
         let companion = McpServer::Stdio(
-            McpServerStdio::new("codeg-mcp", std::path::PathBuf::from("/opt/codeg-mcp"))
-                .args(vec![
+            McpServerStdio::new("codeg-mcp", std::path::PathBuf::from("/opt/codeg-mcp")).args(
+                vec![
                     "--features".to_string(),
                     "deliverables,feedback,ask,sessions".to_string(),
-                ]),
+                ],
+            ),
         );
         let req = build_resume_session_request(
             AgentType::Codex,

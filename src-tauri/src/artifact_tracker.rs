@@ -14,6 +14,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use sea_orm::DatabaseConnection;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::{broadcast, oneshot, Mutex};
 
 use crate::db::entities::conversation_turn_file_change::ConversationTurnFileChangeKind;
@@ -72,6 +73,70 @@ pub(crate) fn input_paths_from_prompt(
         }
     }
     paths
+}
+
+fn fingerprint_field(hasher: &mut Sha256, tag: u8, value: &[u8]) {
+    hasher.update([tag]);
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value);
+}
+
+fn finish_fingerprint(hasher: Sha256, block_count: usize) -> Option<String> {
+    if block_count == 0 {
+        return None;
+    }
+    Some(format!("{:x}", hasher.finalize()))
+}
+
+/// Stable, content-based bridge between an accepted prompt and the user turn
+/// that agent parsers later reconstruct. Unlike `client_message_id`, this value
+/// survives a reload on another machine; unlike timestamp matching, it cannot
+/// attach an output card to a different prompt merely because the clocks were
+/// close. Only the user-visible projection is hashed, so resource/link prompts
+/// match the same representation broadcast to viewers.
+pub(crate) fn prompt_fingerprint(blocks: &[crate::acp::types::PromptInputBlock]) -> Option<String> {
+    let blocks = crate::acp::user_blocks_from_prompt(blocks);
+    let mut hasher = Sha256::new();
+    for block in &blocks {
+        match block {
+            crate::acp::types::UserMessageBlock::Text { text } => {
+                fingerprint_field(&mut hasher, 1, text.as_bytes());
+            }
+            crate::acp::types::UserMessageBlock::Image { data, mime_type } => {
+                fingerprint_field(&mut hasher, 2, mime_type.as_bytes());
+                fingerprint_field(&mut hasher, 3, data.as_bytes());
+            }
+        }
+    }
+    finish_fingerprint(hasher, blocks.len())
+}
+
+/// Compute the same fingerprint from a parser-produced user turn. Any
+/// non-user turn, or a user turn without text/image content, is intentionally
+/// left unmatched and can still use the conservative timestamp fallback.
+pub(crate) fn user_turn_fingerprint(turn: &crate::models::MessageTurn) -> Option<String> {
+    if !matches!(turn.role, crate::models::TurnRole::User) {
+        return None;
+    }
+    let mut hasher = Sha256::new();
+    let mut count = 0;
+    for block in &turn.blocks {
+        match block {
+            crate::models::ContentBlock::Text { text } => {
+                fingerprint_field(&mut hasher, 1, text.as_bytes());
+                count += 1;
+            }
+            crate::models::ContentBlock::Image {
+                data, mime_type, ..
+            } => {
+                fingerprint_field(&mut hasher, 2, mime_type.as_bytes());
+                fingerprint_field(&mut hasher, 3, data.as_bytes());
+                count += 1;
+            }
+            _ => {}
+        }
+    }
+    finish_fingerprint(hasher, count)
 }
 
 pub const CONVERSATION_ARTIFACTS_CHANGED_EVENT: &str = "conversation://artifacts-changed";
@@ -323,6 +388,7 @@ impl ArtifactTracker {
         connection_id: &str,
         conversation_id: i32,
         client_message_id: Option<String>,
+        prompt_fingerprint: Option<String>,
         folder_id: Option<i32>,
         root_path: PathBuf,
         input_paths: Vec<String>,
@@ -387,6 +453,7 @@ impl ArtifactTracker {
                 conversation_id,
                 connection_id: connection_id.to_string(),
                 client_message_id,
+                prompt_fingerprint,
                 folder_id,
                 root_path: stored_root.clone(),
                 capture_incomplete,

@@ -23,6 +23,10 @@ pub struct Model {
     pub conversation_id: i32,
     pub connection_id: String,
     pub client_message_id: Option<String>,
+    /// SHA-256 of the normalized user-visible prompt blocks. This lets a
+    /// reloaded viewer bind the run to the parser's durable user-turn id
+    /// without relying on the sender-only optimistic id or wall-clock guesses.
+    pub prompt_fingerprint: Option<String>,
     pub folder_id: Option<i32>,
     pub root_path: String,
     pub status: ConversationTurnRunStatus,

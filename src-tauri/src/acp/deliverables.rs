@@ -608,29 +608,39 @@ impl SessionDeliverableAccess for DbSessionDeliverableAccess {
                     continue;
                 }
             };
-            let role = item
-                .role
-                .as_deref()
-                .map(str::trim)
-                .filter(|role| !role.is_empty())
-                .unwrap_or("primary");
-            if role != "primary" && role != "supporting" {
-                outcome
-                    .rejected
-                    .push(rejected(raw_path, "role must be `primary` or `supporting`"));
-                continue;
-            }
             let category = item
                 .category
                 .as_deref()
                 .map(str::trim)
                 .filter(|category| !category.is_empty())
-                .unwrap_or_else(|| default_category(extension.as_deref()));
+                .unwrap_or_else(|| {
+                    if kind == "directory" {
+                        "standalone_output"
+                    } else {
+                        default_category(extension.as_deref())
+                    }
+                });
             if !matches!(category, "code_change" | "standalone_output") {
                 outcome.rejected.push(rejected(
                     raw_path,
                     "category must be `code_change` or `standalone_output`",
                 ));
+                continue;
+            }
+            let role = item
+                .role
+                .as_deref()
+                .map(str::trim)
+                .filter(|role| !role.is_empty())
+                .unwrap_or(if category == "code_change" {
+                    "supporting"
+                } else {
+                    "primary"
+                });
+            if role != "primary" && role != "supporting" {
+                outcome
+                    .rejected
+                    .push(rejected(raw_path, "role must be `primary` or `supporting`"));
                 continue;
             }
             if deleting && category != "code_change" {
@@ -866,6 +876,7 @@ mod tests {
                 conversation_id,
                 connection_id: "connection-1".into(),
                 client_message_id: Some("message-1".into()),
+                prompt_fingerprint: None,
                 folder_id: Some(folder_id),
                 root_path: std::fs::canonicalize(workspace.path())
                     .expect("canonical workspace")
@@ -1071,6 +1082,7 @@ mod tests {
                 conversation_id,
                 connection_id: "connection-code".into(),
                 client_message_id: Some("message-code".into()),
+                prompt_fingerprint: None,
                 folder_id: Some(folder_id),
                 root_path: std::fs::canonicalize(workspace.path())
                     .expect("canonical workspace")
@@ -1089,7 +1101,7 @@ mod tests {
                 path: "src/lib.rs".into(),
                 title: Some("Implementation".into()),
                 description: None,
-                role: Some("primary".into()),
+                role: None,
                 category: Some("code_change".into()),
                 change_kind: Some("modified".into()),
             }],
@@ -1108,6 +1120,7 @@ mod tests {
         assert_eq!(first.declaration_status, "success");
         assert_eq!(first.accepted[0].category, "code_change");
         assert_eq!(first.accepted[0].change_kind, "modified");
+        assert_eq!(first.accepted[0].role, "supporting");
 
         artifact_service::finish_run(
             &db.conn,
@@ -1160,6 +1173,7 @@ mod tests {
                 conversation_id,
                 connection_id: "connection-failed".into(),
                 client_message_id: Some("message-failed".into()),
+                prompt_fingerprint: None,
                 folder_id: Some(folder_id),
                 root_path: std::fs::canonicalize(workspace.path())
                     .expect("canonical workspace")
