@@ -176,6 +176,7 @@ async fn end_to_end_uds_publish_deliverables_replaces_only_the_active_turn() {
             conversation_id,
             connection_id: "p1".into(),
             client_message_id: Some("optimistic-publish".into()),
+            prompt_fingerprint: None,
             folder_id: Some(folder_id),
             root_path: root.to_string_lossy().to_string(),
             capture_incomplete: false,

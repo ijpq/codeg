@@ -4,17 +4,17 @@ use std::sync::Arc;
 
 use sacp::schema::{
     BlobResourceContents, CancelNotification, ClientCapabilities, ContentBlock, ContentChunk,
-    CreateTerminalRequest, CreateTerminalResponse,
-    ElicitationCapabilities, ElicitationFormCapabilities, EmbeddedResource, EmbeddedResourceResource,
+    CreateTerminalRequest, CreateTerminalResponse, ElicitationCapabilities,
+    ElicitationFormCapabilities, EmbeddedResource, EmbeddedResourceResource,
     FileSystemCapabilities, ImageContent, InitializeRequest, KillTerminalRequest,
     KillTerminalResponse, LoadSessionRequest, NewSessionRequest, NewSessionResponse,
     PermissionOptionKind, Plan, PlanEntryPriority, PlanEntryStatus, PromptRequest, ProtocolVersion,
     ReadTextFileRequest, ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse, ResourceLink,
     ResumeSessionRequest, ResumeSessionResponse, SelectedPermissionOutcome, SessionConfigKind,
-    SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigSelectGroup, SessionConfigSelectOption, SessionConfigSelectOptions, SessionId,
-    SessionModeState, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectGroup,
+    SessionConfigSelectOption, SessionConfigSelectOptions, SessionId, SessionModeState,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
     SetSessionConfigOptionResponse, SetSessionModeRequest, StopReason, TerminalExitStatus,
     TerminalOutputRequest, TerminalOutputResponse, TextContent, TextResourceContents,
     ToolCallContent, WaitForTerminalExitRequest, WaitForTerminalExitResponse, WriteTextFileRequest,
@@ -91,14 +91,15 @@ fn merge_agent_env(
 /// Gated on the explicit `CURSOR_AUTH_MODE` knob (written by the Cursor panel),
 /// so legacy rows and operator-provided container env are left untouched. In
 /// custom mode the credentials are present and non-empty, so nothing is cleared.
-fn apply_cursor_env_policy(merged: &mut Vec<(String, String)>, runtime_env: &BTreeMap<String, String>) {
+fn apply_cursor_env_policy(
+    merged: &mut Vec<(String, String)>,
+    runtime_env: &BTreeMap<String, String>,
+) {
     if runtime_env.get("CURSOR_AUTH_MODE").map(String::as_str) != Some("subscription") {
         return;
     }
     for key in ["CURSOR_API_KEY", "CURSOR_API_BASE_URL"] {
-        let already_set = merged
-            .iter()
-            .any(|(k, v)| k == key && !v.trim().is_empty());
+        let already_set = merged.iter().any(|(k, v)| k == key && !v.trim().is_empty());
         if !already_set {
             merged.retain(|(k, _)| k != key);
             merged.push((key.to_string(), String::new()));
@@ -115,14 +116,15 @@ fn apply_cursor_env_policy(merged: &mut Vec<(String, String)>, runtime_env: &BTr
 /// sacp-tokio) to `env_remove` the inherited var. In api_key mode the key is
 /// present and non-empty, so nothing is cleared; legacy/no-mode rows are left
 /// untouched.
-fn apply_grok_env_policy(merged: &mut Vec<(String, String)>, runtime_env: &BTreeMap<String, String>) {
+fn apply_grok_env_policy(
+    merged: &mut Vec<(String, String)>,
+    runtime_env: &BTreeMap<String, String>,
+) {
     if runtime_env.get("GROK_AUTH_MODE").map(String::as_str) != Some("subscription") {
         return;
     }
     let key = "XAI_API_KEY";
-    let already_set = merged
-        .iter()
-        .any(|(k, v)| k == key && !v.trim().is_empty());
+    let already_set = merged.iter().any(|(k, v)| k == key && !v.trim().is_empty());
     if !already_set {
         merged.retain(|(k, _)| k != key);
         merged.push((key.to_string(), String::new()));
@@ -447,10 +449,9 @@ async fn build_agent(
                 .unwrap_or_else(|| PathBuf::from(crate::process::normalized_program(cmd)));
 
             // Codex's upstream ACP adapter owns the app-server connection and
-            // active turn id. Prepare Codeg's anchor-verified compatibility
-            // copy so the connection loop can call its `session/steer`
-            // extension. Unknown/old adapters launch unchanged with capability
-            // false; the UI then keeps the existing feedback/queue behavior.
+            // active turn id. codex-acp 1.1.6+ launches unchanged and negotiates
+            // `_session/steering` during initialize. Only the older 1.1.2 bundle
+            // needs Codeg's anchor-verified compatibility copy.
             let prepared_steer = if meta.supports_steer {
                 match crate::acp::codex_steer_adapter::prepare(&resolved_launcher).await {
                     Ok(prepared) => prepared,
@@ -460,7 +461,7 @@ async fn build_agent(
                         // problem must not make an otherwise usable Codex
                         // connection fail to launch.
                         tracing::warn!(
-                            "[ACP][Codex] native steer disabled: adapter preparation failed: {error}"
+                            "[ACP][Codex] legacy steer adapter preparation failed: {error}"
                         );
                         None
                     }
@@ -581,10 +582,7 @@ async fn build_agent(
             let binary_path = match cached {
                 Some((path, cached_version)) => {
                     if cached_version == registry_version {
-                        tracing::info!(
-                            "[ACP][{}] Using cached binary {cached_version}",
-                            meta.name
-                        );
+                        tracing::info!("[ACP][{}] Using cached binary {cached_version}", meta.name);
                     } else {
                         tracing::info!(
                             "[ACP][{}] Using cached binary {cached_version} (registry recommends {registry_version})",
@@ -762,7 +760,8 @@ async fn build_agent(
                 // than provisioned through uvx.
                 tracing::warn!(
                     "[ACP][{}] uvx unavailable; falling back to system command {:?}",
-                    meta.name, sys_path
+                    meta.name,
+                    sys_path
                 );
                 // `system_cmd` is a complete launch recipe for the PATH binary;
                 // the uvx entry-script `args` don't necessarily apply to it
@@ -930,8 +929,7 @@ pub async fn spawn_agent_connection(
     // Derived from the same `runtime_env` we hand the agent (minus per-launch
     // volatile keys) plus the agent's native config file content, so a later
     // settings save can be compared against it to detect a stale running session.
-    let config_fingerprint =
-        crate::commands::acp::fingerprint_config(agent_type, &runtime_env);
+    let config_fingerprint = crate::commands::acp::fingerprint_config(agent_type, &runtime_env);
 
     // Insert the entry BEFORE spawning the background task so that a
     // fast-failing `run_connection` can never remove it before it was
@@ -2073,18 +2071,16 @@ async fn send_resume_session(
     cx: &ConnectionTo<Agent>,
     req: ResumeSessionRequest,
 ) -> Result<(ResumeSessionResponse, Option<serde_json::Value>), sacp::Error> {
-    let untyped_req = UntypedMessage::new("session/resume", req).map_err(|e| {
-        sacp::util::internal_error(format!("Failed to build resume request: {e}"))
-    })?;
+    let untyped_req = UntypedMessage::new("session/resume", req)
+        .map_err(|e| sacp::util::internal_error(format!("Failed to build resume request: {e}")))?;
 
     let raw_response = cx.send_request_to(Agent, untyped_req).block_task().await?;
     // Capture the raw top-level `models` (per-model reasoning-effort data) BEFORE
     // deserializing into the typed response, which drops it (Grok only — the
     // field survives serde as an ignored unknown for other agents).
     let models = raw_response.get("models").cloned();
-    let resp = serde_json::from_value(raw_response).map_err(|e| {
-        sacp::util::internal_error(format!("Failed to parse resume response: {e}"))
-    })?;
+    let resp = serde_json::from_value(raw_response)
+        .map_err(|e| sacp::util::internal_error(format!("Failed to parse resume response: {e}")))?;
     Ok((resp, models))
 }
 
@@ -2843,24 +2839,22 @@ async fn run_connection(
             )
             .await;
 
-            // Capability comes from the concrete adapter handshake, not from
-            // the frontend or an agent-name check. Codeg's compatibility shim
-            // publishes this marker only when its `session/steer` request
-            // handler is installed; a future upstream adapter can publish the
-            // same extension without any Codeg-side launch special case.
-            let supports_steer = init_resp
-                .agent_capabilities
-                .meta
-                .as_ref()
-                .and_then(|meta| meta.get("codeg/steer"))
-                .is_some_and(|capability| {
-                    capability.get("method").and_then(serde_json::Value::as_str)
-                        == Some("session/steer")
-                        && capability
-                            .get("version")
-                            .and_then(serde_json::Value::as_u64)
-                            .is_some_and(|version| version >= 1)
-                });
+            // Negotiate against the concrete initialize handshake. codex-acp
+            // 1.1.6+ advertises `_meta.steering.supported` and serves
+            // `_session/steering`; the old Codeg compatibility copy advertises
+            // `_meta["codeg/steer"]` and serves `session/steer`. Prefer the
+            // upstream protocol when both markers are ever present.
+            let steer_protocol = negotiate_steer_protocol(
+                init_resp.meta.as_ref(),
+                init_resp.agent_capabilities.meta.as_ref(),
+            );
+            let supports_steer = steer_protocol.is_some();
+            if let Some(protocol) = steer_protocol {
+                tracing::info!(
+                    "[ACP][{agent_name_for_log}] negotiated native steering protocol {}",
+                    protocol.method()
+                );
+            }
             emit_with_state(
                 &state,
                 &emitter_clone,
@@ -3072,6 +3066,7 @@ async fn run_connection(
                                 terminal_runtime.clone(),
                                 &cwd_string,
                                 supports_fork,
+                                steer_protocol,
                                 &prompt_ledger,
                                 delegation_injection.as_ref(),
                             )
@@ -3093,6 +3088,7 @@ async fn run_connection(
                                 terminal_runtime.clone(),
                                 &cwd,
                                 &cwd_string,
+                                steer_protocol,
                                 &prompt_ledger,
                                 delegation_injection.as_ref(),
                             )
@@ -3234,6 +3230,7 @@ async fn run_connection(
                             terminal_runtime.clone(),
                             &cwd_string,
                             supports_fork,
+                            steer_protocol,
                             &prompt_ledger,
                             delegation_injection.as_ref(),
                         )
@@ -3251,6 +3248,7 @@ async fn run_connection(
                             terminal_runtime.clone(),
                             &cwd,
                             &cwd_string,
+                            steer_protocol,
                             &prompt_ledger,
                             delegation_injection.as_ref(),
                         )
@@ -3371,6 +3369,7 @@ async fn run_connection(
                             terminal_runtime.clone(),
                             &cwd_string,
                             supports_fork,
+                            steer_protocol,
                             &prompt_ledger,
                             delegation_injection.as_ref(),
                         )
@@ -3390,6 +3389,7 @@ async fn run_connection(
                             terminal_runtime.clone(),
                             &cwd,
                             &cwd_string,
+                            steer_protocol,
                             &prompt_ledger,
                             delegation_injection.as_ref(),
                         )
@@ -3449,6 +3449,7 @@ async fn run_connection(
                     terminal_runtime.clone(),
                     &cwd_string,
                     supports_fork,
+                    steer_protocol,
                     &prompt_ledger,
                     delegation_injection.as_ref(),
                 )
@@ -3466,6 +3467,7 @@ async fn run_connection(
                     terminal_runtime.clone(),
                     &cwd,
                     &cwd_string,
+                    steer_protocol,
                     &prompt_ledger,
                     delegation_injection.as_ref(),
                 )
@@ -3653,8 +3655,7 @@ async fn handle_grok_exit_plan_mode(
             .map(|o| o.keys().map(String::as_str).collect::<Vec<_>>())
     );
     let Some(access) = access else {
-        let _ =
-            responder.respond(crate::acp::plan_approval::grok_exit_plan_disconnect_response());
+        let _ = responder.respond(crate::acp::plan_approval::grok_exit_plan_disconnect_response());
         return;
     };
     let (plan_markdown, tool_call_id) =
@@ -3676,8 +3677,7 @@ async fn handle_grok_exit_plan_mode(
         .await
     else {
         // Connection gone, or an approval is already pending on this connection.
-        let _ =
-            responder.respond(crate::acp::plan_approval::grok_exit_plan_disconnect_response());
+        let _ = responder.respond(crate::acp::plan_approval::grok_exit_plan_disconnect_response());
         return;
     };
     // The user answers out-of-band (the HTTP `answer_plan_approval` endpoint
@@ -4107,40 +4107,150 @@ fn classify_steer_wire_error(error: sacp::Error) -> AcpError {
     {
         return AcpError::NoActiveSteerTurn;
     }
-    AcpError::protocol(format!("turn/steer failed: {message}"))
+    AcpError::protocol(format!("native steering failed: {message}"))
 }
 
-/// Send Codeg's adapter extension. The adapter supplies the active Codex turn
-/// id as app-server's required `expectedTurnId`; the response is the app-server
-/// `{ turnId }`, never a newly-created ACP turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SteerProtocol {
+    /// Codeg's derived codex-acp 1.1.2 compatibility copy.
+    LegacyCodegV1,
+    /// Upstream codex-acp 1.1.6+ protocol.
+    CodexNative,
+}
+
+impl SteerProtocol {
+    fn method(self) -> &'static str {
+        match self {
+            Self::LegacyCodegV1 => "session/steer",
+            Self::CodexNative => "_session/steering",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SteerWireOutcome {
+    Injected,
+    StartedNewTurn,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SteerWireResult {
+    turn_id: Option<String>,
+    outcome: SteerWireOutcome,
+}
+
+fn negotiate_steer_protocol(
+    initialize_meta: Option<&serde_json::Map<String, serde_json::Value>>,
+    capabilities_meta: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Option<SteerProtocol> {
+    // codex-acp 1.1.6+ publishes this on InitializeResponse._meta (not inside
+    // agentCapabilities). Accepting the capabilities location too is harmless
+    // and keeps the client tolerant of adapters that scoped the marker there.
+    let native = |meta: &serde_json::Map<String, serde_json::Value>| {
+        meta.get("steering")
+            .and_then(|capability| capability.get("supported"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    };
+    if initialize_meta.is_some_and(native) || capabilities_meta.is_some_and(native) {
+        return Some(SteerProtocol::CodexNative);
+    }
+    if capabilities_meta
+        .and_then(|meta| meta.get("codeg/steer"))
+        .is_some_and(|capability| {
+            capability.get("method").and_then(serde_json::Value::as_str) == Some("session/steer")
+                && capability
+                    .get("version")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|version| version >= 1)
+        })
+    {
+        return Some(SteerProtocol::LegacyCodegV1);
+    }
+    None
+}
+
+fn parse_steer_wire_response(
+    protocol: SteerProtocol,
+    raw: serde_json::Value,
+) -> Result<SteerWireResult, AcpError> {
+    match protocol {
+        SteerProtocol::LegacyCodegV1 => {
+            let turn_id = raw
+                .get("turnId")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| AcpError::protocol("turn/steer response missing turnId"))?;
+            Ok(SteerWireResult {
+                turn_id: Some(turn_id),
+                outcome: SteerWireOutcome::Injected,
+            })
+        }
+        SteerProtocol::CodexNative => {
+            match raw.get("outcome").and_then(serde_json::Value::as_str) {
+                Some("injected") => Ok(SteerWireResult {
+                    turn_id: None,
+                    outcome: SteerWireOutcome::Injected,
+                }),
+                // A turn can finish between Codeg's in-flight gate and codex-acp
+                // handling the request. Upstream deliberately starts a new turn in
+                // that race. Treat it as accepted so the frontend never queues and
+                // sends the same user message a second time.
+                Some("startedNewTurn") => Ok(SteerWireResult {
+                    turn_id: None,
+                    outcome: SteerWireOutcome::StartedNewTurn,
+                }),
+                Some("failed") => Err(AcpError::protocol(
+                    "_session/steering reported a failed outcome",
+                )),
+                Some(outcome) => Err(AcpError::protocol(format!(
+                    "_session/steering returned unknown outcome {outcome:?}"
+                ))),
+                None => Err(AcpError::protocol(
+                    "_session/steering response missing outcome",
+                )),
+            }
+        }
+    }
+}
+
+/// Send whichever steering extension was negotiated during initialize.
+///
+/// The legacy adapter supplies the active Codex turn id as app-server's
+/// required `expectedTurnId` and returns `{ turnId }`. Upstream codex-acp owns
+/// that detail and returns only `{ outcome }`.
 async fn steer_session(
     cx: &ConnectionTo<Agent>,
     session_id: &SessionId,
     blocks: Vec<PromptInputBlock>,
     client_message_id: &str,
-) -> Result<String, AcpError> {
+    protocol: SteerProtocol,
+) -> Result<SteerWireResult, AcpError> {
     let prompt = map_prompt_blocks(blocks);
     if prompt.is_empty() {
         return Err(AcpError::InvalidSteer(
             "message must contain at least one content block".into(),
         ));
     }
-    let request = serde_json::json!({
-        "sessionId": session_id,
-        "prompt": prompt,
-        "clientMessageId": client_message_id,
-    });
-    let untyped = UntypedMessage::new("session/steer", request)
+    let request = match protocol {
+        SteerProtocol::LegacyCodegV1 => serde_json::json!({
+            "sessionId": session_id,
+            "prompt": prompt,
+            "clientMessageId": client_message_id,
+        }),
+        SteerProtocol::CodexNative => serde_json::json!({
+            "sessionId": session_id,
+            "prompt": prompt,
+        }),
+    };
+    let untyped = UntypedMessage::new(protocol.method(), request)
         .map_err(|error| AcpError::protocol(format!("invalid steer request: {error}")))?;
     let raw = cx
         .send_request_to(Agent, untyped)
         .block_task()
         .await
         .map_err(classify_steer_wire_error)?;
-    raw.get("turnId")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string)
-        .ok_or_else(|| AcpError::protocol("turn/steer response missing turnId"))
+    parse_steer_wire_response(protocol, raw)
 }
 
 /// Apply user-saved mode and config-option preferences to a freshly-attached
@@ -4180,7 +4290,9 @@ async fn apply_preferred_session_options(
             .unwrap_or(false);
         if needs_apply {
             if let Err(e) = set_session_mode(session, state, emitter, pref_mode.to_string()).await {
-                tracing::error!("[ACP] failed to apply preferred mode '{pref_mode}' on connect: {e}");
+                tracing::error!(
+                    "[ACP] failed to apply preferred mode '{pref_mode}' on connect: {e}"
+                );
             }
         }
     }
@@ -4715,7 +4827,8 @@ async fn poll_tracked_terminal_tool_calls(
                 Err(err) => {
                     tracing::error!(
                         "[ACP] Failed to poll terminal output for tool call {}: {:?}",
-                        tool_call_id, err
+                        tool_call_id,
+                        err
                     );
                     continue;
                 }
@@ -4876,6 +4989,7 @@ async fn handle_fork_or_exit(
     terminal_runtime: Arc<TerminalRuntime>,
     _cwd: &std::path::Path,
     cwd_string: &str,
+    steer_protocol: Option<SteerProtocol>,
     // Threaded through from run_connection: the connection-scoped prompt
     // ledger (the forked session's loop keeps fingerprinting into the SAME
     // ledger the still-running watcher consumes from).
@@ -4898,7 +5012,8 @@ async fn handle_fork_or_exit(
 
     tracing::info!(
         "[ACP] Fork transition: attaching to forked session {} (original: {})",
-        new_sid, fork_info.original_session_id
+        new_sid,
+        fork_info.original_session_id
     );
 
     // Reply protocol-level result to manager.fork_session, which will combine
@@ -4962,6 +5077,7 @@ async fn handle_fork_or_exit(
         terminal_runtime.clone(),
         cwd_string,
         true, // fork already succeeded on this process
+        steer_protocol,
         prompt_ledger,
         delegation_injection,
     )
@@ -4981,6 +5097,7 @@ async fn handle_fork_or_exit(
         terminal_runtime,
         _cwd,
         cwd_string,
+        steer_protocol,
         prompt_ledger,
         delegation_injection,
     ))
@@ -5032,8 +5149,7 @@ fn classify_session_load_failure(
     //                          "The Claude Agent process exited unexpectedly…"
     //  - "session has ended" → SESSION_ENDED_MESSAGE
     //  - "Session not found" → a plain Error rethrown as an Internal error
-    const UNRECOVERABLE: &[&str] =
-        &["process exited", "session has ended", "Session not found"];
+    const UNRECOVERABLE: &[&str] = &["process exited", "session has ended", "Session not found"];
     if UNRECOVERABLE.iter().any(|s| message.contains(s)) {
         return Some("session_unavailable");
     }
@@ -5123,6 +5239,7 @@ async fn run_conversation_loop<'a>(
     terminal_runtime: Arc<TerminalRuntime>,
     cwd: &str,
     supports_fork: bool,
+    steer_protocol: Option<SteerProtocol>,
     // Connection-scoped (created once in `run_connection`, shared across fork
     // restarts of this loop): outgoing prompts are fingerprinted here so the
     // transcript watcher can classify their turns as wire-rendered foreground.
@@ -5554,20 +5671,30 @@ async fn run_conversation_loop<'a>(
                                     }
                                     let rendered_blocks =
                                         crate::acp::user_blocks_from_prompt(&blocks);
-                                    let result = steer_session(
-                                        &cx,
-                                        &sid,
-                                        blocks,
-                                        &client_message_id,
-                                    )
-                                    .await;
+                                    let result = match steer_protocol {
+                                        Some(protocol) => {
+                                            steer_session(
+                                                &cx,
+                                                &sid,
+                                                blocks,
+                                                &client_message_id,
+                                                protocol,
+                                            )
+                                            .await
+                                        }
+                                        None => Err(AcpError::SteerUnsupported),
+                                    };
                                     match result {
-                                        Ok(turn_id) => {
+                                        Ok(wire_result) => {
                                             tracing::info!(
-                                                "[ACP][Codex] turn/steer injected connection_id={} session_id={} turn_id={} client_message_id={}",
+                                                "[ACP][Codex] native steer accepted connection_id={} session_id={} method={} outcome={:?} turn_id={:?} client_message_id={}",
                                                 conn_id,
                                                 sid.0,
-                                                turn_id,
+                                                steer_protocol
+                                                    .map(SteerProtocol::method)
+                                                    .unwrap_or("<unavailable>"),
+                                                wire_result.outcome,
+                                                wire_result.turn_id,
                                                 client_message_id
                                             );
                                             emit_with_state(
@@ -5576,12 +5703,12 @@ async fn run_conversation_loop<'a>(
                                                 AcpEvent::SteerMessage {
                                                     message_id: client_message_id.clone(),
                                                     blocks: rendered_blocks,
-                                                    turn_id: turn_id.clone(),
+                                                    turn_id: wire_result.turn_id.clone(),
                                                 },
                                             )
                                             .await;
                                             let result = SteerResult {
-                                                turn_id,
+                                                turn_id: wire_result.turn_id,
                                                 message_id: client_message_id,
                                                 deduplicated: false,
                                             };
@@ -5957,7 +6084,8 @@ async fn run_conversation_loop<'a>(
                 let sid = session.session_id().clone();
                 tracing::info!(
                     "[ACP] Sending session/fork for session_id={} cwd={}",
-                    sid.0, cwd
+                    sid.0,
+                    cwd
                 );
                 let result = crate::acp::fork::fork_session(&cx, &sid, cwd).await;
                 match result {
@@ -5996,10 +6124,7 @@ async fn run_conversation_loop<'a>(
 /// (doubling the event) and the hunkless full-file `--- /+++` blob stays in the
 /// tool `output`, where `extractEditLineChangeStats` mis-counts it as full-file
 /// +/- totals in the card header even though the body shows the compact diff.
-fn serialize_tool_call_content(
-    content: &[ToolCallContent],
-    include_diffs: bool,
-) -> Option<String> {
+fn serialize_tool_call_content(content: &[ToolCallContent], include_diffs: bool) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     for item in content {
         match item {
@@ -6127,10 +6252,7 @@ fn build_new_file_diff(path: &str, new_text: &str) -> String {
     // it keeps the trailing empty segment from a final newline, so the `+N`
     // count and the trailing `+` addition line match exactly.
     let lines: Vec<&str> = new_text.split('\n').collect();
-    let mut out = format!(
-        "--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,{} @@",
-        lines.len()
-    );
+    let mut out = format!("--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,{} @@", lines.len());
     for line in lines {
         out.push('\n');
         out.push('+');
@@ -6378,7 +6500,10 @@ fn cursor_companion_title_from_content(content: Option<&str>) -> Option<&'static
     let is_report_item = |t: &serde_json::Value| {
         t.get("task_id").and_then(|x| x.as_str()).is_some()
             && t.get("status").and_then(|x| x.as_str()).is_some_and(|s| {
-                matches!(s, "running" | "completed" | "failed" | "canceled" | "unknown")
+                matches!(
+                    s,
+                    "running" | "completed" | "failed" | "canceled" | "unknown"
+                )
             })
     };
     if !tasks.is_empty() && tasks.iter().all(is_report_item) {
@@ -6430,7 +6555,10 @@ fn is_subagent_invocation(agent_type: AgentType, raw_input: &Option<String>) -> 
 /// historical unwrap in `parsers/codebuddy.rs`. `raw_input` is left untouched
 /// (the cards peel `params` themselves, and that keeps `inferFromInput` from
 /// misclassifying `cancel_delegation`'s `{task_id}` as a generic task).
-fn codebuddy_deferred_tool_name(agent_type: AgentType, raw_input: &Option<String>) -> Option<String> {
+fn codebuddy_deferred_tool_name(
+    agent_type: AgentType,
+    raw_input: &Option<String>,
+) -> Option<String> {
     if agent_type != AgentType::CodeBuddy {
         return None;
     }
@@ -6498,7 +6626,11 @@ fn codebuddy_meta_marks_subagent(
     if meta.get("codebuddy.ai/toolName").and_then(|v| v.as_str()) == Some("Agent") {
         return true;
     }
-    if meta.get("codebuddy.ai/isSubagent").and_then(|v| v.as_bool()) == Some(true) {
+    if meta
+        .get("codebuddy.ai/isSubagent")
+        .and_then(|v| v.as_bool())
+        == Some(true)
+    {
         return true;
     }
     meta.get("codebuddy.ai/subagentType")
@@ -6617,7 +6749,11 @@ fn codebuddy_chunk_marks_subagent(
     let Some(meta) = meta else {
         return false;
     };
-    if meta.get("codebuddy.ai/isSubagent").and_then(|v| v.as_bool()) == Some(true) {
+    if meta
+        .get("codebuddy.ai/isSubagent")
+        .and_then(|v| v.as_bool())
+        == Some(true)
+    {
         return true;
     }
     meta.get("codebuddy.ai/parentToolCallId")
@@ -6877,8 +7013,7 @@ fn map_claude_sdk_ext_notification(notification: &UntypedMessage) -> Option<AcpE
 /// Both share the standard `session/update` envelope (`params.update.
 /// sessionUpdate` + fields, verified live against grok 0.2.111) but carry
 /// variants the typed ACP pipeline can't deserialize, so codeg drops them.
-const GROK_EXT_UPDATE_METHODS: [&str; 2] =
-    ["_x.ai/session_notification", "_x.ai/session/update"];
+const GROK_EXT_UPDATE_METHODS: [&str; 2] = ["_x.ai/session_notification", "_x.ai/session/update"];
 
 /// A stable id for a synthetic event derived from a grok ext notification —
 /// grok stamps `params._meta.eventId`; fall back to a fresh uuid.
@@ -7158,7 +7293,8 @@ async fn emit_conversation_update(
             // `meta_marks_background` keeps a concurrent sub-agent out of the
             // suppression window (see fn docs).
             let meta_marks_subagent = codebuddy_meta_marks_subagent(agent_type, tc.meta.as_ref());
-            let meta_marks_background = codebuddy_meta_marks_background(agent_type, tc.meta.as_ref());
+            let meta_marks_background =
+                codebuddy_meta_marks_background(agent_type, tc.meta.as_ref());
             let meta = tc.meta.map(serde_json::Value::Object);
             let status = format!("{:?}", tc.status).to_lowercase();
             raw_output_cache.remove_if_final(&tool_call_id, Some(status.as_str()));
@@ -7261,9 +7397,7 @@ async fn emit_conversation_update(
                 Some((_, inner)) => {
                     json_value_to_text(&Some(inner.clone())).filter(|t| !t.trim().is_empty())
                 }
-                None => {
-                    json_value_to_text(&tcu.fields.raw_input).filter(|t| !t.trim().is_empty())
-                }
+                None => json_value_to_text(&tcu.fields.raw_input).filter(|t| !t.trim().is_empty()),
             };
             let synthesized_edit = if own_raw_input.is_none() {
                 tcu.fields
@@ -7316,7 +7450,8 @@ async fn emit_conversation_update(
                 .filter(|l| !l.is_empty())
                 .and_then(|l| serde_json::to_value(l).ok());
             let meta_marks_subagent = codebuddy_meta_marks_subagent(agent_type, tcu.meta.as_ref());
-            let meta_marks_background = codebuddy_meta_marks_background(agent_type, tcu.meta.as_ref());
+            let meta_marks_background =
+                codebuddy_meta_marks_background(agent_type, tcu.meta.as_ref());
             let meta = tcu.meta.clone().map(serde_json::Value::Object);
             let status = tcu.fields.status.map(|s| format!("{:?}", s).to_lowercase());
             raw_output_cache.remove_if_final(&tool_call_id, status.as_deref());
@@ -7540,7 +7675,9 @@ mod tests {
         assert!(!GrokAskUserQuestionRequest::matches_method(
             "x.ai/ask_user_question"
         ));
-        assert!(!GrokAskUserQuestionRequest::matches_method("session/prompt"));
+        assert!(!GrokAskUserQuestionRequest::matches_method(
+            "session/prompt"
+        ));
 
         // The exact params grok sends (captured from a real 0.2.101 run): the
         // transparent newtype must deserialize them and the raw object must parse
@@ -7583,6 +7720,96 @@ mod tests {
     }
 
     #[test]
+    fn steering_negotiation_prefers_upstream_protocol_and_keeps_legacy_support() {
+        let native = meta_map(serde_json::json!({
+            "steering": { "supported": true }
+        }));
+        assert_eq!(
+            negotiate_steer_protocol(Some(&native), None),
+            Some(SteerProtocol::CodexNative)
+        );
+        assert_eq!(SteerProtocol::CodexNative.method(), "_session/steering");
+
+        let legacy = meta_map(serde_json::json!({
+            "codeg/steer": { "method": "session/steer", "version": 1 }
+        }));
+        assert_eq!(
+            negotiate_steer_protocol(None, Some(&legacy)),
+            Some(SteerProtocol::LegacyCodegV1)
+        );
+        assert_eq!(SteerProtocol::LegacyCodegV1.method(), "session/steer");
+
+        let both = meta_map(serde_json::json!({
+            "steering": { "supported": true },
+            "codeg/steer": { "method": "session/steer", "version": 1 }
+        }));
+        assert_eq!(
+            negotiate_steer_protocol(Some(&both), Some(&both)),
+            Some(SteerProtocol::CodexNative)
+        );
+
+        let disabled = meta_map(serde_json::json!({
+            "steering": { "supported": false },
+            "codeg/steer": { "method": "wrong", "version": 1 }
+        }));
+        assert_eq!(
+            negotiate_steer_protocol(Some(&disabled), Some(&disabled)),
+            None
+        );
+        assert_eq!(negotiate_steer_protocol(None, None), None);
+    }
+
+    #[test]
+    fn parses_upstream_steering_outcomes_without_inventing_turn_ids() {
+        assert_eq!(
+            parse_steer_wire_response(
+                SteerProtocol::CodexNative,
+                serde_json::json!({ "outcome": "injected" }),
+            )
+            .expect("injected response"),
+            SteerWireResult {
+                turn_id: None,
+                outcome: SteerWireOutcome::Injected,
+            }
+        );
+        assert_eq!(
+            parse_steer_wire_response(
+                SteerProtocol::CodexNative,
+                serde_json::json!({ "outcome": "startedNewTurn" }),
+            )
+            .expect("turn-end race remains accepted"),
+            SteerWireResult {
+                turn_id: None,
+                outcome: SteerWireOutcome::StartedNewTurn,
+            }
+        );
+        assert!(parse_steer_wire_response(
+            SteerProtocol::CodexNative,
+            serde_json::json!({ "outcome": "failed" }),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn parses_legacy_steer_turn_id() {
+        assert_eq!(
+            parse_steer_wire_response(
+                SteerProtocol::LegacyCodegV1,
+                serde_json::json!({ "turnId": "turn-live" }),
+            )
+            .expect("legacy response"),
+            SteerWireResult {
+                turn_id: Some("turn-live".into()),
+                outcome: SteerWireOutcome::Injected,
+            }
+        );
+        assert!(
+            parse_steer_wire_response(SteerProtocol::LegacyCodegV1, serde_json::json!({}),)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn codex_subagent_activity_detected_only_for_codex_subagent_meta() {
         // codex-acp #304: `_meta.codex.subagent` marks the suppressed activity.
         let sub = meta_map(serde_json::json!({
@@ -7590,7 +7817,10 @@ mod tests {
         }));
         assert!(is_codex_subagent_activity(AgentType::Codex, Some(&sub)));
         // Only Codex is gated — the same meta never suppresses another agent.
-        assert!(!is_codex_subagent_activity(AgentType::ClaudeCode, Some(&sub)));
+        assert!(!is_codex_subagent_activity(
+            AgentType::ClaudeCode,
+            Some(&sub)
+        ));
         // Absent meta and sibling codex meta keys (goal / collaboration) are not
         // subagent activity and must render normally.
         assert!(!is_codex_subagent_activity(AgentType::Codex, None));
@@ -7615,7 +7845,10 @@ mod tests {
                 "presentation": "state"
             }
         }));
-        assert!(is_config_option_state_command(AgentType::Codex, Some(&plan)));
+        assert!(is_config_option_state_command(
+            AgentType::Codex,
+            Some(&plan)
+        ));
         // Gated on Codex — the same meta never suppresses another agent's command.
         assert!(!is_config_option_state_command(
             AgentType::ClaudeCode,
@@ -7626,7 +7859,10 @@ mod tests {
         let goal = meta_map(serde_json::json!({
             "commandAction": { "kind": "prefixPrompt", "presentation": "state" }
         }));
-        assert!(!is_config_option_state_command(AgentType::Codex, Some(&goal)));
+        assert!(!is_config_option_state_command(
+            AgentType::Codex,
+            Some(&goal)
+        ));
         // Ordinary commands (no `commandAction`) and absent meta are kept.
         assert!(!is_config_option_state_command(AgentType::Codex, None));
         let plain = meta_map(serde_json::json!({ "somethingElse": true }));
@@ -7798,7 +8034,9 @@ mod tests {
         // No configured creds → both injected empty (⇒ spawn strips inherited).
         let mut merged = vec![("PATH".to_string(), "/usr/bin".to_string())];
         apply_cursor_env_policy(&mut merged, &sub);
-        assert!(merged.iter().any(|(k, v)| k == "CURSOR_API_KEY" && v.is_empty()));
+        assert!(merged
+            .iter()
+            .any(|(k, v)| k == "CURSOR_API_KEY" && v.is_empty()));
         assert!(merged
             .iter()
             .any(|(k, v)| k == "CURSOR_API_BASE_URL" && v.is_empty()));
@@ -7806,7 +8044,9 @@ mod tests {
         // A configured key is preserved; only the absent base URL is cleared.
         let mut with_key = vec![("CURSOR_API_KEY".to_string(), "sk-x".to_string())];
         apply_cursor_env_policy(&mut with_key, &sub);
-        assert!(with_key.iter().any(|(k, v)| k == "CURSOR_API_KEY" && v == "sk-x"));
+        assert!(with_key
+            .iter()
+            .any(|(k, v)| k == "CURSOR_API_KEY" && v == "sk-x"));
         assert!(with_key
             .iter()
             .any(|(k, v)| k == "CURSOR_API_BASE_URL" && v.is_empty()));
@@ -7832,7 +8072,9 @@ mod tests {
         // inherited XAI_API_KEY so `grok login` is used).
         let mut merged = vec![("PATH".to_string(), "/usr/bin".to_string())];
         apply_grok_env_policy(&mut merged, &sub);
-        assert!(merged.iter().any(|(k, v)| k == "XAI_API_KEY" && v.is_empty()));
+        assert!(merged
+            .iter()
+            .any(|(k, v)| k == "XAI_API_KEY" && v.is_empty()));
 
         // A configured key is preserved even in subscription mode (explicit wins).
         let mut with_key = vec![("XAI_API_KEY".to_string(), "xai-abc".to_string())];
@@ -8029,8 +8271,10 @@ mod tests {
             true,
         );
         // Exactly one PATH-ish key, the original casing preserved, value prepended.
-        let path_keys: Vec<&String> =
-            env.keys().filter(|k| k.eq_ignore_ascii_case("PATH")).collect();
+        let path_keys: Vec<&String> = env
+            .keys()
+            .filter(|k| k.eq_ignore_ascii_case("PATH"))
+            .collect();
         assert_eq!(path_keys.len(), 1, "{env:?}");
         assert_eq!(
             env.get("Path").unwrap(),
@@ -8041,9 +8285,17 @@ mod tests {
     #[test]
     fn prepend_path_windows_seeds_from_fallback_with_semicolon() {
         let mut env = BTreeMap::new();
-        prepend_dir_to_path_env(&mut env, r"C:\OfficeCLI", r"C:\Windows;C:\Windows\System32", true);
+        prepend_dir_to_path_env(
+            &mut env,
+            r"C:\OfficeCLI",
+            r"C:\Windows;C:\Windows\System32",
+            true,
+        );
         // No prior key → default `Path` casing on Windows.
-        assert_eq!(env.get("Path").unwrap(), r"C:\OfficeCLI;C:\Windows;C:\Windows\System32");
+        assert_eq!(
+            env.get("Path").unwrap(),
+            r"C:\OfficeCLI;C:\Windows;C:\Windows\System32"
+        );
     }
 
     #[test]
@@ -8056,9 +8308,15 @@ mod tests {
         env.insert("PATH".to_string(), r"C:\a".to_string());
         env.insert("Path".to_string(), r"C:\b".to_string());
         prepend_dir_to_path_env(&mut env, r"C:\OfficeCLI", "ignored-fallback", true);
-        let path_keys: Vec<&String> =
-            env.keys().filter(|k| k.eq_ignore_ascii_case("PATH")).collect();
-        assert_eq!(path_keys.len(), 1, "exactly one PATH-ish key must remain: {env:?}");
+        let path_keys: Vec<&String> = env
+            .keys()
+            .filter(|k| k.eq_ignore_ascii_case("PATH"))
+            .collect();
+        assert_eq!(
+            path_keys.len(),
+            1,
+            "exactly one PATH-ish key must remain: {env:?}"
+        );
         assert_eq!(env.get("Path").unwrap(), r"C:\OfficeCLI;C:\b");
     }
 
@@ -8170,9 +8428,18 @@ mod tests {
                 assert_eq!(tool_call_id, "019f9475-c67f-7390-9ee5-a09d29986a6c-4");
                 assert_eq!(status, "completed");
                 let meta = meta.expect("compaction card needs meta");
-                assert_eq!(meta.get("contextCompaction").and_then(|v| v.as_bool()), Some(true));
-                assert_eq!(meta.get("tokensBefore").and_then(|v| v.as_u64()), Some(45389));
-                assert_eq!(meta.get("tokensAfter").and_then(|v| v.as_u64()), Some(16486));
+                assert_eq!(
+                    meta.get("contextCompaction").and_then(|v| v.as_bool()),
+                    Some(true)
+                );
+                assert_eq!(
+                    meta.get("tokensBefore").and_then(|v| v.as_u64()),
+                    Some(45389)
+                );
+                assert_eq!(
+                    meta.get("tokensAfter").and_then(|v| v.as_u64()),
+                    Some(16486)
+                );
             }
             other => panic!("expected ToolCall, got {other:?}"),
         }
@@ -8207,8 +8474,13 @@ mod tests {
         )
         .unwrap();
         match map_grok_ext_notification(&raw, AgentType::Grok) {
-            Some(AcpEvent::Error { message, terminal, .. }) => {
-                assert!(message.contains("503"), "error should carry the reason; got: {message}");
+            Some(AcpEvent::Error {
+                message, terminal, ..
+            }) => {
+                assert!(
+                    message.contains("503"),
+                    "error should carry the reason; got: {message}"
+                );
                 assert!(!terminal, "compaction failure must not kill the connection");
             }
             other => panic!("expected non-terminal Error, got {other:?}"),
@@ -8262,11 +8534,20 @@ mod tests {
             )
         };
         // Both compaction outcomes are visible turn output.
-        assert!(grok_ext_notification_is_turn_output(&notif("auto_compact_completed"), AgentType::Grok));
-        assert!(grok_ext_notification_is_turn_output(&notif("auto_compact_failed"), AgentType::Grok));
+        assert!(grok_ext_notification_is_turn_output(
+            &notif("auto_compact_completed"),
+            AgentType::Grok
+        ));
+        assert!(grok_ext_notification_is_turn_output(
+            &notif("auto_compact_failed"),
+            AgentType::Grok
+        ));
         // turn_completed is deliberately left to the prompt-response path — it is
         // NOT counted here (otherwise a genuinely empty turn would be masked).
-        assert!(!grok_ext_notification_is_turn_output(&notif("turn_completed"), AgentType::Grok));
+        assert!(!grok_ext_notification_is_turn_output(
+            &notif("turn_completed"),
+            AgentType::Grok
+        ));
         // Never fires for a non-grok agent.
         assert!(!grok_ext_notification_is_turn_output(
             &notif("auto_compact_completed"),
@@ -8382,11 +8663,12 @@ mod tests {
     fn codex_resume_request_preserves_codeg_mcp_deliverables_companion() {
         let cwd = std::path::PathBuf::from("/tmp/codeg");
         let companion = McpServer::Stdio(
-            McpServerStdio::new("codeg-mcp", std::path::PathBuf::from("/opt/codeg-mcp"))
-                .args(vec![
+            McpServerStdio::new("codeg-mcp", std::path::PathBuf::from("/opt/codeg-mcp")).args(
+                vec![
                     "--features".to_string(),
                     "deliverables,feedback,ask,sessions".to_string(),
-                ]),
+                ],
+            ),
         );
         let req = build_resume_session_request(
             AgentType::Codex,
@@ -8503,10 +8785,12 @@ mod tests {
 
         // A different data.code, or no data at all, must NOT be swallowed —
         // those fall through to the generic error path.
-        let other = sacp::Error::new(-32603, "boom")
-            .data(serde_json::json!({ "code": "SOMETHING_ELSE" }));
+        let other =
+            sacp::Error::new(-32603, "boom").data(serde_json::json!({ "code": "SOMETHING_ELSE" }));
         assert!(!is_grok_incompatible_agent_switch(&other));
-        assert!(!is_grok_incompatible_agent_switch(&sacp::Error::internal_error()));
+        assert!(!is_grok_incompatible_agent_switch(
+            &sacp::Error::internal_error()
+        ));
     }
 
     #[test]
@@ -8529,8 +8813,8 @@ mod tests {
 
         // Empty specs → the effort selector comes from the flat `x.ai/sessionConfig`
         // "mode" list (the no-`models` fallback path).
-        let opts =
-            synthesize_grok_config_options(Some(&meta), &HashMap::new()).expect("should synthesize");
+        let opts = synthesize_grok_config_options(Some(&meta), &HashMap::new())
+            .expect("should synthesize");
         assert_eq!(opts.len(), 2, "model + effort selectors");
 
         let model = &opts[0];
@@ -8540,15 +8824,24 @@ mod tests {
         // Both models appear (agent-type filtering is deliberately NOT applied —
         // cross-type switches are handled gracefully at set time instead).
         assert_eq!(model_sel.options.len(), 2);
-        assert_eq!(model_sel.current_value, "grok-4.5", "the `selected` model is current");
-        assert!(model_sel.options.iter().any(|o| o.value == "grok-composer-2.5-fast"));
+        assert_eq!(
+            model_sel.current_value, "grok-4.5",
+            "the `selected` model is current"
+        );
+        assert!(model_sel
+            .options
+            .iter()
+            .any(|o| o.value == "grok-composer-2.5-fast"));
 
         let effort = &opts[1];
         assert_eq!(effort.id, GROK_EFFORT_OPTION_ID);
         assert_eq!(effort.category.as_deref(), Some("mode"));
         let SessionConfigKindInfo::Select(effort_sel) = &effort.kind;
         assert_eq!(effort_sel.options.len(), 2);
-        assert_eq!(effort_sel.current_value, "high", "the `selected` effort is current");
+        assert_eq!(
+            effort_sel.current_value, "high",
+            "the `selected` effort is current"
+        );
         assert!(effort_sel.options.iter().any(|o| o.value == "low"));
     }
 
@@ -8568,8 +8861,8 @@ mod tests {
         .unwrap();
         // Empty specs → the effort selector comes from the flat `x.ai/sessionConfig`
         // "mode" list (the no-`models` fallback path).
-        let opts =
-            synthesize_grok_config_options(Some(&meta), &HashMap::new()).expect("should synthesize");
+        let opts = synthesize_grok_config_options(Some(&meta), &HashMap::new())
+            .expect("should synthesize");
         assert_eq!(opts.len(), 1);
         assert_eq!(opts[0].id, GROK_MODEL_OPTION_ID);
     }
@@ -8672,10 +8965,9 @@ mod tests {
         );
         assert!(sel.options.iter().all(|o| o.description.is_some()));
         // Grok's own per-tier text is preserved for the switchable tiers.
-        assert!(sel
-            .options
-            .iter()
-            .any(|o| o.value == "high" && o.name == "High" && o.description.as_deref() == Some("Highest quality")));
+        assert!(sel.options.iter().any(|o| o.value == "high"
+            && o.name == "High"
+            && o.description.as_deref() == Some("Highest quality")));
         // Unsupported model → no selector; unknown model → None.
         assert!(build_grok_effort_option("grok-composer-2.5-fast", &specs).is_none());
         assert!(build_grok_effort_option("nope", &specs).is_none());
@@ -8704,7 +8996,10 @@ mod tests {
             .expect("effort selector");
         let SessionConfigKindInfo::Select(sel) = &effort.kind;
         assert_eq!(sel.current_value, "xhigh", "grok-4.5's real default");
-        assert!(sel.options.iter().any(|o| o.value == "xhigh" && o.name == "Max"));
+        assert!(sel
+            .options
+            .iter()
+            .any(|o| o.value == "xhigh" && o.name == "Max"));
     }
 
     #[test]
@@ -8830,9 +9125,7 @@ mod tests {
         let errors: Vec<(Option<String>, bool)> = events
             .iter()
             .filter_map(|e| match &e.payload {
-                AcpEvent::Error {
-                    code, terminal, ..
-                } => Some((code.clone(), *terminal)),
+                AcpEvent::Error { code, terminal, .. } => Some((code.clone(), *terminal)),
                 _ => None,
             })
             .collect();
@@ -9043,10 +9336,10 @@ mod tests {
         // Missing tool_input.
         assert!(unwrap_grok_use_tool(Some(&serde_json::json!({"tool_name": "x"}))).is_none());
         // Empty tool_name.
-        assert!(
-            unwrap_grok_use_tool(Some(&serde_json::json!({"tool_name": "", "tool_input": {}})))
-                .is_none()
-        );
+        assert!(unwrap_grok_use_tool(Some(
+            &serde_json::json!({"tool_name": "", "tool_input": {}})
+        ))
+        .is_none());
         // Absent / non-object.
         assert!(unwrap_grok_use_tool(None).is_none());
         assert!(unwrap_grok_use_tool(Some(&serde_json::json!("s"))).is_none());
@@ -9110,7 +9403,8 @@ mod tests {
             Some("codeg-mcp__get_delegation_status")
         );
         // Mixed batch with a running item still resolves.
-        let mixed = r#"{"tasks":[{"task_id":"a","status":"running"},{"task_id":"b","status":"unknown"}]}"#;
+        let mixed =
+            r#"{"tasks":[{"task_id":"a","status":"running"},{"task_id":"b","status":"unknown"}]}"#;
         assert_eq!(
             cursor_companion_title_from_content(Some(mixed)),
             Some("codeg-mcp__get_delegation_status")
@@ -9136,9 +9430,7 @@ mod tests {
         assert_eq!(cursor_companion_title_from_content(None), None);
         // Ack prefix must match from the start, not mid-string.
         assert_eq!(
-            cursor_companion_title_from_content(Some(
-                "Note: Delegation successful. task_id=x."
-            )),
+            cursor_companion_title_from_content(Some("Note: Delegation successful. task_id=x.")),
             None
         );
     }
@@ -9679,10 +9971,7 @@ mod tests {
         // returns false. Regression guard against any future "optimisation"
         // that conflates the substring check with the field check.
         let input = Some(r#"{"description":"use subagent_type=foo"}"#.to_string());
-        assert!(!is_subagent_invocation(
-            AgentType::OpenCode,
-            &input
-        ));
+        assert!(!is_subagent_invocation(AgentType::OpenCode, &input));
     }
 
     #[test]
@@ -9729,7 +10018,8 @@ mod tests {
             "not json",
         ] {
             assert!(
-                codebuddy_deferred_tool_name(AgentType::CodeBuddy, &Some(raw.to_string())).is_none(),
+                codebuddy_deferred_tool_name(AgentType::CodeBuddy, &Some(raw.to_string()))
+                    .is_none(),
                 "expected None for raw_input={raw}"
             );
         }
@@ -10013,7 +10303,11 @@ mod tests {
         // the parent model is suspended — so every chunk in the window is the
         // sub-agent's, never main-agent output (background sub-agents, which could
         // interleave main output, are excluded from the window upstream).
-        assert!(should_suppress_subagent_chunk(AgentType::CodeBuddy, true, None));
+        assert!(should_suppress_subagent_chunk(
+            AgentType::CodeBuddy,
+            true,
+            None
+        ));
         // Window closed and no chunk meta → emit (e.g. main-agent text before the
         // sub-agent opens or after it closes).
         assert!(!should_suppress_subagent_chunk(
@@ -10033,7 +10327,11 @@ mod tests {
             ));
         }
         // Other agents never suppress, even inside a (spurious) open window.
-        assert!(!should_suppress_subagent_chunk(AgentType::OpenCode, true, None));
+        assert!(!should_suppress_subagent_chunk(
+            AgentType::OpenCode,
+            true,
+            None
+        ));
     }
 
     #[test]

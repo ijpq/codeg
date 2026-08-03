@@ -143,9 +143,7 @@ pub async fn acp_restore_conversation(
     .map_err(|error| {
         let message = error.to_string();
         match error {
-            AcpError::TurnInProgress => {
-                AppCommandError::new(AppErrorCode::TurnInProgress, message)
-            }
+            AcpError::TurnInProgress => AppCommandError::new(AppErrorCode::TurnInProgress, message),
             _ => AppCommandError::task_execution_failed(message),
         }
     })?;
@@ -220,6 +218,8 @@ pub async fn acp_prompt(
                 AcpError::TurnInProgress => {
                     AppCommandError::new(AppErrorCode::TurnInProgress, message)
                 }
+                AcpError::ConnectionNotFound(_) => AppCommandError::connection_not_found(message),
+                AcpError::ProcessExited => AppCommandError::process_exited(message),
                 _ => AppCommandError::task_execution_failed(message),
             }
         })?;
@@ -932,8 +932,8 @@ pub async fn acp_update_pi_config(
     Ok(Json(()))
 }
 
-pub async fn acp_load_pi_config(
-) -> Result<Json<acp_commands::PiConfigProjection>, AppCommandError> {
+pub async fn acp_load_pi_config() -> Result<Json<acp_commands::PiConfigProjection>, AppCommandError>
+{
     Ok(Json(acp_commands::load_pi_config_core()))
 }
 

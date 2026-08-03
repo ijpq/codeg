@@ -49,8 +49,10 @@ import { AskQuestionCard } from "@/components/chat/ask-question-card"
 import { PlanApprovalCard } from "@/components/chat/plan-approval-card"
 import {
   AGENT_LABELS,
+  CONVERSATION_ARTIFACTS_CHANGED_EVENT,
   CONVERSATION_DELIVERABLES_CHANGED_EVENT,
   type AgentType,
+  type ConversationArtifactsChanged,
   type ConversationDeliverablesChanged,
   type PlanApprovalAnswer,
   type QuestionAnswer,
@@ -312,25 +314,36 @@ function SubAgentSessionBody({
   }, [childConversationId, refetchDetail])
 
   // Keep the read-only child viewer's final-output panel current while the
-  // child is still streaming. `preserveLive` updates the persisted declaration
-  // without replacing its bridged reply with a lagging transcript snapshot.
+  // child is still streaming and after artifact settlement. `preserveLive`
+  // updates persisted outputs without replacing its bridged reply with a
+  // lagging transcript snapshot.
   useEffect(() => {
     let disposed = false
-    let unlisten: (() => void) | undefined
-    void subscribe<ConversationDeliverablesChanged>(
-      CONVERSATION_DELIVERABLES_CHANGED_EVENT,
-      (change) => {
-        if (change.conversation_id === childConversationId) {
-          refetchDetail(childConversationId, { preserveLive: true })
-        }
+    const unlistens: (() => void)[] = []
+    const scheduleRefresh = (conversationId: number) => {
+      if (conversationId === childConversationId) {
+        refetchDetail(childConversationId, { preserveLive: true })
       }
-    ).then((dispose) => {
-      if (disposed) dispose()
-      else unlisten = dispose
-    })
+    }
+    const installSubscription = <T extends { conversation_id: number }>(
+      event: string
+    ) => {
+      void subscribe<T>(event, (change) =>
+        scheduleRefresh(change.conversation_id)
+      ).then((dispose) => {
+        if (disposed) dispose()
+        else unlistens.push(dispose)
+      })
+    }
+    installSubscription<ConversationDeliverablesChanged>(
+      CONVERSATION_DELIVERABLES_CHANGED_EVENT
+    )
+    installSubscription<ConversationArtifactsChanged>(
+      CONVERSATION_ARTIFACTS_CHANGED_EVENT
+    )
     return () => {
       disposed = true
-      unlisten?.()
+      unlistens.forEach((dispose) => dispose())
     }
   }, [childConversationId, refetchDetail])
 

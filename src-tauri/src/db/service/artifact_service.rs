@@ -6,9 +6,7 @@ use sea_orm::{
     IntoActiveModel, QueryFilter, QueryOrder, Set, TransactionTrait,
 };
 
-use crate::db::entities::conversation_turn_file_change::{
-    self, ConversationTurnFileChangeKind,
-};
+use crate::db::entities::conversation_turn_file_change::{self, ConversationTurnFileChangeKind};
 use crate::db::entities::conversation_turn_run::{self, ConversationTurnRunStatus};
 use crate::db::error::DbError;
 use crate::models::{ConversationTurnArtifactRun, ConversationTurnFileChange};
@@ -19,6 +17,7 @@ pub struct NewTurnRun {
     pub conversation_id: i32,
     pub connection_id: String,
     pub client_message_id: Option<String>,
+    pub prompt_fingerprint: Option<String>,
     pub folder_id: Option<i32>,
     pub root_path: String,
     pub capture_incomplete: bool,
@@ -43,6 +42,7 @@ pub async fn create_run(
         conversation_id: Set(input.conversation_id),
         connection_id: Set(input.connection_id),
         client_message_id: Set(input.client_message_id),
+        prompt_fingerprint: Set(input.prompt_fingerprint),
         folder_id: Set(input.folder_id),
         root_path: Set(input.root_path),
         status: Set(ConversationTurnRunStatus::Running),
@@ -97,9 +97,7 @@ pub async fn upsert_changes(
     let now = Utc::now();
     for change in changes {
         let existing = conversation_turn_file_change::Entity::find()
-            .filter(
-                conversation_turn_file_change::Column::TurnRunId.eq(turn_run_id.to_string()),
-            )
+            .filter(conversation_turn_file_change::Column::TurnRunId.eq(turn_run_id.to_string()))
             .filter(conversation_turn_file_change::Column::Path.eq(change.path.clone()))
             .one(&txn)
             .await?;
@@ -158,10 +156,7 @@ pub async fn mark_capture_incomplete(
     Ok(())
 }
 
-pub async fn mark_run_ambiguous(
-    conn: &DatabaseConnection,
-    run_id: &str,
-) -> Result<(), DbError> {
+pub async fn mark_run_ambiguous(conn: &DatabaseConnection, run_id: &str) -> Result<(), DbError> {
     let rows = conversation_turn_file_change::Entity::find()
         .filter(conversation_turn_file_change::Column::TurnRunId.eq(run_id.to_string()))
         .all(conn)
@@ -386,11 +381,14 @@ mod tests {
                 conversation_id,
                 connection_id: "conn-1".into(),
                 client_message_id: Some("optimistic-1".into()),
+                prompt_fingerprint: None,
                 folder_id: Some(folder_id),
                 root_path: "/tmp/artifacts".into(),
                 capture_incomplete: false,
                 input_paths_json: "[]".into(),
-                expectation_json: r#"{"publish_required":true,"expects_code_changes":true,"requested_paths":[]}"#.into(),
+                expectation_json:
+                    r#"{"publish_required":true,"expects_code_changes":true,"requested_paths":[]}"#
+                        .into(),
             },
         )
         .await

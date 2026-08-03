@@ -18,6 +18,13 @@ use super::{auth, handlers, ws};
 use crate::app_state::AppState;
 use tracing::Instrument;
 
+// Prompt images are carried inline as base64 inside the JSON request. The
+// composer's native-path guard allows up to 20,000,000 decoded bytes, which
+// expands to about 25.5 MiB before the JSON envelope is added. Keep this route
+// bounded because `Json` buffers the request, while leaving enough headroom for
+// one maximum-size image plus prompt metadata.
+const ACP_PROMPT_BODY_MAX_BYTES: usize = 32 * 1024 * 1024;
+
 pub fn build_router(
     state: Arc<AppState>,
     token: String,
@@ -642,7 +649,10 @@ pub fn build_router(
             "/acp_touch_connection",
             post(handlers::acp::acp_touch_connection),
         )
-        .route("/acp_prompt", post(handlers::acp::acp_prompt))
+        .route(
+            "/acp_prompt",
+            post(handlers::acp::acp_prompt).layer(DefaultBodyLimit::max(ACP_PROMPT_BODY_MAX_BYTES)),
+        )
         .route("/acp_steer", post(handlers::acp::acp_steer))
         .route("/acp_preflight", post(handlers::acp::acp_preflight))
         .route("/acp_set_mode", post(handlers::acp::acp_set_mode))
@@ -650,10 +660,7 @@ pub fn build_router(
             "/acp_set_config_option",
             post(handlers::acp::acp_set_config_option),
         )
-        .route(
-            "/acp_goal_control",
-            post(handlers::acp::acp_goal_control),
-        )
+        .route("/acp_goal_control", post(handlers::acp::acp_goal_control))
         .route(
             "/acp_describe_agent_options",
             post(handlers::acp::acp_describe_agent_options),

@@ -25,11 +25,12 @@ mod m20260612_000001_conversation_folder_kind;
 mod m20260621_000001_automation;
 mod m20260630_000001_conversation_parent_id_index;
 mod m20260703_000001_chat_channel_thread_binding;
-mod m20260717_000001_folder_alias;
 mod m20260717_000001_conversation_turn_artifacts;
+mod m20260717_000001_folder_alias;
 mod m20260718_000001_conversation_deliverables;
 mod m20260720_000001_deliverable_management;
 mod m20260725_000001_deliverable_reconciliation;
+mod m20260802_000001_deliverable_turn_link;
 pub struct Migrator;
 
 #[async_trait::async_trait]
@@ -66,6 +67,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260718_000001_conversation_deliverables::Migration),
             Box::new(m20260720_000001_deliverable_management::Migration),
             Box::new(m20260725_000001_deliverable_reconciliation::Migration),
+            Box::new(m20260802_000001_deliverable_turn_link::Migration),
         ]
     }
 }

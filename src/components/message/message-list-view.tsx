@@ -212,12 +212,38 @@ export interface DeliverableUserTurnRef {
 }
 
 /**
- * Prefer the exact optimistic client message id while a session is live. On a
- * cold parser reload that id is no longer present in the transcript, so match
- * the durable turn-run start to the nearest user turn inside the run's time
- * window. This deliberately refuses distant guesses: the conversation-level
- * panel remains available even when a historical reply cannot be correlated
- * safely.
+ * The conversation-level panel is intentionally an inclusive ledger. A reply
+ * tail has a different contract: it should show only the main files a user is
+ * expected to open or download, never the full source/test/config change set.
+ * Declared missing files remain visible as an honest diagnostic; inferred
+ * entries must still exist because they have weaker semantic evidence.
+ */
+export function replyDeliverablesForRun(
+  deliverables: ConversationDeliverable[]
+): ConversationDeliverable[] {
+  return deliverables.filter((item) => {
+    if (item.role !== "primary" || item.category === "code_change") {
+      return false
+    }
+    if (item.source === "declared") {
+      // Older servers omitted category; a primary declared item is still a
+      // stronger signal than filesystem inference and remains compatible.
+      return item.category == null || item.category === "standalone_output"
+    }
+    return (
+      item.category === "standalone_output" &&
+      item.is_valid &&
+      item.change_kind !== "deleted"
+    )
+  })
+}
+
+/**
+ * Prefer the backend's prompt-fingerprint link, then the exact optimistic id
+ * while a session is live. Historical rows created before that link existed
+ * retain the guarded timestamp fallback. This deliberately refuses distant
+ * guesses: the conversation-level panel remains available even when an old
+ * reply cannot be correlated safely.
  */
 export function associateDeliverablesWithUserTurns(
   runs: ConversationTurnDeliverableSet[],
@@ -229,11 +255,19 @@ export function associateDeliverablesWithUserTurns(
   const unresolved: ConversationTurnDeliverableSet[] = []
 
   for (const run of runs) {
-    if (run.client_message_id && userIds.has(run.client_message_id)) {
-      result.set(run.client_message_id, run.deliverables)
-      used.add(run.client_message_id)
+    const deliverables = replyDeliverablesForRun(run.deliverables)
+    if (deliverables.length === 0) continue
+    const exactId =
+      run.user_turn_id && userIds.has(run.user_turn_id)
+        ? run.user_turn_id
+        : run.client_message_id && userIds.has(run.client_message_id)
+          ? run.client_message_id
+          : null
+    if (exactId) {
+      result.set(exactId, deliverables)
+      used.add(exactId)
     } else {
-      unresolved.push(run)
+      unresolved.push({ ...run, deliverables })
     }
   }
 

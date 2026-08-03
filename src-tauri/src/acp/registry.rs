@@ -242,8 +242,8 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             // the injected `codeg-mcp` server always survives. 1.1.6 adds
             // steering (#309): `_session/steering` injects a user prompt into
             // the LIVE turn (initialize advertises `_meta.steering.supported`)
-            // — not wired into codeg yet. 1.1.7 (#326) emits Plan-mode plan
-            // contents as a plain `agent_message_chunk`
+            // — now negotiated and routed in `connection.rs`. 1.1.7 (#326)
+            // emits Plan-mode plan contents as a plain `agent_message_chunk`
             // (`_meta.codex.phase = "final_answer"`, no `<proposed_plan>` tags),
             // which the adapter's tag-splitter simply no-ops on — tagged output
             // from older codex still renders as the proposed-plan card. 1.1.7
@@ -661,12 +661,7 @@ mod tests {
             "openclaw@2026.7.1",
             Some("22.22.3"),
         );
-        assert_npx_version(
-            AgentType::Cline,
-            "3.0.46",
-            "cline@3.0.46",
-            Some("22.0.0"),
-        );
+        assert_npx_version(AgentType::Cline, "3.0.46", "cline@3.0.46", Some("22.0.0"));
         assert_npx_version(
             AgentType::CodeBuddy,
             "2.127.0",

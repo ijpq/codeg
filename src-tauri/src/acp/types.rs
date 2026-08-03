@@ -39,12 +39,13 @@ pub struct PromptCapabilitiesInfo {
     pub embedded_context: bool,
 }
 
-/// Successful native in-turn steering response. `turn_id` is returned by
-/// Codex app-server's `turn/steer`; it must be the same in-flight turn that the
-/// adapter supplied as `expectedTurnId`.
+/// Successful native in-turn steering response. The legacy Codeg compatibility
+/// adapter returns Codex app-server's concrete `turn/steer` id. Upstream
+/// codex-acp's `_session/steering` response intentionally carries only an
+/// outcome, so `turn_id` is absent on that protocol.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SteerResult {
-    pub turn_id: String,
+    pub turn_id: Option<String>,
     pub message_id: String,
     #[serde(default)]
     pub deduplicated: bool,
@@ -181,7 +182,7 @@ pub enum AcpEvent {
     },
     /// Whether the agent supports session/fork
     ForkSupported { supported: bool },
-    /// Per-connection native steering capability after adapter preparation.
+    /// Per-connection native steering capability negotiated from initialize.
     /// May transition from true to false if the runtime returns method-not-found.
     SteerSupported { supported: bool },
     /// Current session mode changed
@@ -196,7 +197,7 @@ pub enum AcpEvent {
     SteerMessage {
         message_id: String,
         blocks: Vec<UserMessageBlock>,
-        turn_id: String,
+        turn_id: Option<String>,
     },
     /// Error occurred
     Error {
@@ -395,10 +396,7 @@ pub enum AcpEvent {
     /// clear its "restart to apply" banner. Carried into `SessionState` so a
     /// snapshot attach (web reconnect, window refresh, new tile) recovers the
     /// staleness the one-shot event won't replay for it.
-    SessionConfigStale {
-        stale: bool,
-        kind: ConfigStaleKind,
-    },
+    SessionConfigStale { stale: bool, kind: ConfigStaleKind },
 }
 
 /// One background task settled by a `<task-notification>` transcript record,

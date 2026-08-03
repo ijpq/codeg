@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest"
 import {
   associateDeliverablesWithUserTurns,
   mergeConsecutiveAssistantTurns,
+  replyDeliverablesForRun,
   type MergedAssistantRunCache,
   type ResolvedMessageGroup,
   type ThreadRenderItem,
@@ -93,7 +94,18 @@ describe("mergeConsecutiveAssistantTurns", () => {
 })
 
 describe("associateDeliverablesWithUserTurns", () => {
-  const deliverable = (id: string) => ({ id }) as ConversationDeliverable
+  const deliverable = (
+    id: string,
+    overrides: Partial<ConversationDeliverable> = {}
+  ) =>
+    ({
+      id,
+      role: "primary",
+      category: "standalone_output",
+      source: "declared",
+      is_valid: true,
+      ...overrides,
+    }) as ConversationDeliverable
   const run = (
     id: string,
     clientMessageId: string | null,
@@ -123,6 +135,22 @@ describe("associateDeliverablesWithUserTurns", () => {
       [{ id: "optimistic-1", timestamp: "2026-07-20T10:00:01Z" }]
     )
     expect(mapped.get("optimistic-1")?.[0].id).toBe("output-1")
+  })
+
+  it("prefers the backend durable user turn id on a different machine", () => {
+    const linked = run(
+      "run-1",
+      "optimistic-only-on-sender",
+      "2026-07-20T10:00:00Z",
+      "2026-07-20T10:01:00Z",
+      "output-1"
+    )
+    linked.user_turn_id = "parsed-user-turn"
+    const mapped = associateDeliverablesWithUserTurns(
+      [linked],
+      [{ id: "parsed-user-turn", timestamp: "2026-07-20T12:00:00Z" }]
+    )
+    expect(mapped.get("parsed-user-turn")?.[0].id).toBe("output-1")
   })
 
   it("recovers the producing reply by timestamp after a cold parser reload", () => {
@@ -163,6 +191,37 @@ describe("associateDeliverablesWithUserTurns", () => {
       [{ id: "unrelated", timestamp: "2026-07-20T12:00:00Z" }]
     )
     expect(mapped.size).toBe(0)
+  })
+})
+
+describe("replyDeliverablesForRun", () => {
+  const output = (
+    id: string,
+    overrides: Partial<ConversationDeliverable> = {}
+  ) =>
+    ({
+      id,
+      role: "primary",
+      category: "standalone_output",
+      source: "declared",
+      is_valid: true,
+      change_kind: "created",
+      ...overrides,
+    }) as ConversationDeliverable
+
+  it("keeps reply tails strict while the conversation ledger remains broad", () => {
+    const all = [
+      output("report"),
+      output("supporting", { role: "supporting" }),
+      output("source", { category: "code_change" }),
+      output("missing-inferred", { source: "inferred", is_valid: false }),
+      output("expected-inferred", { source: "inferred" }),
+    ]
+    expect(replyDeliverablesForRun(all).map((item) => item.id)).toEqual([
+      "report",
+      "expected-inferred",
+    ])
+    expect(all).toHaveLength(5)
   })
 })
 
