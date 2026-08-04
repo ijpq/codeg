@@ -866,7 +866,14 @@ pub async fn infer_for_turn(
             kind: "file".into(),
             title: file_name.clone(),
             description: None,
-            role: if expected_paths.contains(&change.path) {
+            // A standalone file exclusively observed during this turn is a
+            // user-facing result even when the prompt did not prescribe its
+            // eventual filename (the common "design a PDF" case). Keep
+            // ambiguous watcher matches supporting so concurrent turns do not
+            // claim one another's outputs in their reply tails.
+            role: if expected_paths.contains(&change.path)
+                || (category == "standalone_output" && change.attribution == "exclusive")
+            {
                 "primary".into()
             } else {
                 "supporting".into()
@@ -1088,6 +1095,30 @@ pub async fn list_sets_for_conversation(
         .order_by_asc(conversation_turn_run::Column::StartedAt)
         .all(conn)
         .await?;
+    // v0.21.14 stored inferred standalone outputs as supporting unless the
+    // prompt named their exact path. Recover the original watcher attribution
+    // on read so existing exclusive PDFs/documents become reply-tail primary
+    // outputs without promoting genuinely ambiguous concurrent changes.
+    let run_ids = runs.iter().map(|run| run.id.clone()).collect::<Vec<_>>();
+    let mut exclusive_paths_by_run: HashMap<String, HashSet<String>> = HashMap::new();
+    // Keep each IN clause comfortably below SQLite's common bind limit for
+    // long-running conversations with a large turn history.
+    for run_id_chunk in run_ids.chunks(500) {
+        for change in conversation_turn_file_change::Entity::find()
+            .filter(
+                conversation_turn_file_change::Column::TurnRunId.is_in(run_id_chunk.to_vec()),
+            )
+            .filter(conversation_turn_file_change::Column::Attribution.eq("exclusive"))
+            .filter(conversation_turn_file_change::Column::FinalExists.eq(true))
+            .all(conn)
+            .await?
+        {
+            exclusive_paths_by_run
+                .entry(change.turn_run_id)
+                .or_default()
+                .insert(change.path);
+        }
+    }
     let associations = conversation_turn_deliverable::Entity::find()
         .filter(conversation_turn_deliverable::Column::ConversationId.eq(conversation_id))
         .order_by_asc(conversation_turn_deliverable::Column::Position)
@@ -1110,7 +1141,19 @@ pub async fn list_sets_for_conversation(
                     model_map
                         .get(&association.deliverable_id)
                         .cloned()
-                        .map(|model| to_info(model, Some(&association), Some(&run)))
+                        .map(|model| {
+                            let mut item = to_info(model, Some(&association), Some(&run));
+                            if item.source == SOURCE_INFERRED
+                                && item.category == "standalone_output"
+                                && item.role == "supporting"
+                                && exclusive_paths_by_run
+                                    .get(&run.id)
+                                    .is_some_and(|paths| paths.contains(&item.path))
+                            {
+                                item.role = "primary".into();
+                            }
+                            item
+                        })
                 })
                 .collect::<Vec<_>>();
             (!deliverables.is_empty()).then_some(ConversationTurnDeliverableSet {
@@ -1724,8 +1767,36 @@ mod tests {
             .collect::<HashMap<_, _>>();
         assert_eq!(by_path["final.pdf"].source, SOURCE_INFERRED);
         assert_eq!(by_path["final.pdf"].category, "standalone_output");
+        assert_eq!(by_path["final.pdf"].role, "primary");
         assert_eq!(by_path["src/widget.test.ts"].category, "code_change");
         assert_eq!(by_path["src/widget.test.ts"].change_kind, "modified");
+
+        // Compatibility: rows settled by v0.21.14 retain supporting in the
+        // association, but the preserved exclusive watcher event lets the
+        // read path recover the correct reply-tail role.
+        let association = conversation_turn_deliverable::Entity::find()
+            .filter(conversation_turn_deliverable::Column::TurnRunId.eq("run-infer"))
+            .filter(
+                conversation_turn_deliverable::Column::DeliverableId
+                    .eq(by_path["final.pdf"].id.clone()),
+            )
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut legacy = association.into_active_model();
+        legacy.role = Set("supporting".into());
+        legacy.update(&db.conn).await.unwrap();
+
+        let sets = list_sets_for_conversation(&db.conn, conversation_id)
+            .await
+            .unwrap();
+        let legacy_pdf = sets
+            .iter()
+            .find(|set| set.turn_run_id == "run-infer")
+            .and_then(|set| set.deliverables.iter().find(|item| item.path == "final.pdf"))
+            .unwrap();
+        assert_eq!(legacy_pdf.role, "primary");
     }
 
     #[tokio::test]

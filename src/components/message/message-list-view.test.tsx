@@ -223,6 +223,24 @@ describe("replyDeliverablesForRun", () => {
     ])
     expect(all).toHaveLength(5)
   })
+
+  it("falls back to declared standalone outputs when none were marked primary", () => {
+    const all = [
+      output("designed-pdf", { role: "supporting" }),
+      output("source", {
+        role: "supporting",
+        category: "code_change",
+      }),
+      output("ambiguous-image", {
+        role: "supporting",
+        source: "inferred",
+      }),
+    ]
+
+    expect(replyDeliverablesForRun(all).map((item) => item.id)).toEqual([
+      "designed-pdf",
+    ])
+  })
 })
 
 function makeGroup(
