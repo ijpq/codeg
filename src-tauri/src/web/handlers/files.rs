@@ -211,39 +211,26 @@ pub async fn create_file_tree_entry(
 // Attachment upload
 // ---------------------------------------------------------------------------
 
-/// Hard cap on a single uploaded attachment.
+/// Safety ceiling for paths that read an uploaded image back into memory.
 ///
-/// This is the user-facing attachment ceiling for web / remote-workspace mode
-/// (oversize is rejected with a visible toast), sized to match the desktop
-/// drag-drop image limit (`DRAG_DROP_IMAGE_MAX_BYTES`, 20 MB) so the same
-/// screenshot attaches in every mode. Uploaded images are re-inlined into the
-/// prompt server-side (`acp::prompt_hydration`), so this also bounds that
-/// read-back. The handler streams to disk chunk-by-chunk, so raising the cap
-/// does not change peak memory. The chunk-summing check inside the streaming
-/// loop is the authoritative boundary; the route's `DefaultBodyLimit` (this
-/// value + 64 KiB of multipart overhead, see `router.rs`) rejects grossly
-/// oversized bodies before they stream.
-///
-/// Mirrored by `UPLOAD_MAX_BYTES` in `commands/remote_proxy.rs` and
-/// `src/lib/api.ts` — keep the three in lockstep.
+/// The streaming web upload endpoint itself is unlimited by default and uses
+/// `CODEG_UPLOAD_MAX_ATTACHMENT_BYTES` when an operator wants a per-file cap.
+/// Prompt hydration still buffers image bytes for base64 delivery, so it keeps
+/// this 20 MiB ceiling. The desktop-to-remote proxy has the same ceiling
+/// because it also buffers the complete payload.
 pub const UPLOAD_MAX_BYTES: u64 = 20 * 1024 * 1024;
 
 /// Env-controlled cap on the *total* bytes resident under
-/// `uploads_root/`. Per-file `UPLOAD_MAX_BYTES` bounds one payload; this
-/// bounds long-term accumulation so a compromised or shared token can't
-/// repeatedly upload small files until the host runs out of disk. Unset
-/// or `0` disables the cap — preserves the original "no GC" behavior
+/// `uploads_root/`. This bounds long-term accumulation so a compromised or
+/// shared token can't repeatedly upload files until the host runs out of disk.
+/// Unset or `0` disables the cap — preserving the original "no GC" behavior
 /// for operators who want it.
 ///
-/// The check is intentionally conservative: it fires before any bytes
-/// are streamed to disk, assuming the worst-case `UPLOAD_MAX_BYTES`.
-/// That over-rejects in the last `UPLOAD_MAX_BYTES` of headroom (e.g. a
-/// 100 KB upload may get rejected when only 1 MB remains under the
-/// cap), but it keeps the code free of mid-stream cleanup races. With
-/// the in-flight reservation (see `UPLOAD_IN_FLIGHT_BYTES` below) this
-/// is effectively a hard ceiling: concurrent admits cannot accumulate
-/// past `cap` because each one decrements the in-flight headroom seen
-/// by the next.
+/// Each request reserves an upper bound derived from `Content-Length` and the
+/// optional per-file cap before it streams. A request without a usable length
+/// reserves all remaining quota, serializing that conservative case. Together
+/// with the in-stream byte check this keeps the total cap hard even when the
+/// default per-file policy is unlimited.
 const UPLOAD_TOTAL_BYTES_ENV: &str = "CODEG_UPLOAD_MAX_TOTAL_BYTES";
 
 /// Opt-in fail-closed mode for the quota config. When truthy and
@@ -447,11 +434,10 @@ pub fn validate_upload_quota_config() -> Result<(), UploadQuotaStrictError> {
 /// closes the TOCTOU race where two concurrent uploads both saw the
 /// same disk-level free space and admitted past the cap.
 ///
-/// Reservation strategy: each upload reserves the worst case
-/// (`UPLOAD_MAX_BYTES`) up front and releases it on guard drop.
-/// Over-reservation is acceptable — the operator-facing budget is the
-/// disk, not the counter — and a uniform reservation size keeps the
-/// CAS loop and the cleanup path symmetric.
+/// Reservation strategy: each upload reserves a safe upper bound from its
+/// request framing and configured caps, then releases it on guard drop. An
+/// upload without a usable request length reserves all remaining quota so it
+/// cannot race another admission while its final size is unknown.
 ///
 /// **Scope:** this counter is process-local. Multiple `codeg-server`
 /// processes sharing the same `uploads_root` (horizontally-scaled
@@ -782,23 +768,24 @@ pub async fn purge_upload_staging() {
 
 /// Bytes to reserve against the total-quota in-flight counter for one upload.
 ///
-/// The file's exact size isn't known until the multipart body is drained, but
-/// the request's `Content-Length` is a hard upper bound on it (the multipart
-/// framing only ever ADDS overhead, and hyper enforces the header as a body
-/// framing limit). Reserving `min(Content-Length, UPLOAD_MAX_BYTES)` is
-/// therefore always ≥ the bytes actually written — the streaming loop
-/// independently caps the file at `UPLOAD_MAX_BYTES` — so the quota stays a
-/// hard ceiling while a small upload only reserves its own size. This matters
-/// for operators with `CODEG_UPLOAD_MAX_TOTAL_BYTES` below `UPLOAD_MAX_BYTES`:
-/// a blanket worst-case reservation would reject every upload outright.
-///
-/// A missing/unparseable header (chunked transfer) falls back to the
-/// worst-case reservation, which over-rejects near the cap but never
-/// under-reserves.
-fn upload_reservation_bytes(content_length: Option<u64>) -> u64 {
-    content_length
-        .map(|cl| cl.min(UPLOAD_MAX_BYTES))
-        .unwrap_or(UPLOAD_MAX_BYTES)
+/// `Content-Length` is a hard upper bound on the file because multipart framing
+/// only adds bytes. When a per-file cap is configured, the smaller of those two
+/// bounds is sufficient. Without a usable length, reserve the configured
+/// per-file cap or all remaining total quota; the latter deliberately
+/// serializes an unbounded/chunked upload until its in-stream quota check ends.
+fn upload_reservation_bytes(
+    content_length: Option<u64>,
+    per_file_cap: Option<u64>,
+    remaining_quota: u64,
+) -> u64 {
+    match content_length {
+        Some(content_length) => per_file_cap
+            .map(|cap| content_length.min(cap))
+            .unwrap_or(content_length),
+        None => per_file_cap
+            .map(|cap| cap.min(remaining_quota))
+            .unwrap_or(remaining_quota),
+    }
 }
 
 pub async fn upload_attachment(
@@ -824,20 +811,22 @@ pub async fn upload_attachment(
     // TOCTOU window where two concurrent uploads both saw the same
     // disk-level `used` and admitted past the cap.
     //
-    // With a per-file cap the reserved worst-case is that cap; without one
-    // (unlimited attachments, the default) we reserve the nominal
-    // `UPLOAD_MAX_BYTES` and additionally bound the *actual* bytes mid-stream
-    // via `quota_total`, so an unlimited attachment still can't push the
-    // uploads dir past the total cap.
+    // The actual byte count is also checked mid-stream. That is redundant for
+    // a valid Content-Length, but remains authoritative for unbounded/chunked
+    // requests and keeps the total quota hard when per-file uploads are
+    // unlimited (the default).
     let per_file_cap = attachment_max_bytes();
     let quota_cap = upload_quota_config_from_env().cap_bytes();
     let mut quota_total: Option<(u64, u64)> = None;
     let _quota_guard = if let Some(cap) = quota_cap {
         let used = current_uploads_total_bytes(&uploads_root).await;
-        if per_file_cap.is_none() {
-            quota_total = Some((used, cap));
-        }
-        let reserve = per_file_cap.unwrap_or(UPLOAD_MAX_BYTES);
+        quota_total = Some((used, cap));
+        let content_length = headers
+            .get(axum::http::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok());
+        let remaining_quota = cap.saturating_sub(used);
+        let reserve = upload_reservation_bytes(content_length, per_file_cap, remaining_quota);
         match try_reserve_in_flight(&UPLOAD_IN_FLIGHT_BYTES, reserve, used, cap) {
             Ok(guard) => Some(guard),
             Err(()) => {
@@ -1294,7 +1283,10 @@ mod tests {
         assert_eq!(parse_attachment_max_bytes(Some("not-a-number")), None);
         assert_eq!(parse_attachment_max_bytes(Some("-5")), None);
         // A positive integer (trim-tolerant) enables the cap at that many bytes.
-        assert_eq!(parse_attachment_max_bytes(Some("  1048576 ")), Some(1_048_576));
+        assert_eq!(
+            parse_attachment_max_bytes(Some("  1048576 ")),
+            Some(1_048_576)
+        );
     }
 
     #[test]
@@ -1347,27 +1339,43 @@ mod tests {
     #[test]
     fn reservation_uses_content_length_when_small() {
         // A 1 MiB upload against a 10 MiB total quota must reserve ~1 MiB,
-        // not the 20 MiB worst case (which would reject every upload on
-        // servers whose quota is below the per-file maximum).
+        // not the whole quota.
         let cl = 1024 * 1024 + 300; // file + multipart framing overhead
-        assert_eq!(upload_reservation_bytes(Some(cl)), cl);
+        assert_eq!(upload_reservation_bytes(Some(cl), None, 10 << 20), cl);
     }
 
     #[test]
     fn reservation_clamps_content_length_to_per_file_max() {
-        // The streaming loop caps the file at UPLOAD_MAX_BYTES, so the
-        // reservation never needs to exceed it even when the body (file +
-        // framing) is slightly larger. min(CL, MAX) ≥ bytes written holds:
-        // written ≤ MAX (loop check) and written ≤ CL (hyper framing).
+        // The streaming loop enforces the configured per-file cap, so the
+        // reservation never needs to exceed it even when multipart framing
+        // makes the request body larger.
+        let per_file_cap = 20 * 1024 * 1024;
         assert_eq!(
-            upload_reservation_bytes(Some(UPLOAD_MAX_BYTES + 500)),
-            UPLOAD_MAX_BYTES
+            upload_reservation_bytes(Some(per_file_cap + 500), Some(per_file_cap), 50 << 20),
+            per_file_cap
         );
     }
 
     #[test]
-    fn reservation_falls_back_to_worst_case_without_content_length() {
-        assert_eq!(upload_reservation_bytes(None), UPLOAD_MAX_BYTES);
+    fn unlimited_reservation_uses_content_length_without_clamping() {
+        let content_length = 64 * 1024 * 1024;
+        assert_eq!(
+            upload_reservation_bytes(Some(content_length), None, 100 << 20),
+            content_length
+        );
+    }
+
+    #[test]
+    fn chunked_unlimited_upload_reserves_all_remaining_quota() {
+        assert_eq!(upload_reservation_bytes(None, None, 7 << 20), 7 << 20);
+    }
+
+    #[test]
+    fn chunked_capped_upload_reserves_smaller_safe_bound() {
+        assert_eq!(
+            upload_reservation_bytes(None, Some(20 << 20), 7 << 20),
+            7 << 20
+        );
     }
 
     #[test]
@@ -1377,7 +1385,7 @@ mod tests {
         // reservation.
         let counter = AtomicU64::new(0);
         let cap = 10 * 1024 * 1024;
-        let reserve = upload_reservation_bytes(Some(1024 * 1024 + 300));
+        let reserve = upload_reservation_bytes(Some(1024 * 1024 + 300), None, cap);
         assert!(try_reserve_in_flight(&counter, reserve, 0, cap).is_ok());
     }
 
