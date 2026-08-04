@@ -236,7 +236,7 @@ export interface DeliverableUserTurnRef {
 export function replyDeliverablesForRun(
   deliverables: ConversationDeliverable[]
 ): ConversationDeliverable[] {
-  return deliverables.filter((item) => {
+  const eligible = deliverables.filter((item) => {
     if (item.role !== "primary" || item.category === "code_change") {
       return false
     }
@@ -251,6 +251,20 @@ export function replyDeliverablesForRun(
       item.change_kind !== "deleted"
     )
   })
+  if (eligible.length > 0) return eligible
+
+  // A declaration is authoritative for this exact turn. If an older or
+  // imperfect agent marked every standalone result as supporting, prefer a
+  // useful reply tail over hiding obvious outputs such as the requested PDF.
+  // Inferred supporting items are deliberately excluded here: they can be
+  // ambiguous filesystem changes from another concurrent turn.
+  return deliverables.filter(
+    (item) =>
+      item.source === "declared" &&
+      item.role === "supporting" &&
+      item.category === "standalone_output" &&
+      item.change_kind !== "deleted"
+  )
 }
 
 /**
