@@ -151,7 +151,7 @@ describe("useConnectionLifecycle send-failure surfacing", () => {
     })
 
     expect(onSendFailed).toHaveBeenCalledTimes(1)
-    expect(onSendFailed).toHaveBeenCalledWith(error)
+    expect(onSendFailed).toHaveBeenCalledWith(error, false)
     // Toast first, then the state rollback — the rollback must not hide the
     // failure from the user.
     expect(calls).toEqual(["toast", "onSendFailed"])

@@ -148,9 +148,6 @@ interface MessageListViewProps {
    * items render in arbitrary order and multiplicity. `null` = no divider.
    */
   userTurnHeader?: ((group: ResolvedMessageGroup) => string | null) | null
-  /** Folder owned by this conversation, not necessarily the globally active
-   *  one. Folderless chat mode passes its hidden scratch-folder record. */
-  folder?: FolderDetail | null
   /** Explicit final outputs verified and persisted by the backend. */
   deliverables?: ConversationDeliverable[]
   /** Per-turn output associations used at the producing assistant reply. */
@@ -847,7 +844,6 @@ export function MessageListView({
   onNewSession,
   showMessageNav = true,
   userTurnHeader = null,
-  folder,
   deliverables = EMPTY_DELIVERABLES,
   deliverableRuns = [],
 }: MessageListViewProps) {
