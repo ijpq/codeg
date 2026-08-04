@@ -87,14 +87,14 @@ describe("ConversationDetailPanel new conversation layout", () => {
   })
 
   it("loads persisted history only for visible keep-alive tabs", () => {
-    expect(source).toContain("shouldLoadDetail={canTile || active}")
+    expect(source).toContain("shouldLoadDetail={visible}")
     expect(source).toContain(
       "useConversationDetail(effectiveConversationId, {\n    enabled: shouldLoadDetail,"
     )
   })
 
   it("suspends hidden heavy UI while keeping the tab controller mounted", () => {
-    expect(source).toContain("shouldRenderContent={canTile || active}")
+    expect(source).toContain("shouldRenderContent={visible}")
     expect(source).toContain("if (!shouldRenderContent) {")
 
     const controllerStart = source.indexOf(
