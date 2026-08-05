@@ -42,6 +42,7 @@ pub async fn create_run(
         conversation_id: Set(input.conversation_id),
         connection_id: Set(input.connection_id),
         client_message_id: Set(input.client_message_id),
+        prompt_accepted_at: Set(None),
         prompt_fingerprint: Set(input.prompt_fingerprint),
         folder_id: Set(input.folder_id),
         root_path: Set(input.root_path),
@@ -63,6 +64,36 @@ pub async fn create_run(
     .insert(conn)
     .await?;
     Ok(model)
+}
+
+pub async fn mark_prompt_accepted(conn: &DatabaseConnection, run_id: &str) -> Result<(), DbError> {
+    let Some(model) = conversation_turn_run::Entity::find_by_id(run_id.to_string())
+        .one(conn)
+        .await?
+    else {
+        return Ok(());
+    };
+    if model.prompt_accepted_at.is_some() {
+        return Ok(());
+    }
+    let mut active = model.into_active_model();
+    active.prompt_accepted_at = Set(Some(Utc::now()));
+    active.update(conn).await?;
+    Ok(())
+}
+
+pub async fn was_prompt_accepted(
+    conn: &DatabaseConnection,
+    conversation_id: i32,
+    client_message_id: &str,
+) -> Result<bool, DbError> {
+    Ok(conversation_turn_run::Entity::find()
+        .filter(conversation_turn_run::Column::ConversationId.eq(conversation_id))
+        .filter(conversation_turn_run::Column::ClientMessageId.eq(client_message_id.to_string()))
+        .filter(conversation_turn_run::Column::PromptAcceptedAt.is_not_null())
+        .one(conn)
+        .await?
+        .is_some())
 }
 
 fn merge_kind(
@@ -342,6 +373,7 @@ pub async fn list_for_conversation(
             conversation_id: run.conversation_id,
             connection_id: run.connection_id,
             client_message_id: run.client_message_id,
+            prompt_accepted_at: run.prompt_accepted_at,
             folder_id: run.folder_id,
             root_path: run.root_path,
             status: run_status_str(&run.status).to_string(),

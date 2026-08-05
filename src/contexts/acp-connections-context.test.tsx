@@ -341,7 +341,45 @@ describe("AcpConnectionsProvider cross-client viewer lifecycle", () => {
     expect(h.acpDisconnect).toHaveBeenCalledWith("spawned-conn")
   })
 
-  it("restores a stale remote viewer connection and retries the same prompt id once", async () => {
+  it("does not submit a historical prompt until its attach replay completes", async () => {
+    h.acpFindConnectionForConversation.mockResolvedValue({
+      connection_id: "owner-conn",
+      event_seq: 0,
+    })
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 42)
+    })
+    const handlers = latestAttachHandlers()
+    emitAcpEvent(handlers, {
+      seq: 1,
+      connection_id: "owner-conn",
+      type: "session_started",
+      session_id: "sess-1",
+    })
+
+    const blocks = [{ type: "text" as const, text: "wait for replay" }]
+    await expect(
+      h.actions!.sendPrompt(TAB, blocks, {
+        folderId: 1,
+        conversationId: 42,
+        clientMessageId: "optimistic-before-replay",
+      })
+    ).rejects.toThrow("ACP session restore has not completed")
+    expect(h.acpPrompt).not.toHaveBeenCalled()
+
+    act(() => handlers.onReplay([], 1))
+    await act(async () => {
+      await h.actions!.sendPrompt(TAB, blocks, {
+        folderId: 1,
+        conversationId: 42,
+        clientMessageId: "optimistic-before-replay",
+      })
+    })
+    expect(h.acpPrompt).toHaveBeenCalledTimes(1)
+  })
+
+  it("restores a stale remote viewer and retries the same prompt id after replay", async () => {
     h.acpFindConnectionForConversation
       .mockResolvedValueOnce({ connection_id: "owner-conn", event_seq: 0 })
       .mockResolvedValueOnce({ connection_id: "recovered-conn", event_seq: 0 })
@@ -362,8 +400,25 @@ describe("AcpConnectionsProvider cross-client viewer lifecycle", () => {
       type: "session_started",
       session_id: "sess-1",
     })
+    act(() => latestAttachHandlers().onReplay([], 1))
 
     const blocks = [{ type: "text" as const, text: "remote prompt" }]
+    await expect(
+      h.actions!.sendPrompt(TAB, blocks, {
+        folderId: 1,
+        conversationId: 42,
+        clientMessageId: "optimistic-stable-id",
+      })
+    ).rejects.toThrow("ACP session restore has not completed")
+
+    const recoveredHandlers = latestAttachHandlers()
+    emitAcpEvent(recoveredHandlers, {
+      seq: 1,
+      connection_id: "recovered-conn",
+      type: "session_started",
+      session_id: "sess-1",
+    })
+    act(() => recoveredHandlers.onReplay([], 1))
     await act(async () => {
       await h.actions!.sendPrompt(TAB, blocks, {
         folderId: 1,
@@ -1102,6 +1157,7 @@ describe("AcpConnectionsProvider persisted Codex restore lifecycle", () => {
       type: "session_started",
       session_id: "sess-1",
     })
+    act(() => legacyHandlers.onReplay([], 1))
     expect(h.store!.getConnection(CODEX_TAB)).toMatchObject({
       connectionId: "legacy-codex-conn",
       sessionId: "sess-1",
@@ -1121,8 +1177,6 @@ describe("AcpConnectionsProvider persisted Codex restore lifecycle", () => {
       type: "conversation_linked",
       conversation_id: 77,
       folder_id: 1,
-      parent_conversation_id: null,
-      parent_tool_use_id: null,
     })
 
     expect(h.store!.getConnection("new-codex-tab")?.conversationId).toBe(77)
@@ -1160,6 +1214,7 @@ describe("AcpConnectionsProvider persisted Codex restore lifecycle", () => {
       type: "session_started",
       session_id: "sess-1",
     })
+    act(() => restoredHandlers.onReplay([], 1))
     await act(async () => {
       await h.actions!.sendPrompt(
         CODEX_TAB,

@@ -44,6 +44,7 @@ import {
   isConnectionBusy,
   isConnectionGoneError,
 } from "@/lib/connection-teardown"
+import { SessionRestorePendingError } from "@/lib/session-restore"
 import {
   getConversationIdByExternalIdFromStore,
   useConversationRuntimeStore,
@@ -196,6 +197,12 @@ export interface ConnectionState {
    * stale snapshot cannot resurrect steer after method-not-found. */
   steerCapabilityKnown: boolean
   selectorsReady: boolean
+  /**
+   * True only after this concrete connection's initial snapshot/replay (or the
+   * legacy snapshot handoff) has completed. Reset for every WS re-attach so a
+   * stale `connected` state cannot submit against a half-restored session.
+   */
+  promptReady: boolean
   sessionId: string | null
   /** Built-in Codeg MCP was configured on this concrete ACP session. */
   codegMcpAvailable: boolean
@@ -379,6 +386,11 @@ type Action =
       type: "HYDRATE_FROM_SNAPSHOT"
       contextKey: string
       patch: import("@/lib/snapshot-denormalize").SnapshotPatch
+    }
+  | {
+      type: "PROMPT_READINESS_CHANGED"
+      contextKey: string
+      ready: boolean
     }
   | { type: "CONNECTION_REMOVED"; contextKey: string }
   | { type: "REMOVE_ALL" }
@@ -1289,6 +1301,7 @@ function connectionsReducer(
         supportsSteer: false,
         steerCapabilityKnown: false,
         selectorsReady: false,
+        promptReady: false,
         sessionId: null,
         codegMcpAvailable: action.codegMcpAvailable ?? false,
         mcpServerCount: action.mcpServerCount ?? 0,
@@ -1364,6 +1377,7 @@ function connectionsReducer(
         supportsSteer: false,
         steerCapabilityKnown: false,
         selectorsReady: true,
+        promptReady: true,
         sessionId: null,
         codegMcpAvailable: false,
         mcpServerCount: 0,
@@ -1471,7 +1485,8 @@ function connectionsReducer(
           mergedPromptCapabilities === current.promptCapabilities &&
           mergedConversationId === current.conversationId &&
           mergedCodegMcpAvailable === current.codegMcpAvailable &&
-          mergedMcpServerCount === current.mcpServerCount
+          mergedMcpServerCount === current.mcpServerCount &&
+          current.promptReady
         ) {
           return state
         }
@@ -1486,6 +1501,7 @@ function connectionsReducer(
           codegMcpAvailable: mergedCodegMcpAvailable,
           mcpServerCount: mergedMcpServerCount,
           selectorsReady: mergedSelectorsReady,
+          promptReady: true,
           supportsFork: mergedSupportsFork,
           supportsSteer: mergedSupportsSteer,
           steerCapabilityKnown: mergedSteerCapabilityKnown,
@@ -1518,6 +1534,7 @@ function connectionsReducer(
         steerMessages: action.patch.steerMessages,
         promptCapabilities: mergedPromptCapabilities,
         selectorsReady: mergedSelectorsReady,
+        promptReady: true,
         supportsFork: mergedSupportsFork,
         supportsSteer: action.patch.supportsSteer,
         steerCapabilityKnown: true,
@@ -1533,6 +1550,14 @@ function connectionsReducer(
         error: action.patch.lastError,
         lastAppliedSeq: action.patch.eventSeq,
       })
+      return next
+    }
+
+    case "PROMPT_READINESS_CHANGED": {
+      const current = state.get(action.contextKey)
+      if (!current || current.promptReady === action.ready) return state
+      const next = new Map(state)
+      next.set(action.contextKey, { ...current, promptReady: action.ready })
       return next
     }
 
@@ -4277,6 +4302,13 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
 
       let activeSub: EventStreamSubscription | null = null
       const handlers: AttachHandlers = {
+        onAttaching: () => {
+          dispatch({
+            type: "PROMPT_READINESS_CHANGED",
+            contextKey,
+            ready: false,
+          })
+        },
         onSnapshot: (snapshot) => {
           const patch = denormalizeSnapshot(snapshot)
           dispatch({ type: "HYDRATE_FROM_SNAPSHOT", contextKey, patch })
@@ -4301,6 +4333,11 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             for (const envelope of events) {
               applyMappedEnvelope(contextKey, envelope)
             }
+          })
+          dispatch({
+            type: "PROMPT_READINESS_CHANGED",
+            contextKey,
+            ready: true,
           })
         },
         onEvent: (envelope) => {
@@ -4732,6 +4769,11 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       for (const env of consumeBufferedEvents(connectionId)) {
         applyMappedEnvelope(contextKey, env)
       }
+      dispatch({
+        type: "PROMPT_READINESS_CHANGED",
+        contextKey,
+        ready: true,
+      })
     },
     [
       applyMappedEnvelope,
@@ -5142,6 +5184,11 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
               applyMappedEnvelope(contextKey, event)
             }
           }
+          dispatch({
+            type: "PROMPT_READINESS_CHANGED",
+            contextKey,
+            ready: true,
+          })
         }
         deferredRestoreKeysRef.current.delete(contextKey)
       } catch (err) {
@@ -5610,6 +5657,9 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         })
         throw new Error("Active ACP connection belongs to another conversation")
       }
+      if (!conn.promptReady) {
+        throw new SessionRestorePendingError()
+      }
       if (desired?.sessionId && conn.sessionId !== desired.sessionId) {
         console.warn("[acp-context] prompt session mismatch", {
           conversationId: requestedConversationId,
@@ -5617,7 +5667,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           activeExternalSessionId: conn.sessionId,
           connectionId: conn.connectionId,
         })
-        throw new Error("ACP session restore has not completed")
+        throw new SessionRestorePendingError()
       }
       if (
         desired?.agentType === "codex" &&
@@ -5663,6 +5713,35 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           }
         )
         conn = await recoverPromptConnection(contextKey, staleConnectionId)
+        // Recovery only establishes the replacement connection. Its replayed
+        // snapshot is the point at which the exact historical session becomes
+        // prompt-safe, so let the durable caller queue retry after that signal
+        // instead of racing a prompt into a half-restored replacement.
+        if (!conn.promptReady) {
+          throw new SessionRestorePendingError()
+        }
+        if (desired?.sessionId && conn.sessionId !== desired.sessionId) {
+          throw new SessionRestorePendingError()
+        }
+        if (
+          requestedConversationId != null &&
+          conn.conversationId != null &&
+          conn.conversationId !== requestedConversationId
+        ) {
+          throw new Error(
+            "Recovered ACP connection belongs to another conversation"
+          )
+        }
+        if (
+          desired?.agentType === "codex" &&
+          desired.conversationId != null &&
+          desired.sessionId &&
+          !conn.codegMcpAvailable
+        ) {
+          throw new Error(
+            "Codeg MCP is not ready on the restored Codex session"
+          )
+        }
         await submit(conn.connectionId)
       }
     },
@@ -5678,6 +5757,9 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       const conn = storeRef.current.connections.get(contextKey)
       if (!conn) {
         throw new Error(`No live connection for ${contextKey}`)
+      }
+      if (!conn.promptReady) {
+        throw new SessionRestorePendingError()
       }
       lastActivityRef.current.set(contextKey, Date.now())
       return acpSteer(conn.connectionId, blocks, clientMessageId)

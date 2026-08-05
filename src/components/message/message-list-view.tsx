@@ -225,22 +225,22 @@ export interface DeliverableUserTurnRef {
 
 /**
  * The conversation-level panel is intentionally an inclusive ledger. A reply
- * tail has a different contract: it should show only the main files a user is
- * expected to open or download, never the full source/test/config change set.
- * Declared missing files remain visible as an honest diagnostic; inferred
- * entries must still exist because they have weaker semantic evidence.
+ * tail has a different contract: an explicit declaration is the complete,
+ * authoritative set for that turn (primary and supporting alike). Only when no
+ * declaration exists do we fall back to high-confidence inferred primary
+ * outputs. Declared missing files remain visible as an honest diagnostic.
  */
 export function replyDeliverablesForRun(
   deliverables: ConversationDeliverable[]
 ): ConversationDeliverable[] {
+  const declared = deliverables.filter(
+    (item) => item.source === "declared" && item.change_kind !== "deleted"
+  )
+  if (declared.length > 0) return declared
+
   const eligible = deliverables.filter((item) => {
     if (item.role !== "primary" || item.category === "code_change") {
       return false
-    }
-    if (item.source === "declared") {
-      // Older servers omitted category; a primary declared item is still a
-      // stronger signal than filesystem inference and remains compatible.
-      return item.category == null || item.category === "standalone_output"
     }
     return (
       item.category === "standalone_output" &&
@@ -248,37 +248,62 @@ export function replyDeliverablesForRun(
       item.change_kind !== "deleted"
     )
   })
-  if (eligible.length > 0) return eligible
+  return eligible
+}
 
-  // A declaration is authoritative for this exact turn. If an older or
-  // imperfect agent marked every standalone result as supporting, prefer a
-  // useful reply tail over hiding obvious outputs such as the requested PDF.
-  // Inferred supporting items are deliberately excluded here: they can be
-  // ambiguous filesystem changes from another concurrent turn.
-  return deliverables.filter(
-    (item) =>
-      item.source === "declared" &&
-      item.role === "supporting" &&
-      item.category === "standalone_output" &&
-      item.change_kind !== "deleted"
-  )
+export interface DeliverableAssociationResult {
+  byUserId: Map<string, ConversationDeliverable[]>
+  /**
+   * Durable output sets that could not be correlated to a parser user-turn id.
+   * The message list renders these at the final assistant reply instead of
+   * silently dropping a successfully published deliverable.
+   */
+  unassociated: ConversationDeliverable[]
+}
+
+function dedupeDeliverables(
+  deliverables: ConversationDeliverable[]
+): ConversationDeliverable[] {
+  const seen = new Set<string>()
+  return deliverables.filter((item) => {
+    const key = item.id || `${item.turn_run_id ?? ""}:${item.path}`
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
 }
 
 /**
  * Prefer the backend's prompt-fingerprint link, then the exact optimistic id
  * while a session is live. Historical rows created before that link existed
  * retain the guarded timestamp fallback. This deliberately refuses distant
- * guesses: the conversation-level panel remains available even when an old
- * reply cannot be correlated safely.
+ * guesses; unmatched durable outputs are returned separately so the caller can
+ * use an explicit final-reply fallback instead of silently losing the card.
  */
 export function associateDeliverablesWithUserTurns(
   runs: ConversationTurnDeliverableSet[],
   userTurns: DeliverableUserTurnRef[]
 ): Map<string, ConversationDeliverable[]> {
-  const result = new Map<string, ConversationDeliverable[]>()
+  return resolveDeliverableAssociations(runs, userTurns).byUserId
+}
+
+export function resolveDeliverableAssociations(
+  runs: ConversationTurnDeliverableSet[],
+  userTurns: DeliverableUserTurnRef[]
+): DeliverableAssociationResult {
+  const byUserId = new Map<string, ConversationDeliverable[]>()
   const userIds = new Set(userTurns.map((turn) => turn.id))
   const used = new Set<string>()
   const unresolved: ConversationTurnDeliverableSet[] = []
+  const attach = (userId: string, deliverables: ConversationDeliverable[]) => {
+    byUserId.set(
+      userId,
+      dedupeDeliverables([
+        ...(byUserId.get(userId) ?? EMPTY_DELIVERABLES),
+        ...deliverables,
+      ])
+    )
+  }
 
   for (const run of runs) {
     const deliverables = replyDeliverablesForRun(run.deliverables)
@@ -290,7 +315,7 @@ export function associateDeliverablesWithUserTurns(
           ? run.client_message_id
           : null
     if (exactId) {
-      result.set(exactId, deliverables)
+      attach(exactId, deliverables)
       used.add(exactId)
     } else {
       unresolved.push({ ...run, deliverables })
@@ -328,11 +353,18 @@ export function associateDeliverablesWithUserTurns(
       }
     }
     if (best) {
-      result.set(best.id, run.deliverables)
+      attach(best.id, run.deliverables)
       used.add(best.id)
+      unresolved.splice(unresolved.indexOf(run), 1)
     }
   }
-  return result
+
+  return {
+    byUserId,
+    unassociated: dedupeDeliverables(
+      unresolved.flatMap((run) => run.deliverables)
+    ),
+  }
 }
 
 // Collect the `delegate_to_agent` tool calls within a turn's adapted parts,
@@ -1090,9 +1122,9 @@ export function MessageListView({
     [historicalPlanEntries]
   )
 
-  const deliverablesByUserId = useMemo(
+  const deliverableAssociations = useMemo(
     () =>
-      associateDeliverablesWithUserTurns(
+      resolveDeliverableAssociations(
         deliverableRuns,
         threadItems.flatMap((item) =>
           item.kind === "turn" && item.group.role === "user"
@@ -1102,6 +1134,16 @@ export function MessageListView({
       ),
     [deliverableRuns, threadItems]
   )
+  const fallbackDeliverableAssistantKey = useMemo(() => {
+    if (deliverableAssociations.unassociated.length === 0) return null
+    for (let index = threadItems.length - 1; index >= 0; index -= 1) {
+      const item = threadItems[index]
+      if (item.kind === "turn" && item.group.role === "assistant") {
+        return item.key
+      }
+    }
+    return null
+  }, [deliverableAssociations.unassociated.length, threadItems])
 
   const renderThreadItem = useCallback(
     (item: ThreadRenderItem) => {
@@ -1112,6 +1154,16 @@ export function MessageListView({
             item.group.role === "user" && userTurnHeader
               ? userTurnHeader(item.group)
               : null
+          const associatedDeliverables = item.previousUserId
+            ? deliverableAssociations.byUserId.get(item.previousUserId)
+            : undefined
+          const replyDeliverables =
+            item.key === fallbackDeliverableAssistantKey
+              ? dedupeDeliverables([
+                  ...(associatedDeliverables ?? EMPTY_DELIVERABLES),
+                  ...deliverableAssociations.unassociated,
+                ])
+              : associatedDeliverables
           return (
             <div style={pt > 0 ? { paddingTop: pt } : undefined}>
               {phaseLabel ? (
@@ -1132,11 +1184,7 @@ export function MessageListView({
                 isResponseComplete={item.phase === "persisted"}
                 conversationId={conversationId}
                 delivery={promptDeliveries[item.group.id] ?? null}
-                deliverables={
-                  item.previousUserId
-                    ? deliverablesByUserId.get(item.previousUserId)
-                    : undefined
-                }
+                deliverables={replyDeliverables}
               />
             </div>
           )
@@ -1154,7 +1202,13 @@ export function MessageListView({
           return null
       }
     },
-    [conversationId, deliverablesByUserId, promptDeliveries, userTurnHeader]
+    [
+      conversationId,
+      deliverableAssociations,
+      fallbackDeliverableAssistantKey,
+      promptDeliveries,
+      userTurnHeader,
+    ]
   )
 
   const emptyState = useMemo(

@@ -56,6 +56,22 @@ cargo insta review
 INSTA_UPDATE=auto cargo test --features test-utils     # 自动写新 .snap
 ```
 
+## 发版约定
+
+当用户只说“发版”“release”或“完成 release 发版”时，直接执行
+[`docs/release-workflow.md`](docs/release-workflow.md)，无需再次询问流程。除非用户指定版本或
+发布通道，否则默认发布 `origin` 最新稳定版本的下一个 patch 版本。
+
+固定顺序为：解析并拉取 `upstream` 最新已发布稳定版对应的 commit → 将本地待发版分支
+rebase 到该 commit → 完成检查和版本提交 → 先推送分支到 `origin` 默认分支并确认该 commit
+的普通 CI 通过 → 再推送版本 tag 触发 `origin` 的 Release workflow → 等待 Release CI 全部
+通过并确认 GitHub Release 已正式发布。
+
+不得仅因同名 Release 已存在就报告发版完成。最终必须核对本地 release commit、`origin`
+默认分支包含的 commit、远端 tag 指向的 commit、Release workflow 的 `headSha` 四者一致。
+若 CI 失败后又产生修复 commit，旧 tag/旧 Release 不代表新 commit 已发版，必须重新走版本
+和发布校验流程。
+
 ## 架构
 
 ### 双模式运行
