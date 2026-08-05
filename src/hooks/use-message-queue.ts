@@ -4,12 +4,67 @@ import { useCallback, useRef, useState } from "react"
 import type { PromptDraft } from "@/lib/types"
 import { randomUUID } from "@/lib/utils"
 
+export type QueuedMessageIntent = "prompt" | "guide"
+export type QueuedMessageState =
+  | "queued"
+  | "waiting_session_restore"
+  | "waiting_connection"
+  | "failed"
+  | "expired_guide"
+
+export interface QueuedGuideTarget {
+  /** Historical ACP session the running turn belongs to. */
+  sessionId: string | null
+  /** Concrete live connection at the time the guide was composed. */
+  connectionId: string | null
+  /** Stable id of the original in-flight user prompt, when already observed. */
+  userMessageId: string | null
+}
+
+export function isQueuedGuideTargetCurrent(
+  target: QueuedGuideTarget,
+  current: {
+    sessionId: string | null
+    connectionId: string | null
+    pendingUserMessageId: string | null
+    status: string | null
+  }
+): boolean {
+  if (current.status !== "prompting") return false
+  if (target.sessionId != null && target.sessionId !== current.sessionId) {
+    return false
+  }
+  return target.userMessageId
+    ? target.userMessageId === current.pendingUserMessageId
+    : target.connectionId === current.connectionId
+}
+
 export interface QueuedMessage {
   id: string
   /** Stable id reused when this item is retried after Busy/reconnect. */
   clientMessageId: string
   draft: PromptDraft
   modeId: string | null
+  intent: QueuedMessageIntent
+  state: QueuedMessageState
+  error: string | null
+  guideTarget: QueuedGuideTarget | null
+}
+
+export interface QueueEnqueueOptions {
+  intent?: QueuedMessageIntent
+  state?: QueuedMessageState
+  error?: string | null
+  guideTarget?: QueuedGuideTarget | null
+}
+
+export interface UseMessageQueueOptions {
+  /**
+   * Web/remote images have already been uploaded to a server-side `file://`
+   * URI. Omit their duplicate base64 only in the persisted copy so a large
+   * image cannot exhaust localStorage; the live in-memory draft stays intact.
+   */
+  compactUploadedImages?: boolean
 }
 
 // Persist the queue per conversation so undelivered messages (e.g. a send that
@@ -48,19 +103,80 @@ function loadPersistedQueue(storageKey: string | null): QueuedMessage[] {
           item.clientMessageId.length > 0
             ? item.clientMessageId
             : `optimistic-${item.id}`,
+        intent: item.intent === "guide" ? "guide" : "prompt",
+        state: isQueuedMessageState(item.state) ? item.state : "queued",
+        error: typeof item.error === "string" ? item.error : null,
+        guideTarget: isQueuedGuideTarget(item.guideTarget)
+          ? item.guideTarget
+          : null,
       }))
   } catch {
     return []
   }
 }
 
-function persistQueue(storageKey: string | null, queue: QueuedMessage[]): void {
+function isQueuedMessageState(value: unknown): value is QueuedMessageState {
+  return (
+    value === "queued" ||
+    value === "waiting_session_restore" ||
+    value === "waiting_connection" ||
+    value === "failed" ||
+    value === "expired_guide"
+  )
+}
+
+function isQueuedGuideTarget(value: unknown): value is QueuedGuideTarget {
+  if (!value || typeof value !== "object") return false
+  const target = value as Partial<QueuedGuideTarget>
+  return (
+    (target.sessionId == null || typeof target.sessionId === "string") &&
+    (target.connectionId == null || typeof target.connectionId === "string") &&
+    (target.userMessageId == null || typeof target.userMessageId === "string")
+  )
+}
+
+function compactDraftForPersistence(draft: PromptDraft): PromptDraft {
+  return {
+    ...draft,
+    blocks: draft.blocks.map((block) => {
+      if (
+        block.type === "image" &&
+        block.data.length > 0 &&
+        block.uri?.startsWith("file://")
+      ) {
+        return { ...block, data: "" }
+      }
+      if (
+        block.type === "resource" &&
+        typeof block.blob === "string" &&
+        block.blob.length > 0 &&
+        block.mime_type?.startsWith("image/") &&
+        block.uri.startsWith("file://")
+      ) {
+        return { ...block, blob: "" }
+      }
+      return block
+    }),
+  }
+}
+
+function persistQueue(
+  storageKey: string | null,
+  queue: QueuedMessage[],
+  compactUploadedImages: boolean
+): void {
   if (!storageKey || typeof window === "undefined") return
   try {
     if (queue.length === 0) {
       localStorage.removeItem(storageKey)
     } else {
-      localStorage.setItem(storageKey, JSON.stringify(queue))
+      const persisted = compactUploadedImages
+        ? queue.map((item) => ({
+            ...item,
+            draft: compactDraftForPersistence(item.draft),
+          }))
+        : queue
+      localStorage.setItem(storageKey, JSON.stringify(persisted))
     }
   } catch {
     /* quota / serialization — keep the in-memory queue as source of truth */
@@ -72,7 +188,8 @@ export interface UseMessageQueueReturn {
   enqueue: (
     draft: PromptDraft,
     modeId: string | null,
-    clientMessageId?: string
+    clientMessageId?: string,
+    options?: QueueEnqueueOptions
   ) => void
   /**
    * Put a draft back at the FRONT of the queue. Used when an auto-flushed item
@@ -85,7 +202,16 @@ export interface UseMessageQueueReturn {
     clientMessageId?: string
   ) => void
   dequeue: () => QueuedMessage | undefined
+  /** First auto-sendable item of the requested intent, read synchronously. */
+  peekNext: (intent: QueuedMessageIntent) => QueuedMessage | undefined
   remove: (id: string) => void
+  markState: (
+    id: string,
+    state: QueuedMessageState,
+    error?: string | null
+  ) => void
+  retry: (id: string) => void
+  convertGuideToPrompt: (id: string) => void
   reorder: (items: QueuedMessage[]) => void
   updateItem: (id: string, draft: PromptDraft) => void
   /**
@@ -106,7 +232,8 @@ export function useMessageQueue(
   // (typically the conversation id) so it survives a reload during an outage.
   // Pass a STABLE key — a changing key would reload from the new slot and drop
   // in-memory items.
-  persistKey?: string | number | null
+  persistKey?: string | number | null,
+  options?: UseMessageQueueOptions
 ): UseMessageQueueReturn {
   const storageKey = queueStorageKey(persistKey)
   const [queue, setQueue] = useState<QueuedMessage[]>(() =>
@@ -129,20 +256,30 @@ export function useMessageQueue(
     (next: QueuedMessage[]) => {
       queueRef.current = next
       setQueue(next)
-      persistQueue(storageKey, next)
+      persistQueue(storageKey, next, options?.compactUploadedImages ?? false)
     },
-    [storageKey]
+    [options?.compactUploadedImages, storageKey]
   )
 
   const enqueue = useCallback(
     (
       draft: PromptDraft,
       modeId: string | null,
-      clientMessageId = `optimistic-${randomUUID()}`
+      clientMessageId = `optimistic-${randomUUID()}`,
+      options?: QueueEnqueueOptions
     ) => {
       commit([
         ...queueRef.current,
-        { id: randomUUID(), clientMessageId, draft, modeId },
+        {
+          id: randomUUID(),
+          clientMessageId,
+          draft,
+          modeId,
+          intent: options?.intent ?? "prompt",
+          state: options?.state ?? "queued",
+          error: options?.error ?? null,
+          guideTarget: options?.guideTarget ?? null,
+        },
       ])
     },
     [commit]
@@ -155,7 +292,16 @@ export function useMessageQueue(
       clientMessageId = `optimistic-${randomUUID()}`
     ) => {
       commit([
-        { id: randomUUID(), clientMessageId, draft, modeId },
+        {
+          id: randomUUID(),
+          clientMessageId,
+          draft,
+          modeId,
+          intent: "prompt",
+          state: "queued",
+          error: null,
+          guideTarget: null,
+        },
         ...queueRef.current,
       ])
     },
@@ -169,6 +315,18 @@ export function useMessageQueue(
     return current[0]
   }, [commit])
 
+  const peekNext = useCallback(
+    (intent: QueuedMessageIntent): QueuedMessage | undefined =>
+      queueRef.current.find(
+        (item) =>
+          item.intent === intent &&
+          (item.state === "queued" ||
+            item.state === "waiting_session_restore" ||
+            item.state === "waiting_connection")
+      ),
+    []
+  )
+
   const remove = useCallback(
     (id: string) => {
       if (editingItemId === id) {
@@ -177,6 +335,47 @@ export function useMessageQueue(
       commit(queueRef.current.filter((item) => item.id !== id))
     },
     [commit, editingItemId]
+  )
+
+  const markState = useCallback(
+    (id: string, state: QueuedMessageState, error: string | null = null) => {
+      commit(
+        queueRef.current.map((item) =>
+          item.id === id ? { ...item, state, error } : item
+        )
+      )
+    },
+    [commit]
+  )
+
+  const retry = useCallback(
+    (id: string) => {
+      commit(
+        queueRef.current.map((item) =>
+          item.id === id ? { ...item, state: "queued", error: null } : item
+        )
+      )
+    },
+    [commit]
+  )
+
+  const convertGuideToPrompt = useCallback(
+    (id: string) => {
+      commit(
+        queueRef.current.map((item) =>
+          item.id === id
+            ? {
+                ...item,
+                intent: "prompt",
+                state: "queued",
+                error: null,
+                guideTarget: null,
+              }
+            : item
+        )
+      )
+    },
+    [commit]
   )
 
   const reorder = useCallback(
@@ -232,7 +431,11 @@ export function useMessageQueue(
     enqueue,
     requeueFront,
     dequeue,
+    peekNext,
     remove,
+    markState,
+    retry,
+    convertGuideToPrompt,
     reorder,
     updateItem,
     getQueueLength,

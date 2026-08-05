@@ -1532,6 +1532,8 @@
       "promptAcceptanceUnknown": "Verbindung unterbrochen; Annahme durch den Server wird geprüft",
       "steerUnsupportedQueued": "Native Steuerung nicht verfügbar; Nachricht für den nächsten Turn eingereiht",
       "steerFailedQueued": "Steuerung fehlgeschlagen; Nachricht für den nächsten Turn eingereiht",
+      "steerWaitingRestore": "Anweisung gespeichert; ursprüngliche Sitzung wird wiederhergestellt",
+      "steerOriginalTurnEnded": "Die ursprüngliche Aufgabe ist beendet; diese Anweisung wurde nicht gesendet",
       "exportConversation": "Konversation exportieren",
       "exportImage": "Bild",
       "exportMarkdown": "Markdown",
@@ -2529,7 +2531,14 @@
         "saveEdit": "Speichern",
         "cancelEdit": "Bearbeitung abbrechen",
         "editItem": "Bearbeiten",
-        "deleteItem": "Entfernen"
+        "deleteItem": "Entfernen",
+        "queued": "Eingereiht",
+        "waiting_session_restore": "Warten auf Sitzungswiederherstellung",
+        "waiting_connection": "Warten auf Verbindungswiederholung",
+        "failed": "Senden fehlgeschlagen",
+        "expired_guide": "Ursprüngliche Aufgabe beendet",
+        "retry": "Erneut versuchen",
+        "sendAsPrompt": "Als neue Nachricht senden"
       },
       "welcomeInputPanel": {
         "agentsSettingsPath": "Einstellungen > Agenten",

@@ -4,6 +4,7 @@ import {
   associateDeliverablesWithUserTurns,
   mergeConsecutiveAssistantTurns,
   replyDeliverablesForRun,
+  resolveDeliverableAssociations,
   type MergedAssistantRunCache,
   type ResolvedMessageGroup,
   type ThreadRenderItem,
@@ -209,7 +210,7 @@ describe("replyDeliverablesForRun", () => {
       ...overrides,
     }) as ConversationDeliverable
 
-  it("keeps reply tails strict while the conversation ledger remains broad", () => {
+  it("treats every explicit declaration as the authoritative turn set", () => {
     const all = [
       output("report"),
       output("supporting", { role: "supporting" }),
@@ -219,12 +220,13 @@ describe("replyDeliverablesForRun", () => {
     ]
     expect(replyDeliverablesForRun(all).map((item) => item.id)).toEqual([
       "report",
-      "expected-inferred",
+      "supporting",
+      "source",
     ])
     expect(all).toHaveLength(5)
   })
 
-  it("falls back to declared standalone outputs when none were marked primary", () => {
+  it("shows supporting declarations and ignores inferred QA noise", () => {
     const all = [
       output("designed-pdf", { role: "supporting" }),
       output("source", {
@@ -239,7 +241,87 @@ describe("replyDeliverablesForRun", () => {
 
     expect(replyDeliverablesForRun(all).map((item) => item.id)).toEqual([
       "designed-pdf",
+      "source",
     ])
+  })
+
+  it("does not hide a turn that contains multiple declared primary files", () => {
+    const all = [
+      output("final-pdf"),
+      output("qa-page-1", { source: "inferred" }),
+      output("qa-page-2", { source: "inferred" }),
+      output("merged-docx", { role: "supporting" }),
+    ]
+
+    expect(replyDeliverablesForRun(all).map((item) => item.id)).toEqual([
+      "final-pdf",
+      "merged-docx",
+    ])
+  })
+
+  it("keeps inference-only turns strict and omits empty cards", () => {
+    expect(replyDeliverablesForRun([])).toEqual([])
+    expect(
+      replyDeliverablesForRun([
+        output("qa-supporting", {
+          role: "supporting",
+          source: "inferred",
+        }),
+      ])
+    ).toEqual([])
+  })
+})
+
+describe("resolveDeliverableAssociations", () => {
+  const declared = {
+    id: "published-pdf",
+    role: "primary",
+    category: "standalone_output",
+    source: "declared",
+    is_valid: true,
+    change_kind: "created",
+  } as ConversationDeliverable
+
+  it("retains a persisted declaration when historical turn linkage is missing", () => {
+    const result = resolveDeliverableAssociations(
+      [
+        {
+          turn_run_id: "run-orphaned",
+          conversation_id: 1,
+          client_message_id: null,
+          user_turn_id: null,
+          started_at: "invalid",
+          completed_at: "invalid",
+          deliverables: [declared],
+        },
+      ],
+      [{ id: "parsed-user", timestamp: "2026-08-05T03:01:20Z" }]
+    )
+
+    expect(result.byUserId.size).toBe(0)
+    expect(result.unassociated.map((item) => item.id)).toEqual([
+      "published-pdf",
+    ])
+  })
+
+  it("does not manufacture an unassociated card for a turn without outputs", () => {
+    const result = resolveDeliverableAssociations(
+      [
+        {
+          turn_run_id: "run-empty",
+          conversation_id: 1,
+          client_message_id: null,
+          user_turn_id: null,
+          started_at: "2026-08-05T03:01:20Z",
+          completed_at: "2026-08-05T03:02:20Z",
+          deliverables: [],
+        },
+      ],
+      [{ id: "parsed-user", timestamp: "2026-08-05T03:01:20Z" }]
+    )
+
+    expect(result.byUserId.size).toBe(0)
+    expect(result.unassociated).toEqual([])
   })
 })
 

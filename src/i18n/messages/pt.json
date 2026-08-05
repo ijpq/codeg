@@ -1532,6 +1532,8 @@
       "promptAcceptanceUnknown": "Conexão interrompida; verificando se o servidor recebeu a mensagem",
       "steerUnsupportedQueued": "A orientação nativa não está disponível; a mensagem foi enfileirada para o próximo turno",
       "steerFailedQueued": "Falha na orientação; a mensagem foi enfileirada para o próximo turno",
+      "steerWaitingRestore": "Orientação guardada; aguardando a recuperação da sessão original",
+      "steerOriginalTurnEnded": "A tarefa original terminou; esta orientação não foi enviada",
       "exportConversation": "Exportar conversa",
       "exportImage": "Imagem",
       "exportMarkdown": "Markdown",
@@ -2529,7 +2531,14 @@
         "saveEdit": "Salvar",
         "cancelEdit": "Cancelar edição",
         "editItem": "Editar",
-        "deleteItem": "Remover"
+        "deleteItem": "Remover",
+        "queued": "Na fila",
+        "waiting_session_restore": "Aguardando recuperação da sessão",
+        "waiting_connection": "Aguardando nova tentativa de conexão",
+        "failed": "Falha no envio",
+        "expired_guide": "Tarefa original encerrada",
+        "retry": "Tentar novamente",
+        "sendAsPrompt": "Enviar como nova mensagem"
       },
       "welcomeInputPanel": {
         "agentsSettingsPath": "Configurações > Agentes",

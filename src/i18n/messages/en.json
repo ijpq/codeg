@@ -1532,6 +1532,8 @@
       "promptAcceptanceUnknown": "Connection interrupted; checking whether the backend accepted this message",
       "steerUnsupportedQueued": "Native guidance is unavailable; queued as the next message",
       "steerFailedQueued": "Guidance failed; queued as the next message",
+      "steerWaitingRestore": "Guidance saved; waiting for the original session to recover",
+      "steerOriginalTurnEnded": "The original task has ended; this guidance was not sent",
       "exportConversation": "Export Conversation",
       "exportImage": "Image",
       "exportMarkdown": "Markdown",
@@ -2529,7 +2531,14 @@
         "saveEdit": "Save",
         "cancelEdit": "Cancel edit",
         "editItem": "Edit",
-        "deleteItem": "Remove"
+        "deleteItem": "Remove",
+        "queued": "Queued",
+        "waiting_session_restore": "Waiting for session recovery",
+        "waiting_connection": "Waiting for connection retry",
+        "failed": "Send failed",
+        "expired_guide": "Original task ended",
+        "retry": "Retry",
+        "sendAsPrompt": "Send as a new message"
       },
       "welcomeInputPanel": {
         "agentsSettingsPath": "Settings > Agents",
