@@ -40,6 +40,7 @@ mod m20260801_000003_work_task_template;
 mod m20260802_000001_deliverable_turn_link;
 mod m20260803_000001_folder_link;
 mod m20260803_000001_token_usage;
+mod m20260804_000001_prompt_accepted_at;
 pub struct Migrator;
 
 #[async_trait::async_trait]
@@ -86,6 +87,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260802_000001_deliverable_turn_link::Migration),
             Box::new(m20260803_000001_folder_link::Migration),
             Box::new(m20260803_000001_token_usage::Migration),
+            Box::new(m20260804_000001_prompt_accepted_at::Migration),
         ]
     }
 }

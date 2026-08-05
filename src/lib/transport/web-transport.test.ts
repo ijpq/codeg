@@ -91,11 +91,11 @@ describe("WebTransport connection state machine", () => {
   it("heartbeats a ready socket and accepts pong as liveness", async () => {
     const { t, ws } = connectReady()
 
-    expect(JSON.parse(ws.sent.at(-1)!)).toEqual({ action: "ping" })
+    expect(JSON.parse(ws.sent[ws.sent.length - 1]!)).toEqual({ action: "ping" })
     ws.pong()
 
     await vi.advanceTimersByTimeAsync(20_000)
-    expect(JSON.parse(ws.sent.at(-1)!)).toEqual({ action: "ping" })
+    expect(JSON.parse(ws.sent[ws.sent.length - 1]!)).toEqual({ action: "ping" })
     ws.pong()
     await vi.advanceTimersByTimeAsync(10_000)
 
@@ -127,7 +127,7 @@ describe("WebTransport connection state machine", () => {
     t.verifyNow()
 
     expect(ws.sent).toHaveLength(before + 1)
-    expect(JSON.parse(ws.sent.at(-1)!)).toEqual({ action: "ping" })
+    expect(JSON.parse(ws.sent[ws.sent.length - 1]!)).toEqual({ action: "ping" })
   })
 
   it("rebuilds the transport immediately after an HTTP network failure", async () => {
