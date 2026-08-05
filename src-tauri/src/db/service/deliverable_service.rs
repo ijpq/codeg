@@ -19,6 +19,30 @@ use crate::models::{ConversationDeliverable, ConversationTurnDeliverableSet, Mes
 pub const SOURCE_DECLARED: &str = "declared";
 pub const SOURCE_INFERRED: &str = "inferred";
 
+fn run_has_authoritative_declaration(run: &conversation_turn_run::Model) -> bool {
+    matches!(
+        run.declaration_status.as_str(),
+        "success" | "success_empty" | "partial"
+    )
+}
+
+/// A successful agent declaration is the user-visible set for that turn.
+/// Older releases could append tracker inference after `publish_deliverables`
+/// completed; keep those rows as diagnostic history in SQLite, but never mix
+/// them back into the declared set returned to clients.
+fn retain_authoritative_associations(
+    associations: Vec<conversation_turn_deliverable::Model>,
+    authoritative_run_ids: &HashSet<String>,
+) -> Vec<conversation_turn_deliverable::Model> {
+    associations
+        .into_iter()
+        .filter(|association| {
+            !authoritative_run_ids.contains(&association.turn_run_id)
+                || association.source == SOURCE_DECLARED
+        })
+        .collect()
+}
+
 /// A declaration that has already passed workspace containment and filesystem
 /// validation. Keeping this type internal to the persistence boundary prevents
 /// callers from bypassing the verifier with arbitrary paths.
@@ -713,13 +737,49 @@ fn inference_path_allowed(path: &str) -> bool {
     // fallback settlement. Test-like names are filtered only for standalone
     // output formats, where they conventionally identify preview fixtures.
     if standalone_output_extension(clean_extension(parsed).as_deref()) {
+        const EXCLUDED_OUTPUT_DIRS: &[&str] = &[
+            "qa",
+            "qa-images",
+            "qa_images",
+            "render-cache",
+            "render_cache",
+            "render-check",
+            "render_check",
+        ];
+        if parsed.parent().is_some_and(|parent| {
+            parent.components().any(|component| match component {
+                Component::Normal(name) => EXCLUDED_OUTPUT_DIRS
+                    .iter()
+                    .any(|excluded| name.to_string_lossy().eq_ignore_ascii_case(excluded)),
+                _ => false,
+            })
+        }) {
+            return false;
+        }
         const EXCLUDED_STEMS: &[&str] = &["test"];
         if EXCLUDED_STEMS.contains(&stem.as_str()) {
             return false;
         }
         const EXCLUDED_MARKERS: &[&str] = &[
-            ".test", "_test", "-test", ".spec", "_spec", "-spec", ".tmp", "_tmp", "-tmp", "draft-",
-            "draft_", "preview-", "preview_",
+            ".test",
+            "_test",
+            "-test",
+            ".spec",
+            "_spec",
+            "-spec",
+            ".tmp",
+            "_tmp",
+            "-tmp",
+            "draft-",
+            "draft_",
+            "preview-",
+            "preview_",
+            "qa-",
+            "qa_",
+            "render-check-",
+            "render_check_",
+            "visual-check-",
+            "visual_check_",
         ];
         if EXCLUDED_MARKERS
             .iter()
@@ -731,10 +791,12 @@ fn inference_path_allowed(path: &str) -> bool {
     true
 }
 
-/// Deterministically settle one terminal turn. Successful declarations remain
-/// authoritative, while exclusive finalized filesystem changes fill any gaps.
-/// This intentionally includes source/test/config edits: code changes are
-/// user-facing outputs, not implementation noise.
+/// Deterministically settle one terminal turn. A successful explicit
+/// declaration (including an intentional empty declaration) is authoritative;
+/// tracker inference is a fallback only when declaration never succeeded.
+/// Failed declarations still permit recovery. This intentionally includes
+/// source/test/config edits for inference-only turns: code changes are useful in
+/// the inclusive conversation ledger, but never supplement a declared set.
 pub async fn infer_for_turn(
     conn: &DatabaseConnection,
     conversation_id: i32,
@@ -753,6 +815,10 @@ pub async fn infer_for_turn(
         .filter(conversation_turn_deliverable::Column::TurnRunId.eq(turn_run_id.to_string()))
         .all(conn)
         .await?;
+    let has_authoritative_declaration = run_has_authoritative_declaration(&run)
+        || existing_associations
+            .iter()
+            .any(|association| association.source == SOURCE_DECLARED);
 
     let changes = conversation_turn_file_change::Entity::find()
         .filter(conversation_turn_file_change::Column::TurnRunId.eq(turn_run_id.to_string()))
@@ -793,6 +859,9 @@ pub async fn infer_for_turn(
     let mut observed_paths = HashSet::new();
     for change in &changes {
         observed_paths.insert(change.path.clone());
+        if has_authoritative_declaration {
+            continue;
+        }
         let explicitly_expected = expected_paths.contains(&change.path);
         let extension = clean_extension(Path::new(&change.path));
         // A standalone file is still useful in the inclusive conversation
@@ -1015,6 +1084,18 @@ pub async fn list_for_conversation(
             .all(conn)
             .await?
     };
+    let authoritative_run_ids = runs
+        .iter()
+        .filter(|run| run_has_authoritative_declaration(run))
+        .map(|run| run.id.clone())
+        .chain(
+            associations
+                .iter()
+                .filter(|association| association.source == SOURCE_DECLARED)
+                .map(|association| association.turn_run_id.clone()),
+        )
+        .collect::<HashSet<_>>();
+    let associations = retain_authoritative_associations(associations, &authoritative_run_ids);
     let run_map = runs
         .into_iter()
         .map(|run| (run.id.clone(), run))
@@ -1036,10 +1117,10 @@ pub async fn list_for_conversation(
     }
     Ok(models
         .into_iter()
-        .map(|model| {
+        .filter_map(|model| {
             let association = association_map.get(&model.id);
             let run = association.and_then(|row| run_map.get(&row.turn_run_id));
-            to_info(model, association, run)
+            association.map(|association| to_info(model, Some(association), run))
         })
         .collect())
 }
@@ -1067,6 +1148,16 @@ pub async fn list_for_turn(
         .order_by_asc(conversation_turn_deliverable::Column::Position)
         .all(conn)
         .await?;
+    let authoritative_run_ids = if run_has_authoritative_declaration(&run)
+        || associations
+            .iter()
+            .any(|association| association.source == SOURCE_DECLARED)
+    {
+        HashSet::from([run.id.clone()])
+    } else {
+        HashSet::new()
+    };
+    let associations = retain_authoritative_associations(associations, &authoritative_run_ids);
     Ok(associations
         .into_iter()
         .filter_map(|association| {
@@ -1105,9 +1196,7 @@ pub async fn list_sets_for_conversation(
     // long-running conversations with a large turn history.
     for run_id_chunk in run_ids.chunks(500) {
         for change in conversation_turn_file_change::Entity::find()
-            .filter(
-                conversation_turn_file_change::Column::TurnRunId.is_in(run_id_chunk.to_vec()),
-            )
+            .filter(conversation_turn_file_change::Column::TurnRunId.is_in(run_id_chunk.to_vec()))
             .filter(conversation_turn_file_change::Column::Attribution.eq("exclusive"))
             .filter(conversation_turn_file_change::Column::FinalExists.eq(true))
             .all(conn)
@@ -1124,6 +1213,18 @@ pub async fn list_sets_for_conversation(
         .order_by_asc(conversation_turn_deliverable::Column::Position)
         .all(conn)
         .await?;
+    let authoritative_run_ids = runs
+        .iter()
+        .filter(|run| run_has_authoritative_declaration(run))
+        .map(|run| run.id.clone())
+        .chain(
+            associations
+                .iter()
+                .filter(|association| association.source == SOURCE_DECLARED)
+                .map(|association| association.turn_run_id.clone()),
+        )
+        .collect::<HashSet<_>>();
+    let associations = retain_authoritative_associations(associations, &authoritative_run_ids);
     let mut by_run: HashMap<String, Vec<conversation_turn_deliverable::Model>> = HashMap::new();
     for association in associations {
         by_run
@@ -1484,6 +1585,10 @@ mod tests {
         assert!(!inference_path_allowed("target/debug/app"));
         assert!(!inference_path_allowed("draft.html"));
         assert!(!inference_path_allowed("report.test.pdf"));
+        assert!(!inference_path_allowed("qa_page_1.png"));
+        assert!(!inference_path_allowed("qa/page_1.png"));
+        assert!(!inference_path_allowed("render_cache/page_1.png"));
+        assert!(!inference_path_allowed("visual_check_page_1.png"));
     }
 
     #[tokio::test]
@@ -1541,6 +1646,220 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn merge_appends_and_replace_resets_the_same_turn_set() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("report.pdf"), b"one").unwrap();
+        std::fs::write(workspace.path().join("appendix.docx"), b"two").unwrap();
+        let folder_id =
+            crate::db::test_helpers::seed_folder(&db, &workspace.path().to_string_lossy()).await;
+        let conversation_id =
+            crate::db::test_helpers::seed_conversation(&db, folder_id, AgentType::Codex).await;
+        seed_run(
+            &db,
+            conversation_id,
+            folder_id,
+            workspace.path(),
+            "run-modes",
+            &[],
+        )
+        .await;
+
+        save_declared_for_turn(
+            &db.conn,
+            conversation_id,
+            "run-modes",
+            vec![verified(workspace.path(), "report.pdf", "Report")],
+            false,
+        )
+        .await
+        .unwrap();
+        let mut supporting = verified(workspace.path(), "appendix.docx", "Appendix");
+        supporting.role = "supporting".into();
+        save_declared_for_turn(
+            &db.conn,
+            conversation_id,
+            "run-modes",
+            vec![supporting],
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            list_for_turn(&db.conn, conversation_id, "run-modes")
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+
+        replace_declared_for_turn(
+            &db.conn,
+            conversation_id,
+            "run-modes",
+            vec![verified(workspace.path(), "report.pdf", "Final report")],
+        )
+        .await
+        .unwrap();
+        let replaced = list_for_turn(&db.conn, conversation_id, "run-modes")
+            .await
+            .unwrap();
+        assert_eq!(replaced.len(), 1);
+        assert_eq!(replaced[0].title, "Final report");
+    }
+
+    #[tokio::test]
+    async fn declared_set_suppresses_tracker_noise_and_repairs_legacy_mixed_rows_on_read() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let workspace = tempfile::tempdir().unwrap();
+        for (path, contents) in [
+            ("final.pdf", b"pdf".as_slice()),
+            ("merged.docx", b"docx".as_slice()),
+            ("build_charging_documents.py", b"print('build')".as_slice()),
+            ("qa_page_1.png", b"png-1".as_slice()),
+            ("qa_page_2.png", b"png-2".as_slice()),
+        ] {
+            std::fs::write(workspace.path().join(path), contents).unwrap();
+        }
+        let folder_id =
+            crate::db::test_helpers::seed_folder(&db, &workspace.path().to_string_lossy()).await;
+        let conversation_id =
+            crate::db::test_helpers::seed_conversation(&db, folder_id, AgentType::Codex).await;
+        seed_run(
+            &db,
+            conversation_id,
+            folder_id,
+            workspace.path(),
+            "run-declared-authoritative",
+            &[],
+        )
+        .await;
+
+        let mut supporting = verified(workspace.path(), "merged.docx", "Merged DOCX");
+        supporting.role = "supporting".into();
+        replace_declared_for_turn(
+            &db.conn,
+            conversation_id,
+            "run-declared-authoritative",
+            vec![
+                verified(workspace.path(), "final.pdf", "Final PDF"),
+                supporting,
+            ],
+        )
+        .await
+        .unwrap();
+        assert!(mark_declaration_result(
+            &db.conn,
+            conversation_id,
+            "run-declared-authoritative",
+            "success",
+            None,
+        )
+        .await
+        .unwrap());
+
+        artifact_service::upsert_changes(
+            &db.conn,
+            "run-declared-authoritative",
+            [
+                "build_charging_documents.py",
+                "qa_page_1.png",
+                "qa_page_2.png",
+            ]
+            .into_iter()
+            .map(|path| PendingFileChange {
+                path: path.into(),
+                kind: ConversationTurnFileChangeKind::Created,
+                attribution: "exclusive".into(),
+            })
+            .collect(),
+        )
+        .await
+        .unwrap();
+        for change in artifact_service::list_changes_for_run(&db.conn, "run-declared-authoritative")
+            .await
+            .unwrap()
+        {
+            let metadata = std::fs::metadata(workspace.path().join(&change.path)).unwrap();
+            artifact_service::update_final_state(
+                &db.conn,
+                change,
+                true,
+                i64::try_from(metadata.len()).ok(),
+                metadata.modified().ok().map(DateTime::<Utc>::from),
+            )
+            .await
+            .unwrap();
+        }
+        artifact_service::finish_run(
+            &db.conn,
+            "run-declared-authoritative",
+            ConversationTurnRunStatus::Completed,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            infer_for_turn(&db.conn, conversation_id, "run-declared-authoritative")
+                .await
+                .unwrap()
+                .is_empty(),
+            "successful publish must prevent tracker files from joining the set"
+        );
+
+        // Recreate the faulty shape written by older releases: inference was
+        // appended after a successful replace declaration. The read side must
+        // heal this without requiring a destructive data migration.
+        let mut script = verified(
+            workspace.path(),
+            "build_charging_documents.py",
+            "Build script",
+        );
+        script.role = "supporting".into();
+        script.category = "code_change".into();
+        save_turn_set(
+            &db.conn,
+            conversation_id,
+            "run-declared-authoritative",
+            SOURCE_INFERRED,
+            vec![
+                script,
+                verified(workspace.path(), "qa_page_1.png", "QA page 1"),
+                verified(workspace.path(), "qa_page_2.png", "QA page 2"),
+            ],
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let turn = list_for_turn(&db.conn, conversation_id, "run-declared-authoritative")
+            .await
+            .unwrap();
+        assert_eq!(
+            turn.iter()
+                .map(|item| item.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["final.pdf", "merged.docx"]
+        );
+        assert!(turn.iter().all(|item| item.source == SOURCE_DECLARED));
+
+        let sets = list_sets_for_conversation(&db.conn, conversation_id)
+            .await
+            .unwrap();
+        assert_eq!(sets.len(), 1);
+        assert_eq!(sets[0].deliverables.len(), 2);
+        let conversation = list_for_conversation(&db.conn, conversation_id)
+            .await
+            .unwrap();
+        assert_eq!(conversation.len(), 2);
+        assert!(conversation
+            .iter()
+            .all(|item| !item.path.starts_with("qa_") && item.extension.as_deref() != Some("py")));
     }
 
     #[tokio::test]
@@ -1794,7 +2113,11 @@ mod tests {
         let legacy_pdf = sets
             .iter()
             .find(|set| set.turn_run_id == "run-infer")
-            .and_then(|set| set.deliverables.iter().find(|item| item.path == "final.pdf"))
+            .and_then(|set| {
+                set.deliverables
+                    .iter()
+                    .find(|item| item.path == "final.pdf")
+            })
             .unwrap();
         assert_eq!(legacy_pdf.role, "primary");
     }

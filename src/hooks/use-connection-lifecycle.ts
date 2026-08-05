@@ -9,6 +9,7 @@ import { useConnection, type UseConnectionReturn } from "@/hooks/use-connection"
 import { extractAppCommandError } from "@/lib/app-error"
 import { isConnectionBusy } from "@/lib/connection-teardown"
 import { isNetworkOrOfflineError } from "@/lib/network-error"
+import { isSessionRestorePendingError } from "@/lib/session-restore"
 import { TurnBusyError } from "@/lib/turn-busy"
 import { type AgentType, type PromptDraft } from "@/lib/types"
 import { getAgentLabel } from "@/lib/custom-agents"
@@ -55,6 +56,12 @@ export interface UseConnectionLifecycleReturn {
        * draft instead of treating it as an error.
        */
       onTurnInProgress?: () => void
+      /**
+       * The historical ACP session exists but has not completed its exact
+       * snapshot/identity handoff. The caller retains the draft in its durable
+       * queue and retries after readiness instead of surfacing an error.
+       */
+      onSessionRestorePending?: () => void
       /** Fired only after `/acp_prompt` returned success (backend accepted). */
       onAccepted?: () => void
       /**
@@ -426,6 +433,7 @@ export function useConnectionLifecycle({
         conversationId?: number | null
         clientMessageId?: string | null
         onTurnInProgress?: () => void
+        onSessionRestorePending?: () => void
         onAccepted?: () => void
         /**
          * Called for every non-Busy failure. The boolean marks an ambiguous
@@ -437,6 +445,7 @@ export function useConnectionLifecycle({
     ): Promise<void> => {
       touchActivity(contextKey)
       const onTurnInProgress = opts?.onTurnInProgress
+      const onSessionRestorePending = opts?.onSessionRestorePending
       const onAccepted = opts?.onAccepted
       const onSendFailed = opts?.onSendFailed
       return (async () => {
@@ -456,6 +465,10 @@ export function useConnectionLifecycle({
           // observed yet). Not an error — the draft is re-queued by the caller
           // so it auto-sends when the current turn finishes.
           onTurnInProgress?.()
+          return
+        }
+        if (isSessionRestorePendingError(e)) {
+          onSessionRestorePending?.()
           return
         }
         console.error("[ConnLifecycle] sendPrompt:", e)

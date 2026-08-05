@@ -53,6 +53,8 @@ export interface UseConnectionReturn {
   supportsFork: boolean
   supportsSteer: boolean
   selectorsReady: boolean
+  /** Exact connection snapshot/attach has completed and prompts may be sent. */
+  promptReady: boolean
   hasCachedSelectors: boolean
   sessionId: string | null
   codegMcpAvailable: boolean
@@ -214,6 +216,7 @@ export function useConnection(contextKey: string): UseConnectionReturn {
   const supportsFork = connection?.supportsFork ?? false
   const supportsSteer = connection?.supportsSteer ?? false
   const selectorsReady = connection?.selectorsReady ?? false
+  const promptReady = connection?.promptReady ?? false
   const sessionId = connection?.sessionId ?? null
   const codegMcpAvailable = connection?.codegMcpAvailable ?? false
   const mcpServerCount = connection?.mcpServerCount ?? 0
@@ -326,6 +329,7 @@ export function useConnection(contextKey: string): UseConnectionReturn {
       supportsFork,
       supportsSteer,
       selectorsReady,
+      promptReady,
       hasCachedSelectors,
       sessionId,
       codegMcpAvailable,
@@ -370,6 +374,7 @@ export function useConnection(contextKey: string): UseConnectionReturn {
       supportsFork,
       supportsSteer,
       selectorsReady,
+      promptReady,
       hasCachedSelectors,
       sessionId,
       codegMcpAvailable,

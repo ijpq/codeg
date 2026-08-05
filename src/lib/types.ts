@@ -683,6 +683,8 @@ export interface ConversationTurnArtifactRun {
   conversation_id: number
   connection_id: string
   client_message_id?: string | null
+  /** Durable receipt written only after ACP accepted the prompt command. */
+  prompt_accepted_at?: string | null
   folder_id?: number | null
   root_path: string
   status: ConversationTurnArtifactStatus
