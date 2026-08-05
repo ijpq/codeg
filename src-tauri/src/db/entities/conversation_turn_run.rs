@@ -23,6 +23,10 @@ pub struct Model {
     pub conversation_id: i32,
     pub connection_id: String,
     pub client_message_id: Option<String>,
+    /// Set only after the prompt command has been accepted by the live ACP
+    /// connection. This is the durable idempotency receipt used across browser
+    /// reloads and replacement connections.
+    pub prompt_accepted_at: Option<DateTimeUtc>,
     /// SHA-256 of the normalized user-visible prompt blocks. This lets a
     /// reloaded viewer bind the run to the parser's durable user-turn id
     /// without relying on the sender-only optimistic id or wall-clock guesses.

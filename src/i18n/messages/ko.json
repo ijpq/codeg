@@ -1597,6 +1597,8 @@
       "promptAcceptanceUnknown": "연결이 끊겨 백엔드 수신 여부를 확인하고 있습니다",
       "steerUnsupportedQueued": "네이티브 안내를 사용할 수 없어 다음 메시지로 대기열에 추가했습니다",
       "steerFailedQueued": "안내 전송에 실패해 다음 메시지로 대기열에 추가했습니다",
+      "steerWaitingRestore": "안내를 보관했으며 원래 세션 복구를 기다리는 중입니다",
+      "steerOriginalTurnEnded": "원래 작업이 종료되어 이 안내는 전송되지 않았습니다",
       "exportConversation": "대화 내보내기",
       "exportImage": "이미지",
       "exportMarkdown": "Markdown",
@@ -2621,7 +2623,14 @@
         "saveEdit": "저장",
         "cancelEdit": "편집 취소",
         "editItem": "편집",
-        "deleteItem": "삭제"
+        "deleteItem": "삭제",
+        "queued": "대기열에 추가됨",
+        "waiting_session_restore": "세션 복구 대기 중",
+        "waiting_connection": "연결 재시도 대기 중",
+        "failed": "전송 실패",
+        "expired_guide": "원래 작업 종료됨",
+        "retry": "재시도",
+        "sendAsPrompt": "새 메시지로 보내기"
       },
       "welcomeInputPanel": {
         "agentsSettingsPath": "설정 > 에이전트",

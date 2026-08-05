@@ -46,7 +46,11 @@ import { computeRects, leafIds } from "@/lib/tab-group-layout"
 import { useTaskContext } from "@/contexts/task-context"
 import { cn, copyTextFromMenu, randomUUID } from "@/lib/utils"
 import { useConnectionLifecycle } from "@/hooks/use-connection-lifecycle"
-import { useMessageQueue, type QueuedMessage } from "@/hooks/use-message-queue"
+import {
+  isQueuedGuideTargetCurrent,
+  useMessageQueue,
+  type QueuedMessage,
+} from "@/hooks/use-message-queue"
 import { MessageListView } from "@/components/message/message-list-view"
 import {
   GoalControlProvider,
@@ -76,7 +80,7 @@ import { useWorkspaceView } from "@/contexts/workspace-context"
 import { useIsMobile } from "@/hooks/use-mobile"
 import { usePlatform } from "@/hooks/use-platform"
 import { useZoomLevel } from "@/hooks/use-appearance"
-import { isDesktop } from "@/lib/platform"
+import { isDesktop, isLocalDesktop } from "@/lib/platform"
 import { leftChromeReserve, rightChromeReserve } from "@/lib/window-chrome"
 import {
   acpFork,
@@ -90,6 +94,11 @@ import {
 import { isWindowedDetail } from "@/lib/turn-window"
 import { toErrorMessage } from "@/lib/app-error"
 import { classifySteerFailure } from "@/lib/steer-errors"
+import { isNetworkOrOfflineError } from "@/lib/network-error"
+import {
+  isSessionRestorePendingError,
+  shouldAwaitHistoricalSessionDetail,
+} from "@/lib/session-restore"
 import {
   draftSupportsNativeSteer,
   shouldQueuePromptFailure,
@@ -358,6 +367,13 @@ const ConversationTabView = memo(function ConversationTabView({
     useState<ComposerInjectContent | null>(null)
 
   const hasPersistedConversation = dbConversationId != null
+  // Positive runtime keys belong to conversations opened from persisted
+  // history and must resolve their DB-owned external session identity before
+  // ACP connect. Draft-originated tabs keep a stable negative runtime key even
+  // after their first prompt creates a DB row; those continue to use the live
+  // SessionStarted identity and must not wait on a detail the virtual key never
+  // fetches.
+  const usesPersistedDetailIdentity = effectiveConversationId > 0
 
   // A folderless chat draft before its first send (chat tab, not yet persisted).
   // Used to trigger the eager scratch-dir prepare below, which gives the draft a
@@ -542,6 +558,10 @@ const ConversationTabView = memo(function ConversationTabView({
     acpLoadError,
   } = useConversationDetail(effectiveConversationId, {
     enabled: shouldLoadDetail,
+    // The DB detail owns the external session identity used by historical ACP
+    // restore. Do not let existing optimistic/live runtime data suppress this
+    // first read; retain those buffers while the detail is folded in.
+    preserveLiveOnInitialFetch: usesPersistedDetailIdentity,
   })
 
   // Subscribe to only the fields this panel actually reads from its runtime
@@ -585,8 +605,13 @@ const ConversationTabView = memo(function ConversationTabView({
   // the backend falls back to session/new, orphaning the historical
   // context. cline doesn't support session resume, so it connects
   // immediately regardless.
-  const awaitingHistoricalSessionId =
-    hasPersistedConversation && selectedAgent !== "cline" && detailLoading
+  const awaitingHistoricalSessionId = shouldAwaitHistoricalSessionDetail({
+    usesPersistedDetailIdentity,
+    agentType: selectedAgent,
+    detailLoaded: detail != null,
+    detailLoading,
+    detailError,
+  })
   // Install status of the currently selected agent. An agent can be enabled and
   // platform-available yet have no CLI/SDK installed; selecting one can never
   // connect. Rather than firing a doomed (and racy) auto-connect whose only
@@ -673,7 +698,11 @@ const ConversationTabView = memo(function ConversationTabView({
   const { status: connStatus, sessionId: connSessionId } = conn
   // Persist the queue under the STABLE virtual conversation id so undelivered
   // messages survive a reload during a network outage.
-  const messageQueue = useMessageQueue(effectiveConversationId)
+  const messageQueue = useMessageQueue(effectiveConversationId, {
+    // Remote/web images already live in the server upload jail. Persist only
+    // their URI (not duplicate base64) so a reload-safe queue remains small.
+    compactUploadedImages: !isLocalDesktop(),
+  })
   // Transport link health (web mode). Desktop/remote snapshots are always
   // "connected", so the offline gates below are inert outside web mode.
   const webConnState = useSyncExternalStore(
@@ -686,8 +715,11 @@ const ConversationTabView = memo(function ConversationTabView({
     enqueue: mqEnqueue,
     requeueFront: mqRequeueFront,
     getQueueLength: mqGetQueueLength,
-    dequeue: mqDequeue,
+    peekNext: mqPeekNext,
     remove: mqRemove,
+    markState: mqMarkState,
+    retry: mqRetry,
+    convertGuideToPrompt: mqConvertGuideToPrompt,
     reorder: mqReorder,
     updateItem: mqUpdateItem,
     editingItemId: mqEditingItemId,
@@ -737,11 +769,18 @@ const ConversationTabView = memo(function ConversationTabView({
   const connectionReady =
     !connIsForOtherAgent &&
     restoredIdentityReady &&
+    conn.promptReady &&
     isConnectionReady(
       connStatus,
       conn.connectedWorkingDir,
       workingDirForConnection
     )
+  const guideConnectionReady =
+    !connIsForOtherAgent &&
+    restoredIdentityReady &&
+    conn.promptReady &&
+    connStatus === "prompting" &&
+    (conn.connectedWorkingDir ?? null) === (workingDirForConnection ?? null)
   // Present "connecting" to the composer while connected-but-not-ready, so it
   // disables its send affordance instead of inviting a submit handleSend rejects.
   // While the live connection still belongs to a different agent, present the
@@ -788,6 +827,19 @@ const ConversationTabView = memo(function ConversationTabView({
         { agent: getAgentLabel(selectedAgent) }
       )
     : (autoConnectError ?? agentConnectError)
+
+  // A queued restore-wait should not look eternal when the authoritative ACP
+  // connect attempt has failed. Keep the draft, but expose an explicit Retry
+  // action on that queue item; retry also wakes the existing lifecycle connect
+  // path rather than requiring the user to retype or hunt for Reload.
+  useEffect(() => {
+    if (!autoConnectError) return
+    for (const item of msgQueue) {
+      if (item.state === "waiting_session_restore") {
+        mqMarkState(item.id, "failed", autoConnectError)
+      }
+    }
+  }, [autoConnectError, mqMarkState, msgQueue])
 
   useEffect(() => {
     if (connSessionId) {
@@ -861,17 +913,61 @@ const ConversationTabView = memo(function ConversationTabView({
   // Auto-send queued messages when agent finishes responding.
   // Refs are synced via useEffect; the auto-send effect is declared
   // AFTER completeTurn so React runs it second.
-  const autoSendQueueRef = useRef<() => QueuedMessage | undefined>(mqDequeue)
+  const autoSendQueueRef =
+    useRef<(intent: "prompt" | "guide") => QueuedMessage | undefined>(
+      mqPeekNext
+    )
   useEffect(() => {
-    autoSendQueueRef.current = mqDequeue
-  }, [mqDequeue])
+    autoSendQueueRef.current = mqPeekNext
+  }, [mqPeekNext])
   const handleSendRef = useRef<
     (
       draft: PromptDraft,
       modeId?: string | null,
-      opts?: { fromQueueFlush?: boolean; clientMessageId?: string }
+      opts?: {
+        fromQueueFlush?: boolean
+        clientMessageId?: string
+        queueItemId?: string
+      }
     ) => void
   >(() => {})
+  // A queued item stays persisted until `/acp_prompt` confirms acceptance.
+  // This ref single-flights that retained head while React effects re-run.
+  const queueSendInFlightRef = useRef<string | null>(null)
+  const connectionReadyRef = useRef(connectionReady)
+  useEffect(() => {
+    connectionReadyRef.current = connectionReady
+  }, [connectionReady])
+  // A response can be lost after the Server accepted a prompt. On reload the
+  // persistent queue still contains that id, while conversation detail carries
+  // the durable acceptance receipt. Settle it locally before auto-flush so a
+  // status-recovery request cannot create a stray optimistic bubble after the
+  // original turn has already completed.
+  useEffect(() => {
+    const acceptedIds = new Set(
+      (detail?.artifact_runs ?? [])
+        .filter((run) => Boolean(run.prompt_accepted_at))
+        .map((run) => run.client_message_id)
+        .filter((id): id is string => Boolean(id))
+    )
+    if (acceptedIds.size === 0) return
+    for (const item of msgQueue) {
+      if (item.intent === "prompt" && acceptedIds.has(item.clientMessageId)) {
+        mqRemove(item.id)
+        setPromptDeliveryPhase(
+          effectiveConversationId,
+          item.clientMessageId,
+          "accepted"
+        )
+      }
+    }
+  }, [
+    detail?.artifact_runs,
+    effectiveConversationId,
+    mqRemove,
+    msgQueue,
+    setPromptDeliveryPhase,
+  ])
   // Timestamp of the last send that bounced with TurnBusyError. The flush below
   // backs off after a bounce so repeated busy rejections (backend still running
   // another turn while this client believes it is idle) don't spin one failed
@@ -891,7 +987,7 @@ const ConversationTabView = memo(function ConversationTabView({
   // bounces and rolls back to idle to retry the next item). A bounce backoff
   // rate-limits retries against a still-busy backend.
   useEffect(() => {
-    if (connStatus !== "connected") return
+    if (!connectionReady) return
     // Transport link down (web mode): the ACP connStatus can read a stale
     // "connected" during a WS blip. Don't flush onto a reconnecting link — the
     // send would fail and re-queue in a tight loop. Resumes automatically when
@@ -904,37 +1000,29 @@ const ConversationTabView = memo(function ConversationTabView({
     // old-folder session before the reconnect lands. Flushing then would deliver
     // the queued prompt to the wrong folder's agent. (No-op for normal
     // conversations, whose connection cwd always equals the intended one.)
-    if (
-      (conn.connectedWorkingDir ?? null) !== (workingDirForConnection ?? null)
-    ) {
-      return
-    }
     if (runtimeSyncState === "awaiting_persist") return
-    if (msgQueue.length === 0) return
+    if (!mqPeekNext("prompt")) return
     // setTimeout (not microtask) so a COMPLETE_TURN commit settles first AND so
     // a just-bounced retry waits out the backoff window before re-sending.
     const wait = flushRetryDelayMs(Date.now(), lastFlushBounceAtRef.current)
     const timer = setTimeout(() => {
-      if (connStatusRef.current !== "connected") return
-      const next = autoSendQueueRef.current()
+      if (!connectionReadyRef.current) return
+      if (queueSendInFlightRef.current) return
+      const next = autoSendQueueRef.current("prompt")
       if (next) {
-        // Mark this as the queue auto-flush: it sends the dequeued head now and,
-        // on a bounce, returns it to the FRONT (vs a direct send → tail).
+        // Keep the item in persistent storage until the backend acknowledges
+        // this exact client id. A reload can safely retry the retained item;
+        // backend idempotency turns a lost response into a status recovery.
+        queueSendInFlightRef.current = next.id
         handleSendRef.current(next.draft, next.modeId, {
           fromQueueFlush: true,
           clientMessageId: next.clientMessageId,
+          queueItemId: next.id,
         })
       }
     }, wait)
     return () => clearTimeout(timer)
-  }, [
-    connStatus,
-    webConnState,
-    runtimeSyncState,
-    msgQueue.length,
-    conn.connectedWorkingDir,
-    workingDirForConnection,
-  ])
+  }, [connectionReady, webConnState, runtimeSyncState, msgQueue, mqPeekNext])
 
   // Mirror the connection's liveMessage into the runtime session OUTSIDE React.
   // The connection dispatch invokes this sink synchronously whenever liveMessage
@@ -1073,7 +1161,11 @@ const ConversationTabView = memo(function ConversationTabView({
       // input send (no flag) must NOT jump ahead of already-queued items: when
       // a queue exists it tail-enqueues instead of sending, and on a bounce it
       // re-queues at the TAIL.
-      opts?: { fromQueueFlush?: boolean; clientMessageId?: string }
+      opts?: {
+        fromQueueFlush?: boolean
+        clientMessageId?: string
+        queueItemId?: string
+      }
     ) => {
       // Capture the tab's chat-draft state + eager scratch dir synchronously,
       // before any await. A folderless chat draft is NOT special-cased here:
@@ -1083,39 +1175,60 @@ const ConversationTabView = memo(function ConversationTabView({
       // on `connected` for chat drafts too, so by the time we get here the agent
       // is live and the prompt is delivered inline — never parked in the queue.
       const sendOwnTab = ownTab
+      const fromQueueFlush = opts?.fromQueueFlush ?? false
+      const queueItemId = opts?.queueItemId ?? null
+      const clientMessageId =
+        opts?.clientMessageId ?? `optimistic-${randomUUID()}`
 
       if (!hasPersistedConversation && !canAutoConnect) {
         setAgentConnectError(tWelcome("enableAgentFirstPlaceholder"))
         return
       }
-      // Connected AND the connection's cwd matches this tab's working dir. Bare
-      // `connStatus === "connected"` is not enough: a chat draft mid-reconnect can
-      // read a stale "connected" for the old cwd, and an inline send then would
-      // deliver to the wrong workspace. Same predicate the flush effect uses.
-      if (!connectionReady) return
+      // Historical conversations accept input while their exact ACP identity /
+      // attach snapshot is still restoring. Retain the whole draft under its
+      // stable client id; the queue flushes only after `connectionReady` turns
+      // true. A queue item already being retried is updated in place rather
+      // than duplicated.
+      if (!connectionReady) {
+        if (hasPersistedConversation) {
+          if (queueItemId) {
+            mqMarkState(queueItemId, "waiting_session_restore")
+          } else {
+            mqEnqueue(draft, selectedModeIdArg ?? null, clientMessageId, {
+              state: "waiting_session_restore",
+            })
+          }
+        }
+        if (queueItemId) queueSendInFlightRef.current = null
+        return
+      }
 
-      const fromQueueFlush = opts?.fromQueueFlush ?? false
       // Transport link down (web mode): the composer's ACP gate can read a stale
       // "connected" during a WS blip. Park a direct send in the (persisted)
       // queue instead of firing a request that will fail; auto-flush resends it
       // when the link recovers. Inert on desktop/remote. Queue-flush sends are
       // already gated by the flush effect's webConnState check.
       if (!fromQueueFlush && getWebConnectionSnapshot() === "reconnecting") {
-        mqEnqueue(draft, selectedModeIdArg ?? null)
+        mqEnqueue(draft, selectedModeIdArg ?? null, clientMessageId, {
+          state: "waiting_connection",
+        })
         return
       }
       // Preserve FIFO: a direct send issued while the queue is non-empty joins
       // the tail rather than racing ahead of the queued items. Read the
       // queue length synchronously (it reflects a same-tick bounce requeue).
       if (shouldQueueDirectSend(fromQueueFlush, mqGetQueueLength())) {
-        mqEnqueue(draft, selectedModeIdArg ?? null)
+        mqEnqueue(draft, selectedModeIdArg ?? null, clientMessageId)
         return
       }
 
       // Single-flight every ordinary prompt until the backend has answered the
       // submission request. This closes the double Enter/click window for an
       // existing conversation as well as a new tab.
-      if (promptSubmitPendingRef.current) return
+      if (promptSubmitPendingRef.current) {
+        if (queueItemId) queueSendInFlightRef.current = null
+        return
+      }
 
       // Keep the existing unbound-create guard too: conversation creation can
       // outlive the submission guard and must never run twice.
@@ -1129,8 +1242,6 @@ const ConversationTabView = memo(function ConversationTabView({
       }
       promptSubmitPendingRef.current = true
 
-      const clientMessageId =
-        opts?.clientMessageId ?? `optimistic-${randomUUID()}`
       const optimisticTurn = buildOptimisticUserTurnFromDraft(
         draft,
         sharedT("attachedResources"),
@@ -1154,14 +1265,20 @@ const ConversationTabView = memo(function ConversationTabView({
       let accepted = false
       const onTurnInProgress = () => {
         promptSubmitPendingRef.current = false
-        if (
-          !shouldQueuePromptFailure({
-            backendBusy: true,
-            accepted,
-            activeClientMessageId: conn.pendingUserMessage?.messageId ?? null,
+        const shouldQueue = shouldQueuePromptFailure({
+          backendBusy: true,
+          accepted,
+          activeClientMessageId: conn.pendingUserMessage?.messageId ?? null,
+          clientMessageId,
+        })
+        if (!shouldQueue) {
+          if (queueItemId) mqRemove(queueItemId)
+          queueSendInFlightRef.current = null
+          setPromptDeliveryPhase(
+            effectiveConversationId,
             clientMessageId,
-          })
-        ) {
+            "running"
+          )
           return
         }
         lastFlushBounceAtRef.current = Date.now()
@@ -1171,9 +1288,14 @@ const ConversationTabView = memo(function ConversationTabView({
           clientMessageId,
           "queued"
         )
-        // FIFO: the auto-flush draft WAS the queue head → return it to the
-        // front; a direct send (queue was empty when it left) → tail.
-        if (fromQueueFlush) {
+        if (queueItemId) {
+          // The retained queue head was never removed, so a Busy response only
+          // re-arms it; no dequeue/requeue window and no duplicate item.
+          mqMarkState(queueItemId, "queued")
+          queueSendInFlightRef.current = null
+        } else if (fromQueueFlush) {
+          // Backward-compatible fallback for callers that mark a flush without
+          // passing the retained queue id.
           mqRequeueFront(draft, selectedModeIdArg ?? null, clientMessageId)
         } else {
           mqEnqueue(draft, selectedModeIdArg ?? null, clientMessageId)
@@ -1182,11 +1304,31 @@ const ConversationTabView = memo(function ConversationTabView({
       const onAccepted = () => {
         accepted = true
         promptSubmitPendingRef.current = false
+        if (queueItemId) mqRemove(queueItemId)
+        queueSendInFlightRef.current = null
         setPromptDeliveryPhase(
           effectiveConversationId,
           clientMessageId,
           "accepted"
         )
+      }
+      const onSessionRestorePending = () => {
+        promptSubmitPendingRef.current = false
+        removeOptimisticTurn(effectiveConversationId, optimisticTurn.id)
+        setPromptDeliveryPhase(
+          effectiveConversationId,
+          clientMessageId,
+          "queued"
+        )
+        if (queueItemId) {
+          mqMarkState(queueItemId, "waiting_session_restore")
+        } else {
+          mqEnqueue(draft, selectedModeIdArg ?? null, clientMessageId, {
+            state: "waiting_session_restore",
+          })
+        }
+        queueSendInFlightRef.current = null
+        setSyncState(effectiveConversationId, "idle")
       }
       const onSendFailed = (error: unknown, ambiguous: boolean) => {
         promptSubmitPendingRef.current = false
@@ -1202,6 +1344,22 @@ const ConversationTabView = memo(function ConversationTabView({
         if (!ambiguous) {
           removeOptimisticTurn(effectiveConversationId, optimisticTurn.id)
         }
+        if (queueItemId) {
+          mqMarkState(
+            queueItemId,
+            ambiguous ? "waiting_connection" : "failed",
+            toErrorMessage(error)
+          )
+        } else if (ambiguous) {
+          // The HTTP response may be the only thing that was lost. Retain the
+          // same id for explicit retry; backend/client reconciliation dedups an
+          // already-accepted request.
+          mqEnqueue(draft, selectedModeIdArg ?? null, clientMessageId, {
+            state: "waiting_connection",
+            error: toErrorMessage(error),
+          })
+        }
+        queueSendInFlightRef.current = null
         setSyncState(effectiveConversationId, "idle")
       }
 
@@ -1223,6 +1381,7 @@ const ConversationTabView = memo(function ConversationTabView({
           // turn by exact id (and never suppresses a different sender's prompt).
           clientMessageId: optimisticTurn.id,
           onTurnInProgress,
+          onSessionRestorePending,
           onAccepted,
           onSendFailed,
         })
@@ -1328,6 +1487,7 @@ const ConversationTabView = memo(function ConversationTabView({
             conversationId: newConversationId,
             clientMessageId: optimisticTurn.id,
             onTurnInProgress,
+            onSessionRestorePending,
             onAccepted,
             onSendFailed,
           })
@@ -1371,6 +1531,8 @@ const ConversationTabView = memo(function ConversationTabView({
       appendOptimisticTurn,
       removeOptimisticTurn,
       mqEnqueue,
+      mqMarkState,
+      mqRemove,
       mqRequeueFront,
       mqGetQueueLength,
       bindConversationTab,
@@ -1734,6 +1896,14 @@ const ConversationTabView = memo(function ConversationTabView({
     mqCancelEditing()
   }, [mqCancelEditing])
 
+  const handleQueueRetry = useCallback(
+    (id: string) => {
+      mqRetry(id)
+      handleFocus()
+    },
+    [handleFocus, mqRetry]
+  )
+
   const handleSaveQueueEdit = useCallback(
     (draft: PromptDraft) => {
       if (mqEditingItemId) {
@@ -1907,10 +2077,99 @@ const ConversationTabView = memo(function ConversationTabView({
     [feedbackSteer]
   )
 
+  // Deferred native guides share the existing persisted message queue but keep
+  // their intent and original-turn identity. They are never allowed to fall
+  // through as an ordinary next-turn prompt: after restore we either inject
+  // into the same turn, or mark the guide expired for an explicit user choice.
+  const guideSendInFlightRef = useRef<string | null>(null)
+  useEffect(() => {
+    const item = mqPeekNext("guide")
+    if (!item || !item.guideTarget) return
+    if (!conn.promptReady || webConnState !== "connected") return
+    if (guideSendInFlightRef.current) return
+
+    if (
+      !isQueuedGuideTargetCurrent(item.guideTarget, {
+        sessionId: conn.sessionId,
+        connectionId: conn.connectionId,
+        pendingUserMessageId: conn.pendingUserMessage?.messageId ?? null,
+        status: connStatus,
+      })
+    ) {
+      mqMarkState(item.id, "expired_guide", t("steerOriginalTurnEnded"))
+      return
+    }
+    if (!guideConnectionReady) return
+
+    guideSendInFlightRef.current = item.id
+    void acpActions
+      .steer(tabId, item.draft.blocks, item.clientMessageId)
+      .then(() => {
+        mqRemove(item.id)
+        toast.success(t("steerInjected"))
+      })
+      .catch((error: unknown) => {
+        const failure = classifySteerFailure(error)
+        if (failure === "turn_ended") {
+          mqMarkState(item.id, "expired_guide", t("steerOriginalTurnEnded"))
+          return
+        }
+        if (
+          isSessionRestorePendingError(error) ||
+          isNetworkOrOfflineError(error)
+        ) {
+          mqMarkState(
+            item.id,
+            isSessionRestorePendingError(error)
+              ? "waiting_session_restore"
+              : "waiting_connection",
+            toErrorMessage(error)
+          )
+          return
+        }
+        mqMarkState(item.id, "failed", toErrorMessage(error))
+      })
+      .finally(() => {
+        guideSendInFlightRef.current = null
+      })
+  }, [
+    acpActions,
+    conn.connectionId,
+    conn.pendingUserMessage?.messageId,
+    conn.promptReady,
+    conn.sessionId,
+    connStatus,
+    guideConnectionReady,
+    mqMarkState,
+    mqPeekNext,
+    mqRemove,
+    msgQueue,
+    t,
+    tabId,
+    webConnState,
+  ])
+
   const handleGuide = useCallback(
     async (draft: PromptDraft) => {
       const queueAsNextPrompt = () => {
         mqEnqueue(draft, selectedModeId)
+      }
+      const guideTarget = {
+        sessionId: conn.sessionId,
+        connectionId: conn.connectionId,
+        userMessageId: conn.pendingUserMessage?.messageId ?? null,
+      }
+      const deferGuide = (
+        clientMessageId: string,
+        state: "waiting_session_restore" | "waiting_connection",
+        error: string | null = null
+      ) => {
+        mqEnqueue(draft, selectedModeId, clientMessageId, {
+          intent: "guide",
+          state,
+          error,
+          guideTarget,
+        })
       }
 
       // Codex app-server steering is routed as incremental text. Images and
@@ -1919,6 +2178,16 @@ const ConversationTabView = memo(function ConversationTabView({
       if (!draftSupportsNativeSteer(draft)) {
         queueAsNextPrompt()
         toast.info(t("imageSteerQueued"))
+        return
+      }
+
+      // During a transport re-attach we still know which running turn the
+      // composer represented. Persist that identity and wait for the exact
+      // session snapshot instead of firing at a stale connection or silently
+      // converting the guide into a future ordinary prompt.
+      if (!guideConnectionReady) {
+        deferGuide(`optimistic-${randomUUID()}`, "waiting_session_restore")
+        toast.info(t("steerWaitingRestore"))
         return
       }
 
@@ -1953,6 +2222,22 @@ const ConversationTabView = memo(function ConversationTabView({
         let error = initialError
         let failure = classifySteerFailure(error)
 
+        if (
+          isSessionRestorePendingError(error) ||
+          isNetworkOrOfflineError(error)
+        ) {
+          removeOptimisticTurn(effectiveConversationId, optimisticTurn.id)
+          deferGuide(
+            optimisticTurn.id,
+            isSessionRestorePendingError(error)
+              ? "waiting_session_restore"
+              : "waiting_connection",
+            toErrorMessage(error)
+          )
+          toast.info(t("steerWaitingRestore"))
+          return
+        }
+
         // A transport timeout/response loss is ambiguous: app-server may have
         // accepted the steer even though this client missed the reply. Retry
         // once with the SAME id. The backend success cache and app-server's
@@ -1968,6 +2253,22 @@ const ConversationTabView = memo(function ConversationTabView({
             error = retryError
             failure = classifySteerFailure(retryError)
           }
+        }
+
+        if (
+          isSessionRestorePendingError(error) ||
+          isNetworkOrOfflineError(error)
+        ) {
+          removeOptimisticTurn(effectiveConversationId, optimisticTurn.id)
+          deferGuide(
+            optimisticTurn.id,
+            isSessionRestorePendingError(error)
+              ? "waiting_session_restore"
+              : "waiting_connection",
+            toErrorMessage(error)
+          )
+          toast.info(t("steerWaitingRestore"))
+          return
         }
 
         removeOptimisticTurn(effectiveConversationId, optimisticTurn.id)
@@ -2015,10 +2316,13 @@ const ConversationTabView = memo(function ConversationTabView({
       acpActions,
       appendOptimisticTurn,
       conn.connectionId,
+      conn.pendingUserMessage?.messageId,
+      conn.sessionId,
       conn.supportsSteer,
       connStatus,
       effectiveConversationId,
       feedback.canSubmit,
+      guideConnectionReady,
       mqEnqueue,
       removeOptimisticTurn,
       selectedModeId,
@@ -2092,12 +2396,15 @@ const ConversationTabView = memo(function ConversationTabView({
       onQueueReorder={mqReorder}
       onQueueEdit={handleQueueEdit}
       onQueueDelete={mqRemove}
+      onQueueRetry={handleQueueRetry}
+      onConvertGuideToPrompt={mqConvertGuideToPrompt}
       editingItemId={mqEditingItemId}
       editingDraftText={editingQueueDraftText}
       editingDraftBlocks={editingQueueDraftBlocks}
       isEditingQueueItem={mqEditingItemId != null}
       onSaveQueueEdit={handleSaveQueueEdit}
       onCancelQueueEdit={handleQueueCancelEdit}
+      allowOfflineCompose={hasPersistedConversation && !connectionReady}
       onForkSend={
         connStatus === "connected" &&
         hasPersistedConversation &&

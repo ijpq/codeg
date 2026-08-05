@@ -130,6 +130,9 @@ describe("ConversationDetailPanel new conversation layout", () => {
     expect(source).toContain(
       "useConversationDetail(effectiveConversationId, {\n    enabled: shouldLoadDetail,"
     )
+    expect(source).toContain(
+      "preserveLiveOnInitialFetch: usesPersistedDetailIdentity"
+    )
   })
 
   it("suspends hidden heavy UI while keeping the tab controller mounted", () => {
@@ -362,7 +365,15 @@ describe("ConversationDetailPanel chat-mode send path", () => {
     // allowOfflineCompose let the user send before connecting, which is what
     // parked the first prompt in the never-flushed queue. The composer now
     // waits for `connected` like a normal conversation.
-    expect(source).not.toContain("allowOfflineCompose")
+    const welcomeStart = source.indexOf("<ChatInput")
+    const welcomeEnd = source.indexOf("</ScrollArea>", welcomeStart)
+    const welcomeComposer = source.slice(welcomeStart, welcomeEnd)
+    expect(welcomeComposer).not.toContain("allowOfflineCompose")
+    // Historical conversations are intentionally different: their persisted
+    // queue accepts drafts while session/load is still restoring.
+    expect(source).toContain(
+      "allowOfflineCompose={hasPersistedConversation && !connectionReady}"
+    )
   })
 
   it("surfaces a non-silent error when the eager scratch-dir prepare fails", () => {
@@ -384,7 +395,14 @@ describe("ConversationDetailPanel send-path hardening", () => {
     // cwd; sending then would hit the wrong workspace. handleSend must gate on
     // the readiness predicate (connected AND cwd matches), like the flush effect.
     expect(source).toContain("isConnectionReady(")
-    expect(source).toContain("if (!connectionReady) return")
+    expect(source).toContain("if (!connectionReady) {")
+    expect(source).toContain('state: "waiting_session_restore"')
+  })
+
+  it("settles reload-surviving queue items from durable acceptance receipts", () => {
+    expect(source).toContain("Boolean(run.prompt_accepted_at)")
+    expect(source).toContain("acceptedIds.has(item.clientMessageId)")
+    expect(source).toContain("mqRemove(item.id)")
   })
 
   it("disables the welcome composer while connected-but-not-ready", () => {

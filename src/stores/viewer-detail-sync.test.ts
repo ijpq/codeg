@@ -353,6 +353,65 @@ describe("reconcileCompletedTurn — lost stream recovery", () => {
     expect(reconciled).toHaveBeenCalledTimes(1)
   })
 
+  it("retires a promoted reply when a publish refresh already counted the persisted assistant", async () => {
+    vi.useFakeTimers()
+    const clientMessageId = "optimistic-published"
+    const persisted = {
+      ...detail([
+        userTurn("parser-user", "generate a PDF"),
+        assistantTurn("parser-assistant", "PDF created"),
+      ]),
+      artifact_runs: [
+        {
+          id: "run-published",
+          conversation_id: CID,
+          connection_id: "connection-1",
+          client_message_id: clientMessageId,
+          folder_id: 1,
+          root_path: "/tmp/codeg",
+          status: "completed" as const,
+          capture_incomplete: false,
+          stop_reason: "end_turn",
+          started_at: "2026-08-05T03:01:20.000Z",
+          completed_at: "2026-08-05T03:13:10.000Z",
+          changes: [],
+        },
+      ],
+      deliverable_runs: [
+        {
+          turn_run_id: "run-published",
+          conversation_id: CID,
+          client_message_id: clientMessageId,
+          user_turn_id: "parser-user",
+          started_at: "2026-08-05T03:01:20.000Z",
+          completed_at: "2026-08-05T03:13:10.000Z",
+          // The reconciliation proof uses the durable run/user link; card
+          // payload rendering is covered by message-list-view tests.
+          deliverables: [],
+        },
+      ],
+    }
+    const promotedReply = assistantTurn("live-assistant", "PDF created")
+    seed({
+      detail: persisted,
+      localTurns: [userTurn(clientMessageId, "generate a PDF"), promotedReply],
+      // A publish event refreshed detail after the parser had already created
+      // its assistant row, so the old count-growth test can never succeed.
+      historyAssistantBaseline: 1,
+      lastTurnOwned: true,
+    })
+    mockGet.mockResolvedValue(persisted)
+
+    useConversationRuntimeStore
+      .getState()
+      .actions.reconcileCompletedTurn(CID, CID, clientMessageId)
+    await vi.advanceTimersByTimeAsync(100)
+
+    expect(mockGet).toHaveBeenCalledTimes(1)
+    expect(session()?.localTurns).toEqual([])
+    expect(session()?.detail).toBe(persisted)
+  })
+
   it("never replaces a promoted reply with an incompletely flushed transcript", async () => {
     vi.useFakeTimers()
     const stale = detail([userTurn("u", "prompt")])

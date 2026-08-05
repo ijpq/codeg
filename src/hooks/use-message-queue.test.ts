@@ -1,6 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest"
 import { act, renderHook } from "@testing-library/react"
-import { useMessageQueue } from "./use-message-queue"
+import {
+  isQueuedGuideTargetCurrent,
+  useMessageQueue,
+} from "./use-message-queue"
 import type { PromptDraft } from "@/lib/types"
 
 function draft(text: string): PromptDraft {
@@ -148,6 +151,138 @@ describe("useMessageQueue persistence (offline survival across reload)", () => {
     )
   })
 
+  it("preserves restore-waiting text, image, attachment, and stable id", () => {
+    const pendingDraft: PromptDraft = {
+      displayText: "inspect these files",
+      blocks: [
+        { type: "text", text: "inspect these files" },
+        {
+          type: "image",
+          data: "base64-image",
+          mime_type: "image/png",
+          uri: "file:///uploads/screenshot.png",
+        },
+        {
+          type: "resource",
+          uri: "file:///uploads/spec.pdf",
+          mime_type: "application/pdf",
+          blob: "base64-pdf",
+        },
+      ],
+    }
+    const first = renderHook(() => useMessageQueue(42))
+    act(() =>
+      first.result.current.enqueue(
+        pendingDraft,
+        "modeA",
+        "optimistic-with-attachments",
+        { state: "waiting_session_restore" }
+      )
+    )
+
+    const reloaded = renderHook(() => useMessageQueue(42))
+    const restored = reloaded.result.current.peekNext("prompt")
+    expect(restored).toMatchObject({
+      clientMessageId: "optimistic-with-attachments",
+      state: "waiting_session_restore",
+      draft: pendingDraft,
+    })
+  })
+
+  it("compacts uploaded image bytes only in persisted remote copies", () => {
+    const uploadedDraft: PromptDraft = {
+      displayText: "with image",
+      blocks: [
+        {
+          type: "image",
+          data: "large-base64-image",
+          mime_type: "image/png",
+          uri: "file:///uploads/image.png",
+        },
+        {
+          type: "resource",
+          uri: "file:///uploads/embedded.png",
+          mime_type: "image/png",
+          blob: "large-base64-resource",
+        },
+      ],
+    }
+    const { result } = renderHook(() =>
+      useMessageQueue(42, { compactUploadedImages: true })
+    )
+    act(() =>
+      result.current.enqueue(uploadedDraft, null, "optimistic-uploaded", {
+        state: "waiting_session_restore",
+      })
+    )
+
+    expect(result.current.queue[0].draft.blocks).toEqual(uploadedDraft.blocks)
+    const [persisted] = JSON.parse(localStorage.getItem(KEY)!)
+    expect(persisted.draft.blocks[0]).toMatchObject({
+      data: "",
+      uri: "file:///uploads/image.png",
+    })
+    expect(persisted.draft.blocks[1]).toMatchObject({
+      blob: "",
+      uri: "file:///uploads/embedded.png",
+    })
+  })
+
+  it("auto-retries a stable id after the connection recovers", () => {
+    const { result } = renderHook(() => useMessageQueue(42))
+    act(() =>
+      result.current.enqueue(draft("maybe accepted"), null, "stable-retry", {
+        state: "waiting_connection",
+      })
+    )
+    expect(result.current.peekNext("prompt")?.clientMessageId).toBe(
+      "stable-retry"
+    )
+  })
+
+  it("persists guide identity and only converts it to a prompt explicitly", () => {
+    const target = {
+      sessionId: "session-original",
+      connectionId: "connection-original",
+      userMessageId: "optimistic-original-task",
+    }
+    const first = renderHook(() => useMessageQueue(42))
+    act(() =>
+      first.result.current.enqueue(
+        draft("change direction"),
+        null,
+        "optimistic-guide",
+        {
+          intent: "guide",
+          state: "waiting_session_restore",
+          guideTarget: target,
+        }
+      )
+    )
+
+    const reloaded = renderHook(() => useMessageQueue(42))
+    expect(reloaded.result.current.peekNext("guide")).toMatchObject({
+      intent: "guide",
+      clientMessageId: "optimistic-guide",
+      guideTarget: target,
+    })
+    const id = reloaded.result.current.queue[0].id
+    act(() =>
+      reloaded.result.current.markState(
+        id,
+        "expired_guide",
+        "original task ended"
+      )
+    )
+    expect(reloaded.result.current.peekNext("prompt")).toBeUndefined()
+    act(() => reloaded.result.current.convertGuideToPrompt(id))
+    expect(reloaded.result.current.peekNext("prompt")).toMatchObject({
+      intent: "prompt",
+      guideTarget: null,
+      clientMessageId: "optimistic-guide",
+    })
+  })
+
   it("preserves client_message_id across dequeue and Busy requeue", () => {
     const { result } = renderHook(() => useMessageQueue())
     act(() =>
@@ -187,5 +322,43 @@ describe("useMessageQueue persistence (offline survival across reload)", () => {
     })
     expect(result.current.queue).toHaveLength(0)
     expect(localStorage.getItem(KEY)).toBeNull()
+  })
+})
+
+describe("deferred guide target safety", () => {
+  const target = {
+    sessionId: "session-original",
+    connectionId: "connection-original",
+    userMessageId: "optimistic-original-task",
+  }
+
+  it("accepts a guide only for the same still-running task", () => {
+    expect(
+      isQueuedGuideTargetCurrent(target, {
+        sessionId: "session-original",
+        connectionId: "connection-restored",
+        pendingUserMessageId: "optimistic-original-task",
+        status: "prompting",
+      })
+    ).toBe(true)
+  })
+
+  it("rejects a guide after the original task ended or a new task started", () => {
+    expect(
+      isQueuedGuideTargetCurrent(target, {
+        sessionId: "session-original",
+        connectionId: "connection-original",
+        pendingUserMessageId: null,
+        status: "connected",
+      })
+    ).toBe(false)
+    expect(
+      isQueuedGuideTargetCurrent(target, {
+        sessionId: "session-original",
+        connectionId: "connection-original",
+        pendingUserMessageId: "optimistic-new-task",
+        status: "prompting",
+      })
+    ).toBe(false)
   })
 })

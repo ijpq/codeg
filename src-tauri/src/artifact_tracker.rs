@@ -376,6 +376,21 @@ struct ConversationArtifactsChanged {
     turn_run_id: String,
 }
 
+pub(crate) fn emit_artifacts_changed(
+    emitter: &EventEmitter,
+    conversation_id: i32,
+    turn_run_id: String,
+) {
+    emit_event(
+        emitter,
+        CONVERSATION_ARTIFACTS_CHANGED_EVENT,
+        ConversationArtifactsChanged {
+            conversation_id,
+            turn_run_id,
+        },
+    );
+}
+
 impl ArtifactTracker {
     pub fn new() -> Self {
         Self::default()
@@ -713,9 +728,10 @@ async fn capture_loop(args: CaptureLoopArgs) {
         );
     }
 
-    // Terminal settlement always runs. It preserves accepted declarations and
-    // merges verified filesystem changes that the declaration missed; failed
-    // or empty declarations therefore cannot suppress recovery.
+    // Terminal settlement always runs so status/missing-path diagnostics are
+    // finalized. Inference itself is fallback-only: a successful explicit
+    // declaration is the authoritative user-visible set, while a failed or
+    // absent declaration can still recover verified filesystem changes.
     match deliverable_service::infer_for_turn(&db, conversation_id, &run_id).await {
         Ok(inferred) if !inferred.is_empty() => {
             crate::acp::deliverables::emit_deliverables_changed(
@@ -743,14 +759,7 @@ async fn capture_loop(args: CaptureLoopArgs) {
         final_stats.removed,
         final_stats.stat_errors,
     );
-    emit_event(
-        &emitter,
-        CONVERSATION_ARTIFACTS_CHANGED_EVENT,
-        ConversationArtifactsChanged {
-            conversation_id,
-            turn_run_id: run_id,
-        },
-    );
+    emit_artifacts_changed(&emitter, conversation_id, run_id);
 }
 
 async fn persist_batch(

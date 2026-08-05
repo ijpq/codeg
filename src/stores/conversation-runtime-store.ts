@@ -3593,10 +3593,38 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
                 )
               : null
             const runSettled = Boolean(run && run.status !== "running")
+            // A declaration/detail refresh can land the parser's assistant row
+            // BEFORE the prompting→idle edge starts reconciliation. In that
+            // case `assistantBaseline` already includes this reply, so count
+            // growth can never prove convergence and the promoted local turn
+            // remains forever (only a manual reload used to clear it). Use the
+            // durable deliverable-set link as a stronger proof: the target run's
+            // parser user turn is present and has an assistant turn after it.
+            const targetSet = run
+              ? (detail.deliverable_runs ?? []).find(
+                  (candidate) => candidate.turn_run_id === run.id
+                )
+              : null
+            const persistedUserId =
+              targetSet?.user_turn_id ??
+              (clientMessageId &&
+              detail.turns.some((turn) => turn.id === clientMessageId)
+                ? clientMessageId
+                : null)
+            const persistedUserIndex = persistedUserId
+              ? detail.turns.findIndex((turn) => turn.id === persistedUserId)
+              : -1
+            const targetReplyPersisted =
+              runSettled &&
+              persistedUserIndex >= 0 &&
+              detail.turns
+                .slice(persistedUserIndex + 1)
+                .some((turn) => turn.role === "assistant")
             const finalReplyPersisted =
               detail.in_flight_user_turn_id == null &&
               lastTurn?.role === "assistant" &&
               (assistantCount > assistantBaseline ||
+                targetReplyPersisted ||
                 // A refresh/reconnect can begin after the final assistant was
                 // already present in the first detail snapshot. Only use this
                 // fallback when no local client id exists; otherwise an

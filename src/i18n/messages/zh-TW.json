@@ -1597,6 +1597,8 @@
       "promptAcceptanceUnknown": "連線中斷，正在確認後端是否已接收此訊息",
       "steerUnsupportedQueued": "原生引導無法使用，訊息已進入下一輪佇列",
       "steerFailedQueued": "引導傳送失敗，訊息已進入下一輪佇列",
+      "steerWaitingRestore": "引導已保留，正在等待原會話恢復",
+      "steerOriginalTurnEnded": "原任務已結束，這則引導未傳送",
       "exportConversation": "匯出對話",
       "exportImage": "圖片",
       "exportMarkdown": "Markdown",
@@ -2621,7 +2623,14 @@
         "saveEdit": "儲存",
         "cancelEdit": "取消編輯",
         "editItem": "編輯",
-        "deleteItem": "刪除"
+        "deleteItem": "刪除",
+        "queued": "已排隊",
+        "waiting_session_restore": "等待會話恢復",
+        "waiting_connection": "等待連線重試",
+        "failed": "傳送失敗",
+        "expired_guide": "原任務已結束",
+        "retry": "重試",
+        "sendAsPrompt": "作為新訊息傳送"
       },
       "welcomeInputPanel": {
         "agentsSettingsPath": "設定 > Agents",
