@@ -1202,6 +1202,9 @@ mod tests {
             session_stats: stats,
             transcript_watermark: None,
             in_flight_user_turn_id: None,
+            artifact_runs: Vec::new(),
+            deliverables: Vec::new(),
+            deliverable_runs: Vec::new(),
         }
     }
 
