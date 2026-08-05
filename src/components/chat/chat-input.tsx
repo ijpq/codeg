@@ -51,6 +51,8 @@ interface ChatInputProps {
   onQueueReorder?: (items: QueuedMessage[]) => void
   onQueueEdit?: (id: string) => void
   onQueueDelete?: (id: string) => void
+  onQueueRetry?: (id: string) => void
+  onConvertGuideToPrompt?: (id: string) => void
   editingItemId?: string | null
   editingDraftText?: string | null
   editingDraftBlocks?: PromptInputBlock[] | null
@@ -67,11 +69,9 @@ interface ChatInputProps {
   onAddFeedback?: () => void
   feedbackAddDisabled?: boolean
   /**
-   * Keep the composer usable even while disconnected. Set for a folderless chat
-   * draft: it has no working dir yet (so it never auto-connects), and the FIRST
-   * send is precisely what lazily creates its conversation + scratch dir and
-   * triggers the connection. Without this the composer would be permanently
-   * disabled and the chat could never be started.
+   * Keep the composer usable while a persisted historical session is restoring.
+   * The parent retains those drafts in its durable per-conversation queue and
+   * sends them only after the exact ACP session finishes attaching.
    */
   allowOfflineCompose?: boolean
   injectContent?: ComposerInjectContent | null
@@ -114,6 +114,8 @@ export const ChatInput = memo(function ChatInput({
   onQueueReorder,
   onQueueEdit,
   onQueueDelete,
+  onQueueRetry,
+  onConvertGuideToPrompt,
   editingItemId,
   editingDraftText,
   editingDraftBlocks,
@@ -168,6 +170,8 @@ export const ChatInput = memo(function ChatInput({
             onReorder={onQueueReorder}
             onEdit={onQueueEdit}
             onDelete={onQueueDelete}
+            onRetry={onQueueRetry}
+            onConvertGuideToPrompt={onConvertGuideToPrompt}
             editingItemId={editingItemId ?? null}
           />
         )}

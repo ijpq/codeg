@@ -1533,6 +1533,8 @@
       "promptAcceptanceUnknown": "接続が中断されました。バックエンドの受信状況を確認しています",
       "steerUnsupportedQueued": "ネイティブ誘導が利用できないため、次のメッセージとしてキューに追加しました",
       "steerFailedQueued": "誘導に失敗したため、次のメッセージとしてキューに追加しました",
+      "steerWaitingRestore": "ガイドを保存し、元のセッションの復旧を待っています",
+      "steerOriginalTurnEnded": "元のタスクは終了したため、このガイドは送信されませんでした",
       "exportConversation": "会話をエクスポート",
       "exportImage": "画像",
       "exportMarkdown": "Markdown",
@@ -2542,7 +2544,14 @@
         "saveEdit": "保存",
         "cancelEdit": "編集をキャンセル",
         "editItem": "編集",
-        "deleteItem": "削除"
+        "deleteItem": "削除",
+        "queued": "キュー済み",
+        "waiting_session_restore": "セッションの復旧待ち",
+        "waiting_connection": "接続の再試行待ち",
+        "failed": "送信失敗",
+        "expired_guide": "元のタスクは終了済み",
+        "retry": "再試行",
+        "sendAsPrompt": "新しいメッセージとして送信"
       },
       "welcomeInputPanel": {
         "agentsSettingsPath": "設定 > エージェント",

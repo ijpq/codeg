@@ -1533,6 +1533,8 @@
       "promptAcceptanceUnknown": "انقطع الاتصال؛ جارٍ التحقق مما إذا كان الخادم قد استلم الرسالة",
       "steerUnsupportedQueued": "التوجيه الأصلي غير متاح؛ أُضيفت الرسالة إلى قائمة الانتظار التالية",
       "steerFailedQueued": "فشل التوجيه؛ أُضيفت الرسالة إلى قائمة الانتظار التالية",
+      "steerWaitingRestore": "تم حفظ التوجيه؛ بانتظار استعادة الجلسة الأصلية",
+      "steerOriginalTurnEnded": "انتهت المهمة الأصلية؛ لم يتم إرسال هذا التوجيه",
       "exportConversation": "تصدير المحادثة",
       "exportImage": "صورة",
       "exportMarkdown": "Markdown",
@@ -2542,7 +2544,14 @@
         "saveEdit": "حفظ",
         "cancelEdit": "إلغاء التعديل",
         "editItem": "تعديل",
-        "deleteItem": "حذف"
+        "deleteItem": "حذف",
+        "queued": "في قائمة الانتظار",
+        "waiting_session_restore": "بانتظار استعادة الجلسة",
+        "waiting_connection": "بانتظار إعادة الاتصال",
+        "failed": "فشل الإرسال",
+        "expired_guide": "انتهت المهمة الأصلية",
+        "retry": "إعادة المحاولة",
+        "sendAsPrompt": "إرسال كرسالة جديدة"
       },
       "welcomeInputPanel": {
         "agentsSettingsPath": "الإعدادات > الوكلاء",

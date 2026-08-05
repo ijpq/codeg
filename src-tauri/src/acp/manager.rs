@@ -32,7 +32,7 @@ use crate::acp::types::{
 };
 use crate::artifact_tracker::{ArtifactTracker, ArtifactTurnFinishStatus};
 use crate::db::entities::conversation::{self, ConversationKind, ConversationStatus};
-use crate::db::service::conversation_service;
+use crate::db::service::{artifact_service, conversation_service};
 use crate::db::AppDatabase;
 use crate::models::agent::AgentType;
 use crate::web::event_bridge::{emit_with_state, emit_with_state_gated, EventEmitter};
@@ -1390,6 +1390,25 @@ impl ConnectionManager {
                 );
                 return Ok(linked_conversation_id.or(conversation_id));
             }
+            if let Some(cid) = linked_conversation_id.or(conversation_id) {
+                if artifact_service::was_prompt_accepted(&db.conn, cid, id)
+                    .await
+                    .map_err(|e| AcpError::protocol(e.to_string()))?
+                {
+                    tracing::info!(
+                        conversation_id = cid,
+                        connection_id = conn_id,
+                        client_message_id = id,
+                        "[ACP] deduplicated durably accepted prompt"
+                    );
+                    let mut cache = accepted_prompt_ids.lock().await;
+                    cache.push_back(id.clone());
+                    while cache.len() > ACCEPTED_PROMPT_ID_CACHE_LIMIT {
+                        cache.pop_front();
+                    }
+                    return Ok(Some(cid));
+                }
+            }
         }
 
         // Reject a concurrent prompt while a turn is already in flight, BEFORE
@@ -1643,7 +1662,7 @@ impl ConnectionManager {
             let state = state_arc.read().await;
             (state.working_dir.clone(), state.event_seq, state.folder_id)
         };
-        let artifact_capture_started = if let (Some(cid), Some(root_path)) =
+        let artifact_run_id = if let (Some(cid), Some(root_path)) =
             (conversation_id_for_status, working_dir_for_artifacts)
         {
             let input_paths = crate::artifact_tracker::input_paths_from_prompt(&blocks, &root_path);
@@ -1666,7 +1685,7 @@ impl ConnectionManager {
                 )
                 .await
             {
-                Ok(_) => true,
+                Ok(run_id) => Some(run_id),
                 Err(err) => {
                     // Artifact persistence is observability, not permission to
                     // run the agent: keep the prompt usable and make the loss
@@ -1676,11 +1695,11 @@ impl ConnectionManager {
                         conn_id,
                         err
                     );
-                    false
+                    None
                 }
             }
         } else {
-            false
+            None
         };
 
         // We hold `_prompt_guard` here, so call the lock-free inner helper —
@@ -1696,6 +1715,30 @@ impl ConnectionManager {
         // row would be stuck until a follow-up `send_prompt_linked` re-flipped it.
         match self.send_prompt_inner(conn_id, blocks, user_message).await {
             Ok(()) => {
+                if let Some(run_id) = artifact_run_id.as_ref() {
+                    match artifact_service::mark_prompt_accepted(&db.conn, run_id).await {
+                        Ok(()) => {
+                            if let Some(cid) = conversation_id_for_status {
+                                crate::artifact_tracker::emit_artifacts_changed(
+                                    &emitter,
+                                    cid,
+                                    run_id.clone(),
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            // The command already reached the agent, so returning
+                            // an error here would invite a duplicate retry. Keep
+                            // the connection-local receipt and report the
+                            // durability degradation in diagnostics.
+                            tracing::error!(
+                                run_id,
+                                client_message_id = ?client_message_id,
+                                "[ACP] failed to persist accepted prompt receipt: {err}"
+                            );
+                        }
+                    }
+                }
                 if let Some(id) = client_message_id {
                     let mut cache = accepted_prompt_ids.lock().await;
                     if !cache.contains(&id) {
@@ -1719,7 +1762,7 @@ impl ConnectionManager {
                 Ok(conversation_id_for_status)
             }
             Err(send_err) => {
-                if artifact_capture_started {
+                if artifact_run_id.is_some() {
                     self.artifact_tracker.cancel_unsent_turn(conn_id).await;
                 }
                 if let Some(cid) = conversation_id_for_status {
@@ -4687,6 +4730,66 @@ mod tests {
             prompts.len(),
             1,
             "same client_message_id must enqueue exactly one agent turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn accepted_prompt_id_survives_replacement_connection() {
+        use crate::db::test_helpers;
+        let db = test_helpers::fresh_in_memory_db().await;
+        let root = PathBuf::from("/tmp/prompt-idem-reconnect");
+        let folder_id = test_helpers::seed_folder(&db, root.to_str().unwrap()).await;
+        let mgr = ConnectionManager::new();
+        let mut first_rx = insert_live_connection(
+            &mgr,
+            "conn-before-reload",
+            AgentType::Codex,
+            Some(root.clone()),
+        )
+        .await;
+        let blocks = vec![PromptInputBlock::Text {
+            text: "run exactly once".into(),
+        }];
+        let message_id = Some("optimistic-survives-reload".to_string());
+
+        let conversation_id = mgr
+            .send_prompt_linked_with_message_id(
+                &db,
+                "conn-before-reload",
+                blocks.clone(),
+                Some(folder_id),
+                None,
+                None,
+                message_id.clone(),
+            )
+            .await
+            .expect("first prompt accepted")
+            .expect("conversation linked");
+        assert_eq!(drain_prompt_user_messages(&mut first_rx).len(), 1);
+
+        // A page reload can restore the conversation through a replacement ACP
+        // connection whose in-memory accepted-id cache is empty. The persisted
+        // receipt must still turn the same stable id into a status recovery,
+        // without enqueueing a second agent command.
+        let mut restored_rx =
+            insert_live_connection(&mgr, "conn-after-reload", AgentType::Codex, Some(root)).await;
+        let retry = mgr
+            .send_prompt_linked_with_message_id(
+                &db,
+                "conn-after-reload",
+                blocks,
+                Some(folder_id),
+                Some(conversation_id),
+                None,
+                message_id,
+            )
+            .await
+            .expect("same-id retry recovers durable accepted status");
+
+        assert_eq!(retry, Some(conversation_id));
+        assert!(
+            drain_prompt_user_messages(&mut restored_rx).is_empty(),
+            "replacement connection must not receive a duplicate prompt"
         );
     }
 

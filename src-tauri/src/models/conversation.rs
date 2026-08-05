@@ -231,6 +231,8 @@ pub struct ConversationTurnArtifactRun {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_message_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_accepted_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub folder_id: Option<i32>,
     pub root_path: String,
     /// running | completed | cancelled | interrupted

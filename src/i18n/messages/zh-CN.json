@@ -1533,6 +1533,8 @@
       "promptAcceptanceUnknown": "连接中断，正在核对后端是否已接收此消息",
       "steerUnsupportedQueued": "原生引导不可用，消息已进入下一轮队列",
       "steerFailedQueued": "引导发送失败，消息已进入下一轮队列",
+      "steerWaitingRestore": "引导已保留，正在等待原会话恢复",
+      "steerOriginalTurnEnded": "原任务已经结束，这条引导未发送",
       "exportConversation": "导出会话",
       "exportImage": "图片",
       "exportMarkdown": "Markdown",
@@ -2542,7 +2544,14 @@
         "saveEdit": "保存",
         "cancelEdit": "取消编辑",
         "editItem": "编辑",
-        "deleteItem": "删除"
+        "deleteItem": "删除",
+        "queued": "已排队",
+        "waiting_session_restore": "等待会话恢复",
+        "waiting_connection": "等待连接重试",
+        "failed": "发送失败",
+        "expired_guide": "原任务已结束",
+        "retry": "重试",
+        "sendAsPrompt": "作为新消息发送"
       },
       "welcomeInputPanel": {
         "agentsSettingsPath": "设置 > Agents",

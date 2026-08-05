@@ -1533,6 +1533,8 @@
       "promptAcceptanceUnknown": "Connexion interrompue ; vérification de la réception par le serveur",
       "steerUnsupportedQueued": "Le guidage natif est indisponible ; message placé dans la file du prochain tour",
       "steerFailedQueued": "Échec du guidage ; message placé dans la file du prochain tour",
+      "steerWaitingRestore": "Guidage conservé ; attente de la restauration de la session d’origine",
+      "steerOriginalTurnEnded": "La tâche d’origine est terminée ; ce guidage n’a pas été envoyé",
       "exportConversation": "Exporter la conversation",
       "exportImage": "Image",
       "exportMarkdown": "Markdown",
@@ -2542,7 +2544,14 @@
         "saveEdit": "Enregistrer",
         "cancelEdit": "Annuler la modification",
         "editItem": "Modifier",
-        "deleteItem": "Supprimer"
+        "deleteItem": "Supprimer",
+        "queued": "En attente",
+        "waiting_session_restore": "Attente de restauration de la session",
+        "waiting_connection": "Attente de reconnexion",
+        "failed": "Échec de l’envoi",
+        "expired_guide": "Tâche d’origine terminée",
+        "retry": "Réessayer",
+        "sendAsPrompt": "Envoyer comme nouveau message"
       },
       "welcomeInputPanel": {
         "agentsSettingsPath": "Paramètres > Agents",
