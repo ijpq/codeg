@@ -113,6 +113,7 @@ export interface PendingBackgroundSettlement {
  * `background_activity` handler).
  */
 export const BACKGROUND_OVERLAY_HARD_CAP = 300
+export const HISTORY_PAGE_USER_TURNS = 6
 
 /**
  * Default tail window for a cold detail load, and the page size for
@@ -140,6 +141,8 @@ export interface ConversationRuntimeSession {
   detail: DbConversationDetail | null
   detailLoading: boolean
   detailError: string | null
+  historyPageLoading?: boolean
+  historyPageError?: string | null
 
   // ACP `session/load` failed in a non-recoverable way (currently only when
   // the agent reports ResourceNotFound for the historical session_id). Set
@@ -325,6 +328,17 @@ type Action =
       conversationId: number
       error: string
     }
+  | { type: "FETCH_HISTORY_PAGE_START"; conversationId: number }
+  | {
+      type: "FETCH_HISTORY_PAGE_SUCCESS"
+      conversationId: number
+      detail: DbConversationDetail
+    }
+  | {
+      type: "FETCH_HISTORY_PAGE_ERROR"
+      conversationId: number
+      error: string
+    }
   | {
       type: "COMPLETE_TURN"
       conversationId: number
@@ -461,6 +475,8 @@ function createEmptySession(
     detail: null,
     detailLoading: false,
     detailError: null,
+    historyPageLoading: false,
+    historyPageError: null,
     acpLoadError: null,
     localTurns: [],
     backgroundTurns: [],
@@ -1700,6 +1716,8 @@ function reducer(
         detail: action.detail,
         detailLoading: false,
         detailError: null,
+        historyPageLoading: false,
+        historyPageError: null,
         externalId: nextExternalId ?? current.externalId,
         sessionStats: action.detail.session_stats ?? current.sessionStats,
         backgroundTurns: nextBackgroundTurns,
@@ -1817,6 +1835,58 @@ function reducer(
         olderTurnsPrependEpoch: s.olderTurnsPrependEpoch + 1,
       }))
     }
+    case "FETCH_HISTORY_PAGE_START":
+      return updateSessionInState(state, action.conversationId, (current) => ({
+        ...current,
+        historyPageLoading: true,
+        historyPageError: null,
+      }))
+
+    case "FETCH_HISTORY_PAGE_SUCCESS":
+      return updateSessionInState(state, action.conversationId, (current) => {
+        if (!current.detail) {
+          return {
+            ...current,
+            detail: action.detail,
+            historyPageLoading: false,
+            historyPageError: null,
+          }
+        }
+        const existingIds = new Set(current.detail.turns.map((turn) => turn.id))
+        const olderTurns = action.detail.turns.filter(
+          (turn) => !existingIds.has(turn.id)
+        )
+        const deliverableRuns = new Map(
+          (current.detail.deliverable_runs ?? []).map((run) => [
+            run.turn_run_id,
+            run,
+          ])
+        )
+        for (const run of action.detail.deliverable_runs ?? []) {
+          const existing = deliverableRuns.get(run.turn_run_id)
+          if (!existing || run.user_turn_id) {
+            deliverableRuns.set(run.turn_run_id, run)
+          }
+        }
+        return {
+          ...current,
+          detail: {
+            ...current.detail,
+            turns: [...olderTurns, ...current.detail.turns],
+            deliverable_runs: [...deliverableRuns.values()],
+            history_page: action.detail.history_page,
+          },
+          historyPageLoading: false,
+          historyPageError: null,
+        }
+      })
+
+    case "FETCH_HISTORY_PAGE_ERROR":
+      return updateSessionInState(state, action.conversationId, (current) => ({
+        ...current,
+        historyPageLoading: false,
+        historyPageError: action.error,
+      }))
 
     case "COMPLETE_TURN": {
       const current = state.byConversationId.get(action.conversationId)
@@ -2342,6 +2412,8 @@ function reducer(
         detail: to.detail ?? from.detail,
         detailLoading: to.detailLoading || from.detailLoading,
         detailError: to.detailError ?? from.detailError,
+        historyPageLoading: to.historyPageLoading || from.historyPageLoading,
+        historyPageError: to.historyPageError ?? from.historyPageError,
         localTurns: [...from.localTurns, ...to.localTurns],
         optimisticTurns: [...from.optimisticTurns, ...to.optimisticTurns],
         liveMessage: mergedLiveMessage,
@@ -2494,6 +2566,10 @@ export interface RuntimeActions {
     conversationId: number,
     options?: { preserveLive?: boolean }
   ) => void
+  loadEarlierHistory: (conversationId: number) => Promise<void>
+  loadCompleteHistory: (
+    conversationId: number
+  ) => Promise<DbConversationDetail | null>
   /**
    * Load one page of older history above the current window and prepend it
    * (reverse infinite scroll). No-op unless the loaded detail is windowed
@@ -2650,6 +2726,7 @@ let timelinePrefixCache = new WeakMap<
 // and resurrection-after-remove races. Cells are kept indefinitely (small int
 // per conversation); a cleanup sweep isn't needed for the expected cardinality.
 const fetchGeneration = new Map<number, number>()
+const historyPageFlights = new Map<number, Promise<void>>()
 
 function bumpFetchGeneration(conversationId: number): number {
   const next = (fetchGeneration.get(conversationId) ?? 0) + 1
@@ -3287,7 +3364,9 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
 
     const generation = bumpFetchGeneration(conversationId)
     dispatch({ type: "FETCH_DETAIL_START", conversationId })
-    getFolderConversation(conversationId, { tailTurns: TAIL_TURNS_DEFAULT })
+    getFolderConversation(conversationId, {
+      userTurnLimit: HISTORY_PAGE_USER_TURNS,
+    })
       .then((detail) => {
         if (!isLatestGeneration(conversationId, generation)) return
         dispatch({ type: "FETCH_DETAIL_SUCCESS", conversationId, detail })
@@ -3318,7 +3397,12 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     const fetchId = session?.dbConversationId ?? conversationId
     const generation = bumpFetchGeneration(conversationId)
     dispatch({ type: "FETCH_DETAIL_START", conversationId })
-    fetchDetailWindowed(fetchId, session?.detail ?? null)
+    const detailRequest = isWindowedDetail(session?.detail ?? null)
+      ? fetchDetailWindowed(fetchId, session?.detail ?? null)
+      : getFolderConversation(fetchId, {
+          userTurnLimit: HISTORY_PAGE_USER_TURNS,
+        })
+    detailRequest
       .then((detail) => {
         if (!isLatestGeneration(conversationId, generation)) return
         dispatch({
@@ -3386,6 +3470,76 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       })
   }
 
+  const loadEarlierHistory = (conversationId: number): Promise<void> => {
+    const existingFlight = historyPageFlights.get(conversationId)
+    if (existingFlight) return existingFlight
+
+    const session = get().byConversationId.get(conversationId)
+    const cursor = session?.detail?.history_page?.next_cursor ?? null
+    if (!session?.detail?.history_page?.has_more || !cursor) {
+      return Promise.resolve()
+    }
+    const fetchId = session.dbConversationId ?? conversationId
+    dispatch({ type: "FETCH_HISTORY_PAGE_START", conversationId })
+    const flight = getFolderConversation(fetchId, {
+      beforeCursor: cursor,
+      userTurnLimit: HISTORY_PAGE_USER_TURNS,
+    })
+      .then((detail) => {
+        // A reload/refetch may have replaced the page while this request was in
+        // flight. Only prepend when its cursor is still the one we consumed.
+        const currentCursor =
+          get().byConversationId.get(conversationId)?.detail?.history_page
+            ?.next_cursor ?? null
+        if (currentCursor !== cursor) return
+        dispatch({
+          type: "FETCH_HISTORY_PAGE_SUCCESS",
+          conversationId,
+          detail,
+        })
+      })
+      .catch((error: unknown) => {
+        const currentCursor =
+          get().byConversationId.get(conversationId)?.detail?.history_page
+            ?.next_cursor ?? null
+        if (currentCursor !== cursor) return
+        dispatch({
+          type: "FETCH_HISTORY_PAGE_ERROR",
+          conversationId,
+          error: toErrorMessage(error),
+        })
+      })
+      .finally(() => {
+        if (historyPageFlights.get(conversationId) === flight) {
+          historyPageFlights.delete(conversationId)
+        }
+      })
+    historyPageFlights.set(conversationId, flight)
+    return flight
+  }
+
+  const loadCompleteHistory = async (
+    conversationId: number
+  ): Promise<DbConversationDetail | null> => {
+    // Export/copy-all callers explicitly opt into the bandwidth cost. Ordinary
+    // viewing stays bounded and only advances a page at a time.
+    for (let pages = 0; pages < 10_000; pages += 1) {
+      const detail = get().byConversationId.get(conversationId)?.detail ?? null
+      if (!detail?.history_page?.has_more) return detail
+      const cursor = detail.history_page.next_cursor ?? null
+      await loadEarlierHistory(conversationId)
+      const after = get().byConversationId.get(conversationId)
+      if (after?.historyPageError) return after.detail
+      if ((after?.detail?.history_page?.next_cursor ?? null) === cursor) {
+        // A reload can supersede an older-page request, or a malformed server
+        // response can repeat a cursor. Never spin thousands of requests; the
+        // export caller will surface the still-incomplete history as an error.
+        return after?.detail ?? null
+      }
+    }
+    return get().byConversationId.get(conversationId)?.detail ?? null
+  }
+
   // Bring a passively-VIEWED conversation's detail up to date after its turn
   // completed on another client. See `viewerDetailSyncCancels` above for why the
   // panel's live promotion never fires for such a viewer and why this must poll
@@ -3439,7 +3593,12 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       // times and the attempt cap bounds each run — but it's why this is the one
       // detail fetcher that both triggers and can re-trigger itself.
       const generation = bumpFetchGeneration(conversationId)
-      fetchDetailWindowed(fetchId, cur.detail)
+      const detailRequest = isWindowedDetail(cur.detail)
+        ? fetchDetailWindowed(fetchId, cur.detail)
+        : getFolderConversation(fetchId, {
+            userTurnLimit: HISTORY_PAGE_USER_TURNS,
+          })
+      detailRequest
         .then((detail) => {
           if (cancelled) return
           const cur2 = get().byConversationId.get(conversationId)
@@ -3571,7 +3730,9 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
           return
         }
 
-        getFolderConversation(dbConversationId)
+        getFolderConversation(dbConversationId, {
+          userTurnLimit: HISTORY_PAGE_USER_TURNS,
+        })
           .then((detail) => {
             if (cancelled) return
             const current = get().byConversationId.get(runtimeId)
@@ -3696,10 +3857,17 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
         // of the whole transcript just to patch usage metadata. An old
         // server ignores the selector and returns the legacy full parse.
         const boundaryIndex = session.batchBoundaryIndex
-        getFolderConversation(
-          dbConversationId,
-          boundaryIndex != null ? { fromIndex: boundaryIndex } : undefined
-        )
+        const metadataRequest = session.detail?.history_page
+          ? getFolderConversation(dbConversationId, {
+              userTurnLimit: HISTORY_PAGE_USER_TURNS,
+            })
+          : boundaryIndex != null
+            ? getFolderConversation(
+              dbConversationId,
+                { fromIndex: boundaryIndex }
+            )
+            : getFolderConversation(dbConversationId, undefined)
+        metadataRequest
           .then((parsed) => {
             if (cancelled) return
             const cur = get().byConversationId.get(runtimeId)
@@ -3800,6 +3968,8 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     fetchDetail,
     refetchDetail,
     loadOlderTurns,
+    loadEarlierHistory,
+    loadCompleteHistory,
     syncViewerDetail,
     reconcileCompletedTurn,
     syncTurnMetadata,
@@ -3887,6 +4057,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       // timer immediately).
       cancelViewerDetailSync(conversationId)
       cancelCompletedTurnReconcile(conversationId)
+      historyPageFlights.delete(conversationId)
       dispatch({ type: "REMOVE_CONVERSATION", conversationId })
     },
     reset: () => dispatch({ type: "RESET" }),
@@ -3965,6 +4136,7 @@ export function resetConversationRuntimeStore(): void {
   // have no concurrent fetches — but a real in-place backend switch would need a
   // backend epoch here. See `RemoteConnectionGate`.
   fetchGeneration.clear()
+  historyPageFlights.clear()
   for (const cancel of viewerDetailSyncCancels.values()) cancel()
   for (const cancel of completedTurnReconcileCancels.values()) cancel()
   viewerDetailSyncCancels.clear()

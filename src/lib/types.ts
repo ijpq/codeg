@@ -613,6 +613,8 @@ export interface DbConversationDetail {
   deliverables?: ConversationDeliverable[]
   /** Confirmed outputs grouped by the producing backend turn run. */
   deliverable_runs?: ConversationTurnDeliverableSet[]
+  /** Opaque cursor metadata returned by bounded history reads. */
+  history_page?: ConversationHistoryPage | null
   /**
    * Turn-window metadata, present only when the request asked for a window
    * (`tailTurns`/`fromIndex`); their absence marks a legacy full response
@@ -653,6 +655,12 @@ export interface ConversationTurnsPage {
    *  fingerprint for the page to legally join the loaded window. */
   prefix_hash_before_index: string
   uncovered_prefix_max_ts?: string | null
+}
+
+export interface ConversationHistoryPage {
+  next_cursor?: string | null
+  has_more: boolean
+  loaded_turns: number
 }
 
 export interface ConversationDeliverable {

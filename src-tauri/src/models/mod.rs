@@ -22,11 +22,11 @@ pub use automation::{
 pub use chat_channel::{ChannelStatusInfo, ChatChannelInfo, ChatChannelMessageLogInfo};
 pub use conversation::{
     AgentConversationCount, AgentStats, ConversationDeliverable, ConversationDetail,
-    ConversationSummary, ConversationTurnArtifactRun, ConversationTurnDeliverableSet,
-    ConversationTurnFileChange, ConversationTurnsPage, DbConversationDetail,
-    DbConversationSummary, FolderInfo, ImportFolderOutcome, ImportResult, ImportSelectedResult,
-    ScanFolder, ScanResult, ScanSession, ScanSessionStatus, SelectedSessionKey, SessionStats,
-    SidebarData,
+    ConversationHistoryPage, ConversationSummary, ConversationTurnArtifactRun,
+    ConversationTurnDeliverableSet, ConversationTurnFileChange, ConversationTurnsPage,
+    DbConversationDetail, DbConversationSummary, FolderInfo, ImportFolderOutcome, ImportResult,
+    ImportSelectedResult, ScanFolder, ScanResult, ScanSession, ScanSessionStatus,
+    SelectedSessionKey, SessionStats, SidebarData,
 };
 pub use folder::{
     FolderCommandInfo, FolderDetail, FolderHistoryEntry, OpenedTab, OpenedTabsSnapshot,
@@ -38,22 +38,22 @@ pub use message::{
 };
 pub use quick_message::QuickMessageInfo;
 pub use remote_workspace_connection::RemoteWorkspaceConnectionInfo;
-pub use token_usage::{
-    TokenUsageBreakdownItem, TokenUsageBucket, TokenUsageConversationItem, TokenUsageFacets,
-    TokenUsageFilter, TokenUsageFolderFacet, TokenUsageHeatCell, TokenUsagePoint,
-    TokenUsageReport, TokenUsageStreak, TokenUsageSyncProgress, TokenUsageSyncResult,
-    TokenUsageSyncStatus, TokenUsageTotals,
-};
-pub use work_task::{
-    FollowUpIntent, WorkTaskChangedFile, WorkTaskConfig, WorkTaskDraft, WorkTaskEventInfo,
-    WorkTaskFolderSettings, WorkTaskInfo, WorkTaskMergeState, WorkTaskPreflight,
-    WorkTaskQueuedMerge, WorkTaskStatus, WorkTaskTemplateDraft, WorkTaskTemplateInfo,
-    STAGE_PROMPT_ALL,
-};
 #[cfg(feature = "tauri-runtime")]
 pub use system::SystemRenderingSettings;
 pub use system::{
     AvailableTerminalShells, GitCredentials, GitDetectResult, GitHubAccountsSettings,
     GitHubTokenValidation, GitSettings, SystemLanguageSettings, SystemProxySettings,
     SystemTerminalSettings, TerminalShellOption,
+};
+pub use token_usage::{
+    TokenUsageBreakdownItem, TokenUsageBucket, TokenUsageConversationItem, TokenUsageFacets,
+    TokenUsageFilter, TokenUsageFolderFacet, TokenUsageHeatCell, TokenUsagePoint, TokenUsageReport,
+    TokenUsageStreak, TokenUsageSyncProgress, TokenUsageSyncResult, TokenUsageSyncStatus,
+    TokenUsageTotals,
+};
+pub use work_task::{
+    FollowUpIntent, WorkTaskChangedFile, WorkTaskConfig, WorkTaskDraft, WorkTaskEventInfo,
+    WorkTaskFolderSettings, WorkTaskInfo, WorkTaskMergeState, WorkTaskPreflight,
+    WorkTaskQueuedMerge, WorkTaskStatus, WorkTaskTemplateDraft, WorkTaskTemplateInfo,
+    STAGE_PROMPT_ALL,
 };

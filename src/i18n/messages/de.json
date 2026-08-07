@@ -2927,6 +2927,8 @@
         "loading": "Lädt...",
         "loadEarlier": "Frühere Nachrichten laden",
         "loadingEarlier": "Frühere Nachrichten werden geladen…",
+        "loadEarlierHistory": "Frühere Nachrichten laden",
+        "retryEarlierHistory": "Frühere Nachrichten erneut laden",
         "error": "Fehler: {message}",
         "errorTitle": "Sitzung konnte nicht geladen werden",
         "errorActionReload": "Neu laden",

@@ -2927,6 +2927,8 @@
         "loading": "Chargement...",
         "loadEarlier": "Charger les messages précédents",
         "loadingEarlier": "Chargement des messages précédents…",
+        "loadEarlierHistory": "Charger les messages précédents",
+        "retryEarlierHistory": "Réessayer les messages précédents",
         "error": "Erreur : {message}",
         "errorTitle": "Échec du chargement de la session",
         "errorActionReload": "Recharger",

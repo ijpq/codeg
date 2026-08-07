@@ -47,7 +47,7 @@ use crate::acp::types::{
     PermissionOptionInfo, PlanEntryInfo, PromptCapabilitiesInfo, PromptInputBlock,
     SessionConfigBooleanInfo, SessionConfigKindInfo, SessionConfigOptionInfo,
     SessionConfigSelectGroupInfo, SessionConfigSelectInfo, SessionConfigSelectOptionInfo,
-    SteerResult, ToolCallImageInfo, UserMessageBlock,
+    SessionModeInfo, SessionModeStateInfo, SteerResult, ToolCallImageInfo, UserMessageBlock,
 };
 use crate::logging::throttle::LeadingEdgeThrottle;
 use crate::models::agent::AgentType;
@@ -1254,6 +1254,7 @@ pub async fn spawn_agent_connection(
     preferred_config_values: BTreeMap<String, String>,
     delegation_injection: Option<DelegationInjection>,
     terminal_shell_config: TerminalShellRuntimeConfig,
+    restore_conversation_id: Option<i32>,
 ) -> Result<tokio::sync::oneshot::Receiver<()>, AcpError> {
     // Create the authoritative session state up front. Subsequent emit_with_state
     // calls write through this state and increment its seq counter so the first
@@ -1265,6 +1266,8 @@ pub async fn spawn_agent_connection(
         owner_window_label.clone(),
         None, // folder_id 由后续 prompt handler 在首次 send 时绑定 (Phase 2)
     );
+    initial_state.restore_conversation_id = restore_conversation_id;
+    initial_state.restore_started_at = restore_conversation_id.map(|_| std::time::Instant::now());
 
     // Install the SessionStarted dedup signal BEFORE wrapping into Arc so the
     // first event (StatusChanged{Connecting} below) doesn't race with the
@@ -4077,6 +4080,7 @@ async fn run_connection(
         .connect_with(agent, async move |cx| -> Result<(), sacp::Error> {
             let state = state_outer;
             let agent_name_for_log = registry::get_agent_meta(agent_type).name;
+            let restore_conversation_id = state.read().await.restore_conversation_id;
 
             let init_request = InitializeRequest::new(ProtocolVersion::LATEST)
                 .client_capabilities(build_client_capabilities(agent_type, host_tools));
@@ -4091,6 +4095,9 @@ async fn run_connection(
             // outer `.map_err(...)` below. The outer layer attaches a
             // stable `code` to the frontend event so it can be localized.
             tracing::info!(
+                conversation_id = ?restore_conversation_id,
+                connection_id = %conn_id,
+                stage = "initialize_start",
                 "[ACP][{agent_name_for_log}] Sending Initialize (protocol={}, timeout=60s)",
                 ProtocolVersion::LATEST
             );
@@ -4103,6 +4110,10 @@ async fn run_connection(
             {
                 Ok(Ok(resp)) => {
                     tracing::info!(
+                        conversation_id = ?restore_conversation_id,
+                        connection_id = %conn_id,
+                        stage = "initialize_end",
+                        stage_elapsed_ms = init_started.elapsed().as_millis() as u64,
                         "[ACP][{agent_name_for_log}] Initialize responded in {:?}",
                         init_started.elapsed()
                     );
@@ -4110,6 +4121,10 @@ async fn run_connection(
                 }
                 Ok(Err(e)) => {
                     tracing::error!(
+                        conversation_id = ?restore_conversation_id,
+                        connection_id = %conn_id,
+                        stage = "initialize_failed",
+                        stage_elapsed_ms = init_started.elapsed().as_millis() as u64,
                         "[ACP][{agent_name_for_log}] Initialize failed in {:?}: {e}",
                         init_started.elapsed()
                     );
@@ -4117,6 +4132,10 @@ async fn run_connection(
                 }
                 Err(_) => {
                     tracing::error!(
+                        conversation_id = ?restore_conversation_id,
+                        connection_id = %conn_id,
+                        stage = "initialize_timeout",
+                        stage_elapsed_ms = init_started.elapsed().as_millis() as u64,
                         "[ACP][{agent_name_for_log}] Initialize TIMED OUT after {:?} \
                          — the agent never answered the handshake. Check the \
                          [stderr] lines above for agent-side errors. For a full \
@@ -4350,8 +4369,22 @@ async fn run_connection(
                         &cwd,
                         mcp_servers.clone(),
                     );
+                    let resume_started = std::time::Instant::now();
+                    tracing::info!(
+                        conversation_id = ?restore_conversation_id,
+                        connection_id = %conn_id,
+                        stage = "session_resume_start",
+                        "[ACP][restore] stage started"
+                    );
                     match send_resume_session(&cx, resume_req).await {
                         Ok((resume_resp, grok_models_raw)) => {
+                            tracing::info!(
+                                conversation_id = ?restore_conversation_id,
+                                connection_id = %conn_id,
+                                stage = "session_resume_end",
+                                stage_elapsed_ms = resume_started.elapsed().as_millis() as u64,
+                                "[ACP][restore] stage completed"
+                            );
                             let initial_config_options = resume_resp.config_options.clone();
                             let new_resp = NewSessionResponse::new(SessionId::new(sid.clone()))
                                 .modes(resume_resp.modes)
@@ -4440,6 +4473,14 @@ async fn run_connection(
                             .await;
                         }
                         Err(e) => {
+                            tracing::warn!(
+                                conversation_id = ?restore_conversation_id,
+                                connection_id = %conn_id,
+                                stage = "session_resume_failed",
+                                stage_elapsed_ms = resume_started.elapsed().as_millis() as u64,
+                                error = %e,
+                                "[ACP][restore] stage failed"
+                            );
                             // resume is unstable and NOT guaranteed equivalent to
                             // session/load, so a resume-specific failure must
                             // never deny a load that might still succeed. EVERY
@@ -4476,6 +4517,14 @@ async fn run_connection(
                 // "Method not found" are real, so the whole error ladder below
                 // stays exactly as it was.
                 let attempted_load = init_resp.agent_capabilities.load_session;
+                let load_started = std::time::Instant::now();
+                tracing::info!(
+                    conversation_id = ?restore_conversation_id,
+                    connection_id = %conn_id,
+                    stage = "session_load_start",
+                    attempted = attempted_load,
+                    "[ACP][restore] stage started"
+                );
                 let load_result = if attempted_load {
                     let load_req = build_load_session_request(
                         agent_type,
@@ -4491,6 +4540,13 @@ async fn run_connection(
 
                 match load_result {
                     Ok(load_resp) => {
+                        tracing::info!(
+                            conversation_id = ?restore_conversation_id,
+                            connection_id = %conn_id,
+                            stage = "session_load_end",
+                            stage_elapsed_ms = load_started.elapsed().as_millis() as u64,
+                            "[ACP][restore] stage completed"
+                        );
                         let initial_config_options = load_resp.config_options.clone();
                         let new_resp = NewSessionResponse::new(SessionId::new(sid.clone()))
                             .modes(load_resp.modes)
@@ -4660,6 +4716,14 @@ async fn run_connection(
                         .await
                     }
                     Err(e) => {
+                        tracing::warn!(
+                            conversation_id = ?restore_conversation_id,
+                            connection_id = %conn_id,
+                            stage = "session_load_failed",
+                            stage_elapsed_ms = load_started.elapsed().as_millis() as u64,
+                            error = %e,
+                            "[ACP][restore] stage failed"
+                        );
                         // session/load failed. Classify it: an unrecoverable
                         // historical session — the agent has no record of it
                         // (ResourceNotFound, -32002) or the agent process/session

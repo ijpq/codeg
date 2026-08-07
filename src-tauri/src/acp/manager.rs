@@ -627,6 +627,7 @@ impl ConnectionManager {
             preferred_config_values,
             self.delegation_snapshot(),
             self.terminal_shell_config.clone(),
+            target_conversation_id,
         )
         .await?;
 

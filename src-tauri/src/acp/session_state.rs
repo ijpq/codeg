@@ -249,6 +249,12 @@ pub struct SessionState {
     // 身份
     pub connection_id: String,
     pub conversation_id: Option<i32>,
+    /// Persisted conversation that requested this connection while its atomic
+    /// restore is still in progress. Diagnostic only: unlike
+    /// `conversation_id`, it never participates in routing or ownership.
+    pub restore_conversation_id: Option<i32>,
+    /// Monotonic origin for structured restore-stage timing logs.
+    pub restore_started_at: Option<std::time::Instant>,
     pub external_id: Option<String>,
     /// Wall-clock instant `external_id` last CHANGED value (SessionStarted
     /// for a new/loaded/forked session). The transcript watcher uses this as
@@ -505,6 +511,8 @@ impl SessionState {
         Self {
             connection_id,
             conversation_id: None,
+            restore_conversation_id: None,
+            restore_started_at: None,
             external_id: None,
             external_id_changed_at: None,
             agent_type,
@@ -609,6 +617,17 @@ impl SessionState {
                 // fired in spawn_agent) — also a no-op.
                 if let Some(tx) = self.session_started_tx.take() {
                     let _ = tx.send(());
+                }
+                if let Some(conversation_id) = self.restore_conversation_id {
+                    tracing::info!(
+                        conversation_id,
+                        connection_id = %self.connection_id,
+                        stage = "session_started",
+                        total_elapsed_ms = self
+                            .restore_started_at
+                            .map(|started| started.elapsed().as_millis() as u64),
+                        "[ACP][restore] stage completed"
+                    );
                 }
             }
             AcpEvent::StatusChanged { status } => {
@@ -1017,6 +1036,28 @@ impl SessionState {
                 // after browser refresh) can tell the initial handshake is
                 // already done — the event fires only once per connection.
                 self.selectors_ready = true;
+                if let Some(conversation_id) = self.restore_conversation_id {
+                    let total_elapsed_ms = self
+                        .restore_started_at
+                        .map(|started| started.elapsed().as_millis() as u64);
+                    tracing::info!(
+                        conversation_id,
+                        connection_id = %self.connection_id,
+                        stage = "selectors_ready",
+                        total_elapsed_ms,
+                        "[ACP][restore] stage completed"
+                    );
+                    // SelectorsReady is the backend's prompt-readiness latch;
+                    // name both product stages explicitly for production
+                    // timelines without inventing a second behavioural event.
+                    tracing::info!(
+                        conversation_id,
+                        connection_id = %self.connection_id,
+                        stage = "prompt_ready",
+                        total_elapsed_ms,
+                        "[ACP][restore] stage completed"
+                    );
+                }
             }
             AcpEvent::Error {
                 message,

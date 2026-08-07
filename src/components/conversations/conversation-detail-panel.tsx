@@ -557,6 +557,10 @@ const ConversationTabView = memo(function ConversationTabView({
     loading: detailLoading,
     error: detailError,
     acpLoadError,
+    hasEarlierHistory,
+    earlierHistoryLoading,
+    earlierHistoryError,
+    loadEarlierHistory,
   } = useConversationDetail(effectiveConversationId, {
     enabled: shouldLoadDetail,
     // The DB detail owns the external session identity used by historical ACP
@@ -2033,6 +2037,10 @@ const ConversationTabView = memo(function ConversationTabView({
         detailLoading={detailLoading}
         detailError={detailError}
         acpLoadError={acpLoadError}
+        hasEarlierHistory={hasEarlierHistory}
+        earlierHistoryLoading={earlierHistoryLoading}
+        earlierHistoryError={earlierHistoryError}
+        onLoadEarlierHistory={loadEarlierHistory}
         hideEmptyState={!hasPersistedConversation || hasSentMessage}
         onReload={canShowDetailErrorActions ? handleReloadDetail : undefined}
         onNewSession={
@@ -2635,6 +2643,7 @@ export function ConversationDetailPanel() {
   const tDetails = useTranslations("Folder.sessionDetails")
   const {
     completeTurn: runtimeCompleteTurn,
+    loadCompleteHistory,
     removeConversation: runtimeRemoveConversation,
   } = useConversationRuntimeActions()
   const { activeFolder: folder } = useActiveFolder()
@@ -2877,17 +2886,10 @@ export function ConversationDetailPanel() {
   )
 
   const getExportData = useCallback(async () => {
-    if (!activeConversationTab?.conversationId) return null
-    const session = getRuntimeSession(activeConversationTab.conversationId)
-    if (!session?.detail) return null
-    let detail = session.detail
-    // The loaded detail may be a tail WINDOW (paginated loading); an export
-    // must cover the whole transcript, so fetch the legacy full response on
-    // demand. The window is full when it starts at offset 0.
-    if (isWindowedDetail(detail) && detail.turns_offset > 0) {
-      detail = await getFolderConversation(
-        session.dbConversationId ?? activeConversationTab.conversationId
-      )
+    if (activeRuntimeId == null) return null
+    const detail = await loadCompleteHistory(activeRuntimeId)
+    if (!detail || detail.history_page?.has_more) {
+      throw new Error("Complete conversation history could not be loaded")
     }
     return {
       summary: detail.summary,
@@ -2895,7 +2897,7 @@ export function ConversationDetailPanel() {
       sessionStats: detail.session_stats,
       labels: exportLabels,
     }
-  }, [activeConversationTab, exportLabels])
+  }, [activeRuntimeId, exportLabels, loadCompleteHistory])
 
   const handleExportMarkdown = useCallback(async () => {
     try {
