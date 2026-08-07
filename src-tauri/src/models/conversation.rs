@@ -124,8 +124,9 @@ pub struct DbConversationDetail {
     /// deliverables.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifact_runs: Vec<ConversationTurnArtifactRun>,
-    /// User-facing final outputs explicitly declared by the agent and verified
-    /// against the conversation workspace by codeg.
+    /// Legacy conversation-wide aggregate retained for wire compatibility.
+    /// Detail reads leave this empty; clients use `deliverable_runs` for inline
+    /// cards and the paged deliverable-history endpoint for the ledger.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deliverables: Vec<ConversationDeliverable>,
     /// Per-turn associations for rendering the confirmed outputs directly
@@ -214,6 +215,29 @@ pub struct ConversationTurnDeliverableSet {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<DateTime<Utc>>,
     pub deliverables: Vec<ConversationDeliverable>,
+}
+
+/// One user-facing file in the conversation-wide deliverable history. The
+/// representative is the newest valid version; explicit declarations suppress
+/// inferred duplicates within their turn. `versions` retains per-turn lineage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationDeliverableHistoryGroup {
+    pub path_key: String,
+    pub latest: ConversationDeliverable,
+    pub versions: Vec<ConversationDeliverable>,
+}
+
+/// Bounded conversation-wide deliverable history. This is deliberately
+/// separate from `DbConversationDetail::deliverable_runs`, whose only purpose
+/// is to render outputs next to their producing assistant turn.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationDeliverableHistoryPage {
+    pub items: Vec<ConversationDeliverableHistoryGroup>,
+    pub offset: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<u32>,
+    pub has_more: bool,
+    pub total: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -3144,6 +3144,12 @@
       },
       "conversationDeliverables": {
         "collapsedSummary": "產物 {count}",
+        "historyTitle": "歷史產物",
+        "loadingHistory": "正在載入歷史產物…",
+        "retry": "重試",
+        "versions": "{count} 個版本",
+        "toggleVersions": "展開或收起 {count} 個歷史版本",
+        "loadMore": "載入更多",
         "title": "最終產物",
         "collapse": "收合",
         "openFile": "開啟 {filePath}",
