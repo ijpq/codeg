@@ -378,7 +378,6 @@ export function LiveTranscriptView({
           hideEmptyState={false}
           showMessageNav={false}
           userTurnHeader={userTurnHeader}
-          deliverables={detail?.deliverables}
           deliverableRuns={detail?.deliverable_runs}
         />
       </div>

@@ -3247,6 +3247,12 @@
       },
       "conversationDeliverables": {
         "collapsedSummary": "مخرجات {count}",
+        "historyTitle": "سجل المخرجات",
+        "loadingHistory": "جارٍ تحميل سجل المخرجات…",
+        "retry": "إعادة المحاولة",
+        "versions": "{count} إصدارات",
+        "toggleVersions": "عرض أو إخفاء {count} إصدارات سابقة",
+        "loadMore": "تحميل المزيد",
         "title": "المخرجات النهائية",
         "collapse": "طيّ",
         "openFile": "فتح {filePath}",

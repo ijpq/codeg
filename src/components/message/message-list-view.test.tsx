@@ -248,24 +248,33 @@ describe("replyDeliverablesForRun", () => {
   it("does not hide a turn that contains multiple declared primary files", () => {
     const all = [
       output("final-pdf"),
+      output("second-primary-pdf"),
       output("qa-page-1", { source: "inferred" }),
-      output("qa-page-2", { source: "inferred" }),
       output("merged-docx", { role: "supporting" }),
     ]
 
     expect(replyDeliverablesForRun(all).map((item) => item.id)).toEqual([
       "final-pdf",
+      "second-primary-pdf",
       "merged-docx",
     ])
   })
 
-  it("keeps inference-only turns strict and omits empty cards", () => {
+  it("shows server-filtered inferred outputs and omits empty cards", () => {
     expect(replyDeliverablesForRun([])).toEqual([])
     expect(
       replyDeliverablesForRun([
         output("qa-supporting", {
           role: "supporting",
           source: "inferred",
+        }),
+      ])
+    ).toHaveLength(1)
+    expect(
+      replyDeliverablesForRun([
+        output("invalid", {
+          source: "inferred",
+          is_valid: false,
         }),
       ])
     ).toEqual([])

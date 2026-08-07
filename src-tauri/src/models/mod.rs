@@ -22,6 +22,7 @@ pub use automation::{
 pub use chat_channel::{ChannelStatusInfo, ChatChannelInfo, ChatChannelMessageLogInfo};
 pub use conversation::{
     AgentConversationCount, AgentStats, ConversationDeliverable, ConversationDetail,
+    ConversationDeliverableHistoryGroup, ConversationDeliverableHistoryPage,
     ConversationHistoryPage, ConversationSummary, ConversationTurnArtifactRun,
     ConversationTurnDeliverableSet, ConversationTurnFileChange, ConversationTurnsPage,
     DbConversationDetail, DbConversationSummary, FolderInfo, ImportFolderOutcome, ImportResult,

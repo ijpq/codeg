@@ -4,9 +4,10 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 const mocks = vi.hoisted(() => ({
   copyDeliverableFiles: vi.fn(),
   downloadDeliverables: vi.fn(),
-  hideDeliverables: vi.fn(),
+  listConversationDeliverableHistory: vi.fn(),
   openDeliverable: vi.fn(),
   revealDeliverable: vi.fn(),
+  subscribe: vi.fn().mockResolvedValue(() => undefined),
 }))
 
 vi.mock("next-intl", () => ({
@@ -21,16 +22,20 @@ vi.mock("@/hooks/use-deliverable-capabilities", () => ({
     hostActionNotice: true,
   }),
 }))
+vi.mock("@/lib/platform", () => ({ subscribe: mocks.subscribe }))
 vi.mock("@/lib/api", () => ({
   copyDeliverableFiles: mocks.copyDeliverableFiles,
   downloadDeliverables: mocks.downloadDeliverables,
-  hideDeliverables: mocks.hideDeliverables,
+  listConversationDeliverableHistory: mocks.listConversationDeliverableHistory,
   openDeliverable: mocks.openDeliverable,
   revealDeliverable: mocks.revealDeliverable,
 }))
 
 import { ConversationDeliverablesPanel } from "./conversation-deliverables-panel"
-import type { ConversationDeliverable } from "@/lib/types"
+import type {
+  ConversationDeliverable,
+  ConversationDeliverableHistoryGroup,
+} from "@/lib/types"
 
 function deliverable(
   id: string,
@@ -46,6 +51,8 @@ function deliverable(
     kind: "file",
     title: fileName,
     role: "primary",
+    category: "standalone_output",
+    change_kind: "created",
     position: 0,
     source: "declared",
     file_name: fileName,
@@ -60,91 +67,150 @@ function deliverable(
   }
 }
 
+function historyGroup(
+  item: ConversationDeliverable,
+  versions: ConversationDeliverable[] = [item]
+): ConversationDeliverableHistoryGroup {
+  return {
+    path_key: `${item.root_path}::${item.path}`,
+    latest: item,
+    versions,
+  }
+}
+
+function mockHistory(items: ConversationDeliverable[], total = items.length) {
+  mocks.listConversationDeliverableHistory.mockResolvedValue({
+    items: items.map((item) => historyGroup(item)),
+    offset: 0,
+    next_offset: null,
+    has_more: false,
+    total,
+  })
+}
+
 describe("ConversationDeliverablesPanel", () => {
   beforeEach(() => {
     vi.clearAllMocks()
     mocks.copyDeliverableFiles.mockResolvedValue({ affected: 1 })
     mocks.downloadDeliverables.mockResolvedValue({ status: "started" })
-    mocks.hideDeliverables.mockResolvedValue({ affected: 1 })
     mocks.openDeliverable.mockResolvedValue({ affected: 1 })
     mocks.revealDeliverable.mockResolvedValue({ affected: 1 })
+    mockHistory([])
   })
 
-  it("keeps a fixed conversation entry even when the list is empty", () => {
+  it("keeps a lazy history entry without loading the ledger while collapsed", () => {
     render(
       <ConversationDeliverablesPanel
         conversationId={1}
         expanded={false}
         onToggle={vi.fn()}
-        deliverables={[]}
       />
     )
 
-    expect(screen.getByText("collapsedSummary")).toBeInTheDocument()
+    expect(screen.getByText("historyTitle")).toBeInTheDocument()
+    expect(mocks.listConversationDeliverableHistory).not.toHaveBeenCalled()
   })
 
-  it("renders only persisted deliverables and marks inferred and missing files", () => {
+  it("loads only the persisted, server-filtered history page when expanded", async () => {
+    mockHistory([
+      deliverable("docx", "报告.docx"),
+      deliverable("pdf", "报告.pdf", { source: "inferred" }),
+    ])
     render(
       <ConversationDeliverablesPanel
         conversationId={1}
         expanded
         onToggle={vi.fn()}
-        deliverables={[
-          deliverable("docx", "报告.docx"),
-          deliverable("pdf", "报告.pdf", {
-            source: "inferred",
-            is_valid: false,
-            invalid_reason: "file_not_found",
-          }),
-        ]}
       />
     )
 
-    expect(screen.getByText("报告.docx")).toBeInTheDocument()
+    expect(await screen.findByText("报告.docx")).toBeInTheDocument()
     expect(screen.getByText("报告.pdf")).toBeInTheDocument()
     expect(screen.getByText("inferred")).toBeInTheDocument()
-    expect(screen.getByText("missing")).toBeInTheDocument()
-    expect(screen.queryByText("package.json")).not.toBeInTheDocument()
+    expect(mocks.listConversationDeliverableHistory).toHaveBeenCalledWith(
+      1,
+      0,
+      25
+    )
   })
 
-  it("shows code change and deleted badges for reconciled files", () => {
+  it("shows a deduplicated path and expands its per-turn version lineage", async () => {
+    const latest = deliverable("same", "报告.pdf", {
+      turn_run_id: "run-2",
+      produced_at: "2026-07-19T00:00:00Z",
+    })
+    const older = deliverable("same", "报告.pdf", {
+      turn_run_id: "run-1",
+      produced_at: "2026-07-18T00:00:00Z",
+    })
+    mocks.listConversationDeliverableHistory.mockResolvedValue({
+      items: [historyGroup(latest, [latest, older])],
+      offset: 0,
+      next_offset: null,
+      has_more: false,
+      total: 1,
+    })
     render(
       <ConversationDeliverablesPanel
         conversationId={1}
         expanded
         onToggle={vi.fn()}
-        deliverables={[
-          deliverable("source", "lib.rs", {
-            path: "src/lib.rs",
-            category: "code_change",
-            change_kind: "modified",
-          }),
-          deliverable("deleted", "old.rs", {
-            path: "src/old.rs",
-            category: "code_change",
-            change_kind: "deleted",
-            is_valid: false,
-            invalid_reason: "deleted",
-          }),
-        ]}
       />
     )
 
-    expect(screen.getAllByText("codeChange")).toHaveLength(2)
-    expect(screen.getByText("deleted")).toBeInTheDocument()
-    expect(screen.queryByText("missing")).not.toBeInTheDocument()
+    await screen.findByText("报告.pdf")
+    fireEvent.click(screen.getByText("versions"))
+    expect(screen.getAllByText(/declared/)).toHaveLength(2)
+  })
+
+  it("keeps long history bounded and loads the next page on demand", async () => {
+    const first = deliverable("first", "第一页.pdf")
+    const second = deliverable("second", "下一页.pdf")
+    mocks.listConversationDeliverableHistory
+      .mockResolvedValueOnce({
+        items: [historyGroup(first)],
+        offset: 0,
+        next_offset: 25,
+        has_more: true,
+        total: 158,
+      })
+      .mockResolvedValueOnce({
+        items: [historyGroup(second)],
+        offset: 25,
+        next_offset: null,
+        has_more: false,
+        total: 158,
+      })
+    render(
+      <ConversationDeliverablesPanel
+        conversationId={28}
+        expanded
+        onToggle={vi.fn()}
+      />
+    )
+
+    await screen.findByText("第一页.pdf")
+    expect(screen.queryByText("下一页.pdf")).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: "loadMore" }))
+    expect(await screen.findByText("下一页.pdf")).toBeInTheDocument()
+    expect(mocks.listConversationDeliverableHistory).toHaveBeenLastCalledWith(
+      28,
+      25,
+      25
+    )
   })
 
   it("downloads by deliverable id without sending a source path", async () => {
+    mockHistory([deliverable("docx-id", "交付 文档.docx")])
     render(
       <ConversationDeliverablesPanel
         conversationId={7}
         expanded
         onToggle={vi.fn()}
-        deliverables={[deliverable("docx-id", "交付 文档.docx")]}
       />
     )
 
+    await screen.findByText("交付 文档.docx")
     fireEvent.click(screen.getByRole("button", { name: "download" }))
     await waitFor(() => {
       expect(mocks.downloadDeliverables).toHaveBeenCalledWith({
@@ -157,15 +223,16 @@ describe("ConversationDeliverablesPanel", () => {
   })
 
   it("opens with the host default application by deliverable id", async () => {
+    mockHistory([deliverable("pdf-id", "最终 报告.pdf")])
     render(
       <ConversationDeliverablesPanel
         conversationId={7}
         expanded
         onToggle={vi.fn()}
-        deliverables={[deliverable("pdf-id", "最终 报告.pdf")]}
       />
     )
 
+    await screen.findByText("最终 报告.pdf")
     fireEvent.click(
       screen.getByRole("button", { name: "openWithDefaultAppHost" })
     )
@@ -175,15 +242,16 @@ describe("ConversationDeliverablesPanel", () => {
   })
 
   it("copies selected files as one host clipboard operation", async () => {
+    mockHistory([deliverable("a", "A.pdf"), deliverable("b", "B.pdf")])
     render(
       <ConversationDeliverablesPanel
         conversationId={9}
         expanded
         onToggle={vi.fn()}
-        deliverables={[deliverable("a", "A.pdf"), deliverable("b", "B.pdf")]}
       />
     )
 
+    await screen.findByText("A.pdf")
     for (const checkbox of screen.getAllByRole("checkbox", {
       name: "selectFile",
     })) {

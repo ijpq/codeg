@@ -8,7 +8,9 @@ use serde::{Deserialize, Serialize};
 use crate::app_error::AppCommandError;
 use crate::db::error::DbError;
 use crate::db::service::deliverable_service::{self, ResolvedDeliverable};
-use crate::models::{ConversationDeliverable, ConversationTurnDeliverableSet};
+use crate::models::{
+    ConversationDeliverable, ConversationDeliverableHistoryPage, ConversationTurnDeliverableSet,
+};
 use crate::workspace_transfer::{
     DeliverableDownloadKind, DeliverableDownloadTicketSpec, DownloadTicketIssued,
     WorkspaceTransferManager,
@@ -124,6 +126,17 @@ pub async fn list_conversation_deliverable_runs_core(
     conversation_id: i32,
 ) -> Result<Vec<ConversationTurnDeliverableSet>, AppCommandError> {
     deliverable_service::list_sets_for_conversation(conn, conversation_id)
+        .await
+        .map_err(map_db_error)
+}
+
+pub async fn list_conversation_deliverable_history_core(
+    conn: &DatabaseConnection,
+    conversation_id: i32,
+    offset: u32,
+    limit: u32,
+) -> Result<ConversationDeliverableHistoryPage, AppCommandError> {
+    deliverable_service::list_history_page(conn, conversation_id, offset, limit)
         .await
         .map_err(map_db_error)
 }
@@ -592,6 +605,23 @@ pub async fn list_conversation_deliverable_runs(
     db: tauri::State<'_, crate::db::AppDatabase>,
 ) -> Result<Vec<ConversationTurnDeliverableSet>, AppCommandError> {
     list_conversation_deliverable_runs_core(&db.conn, conversation_id).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn list_conversation_deliverable_history(
+    conversation_id: i32,
+    offset: Option<u32>,
+    limit: Option<u32>,
+    db: tauri::State<'_, crate::db::AppDatabase>,
+) -> Result<ConversationDeliverableHistoryPage, AppCommandError> {
+    list_conversation_deliverable_history_core(
+        &db.conn,
+        conversation_id,
+        offset.unwrap_or(0),
+        limit.unwrap_or(25),
+    )
+    .await
 }
 
 #[cfg(feature = "tauri-runtime")]

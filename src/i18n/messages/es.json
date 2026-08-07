@@ -3247,6 +3247,12 @@
       },
       "conversationDeliverables": {
         "collapsedSummary": "Entregables {count}",
+        "historyTitle": "Historial de entregables",
+        "loadingHistory": "Cargando historial de entregables…",
+        "retry": "Reintentar",
+        "versions": "{count} versiones",
+        "toggleVersions": "Mostrar u ocultar {count} versiones históricas",
+        "loadMore": "Cargar más",
         "title": "Entregables finales",
         "collapse": "Contraer",
         "openFile": "Abrir {filePath}",
