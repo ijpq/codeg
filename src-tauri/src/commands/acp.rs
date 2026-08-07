@@ -8760,6 +8760,14 @@ pub(crate) async fn acp_restore_conversation_core(
     owner_window_label: String,
     emitter: EventEmitter,
 ) -> Result<RestoredConversationConnectionInfo, AcpError> {
+    let restore_started = std::time::Instant::now();
+    tracing::info!(
+        conversation_id,
+        stage = "restore_request_received",
+        total_elapsed_ms = 0u64,
+        "[ACP][restore] request received"
+    );
+    let metadata_started = std::time::Instant::now();
     let conversation = conversation_service::get_by_id(&db.conn, conversation_id)
         .await
         .map_err(|e| AcpError::protocol(e.to_string()))?;
@@ -8783,6 +8791,13 @@ pub(crate) async fn acp_restore_conversation_core(
         })?;
     let agent_type = conversation.agent_type;
     let require_codeg_mcp = agent_type == AgentType::Codex;
+    tracing::info!(
+        conversation_id,
+        stage = "restore_metadata_loaded",
+        stage_elapsed_ms = metadata_started.elapsed().as_millis() as u64,
+        total_elapsed_ms = restore_started.elapsed().as_millis() as u64,
+        "[ACP][restore] stage completed"
+    );
 
     let old_connection_id = manager
         .find_connection_by_conversation_id(conversation_id)
@@ -8808,6 +8823,8 @@ pub(crate) async fn acp_restore_conversation_core(
         old_codeg_mcp_available,
         old_turn_in_flight,
         require_codeg_mcp,
+        stage = "restore_start",
+        total_elapsed_ms = restore_started.elapsed().as_millis() as u64,
         "[ACP] persisted conversation restore starting"
     );
 
@@ -8841,6 +8858,13 @@ pub(crate) async fn acp_restore_conversation_core(
         old_connection_id = ?old_connection_id,
         "[ACP] session resume/load requested"
     );
+    let spawn_started = std::time::Instant::now();
+    tracing::info!(
+        conversation_id,
+        stage = "acp_process_spawn_start",
+        total_elapsed_ms = restore_started.elapsed().as_millis() as u64,
+        "[ACP][restore] stage started"
+    );
     let spawned = manager
         .spawn_agent_for_restore(
             agent_type,
@@ -8855,7 +8879,17 @@ pub(crate) async fn acp_restore_conversation_core(
             conversation_id,
         )
         .await?;
+    tracing::info!(
+        conversation_id,
+        connection_id = %spawned.connection_id,
+        reused_existing = spawned.reused_existing,
+        stage = "acp_connection_ready",
+        stage_elapsed_ms = spawn_started.elapsed().as_millis() as u64,
+        total_elapsed_ms = restore_started.elapsed().as_millis() as u64,
+        "[ACP][restore] stage completed"
+    );
 
+    let activation_started = std::time::Instant::now();
     let activation = manager
         .activate_restored_conversation(
             &spawned.connection_id,
@@ -8900,6 +8934,9 @@ pub(crate) async fn acp_restore_conversation_core(
         codeg_mcp_available = activation.codeg_mcp_available,
         replaced_connection_ids = ?activation.replaced_connection_ids,
         binding_updated = true,
+        stage = "restore_completed",
+        activation_elapsed_ms = activation_started.elapsed().as_millis() as u64,
+        total_elapsed_ms = restore_started.elapsed().as_millis() as u64,
         "[ACP] persisted conversation restore completed"
     );
 

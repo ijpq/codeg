@@ -133,6 +133,10 @@ interface MessageListViewProps {
    * Reload / New session actions), since the agent can't continue the thread.
    */
   acpLoadError?: string | null
+  hasEarlierHistory?: boolean
+  earlierHistoryLoading?: boolean
+  earlierHistoryError?: string | null
+  onLoadEarlierHistory?: () => Promise<void> | void
   hideEmptyState?: boolean
   onReload?: () => void
   onNewSession?: () => void
@@ -862,6 +866,57 @@ const AutoScrollOnSend = memo(function AutoScrollOnSend({
   return null
 })
 
+const LoadEarlierHistoryControl = memo(function LoadEarlierHistoryControl({
+  loading,
+  error,
+  onLoad,
+}: {
+  loading: boolean
+  error: string | null
+  onLoad: () => Promise<void> | void
+}) {
+  const t = useTranslations("Folder.chat.messageList")
+  const { scrollRef } = useStickToBottomContext()
+  const handleLoad = useCallback(async () => {
+    const viewport = scrollRef.current
+    const previousHeight = viewport?.scrollHeight ?? 0
+    const previousTop = viewport?.scrollTop ?? 0
+    await onLoad()
+    // Prepending a virtualized page changes the scrollable height. Preserve
+    // the reader's visual anchor instead of jumping them to the new first row.
+    requestAnimationFrame(() => {
+      if (!viewport) return
+      viewport.scrollTop =
+        previousTop + Math.max(0, viewport.scrollHeight - previousHeight)
+    })
+  }, [onLoad, scrollRef])
+
+  return (
+    <div className="shrink-0 border-b border-border/40 px-3 py-1.5 text-center">
+      <Button
+        type="button"
+        size="sm"
+        variant="ghost"
+        disabled={loading}
+        onClick={() => void handleLoad()}
+      >
+        {loading ? (
+          <Loader2
+            aria-hidden="true"
+            className="me-1.5 size-3.5 animate-spin"
+          />
+        ) : null}
+        {error ? t("retryEarlierHistory") : t("loadEarlierHistory")}
+      </Button>
+      {error ? (
+        <p className="truncate text-xs text-destructive" title={error}>
+          {error}
+        </p>
+      ) : null}
+    </div>
+  )
+})
+
 export function MessageListView({
   conversationId,
   agentType,
@@ -871,6 +926,10 @@ export function MessageListView({
   detailLoading = false,
   detailError = null,
   acpLoadError = null,
+  hasEarlierHistory = false,
+  earlierHistoryLoading = false,
+  earlierHistoryError = null,
+  onLoadEarlierHistory,
   hideEmptyState = false,
   onReload,
   onNewSession,
@@ -1409,6 +1468,13 @@ export function MessageListView({
         resize={shouldUseSmoothResize ? "smooth" : undefined}
       >
         <AutoScrollOnSend signal={sendSignal} />
+        {(hasEarlierHistory || earlierHistoryError) && onLoadEarlierHistory ? (
+          <LoadEarlierHistoryControl
+            loading={earlierHistoryLoading}
+            error={earlierHistoryError}
+            onLoad={onLoadEarlierHistory}
+          />
+        ) : null}
         <VirtualizedMessageThread
           items={threadItems}
           getItemKey={getThreadItemKey}

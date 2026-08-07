@@ -592,12 +592,23 @@ export async function importLocalConversations(
 
 export async function getFolderConversation(
   conversationId: number,
-  window?: { tailTurns?: number; fromIndex?: number }
+  options?: {
+    tailTurns?: number
+    fromIndex?: number
+    beforeCursor?: string | null
+    userTurnLimit?: number | null
+  }
 ): Promise<DbConversationDetail> {
   return invoke("get_folder_conversation", {
     conversationId,
-    ...(window?.tailTurns != null ? { tailTurns: window.tailTurns } : {}),
-    ...(window?.fromIndex != null ? { fromIndex: window.fromIndex } : {}),
+    ...(options?.tailTurns != null ? { tailTurns: options.tailTurns } : {}),
+    ...(options?.fromIndex != null ? { fromIndex: options.fromIndex } : {}),
+    ...(options?.beforeCursor !== undefined
+      ? { beforeCursor: options.beforeCursor }
+      : {}),
+    ...(options?.userTurnLimit !== undefined
+      ? { userTurnLimit: options.userTurnLimit }
+      : {}),
   })
 }
 

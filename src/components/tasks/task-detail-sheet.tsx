@@ -239,7 +239,7 @@ export function TaskDetailSheet({
       return
     }
     let cancelled = false
-    getFolderConversation(conversationId)
+    getFolderConversation(conversationId, { userTurnLimit: 1 })
       .then((detail) => {
         if (cancelled) return
         setConvAgentType(detail.summary.agent_type ?? null)

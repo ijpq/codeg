@@ -2839,6 +2839,8 @@
         "loading": "جارٍ التحميل...",
         "loadEarlier": "تحميل الرسائل السابقة",
         "loadingEarlier": "جارٍ تحميل الرسائل السابقة…",
+        "loadEarlierHistory": "تحميل الرسائل السابقة",
+        "retryEarlierHistory": "إعادة تحميل الرسائل السابقة",
         "error": "خطأ: {message}",
         "errorTitle": "فشل تحميل الجلسة",
         "errorActionReload": "إعادة تحميل",

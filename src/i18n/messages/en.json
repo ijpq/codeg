@@ -2839,6 +2839,8 @@
         "loading": "Loading...",
         "loadEarlier": "Load earlier messages",
         "loadingEarlier": "Loading earlier messages…",
+        "loadEarlierHistory": "Load earlier messages",
+        "retryEarlierHistory": "Retry earlier messages",
         "error": "Error: {message}",
         "errorTitle": "Session load failed",
         "errorActionReload": "Reload",

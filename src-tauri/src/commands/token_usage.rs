@@ -1343,6 +1343,7 @@ mod tests {
             artifact_runs: Vec::new(),
             deliverables: Vec::new(),
             deliverable_runs: Vec::new(),
+            history_page: None,
         }
     }
 

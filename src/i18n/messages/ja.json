@@ -2839,6 +2839,8 @@
         "loading": "読み込み中...",
         "loadEarlier": "以前のメッセージを読み込む",
         "loadingEarlier": "以前のメッセージを読み込み中…",
+        "loadEarlierHistory": "以前のメッセージを読み込む",
+        "retryEarlierHistory": "以前のメッセージを再読み込み",
         "error": "エラー: {message}",
         "errorTitle": "セッションの読み込みに失敗しました",
         "errorActionReload": "再読み込み",
