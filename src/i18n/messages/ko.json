@@ -3159,6 +3159,12 @@
       },
       "conversationDeliverables": {
         "collapsedSummary": "결과물 {count}",
+        "historyTitle": "결과물 기록",
+        "loadingHistory": "결과물 기록 불러오는 중…",
+        "retry": "다시 시도",
+        "versions": "버전 {count}개",
+        "toggleVersions": "이전 버전 {count}개 전환",
+        "loadMore": "더 불러오기",
         "title": "최종 결과물",
         "collapse": "접기",
         "openFile": "{filePath} 열기",

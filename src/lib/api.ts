@@ -76,6 +76,7 @@ import type {
   ScanResult,
   SelectedSessionKey,
   ConversationDeliverable,
+  ConversationDeliverableHistoryPage,
   ConversationTurnDeliverableSet,
   OpenedTab,
   OpenedTabsSnapshot,
@@ -4634,6 +4635,17 @@ export async function listConversationDeliverables(
   return getTransport().call<ConversationDeliverable[]>(
     "list_conversation_deliverables",
     { conversationId }
+  )
+}
+
+export async function listConversationDeliverableHistory(
+  conversationId: number,
+  offset = 0,
+  limit = 25
+): Promise<ConversationDeliverableHistoryPage> {
+  return getTransport().call<ConversationDeliverableHistoryPage>(
+    "list_conversation_deliverable_history",
+    { conversationId, offset, limit }
   )
 }
 

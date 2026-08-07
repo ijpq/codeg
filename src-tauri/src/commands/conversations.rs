@@ -1296,16 +1296,14 @@ async fn get_folder_conversation_core_impl(
     let artifact_runs = artifact_service::list_for_conversation(conn, conversation_id)
         .await
         .map_err(AppCommandError::from)?;
-    let deliverables = deliverable_service::list_for_conversation(conn, conversation_id)
+    let deliverable_runs = deliverable_service::list_sets_for_turns(conn, conversation_id, &turns)
         .await
         .map_err(AppCommandError::from)?;
-    let mut deliverable_runs =
-        deliverable_service::list_sets_for_conversation(conn, conversation_id)
-            .await
-            .map_err(AppCommandError::from)?;
-    deliverable_service::associate_sets_with_user_turns(conn, &mut deliverable_runs, &turns)
-        .await
-        .map_err(AppCommandError::from)?;
+    // Conversation detail owns only outputs that can be attached to a user
+    // turn in this history page. The conversation-wide ledger is fetched
+    // lazily from the dedicated history endpoint; returning it here caused old
+    // outputs to be rendered as one giant footer under the latest reply.
+    let deliverables = Vec::new();
     let related_db_elapsed_ms = related_db_started.elapsed().as_millis() as u64;
 
     tracing::info!(

@@ -602,8 +602,8 @@ export interface DbConversationDetail {
   /** Backend filesystem change diagnostics, grouped by accepted ACP turn.
    * These are not final deliverables. Older servers omit this field. */
   artifact_runs?: ConversationTurnArtifactRun[]
-  /** Agent-declared final outputs that the backend verified inside the
-   * conversation workspace. */
+  /** Legacy aggregate retained for wire compatibility. New detail responses
+   * leave it empty; use deliverable_runs or the paged history API. */
   deliverables?: ConversationDeliverable[]
   /** Confirmed outputs grouped by the producing backend turn run. */
   deliverable_runs?: ConversationTurnDeliverableSet[]
@@ -658,6 +658,20 @@ export interface ConversationTurnDeliverableSet {
   started_at: string
   completed_at?: string | null
   deliverables: ConversationDeliverable[]
+}
+
+export interface ConversationDeliverableHistoryGroup {
+  path_key: string
+  latest: ConversationDeliverable
+  versions: ConversationDeliverable[]
+}
+
+export interface ConversationDeliverableHistoryPage {
+  items: ConversationDeliverableHistoryGroup[]
+  offset: number
+  next_offset?: number | null
+  has_more: boolean
+  total: number
 }
 
 export type ConversationTurnArtifactStatus =

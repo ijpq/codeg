@@ -960,6 +960,7 @@ mod tauri_app {
                 deliverable_commands::list_conversation_deliverables,
                 deliverable_commands::list_turn_deliverables,
                 deliverable_commands::list_conversation_deliverable_runs,
+                deliverable_commands::list_conversation_deliverable_history,
                 deliverable_commands::copy_deliverables,
                 deliverable_commands::open_deliverable,
                 deliverable_commands::reveal_deliverable,

@@ -14,7 +14,10 @@ use crate::db::entities::{
     conversation_turn_file_change, deliverable_declaration, folder,
 };
 use crate::db::error::DbError;
-use crate::models::{ConversationDeliverable, ConversationTurnDeliverableSet, MessageTurn};
+use crate::models::{
+    ConversationDeliverable, ConversationDeliverableHistoryGroup,
+    ConversationDeliverableHistoryPage, ConversationTurnDeliverableSet, MessageTurn,
+};
 
 pub const SOURCE_DECLARED: &str = "declared";
 pub const SOURCE_INFERRED: &str = "inferred";
@@ -695,8 +698,17 @@ fn inference_path_hard_allowed(path: &str) -> bool {
         "coverage",
         "logs",
         "log",
+        "cache",
+        "caches",
         "tmp",
         "temp",
+        "_qa",
+        "qa",
+        "_rendered",
+        "rendered",
+        "_backups",
+        "backup",
+        "backups",
         "__pycache__",
     ];
     if parsed.components().any(|component| match component {
@@ -729,6 +741,39 @@ fn inference_path_allowed(path: &str) -> bool {
     if TRANSIENT_HIDDEN_FILES.contains(&file_name.as_str()) || file_name.starts_with("~$") {
         return false;
     }
+    if file_name == "status.md" || stem == "_probe" || stem.starts_with("_probe.") {
+        return false;
+    }
+    let extension = clean_extension(parsed);
+    if matches!(
+        extension.as_deref(),
+        Some(
+            "py" | "pyc"
+                | "ps1"
+                | "cmd"
+                | "bat"
+                | "log"
+                | "lock"
+                | "tmp"
+                | "temp"
+                | "cache"
+                | "bak"
+                | "old"
+                | "orig"
+        )
+    ) {
+        return false;
+    }
+    if matches!(extension.as_deref(), Some("png" | "jpg" | "jpeg" | "webp")) {
+        let suffix = stem
+            .strip_prefix("page-")
+            .or_else(|| stem.strip_prefix("page_"));
+        if suffix
+            .is_some_and(|value| value.len() >= 2 && value.chars().all(|ch| ch.is_ascii_digit()))
+        {
+            return false;
+        }
+    }
     const TRANSIENT_STEMS: &[&str] = &["draft", "preview", "temp", "tmp"];
     if TRANSIENT_STEMS.contains(&stem.as_str()) {
         return false;
@@ -736,11 +781,17 @@ fn inference_path_allowed(path: &str) -> bool {
     // Test/spec/snapshot source files are real code changes and must survive
     // fallback settlement. Test-like names are filtered only for standalone
     // output formats, where they conventionally identify preview fixtures.
-    if standalone_output_extension(clean_extension(parsed).as_deref()) {
+    if standalone_output_extension(extension.as_deref()) {
         const EXCLUDED_OUTPUT_DIRS: &[&str] = &[
             "qa",
+            "_qa",
             "qa-images",
             "qa_images",
+            "rendered",
+            "_rendered",
+            "backup",
+            "backups",
+            "_backups",
             "render-cache",
             "render_cache",
             "render-check",
@@ -774,12 +825,22 @@ fn inference_path_allowed(path: &str) -> bool {
             "draft_",
             "preview-",
             "preview_",
+            "backup-",
+            "backup_",
+            "old-",
+            "old_",
             "qa-",
             "qa_",
             "render-check-",
             "render_check_",
             "visual-check-",
             "visual_check_",
+            ".backup",
+            "_backup",
+            "-backup",
+            ".old",
+            "_old",
+            "-old",
         ];
         if EXCLUDED_MARKERS
             .iter()
@@ -864,13 +925,14 @@ pub async fn infer_for_turn(
         }
         let explicitly_expected = expected_paths.contains(&change.path);
         let extension = clean_extension(Path::new(&change.path));
-        // A standalone file is still useful in the inclusive conversation
-        // ledger when concurrent turns made process-level attribution
-        // impossible. It remains supporting (never reply-tail primary) unless
-        // the user named this exact path. Ambiguous source/config churn stays
-        // out to avoid cross-conversation noise.
+        // Preserve source changes in the inclusive internal ledger for failed
+        // declaration recovery, but expose only filtered standalone outputs as
+        // user-facing inferred deliverables (see is_user_visible_deliverable).
         let ambiguous_standalone_candidate = change.kind != ConversationTurnFileChangeKind::Deleted
             && standalone_output_extension(extension.as_deref());
+        let expected_code_recovery = expectation.expects_code_changes
+            && explicitly_expected
+            && !ambiguous_standalone_candidate;
         if change.source != "watcher"
             || (change.attribution != "exclusive"
                 && !explicitly_expected
@@ -879,7 +941,8 @@ pub async fn infer_for_turn(
             || (inputs.contains(&change.path)
                 && change.kind == ConversationTurnFileChangeKind::Created)
             || !inference_path_hard_allowed(&change.path)
-            || (!explicitly_expected && !inference_path_allowed(&change.path))
+            || (!ambiguous_standalone_candidate && !expected_code_recovery)
+            || (ambiguous_standalone_candidate && !inference_path_allowed(&change.path))
         {
             continue;
         }
@@ -935,18 +998,10 @@ pub async fn infer_for_turn(
             kind: "file".into(),
             title: file_name.clone(),
             description: None,
-            // A standalone file exclusively observed during this turn is a
-            // user-facing result even when the prompt did not prescribe its
-            // eventual filename (the common "design a PDF" case). Keep
-            // ambiguous watcher matches supporting so concurrent turns do not
-            // claim one another's outputs in their reply tails.
-            role: if expected_paths.contains(&change.path)
-                || (category == "standalone_output" && change.attribution == "exclusive")
-            {
-                "primary".into()
-            } else {
-                "supporting".into()
-            },
+            // Role promotion happens only after the complete candidate set is
+            // known. This prevents a directory full of page previews from
+            // turning into dozens of inferred primary outputs.
+            role: "supporting".into(),
             category: category.into(),
             change_kind: match change.kind {
                 ConversationTurnFileChangeKind::Created => "created",
@@ -962,6 +1017,32 @@ pub async fn infer_for_turn(
             is_valid,
             invalid_reason,
         });
+    }
+
+    let expected_candidates = inferred
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| {
+            item.category == "standalone_output" && expected_paths.contains(&item.path)
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let primary_index = if expected_candidates.len() == 1 {
+        expected_candidates.first().copied()
+    } else if inferred
+        .iter()
+        .filter(|item| item.category == "standalone_output")
+        .count()
+        == 1
+    {
+        inferred
+            .iter()
+            .position(|item| item.category == "standalone_output")
+    } else {
+        None
+    };
+    if let Some(index) = primary_index {
+        inferred[index].role = "primary".into();
     }
 
     let saved = if inferred.is_empty() {
@@ -998,16 +1079,22 @@ pub async fn infer_for_turn(
     Ok(saved)
 }
 
-async fn refreshed_models(
+async fn refreshed_models_for_ids(
     conn: &DatabaseConnection,
     conversation_id: i32,
+    ids: Option<&HashSet<String>>,
 ) -> Result<Vec<conversation_deliverable::Model>, DbError> {
-    let rows = conversation_deliverable::Entity::find()
+    if ids.is_some_and(HashSet::is_empty) {
+        return Ok(Vec::new());
+    }
+    let mut query = conversation_deliverable::Entity::find()
         .filter(conversation_deliverable::Column::ConversationId.eq(conversation_id))
         .filter(conversation_deliverable::Column::IsHidden.eq(false))
-        .order_by_desc(conversation_deliverable::Column::UpdatedAt)
-        .all(conn)
-        .await?;
+        .order_by_desc(conversation_deliverable::Column::UpdatedAt);
+    if let Some(ids) = ids {
+        query = query.filter(conversation_deliverable::Column::Id.is_in(ids.iter().cloned()));
+    }
+    let rows = query.all(conn).await?;
     let mut refreshed = Vec::with_capacity(rows.len());
     for row in rows {
         let now = Utc::now();
@@ -1059,17 +1146,74 @@ async fn refreshed_models(
     Ok(refreshed)
 }
 
-pub async fn list_for_conversation(
+async fn refreshed_models(
     conn: &DatabaseConnection,
     conversation_id: i32,
-) -> Result<Vec<ConversationDeliverable>, DbError> {
-    let models = refreshed_models(conn, conversation_id).await?;
+) -> Result<Vec<conversation_deliverable::Model>, DbError> {
+    refreshed_models_for_ids(conn, conversation_id, None).await
+}
+
+fn normalized_deliverable_path_key(root_path: &str, path: &str) -> String {
+    let normalized_root = root_path
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_string();
+    let normalized_path = path
+        .replace('\\', "/")
+        .split('/')
+        .filter(|component| !component.is_empty() && *component != ".")
+        .collect::<Vec<_>>()
+        .join("/");
+    let (normalized_root, normalized_path) = if cfg!(windows) {
+        (
+            normalized_root.to_lowercase(),
+            normalized_path.to_lowercase(),
+        )
+    } else {
+        (normalized_root, normalized_path)
+    };
+    format!("{normalized_root}::{normalized_path}")
+}
+
+fn is_user_visible_deliverable(item: &ConversationDeliverable) -> bool {
+    if !item.is_valid || item.change_kind == "deleted" {
+        return false;
+    }
+    item.source == SOURCE_DECLARED
+        || (item.source == SOURCE_INFERRED
+            && item.category == "standalone_output"
+            && inference_path_allowed(&item.path))
+}
+
+async fn history_groups_for_conversation(
+    conn: &DatabaseConnection,
+    conversation_id: i32,
+    refresh_filesystem: bool,
+) -> Result<Vec<ConversationDeliverableHistoryGroup>, DbError> {
+    let models = if refresh_filesystem {
+        refreshed_models(conn, conversation_id).await?
+    } else {
+        // History opens frequently and is paged for display. Trust the
+        // persisted validation snapshot here instead of statting every file in
+        // a long conversation before returning page one. Access operations and
+        // the current-turn detail path still revalidate their bounded id set.
+        conversation_deliverable::Entity::find()
+            .filter(conversation_deliverable::Column::ConversationId.eq(conversation_id))
+            .filter(conversation_deliverable::Column::IsHidden.eq(false))
+            .filter(conversation_deliverable::Column::IsValid.eq(true))
+            .order_by_desc(conversation_deliverable::Column::UpdatedAt)
+            .all(conn)
+            .await?
+    };
     if models.is_empty() {
         return Ok(Vec::new());
     }
-    let ids = models.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
+    let model_map = models
+        .into_iter()
+        .map(|row| (row.id.clone(), row))
+        .collect::<HashMap<_, _>>();
     let associations = conversation_turn_deliverable::Entity::find()
-        .filter(conversation_turn_deliverable::Column::DeliverableId.is_in(ids))
+        .filter(conversation_turn_deliverable::Column::ConversationId.eq(conversation_id))
         .all(conn)
         .await?;
     let run_ids = associations
@@ -1100,28 +1244,91 @@ pub async fn list_for_conversation(
         .into_iter()
         .map(|run| (run.id.clone(), run))
         .collect::<HashMap<_, _>>();
-    let mut association_map: HashMap<String, conversation_turn_deliverable::Model> = HashMap::new();
+    let mut grouped: HashMap<String, Vec<ConversationDeliverable>> = HashMap::new();
     for association in associations {
-        let replace = association_map
-            .get(&association.deliverable_id)
-            .and_then(|current| {
-                Some(
-                    run_map.get(&association.turn_run_id)?.started_at
-                        > run_map.get(&current.turn_run_id)?.started_at,
-                )
-            })
-            .unwrap_or(true);
-        if replace {
-            association_map.insert(association.deliverable_id.clone(), association);
+        let Some(model) = model_map.get(&association.deliverable_id).cloned() else {
+            continue;
+        };
+        let run = run_map.get(&association.turn_run_id);
+        let item = to_info(model, Some(&association), run);
+        if !is_user_visible_deliverable(&item) {
+            continue;
         }
+        let key = normalized_deliverable_path_key(&item.root_path, &item.path);
+        grouped.entry(key).or_default().push(item);
     }
-    Ok(models
+
+    let mut groups = grouped
         .into_iter()
-        .filter_map(|model| {
-            let association = association_map.get(&model.id);
-            let run = association.and_then(|row| run_map.get(&row.turn_run_id));
-            association.map(|association| to_info(model, Some(association), run))
+        .filter_map(|(path_key, mut versions)| {
+            versions.sort_by(|left, right| {
+                right
+                    .produced_at
+                    .cmp(&left.produced_at)
+                    .then_with(|| right.updated_at.cmp(&left.updated_at))
+            });
+            versions.dedup_by(|left, right| {
+                left.turn_run_id == right.turn_run_id && left.source == right.source
+            });
+            // Authoritative suppression above resolves declared/inferred
+            // duplicates within one run. Across runs this must remain the
+            // newest valid version, even when an older version was declared.
+            let latest = versions.first()?.clone();
+            Some(ConversationDeliverableHistoryGroup {
+                path_key,
+                latest,
+                versions,
+            })
         })
+        .collect::<Vec<_>>();
+    groups.sort_by(|left, right| {
+        let left_time = left
+            .versions
+            .first()
+            .map(|item| item.produced_at)
+            .unwrap_or(left.latest.produced_at);
+        let right_time = right
+            .versions
+            .first()
+            .map(|item| item.produced_at)
+            .unwrap_or(right.latest.produced_at);
+        right_time.cmp(&left_time)
+    });
+    Ok(groups)
+}
+
+pub async fn list_history_page(
+    conn: &DatabaseConnection,
+    conversation_id: i32,
+    offset: u32,
+    limit: u32,
+) -> Result<ConversationDeliverableHistoryPage, DbError> {
+    let groups = history_groups_for_conversation(conn, conversation_id, false).await?;
+    let total = u32::try_from(groups.len()).unwrap_or(u32::MAX);
+    let start = usize::try_from(offset)
+        .unwrap_or(usize::MAX)
+        .min(groups.len());
+    let limit = usize::try_from(limit.clamp(1, 100)).unwrap_or(25);
+    let end = start.saturating_add(limit).min(groups.len());
+    let items = groups[start..end].to_vec();
+    let has_more = end < groups.len();
+    Ok(ConversationDeliverableHistoryPage {
+        items,
+        offset,
+        next_offset: has_more.then(|| u32::try_from(end).unwrap_or(u32::MAX)),
+        has_more,
+        total,
+    })
+}
+
+pub async fn list_for_conversation(
+    conn: &DatabaseConnection,
+    conversation_id: i32,
+) -> Result<Vec<ConversationDeliverable>, DbError> {
+    Ok(history_groups_for_conversation(conn, conversation_id, true)
+        .await?
+        .into_iter()
+        .map(|group| group.latest)
         .collect())
 }
 
@@ -1165,54 +1372,42 @@ pub async fn list_for_turn(
                 .get(&association.deliverable_id)
                 .cloned()
                 .map(|model| to_info(model, Some(&association), Some(&run)))
+                .filter(is_user_visible_deliverable)
         })
         .collect())
 }
 
-pub async fn list_sets_for_conversation(
+async fn build_sets_for_runs(
     conn: &DatabaseConnection,
     conversation_id: i32,
+    runs: Vec<conversation_turn_run::Model>,
 ) -> Result<Vec<ConversationTurnDeliverableSet>, DbError> {
-    let models = refreshed_models(conn, conversation_id).await?;
-    if models.is_empty() {
+    if runs.is_empty() {
         return Ok(Vec::new());
     }
+    let run_ids = runs.iter().map(|run| run.id.clone()).collect::<Vec<_>>();
+    let mut associations = Vec::new();
+    for run_id_chunk in run_ids.chunks(500) {
+        associations.extend(
+            conversation_turn_deliverable::Entity::find()
+                .filter(conversation_turn_deliverable::Column::ConversationId.eq(conversation_id))
+                .filter(
+                    conversation_turn_deliverable::Column::TurnRunId.is_in(run_id_chunk.to_vec()),
+                )
+                .order_by_asc(conversation_turn_deliverable::Column::Position)
+                .all(conn)
+                .await?,
+        );
+    }
+    let deliverable_ids = associations
+        .iter()
+        .map(|association| association.deliverable_id.clone())
+        .collect::<HashSet<_>>();
+    let models = refreshed_models_for_ids(conn, conversation_id, Some(&deliverable_ids)).await?;
     let model_map = models
         .into_iter()
         .map(|row| (row.id.clone(), row))
         .collect::<HashMap<_, _>>();
-    let runs = conversation_turn_run::Entity::find()
-        .filter(conversation_turn_run::Column::ConversationId.eq(conversation_id))
-        .order_by_asc(conversation_turn_run::Column::StartedAt)
-        .all(conn)
-        .await?;
-    // v0.21.14 stored inferred standalone outputs as supporting unless the
-    // prompt named their exact path. Recover the original watcher attribution
-    // on read so existing exclusive PDFs/documents become reply-tail primary
-    // outputs without promoting genuinely ambiguous concurrent changes.
-    let run_ids = runs.iter().map(|run| run.id.clone()).collect::<Vec<_>>();
-    let mut exclusive_paths_by_run: HashMap<String, HashSet<String>> = HashMap::new();
-    // Keep each IN clause comfortably below SQLite's common bind limit for
-    // long-running conversations with a large turn history.
-    for run_id_chunk in run_ids.chunks(500) {
-        for change in conversation_turn_file_change::Entity::find()
-            .filter(conversation_turn_file_change::Column::TurnRunId.is_in(run_id_chunk.to_vec()))
-            .filter(conversation_turn_file_change::Column::Attribution.eq("exclusive"))
-            .filter(conversation_turn_file_change::Column::FinalExists.eq(true))
-            .all(conn)
-            .await?
-        {
-            exclusive_paths_by_run
-                .entry(change.turn_run_id)
-                .or_default()
-                .insert(change.path);
-        }
-    }
-    let associations = conversation_turn_deliverable::Entity::find()
-        .filter(conversation_turn_deliverable::Column::ConversationId.eq(conversation_id))
-        .order_by_asc(conversation_turn_deliverable::Column::Position)
-        .all(conn)
-        .await?;
     let authoritative_run_ids = runs
         .iter()
         .filter(|run| run_has_authoritative_declaration(run))
@@ -1242,19 +1437,8 @@ pub async fn list_sets_for_conversation(
                     model_map
                         .get(&association.deliverable_id)
                         .cloned()
-                        .map(|model| {
-                            let mut item = to_info(model, Some(&association), Some(&run));
-                            if item.source == SOURCE_INFERRED
-                                && item.category == "standalone_output"
-                                && item.role == "supporting"
-                                && exclusive_paths_by_run
-                                    .get(&run.id)
-                                    .is_some_and(|paths| paths.contains(&item.path))
-                            {
-                                item.role = "primary".into();
-                            }
-                            item
-                        })
+                        .map(|model| to_info(model, Some(&association), Some(&run)))
+                        .filter(is_user_visible_deliverable)
                 })
                 .collect::<Vec<_>>();
             (!deliverables.is_empty()).then_some(ConversationTurnDeliverableSet {
@@ -1270,30 +1454,74 @@ pub async fn list_sets_for_conversation(
         .collect())
 }
 
-/// Bind deliverable runs to parser-stable user-turn ids before a detail is sent
-/// to any client. The sender-only optimistic id remains useful during the live
-/// turn, but a prompt fingerprint is the authoritative cross-device bridge
-/// after reload. Matching is one-to-one; repeated identical prompts are
-/// disambiguated by the nearest run start time.
-pub async fn associate_sets_with_user_turns(
+pub async fn list_sets_for_conversation(
     conn: &DatabaseConnection,
-    sets: &mut [ConversationTurnDeliverableSet],
-    turns: &[MessageTurn],
-) -> Result<(), DbError> {
-    if sets.is_empty() || turns.is_empty() {
-        return Ok(());
-    }
-    let run_ids = sets
-        .iter()
-        .map(|set| set.turn_run_id.clone())
-        .collect::<Vec<_>>();
+    conversation_id: i32,
+) -> Result<Vec<ConversationTurnDeliverableSet>, DbError> {
     let runs = conversation_turn_run::Entity::find()
-        .filter(conversation_turn_run::Column::Id.is_in(run_ids))
+        .filter(conversation_turn_run::Column::ConversationId.eq(conversation_id))
+        .order_by_asc(conversation_turn_run::Column::StartedAt)
         .all(conn)
         .await?;
-    let fingerprints = runs
+    build_sets_for_runs(conn, conversation_id, runs).await
+}
+
+/// Return only deliverable sets that belong to the currently loaded transcript
+/// page, plus an active run whose parser turn has not landed yet. This keeps a
+/// long conversation detail read from statting and serializing its complete
+/// deliverable ledger on every switch or history-page fetch.
+pub async fn list_sets_for_turns(
+    conn: &DatabaseConnection,
+    conversation_id: i32,
+    turns: &[MessageTurn],
+) -> Result<Vec<ConversationTurnDeliverableSet>, DbError> {
+    let runs = conversation_turn_run::Entity::find()
+        .filter(conversation_turn_run::Column::ConversationId.eq(conversation_id))
+        .order_by_asc(conversation_turn_run::Column::StartedAt)
+        .all(conn)
+        .await?;
+    let mut placeholders = runs
+        .iter()
+        .map(|run| ConversationTurnDeliverableSet {
+            turn_run_id: run.id.clone(),
+            conversation_id,
+            client_message_id: run.client_message_id.clone(),
+            user_turn_id: None,
+            started_at: run.started_at,
+            completed_at: run.completed_at,
+            deliverables: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    associate_sets_with_run_models(&mut placeholders, &runs, turns);
+    let user_turn_by_run = placeholders
         .into_iter()
-        .filter_map(|run| Some((run.id, run.prompt_fingerprint?)))
+        .filter_map(|set| Some((set.turn_run_id, set.user_turn_id?)))
+        .collect::<HashMap<_, _>>();
+    let selected_runs = runs
+        .into_iter()
+        .filter(|run| {
+            user_turn_by_run.contains_key(&run.id)
+                || run.status == ConversationTurnRunStatus::Running
+        })
+        .collect::<Vec<_>>();
+    let mut sets = build_sets_for_runs(conn, conversation_id, selected_runs).await?;
+    for set in &mut sets {
+        set.user_turn_id = user_turn_by_run.get(&set.turn_run_id).cloned();
+    }
+    Ok(sets)
+}
+
+fn associate_sets_with_run_models(
+    sets: &mut [ConversationTurnDeliverableSet],
+    runs: &[conversation_turn_run::Model],
+    turns: &[MessageTurn],
+) {
+    if sets.is_empty() || turns.is_empty() {
+        return;
+    }
+    let fingerprints = runs
+        .iter()
+        .filter_map(|run| Some((run.id.clone(), run.prompt_fingerprint.clone()?)))
         .collect::<HashMap<_, _>>();
     let candidates = turns
         .iter()
@@ -1307,7 +1535,10 @@ pub async fn associate_sets_with_user_turns(
         let Some(client_id) = set.client_message_id.as_deref() else {
             continue;
         };
-        if turns.iter().any(|turn| turn.id == client_id) {
+        if turns
+            .iter()
+            .any(|turn| turn.id == client_id && matches!(turn.role, crate::models::TurnRole::User))
+        {
             set.user_turn_id = Some(client_id.to_string());
             used.insert(client_id.to_string());
         }
@@ -1330,6 +1561,58 @@ pub async fn associate_sets_with_user_turns(
             used.insert(turn.id.clone());
         }
     }
+
+    // Rows written before prompt fingerprints were persisted can still be
+    // placed safely when their run began near one unclaimed user turn in the
+    // currently loaded history page. Never return a distant guess: an
+    // unmatched set belongs in the history panel, not under the latest reply.
+    for set in sets.iter_mut().filter(|set| set.user_turn_id.is_none()) {
+        let best = turns
+            .iter()
+            .filter(|turn| matches!(turn.role, crate::models::TurnRole::User))
+            .filter(|turn| !used.contains(&turn.id))
+            .filter_map(|turn| {
+                let distance = turn
+                    .timestamp
+                    .timestamp_millis()
+                    .abs_diff(set.started_at.timestamp_millis());
+                (distance <= 90_000).then_some((turn, distance))
+            })
+            .min_by_key(|(_, distance)| *distance);
+        if let Some((turn, _)) = best {
+            set.user_turn_id = Some(turn.id.clone());
+            used.insert(turn.id.clone());
+        }
+    }
+}
+
+/// Bind deliverable runs to parser-stable user-turn ids before a detail is sent
+/// to any client. The sender-only optimistic id remains useful during the live
+/// turn, but a prompt fingerprint is the authoritative cross-device bridge
+/// after reload. Matching is one-to-one; repeated identical prompts are
+/// disambiguated by the nearest run start time.
+pub async fn associate_sets_with_user_turns(
+    conn: &DatabaseConnection,
+    sets: &mut [ConversationTurnDeliverableSet],
+    turns: &[MessageTurn],
+) -> Result<(), DbError> {
+    if sets.is_empty() || turns.is_empty() {
+        return Ok(());
+    }
+    let run_ids = sets
+        .iter()
+        .map(|set| set.turn_run_id.clone())
+        .collect::<Vec<_>>();
+    let mut runs = Vec::new();
+    for run_id_chunk in run_ids.chunks(500) {
+        runs.extend(
+            conversation_turn_run::Entity::find()
+                .filter(conversation_turn_run::Column::Id.is_in(run_id_chunk.to_vec()))
+                .all(conn)
+                .await?,
+        );
+    }
+    associate_sets_with_run_models(sets, &runs, turns);
     Ok(())
 }
 
@@ -1552,6 +1835,71 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn timestamp_fallback_never_binds_a_deliverable_run_to_an_assistant_turn() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let workspace = tempfile::tempdir().unwrap();
+        let folder_id =
+            crate::db::test_helpers::seed_folder(&db, &workspace.path().to_string_lossy()).await;
+        let conversation_id =
+            crate::db::test_helpers::seed_conversation(&db, folder_id, AgentType::Codex).await;
+        let run = artifact_service::create_run(
+            &db.conn,
+            NewTurnRun {
+                id: "run-timestamp-user-only".into(),
+                conversation_id,
+                connection_id: "conn-timestamp-user-only".into(),
+                client_message_id: None,
+                prompt_fingerprint: None,
+                folder_id: Some(folder_id),
+                root_path: workspace.path().to_string_lossy().to_string(),
+                capture_incomplete: false,
+                input_paths_json: "[]".into(),
+                expectation_json: "{}".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let mut sets = vec![ConversationTurnDeliverableSet {
+            turn_run_id: run.id.clone(),
+            conversation_id,
+            client_message_id: None,
+            user_turn_id: None,
+            started_at: run.started_at,
+            completed_at: None,
+            deliverables: Vec::new(),
+        }];
+        let turns = vec![
+            MessageTurn {
+                id: "assistant-nearest".into(),
+                role: TurnRole::Assistant,
+                blocks: Vec::new(),
+                timestamp: run.started_at,
+                usage: None,
+                duration_ms: None,
+                model: None,
+                completed_at: None,
+            },
+            MessageTurn {
+                id: "user-nearby".into(),
+                role: TurnRole::User,
+                blocks: vec![ContentBlock::Text {
+                    text: "legacy prompt".into(),
+                }],
+                timestamp: run.started_at + chrono::Duration::seconds(1),
+                usage: None,
+                duration_ms: None,
+                model: None,
+                completed_at: None,
+            },
+        ];
+
+        associate_sets_with_user_turns(&db.conn, &mut sets, &turns)
+            .await
+            .unwrap();
+        assert_eq!(sets[0].user_turn_id.as_deref(), Some("user-nearby"));
+    }
+
     fn verified(root: &Path, path: &str, title: &str) -> VerifiedDeliverable {
         let absolute = root.join(path);
         let metadata = std::fs::metadata(&absolute).unwrap();
@@ -1577,9 +1925,9 @@ mod tests {
     }
 
     #[test]
-    fn inference_keeps_source_tests_lockfiles_and_meaningful_dotfiles() {
+    fn inference_filters_internal_outputs_without_restricting_explicit_declarations() {
         assert!(inference_path_allowed("src/widget.test.ts"));
-        assert!(inference_path_allowed("Cargo.lock"));
+        assert!(!inference_path_allowed("Cargo.lock"));
         assert!(inference_path_allowed(".env.example"));
         assert!(!inference_path_allowed(".eslintcache"));
         assert!(!inference_path_allowed("target/debug/app"));
@@ -1587,6 +1935,14 @@ mod tests {
         assert!(!inference_path_allowed("report.test.pdf"));
         assert!(!inference_path_allowed("qa_page_1.png"));
         assert!(!inference_path_allowed("qa/page_1.png"));
+        assert!(!inference_path_allowed("_qa/page-01.png"));
+        assert!(!inference_path_allowed("_rendered/page-002.png"));
+        assert!(!inference_path_allowed("_backups/final.pdf"));
+        assert!(!inference_path_allowed("report_backup.pdf"));
+        assert!(!inference_path_allowed("report-old.pdf"));
+        assert!(!inference_path_allowed("_probe.pdf"));
+        assert!(!inference_path_allowed("build_report.py"));
+        assert!(!inference_path_allowed("STATUS.md"));
         assert!(!inference_path_allowed("render_cache/page_1.png"));
         assert!(!inference_path_allowed("visual_check_page_1.png"));
     }
@@ -1709,6 +2065,42 @@ mod tests {
             .unwrap();
         assert_eq!(replaced.len(), 1);
         assert_eq!(replaced[0].title, "Final report");
+    }
+
+    #[tokio::test]
+    async fn explicit_script_is_visible_even_though_inference_would_filter_it() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("install.py"), b"print('ok')").unwrap();
+        let folder_id =
+            crate::db::test_helpers::seed_folder(&db, &workspace.path().to_string_lossy()).await;
+        let conversation_id =
+            crate::db::test_helpers::seed_conversation(&db, folder_id, AgentType::Codex).await;
+        seed_run(
+            &db,
+            conversation_id,
+            folder_id,
+            workspace.path(),
+            "run-declared-script",
+            &[],
+        )
+        .await;
+
+        replace_declared_for_turn(
+            &db.conn,
+            conversation_id,
+            "run-declared-script",
+            vec![verified(workspace.path(), "install.py", "Installer")],
+        )
+        .await
+        .unwrap();
+
+        let listed = list_for_turn(&db.conn, conversation_id, "run-declared-script")
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].source, SOURCE_DECLARED);
+        assert_eq!(listed[0].path, "install.py");
     }
 
     #[tokio::test]
@@ -1863,6 +2255,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_inferred_qa_scripts_and_status_files_are_filtered_on_read() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(workspace.path().join("_qa")).unwrap();
+        for (path, contents) in [
+            ("final.pdf", b"final".as_slice()),
+            ("_probe.pdf", b"probe".as_slice()),
+            ("_qa/page-01.png", b"preview".as_slice()),
+            ("build_report.py", b"build".as_slice()),
+            ("STATUS.md", b"working".as_slice()),
+        ] {
+            std::fs::write(workspace.path().join(path), contents).unwrap();
+        }
+        let folder_id =
+            crate::db::test_helpers::seed_folder(&db, &workspace.path().to_string_lossy()).await;
+        let conversation_id =
+            crate::db::test_helpers::seed_conversation(&db, folder_id, AgentType::Codex).await;
+        seed_run(
+            &db,
+            conversation_id,
+            folder_id,
+            workspace.path(),
+            "run-legacy-noise",
+            &[],
+        )
+        .await;
+        artifact_service::finish_run(
+            &db.conn,
+            "run-legacy-noise",
+            ConversationTurnRunStatus::Completed,
+            None,
+        )
+        .await
+        .unwrap();
+        let mut script = verified(workspace.path(), "build_report.py", "Build script");
+        script.category = "code_change".into();
+        let mut status = verified(workspace.path(), "STATUS.md", "Status");
+        status.category = "code_change".into();
+        save_turn_set(
+            &db.conn,
+            conversation_id,
+            "run-legacy-noise",
+            SOURCE_INFERRED,
+            vec![
+                verified(workspace.path(), "final.pdf", "Final"),
+                verified(workspace.path(), "_probe.pdf", "Probe"),
+                verified(workspace.path(), "_qa/page-01.png", "QA page"),
+                script,
+                status,
+            ],
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let history = list_history_page(&db.conn, conversation_id, 0, 25)
+            .await
+            .unwrap();
+        assert_eq!(history.total, 1);
+        assert_eq!(history.items[0].latest.path, "final.pdf");
+        let sets = list_sets_for_conversation(&db.conn, conversation_id)
+            .await
+            .unwrap();
+        assert_eq!(sets.len(), 1);
+        assert_eq!(sets[0].deliverables.len(), 1);
+        assert_eq!(sets[0].deliverables[0].path, "final.pdf");
+    }
+
+    #[tokio::test]
     async fn same_path_in_later_turn_is_deduplicated_but_both_turns_keep_history() {
         let db = crate::db::test_helpers::fresh_in_memory_db().await;
         let workspace = tempfile::tempdir().unwrap();
@@ -1924,12 +2386,86 @@ mod tests {
         assert_eq!(aggregate[0].title, "Final version");
         assert_eq!(aggregate[0].turn_run_id.as_deref(), Some("run-2"));
 
+        let history = list_history_page(&db.conn, conversation_id, 0, 25)
+            .await
+            .unwrap();
+        assert_eq!(history.total, 1);
+        assert!(!history.has_more);
+        assert_eq!(history.items[0].latest.title, "Final version");
+        assert_eq!(history.items[0].versions.len(), 2);
+        assert_eq!(history.items[0].versions[0].title, "Final version");
+        assert_eq!(history.items[0].versions[1].title, "First version");
+
         let sets = list_sets_for_conversation(&db.conn, conversation_id)
             .await
             .unwrap();
         assert_eq!(sets.len(), 2);
         assert_eq!(sets[0].deliverables[0].title, "First version");
         assert_eq!(sets[1].deliverables[0].title, "Final version");
+    }
+
+    #[tokio::test]
+    async fn transcript_page_only_loads_deliverables_for_visible_turns() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("old.pdf"), b"old").unwrap();
+        std::fs::write(workspace.path().join("visible.pdf"), b"visible").unwrap();
+        let folder_id =
+            crate::db::test_helpers::seed_folder(&db, &workspace.path().to_string_lossy()).await;
+        let conversation_id =
+            crate::db::test_helpers::seed_conversation(&db, folder_id, AgentType::Codex).await;
+        for (run_id, path) in [("run-old", "old.pdf"), ("run-visible", "visible.pdf")] {
+            seed_run(
+                &db,
+                conversation_id,
+                folder_id,
+                workspace.path(),
+                run_id,
+                &[],
+            )
+            .await;
+            replace_declared_for_turn(
+                &db.conn,
+                conversation_id,
+                run_id,
+                vec![verified(workspace.path(), path, path)],
+            )
+            .await
+            .unwrap();
+            artifact_service::finish_run(
+                &db.conn,
+                run_id,
+                ConversationTurnRunStatus::Completed,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let visible_run = conversation_turn_run::Entity::find_by_id("run-visible")
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let turns = vec![MessageTurn {
+            id: "message-run-visible".into(),
+            role: TurnRole::User,
+            blocks: vec![ContentBlock::Text {
+                text: "visible".into(),
+            }],
+            timestamp: visible_run.started_at,
+            usage: None,
+            duration_ms: None,
+            model: None,
+            completed_at: None,
+        }];
+
+        let sets = list_sets_for_turns(&db.conn, conversation_id, &turns)
+            .await
+            .unwrap();
+        assert_eq!(sets.len(), 1);
+        assert_eq!(sets[0].turn_run_id, "run-visible");
+        assert_eq!(sets[0].user_turn_id.as_deref(), Some("message-run-visible"));
+        assert_eq!(sets[0].deliverables[0].path, "visible.pdf");
     }
 
     #[tokio::test]
@@ -2006,15 +2542,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inference_keeps_code_changes_and_filters_inputs_and_transient_outputs() {
+    async fn inference_keeps_final_outputs_and_leaves_code_changes_in_the_artifact_tracker() {
         let db = crate::db::test_helpers::fresh_in_memory_db().await;
         let workspace = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(workspace.path().join("src")).unwrap();
+        std::fs::create_dir_all(workspace.path().join("_qa")).unwrap();
         std::fs::write(workspace.path().join("input.pdf"), b"input").unwrap();
         std::fs::write(workspace.path().join("draft.html"), b"draft").unwrap();
         std::fs::write(workspace.path().join("report.test.pdf"), b"test").unwrap();
         std::fs::write(workspace.path().join("final.pdf"), b"final").unwrap();
         std::fs::write(workspace.path().join("src/widget.test.ts"), b"test code").unwrap();
+        std::fs::write(workspace.path().join("_qa/page-01.png"), b"preview").unwrap();
+        std::fs::write(workspace.path().join("build_report.py"), b"build").unwrap();
         let folder_id =
             crate::db::test_helpers::seed_folder(&db, &workspace.path().to_string_lossy()).await;
         let conversation_id =
@@ -2040,6 +2579,8 @@ mod tests {
                     "src/widget.test.ts",
                     ConversationTurnFileChangeKind::Modified,
                 ),
+                ("_qa/page-01.png", ConversationTurnFileChangeKind::Created),
+                ("build_report.py", ConversationTurnFileChangeKind::Created),
             ]
             .into_iter()
             .map(|(path, kind)| PendingFileChange {
@@ -2079,7 +2620,7 @@ mod tests {
         let inferred = infer_for_turn(&db.conn, conversation_id, "run-infer")
             .await
             .unwrap();
-        assert_eq!(inferred.len(), 2);
+        assert_eq!(inferred.len(), 1);
         let by_path = inferred
             .into_iter()
             .map(|item| (item.path.clone(), item))
@@ -2087,12 +2628,11 @@ mod tests {
         assert_eq!(by_path["final.pdf"].source, SOURCE_INFERRED);
         assert_eq!(by_path["final.pdf"].category, "standalone_output");
         assert_eq!(by_path["final.pdf"].role, "primary");
-        assert_eq!(by_path["src/widget.test.ts"].category, "code_change");
-        assert_eq!(by_path["src/widget.test.ts"].change_kind, "modified");
+        assert!(!by_path.contains_key("src/widget.test.ts"));
 
-        // Compatibility: rows settled by v0.21.14 retain supporting in the
-        // association, but the preserved exclusive watcher event lets the
-        // read path recover the correct reply-tail role.
+        // Old supporting roles remain supporting on read. The client renders
+        // every filtered inference-only output, so role recovery must not
+        // manufacture extra primary files.
         let association = conversation_turn_deliverable::Entity::find()
             .filter(conversation_turn_deliverable::Column::TurnRunId.eq("run-infer"))
             .filter(
@@ -2119,7 +2659,7 @@ mod tests {
                     .find(|item| item.path == "final.pdf")
             })
             .unwrap();
-        assert_eq!(legacy_pdf.role, "primary");
+        assert_eq!(legacy_pdf.role, "supporting");
     }
 
     #[tokio::test]
@@ -2173,7 +2713,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_prompt_path_promotes_an_ambiguous_observed_change() {
+    async fn expected_source_path_is_recorded_but_not_user_visible_until_declared() {
         let db = crate::db::test_helpers::fresh_in_memory_db().await;
         let workspace = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(workspace.path().join("src")).unwrap();
@@ -2238,12 +2778,18 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(settled.len(), 1);
-        assert_eq!(settled[0].path, "src/lib.rs");
         assert_eq!(settled[0].category, "code_change");
+        assert_eq!(settled[0].role, "supporting");
+        assert!(
+            list_for_turn(&db.conn, conversation_id, "run-ambiguous-expected")
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
-    async fn ambiguous_standalone_output_is_kept_as_a_supporting_ledger_item() {
+    async fn one_unambiguous_standalone_fallback_may_be_primary() {
         let db = crate::db::test_helpers::fresh_in_memory_db().await;
         let workspace = tempfile::tempdir().unwrap();
         std::fs::write(workspace.path().join("report.pdf"), b"report").unwrap();
@@ -2300,7 +2846,7 @@ mod tests {
             .unwrap();
         assert_eq!(settled.len(), 1);
         assert_eq!(settled[0].category, "standalone_output");
-        assert_eq!(settled[0].role, "supporting");
+        assert_eq!(settled[0].role, "primary");
     }
 
     #[tokio::test]
@@ -2334,8 +2880,14 @@ mod tests {
         let listed = list_for_conversation(&db.conn, conversation_id)
             .await
             .unwrap();
-        assert!(!listed[0].is_valid);
-        assert_eq!(listed[0].invalid_reason.as_deref(), Some("file_not_found"));
+        assert!(listed.is_empty(), "invalid records are hidden by default");
+        let row = conversation_deliverable::Entity::find_by_id(saved[0].id.clone())
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!row.is_valid);
+        assert_eq!(row.invalid_reason.as_deref(), Some("file_not_found"));
         assert!(
             resolve_for_access(&db.conn, conversation_id, &[saved[0].id.clone()])
                 .await
@@ -2547,9 +3099,15 @@ mod tests {
         let listed = list_for_conversation(&db.conn, conversation_id)
             .await
             .unwrap();
-        assert!(!listed[0].is_valid);
+        assert!(listed.is_empty(), "unsafe records are hidden by default");
+        let row = conversation_deliverable::Entity::find_by_id(saved[0].id.clone())
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!row.is_valid);
         assert_eq!(
-            listed[0].invalid_reason.as_deref(),
+            row.invalid_reason.as_deref(),
             Some("unsafe_or_changed_path")
         );
     }

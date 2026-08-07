@@ -27,6 +27,16 @@ pub struct ConversationRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ConversationHistoryRequest {
+    pub conversation_id: i32,
+    #[serde(default)]
+    pub offset: Option<u32>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TurnRequest {
     pub conversation_id: i32,
     pub turn_run_id: String,
@@ -78,6 +88,33 @@ pub async fn list_runs_for_conversation(
         )
         .await?,
     ))
+}
+
+pub async fn list_history_for_conversation(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(request): Json<ConversationHistoryRequest>,
+) -> Result<Json<crate::models::ConversationDeliverableHistoryPage>, AppCommandError> {
+    let started = std::time::Instant::now();
+    let offset = request.offset.unwrap_or(0);
+    let limit = request.limit.unwrap_or(25);
+    let page = deliverables::list_conversation_deliverable_history_core(
+        &state.db.conn,
+        request.conversation_id,
+        offset,
+        limit,
+    )
+    .await?;
+    tracing::info!(
+        route = "list_conversation_deliverable_history",
+        conversation_id = request.conversation_id,
+        offset,
+        limit,
+        returned = page.items.len(),
+        total = page.total,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "[deliverables][perf] history page loaded"
+    );
+    Ok(Json(page))
 }
 
 pub async fn create_download_ticket(
