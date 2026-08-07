@@ -611,6 +611,7 @@ impl ConnectionManager {
             preferred_mode_id,
             preferred_config_values,
             self.delegation_snapshot(),
+            target_conversation_id,
         )
         .await?;
 

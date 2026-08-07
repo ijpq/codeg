@@ -2743,6 +2743,8 @@
       "messageList": {
         "attachedResources": "附加資源",
         "loading": "載入中...",
+        "loadEarlierHistory": "載入更早訊息",
+        "retryEarlierHistory": "重試載入更早訊息",
         "error": "錯誤：{message}",
         "errorTitle": "會話載入失敗",
         "errorActionReload": "重新載入",

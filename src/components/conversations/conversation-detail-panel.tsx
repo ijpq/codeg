@@ -550,6 +550,10 @@ const ConversationTabView = memo(function ConversationTabView({
     loading: detailLoading,
     error: detailError,
     acpLoadError,
+    hasEarlierHistory,
+    earlierHistoryLoading,
+    earlierHistoryError,
+    loadEarlierHistory,
   } = useConversationDetail(effectiveConversationId, {
     enabled: shouldLoadDetail,
     // The DB detail owns the external session identity used by historical ACP
@@ -1979,6 +1983,10 @@ const ConversationTabView = memo(function ConversationTabView({
         detailLoading={detailLoading}
         detailError={detailError}
         acpLoadError={acpLoadError}
+        hasEarlierHistory={hasEarlierHistory}
+        earlierHistoryLoading={earlierHistoryLoading}
+        earlierHistoryError={earlierHistoryError}
+        onLoadEarlierHistory={loadEarlierHistory}
         hideEmptyState={!hasPersistedConversation || hasSentMessage}
         onReload={canShowDetailErrorActions ? handleReloadDetail : undefined}
         onNewSession={
@@ -2575,6 +2583,7 @@ export function ConversationDetailPanel() {
   const tDetails = useTranslations("Folder.sessionDetails")
   const {
     completeTurn: runtimeCompleteTurn,
+    loadCompleteHistory,
     removeConversation: runtimeRemoveConversation,
   } = useConversationRuntimeActions()
   const { activeFolder: folder } = useActiveFolder()
@@ -2816,22 +2825,24 @@ export function ConversationDetailPanel() {
     conversations
   )
 
-  const getExportData = useCallback(() => {
-    if (!activeConversationTab?.conversationId) return null
-    const session = getRuntimeSession(activeConversationTab.conversationId)
-    if (!session?.detail) return null
+  const getExportData = useCallback(async () => {
+    if (activeRuntimeId == null) return null
+    const detail = await loadCompleteHistory(activeRuntimeId)
+    if (!detail || detail.history_page?.has_more) {
+      throw new Error("Complete conversation history could not be loaded")
+    }
     return {
-      summary: session.detail.summary,
-      turns: session.detail.turns,
-      sessionStats: session.detail.session_stats,
+      summary: detail.summary,
+      turns: detail.turns,
+      sessionStats: detail.session_stats,
       labels: exportLabels,
     }
-  }, [activeConversationTab, exportLabels])
+  }, [activeRuntimeId, exportLabels, loadCompleteHistory])
 
   const handleExportMarkdown = useCallback(async () => {
-    const data = getExportData()
-    if (!data) return
     try {
+      const data = await getExportData()
+      if (!data) return
       const result = await exportAsMarkdown(data)
       if (result === "saved") toast.success(t("exportSuccess"))
       // "cancelled": user dismissed the Save dialog — stay silent,
@@ -2843,9 +2854,9 @@ export function ConversationDetailPanel() {
   }, [getExportData, t])
 
   const handleExportHtml = useCallback(async () => {
-    const data = getExportData()
-    if (!data) return
     try {
+      const data = await getExportData()
+      if (!data) return
       const result = await exportAsHtml(data)
       if (result === "saved") toast.success(t("exportSuccess"))
     } catch (err) {
@@ -2855,12 +2866,12 @@ export function ConversationDetailPanel() {
   }, [getExportData, t])
 
   const handleExportImage = useCallback(async () => {
-    const data = getExportData()
-    if (!data) return
     const taskId = `export-image-${Date.now()}`
     addTask(taskId, t("exportImage"))
     updateTask(taskId, { status: "running" })
     try {
+      const data = await getExportData()
+      if (!data) return
       const result = await exportAsImage(data)
       updateTask(taskId, { status: "completed" })
       if (result === "saved") toast.success(t("exportSuccess"))

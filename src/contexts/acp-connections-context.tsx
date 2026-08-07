@@ -41,6 +41,7 @@ import { denormalizeSnapshot } from "@/lib/snapshot-denormalize"
 import { buildDelegationSeedEnvelopes } from "@/lib/delegation-seed"
 import { isConnectionBusy } from "@/lib/connection-teardown"
 import { SessionRestorePendingError } from "@/lib/session-restore"
+import { ConversationRestoreSingleFlight } from "@/lib/conversation-restore-single-flight"
 import {
   getConversationIdByExternalIdFromStore,
   useConversationRuntimeStore,
@@ -2807,6 +2808,11 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
 
   // Guard against concurrent connect() calls
   const connectingKeysRef = useRef(new Set<string>())
+  const restoreFlightsRef = useRef(
+    new ConversationRestoreSingleFlight<
+      Awaited<ReturnType<typeof acpRestoreConversation>>
+    >()
+  )
   const pendingConnectRequestsRef = useRef(new Map<string, ConnectRequest>())
   // Latest target for every open context. Event-stream `connection_gone`
   // uses this to rebuild the same persisted session after a Server restart.
@@ -4761,10 +4767,14 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         let backendReplacedConnectionIds: string[] = []
 
         if (shouldRestorePersisted && conversationId != null) {
-          const restored = await acpRestoreConversation(
+          const restored = await restoreFlightsRef.current.run(
             conversationId,
-            savedPrefs.modeId,
-            savedPrefs.configValues
+            () =>
+              acpRestoreConversation(
+                conversationId,
+                savedPrefs.modeId,
+                savedPrefs.configValues
+              )
           )
           if (restored.externalSessionId !== sessionId) {
             throw new Error(
@@ -4797,14 +4807,22 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         // would end a turn nobody asked to stop; it stays reachable at its own
         // key and is reclaimed by the sweeps.
         if (abandonedKeysRef.current.delete(contextKey)) {
-          if (!isViewer && !isConnectionOwnedLocally(connectionId)) {
+          if (
+            restoredConversationId == null &&
+            !isViewer &&
+            !isConnectionOwnedLocally(connectionId)
+          ) {
             acpDisconnect(connectionId).catch(() => {})
           }
           return
         }
         const pendingRequest = pendingConnectRequestsRef.current.get(contextKey)
         if (pendingRequest && !sameConnectRequest(pendingRequest, request)) {
-          if (!isViewer && !isConnectionOwnedLocally(connectionId)) {
+          if (
+            restoredConversationId == null &&
+            !isViewer &&
+            !isConnectionOwnedLocally(connectionId)
+          ) {
             acpDisconnect(connectionId).catch(() => {})
           }
           return

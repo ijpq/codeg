@@ -2743,6 +2743,8 @@
       "messageList": {
         "attachedResources": "الموارد المرفقة",
         "loading": "جارٍ التحميل...",
+        "loadEarlierHistory": "تحميل الرسائل السابقة",
+        "retryEarlierHistory": "إعادة تحميل الرسائل السابقة",
         "error": "خطأ: {message}",
         "errorTitle": "فشل تحميل الجلسة",
         "errorActionReload": "إعادة تحميل",

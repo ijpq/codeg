@@ -2743,6 +2743,8 @@
       "messageList": {
         "attachedResources": "Ressources jointes",
         "loading": "Chargement...",
+        "loadEarlierHistory": "Charger les messages précédents",
+        "retryEarlierHistory": "Réessayer les messages précédents",
         "error": "Erreur : {message}",
         "errorTitle": "Échec du chargement de la session",
         "errorActionReload": "Recharger",

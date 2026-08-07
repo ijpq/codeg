@@ -2743,6 +2743,8 @@
       "messageList": {
         "attachedResources": "Attached resources",
         "loading": "Loading...",
+        "loadEarlierHistory": "Load earlier messages",
+        "retryEarlierHistory": "Retry earlier messages",
         "error": "Error: {message}",
         "errorTitle": "Session load failed",
         "errorActionReload": "Reload",

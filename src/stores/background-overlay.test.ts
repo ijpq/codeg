@@ -20,6 +20,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import {
   BACKGROUND_OVERLAY_HARD_CAP,
+  HISTORY_PAGE_USER_TURNS,
   resetConversationRuntimeStore,
   selectTimelineTurns,
   useConversationRuntimeStore,
@@ -296,7 +297,9 @@ describe("refetchDetail DB-id resolution", () => {
     // 1 call: `completeTurn` no longer fires an implicit refetch (see its
     // own comment — it raced the transcript's last write and lost content).
     expect(mockGetFolderConversation).toHaveBeenCalledTimes(1)
-    expect(mockGetFolderConversation).toHaveBeenCalledWith(42)
+    expect(mockGetFolderConversation).toHaveBeenCalledWith(42, {
+      userTurnLimit: HISTORY_PAGE_USER_TURNS,
+    })
     // Result lands under the runtime key; the stale live buffers are gone and
     // the persisted (terminal) copy is what the timeline renders.
     expect(session(VIRTUAL)?.detail?.turns.map((t) => t.id)).toEqual(["turn-0"])
@@ -312,7 +315,9 @@ describe("refetchDetail DB-id resolution", () => {
     mockGetFolderConversation.mockResolvedValueOnce(detail())
     actions().refetchDetail(7)
     await flushMicrotasks()
-    expect(mockGetFolderConversation).toHaveBeenCalledWith(7)
+    expect(mockGetFolderConversation).toHaveBeenCalledWith(7, {
+      userTurnLimit: HISTORY_PAGE_USER_TURNS,
+    })
   })
 })
 

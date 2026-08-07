@@ -591,9 +591,17 @@ export async function importLocalConversations(
 }
 
 export async function getFolderConversation(
-  conversationId: number
+  conversationId: number,
+  options?: {
+    beforeCursor?: string | null
+    userTurnLimit?: number | null
+  }
 ): Promise<DbConversationDetail> {
-  return invoke("get_folder_conversation", { conversationId })
+  return invoke("get_folder_conversation", {
+    conversationId,
+    beforeCursor: options?.beforeCursor ?? null,
+    userTurnLimit: options?.userTurnLimit ?? null,
+  })
 }
 
 export async function removeFolderFromHistory(path: string): Promise<void> {

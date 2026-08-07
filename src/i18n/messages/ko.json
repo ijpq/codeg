@@ -2743,6 +2743,8 @@
       "messageList": {
         "attachedResources": "첨부된 리소스",
         "loading": "불러오는 중...",
+        "loadEarlierHistory": "이전 메시지 불러오기",
+        "retryEarlierHistory": "이전 메시지 다시 불러오기",
         "error": "오류: {message}",
         "errorTitle": "세션 불러오기 실패",
         "errorActionReload": "다시 불러오기",
