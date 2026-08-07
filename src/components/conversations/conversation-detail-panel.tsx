@@ -2046,7 +2046,6 @@ const ConversationTabView = memo(function ConversationTabView({
         onNewSession={
           canShowDetailErrorActions ? handleOpenNewSession : undefined
         }
-        deliverables={detail?.deliverables}
         deliverableRuns={detail?.deliverable_runs}
       />
     </GoalControlProvider>

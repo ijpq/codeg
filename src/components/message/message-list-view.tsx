@@ -152,8 +152,6 @@ interface MessageListViewProps {
    * items render in arbitrary order and multiplicity. `null` = no divider.
    */
   userTurnHeader?: ((group: ResolvedMessageGroup) => string | null) | null
-  /** Explicit final outputs verified and persisted by the backend. */
-  deliverables?: ConversationDeliverable[]
   /** Per-turn output associations used at the producing assistant reply. */
   deliverableRuns?: ConversationTurnDeliverableSet[]
 }
@@ -228,24 +226,22 @@ export interface DeliverableUserTurnRef {
 }
 
 /**
- * The conversation-level panel is intentionally an inclusive ledger. A reply
- * tail has a different contract: an explicit declaration is the complete,
- * authoritative set for that turn (primary and supporting alike). Only when no
- * declaration exists do we fall back to high-confidence inferred primary
- * outputs. Declared missing files remain visible as an honest diagnostic.
+ * A reply tail has a strict user-facing contract: an explicit declaration is
+ * the complete authoritative set for that turn. Only when none exists do we
+ * fall back to filtered standalone outputs inferred by the backend.
  */
 export function replyDeliverablesForRun(
   deliverables: ConversationDeliverable[]
 ): ConversationDeliverable[] {
   const declared = deliverables.filter(
-    (item) => item.source === "declared" && item.change_kind !== "deleted"
+    (item) =>
+      item.source === "declared" &&
+      item.is_valid &&
+      item.change_kind !== "deleted"
   )
   if (declared.length > 0) return declared
 
   const eligible = deliverables.filter((item) => {
-    if (item.role !== "primary" || item.category === "code_change") {
-      return false
-    }
     return (
       item.category === "standalone_output" &&
       item.is_valid &&
@@ -258,9 +254,10 @@ export function replyDeliverablesForRun(
 export interface DeliverableAssociationResult {
   byUserId: Map<string, ConversationDeliverable[]>
   /**
-   * Durable output sets that could not be correlated to a parser user-turn id.
-   * The message list renders these at the final assistant reply instead of
-   * silently dropping a successfully published deliverable.
+   * Durable output sets that could not be correlated to a user turn in the
+   * currently loaded history page. These remain available from the separate
+   * conversation history endpoint and must never be guessed onto the final
+   * assistant reply.
    */
   unassociated: ConversationDeliverable[]
 }
@@ -281,8 +278,8 @@ function dedupeDeliverables(
  * Prefer the backend's prompt-fingerprint link, then the exact optimistic id
  * while a session is live. Historical rows created before that link existed
  * retain the guarded timestamp fallback. This deliberately refuses distant
- * guesses; unmatched durable outputs are returned separately so the caller can
- * use an explicit final-reply fallback instead of silently losing the card.
+ * guesses; unmatched durable outputs are returned separately for diagnostics
+ * and the conversation history panel.
  */
 export function associateDeliverablesWithUserTurns(
   runs: ConversationTurnDeliverableSet[],
@@ -339,7 +336,7 @@ export function resolveDeliverableAssociations(
     const completed = Date.parse(run.completed_at ?? "")
     const latest = Number.isFinite(completed)
       ? completed + 60_000
-      : started + 5 * 60_000
+      : started + 90_000
     let best: (typeof candidates)[number] | null = null
     for (const candidate of candidates) {
       if (
@@ -935,7 +932,6 @@ export function MessageListView({
   onNewSession,
   showMessageNav = true,
   userTurnHeader = null,
-  deliverables = EMPTY_DELIVERABLES,
   deliverableRuns = [],
 }: MessageListViewProps) {
   const t = useTranslations("Folder.chat.messageList")
@@ -1193,17 +1189,6 @@ export function MessageListView({
       ),
     [deliverableRuns, threadItems]
   )
-  const fallbackDeliverableAssistantKey = useMemo(() => {
-    if (deliverableAssociations.unassociated.length === 0) return null
-    for (let index = threadItems.length - 1; index >= 0; index -= 1) {
-      const item = threadItems[index]
-      if (item.kind === "turn" && item.group.role === "assistant") {
-        return item.key
-      }
-    }
-    return null
-  }, [deliverableAssociations.unassociated.length, threadItems])
-
   const renderThreadItem = useCallback(
     (item: ThreadRenderItem) => {
       switch (item.kind) {
@@ -1216,13 +1201,6 @@ export function MessageListView({
           const associatedDeliverables = item.previousUserId
             ? deliverableAssociations.byUserId.get(item.previousUserId)
             : undefined
-          const replyDeliverables =
-            item.key === fallbackDeliverableAssistantKey
-              ? dedupeDeliverables([
-                  ...(associatedDeliverables ?? EMPTY_DELIVERABLES),
-                  ...deliverableAssociations.unassociated,
-                ])
-              : associatedDeliverables
           return (
             <div style={pt > 0 ? { paddingTop: pt } : undefined}>
               {phaseLabel ? (
@@ -1243,7 +1221,7 @@ export function MessageListView({
                 isResponseComplete={item.phase === "persisted"}
                 conversationId={conversationId}
                 delivery={promptDeliveries[item.group.id] ?? null}
-                deliverables={replyDeliverables}
+                deliverables={associatedDeliverables}
               />
             </div>
           )
@@ -1261,13 +1239,7 @@ export function MessageListView({
           return null
       }
     },
-    [
-      conversationId,
-      deliverableAssociations,
-      fallbackDeliverableAssistantKey,
-      promptDeliveries,
-      userTurnHeader,
-    ]
+    [conversationId, deliverableAssociations, promptDeliveries, userTurnHeader]
   )
 
   const emptyState = useMemo(
@@ -1521,8 +1493,6 @@ export function MessageListView({
           conversationId={conversationId}
           expanded={deliverablesExpanded}
           onToggle={setDeliverablesExpanded}
-          deliverables={deliverables}
-          deliverableRuns={deliverableRuns}
         />
         <AgentPlanOverlay
           key={agentPlanOverlayKey}

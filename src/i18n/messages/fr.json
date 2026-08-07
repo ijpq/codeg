@@ -3367,6 +3367,12 @@
       },
       "conversationDeliverables": {
         "collapsedSummary": "Livrables {count}",
+        "historyTitle": "Historique des livrables",
+        "loadingHistory": "Chargement de l’historique…",
+        "retry": "Réessayer",
+        "versions": "{count} versions",
+        "toggleVersions": "Afficher ou masquer {count} versions historiques",
+        "loadMore": "Charger plus",
         "title": "Livrables finaux",
         "collapse": "Réduire",
         "openFile": "Ouvrir {filePath}",

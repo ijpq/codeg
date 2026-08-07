@@ -3367,6 +3367,12 @@
       },
       "conversationDeliverables": {
         "collapsedSummary": "Deliverables {count}",
+        "historyTitle": "Deliverable history",
+        "loadingHistory": "Loading deliverable history…",
+        "retry": "Retry",
+        "versions": "{count} versions",
+        "toggleVersions": "Toggle {count} historical versions",
+        "loadMore": "Load more",
         "title": "Final deliverables",
         "collapse": "Collapse",
         "openFile": "Open {filePath}",

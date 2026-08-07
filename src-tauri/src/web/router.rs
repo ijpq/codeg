@@ -136,6 +136,10 @@ pub fn build_router(
             post(handlers::deliverables::list_runs_for_conversation),
         )
         .route(
+            "/list_conversation_deliverable_history",
+            post(handlers::deliverables::list_history_for_conversation),
+        )
+        .route(
             "/create_deliverable_download_ticket",
             post(handlers::deliverables::create_download_ticket),
         )
@@ -427,10 +431,7 @@ pub fn build_router(
         .route("/git_pull", post(handlers::git::git_pull))
         .route("/git_push", post(handlers::git::git_push))
         .route("/git_fetch", post(handlers::git::git_fetch))
-        .route(
-            "/git_update_branch",
-            post(handlers::git::git_update_branch),
-        )
+        .route("/git_update_branch", post(handlers::git::git_update_branch))
         .route("/git_commit", post(handlers::git::git_commit))
         .route("/git_fetch_remote", post(handlers::git::git_fetch_remote))
         .route("/git_delete_branch", post(handlers::git::git_delete_branch))

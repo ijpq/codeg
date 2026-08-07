@@ -3367,6 +3367,12 @@
       },
       "conversationDeliverables": {
         "collapsedSummary": "Ergebnisse {count}",
+        "historyTitle": "Lieferverlauf",
+        "loadingHistory": "Lieferverlauf wird geladen…",
+        "retry": "Erneut versuchen",
+        "versions": "{count} Versionen",
+        "toggleVersions": "{count} frühere Versionen umschalten",
+        "loadMore": "Mehr laden",
         "title": "Endergebnisse",
         "collapse": "Einklappen",
         "openFile": "{filePath} öffnen",
