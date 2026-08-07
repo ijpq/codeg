@@ -208,21 +208,9 @@ jobs:
           - name: "macOS x64"
             runner: "macos-latest"
             target: "x86_64-apple-darwin"
-          - name: "macOS arm64"
-            runner: "macos-latest"
-            target: "aarch64-apple-darwin"
-          - name: "Linux x64"
-            runner: "ubuntu-22.04"
-            target: "x86_64-unknown-linux-gnu"
-          - name: "Linux arm64"
-            runner: "ubuntu-22.04"
-            target: "aarch64-unknown-linux-gnu"
           - name: "Windows x64"
             runner: "windows-2022"
             target: "x86_64-pc-windows-msvc"
-          - name: "Windows arm64"
-            runner: "windows-latest"
-            target: "aarch64-pc-windows-msvc"
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -689,26 +677,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: "Linux x64"
-            runner: "ubuntu-22.04"
-            target: "x86_64-unknown-linux-gnu"
-            artifact: "codeg-server-linux-x64"
-            archive: "codeg-server-linux-x64.tar.gz"
-          - name: "Linux arm64"
-            runner: "ubuntu-22.04"
-            target: "aarch64-unknown-linux-gnu"
-            artifact: "codeg-server-linux-arm64"
-            archive: "codeg-server-linux-arm64.tar.gz"
           - name: "macOS x64"
             runner: "macos-latest"
             target: "x86_64-apple-darwin"
             artifact: "codeg-server-darwin-x64"
             archive: "codeg-server-darwin-x64.tar.gz"
-          - name: "macOS arm64"
-            runner: "macos-latest"
-            target: "aarch64-apple-darwin"
-            artifact: "codeg-server-darwin-arm64"
-            archive: "codeg-server-darwin-arm64.tar.gz"
           - name: "Windows x64"
             runner: "windows-2022"
             target: "x86_64-pc-windows-msvc"
@@ -949,10 +922,7 @@ jobs:
           set -euo pipefail
 
           archives=(
-            codeg-server-linux-x64.tar.gz
-            codeg-server-linux-arm64.tar.gz
             codeg-server-darwin-x64.tar.gz
-            codeg-server-darwin-arm64.tar.gz
             codeg-server-windows-x64.zip
           )
 
@@ -964,9 +934,9 @@ jobs:
             fi
           done
 
-          expected_count=10
+          expected_count=4
           if [ "${{ github.event.repository.fork }}" = "false" ]; then
-            expected_count=15
+            expected_count=6
           fi
           actual_count="$(find server-release-assets -maxdepth 1 -type f | wc -l)"
           if [ "$actual_count" -ne "$expected_count" ]; then
@@ -1011,10 +981,7 @@ jobs:
               --jq '.assets[].name'
           )"
           archives=(
-            codeg-server-linux-x64.tar.gz
-            codeg-server-linux-arm64.tar.gz
             codeg-server-darwin-x64.tar.gz
-            codeg-server-darwin-arm64.tar.gz
             codeg-server-windows-x64.zip
           )
 
@@ -1026,111 +993,17 @@ jobs:
             fi
           done
 
-  build-docker:
-    needs:
-      - create-draft-release
-      - build-server
-    name: Build Docker image
-    if: github.event_name == 'push'
-    runs-on: ubuntu-22.04
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download Linux x64 artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: codeg-server-linux-x64
-          path: artifacts/linux-x64
-
-      - name: Download Linux arm64 artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: codeg-server-linux-arm64
-          path: artifacts/linux-arm64
-
-      - name: Prepare Docker build context
-        run: |
-          set -euo pipefail
-          mkdir -p dist/amd64 dist/arm64
-          cp artifacts/linux-x64/codeg-server dist/amd64/codeg-server
-          cp artifacts/linux-x64/codeg-mcp dist/amd64/codeg-mcp
-          cp artifacts/linux-arm64/codeg-server dist/arm64/codeg-server
-          cp artifacts/linux-arm64/codeg-mcp dist/arm64/codeg-mcp
-          cp -r artifacts/linux-x64/web dist/web
-          chmod +x dist/amd64/codeg-server dist/amd64/codeg-mcp \
-                   dist/arm64/codeg-server dist/arm64/codeg-mcp
-          # Fail fast if any companion went missing — Docker would otherwise
-          # produce an image where delegation silently degrades.
-          for f in dist/amd64/codeg-mcp dist/arm64/codeg-mcp; do
-            test -x "$f" || { echo "FATAL: $f missing or non-exec"; exit 1; }
-          done
-
-      - name: Set up QEMU (for multi-arch manifest)
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Log in to Docker Hub
-        if: github.event.repository.fork == false
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Extract version from tag
-        id: version
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-
-      - name: Build and push Docker image
-        if: github.event.repository.fork == false
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile.ci
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: |
-            ghcr.io/${{ github.repository }}:${{ steps.version.outputs.version }}
-            ghcr.io/${{ github.repository }}:latest
-            ${{ secrets.DOCKERHUB_USERNAME }}/codeg:${{ steps.version.outputs.version }}
-            ${{ secrets.DOCKERHUB_USERNAME }}/codeg:latest
-
-      - name: Build and push fork image to GHCR
-        if: github.event.repository.fork == true
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile.ci
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: |
-            ghcr.io/${{ github.repository }}:${{ steps.version.outputs.version }}
-            ghcr.io/${{ github.repository }}:latest
-
   publish-release:
     needs:
       - create-draft-release
       - build-tauri
       - build-server
       - upload-server-assets
-      - build-docker
     if: >-
       github.event_name == 'push' &&
       needs.build-tauri.result == 'success' &&
       needs.build-server.result == 'success' &&
-      needs.upload-server-assets.result == 'success' &&
-      needs.build-docker.result == 'success'
+      needs.upload-server-assets.result == 'success'
     runs-on: ubuntu-22.04
     permissions:
       contents: write
