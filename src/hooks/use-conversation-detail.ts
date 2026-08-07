@@ -39,6 +39,10 @@ export function useConversationDetail(
   loading: boolean
   error: string | null
   acpLoadError: string | null
+  hasEarlierHistory: boolean
+  earlierHistoryLoading: boolean
+  earlierHistoryError: string | null
+  loadEarlierHistory: () => Promise<void>
 } {
   const enabled = options?.enabled ?? true
   const preserveLiveOnInitialFetch =
@@ -51,20 +55,30 @@ export function useConversationDetail(
   // mid-stream, so `useShallow` keeps the slice reference-stable across batches
   // and consumers re-render only on a real detail transition. (`hasSession`
   // preserves the "session exists yet?" signal the loading state depends on.)
-  const { detail, detailLoading, detailError, acpLoadError, hasSession } =
-    useConversationRuntimeStore(
-      useShallow((s) => {
-        const session = s.byConversationId.get(conversationId)
-        return {
-          detail: session?.detail ?? null,
-          detailLoading: session?.detailLoading ?? false,
-          detailError: session?.detailError ?? null,
-          acpLoadError: session?.acpLoadError ?? null,
-          hasSession: session != null,
-        }
-      })
-    )
-  const { fetchDetail, refetchDetail } = useConversationRuntimeActions()
+  const {
+    detail,
+    detailLoading,
+    detailError,
+    acpLoadError,
+    historyPageLoading,
+    historyPageError,
+    hasSession,
+  } = useConversationRuntimeStore(
+    useShallow((s) => {
+      const session = s.byConversationId.get(conversationId)
+      return {
+        detail: session?.detail ?? null,
+        detailLoading: session?.detailLoading ?? false,
+        detailError: session?.detailError ?? null,
+        acpLoadError: session?.acpLoadError ?? null,
+        historyPageLoading: session?.historyPageLoading ?? false,
+        historyPageError: session?.historyPageError ?? null,
+        hasSession: session != null,
+      }
+    })
+  )
+  const { fetchDetail, refetchDetail, loadEarlierHistory } =
+    useConversationRuntimeActions()
   const isVirtual = isVirtualConversationId(conversationId)
 
   useEffect(() => {
@@ -100,5 +114,9 @@ export function useConversationDetail(
     loading: hasSession ? detailLoading : !isVirtual,
     error: detailError,
     acpLoadError,
+    hasEarlierHistory: detail?.history_page?.has_more ?? false,
+    earlierHistoryLoading: historyPageLoading,
+    earlierHistoryError: historyPageError,
+    loadEarlierHistory: () => loadEarlierHistory(conversationId),
   }
 }
