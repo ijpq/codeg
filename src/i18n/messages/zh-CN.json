@@ -2758,6 +2758,8 @@
       "messageList": {
         "attachedResources": "附加资源",
         "loading": "加载中...",
+        "loadEarlierHistory": "加载更早消息",
+        "retryEarlierHistory": "重试加载更早消息",
         "error": "错误：{message}",
         "errorTitle": "会话加载失败",
         "errorActionReload": "重新加载",

@@ -607,6 +607,15 @@ export interface DbConversationDetail {
   deliverables?: ConversationDeliverable[]
   /** Confirmed outputs grouped by the producing backend turn run. */
   deliverable_runs?: ConversationTurnDeliverableSet[]
+  /** Opaque cursor metadata returned by bounded history reads. Absent when an
+   * older client intentionally requested the legacy complete response. */
+  history_page?: ConversationHistoryPage | null
+}
+
+export interface ConversationHistoryPage {
+  next_cursor?: string | null
+  has_more: boolean
+  loaded_turns: number
 }
 
 export interface ConversationDeliverable {

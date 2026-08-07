@@ -102,7 +102,7 @@ function TaskAgentResolver({ task }: { task: WorkTask }) {
   useEffect(() => {
     if (override != null) return
     let cancelled = false
-    getFolderConversation(conversationId)
+    getFolderConversation(conversationId, { userTurnLimit: 1 })
       .then((detail) => {
         if (cancelled) return
         setResolved(detail.summary.agent_type ?? folderDefault ?? "claude_code")

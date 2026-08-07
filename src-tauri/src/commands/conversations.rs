@@ -1004,116 +1004,261 @@ fn inject_delegation_meta(turns: &mut [MessageTurn], children: &[DbConversationS
 /// just read (`None` when no file matched). The live wrapper uses that title to
 /// backfill the DB row's title when the user hasn't locked it — reusing this
 /// already-happening per-turn parse rather than reading the file again.
+fn paginate_parsed_turns(
+    turns: &mut Vec<MessageTurn>,
+    request: &ConversationHistoryRequest,
+) -> Result<ConversationHistoryPage, AppCommandError> {
+    let end = match request.before_cursor.as_deref() {
+        Some(cursor) => cursor
+            .strip_prefix("turn:")
+            .ok_or_else(|| AppCommandError::invalid_input("Invalid history cursor"))?
+            .parse::<usize>()
+            .map_err(|_| AppCommandError::invalid_input("Invalid history cursor"))?
+            .min(turns.len()),
+        None => turns.len(),
+    };
+    let limit = request.user_turn_limit.clamp(1, 100) as usize;
+    let mut start = end;
+    let mut user_turns = 0usize;
+    while start > 0 {
+        start -= 1;
+        if matches!(turns[start].role, TurnRole::User) {
+            user_turns += 1;
+            if user_turns >= limit {
+                break;
+            }
+        }
+    }
+    // System-only transcripts are rare, but a cursor must still make forward
+    // progress rather than returning the same empty page forever.
+    if user_turns == 0 && end > 0 {
+        start = end.saturating_sub(limit);
+    }
+    let page_turns = turns[start..end].to_vec();
+    *turns = page_turns;
+    Ok(ConversationHistoryPage {
+        next_cursor: (start > 0).then(|| format!("turn:{start}")),
+        has_more: start > 0,
+        loaded_turns: turns.len() as u32,
+    })
+}
+
 pub async fn get_folder_conversation_core(
     conn: &sea_orm::DatabaseConnection,
     conversation_id: i32,
 ) -> Result<(DbConversationDetail, Option<String>), AppCommandError> {
+    get_folder_conversation_core_impl(conn, conversation_id, None).await
+}
+
+#[derive(Clone, Debug)]
+pub struct ConversationHistoryRequest {
+    pub before_cursor: Option<String>,
+    pub user_turn_limit: u32,
+}
+
+/// Default size for the public conversation-detail command. Keeping this next
+/// to the request type makes the HTTP and Tauri transports agree even when an
+/// older caller omits the newly added paging arguments.
+pub const DEFAULT_HISTORY_PAGE_USER_TURNS: u32 = 6;
+
+pub async fn get_folder_conversation_page_core(
+    conn: &sea_orm::DatabaseConnection,
+    conversation_id: i32,
+    request: ConversationHistoryRequest,
+) -> Result<(DbConversationDetail, Option<String>), AppCommandError> {
+    get_folder_conversation_core_impl(conn, conversation_id, Some(request)).await
+}
+
+async fn get_folder_conversation_core_impl(
+    conn: &sea_orm::DatabaseConnection,
+    conversation_id: i32,
+    history_request: Option<ConversationHistoryRequest>,
+) -> Result<(DbConversationDetail, Option<String>), AppCommandError> {
+    let total_started = std::time::Instant::now();
+    let db_started = std::time::Instant::now();
     let summary = conversation_service::get_by_id(conn, conversation_id)
         .await
         .map_err(AppCommandError::from)?;
+    let summary_db_elapsed_ms = db_started.elapsed().as_millis() as u64;
 
-    let (mut turns, session_stats, resolved_ext_id, parsed_title, parsed_model, transcript_watermark) =
-        if let Some(ref ext_id) = summary.external_id {
-            let at = summary.agent_type;
-            let eid = ext_id.clone();
-            let db_created_at = summary.created_at;
-            // Prefer the recorded origin cwd (set when a removed task worktree's
-            // conversations were re-parented) over the current folder's path — the
-            // session file still carries the ORIGINAL cwd, so matching on the new
-            // parent folder would never find it.
-            let folder_path_for_fallback = match summary.origin_cwd.clone() {
-                Some(cwd) => Some(cwd),
-                None => folder_service::get_folder_by_id(conn, summary.folder_id)
-                    .await
-                    .ok()
-                    .flatten()
-                    .map(|f| f.path),
+    let parse_started = std::time::Instant::now();
+    let (
+        mut turns,
+        session_stats,
+        resolved_ext_id,
+        parsed_title,
+        parsed_model,
+        transcript_watermark,
+        history_page,
+    ) = if let Some(ref ext_id) = summary.external_id {
+        let at = summary.agent_type;
+        let eid = ext_id.clone();
+        let db_created_at = summary.created_at;
+        // Prefer the recorded origin cwd (set when a removed task worktree's
+        // conversations were re-parented) over the current folder's path — the
+        // session file still carries the ORIGINAL cwd, so matching on the new
+        // parent folder would never find it.
+        let folder_path_for_fallback = match summary.origin_cwd.clone() {
+            Some(cwd) => Some(cwd),
+            None => folder_service::get_folder_by_id(conn, summary.folder_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|f| f.path),
+        };
+        let history_request_for_parse = history_request.clone();
+        let cwd_hint = folder_path_for_fallback.clone();
+        tokio::task::spawn_blocking(move || -> Result<_, AppCommandError> {
+            if at == AgentType::Codex {
+                if let Some(request) = history_request_for_parse.as_ref() {
+                    let before_offset = match request.before_cursor.as_deref() {
+                        Some(cursor) => Some(
+                            cursor
+                                .strip_prefix("codex:")
+                                .ok_or_else(|| {
+                                    AppCommandError::invalid_input("Invalid history cursor")
+                                })?
+                                .parse::<u64>()
+                                .map_err(|_| {
+                                    AppCommandError::invalid_input("Invalid history cursor")
+                                })?,
+                        ),
+                        None => None,
+                    };
+                    let page = CodexParser::new()
+                        .get_conversation_page(
+                            &eid,
+                            before_offset,
+                            request.user_turn_limit as usize,
+                            cwd_hint,
+                        )
+                        .map_err(parse_error_to_app_error)?;
+                    let loaded_turns = page.detail.turns.len() as u32;
+                    return Ok((
+                        page.detail.turns,
+                        page.detail.session_stats,
+                        None,
+                        page.detail.summary.title,
+                        page.detail.summary.model,
+                        page.detail.transcript_watermark,
+                        Some(ConversationHistoryPage {
+                            next_cursor: page
+                                .has_more
+                                .then(|| format!("codex:{}", page.start_offset)),
+                            has_more: page.has_more,
+                            loaded_turns,
+                        }),
+                    ));
+                }
+            }
+            let parser: Box<dyn AgentParser> = match at {
+                AgentType::ClaudeCode => Box::new(ClaudeParser::new()),
+                AgentType::Codex => Box::new(CodexParser::new()),
+                AgentType::OpenCode => Box::new(OpenCodeParser::new()),
+                AgentType::Gemini => Box::new(GeminiParser::new()),
+                AgentType::OpenClaw => Box::new(OpenClawParser::new()),
+                AgentType::Cline => Box::new(ClineParser::new()),
+                AgentType::Hermes => Box::new(HermesParser::new()),
+                AgentType::CodeBuddy => Box::new(CodeBuddyParser::new()),
+                AgentType::KimiCode => Box::new(KimiCodeParser::new()),
+                AgentType::Pi => Box::new(PiParser::new()),
+                AgentType::Grok => Box::new(GrokParser::new()),
+                AgentType::Cursor => Box::new(CursorParser::new()),
+                AgentType::Custom(_) => Box::new(AcpNativeParser::new(at)),
             };
-            tokio::task::spawn_blocking(move || -> Result<_, AppCommandError> {
-                let parser: Box<dyn AgentParser> = match at {
-                    AgentType::ClaudeCode => Box::new(ClaudeParser::new()),
-                    AgentType::Codex => Box::new(CodexParser::new()),
-                    AgentType::OpenCode => Box::new(OpenCodeParser::new()),
-                    AgentType::Gemini => Box::new(GeminiParser::new()),
-                    AgentType::OpenClaw => Box::new(OpenClawParser::new()),
-                    AgentType::Cline => Box::new(ClineParser::new()),
-                    AgentType::Hermes => Box::new(HermesParser::new()),
-                    AgentType::CodeBuddy => Box::new(CodeBuddyParser::new()),
-                    AgentType::KimiCode => Box::new(KimiCodeParser::new()),
-                    AgentType::Pi => Box::new(PiParser::new()),
-                    AgentType::Grok => Box::new(GrokParser::new()),
-                    AgentType::Cursor => Box::new(CursorParser::new()),
-                    AgentType::Custom(_) => Box::new(AcpNativeParser::new(at)),
-                };
-                match parser.get_conversation(&eid) {
-                    Ok(d) => Ok((
+            match parser.get_conversation(&eid) {
+                Ok(mut d) => {
+                    let page = history_request_for_parse
+                        .as_ref()
+                        .map(|request| paginate_parsed_turns(&mut d.turns, request))
+                        .transpose()?;
+                    Ok((
                         d.turns,
                         d.session_stats,
                         None,
                         d.summary.title,
                         d.summary.model,
                         d.transcript_watermark,
-                    )),
-                    Err(crate::parsers::ParseError::ConversationNotFound(_)) => {
-                        // The external_id may no longer match any local file —
-                        // e.g. an ACP session UUID (OpenClaw, Cline) or a stale
-                        // ID after session/new fallback overwrote the original
-                        // (Gemini CLI).  Fall back to matching by folder_path
-                        // and started_at from the parsed conversation list.
-                        if matches!(
-                            at,
-                            AgentType::OpenClaw | AgentType::Cline | AgentType::Gemini
-                        ) {
-                            if let Ok(all) = parser.list_conversations() {
-                                // Filter by folder_path first, then find the closest
-                                // started_at match within 300 seconds of db_created_at.
-                                let matched = all
-                                    .into_iter()
-                                    .filter(|c| {
-                                        c.folder_path
-                                            .as_ref()
-                                            .zip(folder_path_for_fallback.as_ref())
-                                            .is_some_and(|(a, b)| path_eq_for_matching(a, b))
-                                    })
-                                    .min_by_key(|c| {
-                                        (c.started_at - db_created_at).num_seconds().unsigned_abs()
-                                    })
-                                    .filter(|c| {
-                                        let diff = (c.started_at - db_created_at)
-                                            .num_seconds()
-                                            .unsigned_abs();
-                                        diff < 300
-                                    });
-                                if let Some(conv) = matched {
-                                    let new_ext_id = conv.id.clone();
-                                    if let Ok(d) = parser.get_conversation(&new_ext_id) {
-                                        return Ok((
-                                            d.turns,
-                                            d.session_stats,
-                                            Some(new_ext_id),
-                                            d.summary.title,
-                                            d.summary.model,
-                                            d.transcript_watermark,
-                                        ));
-                                    }
+                        page,
+                    ))
+                }
+                Err(crate::parsers::ParseError::ConversationNotFound(_)) => {
+                    // The external_id may no longer match any local file —
+                    // e.g. an ACP session UUID (OpenClaw, Cline) or a stale
+                    // ID after session/new fallback overwrote the original
+                    // (Gemini CLI).  Fall back to matching by folder_path
+                    // and started_at from the parsed conversation list.
+                    if matches!(
+                        at,
+                        AgentType::OpenClaw | AgentType::Cline | AgentType::Gemini
+                    ) {
+                        if let Ok(all) = parser.list_conversations() {
+                            // Filter by folder_path first, then find the closest
+                            // started_at match within 300 seconds of db_created_at.
+                            let matched = all
+                                .into_iter()
+                                .filter(|c| {
+                                    c.folder_path
+                                        .as_ref()
+                                        .zip(folder_path_for_fallback.as_ref())
+                                        .is_some_and(|(a, b)| path_eq_for_matching(a, b))
+                                })
+                                .min_by_key(|c| {
+                                    (c.started_at - db_created_at).num_seconds().unsigned_abs()
+                                })
+                                .filter(|c| {
+                                    let diff =
+                                        (c.started_at - db_created_at).num_seconds().unsigned_abs();
+                                    diff < 300
+                                });
+                            if let Some(conv) = matched {
+                                let new_ext_id = conv.id.clone();
+                                if let Ok(mut d) = parser.get_conversation(&new_ext_id) {
+                                    let page = history_request_for_parse
+                                        .as_ref()
+                                        .map(|request| paginate_parsed_turns(&mut d.turns, request))
+                                        .transpose()?;
+                                    return Ok((
+                                        d.turns,
+                                        d.session_stats,
+                                        Some(new_ext_id),
+                                        d.summary.title,
+                                        d.summary.model,
+                                        d.transcript_watermark,
+                                        page,
+                                    ));
                                 }
                             }
                         }
-                        Ok((vec![], None, None, None, None, None))
                     }
-                    Err(e) => Err(parse_error_to_app_error(e)),
+                    Ok((vec![], None, None, None, None, None, None))
                 }
-            })
-            .await
-            .map_err(|e| {
-                AppCommandError::task_execution_failed(
-                    "Failed to read conversation turns from session file",
-                )
-                .with_detail(e.to_string())
-            })??
-        } else {
-            (vec![], None, None, None, None, None)
-        };
+                Err(e) => Err(parse_error_to_app_error(e)),
+            }
+        })
+        .await
+        .map_err(|e| {
+            AppCommandError::task_execution_failed(
+                "Failed to read conversation turns from session file",
+            )
+            .with_detail(e.to_string())
+        })??
+    } else {
+        (
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            None,
+            history_request.as_ref().map(|_| ConversationHistoryPage {
+                next_cursor: None,
+                has_more: false,
+                loaded_turns: 0,
+            }),
+        )
+    };
+    let session_parse_elapsed_ms = parse_started.elapsed().as_millis() as u64;
 
     // If we resolved a different external_id (e.g. ACP UUID → parser branch ID),
     // update the database so future lookups are direct.
@@ -1122,7 +1267,11 @@ pub async fn get_folder_conversation_core(
     }
 
     let mut summary = summary;
-    summary.message_count = turns.len() as u32;
+    if history_page.is_some() {
+        summary.message_count = summary.message_count.max(turns.len() as u32);
+    } else {
+        summary.message_count = turns.len() as u32;
+    }
     // The transcript is the richer source for the session's model. Codex is
     // the concrete case: an ACP-driven row is created before any
     // `turn_context` names a model, so the DB column can stay NULL forever
@@ -1139,6 +1288,7 @@ pub async fn get_folder_conversation_core(
     // `parent_id = summary.id` to repopulate it from the DB. Failure to
     // fetch children silently degrades to "no button on the card" (the
     // pre-fix behavior), never to a failed detail load.
+    let related_db_started = std::time::Instant::now();
     let children = conversation_service::list_children(conn, conversation_id)
         .await
         .unwrap_or_default();
@@ -1156,6 +1306,19 @@ pub async fn get_folder_conversation_core(
     deliverable_service::associate_sets_with_user_turns(conn, &mut deliverable_runs, &turns)
         .await
         .map_err(AppCommandError::from)?;
+    let related_db_elapsed_ms = related_db_started.elapsed().as_millis() as u64;
+
+    tracing::info!(
+        route = "get_folder_conversation",
+        conversation_id,
+        bounded_history = history_page.is_some(),
+        loaded_turns = turns.len(),
+        summary_db_elapsed_ms,
+        session_parse_elapsed_ms,
+        related_db_elapsed_ms,
+        total_elapsed_ms = total_started.elapsed().as_millis() as u64,
+        "[conversation][perf] detail data loaded"
+    );
 
     Ok((
         DbConversationDetail {
@@ -1167,6 +1330,7 @@ pub async fn get_folder_conversation_core(
             artifact_runs,
             deliverables,
             deliverable_runs,
+            history_page,
         },
         parsed_title,
     ))
@@ -1336,7 +1500,48 @@ pub async fn get_folder_conversation_with_live_core(
     emitter: &EventEmitter,
     conversation_id: i32,
 ) -> Result<DbConversationDetail, AppCommandError> {
-    let (mut detail, parsed_title) = get_folder_conversation_core(conn, conversation_id).await?;
+    get_folder_conversation_with_live_impl(
+        conn,
+        manager,
+        chat_channel_manager,
+        emitter,
+        conversation_id,
+        None,
+    )
+    .await
+}
+
+pub async fn get_folder_conversation_page_with_live_core(
+    conn: &sea_orm::DatabaseConnection,
+    manager: &crate::acp::manager::ConnectionManager,
+    chat_channel_manager: &crate::chat_channel::manager::ChatChannelManager,
+    emitter: &EventEmitter,
+    conversation_id: i32,
+    request: ConversationHistoryRequest,
+) -> Result<DbConversationDetail, AppCommandError> {
+    get_folder_conversation_with_live_impl(
+        conn,
+        manager,
+        chat_channel_manager,
+        emitter,
+        conversation_id,
+        Some(request),
+    )
+    .await
+}
+
+async fn get_folder_conversation_with_live_impl(
+    conn: &sea_orm::DatabaseConnection,
+    manager: &crate::acp::manager::ConnectionManager,
+    chat_channel_manager: &crate::chat_channel::manager::ChatChannelManager,
+    emitter: &EventEmitter,
+    conversation_id: i32,
+    history_request: Option<ConversationHistoryRequest>,
+) -> Result<DbConversationDetail, AppCommandError> {
+    let (mut detail, parsed_title) = match history_request {
+        Some(request) => get_folder_conversation_page_core(conn, conversation_id, request).await?,
+        None => get_folder_conversation_core(conn, conversation_id).await?,
+    };
 
     // Per-turn auto-title backfill. The parse `get_folder_conversation_core`
     // just did already produced the session-file title; adopt it (and broadcast
@@ -1388,13 +1593,20 @@ pub async fn get_folder_conversation(
     manager: tauri::State<'_, crate::acp::manager::ConnectionManager>,
     chat_channel_manager: tauri::State<'_, crate::chat_channel::manager::ChatChannelManager>,
     conversation_id: i32,
+    before_cursor: Option<String>,
+    user_turn_limit: Option<u32>,
 ) -> Result<DbConversationDetail, AppCommandError> {
-    get_folder_conversation_with_live_core(
+    let emitter = EventEmitter::Tauri(app);
+    get_folder_conversation_page_with_live_core(
         &db.conn,
         &manager,
         &chat_channel_manager,
-        &EventEmitter::Tauri(app),
+        &emitter,
         conversation_id,
+        ConversationHistoryRequest {
+            before_cursor,
+            user_turn_limit: user_turn_limit.unwrap_or(DEFAULT_HISTORY_PAGE_USER_TURNS),
+        },
     )
     .await
 }
@@ -2176,6 +2388,61 @@ mod tests {
             model: None,
             completed_at: completed.then_some(ts),
         }
+    }
+
+    #[test]
+    fn parsed_history_pages_preserve_order_and_advance_the_cursor() {
+        let mut turns = vec![
+            user_text_turn("u1", "one", at(0)),
+            assistant_text_turn("a1", "one reply", at(1), true),
+            user_text_turn("u2", "two", at(2)),
+            assistant_text_turn("a2", "two reply", at(3), true),
+            user_text_turn("u3", "three", at(4)),
+            assistant_text_turn("a3", "three reply", at(5), true),
+        ];
+        let page = paginate_parsed_turns(
+            &mut turns,
+            &ConversationHistoryRequest {
+                before_cursor: None,
+                user_turn_limit: 2,
+            },
+        )
+        .expect("latest page");
+        assert_eq!(
+            turns
+                .iter()
+                .map(|turn| turn.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["u2", "a2", "u3", "a3"]
+        );
+        assert_eq!(page.next_cursor.as_deref(), Some("turn:2"));
+        assert!(page.has_more);
+
+        let mut all_turns = vec![
+            user_text_turn("u1", "one", at(0)),
+            assistant_text_turn("a1", "one reply", at(1), true),
+            user_text_turn("u2", "two", at(2)),
+            assistant_text_turn("a2", "two reply", at(3), true),
+            user_text_turn("u3", "three", at(4)),
+            assistant_text_turn("a3", "three reply", at(5), true),
+        ];
+        let earlier = paginate_parsed_turns(
+            &mut all_turns,
+            &ConversationHistoryRequest {
+                before_cursor: page.next_cursor,
+                user_turn_limit: 2,
+            },
+        )
+        .expect("earlier page");
+        assert_eq!(
+            all_turns
+                .iter()
+                .map(|turn| turn.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["u1", "a1"]
+        );
+        assert!(!earlier.has_more);
+        assert!(earlier.next_cursor.is_none());
     }
 
     fn pending_text(message_id: &str, text: &str) -> crate::acp::session_state::PendingUserMessage {

@@ -1,17 +1,19 @@
 use std::sync::Arc;
 
 use axum::{
+    body::Body,
     extract::{DefaultBodyLimit, Extension},
-    http::{StatusCode, Uri},
+    http::{header::CACHE_CONTROL, HeaderValue, StatusCode, Uri},
     middleware::{self, Next},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{any, get, post},
     Json, Router,
 };
 
+use futures_util::StreamExt;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::{Any, CorsLayer};
-use tower_http::services::{ServeDir, ServeFile};
+use tower_http::services::ServeDir;
 
 use super::shutdown::ShutdownSignal;
 use super::{auth, handlers, ws};
@@ -1537,7 +1539,31 @@ pub fn build_router(
             let path = req.uri().path().to_string();
             let request_id = uuid::Uuid::new_v4();
             let span = tracing::info_span!("http", %method, %path, %request_id);
-            next.run(req).instrument(span).await
+            async move {
+                let started = std::time::Instant::now();
+                let response = next.run(req).await;
+                tracing::info!(
+                    route = %path,
+                    status_code = response.status().as_u16(),
+                    total_elapsed_ms = started.elapsed().as_millis() as u64,
+                    content_encoding = ?response
+                        .headers()
+                        .get(axum::http::header::CONTENT_ENCODING)
+                        .and_then(|value| value.to_str().ok()),
+                    response_content_length = ?response
+                        .headers()
+                        .get(axum::http::header::CONTENT_LENGTH)
+                        .and_then(|value| value.to_str().ok()),
+                    "[HTTP][perf] request completed"
+                );
+                if path.ends_with("/get_folder_conversation") {
+                    measure_history_response_body(response, path, request_id, started)
+                } else {
+                    response
+                }
+            }
+            .instrument(span)
+            .await
         },
     ));
 
@@ -1551,8 +1577,14 @@ pub fn build_router(
     // Static file serving.
     // Next.js static export produces "folder.html" for "/folder" route.
     // We use a middleware to rewrite "/folder" → "/folder.html" before ServeDir.
-    let fallback =
-        ServeDir::new(&static_dir).fallback(ServeFile::new(static_dir.join("index.html")));
+    // Do not attach index.html as ServeDir's not-found fallback. Static-export
+    // routes are rewritten to their real `.html` file below; a missing data
+    // request (notably `/local-enhancements/*.json`) must remain a tiny 404,
+    // never a 240 KiB workspace document that a watchdog downloads forever.
+    let static_files = Router::new()
+        .fallback_service(ServeDir::new(&static_dir))
+        .layer(CompressionLayer::new())
+        .layer(middleware::from_fn(static_response_policy));
 
     let static_dir_for_mw = static_dir.clone();
     let html_rewrite = middleware::from_fn(move |req: axum::extract::Request, next: Next| {
@@ -1589,11 +1621,96 @@ pub fn build_router(
     Router::new()
         .nest("/api", api)
         .merge(ws_route)
-        .fallback_service(fallback)
+        .merge(static_files)
         .layer(html_rewrite)
         .layer(cors)
         .layer(Extension(state))
         .layer(Extension(shutdown_signal))
+}
+
+fn measure_history_response_body(
+    response: Response,
+    route: String,
+    request_id: uuid::Uuid,
+    started: std::time::Instant,
+) -> Response {
+    let content_encoding = response
+        .headers()
+        .get(axum::http::header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let (parts, body) = response.into_parts();
+    let body_stream = body.into_data_stream();
+    let measured = futures_util::stream::unfold(
+        (body_stream, 0u64),
+        move |(mut body_stream, transmitted_bytes)| {
+            let route = route.clone();
+            let content_encoding = content_encoding.clone();
+            async move {
+                match body_stream.next().await {
+                    Some(Ok(chunk)) => {
+                        let transmitted_bytes = transmitted_bytes + chunk.len() as u64;
+                        Some((
+                            Ok::<_, axum::Error>(chunk),
+                            (body_stream, transmitted_bytes),
+                        ))
+                    }
+                    Some(Err(error)) => {
+                        tracing::warn!(
+                            route = %route,
+                            %request_id,
+                            transmitted_bytes,
+                            content_encoding = ?content_encoding,
+                            total_elapsed_ms = started.elapsed().as_millis() as u64,
+                            error = %error,
+                            "[HTTP][perf] response body interrupted"
+                        );
+                        Some((Err(error), (body_stream, transmitted_bytes)))
+                    }
+                    None => {
+                        tracing::info!(
+                            route = %route,
+                            %request_id,
+                            transmitted_bytes,
+                            compressed_bytes = content_encoding.as_ref().map(|_| transmitted_bytes),
+                            content_encoding = ?content_encoding,
+                            total_elapsed_ms = started.elapsed().as_millis() as u64,
+                            "[HTTP][perf] response body completed"
+                        );
+                        None
+                    }
+                }
+            }
+        },
+    );
+    Response::from_parts(parts, Body::from_stream(measured))
+}
+
+async fn static_response_policy(request: axum::extract::Request, next: Next) -> Response {
+    let path = request.uri().path().to_string();
+    let mut response = next.run(request).await;
+    if !response.status().is_success() && response.status() != StatusCode::NOT_MODIFIED {
+        return response;
+    }
+
+    let cache_control = if path.starts_with("/_next/static/") {
+        // Next filenames carry a content hash; a new build gets a new URL.
+        "public, max-age=31536000, immutable"
+    } else if path.starts_with("/local-enhancements/") && path.ends_with(".json") {
+        // Polling control files must always reflect their latest small payload.
+        "no-store"
+    } else if path == "/" || path.ends_with(".html") || !path.contains('.') {
+        // HTML owns the build's hashed asset graph and must revalidate after an
+        // upgrade. ServeDir's Last-Modified handling is the condition-request
+        // validator (304) for these files.
+        "no-cache"
+    } else {
+        "public, max-age=3600"
+    };
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static(cache_control));
+    response
 }
 
 fn history_response_compression() -> CompressionLayer {
@@ -1628,7 +1745,9 @@ async fn api_not_found(uri: axum::http::Uri) -> impl IntoResponse {
 
 #[cfg(test)]
 mod tests {
-    use axum::http::header::{ACCEPT_ENCODING, CONTENT_ENCODING};
+    use axum::http::header::{
+        ACCEPT_ENCODING, CACHE_CONTROL, CONTENT_ENCODING, IF_MODIFIED_SINCE, LAST_MODIFIED, RANGE,
+    };
     use axum_test::TestServer;
 
     use super::*;
@@ -1654,5 +1773,97 @@ mod tests {
 
         response.assert_status_ok();
         response.assert_header(CONTENT_ENCODING, "gzip");
+    }
+
+    #[tokio::test]
+    async fn static_assets_are_compressed_cached_and_missing_json_stays_small() {
+        let dir = tempfile::tempdir().expect("temp static dir");
+        std::fs::create_dir_all(dir.path().join("_next/static/chunks")).expect("create chunks dir");
+        std::fs::create_dir_all(dir.path().join("local-enhancements"))
+            .expect("create local enhancements dir");
+        std::fs::write(
+            dir.path().join("workspace.html"),
+            "workspace-shell".repeat(4_096),
+        )
+        .expect("write html");
+        std::fs::write(
+            dir.path().join("_next/static/chunks/app-deadbeef.js"),
+            "const value = 'compress me';\n".repeat(4_096),
+        )
+        .expect("write asset");
+        std::fs::write(
+            dir.path()
+                .join("local-enhancements/turn-watchdog-event.json"),
+            r#"{"status":"idle"}"#,
+        )
+        .expect("write turn watchdog");
+
+        let app = Router::new()
+            .fallback_service(ServeDir::new(dir.path()))
+            .layer(CompressionLayer::new())
+            .layer(middleware::from_fn(static_response_policy));
+        let server = TestServer::new(app).expect("test server should start");
+
+        let asset = server
+            .get("/_next/static/chunks/app-deadbeef.js")
+            .add_header(ACCEPT_ENCODING, "gzip")
+            .await;
+        asset.assert_status_ok();
+        asset.assert_header(CONTENT_ENCODING, "gzip");
+        asset.assert_header(CACHE_CONTROL, "public, max-age=31536000, immutable");
+        let last_modified = asset
+            .headers()
+            .get(LAST_MODIFIED)
+            .expect("ServeDir supplies a validator")
+            .clone();
+
+        let conditional = server
+            .get("/_next/static/chunks/app-deadbeef.js")
+            .add_header(IF_MODIFIED_SINCE, last_modified)
+            .await;
+        conditional.assert_status(StatusCode::NOT_MODIFIED);
+
+        let range = server
+            .get("/_next/static/chunks/app-deadbeef.js")
+            .add_header(ACCEPT_ENCODING, "gzip")
+            .add_header(RANGE, "bytes=0-9")
+            .await;
+        range.assert_status(StatusCode::PARTIAL_CONTENT);
+        assert!(
+            range.headers().get(CONTENT_ENCODING).is_none(),
+            "range responses must not be transformed by compression"
+        );
+        assert_eq!(range.as_bytes().len(), 10);
+
+        let html = server.get("/workspace.html").await;
+        html.assert_status_ok();
+        html.assert_header(CACHE_CONTROL, "no-cache");
+
+        let turn_watchdog = server
+            .get("/local-enhancements/turn-watchdog-event.json")
+            .await;
+        turn_watchdog.assert_status_ok();
+        turn_watchdog.assert_header(CACHE_CONTROL, "no-store");
+        assert_eq!(turn_watchdog.text(), r#"{"status":"idle"}"#);
+
+        let mut watchdog_bytes = 0usize;
+        for poll in 0..6 {
+            let missing = server
+                .get(&format!(
+                    "/local-enhancements/command-watchdog-event.json?t={poll}"
+                ))
+                .await;
+            missing.assert_status_not_found();
+            let bytes = missing.as_bytes().len();
+            assert!(
+                bytes < 1_024,
+                "missing watchdog response must not be the workspace HTML"
+            );
+            watchdog_bytes += bytes;
+        }
+        assert!(
+            watchdog_bytes < 6 * 1_024,
+            "six 5-second polls (30 seconds) must stay below 6 KiB"
+        );
     }
 }

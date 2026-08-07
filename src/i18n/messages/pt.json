@@ -2758,6 +2758,8 @@
       "messageList": {
         "attachedResources": "Recursos anexados",
         "loading": "Carregando...",
+        "loadEarlierHistory": "Carregar mensagens anteriores",
+        "retryEarlierHistory": "Tentar mensagens anteriores novamente",
         "error": "Erro: {message}",
         "errorTitle": "Falha ao carregar a sessão",
         "errorActionReload": "Recarregar",

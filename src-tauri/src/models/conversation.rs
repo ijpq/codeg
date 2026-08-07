@@ -133,6 +133,23 @@ pub struct DbConversationDetail {
     /// below the assistant reply that produced them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deliverable_runs: Vec<ConversationTurnDeliverableSet>,
+    /// Present when the caller requested a bounded history page. Older clients
+    /// omit the paging arguments and continue to receive the complete detail,
+    /// preserving the desktop/server version-skew contract.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub history_page: Option<ConversationHistoryPage>,
+}
+
+/// Cursor metadata for a bounded conversation-history response. The cursor is
+/// deliberately opaque: Codex pages use transcript byte offsets so the server
+/// can seek directly into very large JSONL files, while other parsers fall back
+/// to a turn-index cursor without exposing that distinction to the frontend.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationHistoryPage {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
+    pub loaded_turns: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
