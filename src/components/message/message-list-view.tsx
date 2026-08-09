@@ -217,6 +217,19 @@ const EMPTY_NAV_ENTRIES: MessageNavEntry[] = []
 const EMPTY_DELIVERABLES: ConversationDeliverable[] = []
 const EMPTY_PROMPT_DELIVERIES: Record<string, PromptDeliveryState> = {}
 
+export function resolveMessageThreadResizeBehavior(
+  isActive: boolean,
+  detailLoading: boolean,
+  hasTimelineTurns: boolean
+): "instant" | "smooth" {
+  // `undefined` is not a disabled resize animation in use-stick-to-bottom: it
+  // falls back to the library's spring. While a reply streams, row measurement
+  // can move the target again before that spring settles and leave the viewport
+  // a few pixels behind. An explicit instant resize keeps the active transcript
+  // pinned; the library still stops following after the user scrolls upward.
+  return isActive && !detailLoading && hasTimelineTurns ? "instant" : "smooth"
+}
+
 export interface DeliverableUserTurnRef {
   id: string
   timestamp?: string
@@ -979,10 +992,10 @@ export function MessageListView({
     pendingUserStartedAt,
   ])
 
-  const shouldUseSmoothResize = !(
-    isActive &&
-    !detailLoading &&
-    timelineTurns.length
+  const messageThreadResize = resolveMessageThreadResizeBehavior(
+    isActive,
+    detailLoading,
+    timelineTurns.length > 0
   )
 
   const adapterText = useMemo(
@@ -1408,10 +1421,7 @@ export function MessageListView({
 
   return (
     <div className="relative flex h-full min-h-0 flex-col">
-      <MessageThread
-        className="flex-1 min-h-0"
-        resize={shouldUseSmoothResize ? "smooth" : undefined}
-      >
+      <MessageThread className="flex-1 min-h-0" resize={messageThreadResize}>
         <AutoScrollOnSend signal={sendSignal} />
         {(hasEarlierHistory || earlierHistoryError) && onLoadEarlierHistory ? (
           <LoadEarlierHistoryControl
