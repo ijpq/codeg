@@ -5,6 +5,7 @@ import {
   mergeConsecutiveAssistantTurns,
   replyDeliverablesForRun,
   resolveDeliverableAssociations,
+  resolveMessageThreadResizeBehavior,
   type MergedAssistantRunCache,
   type ResolvedMessageGroup,
   type ThreadRenderItem,
@@ -13,6 +14,24 @@ import type {
   ConversationDeliverable,
   ConversationTurnDeliverableSet,
 } from "@/lib/types"
+
+describe("resolveMessageThreadResizeBehavior", () => {
+  it("pins an active loaded transcript immediately as streaming rows resize", () => {
+    expect(resolveMessageThreadResizeBehavior(true, false, true)).toBe(
+      "instant"
+    )
+  })
+
+  it("keeps smooth resizing while a transcript is inactive, loading, or empty", () => {
+    expect(resolveMessageThreadResizeBehavior(false, false, true)).toBe(
+      "smooth"
+    )
+    expect(resolveMessageThreadResizeBehavior(true, true, true)).toBe("smooth")
+    expect(resolveMessageThreadResizeBehavior(true, false, false)).toBe(
+      "smooth"
+    )
+  })
+})
 
 type ThreadItem = Parameters<typeof mergeConsecutiveAssistantTurns>[0][number]
 type TurnItem = Extract<ThreadItem, { kind: "turn" }>
