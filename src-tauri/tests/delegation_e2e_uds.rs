@@ -255,6 +255,7 @@ async fn end_to_end_uds_publish_deliverables_replaces_only_the_active_turn() {
         Arc::new(NoSessionInfo) as Arc<dyn codeg_lib::acp::session_info::SessionInfoAccess>,
         Arc::new(NoTaskTools)
             as Arc<dyn codeg_lib::acp::work_task_tools::WorkTaskToolAccess>,
+        Arc::new(NoAuthoring) as Arc<dyn codeg_lib::acp::chat_authoring::ChatAuthoringAccess>,
         Arc::new(DbSessionDeliverableAccess::new(
             db.conn.clone(),
             EventEmitter::Noop,
