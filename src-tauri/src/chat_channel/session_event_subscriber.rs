@@ -7,6 +7,8 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 use super::i18n::Lang;
+#[cfg(test)]
+use super::session_bridge::PendingPrompt;
 use super::session_bridge::{PendingPermission, SessionBridge};
 use super::tool_detail::{format_tool_call_detail, truncate_str};
 use super::types::{ChannelMessageTarget, MessageLevel, RichMessage};
@@ -126,13 +128,25 @@ async fn handle_acp_envelope(
                 )
                 .await;
 
-                if let Some(prompt_text) = session.pending_prompt.take() {
+                if let Some(pending) = session.pending_prompt.take() {
                     // Clone so the prompt can be RESTORED (not dropped) if a turn
                     // is already in flight — see the TurnInProgress arm below.
                     let blocks = vec![PromptInputBlock::Text {
-                        text: prompt_text.clone(),
+                        text: pending.text.clone(),
                     }];
-                    if let Err(e) = conn_mgr.send_prompt(connection_id, blocks).await {
+                    session.forward_events = true;
+                    if let Err(e) = conn_mgr
+                        .send_prompt_linked(
+                            &crate::db::AppDatabase { conn: db.clone() },
+                            connection_id,
+                            blocks,
+                            Some(pending.folder_id),
+                            Some(pending.conversation_id),
+                            None,
+                        )
+                        .await
+                    {
+                        session.forward_events = false;
                         // A turn is already in flight on this shared connection
                         // (another client raced this kickoff between
                         // SessionStarted and here). Transient, not a failure —
@@ -140,7 +154,7 @@ async fn handle_acp_envelope(
                         // retries the kickoff once the in-flight turn finishes,
                         // instead of silently dropping the task's initial prompt.
                         if matches!(e, crate::acp::error::AcpError::TurnInProgress) {
-                            session.pending_prompt = Some(prompt_text);
+                            session.pending_prompt = Some(pending);
                             tracing::warn!(
                                 "[SessionEventSub] kickoff deferred; a turn is already in \
                                  progress, will retry on TurnComplete"
@@ -177,6 +191,9 @@ async fn handle_acp_envelope(
                 let mut guard = bridge.lock().await;
                 match guard.get_mut(connection_id) {
                     Some(session) => {
+                        if !session.forward_events {
+                            return;
+                        }
                         session.content_buffer.push_str(text);
                         if session.content_buffer.len() >= BUFFER_FLUSH_THRESHOLD
                             && session.last_flushed.elapsed() >= Duration::from_secs(2)
@@ -226,6 +243,9 @@ async fn handle_acp_envelope(
 
             let mut guard = bridge.lock().await;
             if let Some(session) = guard.get_mut(connection_id) {
+                if !session.forward_events {
+                    return;
+                }
                 // Store title for progress indicator; store raw_input for later
                 session.tool_calls.push(title.clone());
                 if let Some(input) = raw_input.as_deref() {
@@ -252,6 +272,9 @@ async fn handle_acp_envelope(
         } => {
             let mut guard = bridge.lock().await;
             if let Some(session) = guard.get_mut(connection_id) {
+                if !session.forward_events {
+                    return;
+                }
                 // Accumulate raw_input if newly available
                 if let Some(input) = raw_input.as_deref() {
                     session
@@ -344,6 +367,9 @@ async fn handle_acp_envelope(
         } => {
             let mut guard = bridge.lock().await;
             if let Some(session) = guard.get_mut(connection_id) {
+                if !session.forward_events {
+                    return;
+                }
                 // Render EXACTLY ONCE, gated on the `delegation_rendered` marker:
                 // if a terminal `ToolCallUpdate` already rendered this task's
                 // result, skip. (A synthetic `parent_tool_use_id` is never emitted
@@ -377,6 +403,9 @@ async fn handle_acp_envelope(
         } => {
             let mut guard = bridge.lock().await;
             if let Some(session) = guard.get_mut(connection_id) {
+                if !session.forward_events {
+                    return;
+                }
                 let channel_id = session.channel_id;
                 let sender_id = session.sender_id.clone();
                 let target = session.target.clone();
@@ -463,10 +492,20 @@ async fn handle_acp_envelope(
             if let Some(session) = guard.get_mut(connection_id) {
                 let target = session.target.clone();
                 let conv_id = session.conversation_id;
-                let content = std::mem::take(&mut session.content_buffer);
-                let tool_count = session.tool_calls.len();
+                let owned_turn = session.forward_events;
+                let content = if owned_turn {
+                    std::mem::take(&mut session.content_buffer)
+                } else {
+                    String::new()
+                };
+                let tool_count = if owned_turn {
+                    session.tool_calls.len()
+                } else {
+                    0
+                };
                 session.tool_calls.clear();
                 session.last_flushed = Instant::now();
+                session.forward_events = false;
                 // A kickoff prompt deferred by `SessionStarted` (the connection
                 // was already mid-turn for another client) waits here. Take it
                 // BEFORE dropping the guard so a second TurnComplete can't
@@ -475,25 +514,25 @@ async fn handle_acp_envelope(
                 drop(guard);
 
                 let lang = get_lang(db).await;
-                let body = format_completion(&content, tool_count, lang);
+                if owned_turn {
+                    let body = format_completion(&content, tool_count, lang);
+                    let msg = RichMessage::info(body)
+                        .with_title(match lang {
+                            Lang::ZhCn | Lang::ZhTw => "任务完成",
+                            _ => "Turn Complete",
+                        })
+                        .with_field("Agent", agent_type)
+                        .with_field(
+                            match lang {
+                                Lang::ZhCn | Lang::ZhTw => "结束原因",
+                                _ => "Stop Reason",
+                            },
+                            localize_stop_reason(stop_reason, lang),
+                        );
+                    let _ = manager.send_to_target(&target, &msg).await;
+                }
 
-                let msg = RichMessage::info(body)
-                    .with_title(match lang {
-                        Lang::ZhCn | Lang::ZhTw => "任务完成",
-                        _ => "Turn Complete",
-                    })
-                    .with_field("Agent", agent_type)
-                    .with_field(
-                        match lang {
-                            Lang::ZhCn | Lang::ZhTw => "结束原因",
-                            _ => "Stop Reason",
-                        },
-                        localize_stop_reason(stop_reason, lang),
-                    );
-
-                let _ = manager.send_to_target(&target, &msg).await;
-
-                if stop_reason == "end_turn" {
+                if owned_turn && stop_reason == "end_turn" {
                     let _ = conversation_service::update_status(
                         db,
                         conv_id,
@@ -506,22 +545,41 @@ async fn handle_acp_envelope(
                 // If yet ANOTHER turn slipped in (another client raced this
                 // TurnComplete), restore the prompt for the next TurnComplete —
                 // never drop it.
-                if let Some(prompt_text) = deferred_kickoff {
+                if let Some(pending) = deferred_kickoff {
                     let blocks = vec![PromptInputBlock::Text {
-                        text: prompt_text.clone(),
+                        text: pending.text.clone(),
                     }];
-                    if let Err(e) = conn_mgr.send_prompt(connection_id, blocks).await {
+                    if let Some(session) = bridge.lock().await.get_mut(connection_id) {
+                        session.forward_events = true;
+                    }
+                    if let Err(e) = conn_mgr
+                        .send_prompt_linked(
+                            &crate::db::AppDatabase { conn: db.clone() },
+                            connection_id,
+                            blocks,
+                            Some(pending.folder_id),
+                            Some(pending.conversation_id),
+                            None,
+                        )
+                        .await
+                    {
                         if matches!(e, crate::acp::error::AcpError::TurnInProgress) {
                             let mut g = bridge.lock().await;
                             if let Some(s) = g.get_mut(connection_id) {
-                                s.pending_prompt = Some(prompt_text);
+                                s.forward_events = false;
+                                s.pending_prompt = Some(pending);
                             }
                             tracing::warn!(
                                 "[SessionEventSub] deferred kickoff still blocked; will retry on \
                                  next TurnComplete"
                             );
                         } else {
-                            tracing::error!("[SessionEventSub] failed to send deferred kickoff: {e}");
+                            if let Some(s) = bridge.lock().await.get_mut(connection_id) {
+                                s.forward_events = false;
+                            }
+                            tracing::error!(
+                                "[SessionEventSub] failed to send deferred kickoff: {e}"
+                            );
                             let msg = RichMessage::error(format!("Failed to send task: {e}"));
                             let _ = manager.send_to_target(&target, &msg).await;
                         }
@@ -560,7 +618,10 @@ async fn handle_acp_envelope(
             if !*terminal {
                 let target = {
                     let guard = bridge.lock().await;
-                    guard.get(connection_id).map(|s| s.target.clone())
+                    guard
+                        .get(connection_id)
+                        .filter(|s| s.forward_events)
+                        .map(|s| s.target.clone())
                 };
                 if let Some(target) = target {
                     let _ = manager.send_to_target(&target, &msg).await;
@@ -576,7 +637,9 @@ async fn handle_acp_envelope(
                 let conv_id = session.conversation_id;
                 drop(guard);
 
-                let _ = manager.send_to_target(&target, &msg).await;
+                if session.forward_events {
+                    let _ = manager.send_to_target(&target, &msg).await;
+                }
 
                 let _ = conversation_service::update_status(
                     db,
@@ -619,7 +682,8 @@ async fn flush_progress(
         let mut guard = bridge.lock().await;
         let mut out = Vec::new();
         for session in guard.all_sessions_mut() {
-            if !session.content_buffer.is_empty()
+            if session.forward_events
+                && !session.content_buffer.is_empty()
                 && session.last_flushed.elapsed() >= Duration::from_secs(FLUSH_INTERVAL_SECS)
             {
                 session.last_flushed = Instant::now();
@@ -652,7 +716,7 @@ async fn clear_session_route(
             let _ = thread_binding_service::clear_connection(db, binding.id).await;
         }
     } else {
-        let _ = sender_context_service::clear_session(db, channel_id, sender_id).await;
+        let _ = sender_context_service::clear_connection(db, channel_id, sender_id).await;
     }
 }
 
@@ -961,9 +1025,7 @@ mod delegation_relay_tests {
         assert!(is_delegation_title("delegate_to_agent"));
         assert!(is_delegation_title("Delegate To Agent"));
         assert!(is_delegation_title("delegate-to-agent"));
-        assert!(is_delegation_title(
-            "mcp__codeg-mcp__delegate_to_agent"
-        ));
+        assert!(is_delegation_title("mcp__codeg-mcp__delegate_to_agent"));
         assert!(is_delegation_title("Run mcp__codeg__delegate_to_agent"));
         assert!(!is_delegation_title("agent"));
         assert!(!is_delegation_title("write"));
@@ -1191,6 +1253,7 @@ mod async_relay_dedup_tests {
                 delegation_rendered: HashSet::new(),
                 last_flushed: Instant::now(),
                 pending_prompt: None,
+                forward_events: true,
                 permission_pending: None,
             },
         );
@@ -1367,6 +1430,46 @@ mod async_relay_dedup_tests {
         assert!(msgs[0].starts_with("❌ codex failed"), "got {:?}", msgs[0]);
     }
 
+    #[tokio::test]
+    async fn restored_bridge_does_not_relay_an_unowned_web_turn() {
+        let (bridge, chat, rec) = harness().await;
+        bridge.lock().await.get_mut("conn").unwrap().forward_events = false;
+        let db = test_helpers::fresh_in_memory_db().await;
+        let conn = ConnectionManager::new();
+        handle_acp_envelope(
+            &EventEnvelope {
+                seq: 1,
+                connection_id: "conn".into(),
+                payload: AcpEvent::ContentDelta {
+                    text: "web-only output".into(),
+                    parent_tool_use_id: None,
+                },
+            },
+            &bridge,
+            &chat,
+            &conn,
+            &db.conn,
+        )
+        .await;
+        handle_acp_envelope(
+            &EventEnvelope {
+                seq: 2,
+                connection_id: "conn".into(),
+                payload: AcpEvent::TurnComplete {
+                    session_id: "web-session".into(),
+                    stop_reason: "end_turn".into(),
+                    agent_type: "codex".into(),
+                },
+            },
+            &bridge,
+            &chat,
+            &conn,
+            &db.conn,
+        )
+        .await;
+        assert!(sent(&rec).await.is_empty());
+    }
+
     /// Chat kickoff DEFERS (does not drop) when a turn is already in flight on a
     /// shared connection: SessionStarted bounces with `TurnInProgress` → the
     /// pending prompt is RESTORED and an info line is posted; `TurnComplete`
@@ -1378,6 +1481,9 @@ mod async_relay_dedup_tests {
 
         let (bridge, chat, rec) = harness().await;
         let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/codeg-deferred-kickoff").await;
+        let conversation_id =
+            test_helpers::seed_conversation(&db, folder_id, AgentType::ClaudeCode).await;
 
         // A LIVE connection (receiver kept) so `send_prompt` reaches the gate —
         // a dropped receiver would fail `reserve()` with ProcessExited before it.
@@ -1386,7 +1492,11 @@ mod async_relay_dedup_tests {
             .insert_test_connection_live("conn", AgentType::ClaudeCode, None, EventEmitter::Noop)
             .await;
         // Seed the kickoff prompt + simulate another client's turn in flight.
-        bridge.lock().await.get_mut("conn").unwrap().pending_prompt = Some("do the task".into());
+        bridge.lock().await.get_mut("conn").unwrap().pending_prompt = Some(PendingPrompt {
+            text: "do the task".into(),
+            folder_id,
+            conversation_id,
+        });
         conn.get_state("conn")
             .await
             .unwrap()
@@ -1411,7 +1521,8 @@ mod async_relay_dedup_tests {
                 .get("conn")
                 .unwrap()
                 .pending_prompt
-                .as_deref(),
+                .as_ref()
+                .map(|pending| pending.text.as_str()),
             Some("do the task"),
             "a deferred kickoff must be RESTORED, not dropped"
         );
@@ -1524,6 +1635,7 @@ mod error_terminal_gate_tests {
                 delegation_rendered: std::collections::HashSet::new(),
                 last_flushed: Instant::now(),
                 pending_prompt: None,
+                forward_events: true,
                 permission_pending: None,
             },
         );

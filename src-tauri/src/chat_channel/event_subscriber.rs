@@ -653,6 +653,7 @@ mod permission_push_tests {
             delegation_rendered: HashSet::new(),
             last_flushed: Instant::now(),
             pending_prompt: None,
+            forward_events: true,
             permission_pending: None,
         }
     }

@@ -1700,7 +1700,25 @@
         "toolResult": "結果",
         "toolError": "錯誤"
       },
-      "moreActions": "更多操作"
+      "moreActions": "更多操作",
+      "branch": {
+        "create": "建立分支",
+        "createFromMessage": "從這裡建立分支",
+        "nativeCreated": "已建立獨立原生分支",
+        "snapshotCreated": "已透過上下文快照建立分支",
+        "source": "分支自：{title}",
+        "sourceDeleted": "來源已刪除：{title}",
+        "sourceDeletedHint": "來源對話已刪除；此分支仍可獨立使用。",
+        "nativeMode": "原生分支",
+        "snapshotMode": "上下文快照",
+        "merge": "合併回主對話",
+        "mergeSuccess": "已合併回主對話（{count} 個交付檔案）",
+        "mergeDescription": "只會追加結論及明確選取的交付檔案，不會改寫既有歷史。",
+        "summaryPlaceholder": "填寫要回傳的最終結論",
+        "selectMessages": "選擇要回傳的可見回覆（仍可編輯文字）",
+        "mergeKeep": "合併並繼續使用分支",
+        "mergeArchive": "合併並封存分支（標記完成）"
+      }
     },
     "sessionDetails": {
       "menuLabel": "對話詳情",

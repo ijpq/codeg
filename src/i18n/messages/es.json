@@ -1700,7 +1700,25 @@
         "toolResult": "Resultado",
         "toolError": "Error"
       },
-      "moreActions": "Más acciones"
+      "moreActions": "Más acciones",
+      "branch": {
+        "create": "Crear rama",
+        "createFromMessage": "Crear rama desde aquí",
+        "nativeCreated": "Rama nativa independiente creada",
+        "snapshotCreated": "Rama creada desde una instantánea de contexto",
+        "source": "Rama de: {title}",
+        "sourceDeleted": "Origen eliminado: {title}",
+        "sourceDeletedHint": "La conversación de origen fue eliminada; esta rama sigue siendo independiente.",
+        "nativeMode": "Rama nativa",
+        "snapshotMode": "Instantánea de contexto",
+        "merge": "Fusionar en la conversación principal",
+        "mergeSuccess": "Fusionado en la conversación principal ({count} entregables)",
+        "mergeDescription": "Solo se añaden la conclusión y los entregables seleccionados; no se reescribe el historial.",
+        "summaryPlaceholder": "Conclusión que se devolverá",
+        "selectMessages": "Selecciona respuestas visibles (el texto se puede editar)",
+        "mergeKeep": "Fusionar y seguir usando la rama",
+        "mergeArchive": "Fusionar y marcar la rama como completada"
+      }
     },
     "sessionDetails": {
       "menuLabel": "Detalles de la sesión",

@@ -8,7 +8,7 @@ use tokio::sync::Mutex;
 
 use super::i18n::{self, Lang};
 use super::manager::ChatChannelManager;
-use super::session_bridge::{ActiveSession, SessionBridge};
+use super::session_bridge::{ActiveSession, PendingPrompt, SessionBridge};
 use super::types::{
     ButtonStyle, ChannelMessageTarget, InteractiveMessage, MessageButton, MessageLevel, RichMessage,
 };
@@ -621,6 +621,7 @@ pub async fn handle_task(
             delegation_rendered: std::collections::HashSet::new(),
             last_flushed: Instant::now(),
             pending_prompt: None,
+            forward_events: true,
             permission_pending: None,
         };
         bridge.lock().await.register(connection_id.clone(), session);
@@ -872,36 +873,23 @@ pub async fn handle_resume(
         }
     };
 
-    let runtime_env = match build_chat_session_runtime_env(
-        db,
-        conv.agent_type,
-        conv.external_id.as_deref(),
+    // Manual and automatic resume intentionally share the persisted restore
+    // primitive. It provides per-session/per-conversation single-flight,
+    // connection reuse and atomic DB binding replacement.
+    let owner_label = owner_label_for(channel_id, sender_id, target);
+    let connection_id = match crate::commands::acp::acp_restore_conversation_core(
+        conv.id,
+        None,
+        BTreeMap::new(),
+        conn_mgr,
+        &AppDatabase { conn: db.clone() },
         data_dir,
+        owner_label,
+        emitter.clone(),
     )
     .await
     {
-        Ok(env) => env,
-        Err(e) => {
-            return RichMessage::error(format!("{}{e}", i18n::failed_to_start_agent_label(lang)));
-        }
-    };
-
-    // Spawn agent with session_id for resume
-    let owner_label = owner_label_for(channel_id, sender_id, target);
-    let connection_id = match conn_mgr
-        .spawn_agent(
-            conv.agent_type,
-            Some(folder.path.clone()),
-            conv.external_id.clone(),
-            runtime_env,
-            owner_label,
-            emitter.clone(),
-            None,
-            BTreeMap::new(),
-        )
-        .await
-    {
-        Ok(id) => id,
+        Ok(restored) => restored.connection_id,
         Err(e) => {
             return RichMessage::error(format!("{}{e}", i18n::failed_to_start_agent_label(lang)));
         }
@@ -922,6 +910,7 @@ pub async fn handle_resume(
             delegation_rendered: std::collections::HashSet::new(),
             last_flushed: Instant::now(),
             pending_prompt: None,
+            forward_events: false,
             permission_pending: None,
         };
         bridge.lock().await.register(connection_id.clone(), session);
@@ -1119,25 +1108,77 @@ pub async fn handle_followup(req: FollowupRequest<'_>) -> RichMessage {
         return handle_topic_followup(req).await;
     }
 
-    let session_ref = match command_session_ref(
-        req.db,
-        req.bridge,
-        req.channel_id,
-        req.sender_id,
-        req.target,
-    )
-    .await
-    {
-        Ok(Some(s)) => s,
-        Ok(None) => {
-            let body = if req.target.is_telegram_forum_topic() {
-                no_topic_session_use_task_or_resume(req.lang, req.prefix)
-            } else {
-                i18n::no_active_session_use_task(req.lang, req.prefix)
-            };
-            return RichMessage::info(body);
-        }
+    let active = {
+        let guard = req.bridge.lock().await;
+        guard
+            .find_by_sender(req.channel_id, req.sender_id)
+            .map(|session| CommandSessionRef {
+                connection_id: session.connection_id.clone(),
+                conversation_id: Some(session.conversation_id),
+                binding_id: None,
+            })
+    };
+    if let Some(session_ref) = active {
+        return send_followup_to_session(req, session_ref).await;
+    }
+
+    restore_sender_context_and_send_followup(req).await
+}
+
+async fn restore_sender_context_and_send_followup(req: FollowupRequest<'_>) -> RichMessage {
+    let restore_lock = {
+        let mut guard = req.bridge.lock().await;
+        guard.restore_lock(req.channel_id, req.sender_id)
+    };
+    let _restore_guard = restore_lock.lock().await;
+
+    // A concurrent first message may already have completed restoration.
+    let active = {
+        let guard = req.bridge.lock().await;
+        guard
+            .find_by_sender(req.channel_id, req.sender_id)
+            .map(|session| CommandSessionRef {
+                connection_id: session.connection_id.clone(),
+                conversation_id: Some(session.conversation_id),
+                binding_id: None,
+            })
+    };
+    if let Some(session_ref) = active {
+        return send_followup_to_session(req, session_ref).await;
+    }
+
+    let context =
+        match sender_context_service::get_or_create(req.db, req.channel_id, req.sender_id).await {
+            Ok(context) => context,
+            Err(e) => {
+                return RichMessage::error(format!(
+                    "{}{e}",
+                    i18n::failed_to_load_context_label(req.lang)
+                ));
+            }
+        };
+    let Some(conversation_id) = context.current_conversation_id else {
+        return RichMessage::info(i18n::no_active_session_use_task(req.lang, req.prefix));
+    };
+
+    let conversation = match conversation_service::get_by_id(req.db, conversation_id).await {
+        Ok(conversation) => conversation,
         Err(e) => {
+            let existence = conversation::Entity::find_by_id(conversation_id)
+                .filter(conversation::Column::DeletedAt.is_null())
+                .one(req.db)
+                .await;
+            if matches!(existence, Ok(None)) {
+                let _ =
+                    sender_context_service::clear_session(req.db, req.channel_id, req.sender_id)
+                        .await;
+                return RichMessage::info(i18n::conversation_not_found(req.lang));
+            }
+            // A second DB read failure is not proof that the conversation was
+            // deleted. Retain the durable binding and discard only its stale
+            // process-local connection so the next message can retry.
+            let _ = sender_context_service::clear_connection(req.db, req.channel_id, req.sender_id)
+                .await;
             return RichMessage::error(format!(
                 "{}{e}",
                 i18n::failed_to_load_context_label(req.lang)
@@ -1145,49 +1186,113 @@ pub async fn handle_followup(req: FollowupRequest<'_>) -> RichMessage {
         }
     };
 
-    let connection_id = session_ref.connection_id;
+    let restored = crate::commands::acp::acp_restore_conversation_core(
+        conversation.id,
+        None,
+        BTreeMap::new(),
+        req.conn_mgr,
+        &AppDatabase {
+            conn: req.db.clone(),
+        },
+        req.data_dir,
+        owner_label_for(req.channel_id, req.sender_id, req.target),
+        req.emitter.clone(),
+    )
+    .await;
+    let connection_id = match restored {
+        Ok(restored) => restored.connection_id,
+        Err(e) => {
+            // The durable conversation remains authoritative and retryable;
+            // only the stale process-local connection id is discarded.
+            let _ = sender_context_service::clear_connection(req.db, req.channel_id, req.sender_id)
+                .await;
+            return RichMessage::error(auto_resume_failed(req.lang, &e.to_string()));
+        }
+    };
 
-    // Check connection exists in bridge
+    req.bridge.lock().await.register(
+        connection_id.clone(),
+        ActiveSession {
+            channel_id: req.channel_id,
+            sender_id: req.sender_id.to_string(),
+            target: req.target.clone(),
+            conversation_id: conversation.id,
+            connection_id: connection_id.clone(),
+            agent_type: conversation.agent_type,
+            content_buffer: String::new(),
+            tool_calls: Vec::new(),
+            tool_call_inputs: std::collections::HashMap::new(),
+            delegation_rendered: std::collections::HashSet::new(),
+            last_flushed: Instant::now(),
+            pending_prompt: None,
+            forward_events: false,
+            permission_pending: None,
+        },
+    );
+    let _ = sender_context_service::update_session(
+        req.db,
+        req.channel_id,
+        req.sender_id,
+        Some(conversation.id),
+        Some(connection_id.clone()),
+    )
+    .await;
+    let _ = sender_context_service::update_folder(
+        req.db,
+        req.channel_id,
+        req.sender_id,
+        Some(conversation.folder_id),
+    )
+    .await;
+
+    send_restored_followup(req, connection_id, conversation.folder_id, conversation.id).await
+}
+
+async fn send_restored_followup(
+    req: FollowupRequest<'_>,
+    connection_id: String,
+    folder_id: i32,
+    conversation_id: i32,
+) -> RichMessage {
     {
-        let bridge_guard = req.bridge.lock().await;
-        if bridge_guard.get(&connection_id).is_none() {
-            // Connection lost, clear context
-            drop(bridge_guard);
-            if let Some(binding_id) = session_ref.binding_id {
-                let _ = thread_binding_service::clear_connection(req.db, binding_id).await;
-            } else {
-                let _ =
-                    sender_context_service::clear_session(req.db, req.channel_id, req.sender_id)
-                        .await;
+        let mut guard = req.bridge.lock().await;
+        if let Some(session) = guard.get_mut(&connection_id) {
+            session.forward_events = true;
+        }
+    }
+    match send_chat_prompt_linked(
+        req.db,
+        req.conn_mgr,
+        &connection_id,
+        folder_id,
+        conversation_id,
+        req.text,
+    )
+    .await
+    {
+        Ok(()) => RichMessage::info(i18n::message_sent(req.lang)),
+        Err(crate::acp::error::AcpError::TurnInProgress) => {
+            let mut guard = req.bridge.lock().await;
+            if let Some(session) = guard.get_mut(&connection_id) {
+                session.forward_events = false;
+                session.pending_prompt = Some(PendingPrompt {
+                    text: req.text.to_string(),
+                    folder_id,
+                    conversation_id,
+                });
             }
-            return RichMessage::info(i18n::session_connection_lost(req.lang, req.prefix));
+            RichMessage::info(i18n::task_deferred_busy(req.lang).to_string())
+        }
+        Err(e) => {
+            req.bridge.lock().await.remove(&connection_id);
+            let _ = sender_context_service::clear_connection(req.db, req.channel_id, req.sender_id)
+                .await;
+            RichMessage::error(format!(
+                "{}{e}",
+                i18n::failed_to_send_message_label(req.lang)
+            ))
         }
     }
-
-    // Send prompt to agent
-    if let Err(e) = send_chat_prompt(req.conn_mgr, &connection_id, req.text).await {
-        // A turn is already in flight on this (shared) connection — another
-        // client, or a previous prompt still running. This is transient: the
-        // connection is alive, so do NOT tear down the bridge/session. Tell the
-        // user to retry once the current turn finishes.
-        if matches!(e, crate::acp::error::AcpError::TurnInProgress) {
-            return RichMessage::info(i18n::agent_busy_retry(req.lang).to_string());
-        }
-        // Otherwise the connection may have died — clean up.
-        req.bridge.lock().await.remove(&connection_id);
-        if let Some(binding_id) = session_ref.binding_id {
-            let _ = thread_binding_service::clear_connection(req.db, binding_id).await;
-        } else {
-            let _ =
-                sender_context_service::clear_session(req.db, req.channel_id, req.sender_id).await;
-        }
-        return RichMessage::error(format!(
-            "{}{e}",
-            i18n::failed_to_send_message_label(req.lang)
-        ));
-    }
-
-    RichMessage::info(i18n::message_sent(req.lang))
 }
 
 async fn handle_topic_followup(req: FollowupRequest<'_>) -> RichMessage {
@@ -1256,14 +1361,24 @@ async fn send_followup_to_session(
                 let _ = thread_binding_service::clear_connection(req.db, binding_id).await;
             } else {
                 let _ =
-                    sender_context_service::clear_session(req.db, req.channel_id, req.sender_id)
+                    sender_context_service::clear_connection(req.db, req.channel_id, req.sender_id)
                         .await;
             }
             return RichMessage::info(i18n::session_connection_lost(req.lang, req.prefix));
         }
     }
 
+    let was_forwarding = {
+        let mut guard = req.bridge.lock().await;
+        let Some(session) = guard.get_mut(&connection_id) else {
+            return RichMessage::info(i18n::session_connection_lost(req.lang, req.prefix));
+        };
+        std::mem::replace(&mut session.forward_events, true)
+    };
     if let Err(e) = send_chat_prompt(req.conn_mgr, &connection_id, req.text).await {
+        if let Some(session) = req.bridge.lock().await.get_mut(&connection_id) {
+            session.forward_events = was_forwarding;
+        }
         if matches!(e, crate::acp::error::AcpError::TurnInProgress) {
             return RichMessage::info(i18n::agent_busy_retry(req.lang).to_string());
         }
@@ -1271,8 +1386,8 @@ async fn send_followup_to_session(
         if let Some(binding_id) = session_ref.binding_id {
             let _ = thread_binding_service::clear_connection(req.db, binding_id).await;
         } else {
-            let _ =
-                sender_context_service::clear_session(req.db, req.channel_id, req.sender_id).await;
+            let _ = sender_context_service::clear_connection(req.db, req.channel_id, req.sender_id)
+                .await;
         }
         return RichMessage::error(format!(
             "{}{}",
@@ -1321,6 +1436,7 @@ async fn resume_topic_binding_and_send_followup(
         delegation_rendered: std::collections::HashSet::new(),
         last_flushed: Instant::now(),
         pending_prompt: None,
+        forward_events: false,
         permission_pending: None,
     };
     req.bridge
@@ -1352,6 +1468,9 @@ async fn resume_topic_binding_and_send_followup(
     )
     .await;
 
+    if let Some(session) = req.bridge.lock().await.get_mut(&connection_id) {
+        session.forward_events = true;
+    }
     if let Err(e) = send_chat_prompt_linked(
         req.db,
         req.conn_mgr,
@@ -1362,6 +1481,9 @@ async fn resume_topic_binding_and_send_followup(
     )
     .await
     {
+        if let Some(session) = req.bridge.lock().await.get_mut(&connection_id) {
+            session.forward_events = false;
+        }
         req.bridge.lock().await.remove(&connection_id);
         let _ = thread_binding_service::clear_connection(req.db, binding.id).await;
         let _ = req.conn_mgr.cancel(req.db, &connection_id).await;
@@ -1637,6 +1759,13 @@ fn topic_resume_failed(lang: Lang, conversation_id: i32, detail: &str) -> String
     }
 }
 
+fn auto_resume_failed(lang: Lang, detail: &str) -> String {
+    match lang {
+        Lang::ZhCn | Lang::ZhTw => format!("恢复上次会话失败，请重试：{detail}"),
+        _ => format!("Failed to restore the previous session; please retry: {detail}"),
+    }
+}
+
 fn general_topic_task_created_message(
     lang: Lang,
     agent_type: AgentType,
@@ -1752,6 +1881,168 @@ mod tests {
         .await
         .expect("seed chat channel")
         .id
+    }
+
+    fn followup_request<'a>(
+        db: &'a sea_orm::DatabaseConnection,
+        text: &'a str,
+        channel_id: i32,
+        target: &'a ChannelMessageTarget,
+        manager: &'a ConnectionManager,
+        emitter: &'a EventEmitter,
+        bridge: &'a Arc<Mutex<SessionBridge>>,
+    ) -> FollowupRequest<'a> {
+        FollowupRequest {
+            db,
+            text,
+            channel_id,
+            sender_id: "sender-1",
+            target,
+            conn_mgr: manager,
+            emitter,
+            bridge,
+            data_dir: std::path::Path::new("/tmp/codeg-channel-restore-test"),
+            lang: Lang::En,
+            prefix: "/",
+        }
+    }
+
+    #[tokio::test]
+    async fn active_bridge_followup_sends_original_message_exactly_once() {
+        let db = fresh_in_memory_db().await;
+        let channel_id = seed_chat_channel(&db).await;
+        let folder_id = seed_folder(&db, "/tmp/codeg-channel-active").await;
+        let conversation_id = seed_conversation(&db, folder_id, AgentType::OpenCode).await;
+        let target = ChannelMessageTarget::channel(channel_id);
+        let manager = ConnectionManager::new();
+        let emitter = EventEmitter::Noop;
+        let mut commands = manager
+            .insert_test_connection_live(
+                "channel-active",
+                AgentType::OpenCode,
+                None,
+                EventEmitter::Noop,
+            )
+            .await;
+        let bridge = Arc::new(Mutex::new(SessionBridge::new()));
+        bridge.lock().await.register(
+            "channel-active".into(),
+            ActiveSession {
+                channel_id,
+                sender_id: "sender-1".into(),
+                target: target.clone(),
+                conversation_id,
+                connection_id: "channel-active".into(),
+                agent_type: AgentType::OpenCode,
+                content_buffer: String::new(),
+                tool_calls: Vec::new(),
+                tool_call_inputs: std::collections::HashMap::new(),
+                delegation_rendered: std::collections::HashSet::new(),
+                last_flushed: Instant::now(),
+                pending_prompt: None,
+                forward_events: false,
+                permission_pending: None,
+            },
+        );
+
+        let response = handle_followup(followup_request(
+            &db.conn,
+            "first message",
+            channel_id,
+            &target,
+            &manager,
+            &emitter,
+            &bridge,
+        ))
+        .await;
+        assert_eq!(response.body, "Message sent.");
+        let command = commands.recv().await.expect("prompt command");
+        let ConnectionCommand::Prompt { blocks, .. } = command else {
+            panic!("expected prompt")
+        };
+        assert!(matches!(
+            blocks.as_slice(),
+            [PromptInputBlock::Text { text }] if text == "first message"
+        ));
+        assert!(
+            commands.try_recv().is_err(),
+            "message must be submitted once"
+        );
+        assert!(
+            bridge
+                .lock()
+                .await
+                .get("channel-active")
+                .unwrap()
+                .forward_events
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_auto_restore_keeps_conversation_and_clears_only_connection() {
+        let db = fresh_in_memory_db().await;
+        let channel_id = seed_chat_channel(&db).await;
+        let folder_id = seed_folder(&db, "/tmp/codeg-channel-retry").await;
+        let conversation_id = seed_conversation(&db, folder_id, AgentType::OpenCode).await;
+        sender_context_service::update_session(
+            &db.conn,
+            channel_id,
+            "sender-1",
+            Some(conversation_id),
+            Some("stale-process-connection".into()),
+        )
+        .await
+        .unwrap();
+        let target = ChannelMessageTarget::channel(channel_id);
+        let manager = ConnectionManager::new();
+        let emitter = EventEmitter::Noop;
+        let bridge = Arc::new(Mutex::new(SessionBridge::new()));
+
+        let response = handle_followup(followup_request(
+            &db.conn,
+            "restore me",
+            channel_id,
+            &target,
+            &manager,
+            &emitter,
+            &bridge,
+        ))
+        .await;
+        let context = sender_context_service::get_or_create(&db.conn, channel_id, "sender-1")
+            .await
+            .unwrap();
+        assert!(response.body.contains("Failed to restore"));
+        assert_eq!(context.current_conversation_id, Some(conversation_id));
+        assert_eq!(context.current_connection_id, None);
+    }
+
+    #[tokio::test]
+    async fn deleted_conversation_auto_restore_clears_invalid_binding() {
+        let db = fresh_in_memory_db().await;
+        let channel_id = seed_chat_channel(&db).await;
+        sender_context_service::update_session(
+            &db.conn,
+            channel_id,
+            "sender-1",
+            Some(999_999),
+            Some("stale".into()),
+        )
+        .await
+        .unwrap();
+        let target = ChannelMessageTarget::channel(channel_id);
+        let manager = ConnectionManager::new();
+        let emitter = EventEmitter::Noop;
+        let bridge = Arc::new(Mutex::new(SessionBridge::new()));
+        let response = handle_followup(followup_request(
+            &db.conn, "hello", channel_id, &target, &manager, &emitter, &bridge,
+        ))
+        .await;
+        let context = sender_context_service::get_or_create(&db.conn, channel_id, "sender-1")
+            .await
+            .unwrap();
+        assert!(response.body.contains("not found"));
+        assert_eq!(context.current_conversation_id, None);
+        assert_eq!(context.current_connection_id, None);
     }
 
     #[tokio::test]
@@ -1908,6 +2199,7 @@ mod tests {
                 delegation_rendered: std::collections::HashSet::new(),
                 last_flushed: Instant::now(),
                 pending_prompt: None,
+                forward_events: true,
                 permission_pending: None,
             },
         );
@@ -2113,6 +2405,7 @@ mod tests {
                 delegation_rendered: std::collections::HashSet::new(),
                 last_flushed: Instant::now(),
                 pending_prompt: None,
+                forward_events: true,
                 permission_pending: None,
             },
         );

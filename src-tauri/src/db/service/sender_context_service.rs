@@ -87,6 +87,21 @@ pub async fn clear_session(
     update_session(conn, channel_id, sender_id, None, None).await
 }
 
+/// Forget only the ephemeral in-process ACP binding while retaining the
+/// durable conversation selection. Server restart and reconnect recovery use
+/// that conversation id to rebuild `SessionBridge` on the next message.
+pub async fn clear_connection(
+    conn: &DatabaseConnection,
+    channel_id: i32,
+    sender_id: &str,
+) -> Result<chat_channel_sender_context::Model, DbError> {
+    let model = get_or_create(conn, channel_id, sender_id).await?;
+    let mut active = model.into_active_model();
+    active.current_connection_id = Set(None);
+    active.updated_at = Set(Utc::now());
+    Ok(active.update(conn).await?)
+}
+
 pub async fn update_auto_approve(
     conn: &DatabaseConnection,
     channel_id: i32,

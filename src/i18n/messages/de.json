@@ -1700,7 +1700,25 @@
         "toolResult": "Ergebnis",
         "toolError": "Fehler"
       },
-      "moreActions": "Weitere Aktionen"
+      "moreActions": "Weitere Aktionen",
+      "branch": {
+        "create": "Zweig erstellen",
+        "createFromMessage": "Ab hier Zweig erstellen",
+        "nativeCreated": "Unabhängiger nativer Zweig erstellt",
+        "snapshotCreated": "Zweig aus Kontext-Snapshot erstellt",
+        "source": "Abgezweigt von: {title}",
+        "sourceDeleted": "Quelle gelöscht: {title}",
+        "sourceDeletedHint": "Die Quellkonversation wurde gelöscht; dieser Zweig bleibt unabhängig nutzbar.",
+        "nativeMode": "Nativer Zweig",
+        "snapshotMode": "Kontext-Snapshot",
+        "merge": "In Hauptkonversation zusammenführen",
+        "mergeSuccess": "In Hauptkonversation zusammengeführt ({count} Ergebnisse)",
+        "mergeDescription": "Nur das Fazit und ausgewählte Ergebnisse werden angehängt; der Verlauf wird nicht umgeschrieben.",
+        "summaryPlaceholder": "Zurückzugebendes Fazit",
+        "selectMessages": "Sichtbare Antworten auswählen (Text bleibt bearbeitbar)",
+        "mergeKeep": "Zusammenführen und Zweig weiterverwenden",
+        "mergeArchive": "Zusammenführen und Zweig abschließen"
+      }
     },
     "sessionDetails": {
       "menuLabel": "Sitzungsdetails",

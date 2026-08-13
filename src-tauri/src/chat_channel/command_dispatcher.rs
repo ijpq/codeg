@@ -239,31 +239,27 @@ async fn dispatch_command(
                 );
             }
 
-            // Check if sender has an active session for follow-up
-            let has_session = {
-                let guard = bridge.lock().await;
-                guard.find_by_sender(channel_id, sender_id).is_some()
-            };
-            if has_session {
-                return DispatchResponse::current(
-                    session_commands::handle_followup(session_commands::FollowupRequest {
-                        db,
-                        text,
-                        channel_id,
-                        sender_id,
-                        target,
-                        conn_mgr,
-                        emitter,
-                        bridge,
-                        data_dir,
-                        lang,
-                        prefix,
-                    })
-                    .await,
+            // The bridge is intentionally in-memory. Always let follow-up
+            // routing inspect the durable sender context so the first message
+            // after a restart can restore its previous conversation instead
+            // of falling through to Help.
+            return DispatchResponse::current(
+                session_commands::handle_followup(session_commands::FollowupRequest {
+                    db,
+                    text,
+                    channel_id,
+                    sender_id,
                     target,
-                );
-            }
-            return DispatchResponse::current(command_handlers::handle_help(prefix, lang), target);
+                    conn_mgr,
+                    emitter,
+                    bridge,
+                    data_dir,
+                    lang,
+                    prefix,
+                })
+                .await,
+                target,
+            );
         }
     };
 
@@ -544,5 +540,35 @@ mod tests {
 
         assert!(response.message.is_none());
         assert_eq!(response.target, target);
+    }
+
+    #[tokio::test]
+    async fn ordinary_plain_text_uses_followup_router_instead_of_help_fallback() {
+        let db = fresh_in_memory_db().await;
+        let channel_id = seed_chat_channel(&db).await;
+        let target = ChannelMessageTarget::channel(channel_id);
+        let bridge = Arc::new(Mutex::new(SessionBridge::new()));
+
+        let response = dispatch_command(
+            "hello",
+            "/",
+            &db.conn,
+            &ChatChannelManager::new(),
+            &ConnectionManager::new(),
+            &EventEmitter::Noop,
+            &bridge,
+            std::path::Path::new("/tmp/codeg-dispatch-data"),
+            channel_id,
+            "sender-1",
+            &target,
+            None,
+            Lang::En,
+        )
+        .await;
+        let Some(DispatchMessage::Rich(message)) = response.message else {
+            panic!("ordinary text should receive follow-up status")
+        };
+        assert!(message.body.contains("/task"));
+        assert_ne!(message.title.as_deref(), Some("Codeg Bot Help"));
     }
 }

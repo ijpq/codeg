@@ -1700,7 +1700,25 @@
         "toolResult": "結果",
         "toolError": "エラー"
       },
-      "moreActions": "その他の操作"
+      "moreActions": "その他の操作",
+      "branch": {
+        "create": "ブランチを作成",
+        "createFromMessage": "ここからブランチを作成",
+        "nativeCreated": "独立したネイティブブランチを作成しました",
+        "snapshotCreated": "コンテキストスナップショットからブランチを作成しました",
+        "source": "分岐元：{title}",
+        "sourceDeleted": "削除された分岐元：{title}",
+        "sourceDeletedHint": "元の会話は削除されましたが、このブランチは独立して利用できます。",
+        "nativeMode": "ネイティブブランチ",
+        "snapshotMode": "コンテキストスナップショット",
+        "merge": "メイン会話へマージ",
+        "mergeSuccess": "メイン会話へマージしました（成果物 {count} 件）",
+        "mergeDescription": "結論と選択した成果物のみを追加し、既存履歴は書き換えません。",
+        "summaryPlaceholder": "戻す結論を入力",
+        "selectMessages": "戻す表示可能な返信を選択（本文は編集できます）",
+        "mergeKeep": "マージしてブランチを継続",
+        "mergeArchive": "マージしてブランチを完了にする"
+      }
     },
     "sessionDetails": {
       "menuLabel": "セッション詳細",
