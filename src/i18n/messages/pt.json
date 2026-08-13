@@ -1625,7 +1625,25 @@
         "toolResult": "Resultado",
         "toolError": "Erro"
       },
-      "moreActions": "Mais ações"
+      "moreActions": "Mais ações",
+      "branch": {
+        "create": "Criar ramificação",
+        "createFromMessage": "Criar ramificação daqui",
+        "nativeCreated": "Ramificação nativa independente criada",
+        "snapshotCreated": "Ramificação criada de um snapshot de contexto",
+        "source": "Ramificada de: {title}",
+        "sourceDeleted": "Origem excluída: {title}",
+        "sourceDeletedHint": "A conversa de origem foi excluída; esta ramificação continua independente.",
+        "nativeMode": "Ramificação nativa",
+        "snapshotMode": "Snapshot de contexto",
+        "merge": "Mesclar na conversa principal",
+        "mergeSuccess": "Mesclado na conversa principal ({count} entregáveis)",
+        "mergeDescription": "Somente a conclusão e os entregáveis selecionados são anexados; o histórico não é reescrito.",
+        "summaryPlaceholder": "Conclusão a devolver",
+        "selectMessages": "Selecione respostas visíveis (o texto pode ser editado)",
+        "mergeKeep": "Mesclar e continuar a ramificação",
+        "mergeArchive": "Mesclar e marcar a ramificação como concluída"
+      }
     },
     "sessionDetails": {
       "menuLabel": "Detalhes da sessão",

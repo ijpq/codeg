@@ -1625,7 +1625,25 @@
         "toolResult": "Result",
         "toolError": "Error"
       },
-      "moreActions": "More actions"
+      "moreActions": "More actions",
+      "branch": {
+        "create": "Create branch",
+        "createFromMessage": "Create branch from here",
+        "nativeCreated": "Independent native branch created",
+        "snapshotCreated": "Branch created from a context snapshot",
+        "source": "Branched from: {title}",
+        "sourceDeleted": "Source deleted: {title}",
+        "sourceDeletedHint": "The source conversation was deleted; this branch remains independent.",
+        "nativeMode": "Native branch",
+        "snapshotMode": "Context snapshot",
+        "merge": "Merge into main conversation",
+        "mergeSuccess": "Merged into the main conversation ({count} deliverables)",
+        "mergeDescription": "Only the conclusion below and explicitly selected deliverables are appended. Existing history is never rewritten.",
+        "summaryPlaceholder": "Conclusion to send back",
+        "selectMessages": "Select visible replies to send back (you can still edit the text)",
+        "mergeKeep": "Merge and keep branch",
+        "mergeArchive": "Merge and mark branch complete"
+      }
     },
     "sessionDetails": {
       "menuLabel": "Session Details",

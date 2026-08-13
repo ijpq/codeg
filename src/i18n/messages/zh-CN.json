@@ -1625,7 +1625,25 @@
         "toolResult": "结果",
         "toolError": "错误"
       },
-      "moreActions": "更多操作"
+      "moreActions": "更多操作",
+      "branch": {
+        "create": "创建分支",
+        "createFromMessage": "从这里创建分支",
+        "nativeCreated": "已创建独立原生分支",
+        "snapshotCreated": "已通过上下文快照创建分支",
+        "source": "分支自：{title}",
+        "sourceDeleted": "来源已删除：{title}",
+        "sourceDeletedHint": "来源会话已删除；本分支仍可独立使用。",
+        "nativeMode": "原生分支",
+        "snapshotMode": "上下文快照",
+        "merge": "合并回主会话",
+        "mergeSuccess": "已合并回主会话（{count} 个交付文件）",
+        "mergeDescription": "只会向主会话追加下面的结论和你明确选择的交付文件，不会改写原历史。",
+        "summaryPlaceholder": "填写要回传的最终结论",
+        "selectMessages": "选择要回传的用户可见回复（正文仍可继续编辑）",
+        "mergeKeep": "合并并继续使用分支",
+        "mergeArchive": "合并并归档分支（标记完成）"
+      }
     },
     "sessionDetails": {
       "menuLabel": "会话详情",

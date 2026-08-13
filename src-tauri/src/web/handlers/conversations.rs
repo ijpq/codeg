@@ -5,6 +5,7 @@ use serde::Deserialize;
 
 use crate::app_error::AppCommandError;
 use crate::app_state::AppState;
+use crate::commands::conversation_branches as branch_commands;
 use crate::commands::conversations as conv_commands;
 use crate::models::*;
 
@@ -303,6 +304,79 @@ pub async fn create_conversation(
     .await?;
     conv_commands::emit_conversation_upsert(&state.emitter, &db.conn, result).await;
     Ok(Json(result))
+}
+
+#[derive(Deserialize)]
+pub struct CreateConversationBranchParams {
+    pub request: branch_commands::CreateConversationBranchRequest,
+}
+
+pub async fn create_conversation_branch(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<CreateConversationBranchParams>,
+) -> Result<Json<branch_commands::CreateConversationBranchResult>, AppCommandError> {
+    Ok(Json(
+        branch_commands::create_conversation_branch_core(
+            &state.db,
+            &state.connection_manager,
+            &state.emitter,
+            &state.data_dir,
+            "web:conversation-branch".into(),
+            params.request,
+        )
+        .await?,
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetConversationBranchInfoParams {
+    pub conversation_id: i32,
+}
+
+pub async fn get_conversation_branch_info(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<GetConversationBranchInfoParams>,
+) -> Result<
+    Json<Option<crate::db::service::conversation_branch_service::ConversationBranchInfo>>,
+    AppCommandError,
+> {
+    Ok(Json(
+        crate::db::service::conversation_branch_service::get_info(
+            &state.db.conn,
+            params.conversation_id,
+        )
+        .await
+        .map_err(AppCommandError::from)?,
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergeConversationBranchParams {
+    pub branch_conversation_id: i32,
+    pub request_id: String,
+    pub summary: String,
+    #[serde(default)]
+    pub deliverable_ids: Vec<String>,
+}
+
+pub async fn merge_conversation_branch(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<MergeConversationBranchParams>,
+) -> Result<Json<crate::db::service::conversation_branch_service::MergeBranchResult>, AppCommandError>
+{
+    Ok(Json(
+        branch_commands::merge_conversation_branch_core(
+            &state.db,
+            &state.emitter,
+            params.branch_conversation_id,
+            params.request_id,
+            params.summary,
+            params.deliverable_ids,
+        )
+        .await?,
+    ))
 }
 
 #[derive(Deserialize)]

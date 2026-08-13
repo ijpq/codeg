@@ -62,10 +62,9 @@ mod tauri_app {
     use crate::acp::manager::ConnectionManager;
     use crate::chat_channel::manager::ChatChannelManager;
     use crate::commands::{
-        acp as acp_commands, app_update as app_update_commands,
-        automation as automation_commands, background as background_commands, backup,
-        chat_authoring as chat_authoring_commands, chat_channel as chat_channel_commands,
-        conversations,
+        acp as acp_commands, app_update as app_update_commands, automation as automation_commands,
+        background as background_commands, backup, chat_authoring as chat_authoring_commands,
+        chat_channel as chat_channel_commands, conversation_branches, conversations,
         custom_skills as custom_skills_commands, delegation as delegation_commands,
         deliverables as deliverable_commands, experts as experts_commands,
         feedback as feedback_commands, file_io, folder_commands, folder_links, folders,
@@ -73,13 +72,10 @@ mod tauri_app {
         model_provider as model_provider_commands, notification,
         office_tools as office_tools_commands, pet as pet_commands, project_boot,
         question as question_commands, quick_messages as quick_messages_commands,
-        remote_proxy as remote_proxy_commands,
-        remote_workspace as remote_workspace_commands, science as science_commands,
-        session_info as session_info_commands,
-        system_settings, terminal as terminal_commands,
-        token_usage as token_usage_commands,
-        version_control, windows, work_task as work_task_commands,
-        workspace_state as workspace_state_commands,
+        remote_proxy as remote_proxy_commands, remote_workspace as remote_workspace_commands,
+        science as science_commands, session_info as session_info_commands, system_settings,
+        terminal as terminal_commands, token_usage as token_usage_commands, version_control,
+        windows, work_task as work_task_commands, workspace_state as workspace_state_commands,
     };
     use crate::terminal::manager::TerminalManager;
     use crate::{db, git_credential, network, paths, process, web};
@@ -957,6 +953,9 @@ mod tauri_app {
                 conversations::update_conversation_title,
                 conversations::update_conversation_pinned,
                 conversations::delete_conversation,
+                conversation_branches::create_conversation_branch,
+                conversation_branches::get_conversation_branch_info,
+                conversation_branches::merge_conversation_branch,
                 deliverable_commands::deliverable_capabilities,
                 deliverable_commands::list_conversation_deliverables,
                 deliverable_commands::list_turn_deliverables,

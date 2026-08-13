@@ -182,6 +182,18 @@ pub fn build_router(
             post(handlers::conversations::create_conversation),
         )
         .route(
+            "/create_conversation_branch",
+            post(handlers::conversations::create_conversation_branch),
+        )
+        .route(
+            "/get_conversation_branch_info",
+            post(handlers::conversations::get_conversation_branch_info),
+        )
+        .route(
+            "/merge_conversation_branch",
+            post(handlers::conversations::merge_conversation_branch),
+        )
+        .route(
             "/create_chat_conversation",
             post(handlers::conversations::create_chat_conversation),
         )

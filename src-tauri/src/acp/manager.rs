@@ -28,11 +28,11 @@ use crate::acp::question::{
 };
 use crate::acp::types::{
     AcpEvent, AgentOptionsSnapshot, ConfigStaleKind, ConnectionInfo, ConnectionStatus,
-    ForkResultInfo, PromptCapabilitiesInfo, PromptInputBlock, SteerResult,
+    ForkProtocolResult, ForkResultInfo, PromptCapabilitiesInfo, PromptInputBlock, SteerResult,
 };
 use crate::artifact_tracker::{ArtifactTracker, ArtifactTurnFinishStatus};
 use crate::db::entities::conversation::{self, ConversationKind, ConversationStatus};
-use crate::db::service::{artifact_service, conversation_service};
+use crate::db::service::{artifact_service, conversation_branch_service, conversation_service};
 use crate::db::AppDatabase;
 use crate::models::agent::AgentType;
 use crate::web::event_bridge::{emit_with_state, emit_with_state_gated, EventEmitter};
@@ -481,6 +481,132 @@ impl ConnectionManager {
             )
             .await?
             .connection_id)
+    }
+
+    /// Start a second process for an existing session without reuse. User
+    /// conversation branching needs an isolated source handle: `session/fork`
+    /// mutates the connection it runs on, so using the source tab's live
+    /// connection would steal that tab and couple both sides' turn state.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn spawn_isolated_session(
+        &self,
+        agent_type: AgentType,
+        working_dir: Option<String>,
+        session_id: String,
+        runtime_env: BTreeMap<String, String>,
+        owner_window_label: String,
+        emitter: EventEmitter,
+        preferred_mode_id: Option<String>,
+        preferred_config_values: BTreeMap<String, String>,
+    ) -> Result<String, AcpError> {
+        let connection_id = uuid::Uuid::new_v4().to_string();
+        let ready_rx = spawn_agent_connection(
+            connection_id.clone(),
+            agent_type,
+            working_dir,
+            Some(session_id.clone()),
+            runtime_env,
+            owner_window_label,
+            emitter,
+            self.connections.clone(),
+            preferred_mode_id,
+            preferred_config_values,
+            self.delegation_snapshot(),
+            None,
+        )
+        .await?;
+        let (outcome, elapsed) =
+            wait_for_session_started(ready_rx, self.spawn_handshake_timeout).await;
+        tracing::info!(
+            connection_id,
+            external_session_id = session_id,
+            outcome = outcome.as_str(),
+            elapsed_ms = elapsed.as_millis() as u64,
+            "[ACP][branch] isolated source session initialized"
+        );
+        if !matches!(outcome, HandshakeWaitOutcome::Ready) {
+            let _ = self.disconnect(&connection_id).await;
+            return Err(AcpError::protocol(format!(
+                "isolated branch source did not become ready ({})",
+                outcome.as_str()
+            )));
+        }
+        Ok(connection_id)
+    }
+
+    /// Run only the native ACP `session/fork` round trip. Unlike
+    /// `fork_session`, this intentionally performs no conversation-row
+    /// mutation; its caller persists a new user branch row and relation.
+    pub(crate) async fn fork_protocol_only(
+        &self,
+        conn_id: &str,
+    ) -> Result<ForkProtocolResult, AcpError> {
+        let (state, cmd_tx) = {
+            let connections = self.connections.lock().await;
+            let conn = connections
+                .get(conn_id)
+                .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?;
+            (conn.state.clone(), conn.cmd_tx.clone())
+        };
+        let prompt_lock = self.clone_prompt_lock(conn_id).await?;
+        let _guard = prompt_lock.lock_owned().await;
+        if state.read().await.turn_in_flight {
+            return Err(AcpError::TurnInProgress);
+        }
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        cmd_tx
+            .send(ConnectionCommand::Fork { reply: reply_tx })
+            .await
+            .map_err(|_| AcpError::ProcessExited)?;
+        let result = reply_rx
+            .await
+            .map_err(|_| AcpError::protocol("Fork reply channel closed".to_string()))??;
+        // The protocol reply is emitted just before the connection loop
+        // publishes SessionStarted for S2. Do not expose the connection to the
+        // new tab during that narrow gap: restore dedup keys on external_id,
+        // and an early tab open could otherwise spawn a second process for the
+        // same forked session.
+        let deadline = tokio::time::Instant::now() + self.spawn_handshake_timeout;
+        loop {
+            if state.read().await.external_id.as_deref() == Some(result.forked_session_id.as_str())
+            {
+                return Ok(result);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(AcpError::protocol(format!(
+                    "forked session {} did not become active before timeout",
+                    result.forked_session_id
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    pub(crate) async fn bind_connection_to_conversation(
+        &self,
+        conn_id: &str,
+        conversation_id: i32,
+        folder_id: i32,
+    ) -> Result<(), AcpError> {
+        let (state, emitter) = {
+            let connections = self.connections.lock().await;
+            let conn = connections
+                .get(conn_id)
+                .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?;
+            (conn.state.clone(), conn.emitter.clone())
+        };
+        emit_with_state(
+            &state,
+            &emitter,
+            AcpEvent::ConversationLinked {
+                conversation_id,
+                folder_id,
+                parent_conversation_id: None,
+                parent_tool_use_id: None,
+            },
+        )
+        .await;
+        Ok(())
     }
 
     /// Spawn or reuse a connection for an atomic persisted-conversation
@@ -1703,6 +1829,57 @@ impl ConnectionManager {
             None
         };
 
+        // Snapshot branches bootstrap their fresh ACP session exactly once.
+        // Projection of the user-visible message and artifact expectation has
+        // already happened above, so this private context block reaches only
+        // the agent; the detail loader strips the marker from the persisted
+        // transcript after reload.
+        let branch_snapshot = if let Some(cid) = conversation_id_for_status {
+            conversation_branch_service::pending_snapshot(&db.conn, cid)
+                .await
+                .map_err(|e| AcpError::protocol(e.to_string()))?
+        } else {
+            None
+        };
+        if let Some(snapshot) = branch_snapshot.as_ref() {
+            blocks.insert(
+                0,
+                PromptInputBlock::Text {
+                    text: format!(
+                        "<codeg-branch-context>\nThis is a read-only context snapshot from the source conversation. Preserve it as prior context; the current user request follows after this block.\n\n{snapshot}\n</codeg-branch-context>"
+                    ),
+                },
+            );
+        }
+        // A merge is an append-only Codeg-authored turn, not an immediate
+        // agent request. Feed unconsumed merge conclusions into the target
+        // session with its next real prompt, and acknowledge them only after
+        // that prompt is accepted. This makes the result useful as agent
+        // context without creating a surprise extra turn at merge time.
+        let pending_merge_context = if let Some(cid) = conversation_id_for_status {
+            conversation_branch_service::pending_merge_context(&db.conn, cid)
+                .await
+                .map_err(|e| AcpError::protocol(e.to_string()))?
+        } else {
+            Vec::new()
+        };
+        if !pending_merge_context.is_empty() {
+            let text = pending_merge_context
+                .iter()
+                .map(|(_, context)| context.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            let insert_at = usize::from(branch_snapshot.is_some());
+            blocks.insert(
+                insert_at,
+                PromptInputBlock::Text {
+                    text: format!(
+                        "<codeg-branch-merge-context>\n{text}\n</codeg-branch-merge-context>"
+                    ),
+                },
+            );
+        }
+
         // We hold `_prompt_guard` here, so call the lock-free inner helper —
         // re-entering `send_prompt` would try to acquire the same mutex and
         // deadlock. The helper reserves channel capacity FIRST and only then
@@ -1716,6 +1893,39 @@ impl ConnectionManager {
         // row would be stuck until a follow-up `send_prompt_linked` re-flipped it.
         match self.send_prompt_inner(conn_id, blocks, user_message).await {
             Ok(()) => {
+                if branch_snapshot.is_some() {
+                    if let Some(cid) = conversation_id_for_status {
+                        if let Err(error) =
+                            conversation_branch_service::mark_snapshot_consumed(&db.conn, cid).await
+                        {
+                            tracing::error!(
+                                conversation_id = cid,
+                                error = %error,
+                                "[ACP][branch] failed to mark snapshot context consumed"
+                            );
+                        }
+                    }
+                }
+                if !pending_merge_context.is_empty() {
+                    if let Some(cid) = conversation_id_for_status {
+                        let merge_ids = pending_merge_context
+                            .iter()
+                            .map(|(id, _)| id.clone())
+                            .collect::<Vec<_>>();
+                        if let Err(error) =
+                            conversation_branch_service::mark_merge_context_consumed(
+                                &db.conn, cid, &merge_ids,
+                            )
+                            .await
+                        {
+                            tracing::error!(
+                                conversation_id = cid,
+                                error = %error,
+                                "[ACP][branch] failed to mark merged context consumed"
+                            );
+                        }
+                    }
+                }
                 if let Some(run_id) = artifact_run_id.as_ref() {
                     match artifact_service::mark_prompt_accepted(&db.conn, run_id).await {
                         Ok(()) => {
@@ -6739,7 +6949,10 @@ mod tests {
 
         let (mgr, join) =
             manager_with_fake_fork("c-fork-lock", pre.id, "session-S2", "session-S1").await;
-        let result = mgr.fork_session(&db, "c-fork-lock", None, None).await.unwrap();
+        let result = mgr
+            .fork_session(&db, "c-fork-lock", None, None)
+            .await
+            .unwrap();
         let _ = join.await;
 
         let sibling_id = result.sibling_conversation_id;
@@ -6874,7 +7087,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(current.title, None, "no title to prefix");
-        assert!(!current.title_locked, "an unwritten title must stay unlocked");
+        assert!(
+            !current.title_locked,
+            "an unwritten title must stay unlocked"
+        );
         let sibling = conversation_service::get_by_id(&db.conn, result.sibling_conversation_id)
             .await
             .unwrap();
@@ -6886,11 +7102,13 @@ mod tests {
                 .await
                 .unwrap()
         );
-        assert!(
-            conversation_service::refresh_auto_title(&db.conn, sibling.id, "First Name".into())
-                .await
-                .unwrap()
-        );
+        assert!(conversation_service::refresh_auto_title(
+            &db.conn,
+            sibling.id,
+            "First Name".into()
+        )
+        .await
+        .unwrap());
     }
 
     #[tokio::test]

@@ -4,8 +4,8 @@ use crate::app_error::AppCommandError;
 use crate::db::entities::conversation;
 use crate::db::entities::folder::FolderKind;
 use crate::db::service::{
-    artifact_service, conversation_service, deliverable_service, folder_service, import_service,
-    tab_service,
+    artifact_service, conversation_branch_service, conversation_service, deliverable_service,
+    folder_service, import_service, tab_service,
 };
 #[cfg(feature = "tauri-runtime")]
 use crate::db::AppDatabase;
@@ -1260,6 +1260,20 @@ async fn get_folder_conversation_core_impl(
     };
     let session_parse_elapsed_ms = parse_started.elapsed().as_millis() as u64;
 
+    // A snapshot fallback is injected into the first ACP prompt so an agent
+    // without native session/fork receives the source context. It is transport
+    // metadata, not user-authored text; remove it from persisted history while
+    // preserving the actual prompt that follows in later text blocks.
+    if conversation_branch_service::get_info(conn, conversation_id)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|info| info.fork_mode == "snapshot")
+    {
+        strip_branch_snapshot_context(&mut turns);
+    }
+    strip_branch_merge_context(&mut turns);
+
     // If we resolved a different external_id (e.g. ACP UUID → parser branch ID),
     // update the database so future lookups are direct.
     if let Some(new_ext_id) = resolved_ext_id {
@@ -1293,6 +1307,21 @@ async fn get_folder_conversation_core_impl(
         .await
         .unwrap_or_default();
     inject_delegation_meta(&mut turns, &children);
+    // Authored branch merges live in Codeg's durable DB rather than the
+    // agent-owned transcript. Append them only to the newest history page;
+    // older cursor pages must not repeat the same synthetic turns.
+    let newest_page = history_request
+        .as_ref()
+        .is_none_or(|request| request.before_cursor.is_none());
+    if newest_page {
+        for merge_turn in conversation_branch_service::merge_turns_for_target(conn, conversation_id)
+            .await
+            .map_err(AppCommandError::from)?
+        {
+            let index = turns.partition_point(|turn| turn.timestamp <= merge_turn.timestamp);
+            turns.insert(index, merge_turn);
+        }
+    }
     let artifact_runs = artifact_service::list_for_conversation(conn, conversation_id)
         .await
         .map_err(AppCommandError::from)?;
@@ -1337,6 +1366,52 @@ async fn get_folder_conversation_core_impl(
         },
         parsed_title,
     ))
+}
+
+fn strip_branch_snapshot_context(turns: &mut [MessageTurn]) {
+    let Some(first_user) = turns
+        .iter_mut()
+        .find(|turn| matches!(turn.role, TurnRole::User))
+    else {
+        return;
+    };
+    strip_context_marker_from_turn(
+        first_user,
+        "<codeg-branch-context>",
+        "</codeg-branch-context>",
+    );
+}
+
+fn strip_branch_merge_context(turns: &mut [MessageTurn]) {
+    for turn in turns
+        .iter_mut()
+        .filter(|turn| matches!(turn.role, TurnRole::User))
+    {
+        strip_context_marker_from_turn(
+            turn,
+            "<codeg-branch-merge-context>",
+            "</codeg-branch-merge-context>",
+        );
+    }
+}
+
+fn strip_context_marker_from_turn(turn: &mut MessageTurn, opening: &str, closing: &str) {
+    turn.blocks.retain_mut(|block| {
+        let ContentBlock::Text { text } = block else {
+            return true;
+        };
+        while let Some(start) = text.find(opening) {
+            let Some(relative_end) = text[start..].find(closing) else {
+                break;
+            };
+            let end = start + relative_end + closing.len();
+            let mut visible = String::new();
+            visible.push_str(&text[..start]);
+            visible.push_str(text[end..].trim_start_matches(['\r', '\n']));
+            *text = visible;
+        }
+        !text.trim().is_empty()
+    });
 }
 
 /// A normalized, comparable view of a user turn's renderable content. Used to
@@ -2388,6 +2463,42 @@ fn parse_error_to_app_error(error: ParseError) -> AppCommandError {
 mod tests {
     use super::*;
     use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+    #[test]
+    fn snapshot_bootstrap_context_is_not_rendered_as_user_authored_text() {
+        let now = chrono::Utc::now();
+        let mut turns = vec![MessageTurn {
+            id: "branch-first-prompt".into(),
+            role: TurnRole::User,
+            blocks: vec![
+                ContentBlock::Text {
+                    text: "<codeg-branch-context>\nprivate source snapshot\n</codeg-branch-context>"
+                        .into(),
+                },
+                ContentBlock::Text {
+                    text: "<codeg-branch-merge-context>\nprivate merged result\n</codeg-branch-merge-context>"
+                        .into(),
+                },
+                ContentBlock::Text {
+                    text: "continue from the branch".into(),
+                },
+            ],
+            timestamp: now,
+            usage: None,
+            duration_ms: None,
+            model: None,
+            completed_at: None,
+        }];
+
+        strip_branch_snapshot_context(&mut turns);
+        strip_branch_merge_context(&mut turns);
+
+        assert_eq!(turns[0].blocks.len(), 1);
+        let ContentBlock::Text { text } = &turns[0].blocks[0] else {
+            panic!("expected visible user text")
+        };
+        assert_eq!(text, "continue from the branch");
+    }
 
     // ──────────────────────────────────────────────────────────────────────
     // Delegation meta injection for historical reload. Parsers always emit

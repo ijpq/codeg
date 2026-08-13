@@ -84,6 +84,7 @@ import { isDesktop, isLocalDesktop } from "@/lib/platform"
 import { leftChromeReserve, rightChromeReserve } from "@/lib/window-chrome"
 import {
   acpFork,
+  createConversationBranch,
   createChatConversation,
   createChatDir,
   createConversation,
@@ -91,7 +92,7 @@ import {
   openSettingsWindow,
   submitSessionFeedback,
 } from "@/lib/api"
-import { isWindowedDetail } from "@/lib/turn-window"
+import { buildConversationBranchSnapshot } from "@/lib/conversation-branch"
 import { toErrorMessage } from "@/lib/app-error"
 import { classifySteerFailure } from "@/lib/steer-errors"
 import { isNetworkOrOfflineError } from "@/lib/network-error"
@@ -308,6 +309,7 @@ const ConversationTabView = memo(function ConversationTabView({
     setTabRuntimeConversationId,
     pinTab,
     openNewConversationTab,
+    openTab,
     closeTab,
     confirmDraftAgent,
     setDraftAgentFromFallback,
@@ -2025,6 +2027,54 @@ const ConversationTabView = memo(function ConversationTabView({
     }
   }, [conn.connectionId, conn.isViewer, connStatus, acpActions, tabId])
 
+  const handleForkFromMessage = useCallback(
+    async (messageId: string) => {
+      if (dbConversationId == null || !folder) return
+      const runtime = getRuntimeSession(effectiveConversationId)
+      const turns = [
+        ...(runtime?.detail?.turns ?? []),
+        ...(runtime?.localTurns ?? []),
+      ]
+      try {
+        const result = await createConversationBranch({
+          sourceConversationId: dbConversationId,
+          forkMessageId: messageId,
+          snapshotContext: buildConversationBranchSnapshot(turns, messageId),
+          preferredModeId: selectedModeId,
+          preferredConfigValues: Object.fromEntries(
+            connectionConfigOptions.map((option) => [
+              option.id,
+              option.kind.current_value,
+            ])
+          ),
+        })
+        await refreshConversations()
+        openTab(
+          result.folderId,
+          result.branchConversationId,
+          selectedAgent,
+          true,
+          `${ownTab?.title ?? "未命名会话"} · 分支`
+        )
+        toast.success(t("branch.snapshotCreated"))
+      } catch (error) {
+        toast.error(toErrorMessage(error))
+      }
+    },
+    [
+      dbConversationId,
+      effectiveConversationId,
+      folder,
+      openTab,
+      ownTab?.title,
+      refreshConversations,
+      selectedModeId,
+      connectionConfigOptions,
+      selectedAgent,
+      t,
+    ]
+  )
+
   const messageListNode = (
     <GoalControlProvider value={goalControlValue}>
       <MessageListView
@@ -2046,6 +2096,9 @@ const ConversationTabView = memo(function ConversationTabView({
           canShowDetailErrorActions ? handleOpenNewSession : undefined
         }
         deliverableRuns={detail?.deliverable_runs}
+        onForkFromMessage={
+          hasPersistedConversation ? handleForkFromMessage : null
+        }
       />
     </GoalControlProvider>
   )

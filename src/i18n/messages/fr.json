@@ -1625,7 +1625,25 @@
         "toolResult": "Résultat",
         "toolError": "Erreur"
       },
-      "moreActions": "Plus d’actions"
+      "moreActions": "Plus d’actions",
+      "branch": {
+        "create": "Créer une branche",
+        "createFromMessage": "Créer une branche à partir d’ici",
+        "nativeCreated": "Branche native indépendante créée",
+        "snapshotCreated": "Branche créée depuis un instantané de contexte",
+        "source": "Branche issue de : {title}",
+        "sourceDeleted": "Source supprimée : {title}",
+        "sourceDeletedHint": "La conversation source a été supprimée ; cette branche reste indépendante.",
+        "nativeMode": "Branche native",
+        "snapshotMode": "Instantané de contexte",
+        "merge": "Fusionner dans la conversation principale",
+        "mergeSuccess": "Fusion effectuée ({count} livrables)",
+        "mergeDescription": "Seuls la conclusion et les livrables sélectionnés sont ajoutés ; l’historique n’est pas réécrit.",
+        "summaryPlaceholder": "Conclusion à renvoyer",
+        "selectMessages": "Sélectionnez les réponses visibles (texte modifiable)",
+        "mergeKeep": "Fusionner et continuer la branche",
+        "mergeArchive": "Fusionner et marquer la branche terminée"
+      }
     },
     "sessionDetails": {
       "menuLabel": "Détails de la session",

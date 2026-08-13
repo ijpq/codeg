@@ -2744,6 +2744,74 @@ export async function createConversation(
   })
 }
 
+export interface CreateConversationBranchRequest {
+  sourceConversationId: number
+  forkMessageId?: string | null
+  snapshotContext?: string | null
+  preferredModeId?: string | null
+  preferredConfigValues?: Record<string, string>
+}
+
+export interface CreateConversationBranchResult {
+  branchConversationId: number
+  sourceConversationId: number
+  folderId: number
+  connectionId?: string | null
+  forkMode: "native" | "snapshot"
+  fallbackReason?: string | null
+}
+
+export interface ConversationBranchInfo {
+  branchConversationId: number
+  sourceConversationId: number
+  sourceTitle?: string | null
+  sourceAvailable: boolean
+  forkMessageId?: string | null
+  forkMode: "native" | "snapshot"
+  createdAt: string
+  lastMergedAt?: string | null
+  mergeTargetConversationId?: number | null
+}
+
+export interface MergeConversationBranchResult {
+  mergeId: string
+  targetConversationId: number
+  copiedDeliverableCount: number
+  deduplicated: boolean
+}
+
+export async function createConversationBranch(
+  request: CreateConversationBranchRequest
+): Promise<CreateConversationBranchResult> {
+  return getTransport().call(
+    "create_conversation_branch",
+    { request },
+    { timeoutMs: 120_000 }
+  )
+}
+
+export async function getConversationBranchInfo(
+  conversationId: number
+): Promise<ConversationBranchInfo | null> {
+  return getTransport().call("get_conversation_branch_info", {
+    conversationId,
+  })
+}
+
+export async function mergeConversationBranch(params: {
+  branchConversationId: number
+  requestId: string
+  summary: string
+  deliverableIds?: string[]
+}): Promise<MergeConversationBranchResult> {
+  return getTransport().call("merge_conversation_branch", {
+    branchConversationId: params.branchConversationId,
+    requestId: params.requestId,
+    summary: params.summary,
+    deliverableIds: params.deliverableIds ?? [],
+  })
+}
+
 /**
  * Create a folderless "chat mode" conversation. The backend lazily creates a
  * dated per-conversation scratch dir and a dedicated hidden chat folder

@@ -49,6 +49,7 @@ import {
   ChevronRight,
   CopyIcon,
   Info,
+  GitBranch,
   Loader2,
   Plus,
   RefreshCw,
@@ -154,6 +155,8 @@ interface MessageListViewProps {
   userTurnHeader?: ((group: ResolvedMessageGroup) => string | null) | null
   /** Per-turn output associations used at the producing assistant reply. */
   deliverableRuns?: ConversationTurnDeliverableSet[]
+  /** Create a durable user branch at this exact source message. */
+  onForkFromMessage?: ((messageId: string) => void) | null
 }
 
 export interface ResolvedMessageGroup {
@@ -752,6 +755,33 @@ const UserMessageTaskButton = memo(function UserMessageTaskButton({
   )
 })
 
+const MessageBranchButton = memo(function MessageBranchButton({
+  messageId,
+  onFork,
+  align,
+}: {
+  messageId: string
+  onFork: (messageId: string) => void
+  align: "user" | "assistant"
+}) {
+  const tBranch = useTranslations("Folder.conversation.branch")
+  return (
+    <MessageAction
+      tooltip={tBranch("createFromMessage")}
+      className={cn(
+        "self-end opacity-0 transition-opacity",
+        align === "user"
+          ? "group-hover/user-msg:opacity-100"
+          : "group-hover/assistant-msg:opacity-100"
+      )}
+      onClick={() => onFork(messageId)}
+      size="icon-xs"
+    >
+      <GitBranch size={12} />
+    </MessageAction>
+  )
+})
+
 const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
   group,
   dimmed = false,
@@ -762,6 +792,7 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
   conversationId,
   deliverables = EMPTY_DELIVERABLES,
   delivery = null,
+  onForkFromMessage = null,
 }: {
   group: ResolvedMessageGroup
   dimmed?: boolean
@@ -772,6 +803,7 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
   conversationId: number
   deliverables?: ConversationDeliverable[]
   delivery?: PromptDeliveryState | null
+  onForkFromMessage?: ((messageId: string) => void) | null
 }) {
   const t = useTranslations("Folder.chat.messageList")
   if (group.role === "system") {
@@ -786,6 +818,13 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
         ) : null}
         {group.role === "user" ? (
           <div className="group/user-msg flex w-fit ml-auto max-w-full items-start gap-1">
+            {onForkFromMessage && (
+              <MessageBranchButton
+                messageId={group.id}
+                onFork={onForkFromMessage}
+                align="user"
+              />
+            )}
             <UserMessageTaskButton parts={group.parts} />
             <UserMessageCopyButton parts={group.parts} />
             <MessageContent>
@@ -793,9 +832,18 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
             </MessageContent>
           </div>
         ) : (
-          <MessageContent>
-            <ContentPartsRenderer parts={group.parts} role={group.role} />
-          </MessageContent>
+          <div className="group/assistant-msg flex max-w-full items-start gap-1">
+            <MessageContent>
+              <ContentPartsRenderer parts={group.parts} role={group.role} />
+            </MessageContent>
+            {onForkFromMessage && (
+              <MessageBranchButton
+                messageId={group.id}
+                onFork={onForkFromMessage}
+                align="assistant"
+              />
+            )}
+          </div>
         )}
         {group.role === "user" && group.resources.length > 0 ? (
           <UserResourceLinks resources={group.resources} className="self-end" />
@@ -946,6 +994,7 @@ export function MessageListView({
   showMessageNav = true,
   userTurnHeader = null,
   deliverableRuns = [],
+  onForkFromMessage = null,
 }: MessageListViewProps) {
   const t = useTranslations("Folder.chat.messageList")
   const sharedT = useTranslations("Folder.chat.shared")
@@ -1235,6 +1284,7 @@ export function MessageListView({
                 conversationId={conversationId}
                 delivery={promptDeliveries[item.group.id] ?? null}
                 deliverables={associatedDeliverables}
+                onForkFromMessage={onForkFromMessage}
               />
             </div>
           )
@@ -1252,7 +1302,13 @@ export function MessageListView({
           return null
       }
     },
-    [conversationId, deliverableAssociations, promptDeliveries, userTurnHeader]
+    [
+      conversationId,
+      deliverableAssociations,
+      onForkFromMessage,
+      promptDeliveries,
+      userTurnHeader,
+    ]
   )
 
   const emptyState = useMemo(

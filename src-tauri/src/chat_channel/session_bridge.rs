@@ -1,9 +1,17 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::acp::types::PermissionOptionInfo;
 use crate::chat_channel::types::{ChannelMessageTarget, SentMessageId};
 use crate::models::agent::AgentType;
+
+#[derive(Clone)]
+pub struct PendingPrompt {
+    pub text: String,
+    pub folder_id: i32,
+    pub conversation_id: i32,
+}
 
 pub struct PendingPermission {
     pub request_id: String,
@@ -32,13 +40,18 @@ pub struct ActiveSession {
     /// update and so can't serve as a one-shot token. Cleared with the session.
     pub delegation_rendered: HashSet<String>,
     pub last_flushed: Instant,
-    pub pending_prompt: Option<String>,
+    pub pending_prompt: Option<PendingPrompt>,
+    /// Only relay ACP events while the in-flight turn was admitted by this
+    /// chat-channel route. A restored connection can be shared with the Web
+    /// client, whose output must never leak to WeChat/Telegram/Lark.
+    pub forward_events: bool,
     pub permission_pending: Option<PendingPermission>,
 }
 
 #[derive(Default)]
 pub struct SessionBridge {
     sessions: HashMap<String, ActiveSession>,
+    restore_locks: HashMap<String, Arc<tokio::sync::Mutex<()>>>,
 }
 
 impl SessionBridge {
@@ -48,6 +61,17 @@ impl SessionBridge {
 
     pub fn register(&mut self, connection_id: String, session: ActiveSession) {
         self.sessions.insert(connection_id, session);
+    }
+
+    pub fn restore_lock(
+        &mut self,
+        channel_id: i32,
+        sender_id: &str,
+    ) -> Arc<tokio::sync::Mutex<()>> {
+        self.restore_locks
+            .entry(format!("{channel_id}:{sender_id}"))
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     pub fn remove(&mut self, connection_id: &str) -> Option<ActiveSession> {
@@ -99,5 +123,20 @@ impl SessionBridge {
 
     pub fn all_sessions_mut(&mut self) -> impl Iterator<Item = &mut ActiveSession> {
         self.sessions.values_mut()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restore_lock_is_single_flight_per_sender_route() {
+        let mut bridge = SessionBridge::new();
+        let first = bridge.restore_lock(7, "wx-user");
+        let second = bridge.restore_lock(7, "wx-user");
+        let other = bridge.restore_lock(7, "other-user");
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(!Arc::ptr_eq(&first, &other));
     }
 }
