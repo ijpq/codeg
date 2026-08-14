@@ -12,13 +12,7 @@ import {
   countUnifiedDiffLineChanges,
   estimateChangedLineStats,
 } from "@/lib/line-change-stats"
-import {
-  Activity,
-  FilePenLine,
-  Loader2,
-  Plane,
-  Timer,
-} from "lucide-react"
+import { Activity, FilePenLine, Loader2, Plane, Timer } from "lucide-react"
 import type { AgentType, ModelProviderProbeResult } from "@/lib/types"
 import { probeActiveModelProvider } from "@/lib/api"
 import { AgentIcon } from "@/components/agent-icon"

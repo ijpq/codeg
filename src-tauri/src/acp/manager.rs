@@ -527,6 +527,7 @@ impl ConnectionManager {
             preferred_mode_id,
             preferred_config_values,
             self.delegation_snapshot(),
+            self.terminal_shell_config.clone(),
             None,
         )
         .await?;

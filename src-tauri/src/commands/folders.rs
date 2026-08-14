@@ -4945,7 +4945,7 @@ pub async fn stat_workspace_file(
     let path_for_response = path;
 
     run_file_io(move || {
-        ensure_path_in_workspace(&root, &target)?;
+        ensure_user_navigable_path(&root, &target)?;
         let metadata = std::fs::metadata(&target).map_err(AppCommandError::io)?;
         if !metadata.is_file() {
             return Err(AppCommandError::invalid_input("Path is not a file"));
