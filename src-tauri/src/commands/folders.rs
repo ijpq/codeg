@@ -6565,8 +6565,10 @@ mod tests {
         let refused = git_delete_branch(repo.clone(), "wt".into(), false)
             .await
             .expect_err("git refuses a branch held by a worktree");
+        let refused_text = format!("{refused:?}");
         assert!(
-            format!("{refused:?}").contains("used by worktree"),
+            refused_text.contains("used by worktree")
+                || refused_text.contains("checked out at"),
             "expected git's worktree refusal, got: {refused:?}"
         );
 

@@ -12,6 +12,7 @@ import {
   Cog,
   Copy,
   GitFork,
+  Loader2,
   MessageSquareText,
   Scissors,
   Send,

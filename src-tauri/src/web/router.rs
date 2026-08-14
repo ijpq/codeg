@@ -1604,7 +1604,6 @@ pub fn build_router(
     // never a 240 KiB workspace document that a watchdog downloads forever.
     let static_files = Router::new()
         .fallback_service(ServeDir::new(&static_dir))
-        .layer(CompressionLayer::new())
         .layer(middleware::from_fn(static_response_policy));
 
     let static_dir_for_mw = static_dir.clone();

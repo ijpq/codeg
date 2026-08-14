@@ -3862,10 +3862,9 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
               userTurnLimit: HISTORY_PAGE_USER_TURNS,
             })
           : boundaryIndex != null
-            ? getFolderConversation(
-              dbConversationId,
-                { fromIndex: boundaryIndex }
-            )
+            ? getFolderConversation(dbConversationId, {
+                fromIndex: boundaryIndex,
+              })
             : getFolderConversation(dbConversationId, undefined)
         metadataRequest
           .then((parsed) => {
