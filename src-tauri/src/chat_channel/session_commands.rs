@@ -1126,6 +1126,7 @@ pub async fn handle_followup(req: FollowupRequest<'_>) -> RichMessage {
 }
 
 async fn restore_sender_context_and_send_followup(req: FollowupRequest<'_>) -> RichMessage {
+    let lazy_restore_started_at = Instant::now();
     let restore_lock = {
         let mut guard = req.bridge.lock().await;
         guard.restore_lock(req.channel_id, req.sender_id)
@@ -1147,19 +1148,51 @@ async fn restore_sender_context_and_send_followup(req: FollowupRequest<'_>) -> R
         return send_followup_to_session(req, session_ref).await;
     }
 
-    let context =
-        match sender_context_service::get_or_create(req.db, req.channel_id, req.sender_id).await {
-            Ok(context) => context,
-            Err(e) => {
-                return RichMessage::error(format!(
-                    "{}{e}",
-                    i18n::failed_to_load_context_label(req.lang)
-                ));
-            }
-        };
+    let context = match sender_context_service::find(req.db, req.channel_id, req.sender_id).await {
+        Ok(Some(context)) => context,
+        Ok(None) => {
+            tracing::info!(
+                stage = "persisted_conversation_missing",
+                channel_id = req.channel_id,
+                sender_id = req.sender_id,
+                "[ChatChannel][lazy_restore] sender has no persisted context"
+            );
+            return RichMessage::info(i18n::no_active_session_use_task(req.lang, req.prefix));
+        }
+        Err(e) => {
+            tracing::warn!(
+                stage = "lazy_restore_failed",
+                phase = "load_sender_context",
+                channel_id = req.channel_id,
+                sender_id = req.sender_id,
+                error = %e,
+                "[ChatChannel][lazy_restore] failed"
+            );
+            return RichMessage::error(format!(
+                "{}{e}",
+                i18n::failed_to_load_context_label(req.lang)
+            ));
+        }
+    };
     let Some(conversation_id) = context.current_conversation_id else {
+        tracing::info!(
+            stage = "persisted_conversation_missing",
+            channel_id = req.channel_id,
+            sender_id = req.sender_id,
+            sender_context_id = context.id,
+            "[ChatChannel][lazy_restore] sender context has no conversation"
+        );
         return RichMessage::info(i18n::no_active_session_use_task(req.lang, req.prefix));
     };
+    tracing::info!(
+        stage = "persisted_conversation_found",
+        channel_id = req.channel_id,
+        sender_id = req.sender_id,
+        sender_context_id = context.id,
+        conversation_id,
+        persisted_connection_id = ?context.current_connection_id,
+        "[ChatChannel][lazy_restore] persisted conversation found"
+    );
 
     let conversation = match conversation_service::get_by_id(req.db, conversation_id).await {
         Ok(conversation) => conversation,
@@ -1172,13 +1205,29 @@ async fn restore_sender_context_and_send_followup(req: FollowupRequest<'_>) -> R
                 let _ =
                     sender_context_service::clear_session(req.db, req.channel_id, req.sender_id)
                         .await;
-                return RichMessage::info(i18n::conversation_not_found(req.lang));
+                tracing::info!(
+                    stage = "persisted_conversation_deleted",
+                    channel_id = req.channel_id,
+                    sender_id = req.sender_id,
+                    conversation_id,
+                    "[ChatChannel][lazy_restore] removed permanently deleted binding"
+                );
+                return RichMessage::info(i18n::no_active_session_use_task(req.lang, req.prefix));
             }
             // A second DB read failure is not proof that the conversation was
             // deleted. Retain the durable binding and discard only its stale
             // process-local connection so the next message can retry.
             let _ = sender_context_service::clear_connection(req.db, req.channel_id, req.sender_id)
                 .await;
+            tracing::warn!(
+                stage = "lazy_restore_failed",
+                phase = "load_conversation",
+                channel_id = req.channel_id,
+                sender_id = req.sender_id,
+                conversation_id,
+                error = %e,
+                "[ChatChannel][lazy_restore] failed"
+            );
             return RichMessage::error(format!(
                 "{}{e}",
                 i18n::failed_to_load_context_label(req.lang)
@@ -1186,6 +1235,14 @@ async fn restore_sender_context_and_send_followup(req: FollowupRequest<'_>) -> R
         }
     };
 
+    tracing::info!(
+        stage = "lazy_restore_started",
+        channel_id = req.channel_id,
+        sender_id = req.sender_id,
+        conversation_id,
+        agent_type = %conversation.agent_type,
+        "[ChatChannel][lazy_restore] ACP restore started"
+    );
     let restored = crate::commands::acp::acp_restore_conversation_core(
         conversation.id,
         None,
@@ -1199,16 +1256,37 @@ async fn restore_sender_context_and_send_followup(req: FollowupRequest<'_>) -> R
         req.emitter.clone(),
     )
     .await;
-    let connection_id = match restored {
-        Ok(restored) => restored.connection_id,
+    let restored = match restored {
+        Ok(restored) => restored,
         Err(e) => {
             // The durable conversation remains authoritative and retryable;
             // only the stale process-local connection id is discarded.
             let _ = sender_context_service::clear_connection(req.db, req.channel_id, req.sender_id)
                 .await;
+            tracing::warn!(
+                stage = "lazy_restore_failed",
+                phase = "restore_acp_session",
+                channel_id = req.channel_id,
+                sender_id = req.sender_id,
+                conversation_id,
+                elapsed_ms = lazy_restore_started_at.elapsed().as_millis() as u64,
+                error = %e,
+                "[ChatChannel][lazy_restore] failed"
+            );
             return RichMessage::error(auto_resume_failed(req.lang, &e.to_string()));
         }
     };
+    let connection_id = restored.connection_id;
+    tracing::info!(
+        stage = "lazy_restore_completed",
+        channel_id = req.channel_id,
+        sender_id = req.sender_id,
+        conversation_id,
+        connection_id = %connection_id,
+        reused_existing = restored.reused_existing,
+        elapsed_ms = lazy_restore_started_at.elapsed().as_millis() as u64,
+        "[ChatChannel][lazy_restore] ACP restore completed"
+    );
 
     req.bridge.lock().await.register(
         connection_id.clone(),
@@ -1229,21 +1307,53 @@ async fn restore_sender_context_and_send_followup(req: FollowupRequest<'_>) -> R
             permission_pending: None,
         },
     );
-    let _ = sender_context_service::update_session(
+    tracing::info!(
+        stage = "active_session_registered",
+        channel_id = req.channel_id,
+        sender_id = req.sender_id,
+        conversation_id,
+        connection_id = %connection_id,
+        "[ChatChannel][lazy_restore] active session registered"
+    );
+    if let Err(e) = sender_context_service::update_session(
         req.db,
         req.channel_id,
         req.sender_id,
         Some(conversation.id),
         Some(connection_id.clone()),
     )
-    .await;
-    let _ = sender_context_service::update_folder(
+    .await
+    {
+        req.bridge.lock().await.remove(&connection_id);
+        tracing::warn!(
+            stage = "lazy_restore_failed",
+            phase = "persist_connection_binding",
+            channel_id = req.channel_id,
+            sender_id = req.sender_id,
+            conversation_id,
+            connection_id = %connection_id,
+            error = %e,
+            "[ChatChannel][lazy_restore] failed"
+        );
+        return RichMessage::error(auto_resume_failed(req.lang, &e.to_string()));
+    }
+    if let Err(e) = sender_context_service::update_folder(
         req.db,
         req.channel_id,
         req.sender_id,
         Some(conversation.folder_id),
     )
-    .await;
+    .await
+    {
+        tracing::warn!(
+            stage = "lazy_restore_folder_update_failed",
+            channel_id = req.channel_id,
+            sender_id = req.sender_id,
+            conversation_id,
+            error = %e,
+            "[ChatChannel][lazy_restore] folder context update failed"
+        );
+    }
 
     send_restored_followup(req, connection_id, conversation.folder_id, conversation.id).await
 }
@@ -1270,7 +1380,18 @@ async fn send_restored_followup(
     )
     .await
     {
-        Ok(()) => RichMessage::info(i18n::message_sent(req.lang)),
+        Ok(()) => {
+            tracing::info!(
+                stage = "original_message_forwarded",
+                channel_id = req.channel_id,
+                sender_id = req.sender_id,
+                conversation_id,
+                connection_id = %connection_id,
+                message_chars = req.text.chars().count(),
+                "[ChatChannel][lazy_restore] original message forwarded"
+            );
+            RichMessage::info(i18n::message_sent(req.lang))
+        }
         Err(crate::acp::error::AcpError::TurnInProgress) => {
             let mut guard = req.bridge.lock().await;
             if let Some(session) = guard.get_mut(&connection_id) {
@@ -1281,12 +1402,31 @@ async fn send_restored_followup(
                     conversation_id,
                 });
             }
+            tracing::info!(
+                stage = "original_message_deferred",
+                channel_id = req.channel_id,
+                sender_id = req.sender_id,
+                conversation_id,
+                connection_id = %connection_id,
+                message_chars = req.text.chars().count(),
+                "[ChatChannel][lazy_restore] original message retained until active turn completes"
+            );
             RichMessage::info(i18n::task_deferred_busy(req.lang).to_string())
         }
         Err(e) => {
             req.bridge.lock().await.remove(&connection_id);
             let _ = sender_context_service::clear_connection(req.db, req.channel_id, req.sender_id)
                 .await;
+            tracing::warn!(
+                stage = "lazy_restore_failed",
+                phase = "forward_original_message",
+                channel_id = req.channel_id,
+                sender_id = req.sender_id,
+                conversation_id,
+                connection_id = %connection_id,
+                error = %e,
+                "[ChatChannel][lazy_restore] failed"
+            );
             RichMessage::error(format!(
                 "{}{e}",
                 i18n::failed_to_send_message_label(req.lang)
@@ -2040,7 +2180,7 @@ mod tests {
         let context = sender_context_service::get_or_create(&db.conn, channel_id, "sender-1")
             .await
             .unwrap();
-        assert!(response.body.contains("not found"));
+        assert!(response.body.contains("No active session"));
         assert_eq!(context.current_conversation_id, None);
         assert_eq!(context.current_connection_id, None);
     }

@@ -9501,42 +9501,67 @@ pub(crate) async fn acp_restore_conversation_core(
         return Err(AcpError::TurnInProgress);
     }
 
-    let runtime_env = build_session_runtime_env(
-        db,
-        agent_type,
-        Some(external_session_id.as_str()),
-        data_dir,
-    )
-    .await?;
-    verify_agent_installed(agent_type).await?;
-
-    tracing::info!(
-        conversation_id,
-        external_session_id = %external_session_id,
-        old_connection_id = ?old_connection_id,
-        "[ACP] session resume/load requested"
-    );
     let spawn_started = std::time::Instant::now();
-    tracing::info!(
-        conversation_id,
-        stage = "acp_process_spawn_start",
-        total_elapsed_ms = restore_started.elapsed().as_millis() as u64,
-        "[ACP][restore] stage started"
-    );
-    let spawned = manager
-        .spawn_agent_for_restore(
+    // A warm restore can attach an already-ready connection without touching
+    // the filesystem or requiring the agent executable to still be resolvable.
+    // This also makes the channel restart path deterministic: reuse is checked
+    // before any cold-start prerequisite can mask the durable conversation.
+    let working_dir = PathBuf::from(&folder.path);
+    let reusable_connection = manager
+        .find_connection_for_reuse_with_requirements(
             agent_type,
-            Some(folder.path.clone()),
-            external_session_id.clone(),
-            runtime_env,
-            owner_window_label,
-            emitter,
-            preferred_mode_id,
-            preferred_config_values,
+            Some(&working_dir),
+            Some(&external_session_id),
             require_codeg_mcp,
-            conversation_id,
+            Some(conversation_id),
         )
-        .await?;
+        .await;
+    let spawned = if let Some(connection_id) = reusable_connection {
+        tracing::info!(
+            conversation_id,
+            connection_id = %connection_id,
+            external_session_id = %external_session_id,
+            stage = "restore_warm_connection_reused",
+            total_elapsed_ms = restore_started.elapsed().as_millis() as u64,
+            "[ACP][restore] warm connection reused"
+        );
+        crate::acp::manager::SpawnAgentOutcome {
+            connection_id,
+            reused_existing: true,
+        }
+    } else {
+        let runtime_env =
+            build_session_runtime_env(db, agent_type, Some(external_session_id.as_str()), data_dir)
+                .await?;
+        verify_agent_installed(agent_type).await?;
+
+        tracing::info!(
+            conversation_id,
+            external_session_id = %external_session_id,
+            old_connection_id = ?old_connection_id,
+            "[ACP] session resume/load requested"
+        );
+        tracing::info!(
+            conversation_id,
+            stage = "acp_process_spawn_start",
+            total_elapsed_ms = restore_started.elapsed().as_millis() as u64,
+            "[ACP][restore] stage started"
+        );
+        manager
+            .spawn_agent_for_restore(
+                agent_type,
+                Some(folder.path.clone()),
+                external_session_id.clone(),
+                runtime_env,
+                owner_window_label,
+                emitter,
+                preferred_mode_id,
+                preferred_config_values,
+                require_codeg_mcp,
+                conversation_id,
+            )
+            .await?
+    };
     tracing::info!(
         conversation_id,
         connection_id = %spawned.connection_id,
