@@ -5,7 +5,7 @@ use sea_orm::{
 };
 
 use crate::db::entities::conversation::ConversationKind;
-use crate::db::entities::{conversation, folder};
+use crate::db::entities::{conversation, conversation_branch, folder};
 use crate::db::error::DbError;
 use crate::models::{AgentType, DbConversationSummary};
 
@@ -305,10 +305,24 @@ pub async fn update_external_id(
 ) -> Result<(), DbError> {
     use sea_orm::sea_query::Expr;
     conversation::Entity::update_many()
-        .col_expr(conversation::Column::ExternalId, Expr::value(external_id))
+        .col_expr(
+            conversation::Column::ExternalId,
+            Expr::value(external_id.clone()),
+        )
         .col_expr(conversation::Column::UpdatedAt, Expr::value(Utc::now()))
         .filter(conversation::Column::Id.eq(conversation_id))
         .filter(conversation::Column::DeletedAt.is_null())
+        .exec(conn)
+        .await?;
+    // A snapshot branch is born before session/new necessarily reports its
+    // external id. Keep its audit metadata converged at the same durable write
+    // that links the conversation; ordinary rows simply match no branch row.
+    conversation_branch::Entity::update_many()
+        .col_expr(
+            conversation_branch::Column::BranchSessionId,
+            Expr::value(external_id),
+        )
+        .filter(conversation_branch::Column::BranchConversationId.eq(conversation_id))
         .exec(conn)
         .await?;
     Ok(())

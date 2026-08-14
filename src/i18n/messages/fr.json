@@ -1636,6 +1636,8 @@
         "sourceDeletedHint": "La conversation source a été supprimée ; cette branche reste indépendante.",
         "nativeMode": "Branche native",
         "snapshotMode": "Instantané de contexte",
+        "inheritanceRange": "{count} messages jusqu’à {boundary}",
+        "inheritanceTruncated": "contexte compressé",
         "merge": "Fusionner dans la conversation principale",
         "mergeSuccess": "Fusion effectuée ({count} livrables)",
         "mergeDescription": "Seuls la conclusion et les livrables sélectionnés sont ajoutés ; l’historique n’est pas réécrit.",

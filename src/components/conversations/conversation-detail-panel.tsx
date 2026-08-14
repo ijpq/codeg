@@ -91,7 +91,6 @@ import {
   openSettingsWindow,
   submitSessionFeedback,
 } from "@/lib/api"
-import { buildConversationBranchSnapshot } from "@/lib/conversation-branch"
 import { toErrorMessage } from "@/lib/app-error"
 import { classifySteerFailure } from "@/lib/steer-errors"
 import { isNetworkOrOfflineError } from "@/lib/network-error"
@@ -2029,16 +2028,10 @@ const ConversationTabView = memo(function ConversationTabView({
   const handleForkFromMessage = useCallback(
     async (messageId: string) => {
       if (dbConversationId == null || !folder) return
-      const runtime = getRuntimeSession(effectiveConversationId)
-      const turns = [
-        ...(runtime?.detail?.turns ?? []),
-        ...(runtime?.localTurns ?? []),
-      ]
       try {
         const result = await createConversationBranch({
           sourceConversationId: dbConversationId,
           forkMessageId: messageId,
-          snapshotContext: buildConversationBranchSnapshot(turns, messageId),
           preferredModeId: selectedModeId,
           preferredConfigValues: Object.fromEntries(
             connectionConfigOptions.map((option) => [
@@ -2062,7 +2055,6 @@ const ConversationTabView = memo(function ConversationTabView({
     },
     [
       dbConversationId,
-      effectiveConversationId,
       folder,
       openTab,
       ownTab?.title,

@@ -1636,6 +1636,8 @@
         "sourceDeletedHint": "來源對話已刪除；此分支仍可獨立使用。",
         "nativeMode": "原生分支",
         "snapshotMode": "上下文快照",
+        "inheritanceRange": "繼承 {count} 則訊息，截止 {boundary}",
+        "inheritanceTruncated": "上下文已壓縮",
         "merge": "合併回主對話",
         "mergeSuccess": "已合併回主對話（{count} 個交付檔案）",
         "mergeDescription": "只會追加結論及明確選取的交付檔案，不會改寫既有歷史。",

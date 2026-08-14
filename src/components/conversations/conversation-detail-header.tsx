@@ -30,7 +30,6 @@ import {
 } from "@/lib/api"
 import type { ConversationBranchInfo } from "@/lib/api"
 import {
-  buildConversationBranchSnapshot,
   latestAssistantConclusion,
   visibleTurnText,
 } from "@/lib/conversation-branch"
@@ -215,12 +214,6 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
     }
     setBranchBusy(true)
     try {
-      const currentSession =
-        runtimeId == null ? null : getRuntimeSession(runtimeId)
-      const currentTurns = [
-        ...(currentSession?.detail?.turns ?? []),
-        ...(currentSession?.localTurns ?? []),
-      ]
       const selectors = getCachedSelectors(persistedConversation.agent_type)
       const preferredConfigValues = Object.fromEntries(
         (selectors?.configOptions ?? []).map((option) => [
@@ -230,7 +223,6 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
       )
       const result = await createConversationBranch({
         sourceConversationId: conversationId,
-        snapshotContext: buildConversationBranchSnapshot(currentTurns),
         preferredModeId: selectors?.modes?.current_mode_id ?? null,
         preferredConfigValues,
       })
@@ -243,7 +235,7 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
         `${displayTitle} · 分支`
       )
       toast.success(
-        result.forkMode === "native"
+        result.inheritanceMode === "native_fork"
           ? tBranch("nativeCreated")
           : tBranch("snapshotCreated")
       )
@@ -259,7 +251,6 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
     openTab,
     persistedConversation,
     refreshConversations,
-    runtimeId,
     tBranch,
   ])
 
@@ -485,7 +476,7 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
             disabled={!branchInfo.sourceAvailable}
             title={
               branchInfo.sourceAvailable
-                ? `${tBranch("source", { title: branchInfo.sourceTitle ?? `#${branchInfo.sourceConversationId}` })} · ${branchInfo.forkMode === "native" ? tBranch("nativeMode") : tBranch("snapshotMode")}`
+                ? `${tBranch("source", { title: branchInfo.sourceTitle ?? `#${branchInfo.sourceConversationId}` })} · ${branchInfo.inheritanceMode === "native_fork" ? tBranch("nativeMode") : tBranch("snapshotMode")} · ${tBranch("inheritanceRange", { count: branchInfo.inheritedMessageCount, boundary: branchInfo.forkMessageId ?? branchInfo.forkedThroughAt ?? "—" })}${branchInfo.inheritanceTruncated ? ` · ${tBranch("inheritanceTruncated")}` : ""}${branchInfo.inheritanceNote ? ` · ${branchInfo.inheritanceNote}` : ""}`
                 : tBranch("sourceDeletedHint")
             }
           >
@@ -501,6 +492,9 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
                     branchInfo.sourceTitle ??
                     `#${branchInfo.sourceConversationId}`,
                 })}
+            <span className="hidden xl:inline">
+              {` · ${branchInfo.inheritanceMode === "native_fork" ? tBranch("nativeMode") : tBranch("snapshotMode")}`}
+            </span>
           </button>
         )}
       </div>

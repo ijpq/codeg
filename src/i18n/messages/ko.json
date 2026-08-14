@@ -1636,6 +1636,8 @@
         "sourceDeletedHint": "원본 대화가 삭제되었지만 이 브랜치는 독립적으로 사용할 수 있습니다.",
         "nativeMode": "네이티브 브랜치",
         "snapshotMode": "컨텍스트 스냅샷",
+        "inheritanceRange": "{boundary}까지 메시지 {count}개",
+        "inheritanceTruncated": "컨텍스트 압축됨",
         "merge": "주 대화로 병합",
         "mergeSuccess": "주 대화로 병합했습니다(결과물 {count}개)",
         "mergeDescription": "결론과 선택한 결과물만 추가하며 기존 기록은 변경하지 않습니다.",

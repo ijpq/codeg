@@ -1380,6 +1380,13 @@ fn strip_branch_snapshot_context(turns: &mut [MessageTurn]) {
         "<codeg-branch-context>",
         "</codeg-branch-context>",
     );
+    first_user.blocks.retain(|block| {
+        !matches!(
+            block,
+            ContentBlock::Image { uri: Some(uri), .. }
+                if uri.starts_with("codeg-branch-context://")
+        )
+    });
 }
 
 fn strip_branch_merge_context(turns: &mut [MessageTurn]) {
@@ -2483,6 +2490,16 @@ mod tests {
                 ContentBlock::Text {
                     text: "continue from the branch".into(),
                 },
+                ContentBlock::Image {
+                    data: "inherited".into(),
+                    mime_type: "image/png".into(),
+                    uri: Some("codeg-branch-context://image/0".into()),
+                },
+                ContentBlock::Image {
+                    data: "current".into(),
+                    mime_type: "image/png".into(),
+                    uri: Some("clipboard://current".into()),
+                },
             ],
             timestamp: now,
             usage: None,
@@ -2494,11 +2511,15 @@ mod tests {
         strip_branch_snapshot_context(&mut turns);
         strip_branch_merge_context(&mut turns);
 
-        assert_eq!(turns[0].blocks.len(), 1);
+        assert_eq!(turns[0].blocks.len(), 2);
         let ContentBlock::Text { text } = &turns[0].blocks[0] else {
             panic!("expected visible user text")
         };
         assert_eq!(text, "continue from the branch");
+        assert!(matches!(
+            &turns[0].blocks[1],
+            ContentBlock::Image { uri: Some(uri), .. } if uri == "clipboard://current"
+        ));
     }
 
     // ──────────────────────────────────────────────────────────────────────

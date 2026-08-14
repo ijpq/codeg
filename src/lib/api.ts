@@ -2747,7 +2747,6 @@ export async function createConversation(
 export interface CreateConversationBranchRequest {
   sourceConversationId: number
   forkMessageId?: string | null
-  snapshotContext?: string | null
   preferredModeId?: string | null
   preferredConfigValues?: Record<string, string>
 }
@@ -2758,6 +2757,9 @@ export interface CreateConversationBranchResult {
   folderId: number
   connectionId?: string | null
   forkMode: "native" | "snapshot"
+  inheritanceMode: "native_fork" | "full_replay" | "structured_snapshot"
+  inheritedMessageCount: number
+  inheritanceTruncated: boolean
   fallbackReason?: string | null
 }
 
@@ -2768,6 +2770,17 @@ export interface ConversationBranchInfo {
   sourceAvailable: boolean
   forkMessageId?: string | null
   forkMode: "native" | "snapshot"
+  sourceSessionId?: string | null
+  branchSessionId?: string | null
+  inheritanceMode: "native_fork" | "full_replay" | "structured_snapshot"
+  inheritedMessageCount: number
+  inheritedContextChars: number
+  inheritedEstimatedTokens: number
+  inheritanceCompressed: boolean
+  inheritanceTruncated: boolean
+  inheritanceNote?: string | null
+  forkedThroughAt?: string | null
+  snapshotVersion: number
   createdAt: string
   lastMergedAt?: string | null
   mergeTargetConversationId?: number | null

@@ -23,6 +23,9 @@ const h = vi.hoisted(() => ({
     folderId: 1,
     connectionId: "branch-connection",
     forkMode: "native" as const,
+    inheritanceMode: "native_fork" as const,
+    inheritedMessageCount: 12,
+    inheritanceTruncated: false,
   })),
   getConversationBranchInfo: vi.fn(async () => null),
   listConversationDeliverables: vi.fn(async () => []),
@@ -175,6 +178,9 @@ describe("ConversationDetailHeader dialog target snapshot", () => {
     await waitFor(() => {
       expect(h.createConversationBranch).toHaveBeenCalledWith(
         expect.objectContaining({ sourceConversationId: 1 })
+      )
+      expect(h.createConversationBranch.mock.calls[0]?.[0]).not.toHaveProperty(
+        "snapshotContext"
       )
       expect(h.openTab).toHaveBeenCalledWith(
         1,

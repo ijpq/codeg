@@ -1636,6 +1636,8 @@
         "sourceDeletedHint": "来源会话已删除；本分支仍可独立使用。",
         "nativeMode": "原生分支",
         "snapshotMode": "上下文快照",
+        "inheritanceRange": "继承 {count} 条消息，截止 {boundary}",
+        "inheritanceTruncated": "上下文已压缩",
         "merge": "合并回主会话",
         "mergeSuccess": "已合并回主会话（{count} 个交付文件）",
         "mergeDescription": "只会向主会话追加下面的结论和你明确选择的交付文件，不会改写原历史。",

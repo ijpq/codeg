@@ -1636,6 +1636,8 @@
         "sourceDeletedHint": "A conversa de origem foi excluída; esta ramificação continua independente.",
         "nativeMode": "Ramificação nativa",
         "snapshotMode": "Snapshot de contexto",
+        "inheritanceRange": "{count} mensagens até {boundary}",
+        "inheritanceTruncated": "contexto compactado",
         "merge": "Mesclar na conversa principal",
         "mergeSuccess": "Mesclado na conversa principal ({count} entregáveis)",
         "mergeDescription": "Somente a conclusão e os entregáveis selecionados são anexados; o histórico não é reescrito.",

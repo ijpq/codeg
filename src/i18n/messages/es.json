@@ -1636,6 +1636,8 @@
         "sourceDeletedHint": "La conversación de origen fue eliminada; esta rama sigue siendo independiente.",
         "nativeMode": "Rama nativa",
         "snapshotMode": "Instantánea de contexto",
+        "inheritanceRange": "{count} mensajes hasta {boundary}",
+        "inheritanceTruncated": "contexto comprimido",
         "merge": "Fusionar en la conversación principal",
         "mergeSuccess": "Fusionado en la conversación principal ({count} entregables)",
         "mergeDescription": "Solo se añaden la conclusión y los entregables seleccionados; no se reescribe el historial.",

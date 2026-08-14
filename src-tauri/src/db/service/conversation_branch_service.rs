@@ -12,7 +12,7 @@ use crate::db::entities::{
 use crate::db::error::DbError;
 use crate::db::service::conversation_service;
 use crate::models::conversation::DbConversationSummary;
-use crate::models::message::{ContentBlock, MessageTurn, TurnRole};
+use crate::models::message::{ContentBlock, ImageData, MessageTurn, TurnRole};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -23,6 +23,17 @@ pub struct ConversationBranchInfo {
     pub source_available: bool,
     pub fork_message_id: Option<String>,
     pub fork_mode: String,
+    pub source_session_id: Option<String>,
+    pub branch_session_id: Option<String>,
+    pub inheritance_mode: String,
+    pub inherited_message_count: i32,
+    pub inherited_context_chars: i64,
+    pub inherited_estimated_tokens: i64,
+    pub inheritance_compressed: bool,
+    pub inheritance_truncated: bool,
+    pub inheritance_note: Option<String>,
+    pub forked_through_at: Option<chrono::DateTime<Utc>>,
+    pub snapshot_version: i32,
     pub created_at: chrono::DateTime<Utc>,
     pub last_merged_at: Option<chrono::DateTime<Utc>>,
     pub merge_target_conversation_id: Option<i32>,
@@ -37,11 +48,39 @@ impl From<conversation_branch::Model> for ConversationBranchInfo {
             source_available: true,
             fork_message_id: value.fork_message_id,
             fork_mode: value.fork_mode,
+            source_session_id: value.source_session_id,
+            branch_session_id: value.branch_session_id,
+            inheritance_mode: value.inheritance_mode,
+            inherited_message_count: value.inherited_message_count,
+            inherited_context_chars: value.inherited_context_chars,
+            inherited_estimated_tokens: value.inherited_estimated_tokens,
+            inheritance_compressed: value.inheritance_compressed,
+            inheritance_truncated: value.inheritance_truncated,
+            inheritance_note: value.inheritance_note,
+            forked_through_at: value.forked_through_at,
+            snapshot_version: value.snapshot_version,
             created_at: value.created_at,
             last_merged_at: value.last_merged_at,
             merge_target_conversation_id: value.merge_target_conversation_id,
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct BranchInheritanceRecord {
+    pub source_session_id: Option<String>,
+    pub branch_session_id: Option<String>,
+    pub inheritance_mode: String,
+    pub inherited_message_count: i32,
+    pub inherited_context_chars: i64,
+    pub inherited_estimated_tokens: i64,
+    pub inheritance_compressed: bool,
+    pub inheritance_truncated: bool,
+    pub inheritance_note: Option<String>,
+    pub forked_through_at: Option<chrono::DateTime<Utc>>,
+    pub snapshot_version: i32,
+    pub snapshot_context: Option<String>,
+    pub snapshot_images: Vec<ImageData>,
 }
 
 pub async fn create_branch_row(
@@ -50,7 +89,7 @@ pub async fn create_branch_row(
     external_id: Option<String>,
     fork_message_id: Option<String>,
     fork_mode: &str,
-    snapshot_context: Option<String>,
+    inheritance: BranchInheritanceRecord,
 ) -> Result<(conversation::Model, ConversationBranchInfo), DbError> {
     let title = Some(format!(
         "{} · 分支",
@@ -89,7 +128,21 @@ pub async fn create_branch_row(
         source_title: Set(source.title.clone()),
         fork_message_id: Set(fork_message_id),
         fork_mode: Set(fork_mode.to_string()),
-        snapshot_context: Set(snapshot_context),
+        source_session_id: Set(inheritance.source_session_id),
+        branch_session_id: Set(inheritance.branch_session_id),
+        inheritance_mode: Set(inheritance.inheritance_mode),
+        inherited_message_count: Set(inheritance.inherited_message_count),
+        inherited_context_chars: Set(inheritance.inherited_context_chars),
+        inherited_estimated_tokens: Set(inheritance.inherited_estimated_tokens),
+        inheritance_compressed: Set(inheritance.inheritance_compressed),
+        inheritance_truncated: Set(inheritance.inheritance_truncated),
+        inheritance_note: Set(inheritance.inheritance_note),
+        forked_through_at: Set(inheritance.forked_through_at),
+        snapshot_version: Set(inheritance.snapshot_version),
+        snapshot_images_json: Set((!inheritance.snapshot_images.is_empty()).then(|| {
+            serde_json::to_string(&inheritance.snapshot_images).unwrap_or_else(|_| "[]".into())
+        })),
+        snapshot_context: Set(inheritance.snapshot_context),
         snapshot_consumed_at: Set(None),
         created_at: Set(now),
         last_merged_at: Set(None),
@@ -99,6 +152,22 @@ pub async fn create_branch_row(
     .insert(conn)
     .await?;
     Ok((created, relation.into()))
+}
+
+pub async fn update_branch_session_id(
+    conn: &DatabaseConnection,
+    conversation_id: i32,
+    session_id: String,
+) -> Result<(), DbError> {
+    if let Some(row) = conversation_branch::Entity::find_by_id(conversation_id)
+        .one(conn)
+        .await?
+    {
+        let mut active = row.into_active_model();
+        active.branch_session_id = Set(Some(session_id));
+        active.update(conn).await?;
+    }
+    Ok(())
 }
 
 pub async fn get_info(
@@ -123,16 +192,32 @@ pub async fn get_info(
     Ok(Some(info))
 }
 
+#[derive(Debug, Clone)]
+pub struct PendingBranchSnapshot {
+    pub context: String,
+    pub images: Vec<ImageData>,
+}
+
 pub async fn pending_snapshot(
     conn: &DatabaseConnection,
     conversation_id: i32,
-) -> Result<Option<String>, DbError> {
-    Ok(conversation_branch::Entity::find_by_id(conversation_id)
+) -> Result<Option<PendingBranchSnapshot>, DbError> {
+    let row = conversation_branch::Entity::find_by_id(conversation_id)
         .filter(conversation_branch::Column::SnapshotConsumedAt.is_null())
         .one(conn)
-        .await?
-        .and_then(|row| row.snapshot_context)
-        .filter(|text| !text.trim().is_empty()))
+        .await?;
+    Ok(row.and_then(|row| {
+        let context = row.snapshot_context?.trim().to_string();
+        if context.is_empty() {
+            return None;
+        }
+        let images = row
+            .snapshot_images_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str(json).ok())
+            .unwrap_or_default();
+        Some(PendingBranchSnapshot { context, images })
+    }))
 }
 
 pub async fn mark_snapshot_consumed(
@@ -477,7 +562,21 @@ mod tests {
             None,
             Some("turn-3".into()),
             "snapshot",
-            Some("User: hello".into()),
+            BranchInheritanceRecord {
+                source_session_id: source.external_id.clone(),
+                branch_session_id: None,
+                inheritance_mode: "full_replay".into(),
+                inherited_message_count: 1,
+                inherited_context_chars: 11,
+                inherited_estimated_tokens: 3,
+                inheritance_compressed: false,
+                inheritance_truncated: false,
+                inheritance_note: None,
+                forked_through_at: None,
+                snapshot_version: 2,
+                snapshot_context: Some("User: hello".into()),
+                snapshot_images: Vec::new(),
+            },
         )
         .await
         .unwrap();
@@ -493,11 +592,14 @@ mod tests {
             pending_snapshot(&db.conn, branch.id)
                 .await
                 .unwrap()
-                .as_deref(),
-            Some("User: hello")
+                .map(|snapshot| snapshot.context),
+            Some("User: hello".into())
         );
         mark_snapshot_consumed(&db.conn, branch.id).await.unwrap();
-        assert_eq!(pending_snapshot(&db.conn, branch.id).await.unwrap(), None);
+        assert!(pending_snapshot(&db.conn, branch.id)
+            .await
+            .unwrap()
+            .is_none());
 
         conversation_service::soft_delete(&db.conn, source_id)
             .await
@@ -523,7 +625,21 @@ mod tests {
             Some("fork-session".into()),
             None,
             "native",
-            None,
+            BranchInheritanceRecord {
+                source_session_id: source.external_id.clone(),
+                branch_session_id: Some("fork-session".into()),
+                inheritance_mode: "native_fork".into(),
+                inherited_message_count: 0,
+                inherited_context_chars: 0,
+                inherited_estimated_tokens: 0,
+                inheritance_compressed: false,
+                inheritance_truncated: false,
+                inheritance_note: None,
+                forked_through_at: None,
+                snapshot_version: 2,
+                snapshot_context: None,
+                snapshot_images: Vec::new(),
+            },
         )
         .await
         .unwrap();
