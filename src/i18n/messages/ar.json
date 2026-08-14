@@ -1711,6 +1711,8 @@
         "sourceDeletedHint": "حُذفت المحادثة المصدر؛ يظل هذا الفرع مستقلاً وقابلاً للاستخدام.",
         "nativeMode": "فرع أصلي",
         "snapshotMode": "لقطة سياق",
+        "inheritanceRange": "{count} رسالة حتى {boundary}",
+        "inheritanceTruncated": "تم ضغط السياق",
         "merge": "دمج في المحادثة الرئيسية",
         "mergeSuccess": "تم الدمج في المحادثة الرئيسية ({count} ملفات تسليم)",
         "mergeDescription": "تُضاف الخلاصة وملفات التسليم المحددة فقط، ولا يُعاد كتابة السجل.",

@@ -1862,10 +1862,32 @@ impl ConnectionManager {
                 0,
                 PromptInputBlock::Text {
                     text: format!(
-                        "<codeg-branch-context>\nThis is a read-only context snapshot from the source conversation. Preserve it as prior context; the current user request follows after this block.\n\n{snapshot}\n</codeg-branch-context>"
+                        "<codeg-branch-context>\nThis is read-only initialization context from the source conversation. Preserve it as prior context; the current user request follows after this block.\n\n{}\n</codeg-branch-context>",
+                        snapshot.context
                     ),
                 },
             );
+            let prompt_capabilities = match state_arc.read().await.prompt_capabilities.clone() {
+                Some(capabilities) => Some(capabilities),
+                None if !snapshot.images.is_empty() => {
+                    self.wait_for_prompt_capabilities(conn_id, Duration::from_secs(2))
+                        .await
+                }
+                None => None,
+            };
+            let accepts_images = prompt_capabilities.is_some_and(|capabilities| capabilities.image);
+            if accepts_images {
+                for (index, image) in snapshot.images.iter().enumerate() {
+                    blocks.insert(
+                        index + 1,
+                        PromptInputBlock::Image {
+                            data: image.data.clone(),
+                            mime_type: image.mime_type.clone(),
+                            uri: Some(format!("codeg-branch-context://image/{index}")),
+                        },
+                    );
+                }
+            }
         }
         // A merge is an append-only Codeg-authored turn, not an immediate
         // agent request. Feed unconsumed merge conclusions into the target
@@ -1885,7 +1907,20 @@ impl ConnectionManager {
                 .map(|(_, context)| context.as_str())
                 .collect::<Vec<_>>()
                 .join("\n\n");
-            let insert_at = usize::from(branch_snapshot.is_some());
+            let insert_at = blocks
+                .iter()
+                .position(|block| {
+                    !matches!(
+                        block,
+                        PromptInputBlock::Text { text }
+                            if text.starts_with("<codeg-branch-context>")
+                    ) && !matches!(
+                        block,
+                        PromptInputBlock::Image { uri: Some(uri), .. }
+                            if uri.starts_with("codeg-branch-context://")
+                    )
+                })
+                .unwrap_or(blocks.len());
             blocks.insert(
                 insert_at,
                 PromptInputBlock::Text {
@@ -4573,6 +4608,56 @@ mod tests {
             1,
             "only the first prompt reaches the loop; the second is rejected, not queued"
         );
+    }
+
+    #[tokio::test]
+    async fn independent_branch_connection_does_not_share_source_prompt_gate() {
+        use crate::db::test_helpers;
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/branch-parallel").await;
+        let mgr = ConnectionManager::new();
+        let mut source_rx = insert_live_connection(
+            &mgr,
+            "source-connection",
+            AgentType::ClaudeCode,
+            Some(PathBuf::from("/tmp/branch-parallel")),
+        )
+        .await;
+        let mut branch_rx = insert_live_connection(
+            &mgr,
+            "branch-connection",
+            AgentType::ClaudeCode,
+            Some(PathBuf::from("/tmp/branch-parallel")),
+        )
+        .await;
+
+        mgr.send_prompt_linked(
+            &db,
+            "source-connection",
+            vec![PromptInputBlock::Text {
+                text: "source task".into(),
+            }],
+            Some(folder_id),
+            None,
+            None,
+        )
+        .await
+        .expect("source prompt");
+        mgr.send_prompt_linked(
+            &db,
+            "branch-connection",
+            vec![PromptInputBlock::Text {
+                text: "parallel branch task".into(),
+            }],
+            Some(folder_id),
+            None,
+            None,
+        )
+        .await
+        .expect("branch prompt must not queue behind source");
+
+        assert_eq!(drain_prompt_user_messages(&mut source_rx).len(), 1);
+        assert_eq!(drain_prompt_user_messages(&mut branch_rx).len(), 1);
     }
 
     #[tokio::test]

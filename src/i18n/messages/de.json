@@ -1711,6 +1711,8 @@
         "sourceDeletedHint": "Die Quellkonversation wurde gelöscht; dieser Zweig bleibt unabhängig nutzbar.",
         "nativeMode": "Nativer Zweig",
         "snapshotMode": "Kontext-Snapshot",
+        "inheritanceRange": "{count} Nachrichten bis {boundary}",
+        "inheritanceTruncated": "Kontext komprimiert",
         "merge": "In Hauptkonversation zusammenführen",
         "mergeSuccess": "In Hauptkonversation zusammengeführt ({count} Ergebnisse)",
         "mergeDescription": "Nur das Fazit und ausgewählte Ergebnisse werden angehängt; der Verlauf wird nicht umgeschrieben.",

@@ -1711,6 +1711,8 @@
         "sourceDeletedHint": "元の会話は削除されましたが、このブランチは独立して利用できます。",
         "nativeMode": "ネイティブブランチ",
         "snapshotMode": "コンテキストスナップショット",
+        "inheritanceRange": "{boundary} までの {count} 件のメッセージ",
+        "inheritanceTruncated": "コンテキスト圧縮済み",
         "merge": "メイン会話へマージ",
         "mergeSuccess": "メイン会話へマージしました（成果物 {count} 件）",
         "mergeDescription": "結論と選択した成果物のみを追加し、既存履歴は書き換えません。",
