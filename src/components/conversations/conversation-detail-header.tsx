@@ -225,7 +225,7 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
       const preferredConfigValues = Object.fromEntries(
         (selectors?.configOptions ?? []).map((option) => [
           option.id,
-          option.kind.current_value,
+          String(option.kind.current_value),
         ])
       )
       const result = await createConversationBranch({

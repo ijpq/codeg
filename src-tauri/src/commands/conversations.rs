@@ -1741,6 +1741,7 @@ pub async fn get_folder_conversation_turns_core(
 
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
+#[allow(clippy::too_many_arguments)]
 pub async fn get_folder_conversation(
     app: tauri::AppHandle,
     db: tauri::State<'_, AppDatabase>,
@@ -5010,6 +5011,10 @@ mod tests {
             session_stats: None,
             transcript_watermark: Some(123),
             in_flight_user_turn_id: None,
+            artifact_runs: Vec::new(),
+            deliverables: Vec::new(),
+            deliverable_runs: Vec::new(),
+            history_page: None,
             turns_offset: None,
             turns_total: None,
             assistant_turns_before_offset: None,

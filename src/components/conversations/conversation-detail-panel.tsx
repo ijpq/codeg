@@ -89,7 +89,6 @@ import {
   createChatConversation,
   createChatDir,
   createConversation,
-  getFolderConversation,
   openSettingsWindow,
   submitSessionFeedback,
 } from "@/lib/api"
@@ -2045,7 +2044,7 @@ const ConversationTabView = memo(function ConversationTabView({
           preferredConfigValues: Object.fromEntries(
             connectionConfigOptions.map((option) => [
               option.id,
-              option.kind.current_value,
+              String(option.kind.current_value),
             ])
           ),
         })
