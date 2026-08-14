@@ -756,7 +756,7 @@ mod tests {
         );
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if recorder.messages.lock().await.len() >= 1 {
+                if !recorder.messages.lock().await.is_empty() {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
