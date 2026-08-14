@@ -7,16 +7,27 @@ use sea_orm::{
 use crate::db::entities::chat_channel_sender_context;
 use crate::db::error::DbError;
 
+/// Read a sender route without manufacturing an empty row. Ordinary chat
+/// messages use this to distinguish "this sender has never selected a
+/// conversation" from a temporary database/restore failure.
+pub async fn find(
+    conn: &DatabaseConnection,
+    channel_id: i32,
+    sender_id: &str,
+) -> Result<Option<chat_channel_sender_context::Model>, DbError> {
+    Ok(chat_channel_sender_context::Entity::find()
+        .filter(chat_channel_sender_context::Column::ChannelId.eq(channel_id))
+        .filter(chat_channel_sender_context::Column::SenderId.eq(sender_id))
+        .one(conn)
+        .await?)
+}
+
 pub async fn get_or_create(
     conn: &DatabaseConnection,
     channel_id: i32,
     sender_id: &str,
 ) -> Result<chat_channel_sender_context::Model, DbError> {
-    let existing = chat_channel_sender_context::Entity::find()
-        .filter(chat_channel_sender_context::Column::ChannelId.eq(channel_id))
-        .filter(chat_channel_sender_context::Column::SenderId.eq(sender_id))
-        .one(conn)
-        .await?;
+    let existing = find(conn, channel_id, sender_id).await?;
 
     if let Some(model) = existing {
         return Ok(model);

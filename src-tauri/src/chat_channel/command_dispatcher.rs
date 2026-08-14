@@ -243,6 +243,12 @@ async fn dispatch_command(
             // routing inspect the durable sender context so the first message
             // after a restart can restore its previous conversation instead
             // of falling through to Help.
+            tracing::info!(
+                stage = "ordinary_message_followup_dispatched",
+                channel_id,
+                sender_id,
+                "[ChatChannel][lazy_restore] ordinary message entered follow-up routing"
+            );
             return DispatchResponse::current(
                 session_commands::handle_followup(session_commands::FollowupRequest {
                     db,
@@ -464,8 +470,68 @@ impl DispatchMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::service::{chat_channel_service, sender_context_service};
-    use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+    use crate::acp::connection::ConnectionCommand;
+    use crate::acp::types::{AcpEvent, EventEnvelope, PromptInputBlock};
+    use crate::chat_channel::error::ChatChannelError;
+    use crate::chat_channel::traits::ChatChannelBackend;
+    use crate::chat_channel::types::{ChannelConnectionStatus, ChannelType, SentMessageId};
+    use crate::db::service::{chat_channel_service, conversation_service, sender_context_service};
+    use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
+    use crate::models::AgentType;
+    use async_trait::async_trait;
+    use std::sync::Arc;
+
+    #[derive(Clone, Default)]
+    struct Recorder {
+        messages: Arc<Mutex<Vec<String>>>,
+    }
+
+    struct RecordingWeixinBackend {
+        recorder: Recorder,
+    }
+
+    #[async_trait]
+    impl ChatChannelBackend for RecordingWeixinBackend {
+        fn channel_type(&self) -> ChannelType {
+            ChannelType::Weixin
+        }
+
+        async fn start(
+            &self,
+            _command_tx: mpsc::Sender<IncomingCommand>,
+        ) -> Result<(), ChatChannelError> {
+            Ok(())
+        }
+
+        async fn stop(&self) -> Result<(), ChatChannelError> {
+            Ok(())
+        }
+
+        async fn status(&self) -> ChannelConnectionStatus {
+            ChannelConnectionStatus::Connected
+        }
+
+        async fn send_message(&self, text: &str) -> Result<SentMessageId, ChatChannelError> {
+            self.recorder.messages.lock().await.push(text.to_string());
+            Ok(SentMessageId("weixin-test-message".into()))
+        }
+
+        async fn send_rich_message(
+            &self,
+            message: &RichMessage,
+        ) -> Result<SentMessageId, ChatChannelError> {
+            self.recorder
+                .messages
+                .lock()
+                .await
+                .push(message.body.clone());
+            Ok(SentMessageId("weixin-test-message".into()))
+        }
+
+        async fn test_connection(&self) -> Result<(), ChatChannelError> {
+            Ok(())
+        }
+    }
 
     async fn seed_chat_channel(db: &crate::db::AppDatabase) -> i32 {
         chat_channel_service::create(
@@ -479,6 +545,21 @@ mod tests {
         )
         .await
         .expect("seed chat channel")
+        .id
+    }
+
+    async fn seed_weixin_channel(db: &crate::db::AppDatabase) -> i32 {
+        chat_channel_service::create(
+            &db.conn,
+            "Weixin lazy restore test".to_string(),
+            "weixin".to_string(),
+            serde_json::json!({ "base_url": "https://example.invalid" }).to_string(),
+            true,
+            false,
+            None,
+        )
+        .await
+        .expect("seed Weixin chat channel")
         .id
     }
 
@@ -570,5 +651,185 @@ mod tests {
         };
         assert!(message.body.contains("/task"));
         assert_ne!(message.title.as_deref(), Some("Codeg Bot Help"));
+        assert!(
+            sender_context_service::find(&db.conn, channel_id, "sender-1")
+                .await
+                .unwrap()
+                .is_none(),
+            "an unbound sender must not get a manufactured empty context row"
+        );
+    }
+
+    #[tokio::test]
+    async fn weixin_restart_lazily_restores_and_forwards_original_message_once() {
+        let db = fresh_in_memory_db().await;
+        let channel_id = seed_weixin_channel(&db).await;
+        let folder_path = "/tmp/codeg-weixin-lazy-restore";
+        let folder_id = seed_folder(&db, folder_path).await;
+        let conversation_id = seed_conversation(&db, folder_id, AgentType::OpenCode).await;
+        conversation_service::update_external_id(
+            &db.conn,
+            conversation_id,
+            "weixin-persisted-session".into(),
+        )
+        .await
+        .expect("persist external session");
+        sender_context_service::update_session(
+            &db.conn,
+            channel_id,
+            "wx-user",
+            Some(conversation_id),
+            Some("stale-before-restart".into()),
+        )
+        .await
+        .expect("persist sender conversation binding");
+
+        let conn_mgr = ConnectionManager::new();
+        let mut agent_commands = conn_mgr
+            .insert_test_connection_live(
+                "weixin-restored-connection",
+                AgentType::OpenCode,
+                Some(PathBuf::from(folder_path)),
+                EventEmitter::Noop,
+            )
+            .await;
+        let state = conn_mgr
+            .get_state("weixin-restored-connection")
+            .await
+            .expect("test ACP state");
+        state.write().await.external_id = Some("weixin-persisted-session".into());
+
+        // A fresh bridge models codeg-server restart/reconnect. The durable DB
+        // route above is the only place that still knows the conversation.
+        let bridge = Arc::new(Mutex::new(SessionBridge::new()));
+        let target = ChannelMessageTarget::channel(channel_id);
+        let manager = ChatChannelManager::new();
+        let recorder = Recorder::default();
+        manager
+            .add_channel(
+                channel_id,
+                "Weixin test".into(),
+                ChannelType::Weixin,
+                Box::new(RecordingWeixinBackend {
+                    recorder: recorder.clone(),
+                }),
+            )
+            .await
+            .expect("register recording Weixin backend");
+
+        let (command_tx, command_rx) = mpsc::channel(4);
+        let dispatcher = spawn_command_dispatcher(
+            command_rx,
+            manager.clone_ref(),
+            db.conn.clone(),
+            PathBuf::from("/tmp/codeg-dispatch-data"),
+            conn_mgr.clone_ref(),
+            EventEmitter::Noop,
+            bridge.clone(),
+        );
+        command_tx
+            .send(IncomingCommand {
+                channel_id,
+                sender_id: "wx-user".into(),
+                command_text: "你好".into(),
+                callback_data: None,
+                target: target.clone(),
+                metadata: serde_json::json!({ "provider": "weixin" }),
+            })
+            .await
+            .expect("submit ordinary Weixin text to dispatcher");
+
+        let command = tokio::time::timeout(Duration::from_secs(2), agent_commands.recv())
+            .await
+            .expect("dispatcher timed out")
+            .expect("forwarded ACP prompt");
+        let ConnectionCommand::Prompt { blocks, .. } = command else {
+            panic!("expected prompt command")
+        };
+        assert!(matches!(
+            blocks.as_slice(),
+            [PromptInputBlock::Text { text }] if text == "你好"
+        ));
+        assert!(
+            agent_commands.try_recv().is_err(),
+            "the original message must be submitted exactly once"
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if recorder.messages.lock().await.len() >= 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("dispatcher acknowledgement timed out");
+
+        let active = bridge.lock().await;
+        let session = active
+            .find_by_sender(channel_id, "wx-user")
+            .expect("ActiveSession registered after restore");
+        assert_eq!(session.conversation_id, conversation_id);
+        assert_eq!(session.connection_id, "weixin-restored-connection");
+        assert!(session.forward_events);
+        drop(active);
+        let persisted = sender_context_service::find(&db.conn, channel_id, "wx-user")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.current_conversation_id, Some(conversation_id));
+        assert_eq!(
+            persisted.current_connection_id.as_deref(),
+            Some("weixin-restored-connection")
+        );
+
+        // Model output is still scoped to the Weixin-owned turn and reaches
+        // the channel backend after the lazy restore.
+        super::super::session_event_subscriber::handle_acp_envelope(
+            &EventEnvelope {
+                seq: 1,
+                connection_id: "weixin-restored-connection".into(),
+                payload: AcpEvent::ContentDelta {
+                    text: "你好，我已经恢复了原会话。".into(),
+                    parent_tool_use_id: None,
+                },
+            },
+            &bridge,
+            &manager,
+            &conn_mgr,
+            &db.conn,
+        )
+        .await;
+        super::super::session_event_subscriber::handle_acp_envelope(
+            &EventEnvelope {
+                seq: 2,
+                connection_id: "weixin-restored-connection".into(),
+                payload: AcpEvent::TurnComplete {
+                    session_id: "weixin-persisted-session".into(),
+                    stop_reason: "end_turn".into(),
+                    agent_type: "opencode".into(),
+                },
+            },
+            &bridge,
+            &manager,
+            &conn_mgr,
+            &db.conn,
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if recorder.messages.lock().await.len() >= 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Weixin model reply timed out");
+        let sent = recorder.messages.lock().await.clone();
+        assert_eq!(sent.len(), 2, "one acknowledgement and one model reply");
+        assert_eq!(sent[0], "Message sent.");
+        assert!(sent[1].contains("你好，我已经恢复了原会话。"));
+        dispatcher.abort();
     }
 }

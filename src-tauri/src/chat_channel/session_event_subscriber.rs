@@ -108,7 +108,7 @@ async fn get_prefix(db: &DatabaseConnection) -> String {
 /// `payload.get("type").as_str()` switch — every accessor we used to need
 /// (type / connection_id / event-specific fields) is now a structural
 /// match on `AcpEvent`, with no `unwrap_or("")` defensive fallbacks.
-async fn handle_acp_envelope(
+pub(super) async fn handle_acp_envelope(
     envelope: &EventEnvelope,
     bridge: &Arc<Mutex<SessionBridge>>,
     manager: &ChatChannelManager,
