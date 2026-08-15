@@ -134,6 +134,37 @@ describe("ConversationDeliverablesPanel", () => {
     )
   })
 
+  it("keeps the generated time first and leaves secondary metadata truncatable", async () => {
+    const generatedAt = "2026-07-18T09:10:11Z"
+    mockHistory([
+      deliverable("timed", "版本报告.pdf", {
+        title: "用于区分版本的详细报告说明",
+        produced_at: generatedAt,
+        updated_at: "2026-07-19T12:13:14Z",
+      }),
+    ])
+    render(
+      <ConversationDeliverablesPanel
+        conversationId={1}
+        expanded
+        onToggle={vi.fn()}
+      />
+    )
+
+    await screen.findByText("版本报告.pdf")
+    const metadata = screen.getByTestId("deliverable-metadata-timed")
+    const generatedTime = metadata.querySelector("time")
+    const secondary = metadata.querySelector("span.truncate")
+
+    expect(metadata.firstElementChild).toBe(generatedTime)
+    expect(generatedTime).toHaveAttribute("dateTime", generatedAt)
+    expect(generatedTime).toHaveClass("shrink-0")
+    expect(generatedTime).toHaveTextContent("producedAt")
+    expect(secondary).toHaveClass("truncate")
+    expect(secondary).toHaveTextContent("用于区分版本的详细报告说明")
+    expect(secondary).toHaveTextContent("updatedAt")
+  })
+
   it("shows a deduplicated path and expands its per-turn version lineage", async () => {
     const latest = deliverable("same", "报告.pdf", {
       turn_run_id: "run-2",

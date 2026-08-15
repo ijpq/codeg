@@ -524,19 +524,33 @@ export const ConversationDeliverablesPanel = memo(
                             </Badge>
                           )}
                         </div>
-                        <div className="truncate text-[10px] text-muted-foreground">
-                          {item.title && item.title !== item.file_name
-                            ? `${item.title} · `
-                            : ""}
-                          {formatBytes(item.size_bytes)} · {t("producedAt")}{" "}
-                          {new Date(item.produced_at).toLocaleString()} ·{" "}
-                          {t("updatedAt")}{" "}
-                          {new Date(item.updated_at).toLocaleString()}
-                          {item.turn_run_id && turnLabels.has(item.turn_run_id)
-                            ? ` · ${t("turnNumber", {
-                                number: turnLabels.get(item.turn_run_id) ?? 1,
-                              })}`
-                            : ""}
+                        <div
+                          data-testid={`deliverable-metadata-${item.id}`}
+                          className="flex min-w-0 items-center gap-1 text-[10px] text-muted-foreground"
+                        >
+                          <time
+                            dateTime={item.produced_at}
+                            className="shrink-0 font-medium"
+                          >
+                            {t("producedAt")}{" "}
+                            {new Date(item.produced_at).toLocaleString()}
+                          </time>
+                          <span aria-hidden="true" className="shrink-0">
+                            ·
+                          </span>
+                          <span className="truncate">
+                            {item.title && item.title !== item.file_name
+                              ? `${item.title} · `
+                              : ""}
+                            {formatBytes(item.size_bytes)} · {t("updatedAt")}{" "}
+                            {new Date(item.updated_at).toLocaleString()}
+                            {item.turn_run_id &&
+                            turnLabels.has(item.turn_run_id)
+                              ? ` · ${t("turnNumber", {
+                                  number: turnLabels.get(item.turn_run_id) ?? 1,
+                                })}`
+                              : ""}
+                          </span>
                         </div>
                       </div>
                       <DeliverableFileActions
