@@ -205,9 +205,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: "macOS x64"
-            runner: "macos-latest"
-            target: "x86_64-apple-darwin"
           - name: "Windows x64"
             runner: "windows-2022"
             target: "x86_64-pc-windows-msvc"
@@ -677,11 +674,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: "macOS x64"
-            runner: "macos-latest"
-            target: "x86_64-apple-darwin"
-            artifact: "codeg-server-darwin-x64"
-            archive: "codeg-server-darwin-x64.tar.gz"
           - name: "Windows x64"
             runner: "windows-2022"
             target: "x86_64-pc-windows-msvc"
@@ -922,7 +914,6 @@ jobs:
           set -euo pipefail
 
           archives=(
-            codeg-server-darwin-x64.tar.gz
             codeg-server-windows-x64.zip
           )
 
@@ -934,9 +925,9 @@ jobs:
             fi
           done
 
-          expected_count=4
+          expected_count=2
           if [ "${{ github.event.repository.fork }}" = "false" ]; then
-            expected_count=6
+            expected_count=3
           fi
           actual_count="$(find server-release-assets -maxdepth 1 -type f | wc -l)"
           if [ "$actual_count" -ne "$expected_count" ]; then
@@ -981,7 +972,6 @@ jobs:
               --jq '.assets[].name'
           )"
           archives=(
-            codeg-server-darwin-x64.tar.gz
             codeg-server-windows-x64.zip
           )
 
@@ -1008,6 +998,47 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Validate Windows-only fork release assets
+        if: github.event.repository.fork == true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          mapfile -t remote_assets < <(
+            gh release view "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json assets \
+              --jq '.assets[].name'
+          )
+
+          printf '%s\n' "${remote_assets[@]}"
+          printf '%s\n' "${remote_assets[@]}" \
+            | grep -Fqx 'codeg-server-windows-x64.zip'
+          printf '%s\n' "${remote_assets[@]}" \
+            | grep -Fqx 'codeg-server-windows-x64.zip.sha256'
+
+          setup_count=0
+          for asset in "${remote_assets[@]}"; do
+            case "$asset" in
+              codeg_*_x64-setup.exe)
+                setup_count=$((setup_count + 1))
+                ;;
+              codeg-server-windows-x64.zip|codeg-server-windows-x64.zip.sha256)
+                ;;
+              *)
+                echo "Unexpected release asset: $asset"
+                exit 1
+                ;;
+            esac
+          done
+
+          if [ "$setup_count" -ne 1 ] || [ "${#remote_assets[@]}" -ne 3 ]; then
+            echo "Expected one Windows setup and two Windows Server files"
+            exit 1
+          fi
+
       - name: Publish draft release
         uses: actions/github-script@v7
         env:

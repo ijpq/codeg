@@ -25,11 +25,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: darwin
-            runner: macos-latest
-            target: x86_64-apple-darwin
-            bundles: dmg
-            bundle_path: src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/*.dmg
           - os: windows
             runner: windows-latest
             target: x86_64-pc-windows-msvc
@@ -91,10 +86,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: darwin
-            arch: x64
-            runner: macos-latest
-            target: x86_64-apple-darwin
           - os: windows
             arch: x64
             runner: windows-latest
@@ -265,6 +256,20 @@ jobs:
             cd release-assets
             sha256sum ./* > SHA256SUMS.txt
           )
+
+          setup_count="$(
+            find release-assets -maxdepth 1 -type f \
+              -name 'codeg_*_x64-setup.exe' \
+              | wc -l
+          )"
+          actual_count="$(find release-assets -maxdepth 1 -type f | wc -l)"
+          test -s release-assets/codeg-server-windows-x64.zip
+          test -s release-assets/SHA256SUMS.txt
+          if [ "$setup_count" -ne 1 ] || [ "$actual_count" -ne 3 ]; then
+            echo 'Expected only Windows setup, Windows Server, and SHA256SUMS.txt'
+            find release-assets -maxdepth 1 -type f -printf '%f\n' | sort
+            exit 1
+          fi
 
       - id: release-meta
         name: Generate release metadata and notes

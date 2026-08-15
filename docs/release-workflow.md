@@ -14,12 +14,11 @@
 - 用户未指定版本时，以 `origin` 最新稳定 Release 为基础递增 patch 版本。
 - Release workflow 由 `v*.*.*` tag push 触发；tag 必须与
   `src-tauri/tauri.conf.json` 中的版本一致，而且 tag commit 必须属于 `origin` 默认分支。
-- 默认 Release 只构建并发布以下四类 x64 产物：
-  - Windows x64 客户端安装包
-  - Windows x64 Server 压缩包
-  - macOS x64 客户端安装包
-  - macOS x64 Server 压缩包
-- 默认不发布 Linux、arm64 或 Docker 镜像。只有用户在当次发版中明确要求扩大发布范围时，
+- 默认 Release 只构建并发布以下两类 Windows x64 产物：
+  - Windows x64 客户端 NSIS 安装包（`*_x64-setup.exe`）
+  - Windows x64 Server 压缩包及 SHA-256 校验文件
+- 默认不发布 macOS、Linux、arm64 或 Docker 镜像。只有用户在当次发版中明确要求扩大发
+  布范围时，
   才能调整目标矩阵；不能沿用旧版本的全平台矩阵。
 
 ## 1. 发布前确认
@@ -152,9 +151,9 @@ gh run watch <run-id> --exit-status
 3. `origin` 远端 `RELEASE_TAG` peel 后精确指向 `EXPECTED_SHA`。
 4. Release workflow 的 `headSha` 精确等于 `EXPECTED_SHA` 且 conclusion 为 `success`。
 5. `gh release view "$RELEASE_TAG"` 显示 Release 存在且 `isDraft=false`。
-6. Release 页面已生成 Windows x64/macOS x64 的客户端与 Server assets；不能只看到 draft、
-   缺少任一目标，或看到旧的同名 Release 就结束。
-7. Release 中没有本流程未授权的 Linux、arm64 或 Docker 新产物。
+6. Release 页面已生成 Windows x64 的 `setup.exe`、Server 压缩包及校验文件；不能只看到
+   draft、缺少任一目标，或看到旧的同名 Release 就结束。
+7. Release 中没有本流程未授权的 macOS、Linux、arm64 或 Docker 新产物。
 
 建议最终核对：
 

@@ -20,8 +20,8 @@
 
 ### 构建与分发
 
-- 桌面客户端：macOS x64、Windows x64。
-- 独立服务器：macOS x64、Windows x64；包内含 `codeg-server`、`codeg-mcp` 与静态 Web UI。
+- 桌面客户端：仅发布 Windows x64 NSIS 安装包（`setup.exe`）。
+- 独立服务器：仅发布 Windows x64；包内含 `codeg-server`、`codeg-mcp` 与静态 Web UI。
 - 每个下载文件都可通过 `SHA256SUMS.txt` 校验。
 
-> 桌面客户端为未签名 snapshot 构建，不提供应用内自动更新；macOS Gatekeeper 或 Windows SmartScreen 可能显示安全提示。
+> 桌面客户端为未签名 snapshot 构建，不提供应用内自动更新；Windows SmartScreen 可能显示安全提示。
