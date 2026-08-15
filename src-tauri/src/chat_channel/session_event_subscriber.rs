@@ -128,7 +128,7 @@ pub(super) async fn handle_acp_envelope(
                 )
                 .await;
 
-                if let Some(pending) = session.pending_prompt.take() {
+                if let Some(pending) = session.pending_prompts.pop_front() {
                     // Clone so the prompt can be RESTORED (not dropped) if a turn
                     // is already in flight — see the TurnInProgress arm below.
                     let blocks = vec![PromptInputBlock::Text {
@@ -154,7 +154,7 @@ pub(super) async fn handle_acp_envelope(
                         // retries the kickoff once the in-flight turn finishes,
                         // instead of silently dropping the task's initial prompt.
                         if matches!(e, crate::acp::error::AcpError::TurnInProgress) {
-                            session.pending_prompt = Some(pending);
+                            session.pending_prompts.push_front(pending);
                             tracing::warn!(
                                 "[SessionEventSub] kickoff deferred; a turn is already in \
                                  progress, will retry on TurnComplete"
@@ -510,7 +510,7 @@ pub(super) async fn handle_acp_envelope(
                 // was already mid-turn for another client) waits here. Take it
                 // BEFORE dropping the guard so a second TurnComplete can't
                 // double-send it; retry below once the lock is released.
-                let deferred_kickoff = session.pending_prompt.take();
+                let deferred_kickoff = session.pending_prompts.pop_front();
                 drop(guard);
 
                 let lang = get_lang(db).await;
@@ -567,7 +567,7 @@ pub(super) async fn handle_acp_envelope(
                             let mut g = bridge.lock().await;
                             if let Some(s) = g.get_mut(connection_id) {
                                 s.forward_events = false;
-                                s.pending_prompt = Some(pending);
+                                s.pending_prompts.push_front(pending);
                             }
                             tracing::warn!(
                                 "[SessionEventSub] deferred kickoff still blocked; will retry on \
@@ -1252,7 +1252,7 @@ mod async_relay_dedup_tests {
                 tool_call_inputs: inputs,
                 delegation_rendered: HashSet::new(),
                 last_flushed: Instant::now(),
-                pending_prompt: None,
+                pending_prompts: std::collections::VecDeque::new(),
                 forward_events: true,
                 permission_pending: None,
             },
@@ -1492,11 +1492,17 @@ mod async_relay_dedup_tests {
             .insert_test_connection_live("conn", AgentType::ClaudeCode, None, EventEmitter::Noop)
             .await;
         // Seed the kickoff prompt + simulate another client's turn in flight.
-        bridge.lock().await.get_mut("conn").unwrap().pending_prompt = Some(PendingPrompt {
-            text: "do the task".into(),
-            folder_id,
-            conversation_id,
-        });
+        bridge
+            .lock()
+            .await
+            .get_mut("conn")
+            .unwrap()
+            .pending_prompts
+            .push_back(PendingPrompt {
+                text: "do the task".into(),
+                folder_id,
+                conversation_id,
+            });
         conn.get_state("conn")
             .await
             .unwrap()
@@ -1520,8 +1526,8 @@ mod async_relay_dedup_tests {
                 .await
                 .get("conn")
                 .unwrap()
-                .pending_prompt
-                .as_ref()
+                .pending_prompts
+                .front()
                 .map(|pending| pending.text.as_str()),
             Some("do the task"),
             "a deferred kickoff must be RESTORED, not dropped"
@@ -1562,8 +1568,8 @@ mod async_relay_dedup_tests {
                 .await
                 .get("conn")
                 .unwrap()
-                .pending_prompt
-                .is_none(),
+                .pending_prompts
+                .is_empty(),
             "a retried kickoff must clear the pending prompt"
         );
         // The retried prompt landed on the connection's command channel.
@@ -1634,7 +1640,7 @@ mod error_terminal_gate_tests {
                 tool_call_inputs: std::collections::HashMap::new(),
                 delegation_rendered: std::collections::HashSet::new(),
                 last_flushed: Instant::now(),
-                pending_prompt: None,
+                pending_prompts: std::collections::VecDeque::new(),
                 forward_events: true,
                 permission_pending: None,
             },

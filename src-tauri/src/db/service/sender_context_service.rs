@@ -90,6 +90,27 @@ pub async fn update_session(
     Ok(active.update(conn).await?)
 }
 
+/// Atomically select a durable conversation route while leaving the process-
+/// local ACP connection empty. Lazy restore fills the connection id only after
+/// ACP has actually become usable.
+pub async fn update_binding(
+    conn: &DatabaseConnection,
+    channel_id: i32,
+    sender_id: &str,
+    folder_id: i32,
+    agent_type: String,
+    conversation_id: i32,
+) -> Result<chat_channel_sender_context::Model, DbError> {
+    let model = get_or_create(conn, channel_id, sender_id).await?;
+    let mut active = model.into_active_model();
+    active.current_folder_id = Set(Some(folder_id));
+    active.current_agent_type = Set(Some(agent_type));
+    active.current_conversation_id = Set(Some(conversation_id));
+    active.current_connection_id = Set(None);
+    active.updated_at = Set(Utc::now());
+    Ok(active.update(conn).await?)
+}
+
 pub async fn clear_session(
     conn: &DatabaseConnection,
     channel_id: i32,
@@ -110,7 +131,23 @@ pub async fn clear_connection(
     let mut active = model.into_active_model();
     active.current_connection_id = Set(None);
     active.updated_at = Set(Utc::now());
-    Ok(active.update(conn).await?)
+    let updated = active.update(conn).await?;
+    let sender_key = crate::chat_channel::types::sender_log_key(sender_id);
+    tracing::info!(
+        stage = "transient_connection_cleared",
+        channel_id,
+        sender_key,
+        conversation_id = ?updated.current_conversation_id,
+        "[ChatChannel] transient ACP connection cleared"
+    );
+    tracing::info!(
+        stage = "durable_binding_preserved",
+        channel_id,
+        sender_key,
+        conversation_id = ?updated.current_conversation_id,
+        "[ChatChannel] durable conversation binding preserved"
+    );
+    Ok(updated)
 }
 
 pub async fn update_auto_approve(

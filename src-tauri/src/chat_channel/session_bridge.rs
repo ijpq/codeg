@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -40,7 +40,10 @@ pub struct ActiveSession {
     /// update and so can't serve as a one-shot token. Cleared with the session.
     pub delegation_rendered: HashSet<String>,
     pub last_flushed: Instant,
-    pub pending_prompt: Option<PendingPrompt>,
+    /// FIFO of ordinary messages admitted while ACP was restoring or another
+    /// turn owned the shared connection. A queue (rather than one slot) keeps
+    /// bursts during cold restore lossless and ordered.
+    pub pending_prompts: VecDeque<PendingPrompt>,
     /// Only relay ACP events while the in-flight turn was admitted by this
     /// chat-channel route. A restored connection can be shared with the Web
     /// client, whose output must never leak to WeChat/Telegram/Lark.

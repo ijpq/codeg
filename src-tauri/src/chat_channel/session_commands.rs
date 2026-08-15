@@ -10,14 +10,16 @@ use super::i18n::{self, Lang};
 use super::manager::ChatChannelManager;
 use super::session_bridge::{ActiveSession, PendingPrompt, SessionBridge};
 use super::types::{
-    ButtonStyle, ChannelMessageTarget, InteractiveMessage, MessageButton, MessageLevel, RichMessage,
+    sender_log_key, ButtonStyle, ChannelMessageTarget, InteractiveMessage, MessageButton,
+    MessageLevel, RichMessage,
 };
 use crate::acp::manager::ConnectionManager;
 use crate::acp::registry::all_acp_agents;
 use crate::acp::types::PromptInputBlock;
 use crate::db::entities::{chat_channel_thread_binding, conversation};
 use crate::db::service::{
-    conversation_service, folder_service, sender_context_service, thread_binding_service,
+    chat_channel_service, conversation_service, folder_service, sender_context_service,
+    thread_binding_service,
 };
 use crate::db::AppDatabase;
 use crate::models::agent::AgentType;
@@ -620,7 +622,7 @@ pub async fn handle_task(
             tool_call_inputs: std::collections::HashMap::new(),
             delegation_rendered: std::collections::HashSet::new(),
             last_flushed: Instant::now(),
-            pending_prompt: None,
+            pending_prompts: std::collections::VecDeque::new(),
             forward_events: true,
             permission_pending: None,
         };
@@ -703,7 +705,8 @@ pub async fn handle_post_action(
                         let _ = thread_binding_service::clear_connection(db, binding.id).await;
                     }
                 } else {
-                    let _ = sender_context_service::clear_session(db, channel_id, &sender_id).await;
+                    let _ =
+                        sender_context_service::clear_connection(db, channel_id, &sender_id).await;
                 }
                 let _ = conn_mgr.cancel(db, &connection_id).await;
                 let _ = conversation_service::update_status(
@@ -909,7 +912,7 @@ pub async fn handle_resume(
             tool_call_inputs: std::collections::HashMap::new(),
             delegation_rendered: std::collections::HashSet::new(),
             last_flushed: Instant::now(),
-            pending_prompt: None,
+            pending_prompts: std::collections::VecDeque::new(),
             forward_events: false,
             permission_pending: None,
         };
@@ -997,11 +1000,13 @@ pub async fn handle_cancel(
         .await;
     }
 
-    // Clear session from context
+    // Cancelling a turn invalidates only the process-local ACP connection. The
+    // user's selected conversation remains the durable route for the next
+    // ordinary message, which will lazily restore it.
     if let Some(binding_id) = session_ref.binding_id {
         let _ = thread_binding_service::clear_connection(db, binding_id).await;
     } else {
-        let _ = sender_context_service::clear_session(db, channel_id, sender_id).await;
+        let _ = sender_context_service::clear_connection(db, channel_id, sender_id).await;
     }
 
     RichMessage::info(i18n::task_cancelled_body(lang)).with_title(i18n::task_cancelled_title(lang))
@@ -1127,6 +1132,7 @@ pub async fn handle_followup(req: FollowupRequest<'_>) -> RichMessage {
 
 async fn restore_sender_context_and_send_followup(req: FollowupRequest<'_>) -> RichMessage {
     let lazy_restore_started_at = Instant::now();
+    let sender_key = sender_log_key(req.sender_id);
     let restore_lock = {
         let mut guard = req.bridge.lock().await;
         guard.restore_lock(req.channel_id, req.sender_id)
@@ -1149,22 +1155,13 @@ async fn restore_sender_context_and_send_followup(req: FollowupRequest<'_>) -> R
     }
 
     let context = match sender_context_service::find(req.db, req.channel_id, req.sender_id).await {
-        Ok(Some(context)) => context,
-        Ok(None) => {
-            tracing::info!(
-                stage = "persisted_conversation_missing",
-                channel_id = req.channel_id,
-                sender_id = req.sender_id,
-                "[ChatChannel][lazy_restore] sender has no persisted context"
-            );
-            return RichMessage::info(i18n::no_active_session_use_task(req.lang, req.prefix));
-        }
+        Ok(context) => context,
         Err(e) => {
             tracing::warn!(
                 stage = "lazy_restore_failed",
                 phase = "load_sender_context",
                 channel_id = req.channel_id,
-                sender_id = req.sender_id,
+                sender_key,
                 error = %e,
                 "[ChatChannel][lazy_restore] failed"
             );
@@ -1174,71 +1171,95 @@ async fn restore_sender_context_and_send_followup(req: FollowupRequest<'_>) -> R
             ));
         }
     };
-    let Some(conversation_id) = context.current_conversation_id else {
+    let durable_conversation_id = context
+        .as_ref()
+        .and_then(|context| context.current_conversation_id);
+    let conversation = if let Some(conversation_id) = durable_conversation_id {
         tracing::info!(
-            stage = "persisted_conversation_missing",
+            stage = "durable_binding_found",
             channel_id = req.channel_id,
-            sender_id = req.sender_id,
-            sender_context_id = context.id,
-            "[ChatChannel][lazy_restore] sender context has no conversation"
+            sender_key,
+            sender_context_id = context.as_ref().map(|context| context.id),
+            conversation_id,
+            "[ChatChannel][lazy_restore] durable conversation binding found"
         );
-        return RichMessage::info(i18n::no_active_session_use_task(req.lang, req.prefix));
-    };
-    tracing::info!(
-        stage = "persisted_conversation_found",
-        channel_id = req.channel_id,
-        sender_id = req.sender_id,
-        sender_context_id = context.id,
-        conversation_id,
-        persisted_connection_id = ?context.current_connection_id,
-        "[ChatChannel][lazy_restore] persisted conversation found"
-    );
-
-    let conversation = match conversation_service::get_by_id(req.db, conversation_id).await {
-        Ok(conversation) => conversation,
-        Err(e) => {
-            let existence = conversation::Entity::find_by_id(conversation_id)
-                .filter(conversation::Column::DeletedAt.is_null())
-                .one(req.db)
-                .await;
-            if matches!(existence, Ok(None)) {
+        match load_live_conversation(req.db, conversation_id).await {
+            Ok(Some(conversation)) => conversation,
+            Ok(None) => {
+                // A permanently removed conversation is the one failure that
+                // invalidates the durable selection. If a channel default is
+                // configured, immediately fall back to it for this same input.
                 let _ =
                     sender_context_service::clear_session(req.db, req.channel_id, req.sender_id)
                         .await;
                 tracing::info!(
-                    stage = "persisted_conversation_deleted",
+                    stage = "conversation_permanently_deleted",
                     channel_id = req.channel_id,
-                    sender_id = req.sender_id,
+                    sender_key,
                     conversation_id,
-                    "[ChatChannel][lazy_restore] removed permanently deleted binding"
+                    "[ChatChannel][lazy_restore] permanently deleted binding cleared"
                 );
+                match apply_channel_default_binding(&req, &sender_key).await {
+                    Ok(Some(conversation)) => conversation,
+                    Ok(None) => {
+                        return RichMessage::info(i18n::no_active_session_use_task(
+                            req.lang, req.prefix,
+                        ));
+                    }
+                    Err(e) => {
+                        return RichMessage::error(format!(
+                            "{}{e}",
+                            i18n::failed_to_load_context_label(req.lang)
+                        ));
+                    }
+                }
+            }
+            Err(e) => {
+                let _ =
+                    sender_context_service::clear_connection(req.db, req.channel_id, req.sender_id)
+                        .await;
+                tracing::warn!(
+                    stage = "lazy_restore_failed",
+                    phase = "load_conversation",
+                    channel_id = req.channel_id,
+                    sender_key,
+                    conversation_id,
+                    error = %e,
+                    "[ChatChannel][lazy_restore] failed"
+                );
+                return RichMessage::error(format!(
+                    "{}{e}",
+                    i18n::failed_to_load_context_label(req.lang)
+                ));
+            }
+        }
+    } else {
+        tracing::info!(
+            stage = "persisted_conversation_missing",
+            channel_id = req.channel_id,
+            sender_key,
+            sender_context_id = context.as_ref().map(|context| context.id),
+            "[ChatChannel][lazy_restore] no durable sender conversation"
+        );
+        match apply_channel_default_binding(&req, &sender_key).await {
+            Ok(Some(conversation)) => conversation,
+            Ok(None) => {
                 return RichMessage::info(i18n::no_active_session_use_task(req.lang, req.prefix));
             }
-            // A second DB read failure is not proof that the conversation was
-            // deleted. Retain the durable binding and discard only its stale
-            // process-local connection so the next message can retry.
-            let _ = sender_context_service::clear_connection(req.db, req.channel_id, req.sender_id)
-                .await;
-            tracing::warn!(
-                stage = "lazy_restore_failed",
-                phase = "load_conversation",
-                channel_id = req.channel_id,
-                sender_id = req.sender_id,
-                conversation_id,
-                error = %e,
-                "[ChatChannel][lazy_restore] failed"
-            );
-            return RichMessage::error(format!(
-                "{}{e}",
-                i18n::failed_to_load_context_label(req.lang)
-            ));
+            Err(e) => {
+                return RichMessage::error(format!(
+                    "{}{e}",
+                    i18n::failed_to_load_context_label(req.lang)
+                ));
+            }
         }
     };
+    let conversation_id = conversation.id;
 
     tracing::info!(
         stage = "lazy_restore_started",
         channel_id = req.channel_id,
-        sender_id = req.sender_id,
+        sender_key,
         conversation_id,
         agent_type = %conversation.agent_type,
         "[ChatChannel][lazy_restore] ACP restore started"
@@ -1267,7 +1288,7 @@ async fn restore_sender_context_and_send_followup(req: FollowupRequest<'_>) -> R
                 stage = "lazy_restore_failed",
                 phase = "restore_acp_session",
                 channel_id = req.channel_id,
-                sender_id = req.sender_id,
+                sender_key,
                 conversation_id,
                 elapsed_ms = lazy_restore_started_at.elapsed().as_millis() as u64,
                 error = %e,
@@ -1280,7 +1301,7 @@ async fn restore_sender_context_and_send_followup(req: FollowupRequest<'_>) -> R
     tracing::info!(
         stage = "lazy_restore_completed",
         channel_id = req.channel_id,
-        sender_id = req.sender_id,
+        sender_key,
         conversation_id,
         connection_id = %connection_id,
         reused_existing = restored.reused_existing,
@@ -1302,7 +1323,7 @@ async fn restore_sender_context_and_send_followup(req: FollowupRequest<'_>) -> R
             tool_call_inputs: std::collections::HashMap::new(),
             delegation_rendered: std::collections::HashSet::new(),
             last_flushed: Instant::now(),
-            pending_prompt: None,
+            pending_prompts: std::collections::VecDeque::new(),
             forward_events: false,
             permission_pending: None,
         },
@@ -1310,7 +1331,7 @@ async fn restore_sender_context_and_send_followup(req: FollowupRequest<'_>) -> R
     tracing::info!(
         stage = "active_session_registered",
         channel_id = req.channel_id,
-        sender_id = req.sender_id,
+        sender_key,
         conversation_id,
         connection_id = %connection_id,
         "[ChatChannel][lazy_restore] active session registered"
@@ -1329,7 +1350,7 @@ async fn restore_sender_context_and_send_followup(req: FollowupRequest<'_>) -> R
             stage = "lazy_restore_failed",
             phase = "persist_connection_binding",
             channel_id = req.channel_id,
-            sender_id = req.sender_id,
+            sender_key,
             conversation_id,
             connection_id = %connection_id,
             error = %e,
@@ -1348,7 +1369,7 @@ async fn restore_sender_context_and_send_followup(req: FollowupRequest<'_>) -> R
         tracing::warn!(
             stage = "lazy_restore_folder_update_failed",
             channel_id = req.channel_id,
-            sender_id = req.sender_id,
+            sender_key,
             conversation_id,
             error = %e,
             "[ChatChannel][lazy_restore] folder context update failed"
@@ -1358,12 +1379,90 @@ async fn restore_sender_context_and_send_followup(req: FollowupRequest<'_>) -> R
     send_restored_followup(req, connection_id, conversation.folder_id, conversation.id).await
 }
 
+async fn load_live_conversation(
+    db: &DatabaseConnection,
+    conversation_id: i32,
+) -> Result<Option<DbConversationSummary>, crate::db::error::DbError> {
+    match conversation_service::get_by_id(db, conversation_id).await {
+        Ok(conversation) => Ok(Some(conversation)),
+        Err(primary_error) => match conversation::Entity::find_by_id(conversation_id)
+            .one(db)
+            .await
+        {
+            Ok(None) => Ok(None),
+            Ok(Some(row)) if row.deleted_at.is_some() => Ok(None),
+            // A live row means the summary query failed for a transient DB or
+            // relation reason. It is not evidence that the route was deleted.
+            Ok(Some(_)) | Err(_) => Err(primary_error),
+        },
+    }
+}
+
+async fn apply_channel_default_binding(
+    req: &FollowupRequest<'_>,
+    sender_key: &str,
+) -> Result<Option<DbConversationSummary>, crate::db::error::DbError> {
+    let Some(default_binding) =
+        chat_channel_service::get_default_conversation_binding(req.db, req.channel_id).await?
+    else {
+        return Ok(None);
+    };
+    let Some(conversation) =
+        load_live_conversation(req.db, default_binding.conversation_id).await?
+    else {
+        tracing::info!(
+            stage = "conversation_permanently_deleted",
+            source = "channel_default",
+            channel_id = req.channel_id,
+            sender_key,
+            conversation_id = default_binding.conversation_id,
+            "[ChatChannel][lazy_restore] configured default conversation no longer exists"
+        );
+        return Ok(None);
+    };
+
+    if default_binding.folder_id != Some(conversation.folder_id)
+        || default_binding.agent_type.as_deref() != Some(conversation.agent_type.as_wire().as_ref())
+    {
+        tracing::warn!(
+            stage = "default_binding_metadata_mismatch",
+            channel_id = req.channel_id,
+            conversation_id = conversation.id,
+            configured_folder_id = ?default_binding.folder_id,
+            actual_folder_id = conversation.folder_id,
+            configured_agent_type = ?default_binding.agent_type,
+            actual_agent_type = %conversation.agent_type,
+            "[ChatChannel][lazy_restore] conversation metadata is authoritative"
+        );
+    }
+    sender_context_service::update_binding(
+        req.db,
+        req.channel_id,
+        req.sender_id,
+        conversation.folder_id,
+        conversation.agent_type.as_wire().into_owned(),
+        conversation.id,
+    )
+    .await?;
+    tracing::info!(
+        stage = "default_binding_applied",
+        channel_id = req.channel_id,
+        sender_key,
+        conversation_id = conversation.id,
+        folder_id = conversation.folder_id,
+        agent_type = %conversation.agent_type,
+        "[ChatChannel][lazy_restore] channel default conversation bound to sender"
+    );
+    Ok(Some(conversation))
+}
+
 async fn send_restored_followup(
     req: FollowupRequest<'_>,
     connection_id: String,
     folder_id: i32,
     conversation_id: i32,
 ) -> RichMessage {
+    let sender_key = sender_log_key(req.sender_id);
     {
         let mut guard = req.bridge.lock().await;
         if let Some(session) = guard.get_mut(&connection_id) {
@@ -1382,9 +1481,9 @@ async fn send_restored_followup(
     {
         Ok(()) => {
             tracing::info!(
-                stage = "original_message_forwarded",
+                stage = "original_message_forwarded_after_restore",
                 channel_id = req.channel_id,
-                sender_id = req.sender_id,
+                sender_key,
                 conversation_id,
                 connection_id = %connection_id,
                 message_chars = req.text.chars().count(),
@@ -1396,7 +1495,7 @@ async fn send_restored_followup(
             let mut guard = req.bridge.lock().await;
             if let Some(session) = guard.get_mut(&connection_id) {
                 session.forward_events = false;
-                session.pending_prompt = Some(PendingPrompt {
+                session.pending_prompts.push_back(PendingPrompt {
                     text: req.text.to_string(),
                     folder_id,
                     conversation_id,
@@ -1405,7 +1504,7 @@ async fn send_restored_followup(
             tracing::info!(
                 stage = "original_message_deferred",
                 channel_id = req.channel_id,
-                sender_id = req.sender_id,
+                sender_key,
                 conversation_id,
                 connection_id = %connection_id,
                 message_chars = req.text.chars().count(),
@@ -1421,7 +1520,7 @@ async fn send_restored_followup(
                 stage = "lazy_restore_failed",
                 phase = "forward_original_message",
                 channel_id = req.channel_id,
-                sender_id = req.sender_id,
+                sender_key,
                 conversation_id,
                 connection_id = %connection_id,
                 error = %e,
@@ -1520,6 +1619,35 @@ async fn send_followup_to_session(
             session.forward_events = was_forwarding;
         }
         if matches!(e, crate::acp::error::AcpError::TurnInProgress) {
+            // Ordinary channel messages are durable user input. Keep bursts
+            // that arrive during a cold restore / active turn in FIFO order;
+            // Telegram forum topics retain their established busy response.
+            if !req.target.is_telegram_forum_topic() {
+                if let Some(conversation_id) = session_ref.conversation_id {
+                    if let Ok(conversation) =
+                        conversation_service::get_by_id(req.db, conversation_id).await
+                    {
+                        if let Some(session) = req.bridge.lock().await.get_mut(&connection_id) {
+                            session.pending_prompts.push_back(PendingPrompt {
+                                text: req.text.to_string(),
+                                folder_id: conversation.folder_id,
+                                conversation_id,
+                            });
+                            tracing::info!(
+                                stage = "ordinary_message_queued",
+                                channel_id = req.channel_id,
+                                sender_key = sender_log_key(req.sender_id),
+                                conversation_id,
+                                queue_depth = session.pending_prompts.len(),
+                                "[ChatChannel] ordinary message queued behind active turn"
+                            );
+                            return RichMessage::info(
+                                i18n::task_deferred_busy(req.lang).to_string(),
+                            );
+                        }
+                    }
+                }
+            }
             return RichMessage::info(i18n::agent_busy_retry(req.lang).to_string());
         }
         req.bridge.lock().await.remove(&connection_id);
@@ -1575,7 +1703,7 @@ async fn resume_topic_binding_and_send_followup(
         tool_call_inputs: std::collections::HashMap::new(),
         delegation_rendered: std::collections::HashSet::new(),
         last_flushed: Instant::now(),
-        pending_prompt: None,
+        pending_prompts: std::collections::VecDeque::new(),
         forward_events: false,
         permission_pending: None,
     };
@@ -2079,7 +2207,7 @@ mod tests {
                 tool_call_inputs: std::collections::HashMap::new(),
                 delegation_rendered: std::collections::HashSet::new(),
                 last_flushed: Instant::now(),
-                pending_prompt: None,
+                pending_prompts: std::collections::VecDeque::new(),
                 forward_events: false,
                 permission_pending: None,
             },
@@ -2119,6 +2247,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ordinary_messages_during_active_turn_queue_without_loss() {
+        let db = fresh_in_memory_db().await;
+        let channel_id = seed_chat_channel(&db).await;
+        let folder_id = seed_folder(&db, "/tmp/codeg-channel-queue").await;
+        let conversation_id = seed_conversation(&db, folder_id, AgentType::Codex).await;
+        let target = ChannelMessageTarget::channel(channel_id);
+        let manager = ConnectionManager::new();
+        let _commands = manager
+            .insert_test_connection_live("channel-busy", AgentType::Codex, None, EventEmitter::Noop)
+            .await;
+        manager
+            .get_state("channel-busy")
+            .await
+            .unwrap()
+            .write()
+            .await
+            .turn_in_flight = true;
+        let bridge = Arc::new(Mutex::new(SessionBridge::new()));
+        bridge.lock().await.register(
+            "channel-busy".into(),
+            ActiveSession {
+                channel_id,
+                sender_id: "sender-1".into(),
+                target: target.clone(),
+                conversation_id,
+                connection_id: "channel-busy".into(),
+                agent_type: AgentType::Codex,
+                content_buffer: String::new(),
+                tool_calls: Vec::new(),
+                tool_call_inputs: std::collections::HashMap::new(),
+                delegation_rendered: std::collections::HashSet::new(),
+                last_flushed: Instant::now(),
+                pending_prompts: std::collections::VecDeque::new(),
+                forward_events: true,
+                permission_pending: None,
+            },
+        );
+        let emitter = EventEmitter::Noop;
+
+        for text in ["second", "third"] {
+            let response = handle_followup(followup_request(
+                &db.conn, text, channel_id, &target, &manager, &emitter, &bridge,
+            ))
+            .await;
+            assert!(response.body.contains("start automatically"));
+        }
+        let queued: Vec<String> = bridge
+            .lock()
+            .await
+            .get("channel-busy")
+            .unwrap()
+            .pending_prompts
+            .iter()
+            .map(|pending| pending.text.clone())
+            .collect();
+        assert_eq!(queued, ["second", "third"]);
+    }
+
+    #[tokio::test]
     async fn failed_auto_restore_keeps_conversation_and_clears_only_connection() {
         let db = fresh_in_memory_db().await;
         let channel_id = seed_chat_channel(&db).await;
@@ -2152,6 +2339,112 @@ mod tests {
             .await
             .unwrap();
         assert!(response.body.contains("Failed to restore"));
+        assert_eq!(context.current_conversation_id, Some(conversation_id));
+        assert_eq!(context.current_connection_id, None);
+    }
+
+    #[tokio::test]
+    async fn linked_prompt_failure_preserves_durable_conversation_binding() {
+        let db = fresh_in_memory_db().await;
+        let channel_id = seed_chat_channel(&db).await;
+        let folder_id = seed_folder(&db, "/tmp/codeg-linked-failure").await;
+        let conversation_id = seed_conversation(&db, folder_id, AgentType::Codex).await;
+        sender_context_service::update_session(
+            &db.conn,
+            channel_id,
+            "sender-1",
+            Some(conversation_id),
+            Some("missing-connection".into()),
+        )
+        .await
+        .unwrap();
+
+        let result = handle_post_action(
+            CommandPostAction::SendLinkedPrompt {
+                connection_id: "missing-connection".into(),
+                folder_id,
+                conversation_id,
+                text: "hello".into(),
+                channel_id,
+                sender_id: "sender-1".into(),
+                response_target: ChannelMessageTarget::channel(channel_id),
+                lang: Lang::En,
+            },
+            &db.conn,
+            &ConnectionManager::new(),
+            &Arc::new(Mutex::new(SessionBridge::new())),
+        )
+        .await;
+
+        assert!(result.is_some());
+        let context = sender_context_service::find(&db.conn, channel_id, "sender-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(context.current_conversation_id, Some(conversation_id));
+        assert_eq!(context.current_connection_id, None);
+    }
+
+    #[tokio::test]
+    async fn cancel_clears_only_connection_and_preserves_selected_conversation() {
+        let db = fresh_in_memory_db().await;
+        let channel_id = seed_chat_channel(&db).await;
+        let folder_id = seed_folder(&db, "/tmp/codeg-cancel-preserve").await;
+        let conversation_id = seed_conversation(&db, folder_id, AgentType::Codex).await;
+        sender_context_service::update_session(
+            &db.conn,
+            channel_id,
+            "sender-1",
+            Some(conversation_id),
+            Some("cancel-connection".into()),
+        )
+        .await
+        .unwrap();
+        let conn_mgr = ConnectionManager::new();
+        let _commands = conn_mgr
+            .insert_test_connection_live(
+                "cancel-connection",
+                AgentType::Codex,
+                None,
+                EventEmitter::Noop,
+            )
+            .await;
+        let bridge = Arc::new(Mutex::new(SessionBridge::new()));
+        bridge.lock().await.register(
+            "cancel-connection".into(),
+            ActiveSession {
+                channel_id,
+                sender_id: "sender-1".into(),
+                target: ChannelMessageTarget::channel(channel_id),
+                conversation_id,
+                connection_id: "cancel-connection".into(),
+                agent_type: AgentType::Codex,
+                content_buffer: String::new(),
+                tool_calls: Vec::new(),
+                tool_call_inputs: std::collections::HashMap::new(),
+                delegation_rendered: std::collections::HashSet::new(),
+                last_flushed: Instant::now(),
+                pending_prompts: std::collections::VecDeque::new(),
+                forward_events: true,
+                permission_pending: None,
+            },
+        );
+
+        let response = handle_cancel(
+            &db.conn,
+            channel_id,
+            "sender-1",
+            &ChannelMessageTarget::channel(channel_id),
+            &conn_mgr,
+            &bridge,
+            Lang::En,
+        )
+        .await;
+        assert_eq!(response.title.as_deref(), Some("Task Cancelled"));
+        let context = sender_context_service::find(&db.conn, channel_id, "sender-1")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(context.current_conversation_id, Some(conversation_id));
         assert_eq!(context.current_connection_id, None);
     }
@@ -2338,7 +2631,7 @@ mod tests {
                 tool_call_inputs: std::collections::HashMap::new(),
                 delegation_rendered: std::collections::HashSet::new(),
                 last_flushed: Instant::now(),
-                pending_prompt: None,
+                pending_prompts: std::collections::VecDeque::new(),
                 forward_events: true,
                 permission_pending: None,
             },
@@ -2544,7 +2837,7 @@ mod tests {
                 tool_call_inputs: std::collections::HashMap::new(),
                 delegation_rendered: std::collections::HashSet::new(),
                 last_flushed: Instant::now(),
-                pending_prompt: None,
+                pending_prompts: std::collections::VecDeque::new(),
                 forward_events: true,
                 permission_pending: None,
             },
@@ -2574,6 +2867,84 @@ mod tests {
             &blocks[0],
             PromptInputBlock::Text { text } if text == "continue task"
         ));
+    }
+
+    #[tokio::test]
+    async fn busy_telegram_forum_topic_keeps_existing_retry_behavior() {
+        let db = fresh_in_memory_db().await;
+        let channel_id = seed_chat_channel(&db).await;
+        let folder_id = seed_folder(&db, "/tmp/codeg-topic-busy-regression").await;
+        let conversation_id = seed_conversation(&db, folder_id, AgentType::Codex).await;
+        let target = ChannelMessageTarget::telegram_forum_topic(channel_id, "-100123", "9");
+        thread_binding_service::upsert_for_target(
+            &db.conn,
+            &target,
+            "telegram",
+            conversation_id,
+            Some("topic-busy".into()),
+            "sender-1",
+            Some("Busy topic".into()),
+        )
+        .await
+        .unwrap();
+        let conn_mgr = ConnectionManager::new();
+        let _commands = conn_mgr
+            .insert_test_connection_live("topic-busy", AgentType::Codex, None, EventEmitter::Noop)
+            .await;
+        conn_mgr
+            .get_state("topic-busy")
+            .await
+            .unwrap()
+            .write()
+            .await
+            .turn_in_flight = true;
+        let bridge = Arc::new(Mutex::new(SessionBridge::new()));
+        bridge.lock().await.register(
+            "topic-busy".into(),
+            ActiveSession {
+                channel_id,
+                sender_id: "sender-1".into(),
+                target: target.clone(),
+                conversation_id,
+                connection_id: "topic-busy".into(),
+                agent_type: AgentType::Codex,
+                content_buffer: String::new(),
+                tool_calls: Vec::new(),
+                tool_call_inputs: std::collections::HashMap::new(),
+                delegation_rendered: std::collections::HashSet::new(),
+                last_flushed: Instant::now(),
+                pending_prompts: std::collections::VecDeque::new(),
+                forward_events: true,
+                permission_pending: None,
+            },
+        );
+
+        let message = handle_followup(FollowupRequest {
+            db: &db.conn,
+            text: "do not queue me",
+            channel_id,
+            sender_id: "sender-1",
+            target: &target,
+            conn_mgr: &conn_mgr,
+            emitter: &EventEmitter::Noop,
+            bridge: &bridge,
+            data_dir: std::path::Path::new("/tmp/codeg-topic-followup-data"),
+            lang: Lang::En,
+            prefix: "/",
+        })
+        .await;
+
+        assert_eq!(message.body, i18n::agent_busy_retry(Lang::En));
+        assert!(
+            bridge
+                .lock()
+                .await
+                .get("topic-busy")
+                .unwrap()
+                .pending_prompts
+                .is_empty(),
+            "forum topic busy semantics must not switch to the legacy sender FIFO"
+        );
     }
 
     #[test]

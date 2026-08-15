@@ -1,3 +1,4 @@
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,6 +17,8 @@ const ILINK_BASE_URL: &str = "https://ilinkai.weixin.qq.com";
 const ILINK_CHANNEL_VERSION: &str = "1.0.2";
 /// Maximum number of messages buffered while context_token is expired.
 const MAX_PENDING_MESSAGES: usize = 50;
+const MAX_SEEN_INBOUND_MESSAGES: usize = 1024;
+const MAX_SEND_RETRIES: usize = 3;
 
 /// Shared HTTP client for QR code auth requests (avoids re-creating TLS state).
 fn qr_client() -> reqwest::Client {
@@ -58,6 +61,7 @@ pub struct WeixinQrcodeStatusPublic {
 }
 
 struct SendRequest<'a> {
+    channel_id: i32,
     client: &'a reqwest::Client,
     base_url: &'a str,
     bot_token: &'a str,
@@ -67,6 +71,30 @@ struct SendRequest<'a> {
     text: &'a str,
     reply_context: &'a Mutex<Option<WeixinReplyContext>>,
     pending_messages: &'a Mutex<Vec<String>>,
+}
+
+fn send_retry_delay(retry: usize) -> Duration {
+    let seconds = 1u64 << retry.min(2);
+    #[cfg(test)]
+    return Duration::from_millis(seconds);
+    #[cfg(not(test))]
+    Duration::from_secs(seconds)
+}
+
+fn retryable_send_status(status: reqwest::StatusCode) -> bool {
+    status.is_server_error() || matches!(status.as_u16(), 408 | 425 | 429)
+}
+
+fn weixin_message_key(message: &serde_json::Value) -> Option<String> {
+    ["message_id", "msg_id", "client_id"]
+        .into_iter()
+        .find_map(|field| {
+            let value = message.get(field)?;
+            value
+                .as_str()
+                .map(|id| format!("{field}:{id}"))
+                .or_else(|| value.as_i64().map(|id| format!("{field}:{id}")))
+        })
 }
 
 // ── QR code auth functions (called before backend exists) ──
@@ -324,54 +352,133 @@ impl WeixinBackend {
     async fn do_send(req: SendRequest<'_>) -> Result<bool, ChatChannelError> {
         let body = Self::build_send_body(req.to_user_id, req.context_token, req.text);
         let url = format!("{}/ilink/bot/sendmessage", req.base_url);
+        for attempt in 0..=MAX_SEND_RETRIES {
+            // `body` (including client_id) is built once above and deliberately
+            // reused across retries so iLink can deduplicate an uncertain send.
+            let response = req
+                .client
+                .post(&url)
+                .headers(Self::build_headers(req.bot_token, req.wechat_uin))
+                .json(&body)
+                .send()
+                .await;
+            let resp = match response {
+                Ok(resp) => resp,
+                Err(error) if attempt < MAX_SEND_RETRIES => {
+                    let delay = send_retry_delay(attempt);
+                    tracing::warn!(
+                        stage = "weixin_send_retry",
+                        channel_id = req.channel_id,
+                        retry = attempt + 1,
+                        delay_ms = delay.as_millis() as u64,
+                        error = %error,
+                        "[Weixin] transient send failure; retrying"
+                    );
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                Err(error) => {
+                    tracing::error!(
+                        stage = "weixin_send_failed_binding_preserved",
+                        channel_id = req.channel_id,
+                        attempts = attempt + 1,
+                        error = %error,
+                        "[Weixin] send failed; durable binding is unchanged"
+                    );
+                    return Err(ChatChannelError::SendFailed(error.to_string()));
+                }
+            };
 
-        let resp = req
-            .client
-            .post(&url)
-            .headers(Self::build_headers(req.bot_token, req.wechat_uin))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ChatChannelError::SendFailed(e.to_string()))?;
+            let status_code = resp.status();
+            let resp_text = match resp.text().await {
+                Ok(text) => text,
+                Err(error) if attempt < MAX_SEND_RETRIES => {
+                    let delay = send_retry_delay(attempt);
+                    tracing::warn!(
+                        stage = "weixin_send_retry",
+                        channel_id = req.channel_id,
+                        retry = attempt + 1,
+                        delay_ms = delay.as_millis() as u64,
+                        error = %error,
+                        "[Weixin] response body read failed; retrying stable client_id"
+                    );
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                Err(error) => {
+                    tracing::error!(
+                        stage = "weixin_send_failed_binding_preserved",
+                        channel_id = req.channel_id,
+                        attempts = attempt + 1,
+                        error = %error,
+                        "[Weixin] response read failed; durable binding is unchanged"
+                    );
+                    return Err(ChatChannelError::SendFailed(error.to_string()));
+                }
+            };
 
-        let status_code = resp.status();
-        let resp_text = resp.text().await.unwrap_or_default();
+            if !status_code.is_success() {
+                let error = format!("HTTP {status_code}: {resp_text}");
+                if retryable_send_status(status_code) && attempt < MAX_SEND_RETRIES {
+                    let delay = send_retry_delay(attempt);
+                    tracing::warn!(
+                        stage = "weixin_send_retry",
+                        channel_id = req.channel_id,
+                        retry = attempt + 1,
+                        delay_ms = delay.as_millis() as u64,
+                        status = status_code.as_u16(),
+                        "[Weixin] transient HTTP send failure; retrying"
+                    );
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                tracing::error!(
+                    stage = "weixin_send_failed_binding_preserved",
+                    channel_id = req.channel_id,
+                    attempts = attempt + 1,
+                    status = status_code.as_u16(),
+                    "[Weixin] send failed; durable binding is unchanged"
+                );
+                return Err(ChatChannelError::SendFailed(error));
+            }
 
-        if !status_code.is_success() {
-            return Err(ChatChannelError::SendFailed(format!(
-                "HTTP {status_code}: {resp_text}"
-            )));
-        }
+            // Check for ret errors in response (e.g. -2 = context expired).
+            if let Ok(resp_json) = serde_json::from_str::<serde_json::Value>(&resp_text) {
+                if let Some(ret) = resp_json.get("ret").and_then(|v| v.as_i64()) {
+                    if ret != 0 {
+                        let errmsg = resp_json
+                            .get("errmsg")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+                        tracing::info!("[Weixin] sendmessage ret={ret}, errmsg={errmsg}");
 
-        // Check for ret errors in response (e.g. -2 = context expired)
-        if let Ok(resp_json) = serde_json::from_str::<serde_json::Value>(&resp_text) {
-            if let Some(ret) = resp_json.get("ret").and_then(|v| v.as_i64()) {
-                if ret != 0 {
-                    let errmsg = resp_json
-                        .get("errmsg")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown");
-                    tracing::info!("[Weixin] sendmessage ret={ret}, errmsg={errmsg}");
-
-                    if ret == -2 {
-                        // Context token expired — mark stale and buffer
-                        if let Some(ref mut c) = *req.reply_context.lock().await {
-                            c.expired = true;
+                        if ret == -2 {
+                            if let Some(ref mut context) = *req.reply_context.lock().await {
+                                context.expired = true;
+                            }
+                            let mut buffer = req.pending_messages.lock().await;
+                            if buffer.len() < MAX_PENDING_MESSAGES {
+                                buffer.push(req.text.to_string());
+                            }
+                            tracing::info!(
+                                "[Weixin] context_token expired (ret=-2), buffered message"
+                            );
+                            return Ok(false);
                         }
-                        let mut buf = req.pending_messages.lock().await;
-                        if buf.len() < MAX_PENDING_MESSAGES {
-                            buf.push(req.text.to_string());
-                        }
-                        tracing::info!("[Weixin] context_token expired (ret=-2), buffered message");
-                        return Ok(false);
+
+                        tracing::error!(
+                            stage = "weixin_send_failed_binding_preserved",
+                            channel_id = req.channel_id,
+                            ret,
+                            "[Weixin] API rejected send; durable binding is unchanged"
+                        );
+                        return Err(ChatChannelError::SendFailed(format!("ret={ret}: {errmsg}")));
                     }
-
-                    return Err(ChatChannelError::SendFailed(format!("ret={ret}: {errmsg}")));
                 }
             }
+            return Ok(true);
         }
-
-        Ok(true)
+        unreachable!("send retry loop always returns")
     }
 
     async fn send_text(&self, text: &str) -> Result<SentMessageId, ChatChannelError> {
@@ -407,12 +514,15 @@ impl WeixinBackend {
         }
 
         tracing::info!(
-            "[Weixin] sendmessage to={to_user_id}, context_token_len={}, text_len={}",
-            context_token.len(),
-            text.len()
+            channel_id = self.channel_id,
+            recipient_key = %sender_log_key(&to_user_id),
+            context_token_len = context_token.len(),
+            text_len = text.len(),
+            "[Weixin] sending message"
         );
 
         Self::do_send(SendRequest {
+            channel_id: self.channel_id,
             client: &self.client,
             base_url: &self.base_url,
             bot_token: &self.bot_token,
@@ -534,6 +644,8 @@ impl ChatChannelBackend for WeixinBackend {
         tokio::spawn(async move {
             let mut cursor = initial_cursor;
             let mut consecutive_errors: u32 = 0;
+            let mut seen_message_keys = HashSet::new();
+            let mut seen_message_order = VecDeque::new();
 
             loop {
                 if *shutdown_rx.borrow() {
@@ -604,6 +716,23 @@ impl ChatChannelBackend for WeixinBackend {
                                         continue;
                                     }
 
+                                    if let Some(message_key) = weixin_message_key(msg) {
+                                        if !seen_message_keys.insert(message_key.clone()) {
+                                            tracing::info!(
+                                                stage = "weixin_inbound_duplicate_ignored",
+                                                channel_id,
+                                                "[Weixin] duplicate inbound message ignored"
+                                            );
+                                            continue;
+                                        }
+                                        seen_message_order.push_back(message_key);
+                                        if seen_message_order.len() > MAX_SEEN_INBOUND_MESSAGES {
+                                            if let Some(expired) = seen_message_order.pop_front() {
+                                                seen_message_keys.remove(&expired);
+                                            }
+                                        }
+                                    }
+
                                     // Extract text from type=1 (text) or type=3 (voice-to-text)
                                     let text = msg
                                         .get("item_list")
@@ -667,6 +796,7 @@ impl ChatChannelBackend for WeixinBackend {
                                                 );
                                                 for pending_text in &buffered {
                                                     let ok = WeixinBackend::do_send(SendRequest {
+                                                        channel_id,
                                                         client: &client,
                                                         base_url: &base_url,
                                                         bot_token: &bot_token,
@@ -693,7 +823,12 @@ impl ChatChannelBackend for WeixinBackend {
                                         }
                                     }
 
-                                    tracing::debug!("[Weixin] dispatching: {text}");
+                                    tracing::debug!(
+                                        channel_id,
+                                        sender_key = %sender_log_key(from_user_id),
+                                        message_chars = text.chars().count(),
+                                        "[Weixin] dispatching inbound message"
+                                    );
                                     let send_result = command_tx
                                         .send(IncomingCommand {
                                             channel_id,
@@ -798,5 +933,101 @@ impl ChatChannelBackend for WeixinBackend {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::extract::State;
+    use axum::http::StatusCode;
+    use axum::routing::post;
+    use axum::{Json, Router};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone, Default)]
+    struct SendServerState {
+        attempts: Arc<AtomicUsize>,
+        client_ids: Arc<Mutex<Vec<String>>>,
+    }
+
+    async fn flaky_send(
+        State(state): State<SendServerState>,
+        Json(body): Json<serde_json::Value>,
+    ) -> (StatusCode, Json<serde_json::Value>) {
+        let attempt = state.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+        let client_id = body
+            .pointer("/msg/client_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        state.client_ids.lock().await.push(client_id);
+        if attempt < 3 {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": "temporary" })),
+            )
+        } else {
+            (StatusCode::OK, Json(serde_json::json!({ "ret": 0 })))
+        }
+    }
+
+    #[tokio::test]
+    async fn transient_send_failures_retry_with_one_stable_client_id() {
+        let state = SendServerState::default();
+        let app = Router::new()
+            .route("/ilink/bot/sendmessage", post(flaky_send))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let reply_context = Mutex::new(Some(WeixinReplyContext {
+            to_user_id: "wx-user".into(),
+            context_token: "context".into(),
+            expired: false,
+        }));
+        let pending_messages = Mutex::new(Vec::new());
+
+        let sent = WeixinBackend::do_send(SendRequest {
+            channel_id: 1,
+            client: &reqwest::Client::new(),
+            base_url: &format!("http://{address}"),
+            bot_token: "test-token",
+            wechat_uin: "test-uin",
+            to_user_id: "wx-user",
+            context_token: "context",
+            text: "reply",
+            reply_context: &reply_context,
+            pending_messages: &pending_messages,
+        })
+        .await
+        .unwrap();
+
+        assert!(sent);
+        assert_eq!(state.attempts.load(Ordering::SeqCst), 3);
+        let client_ids = state.client_ids.lock().await;
+        assert_eq!(client_ids.len(), 3);
+        assert!(!client_ids[0].is_empty());
+        assert!(client_ids.iter().all(|id| id == &client_ids[0]));
+        server.abort();
+    }
+
+    #[test]
+    fn inbound_dedup_uses_only_stable_provider_message_ids() {
+        assert_eq!(
+            weixin_message_key(&serde_json::json!({ "message_id": "m-1", "text": "a" })),
+            Some("message_id:m-1".into())
+        );
+        assert_eq!(
+            weixin_message_key(&serde_json::json!({ "msg_id": 42 })),
+            Some("msg_id:42".into())
+        );
+        assert_eq!(
+            weixin_message_key(&serde_json::json!({ "text": "same text" })),
+            None,
+            "identical user text without a provider id must remain a legitimate repeat"
+        );
     }
 }

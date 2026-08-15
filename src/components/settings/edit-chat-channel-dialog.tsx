@@ -46,6 +46,15 @@ export function EditChatChannelDialog({
   const [chatId, setChatId] = useState(config.chat_id ?? "")
   const [appId, setAppId] = useState(config.app_id ?? "")
   const [baseUrl] = useState(config.base_url ?? "")
+  const [defaultFolderId, setDefaultFolderId] = useState(
+    config.default_folder_id?.toString() ?? ""
+  )
+  const [defaultAgentType, setDefaultAgentType] = useState(
+    config.default_agent_type ?? "codex"
+  )
+  const [defaultConversationId, setDefaultConversationId] = useState(
+    config.default_conversation_id?.toString() ?? ""
+  )
   const [topicMode, setTopicMode] = useState(Boolean(config.topic_mode))
   const [dailyReportEnabled, setDailyReportEnabled] = useState(
     channel.daily_report_enabled
@@ -77,9 +86,22 @@ export function EditChatChannelDialog({
     setLoading(true)
     setError(null)
     try {
+      const optionalPositiveId = (value: string) => {
+        if (!value.trim()) return undefined
+        const parsed = Number.parseInt(value, 10)
+        return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined
+      }
       const configJson =
         channel.channel_type === "weixin"
-          ? JSON.stringify({ base_url: baseUrl })
+          ? JSON.stringify({
+              ...JSON.parse(channel.config_json || "{}"),
+              base_url: baseUrl,
+              default_folder_id: optionalPositiveId(defaultFolderId),
+              default_agent_type: defaultAgentType.trim() || undefined,
+              default_conversation_id: optionalPositiveId(
+                defaultConversationId
+              ),
+            })
           : channel.channel_type === "lark"
             ? JSON.stringify({ app_id: appId, chat_id: chatId })
             : JSON.stringify({ chat_id: chatId, topic_mode: topicMode })
@@ -112,6 +134,9 @@ export function EditChatChannelDialog({
     channel,
     appId,
     baseUrl,
+    defaultFolderId,
+    defaultAgentType,
+    defaultConversationId,
     topicMode,
     dailyReportEnabled,
     dailyReportTime,
@@ -205,6 +230,55 @@ export function EditChatChannelDialog({
             <div className="space-y-1.5">
               <label className="text-xs font-medium">Base URL</label>
               <Input value={baseUrl} disabled />
+            </div>
+          )}
+
+          {channel.channel_type === "weixin" && (
+            <div className="space-y-3 rounded-md border border-border/70 p-3">
+              <div>
+                <p className="text-xs font-medium">
+                  {t("defaultConversation")}
+                </p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  {t("defaultConversationHint")}
+                </p>
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div className="space-y-1.5">
+                  <label className="text-xs font-medium">
+                    {t("defaultFolderId")}
+                  </label>
+                  <Input
+                    type="number"
+                    min="1"
+                    value={defaultFolderId}
+                    onChange={(e) => setDefaultFolderId(e.target.value)}
+                    placeholder="8"
+                  />
+                </div>
+                <div className="space-y-1.5">
+                  <label className="text-xs font-medium">
+                    {t("defaultConversationId")}
+                  </label>
+                  <Input
+                    type="number"
+                    min="1"
+                    value={defaultConversationId}
+                    onChange={(e) => setDefaultConversationId(e.target.value)}
+                    placeholder="75"
+                  />
+                </div>
+              </div>
+              <div className="space-y-1.5">
+                <label className="text-xs font-medium">
+                  {t("defaultAgentType")}
+                </label>
+                <Input
+                  value={defaultAgentType}
+                  onChange={(e) => setDefaultAgentType(e.target.value)}
+                  placeholder="codex"
+                />
+              </div>
             </div>
           )}
 

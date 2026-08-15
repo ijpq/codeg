@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -26,6 +27,22 @@ pub struct LarkConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct WeixinConfig {
     pub base_url: String,
+    #[serde(default)]
+    pub default_folder_id: Option<i32>,
+    #[serde(default)]
+    pub default_agent_type: Option<String>,
+    #[serde(default)]
+    pub default_conversation_id: Option<i32>,
+}
+
+/// A stable, non-reversible identifier suitable for routing logs. Never log
+/// raw provider sender ids: they are credentials-adjacent personal data.
+pub fn sender_log_key(sender_id: &str) -> String {
+    let digest = Sha256::digest(sender_id.as_bytes());
+    digest[..6]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 impl std::fmt::Display for ChannelType {

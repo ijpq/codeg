@@ -652,7 +652,7 @@ mod permission_push_tests {
             tool_call_inputs: HashMap::new(),
             delegation_rendered: HashSet::new(),
             last_flushed: Instant::now(),
-            pending_prompt: None,
+            pending_prompts: std::collections::VecDeque::new(),
             forward_events: true,
             permission_pending: None,
         }
