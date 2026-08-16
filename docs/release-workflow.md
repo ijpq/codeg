@@ -11,7 +11,11 @@
   commit，不使用可能领先于正式版的 `upstream/main`。用户明确要求 RC 或其他通道时按其
   指定执行。
 - 待发版分支是用户当前工作的本地分支，通常为 `main`。
-- 用户未指定版本时，以 `origin` 最新稳定 Release 为基础递增 patch 版本。
+- 用户未指定版本时，版本号跟随本次采用的 `upstream` 正式 Release，并追加 fork
+  修订号：`<upstream-version>-fixN`。同一 upstream 基线从 `fix1` 开始递增；upstream
+  版本变化后重新从 `fix1` 开始。例如，基于 `upstream v0.25.0` 的连续发布依次为
+  `v0.25.0-fix1`、`v0.25.0-fix2`，同步到 `upstream v0.25.1` 后改为
+  `v0.25.1-fix1`。不得再根据 origin 旧版本号单独递增 patch。
 - Release workflow 由 `v*.*.*` tag push 触发；tag 必须与
   `src-tauri/tauri.conf.json` 中的版本一致，而且 tag commit 必须属于 `origin` 默认分支。
 - 默认 Release 只构建并发布以下两类 Windows x64 产物：
@@ -73,7 +77,24 @@ git merge-base --is-ancestor "$UPSTREAM_SHA" HEAD
 
 ## 4. 版本和 release commit
 
-默认选择 `origin` 最新稳定版本的下一个 patch 版本。同步更新以下版本来源：
+从第 2 步的 `UPSTREAM_TAG` 去掉前缀 `v`，得到 upstream 基线版本。检查 origin 上所有
+匹配 `v<upstream-version>-fixN` 的远端 tag 和 Release，选择尚未使用的下一个正整数
+`N`；没有匹配项时使用 `fix1`。版本文件和 tag 使用完全相同的
+`<upstream-version>-fixN` 形式。已有的旧式 origin 版本（例如 `v0.24.4`）不参与计算。
+
+选择修订号时必须检查远端 tag，而不能只看非 draft Release；draft、失败发布遗留的 tag
+同样占用版本号，不得静默移动或复用。示例：
+
+```bash
+UPSTREAM_VERSION="${UPSTREAM_TAG#v}"
+git fetch origin --tags --prune
+git ls-remote --tags origin "refs/tags/v${UPSTREAM_VERSION}-fix*"
+# 若 fix1、fix2 已存在，则 VERSION=${UPSTREAM_VERSION}-fix3
+VERSION="${UPSTREAM_VERSION}-fix<N>"
+RELEASE_TAG="v${VERSION}"
+```
+
+确定版本后同步更新以下版本来源：
 
 - `package.json`
 - `src-tauri/Cargo.toml`
@@ -90,7 +111,7 @@ release: <version> <简短发布主题>
 
 ```bash
 EXPECTED_SHA=$(git rev-parse HEAD)
-RELEASE_TAG="v<version>"
+RELEASE_TAG="v<upstream-version>-fixN"
 ```
 
 从此处开始，任何代码或配置修复都会改变 `EXPECTED_SHA`，必须重新检查、提交并重新确认
@@ -173,7 +194,8 @@ Release CI 结果和 GitHub Release 地址。
 - 只是 GitHub runner、下载源等瞬时基础设施问题且代码未变，可以重跑同一 SHA 的 workflow。
 - 任何修复导致 commit 变化，都必须更新 `EXPECTED_SHA`，重新推分支、等待普通 CI，再触发与
   新 commit 对应的发布。
-- 已发布 tag 原则上不可变。若已发布版本需要代码修复，默认递增 patch 版本并创建新 tag；
+- 已发布 tag 原则上不可变。若已发布版本需要代码修复，在同一 upstream 基线上递增
+  `fixN` 并创建新 tag；同步了新的 upstream 正式版后改用新基线的 `fix1`；
   不得把旧 release 的存在当成修复 commit 已经发布。
 - `workflow_dispatch` 在当前仓库只用于修复既有 tag 的 server assets，不等价于一次新的完整
   Release，也不能用它证明新 commit 已发布。
