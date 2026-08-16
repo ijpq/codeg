@@ -5,14 +5,18 @@ import {
   loadSectionCollapsed,
   loadSectionOrder,
   loadShowRecent,
+  loadSortMode,
   moveSectionInOrder,
   normalizeSectionOrder,
   saveSectionOrder,
   saveShowRecent,
+  saveSortMode,
 } from "./sidebar-view-mode-storage"
 
 const SECTION_ORDER_KEY = "workspace:sidebar-section-order"
 const SHOW_RECENT_KEY = "workspace:sidebar-show-recent"
+const LEGACY_SORT_MODE_KEY = "workspace:sidebar-sort-mode"
+const SORT_MODE_KEY = "workspace:sidebar-sort-mode:v2"
 
 describe("normalizeSectionOrder", () => {
   it("passes a complete order through unchanged", () => {
@@ -141,5 +145,32 @@ describe("loadSectionCollapsed", () => {
       JSON.stringify({ recent: true, chats: false, bogus: 1 })
     )
     expect(loadSectionCollapsed()).toEqual({ recent: true, chats: false })
+  })
+})
+
+describe("sidebar sort-mode storage", () => {
+  beforeEach(() => localStorage.clear())
+
+  it("defaults new installations to latest activity", () => {
+    expect(loadSortMode()).toBe("updated")
+  })
+
+  it("migrates the historical created-time default to latest activity", () => {
+    localStorage.setItem(LEGACY_SORT_MODE_KEY, "created")
+
+    expect(loadSortMode()).toBe("updated")
+  })
+
+  it("persists an explicit choice made after the default migration", () => {
+    saveSortMode("created")
+
+    expect(localStorage.getItem(SORT_MODE_KEY)).toBe("created")
+    expect(loadSortMode()).toBe("created")
+  })
+
+  it("falls back to latest activity for an invalid stored value", () => {
+    localStorage.setItem(SORT_MODE_KEY, "unexpected")
+
+    expect(loadSortMode()).toBe("updated")
   })
 })

@@ -54,6 +54,8 @@ interface ConversationShellProps {
   pendingPlanApproval: PendingPlanApprovalState | null
   onFocus: () => void
   onSend: (draft: PromptDraft, modeId?: string | null) => void
+  supportsSteer?: boolean
+  onGuide?: (draft: PromptDraft) => void | Promise<void>
   onCancel: () => void
   onRespondPermission: (requestId: string, optionId: string) => void
   onAnswerQuestion: (answer: string) => void
@@ -102,6 +104,8 @@ interface ConversationShellProps {
   onQueueReorder?: (items: QueuedMessage[]) => void
   onQueueEdit?: (id: string) => void
   onQueueDelete?: (id: string) => void
+  onQueueRetry?: (id: string) => void
+  onConvertGuideToPrompt?: (id: string) => void
   editingItemId?: string | null
   editingDraftText?: string | null
   editingDraftBlocks?: PromptInputBlock[] | null
@@ -113,6 +117,8 @@ interface ConversationShellProps {
    *  steering). Present only for sessions on the native channel; threaded
    *  straight through to the composer. */
   onSteer?: (text: string) => Promise<void>
+  /** Keep the composer editable while a historical ACP session restores. */
+  allowOfflineCompose?: boolean
   /** Optional banner pinned to the top of the panel, above the message area
    *  (e.g. the "restart to apply" config-stale banner). Renders nothing when
    *  omitted. */
@@ -134,6 +140,8 @@ export function ConversationShell({
   pendingPlanApproval,
   onFocus,
   onSend,
+  supportsSteer,
+  onGuide,
   onCancel,
   onRespondPermission,
   onAnswerQuestion,
@@ -164,6 +172,8 @@ export function ConversationShell({
   onQueueReorder,
   onQueueEdit,
   onQueueDelete,
+  onQueueRetry,
+  onConvertGuideToPrompt,
   editingItemId,
   editingDraftText,
   editingDraftBlocks,
@@ -172,6 +182,7 @@ export function ConversationShell({
   onCancelQueueEdit,
   onForkSend,
   onSteer,
+  allowOfflineCompose = false,
   topBanner,
 }: ConversationShellProps) {
   const tAcp = useTranslations("Folder.chat.acpConnections")
@@ -286,6 +297,8 @@ export function ConversationShell({
               agentName={agentName}
               onFocus={onFocus}
               onSend={onSend}
+              supportsSteer={supportsSteer}
+              onGuide={onGuide}
               onCancel={onCancel}
               modes={modes}
               configOptions={configOptions}
@@ -306,6 +319,8 @@ export function ConversationShell({
               onQueueReorder={onQueueReorder}
               onQueueEdit={onQueueEdit}
               onQueueDelete={onQueueDelete}
+              onQueueRetry={onQueueRetry}
+              onConvertGuideToPrompt={onConvertGuideToPrompt}
               editingItemId={editingItemId}
               editingDraftText={editingDraftText}
               editingDraftBlocks={editingDraftBlocks}
@@ -314,6 +329,7 @@ export function ConversationShell({
               onCancelQueueEdit={onCancelQueueEdit}
               onForkSend={onForkSend}
               onSteer={onSteer}
+              allowOfflineCompose={allowOfflineCompose}
               onAddFeedback={onAddFeedback}
               feedbackAddDisabled={feedbackAddDisabled}
             />

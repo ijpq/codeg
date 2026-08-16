@@ -12,6 +12,7 @@ import {
   Cog,
   Copy,
   GitFork,
+  Loader2,
   MessageSquareText,
   Scissors,
   Send,
@@ -95,6 +96,7 @@ import { useScrollbarSafeDismiss } from "@/hooks/use-scrollbar-safe-dismiss"
 import {
   clearMessageInputDraftV2,
   loadMessageInputDraftV2,
+  saveMessageInputDraft,
   saveMessageInputDraftV2,
 } from "@/lib/message-input-draft"
 import { rankByTextMatch } from "@/lib/fuzzy-text-match"
@@ -128,6 +130,7 @@ import { ComposerAddMenu } from "@/components/chat/composer/composer-add-menu"
 import { ComposerImageThumbnails } from "@/components/chat/composer/composer-image-thumbnails"
 import { useComposerAttachments } from "@/components/chat/composer/use-composer-attachments"
 import { useComposerShortcuts } from "@/components/chat/composer/use-composer-shortcuts"
+import { draftSupportsNativeSteer } from "@/lib/prompt-delivery-state"
 
 /**
  * Payload pushed into the composer from outside (e.g. a welcome-page quick
@@ -142,6 +145,8 @@ export interface ComposerInjectContent {
 
 interface MessageInputProps {
   onSend: (draft: PromptDraft, modeId?: string | null) => void
+  supportsSteer?: boolean
+  onGuide?: (draft: PromptDraft) => void | Promise<void>
   placeholder?: string
   defaultPath?: string
   disabled?: boolean
@@ -266,6 +271,8 @@ function modelPickerGroups(
 
 export function MessageInput({
   onSend,
+  supportsSteer = false,
+  onGuide,
   placeholder,
   defaultPath,
   disabled = false,
@@ -327,6 +334,8 @@ export function MessageInput({
   // The editor owns the content now; this mirror of its empty state drives the
   // send button and `hasSendableContent`.
   const [composerEmpty, setComposerEmpty] = useState(true)
+  const [steerSubmitting, setSteerSubmitting] = useState(false)
+  const steerSubmittingRef = useRef(false)
   // Flips true once the RichComposer's async (immediatelyRender:false) editor has
   // mounted, so the hydration effect can use the imperative handle.
   const [composerReady, setComposerReady] = useState(false)
@@ -424,6 +433,21 @@ export function MessageInput({
   // Markdown) ~300ms after the last change so inline reference badges survive a
   // reload — a Markdown round-trip would downgrade them to plain links.
   const draftSaveTimerRef = useRef<number | null>(null)
+  const persistDraftNow = useCallback(() => {
+    if (typeof window === "undefined") return
+    if (!effectiveDraftStorageKey || isEditingQueueItem) return
+    const ed = editorRef.current
+    if (!ed) return
+    if (ed.isEmpty()) {
+      clearMessageInputDraftV2(effectiveDraftStorageKey)
+    } else {
+      saveMessageInputDraftV2(
+        effectiveDraftStorageKey,
+        stripEmbeddedReferences(ed.getJSON())
+      )
+    }
+  }, [effectiveDraftStorageKey, isEditingQueueItem])
+
   const scheduleDraftSave = useCallback(() => {
     if (typeof window === "undefined") return
     if (!effectiveDraftStorageKey || isEditingQueueItem) return
@@ -432,18 +456,9 @@ export function MessageInput({
     }
     draftSaveTimerRef.current = window.setTimeout(() => {
       draftSaveTimerRef.current = null
-      const ed = editorRef.current
-      if (!ed || !effectiveDraftStorageKey) return
-      if (ed.isEmpty()) {
-        clearMessageInputDraftV2(effectiveDraftStorageKey)
-      } else {
-        saveMessageInputDraftV2(
-          effectiveDraftStorageKey,
-          stripEmbeddedReferences(ed.getJSON())
-        )
-      }
+      persistDraftNow()
     }, 300)
-  }, [effectiveDraftStorageKey, isEditingQueueItem])
+  }, [effectiveDraftStorageKey, isEditingQueueItem, persistDraftNow])
 
   useEffect(() => {
     return () => {
@@ -618,11 +633,27 @@ export function MessageInput({
     return () => cancelAnimationFrame(raf)
   }, [skillPrefix, composerReady])
 
-  const handleComposerChange = useCallback(() => {
-    syncComposerEmpty()
-    scheduleDraftSave()
-    detectSlashTriggerRef.current?.()
-  }, [syncComposerEmpty, scheduleDraftSave])
+  const handleComposerChange = useCallback(
+    (text: string) => {
+      syncComposerEmpty()
+      // Keep an O(1) plain-text fallback current on every edit. The richer v2
+      // Tiptap document remains debounced below, but this synchronous cache
+      // update guarantees that an immediate tab suspension cannot lose the last
+      // 300ms of typing even if removing the focused DOM node does not dispatch
+      // blur in a particular webview/browser.
+      if (effectiveDraftStorageKey && !isEditingQueueItem) {
+        saveMessageInputDraft(effectiveDraftStorageKey, text)
+      }
+      scheduleDraftSave()
+      detectSlashTriggerRef.current?.()
+    },
+    [
+      effectiveDraftStorageKey,
+      isEditingQueueItem,
+      scheduleDraftSave,
+      syncComposerEmpty,
+    ]
+  )
 
   const handleComposerReady = useCallback(() => {
     setComposerReady(true)
@@ -659,6 +690,7 @@ export function MessageInput({
   const imageAttachments = attach.imageAttachments
   const hasAttachments = attachments.length > 0
   const hasSendableContent = !composerEmpty || hasAttachments
+  const isNativeGuide = isPrompting && supportsSteer && Boolean(onGuide)
 
   // ── Slash command autocomplete ──
   //
@@ -1119,6 +1151,29 @@ export function MessageInput({
       return
     }
 
+    if (isNativeGuide && onGuide && draftSupportsNativeSteer(draft)) {
+      // Consume the draft synchronously so a double-click/key repeat cannot
+      // inject it twice. The parent owns failure recovery and always converts
+      // an unsuccessful guide into live feedback or the ordinary-message queue.
+      if (steerSubmittingRef.current) return
+      steerSubmittingRef.current = true
+      setSteerSubmitting(true)
+      if (effectiveDraftStorageKey) {
+        clearMessageInputDraftV2(effectiveDraftStorageKey)
+      }
+      resetComposer()
+      void Promise.resolve()
+        .then(() => onGuide(draft))
+        .catch(() => {
+          // The parent has already surfaced and recovered the failed draft.
+        })
+        .finally(() => {
+          steerSubmittingRef.current = false
+          setSteerSubmitting(false)
+        })
+      return
+    }
+
     // Prompting mode: enqueue instead of sending
     if (isPrompting && onEnqueue) {
       onEnqueue(draft, showModeSelector ? effectiveModeId : null)
@@ -1138,6 +1193,8 @@ export function MessageInput({
     buildDraft,
     isEditingQueueItem,
     isPrompting,
+    isNativeGuide,
+    onGuide,
     onSaveQueueEdit,
     onEnqueue,
     onSend,
@@ -1536,6 +1593,32 @@ export function MessageInput({
         <Check className="size-4" />
       </Button>
     </div>
+  ) : isNativeGuide && onCancel ? (
+    <div className="flex items-center gap-1">
+      <Button
+        onClick={onCancel}
+        variant="destructive"
+        size="icon"
+        className="h-8 w-8"
+        title={t("cancel")}
+      >
+        <Square className="size-4" />
+      </Button>
+      <Button
+        onClick={handleSend}
+        disabled={!hasSendableContent || steerSubmitting}
+        size="icon"
+        className="h-8 w-8"
+        title={steerSubmitting ? t("steerSending") : t("steer")}
+        aria-label={steerSubmitting ? t("steerSending") : t("steer")}
+      >
+        {steerSubmitting ? (
+          <Loader2 className="size-4 animate-spin" />
+        ) : (
+          <Send className="size-4" />
+        )}
+      </Button>
+    </div>
   ) : isPrompting && onCancel ? (
     onSteer && onEnqueue && hasSendableContent ? (
       // Native-steering sessions surface the mid-turn actions that already
@@ -1798,11 +1881,16 @@ export function MessageInput({
                 onReady={handleComposerReady}
                 onSubmit={handleSend}
                 onFocus={onFocus}
+                onBlur={persistDraftNow}
                 onPasteFiles={attach.handlePasteFiles}
                 onDropFiles={attach.handleEditorDrop}
                 onPlainPaste={handlePlainPasteShortcut}
-                submitShortcut={shortcuts.send_message}
-                newlineShortcut={shortcuts.newline_in_message}
+                submitShortcut={
+                  isNativeGuide ? "enter" : shortcuts.send_message
+                }
+                newlineShortcut={
+                  isNativeGuide ? "shift+enter" : shortcuts.newline_in_message
+                }
                 isExternalMenuOpen={slashMenuOpen && slashAutocompleteCount > 0}
                 onExternalMenuKeyDown={handleExternalMenuKeyDown}
                 className="min-h-0 flex-1"

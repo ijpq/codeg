@@ -80,7 +80,7 @@ export function useDelegatedSubSession(
     if (!shouldFetch) return
     let cancelled = false
     dispatch({ kind: "start" })
-    void getFolderConversation(childId)
+    void getFolderConversation(childId, { userTurnLimit: 12 })
       .then((d) => {
         if (cancelled) return
         dispatch({ kind: "ok", detail: d })

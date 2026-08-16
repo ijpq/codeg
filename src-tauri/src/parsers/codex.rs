@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use chrono::{DateTime, Utc};
@@ -11,9 +11,8 @@ use walkdir::WalkDir;
 use crate::models::*;
 use crate::parsers::codex_code_mode::{
     extract_chunk_ids, extract_shell_session_ids, is_code_mode_call, parse_code_mode_script,
-    script_card_input,
-    split_code_mode_output, with_note, CodeModeCall, CodeModeOutput, CodeModeScript, ScriptStatus,
-    Separator, CODEX_SCRIPT_TOOL_NAME,
+    script_card_input, split_code_mode_output, with_note, CodeModeCall, CodeModeOutput,
+    CodeModeScript, ScriptStatus, Separator, CODEX_SCRIPT_TOOL_NAME,
 };
 use crate::parsers::{
     folder_name_from_path, title_from_user_text, truncate_str, AgentParser, ParseError,
@@ -282,6 +281,117 @@ fn resolve_codex_home_dir_from(
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| home_dir.unwrap_or_default().join(".codex"))
+}
+
+/// A directly-seekable page from a Codex rollout. `start_offset` is also the
+/// cursor for the next (older) page; callers never need to know how the JSONL
+/// was split into render turns.
+pub(crate) struct CodexConversationPage {
+    pub detail: ConversationDetail,
+    pub start_offset: u64,
+    pub has_more: bool,
+}
+
+const CODEX_HISTORY_SCAN_CHUNK_BYTES: usize = 1024 * 1024;
+
+fn is_codex_user_boundary(line: &[u8]) -> bool {
+    // Most JSONL records are tool/output traffic. Avoid feeding their often
+    // multi-megabyte payloads to serde just to discover they cannot start a
+    // user round.
+    if !line
+        .windows(b"user_message".len())
+        .any(|w| w == b"user_message")
+        && !line
+            .windows(b"thread_goal_updated".len())
+            .any(|w| w == b"thread_goal_updated")
+        && !line.windows(b"\"role\"".len()).any(|w| w == b"\"role\"")
+    {
+        return false;
+    }
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) else {
+        return false;
+    };
+    match value.get("type").and_then(|value| value.as_str()) {
+        Some("event_msg") => {
+            let Some(payload) = value.get("payload") else {
+                return false;
+            };
+            match payload.get("type").and_then(|value| value.as_str()) {
+                Some("user_message") => true,
+                Some("thread_goal_updated") => payload
+                    .get("goal")
+                    .and_then(crate::acp::codex_goal::goal_marker)
+                    .is_some_and(|marker| marker.tool_name == "create_goal"),
+                _ => false,
+            }
+        }
+        Some("response_item") => value.get("payload").is_some_and(|payload| {
+            payload.get("type").and_then(|value| value.as_str()) == Some("message")
+                && payload.get("role").and_then(|value| value.as_str()) == Some("user")
+                && response_item_user_has_image(payload)
+        }),
+        _ => false,
+    }
+}
+
+/// Walk JSONL records backwards until `user_turn_limit` user-round boundaries
+/// have been found. Memory is bounded by the selected page (plus one JSONL
+/// record), not by the complete rollout; this is the critical difference for
+/// 300+ MB Codex sessions.
+fn find_codex_page_start(
+    file: &mut fs::File,
+    end_offset: u64,
+    user_turn_limit: usize,
+) -> Result<u64, ParseError> {
+    if end_offset == 0 || user_turn_limit == 0 {
+        return Ok(end_offset);
+    }
+
+    let mut position = end_offset;
+    let mut suffix = Vec::<u8>::new();
+    let mut boundaries = 0usize;
+    let mut include_preceding_record = false;
+
+    while position > 0 {
+        let read_start = position.saturating_sub(CODEX_HISTORY_SCAN_CHUNK_BYTES as u64);
+        let read_len =
+            usize::try_from(position - read_start).unwrap_or(CODEX_HISTORY_SCAN_CHUNK_BYTES);
+        let mut chunk = vec![0u8; read_len];
+        file.seek(SeekFrom::Start(read_start))?;
+        file.read_exact(&mut chunk)?;
+        chunk.extend_from_slice(&suffix);
+
+        let mut line_end = chunk.len();
+        let mut first_newline = None;
+        for newline in (0..chunk.len())
+            .rev()
+            .filter(|index| chunk[*index] == b'\n')
+        {
+            first_newline = Some(newline);
+            let line_start = newline + 1;
+            if include_preceding_record {
+                // Codex writes `turn_context` immediately before the user
+                // event. Include that one record so the page keeps the turn's
+                // model and cumulative context/token metadata, while the next
+                // cursor still ends cleanly before this round.
+                return Ok(read_start + line_start as u64);
+            }
+            if line_start < line_end && is_codex_user_boundary(&chunk[line_start..line_end]) {
+                boundaries += 1;
+                if boundaries >= user_turn_limit {
+                    include_preceding_record = true;
+                }
+            }
+            line_end = newline;
+        }
+
+        let prefix_end = first_newline.unwrap_or(chunk.len());
+        suffix.clear();
+        suffix.extend_from_slice(&chunk[..prefix_end]);
+        position = read_start;
+    }
+
+    Ok(0)
 }
 
 impl AgentParser for CodexParser {
@@ -1994,6 +2104,53 @@ fn parse_codex_subagent_stats(
 }
 
 impl CodexParser {
+    pub(crate) fn get_conversation_page(
+        &self,
+        conversation_id: &str,
+        before_offset: Option<u64>,
+        user_turn_limit: usize,
+        cwd_hint: Option<String>,
+    ) -> Result<CodexConversationPage, ParseError> {
+        if !self.base_dir.exists() {
+            return Err(ParseError::ConversationNotFound(
+                conversation_id.to_string(),
+            ));
+        }
+        let path = WalkDir::new(&self.base_dir)
+            .into_iter()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path().to_path_buf())
+            .find(|path| {
+                path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+                    && path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .contains(conversation_id)
+            })
+            .ok_or_else(|| ParseError::ConversationNotFound(conversation_id.to_string()))?;
+
+        let mut file = fs::File::open(&path)?;
+        let file_len = file.metadata()?.len();
+        let end_offset = before_offset.unwrap_or(file_len).min(file_len);
+        let start_offset =
+            find_codex_page_start(&mut file, end_offset, user_turn_limit.clamp(1, 100))?;
+        file.seek(SeekFrom::Start(start_offset))?;
+        let reader = BufReader::new(file.take(end_offset.saturating_sub(start_offset)));
+        let detail = self.parse_conversation_detail_reader(
+            &path,
+            conversation_id,
+            reader,
+            cwd_hint,
+            Some(start_offset),
+        )?;
+        Ok(CodexConversationPage {
+            detail,
+            start_offset,
+            has_more: start_offset > 0,
+        })
+    }
+
     fn parse_conversation_detail(
         &self,
         path: &PathBuf,
@@ -2002,8 +2159,19 @@ impl CodexParser {
         let file = fs::File::open(path)?;
         let reader = BufReader::new(file);
 
+        self.parse_conversation_detail_reader(path, conversation_id, reader, None, None)
+    }
+
+    fn parse_conversation_detail_reader<R: BufRead>(
+        &self,
+        path: &Path,
+        conversation_id: &str,
+        reader: R,
+        cwd_hint: Option<String>,
+        page_start_offset: Option<u64>,
+    ) -> Result<ConversationDetail, ParseError> {
         let mut messages = Vec::new();
-        let mut cwd: Option<String> = None;
+        let mut cwd: Option<String> = cwd_hint;
         let mut git_branch: Option<String> = None;
         let mut model: Option<String> = None;
         let mut title: Option<String> = None;
@@ -2364,9 +2532,10 @@ impl CodexParser {
                                     {
                                         // Positional: the goal opened the session iff no
                                         // real user turn exists yet.
-                                        goal_opens_session = !messages
-                                            .iter()
-                                            .any(|m| matches!(m.role, MessageRole::User));
+                                        goal_opens_session = page_start_offset.unwrap_or(0) == 0
+                                            && !messages
+                                                .iter()
+                                                .any(|m| matches!(m.role, MessageRole::User));
                                         // Claim the title from the objective HERE, in
                                         // stream order, when the goal is the opener — so
                                         // a LATER `user_message` (its own guard is
@@ -3477,6 +3646,15 @@ impl CodexParser {
         fold_shell_session_polls(&mut messages, &poll_origins);
         let mut turns = group_into_turns(messages);
         reconcile_turn_usage(&mut turns, &recorded_round_usage);
+        if let Some(offset) = page_start_offset {
+            // Page-local `turn-0` ids would collide as older pages are
+            // prepended in the browser. Byte-offset names remain stable while
+            // the append-only rollout grows and require no full-file turn
+            // count just to number a tail page.
+            for (index, turn) in turns.iter_mut().enumerate() {
+                turn.id = format!("codex-{offset}-turn-{index}");
+            }
+        }
         super::relocate_orphaned_tool_results(&mut turns);
         super::structurize_read_tool_output(&mut turns);
         super::resolve_patch_line_numbers(&mut turns, cwd.as_deref());
@@ -4179,8 +4357,9 @@ mod tests {
     use chrono::{DateTime, Duration, Utc};
     use std::env;
     use std::fs;
+    use std::io::{BufWriter, Write};
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
     #[test]
     fn skips_agents_instructions_title_candidate() {
@@ -5752,6 +5931,221 @@ mod tests {
         content.push('\n');
         fs::write(&path, content).expect("write test jsonl");
         path
+    }
+
+    fn user_texts(detail: &crate::models::ConversationDetail) -> Vec<String> {
+        detail
+            .turns
+            .iter()
+            .filter(|turn| matches!(turn.role, TurnRole::User))
+            .flat_map(|turn| turn.blocks.iter())
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn byte_cursor_pages_codex_history_without_loss_or_duplicate_ids() {
+        let dir = tempfile::tempdir().expect("temp sessions dir");
+        let conversation_id = "paged-history";
+        let path = dir
+            .path()
+            .join(format!("rollout-2026-08-06-{conversation_id}.jsonl"));
+        let mut lines = vec![rollout_line(
+            "2026-08-06T00:00:00Z",
+            "session_meta",
+            serde_json::json!({"id": conversation_id, "cwd": "/tmp/paged"}),
+        )];
+        for index in 0..5 {
+            lines.push(rollout_line(
+                "2026-08-06T00:00:00.500Z",
+                "turn_context",
+                serde_json::json!({"model": format!("gpt-page-{index}")}),
+            ));
+            lines.push(rollout_line(
+                "2026-08-06T00:00:01Z",
+                "event_msg",
+                serde_json::json!({
+                    "type": "user_message",
+                    "message": format!("prompt-{index}"),
+                }),
+            ));
+            lines.push(rollout_line(
+                "2026-08-06T00:00:02Z",
+                "event_msg",
+                serde_json::json!({
+                    "type": "agent_message",
+                    "message": format!("reply-{index}"),
+                }),
+            ));
+        }
+        fs::write(&path, format!("{}\n", lines.join("\n"))).expect("write rollout");
+
+        let parser = CodexParser::with_base_dir(dir.path().to_path_buf());
+        let latest = parser
+            .get_conversation_page(conversation_id, None, 2, Some("/tmp/paged".into()))
+            .expect("latest page");
+        assert_eq!(user_texts(&latest.detail), vec!["prompt-3", "prompt-4"]);
+        assert_eq!(latest.detail.summary.model.as_deref(), Some("gpt-page-3"));
+        assert!(latest.has_more);
+
+        let earlier = parser
+            .get_conversation_page(
+                conversation_id,
+                Some(latest.start_offset),
+                2,
+                Some("/tmp/paged".into()),
+            )
+            .expect("earlier page");
+        assert_eq!(user_texts(&earlier.detail), vec!["prompt-1", "prompt-2"]);
+        let latest_ids = latest
+            .detail
+            .turns
+            .iter()
+            .map(|turn| turn.id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        assert!(earlier
+            .detail
+            .turns
+            .iter()
+            .all(|turn| !latest_ids.contains(turn.id.as_str())));
+
+        let oldest = parser
+            .get_conversation_page(
+                conversation_id,
+                Some(earlier.start_offset),
+                2,
+                Some("/tmp/paged".into()),
+            )
+            .expect("oldest page");
+        assert_eq!(user_texts(&oldest.detail), vec!["prompt-0"]);
+        assert!(!oldest.has_more);
+        assert_eq!(oldest.start_offset, 0);
+    }
+
+    /// Manual acceptance benchmark for the reported 300+ MB rollout shape.
+    /// Kept ignored in the default suite because it deliberately writes a
+    /// 305+ MiB temporary JSONL; release verification runs it explicitly.
+    #[test]
+    #[ignore = "writes a 300+ MiB temporary Codex rollout"]
+    fn large_rollout_first_page_reads_only_the_tail() {
+        const ROUNDS: usize = 200;
+        const TOOL_OUTPUT_BYTES: usize = 1_600_000;
+
+        let dir = tempfile::tempdir().expect("temp sessions dir");
+        let conversation_id = "large-paged-history";
+        let path = dir
+            .path()
+            .join(format!("rollout-2026-08-06-{conversation_id}.jsonl"));
+        let file = fs::File::create(&path).expect("create rollout");
+        let mut writer = BufWriter::new(file);
+        writeln!(
+            writer,
+            "{}",
+            rollout_line(
+                "2026-08-06T00:00:00Z",
+                "session_meta",
+                serde_json::json!({"id": conversation_id, "cwd": "/tmp/large"}),
+            )
+        )
+        .expect("write metadata");
+        let output = "x".repeat(TOOL_OUTPUT_BYTES);
+        for index in 0..ROUNDS {
+            writeln!(
+                writer,
+                "{}",
+                rollout_line(
+                    "2026-08-06T00:00:00.500Z",
+                    "turn_context",
+                    serde_json::json!({"model": "gpt-5.5"}),
+                )
+            )
+            .expect("write turn context");
+            writeln!(
+                writer,
+                "{}",
+                rollout_line(
+                    "2026-08-06T00:00:01Z",
+                    "event_msg",
+                    serde_json::json!({
+                        "type": "user_message",
+                        "message": format!("prompt-{index}"),
+                    }),
+                )
+            )
+            .expect("write user");
+            writeln!(
+                writer,
+                "{}",
+                rollout_line(
+                    "2026-08-06T00:00:02Z",
+                    "response_item",
+                    serde_json::json!({
+                        "type": "function_call_output",
+                        "call_id": format!("call-{index}"),
+                        "output": output.as_str(),
+                    }),
+                )
+            )
+            .expect("write tool output");
+            writeln!(
+                writer,
+                "{}",
+                rollout_line(
+                    "2026-08-06T00:00:03Z",
+                    "event_msg",
+                    serde_json::json!({
+                        "type": "agent_message",
+                        "message": format!("reply-{index}"),
+                    }),
+                )
+            )
+            .expect("write assistant");
+        }
+        writer.flush().expect("flush rollout");
+
+        let source_bytes = fs::metadata(&path).expect("rollout metadata").len();
+        assert!(source_bytes > 300 * 1024 * 1024);
+        let parser = CodexParser::with_base_dir(dir.path().to_path_buf());
+        let started = Instant::now();
+        let page = parser
+            .get_conversation_page(conversation_id, None, 6, Some("/tmp/large".into()))
+            .expect("load bounded tail");
+        let elapsed = started.elapsed();
+        let response = serde_json::to_vec(&page.detail).expect("serialize page");
+        let response_bytes = response.len();
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gzip.write_all(&response).expect("compress first page");
+        let gzip_bytes = gzip.finish().expect("finish first-page compression").len();
+        eprintln!(
+            "large_history_benchmark source_bytes={source_bytes} page_bytes={response_bytes} gzip_bytes={gzip_bytes} elapsed_ms={}",
+            elapsed.as_millis()
+        );
+        assert_eq!(user_texts(&page.detail).len(), 6);
+        assert!(page.has_more);
+        assert!(response_bytes < source_bytes as usize / 10);
+        assert!(elapsed.as_secs() < 10, "tail page parse took {elapsed:?}");
+
+        let complete_started = Instant::now();
+        let mut cursor = page.start_offset;
+        let mut loaded_user_turns = user_texts(&page.detail).len();
+        let mut page_count = 1usize;
+        while cursor > 0 {
+            let earlier = parser
+                .get_conversation_page(conversation_id, Some(cursor), 6, Some("/tmp/large".into()))
+                .expect("load earlier page");
+            assert!(earlier.start_offset < cursor, "cursor must advance");
+            cursor = earlier.start_offset;
+            loaded_user_turns += user_texts(&earlier.detail).len();
+            page_count += 1;
+        }
+        eprintln!(
+            "large_history_complete pages={page_count} user_turns={loaded_user_turns} elapsed_ms={}",
+            complete_started.elapsed().as_millis()
+        );
+        assert_eq!(loaded_user_turns, ROUNDS);
     }
 
     fn rollout_line(ts: &str, msg_type: &str, payload: serde_json::Value) -> String {

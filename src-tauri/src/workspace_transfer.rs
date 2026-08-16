@@ -50,6 +50,30 @@ pub struct DownloadTicket {
     pub expires_at: Instant,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DeliverableDownloadKind {
+    Single,
+    Zip,
+}
+
+#[derive(Clone, Debug)]
+pub struct DeliverableDownloadTicketSpec {
+    pub conversation_id: i32,
+    pub deliverable_ids: Vec<String>,
+    pub kind: DeliverableDownloadKind,
+    pub filename: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct DeliverableDownloadTicket {
+    pub conversation_id: i32,
+    pub deliverable_ids: Vec<String>,
+    pub kind: DeliverableDownloadKind,
+    pub filename: String,
+    pub expires_at: Instant,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceTransferProgress {
@@ -80,6 +104,7 @@ pub enum TransferState {
 
 pub struct WorkspaceTransferManager {
     tickets: Mutex<HashMap<String, DownloadTicket>>,
+    deliverable_tickets: Mutex<HashMap<String, DeliverableDownloadTicket>>,
     cancels: Mutex<HashMap<String, CancellationToken>>,
     ticket_ttl: Duration,
     pub workspace_upload_semaphore: Semaphore,
@@ -93,6 +118,7 @@ impl WorkspaceTransferManager {
     pub fn new_from_env() -> Self {
         Self {
             tickets: Mutex::new(HashMap::new()),
+            deliverable_tickets: Mutex::new(HashMap::new()),
             cancels: Mutex::new(HashMap::new()),
             ticket_ttl: Duration::from_secs(DOWNLOAD_TICKET_TTL_SECS),
             workspace_upload_semaphore: Semaphore::new(env_usize(
@@ -121,6 +147,7 @@ impl WorkspaceTransferManager {
     pub fn new_for_tests(ticket_ttl: Duration) -> Self {
         Self {
             tickets: Mutex::new(HashMap::new()),
+            deliverable_tickets: Mutex::new(HashMap::new()),
             cancels: Mutex::new(HashMap::new()),
             ticket_ttl,
             workspace_upload_semaphore: Semaphore::new(DEFAULT_WORKSPACE_UPLOAD_CONCURRENCY),
@@ -195,9 +222,53 @@ impl WorkspaceTransferManager {
         found.filter(|ticket| Instant::now() <= ticket.expires_at)
     }
 
+    pub async fn issue_deliverable_download_ticket(
+        &self,
+        spec: DeliverableDownloadTicketSpec,
+    ) -> DownloadTicketIssued {
+        self.cleanup_expired_tickets().await;
+        let ticket = uuid::Uuid::new_v4().simple().to_string();
+        let expires_at_instant = Instant::now() + self.ticket_ttl;
+        let expires_at = SystemTime::now()
+            .checked_add(self.ticket_ttl)
+            .unwrap_or(SystemTime::now())
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        self.deliverable_tickets.lock().await.insert(
+            ticket.clone(),
+            DeliverableDownloadTicket {
+                conversation_id: spec.conversation_id,
+                deliverable_ids: spec.deliverable_ids,
+                kind: spec.kind,
+                filename: spec.filename.clone(),
+                expires_at: expires_at_instant,
+            },
+        );
+        DownloadTicketIssued {
+            url: ticket.clone(),
+            ticket,
+            filename: spec.filename,
+            expires_at,
+        }
+    }
+
+    pub async fn consume_deliverable_download_ticket(
+        &self,
+        ticket: &str,
+    ) -> Option<DeliverableDownloadTicket> {
+        self.cleanup_expired_tickets().await;
+        let found = self.deliverable_tickets.lock().await.remove(ticket);
+        found.filter(|ticket| Instant::now() <= ticket.expires_at)
+    }
+
     pub async fn cleanup_expired_tickets(&self) {
         let now = Instant::now();
         self.tickets
+            .lock()
+            .await
+            .retain(|_, ticket| ticket.expires_at > now);
+        self.deliverable_tickets
             .lock()
             .await
             .retain(|_, ticket| ticket.expires_at > now);

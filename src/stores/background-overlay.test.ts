@@ -20,6 +20,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import {
   BACKGROUND_OVERLAY_HARD_CAP,
+  HISTORY_PAGE_USER_TURNS,
   resetConversationRuntimeStore,
   selectTimelineTurns,
   useConversationRuntimeStore,
@@ -297,7 +298,7 @@ describe("refetchDetail DB-id resolution", () => {
     // own comment — it raced the transcript's last write and lost content).
     expect(mockGetFolderConversation).toHaveBeenCalledTimes(1)
     expect(mockGetFolderConversation).toHaveBeenCalledWith(42, {
-      tailTurns: 120,
+      userTurnLimit: HISTORY_PAGE_USER_TURNS,
     })
     // Result lands under the runtime key; the stale live buffers are gone and
     // the persisted (terminal) copy is what the timeline renders.
@@ -315,7 +316,7 @@ describe("refetchDetail DB-id resolution", () => {
     actions().refetchDetail(7)
     await flushMicrotasks()
     expect(mockGetFolderConversation).toHaveBeenCalledWith(7, {
-      tailTurns: 120,
+      userTurnLimit: HISTORY_PAGE_USER_TURNS,
     })
   })
 })

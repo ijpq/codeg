@@ -254,5 +254,69 @@
         }
       }
     }
+  },
+  {
+    "name": "publish_deliverables",
+    "description": "Publish the user-relevant files changed or produced by this turn. You MUST call this at least once near the end of every turn before the final response, including ordinary code-change turns. Include meaningful source, test, documentation, and necessary configuration changes with category=code_change and role=supporting, plus standalone files the user should open or download with category=standalone_output. Use role=primary only for the small set of main standalone results that should appear directly below the reply; supporting items remain available in the conversation deliverables panel. Exclude files merely read, caches, logs, dependencies, build intermediates, editor temporaries, and the workspace root. If the turn changed no files, call with an empty deliverables array. The default merge mode preserves earlier accepted items and supports additional calls for large sets or corrections; use replace only for an intentional complete replacement and clear only to explicitly clear the turn set. Existing created/modified files and directories are verified inside the workspace. A deleted code path may be declared with change_kind=deleted only when Codeg observed that deletion in this turn. Rejected merge items do not discard accepted items; correct and resubmit rejected paths before the final response.",
+    "inputSchema": {
+      "type": "object",
+      "required": ["deliverables"],
+      "properties": {
+        "deliverables": {
+          "type": "array",
+          "maxItems": 200,
+          "description": "User-relevant changed code files and standalone outputs. An empty array confirms that this call adds no files; it does not clear prior items in merge mode.",
+          "items": {
+            "type": "object",
+            "required": ["path"],
+            "properties": {
+              "path": {
+                "type": "string",
+                "description": "Existing file or directory inside the session working directory. Relative paths are preferred."
+              },
+              "title": {
+                "type": "string",
+                "maxLength": 160,
+                "description": "Short user-facing name. Defaults to the file or directory name."
+              },
+              "description": {
+                "type": "string",
+                "maxLength": 800,
+                "description": "Optional concise explanation of what this output contains."
+              },
+              "role": {
+                "type": "string",
+                "enum": ["primary", "supporting"],
+                "description": "Whether this is a main standalone result or an item kept only in the conversation ledger. Defaults to supporting for code_change and primary for standalone_output."
+              },
+              "category": {
+                "type": "string",
+                "enum": ["code_change", "standalone_output"],
+                "description": "Use code_change for source, tests, docs, and necessary config; standalone_output for reports, media, archives, and other files intended to be opened or downloaded."
+              },
+              "change_kind": {
+                "type": "string",
+                "enum": ["created", "modified", "deleted", "renamed"],
+                "description": "How this turn changed the path. Defaults from Codeg filesystem evidence when available."
+              }
+            }
+          }
+        },
+        "mode": {
+          "type": "string",
+          "enum": ["merge", "replace", "clear"],
+          "default": "merge",
+          "description": "merge upserts the submitted paths; replace intentionally replaces this turn's set; clear requires empty deliverables/remove arrays and clears the set."
+        },
+        "remove": {
+          "type": "array",
+          "maxItems": 200,
+          "items": {
+            "type": "string"
+          },
+          "description": "Paths to remove from this turn's declared set without deleting files from disk."
+        }
+      }
+    }
   }
 ]
