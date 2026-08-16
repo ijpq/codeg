@@ -4983,6 +4983,8 @@ mod tests {
             _ => panic!("expected a GoalControl command"),
         }
         assert!(rx.try_recv().is_err(), "the carrying turn survives");
+    }
+
     async fn mark_native_steer_ready(mgr: &ConnectionManager, conn_id: &str) {
         let state = mgr.get_state(conn_id).await.expect("test connection");
         let mut state = state.write().await;
