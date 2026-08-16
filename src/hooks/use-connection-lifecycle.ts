@@ -8,6 +8,8 @@ import { useTaskContext } from "@/contexts/task-context"
 import { useConnection, type UseConnectionReturn } from "@/hooks/use-connection"
 import { extractAppCommandError } from "@/lib/app-error"
 import { isConnectionBusy } from "@/lib/connection-teardown"
+import { isNetworkOrOfflineError } from "@/lib/network-error"
+import { isSessionRestorePendingError } from "@/lib/session-restore"
 import { TurnBusyError } from "@/lib/turn-busy"
 import { type AgentType, type PromptDraft } from "@/lib/types"
 import { getAgentLabel } from "@/lib/custom-agents"
@@ -55,17 +57,22 @@ export interface UseConnectionLifecycleReturn {
        */
       onTurnInProgress?: () => void
       /**
-       * Called for every OTHER send failure (413, hydration failure, network
-       * drop) after the error toast is shown. The caller must settle any
-       * optimistic state it created for this send — roll back the optimistic
-       * user turn so the conversation doesn't stay `awaiting_persist` (which
-       * would block queue auto-flush) and doesn't display the failed prompt
-       * as though it were sent. The draft is deliberately NOT re-queued: a
-       * deterministic failure would otherwise retry forever.
+       * The historical ACP session exists but has not completed its exact
+       * snapshot/identity handoff. The caller retains the draft in its durable
+       * queue and retries after readiness instead of surfacing an error.
        */
-      onSendFailed?: (error: unknown) => void
+      onSessionRestorePending?: () => void
+      /** Fired only after `/acp_prompt` returned success (backend accepted). */
+      onAccepted?: () => void
+      /**
+       * Called for every non-Busy failure after the error toast is shown.
+       * `ambiguous=true` means the transport
+       * response was lost and the backend may already have accepted the prompt;
+       * callers must keep the optimistic message and reconcile by id.
+       */
+      onSendFailed?: (error: unknown, ambiguous: boolean) => void
     }
-  ) => void
+  ) => Promise<void>
   handleSetConfigOption: (configId: string, valueId: string) => void
   handleCancel: () => void
   handleRespondPermission: (requestId: string, optionId: string) => void
@@ -208,7 +215,13 @@ export function useConnectionLifecycle({
   }, [isActive, contextKey, setActiveKey, touchActivity])
 
   // Auto-connect when tab becomes active and workingDir is available.
-  // Depends on isActive + workingDir + agentType so that connections wait
+  // Depends on isActive + workingDir + agentType + persisted identities so
+  // that a detail/runtime load resolving `sessionId` cannot strand the early
+  // `session_id=None` connection. `connect()` deduplicates an identical target,
+  // while a newly-resolved session/conversation id enters the backend atomic
+  // restore path.
+  //
+  // The working-directory dependency ensures connections wait
   // for folder info to load (workingDir transitions from undefined →
   // folder.path), and so that changing folders or agents on an already-
   // connected tab triggers a reconnect. The context's connect() dedups
@@ -246,7 +259,7 @@ export function useConnectionLifecycle({
     return () => {
       cancelled = true
     }
-  }, [isActive, workingDir, agentType])
+  }, [isActive, workingDir, agentType, sessionId, conversationId])
 
   // Manage task status for connection progress
   const taskIdRef = useRef<string | null>(null)
@@ -420,13 +433,22 @@ export function useConnectionLifecycle({
         conversationId?: number | null
         clientMessageId?: string | null
         onTurnInProgress?: () => void
-        onSendFailed?: (error: unknown) => void
+        onSessionRestorePending?: () => void
+        onAccepted?: () => void
+        /**
+         * Called for every non-Busy failure. The boolean marks an ambiguous
+         * network/offline loss, where the backend may already have accepted
+         * the prompt and the optimistic message must remain visible.
+         */
+        onSendFailed?: (error: unknown, ambiguous: boolean) => void
       }
-    ) => {
+    ): Promise<void> => {
       touchActivity(contextKey)
       const onTurnInProgress = opts?.onTurnInProgress
+      const onSessionRestorePending = opts?.onSessionRestorePending
+      const onAccepted = opts?.onAccepted
       const onSendFailed = opts?.onSendFailed
-      void (async () => {
+      return (async () => {
         const currentModeId = modeIdRef.current
         if (modeId && modeId !== currentModeId) {
           await connSetMode(modeId)
@@ -435,6 +457,7 @@ export function useConnectionLifecycle({
           modeIdRef.current = modeId
         }
         await sendPrompt(draft.blocks, opts)
+        onAccepted?.()
       })().catch((e: unknown) => {
         if (e instanceof TurnBusyError) {
           // A turn was already in flight on the connection (another
@@ -442,6 +465,10 @@ export function useConnectionLifecycle({
           // observed yet). Not an error — the draft is re-queued by the caller
           // so it auto-sends when the current turn finishes.
           onTurnInProgress?.()
+          return
+        }
+        if (isSessionRestorePendingError(e)) {
+          onSessionRestorePending?.()
           return
         }
         console.error("[ConnLifecycle] sendPrompt:", e)
@@ -455,11 +482,9 @@ export function useConnectionLifecycle({
           appError?.message ??
           (e instanceof Error ? e.message : String(e ?? "unknown error"))
         toast.error(t("errors.sendPromptFailed", { error: message }))
-        // Let the caller settle its optimistic state (roll back the phantom
-        // user turn, drop out of awaiting_persist so the queue keeps
-        // flushing). Runs after the toast so the state rollback can't hide
-        // the failure.
-        onSendFailed?.(e)
+        // Let the caller distinguish a transport loss (the backend may have
+        // accepted the id) from a deterministic rejection.
+        onSendFailed?.(e, isNetworkOrOfflineError(e))
       })
     },
     [connSetMode, sendPrompt, contextKey, touchActivity, t]

@@ -25,7 +25,11 @@ mod m20260612_000001_conversation_folder_kind;
 mod m20260621_000001_automation;
 mod m20260630_000001_conversation_parent_id_index;
 mod m20260703_000001_chat_channel_thread_binding;
+mod m20260717_000001_conversation_turn_artifacts;
 mod m20260717_000001_folder_alias;
+mod m20260718_000001_conversation_deliverables;
+mod m20260720_000001_deliverable_management;
+mod m20260725_000001_deliverable_reconciliation;
 mod m20260726_000001_custom_agent;
 mod m20260727_000001_custom_agent_skills;
 mod m20260728_000001_custom_agent_skills_dir;
@@ -33,10 +37,16 @@ mod m20260728_000002_custom_agent_source;
 mod m20260801_000001_work_task;
 mod m20260801_000002_work_task_p2;
 mod m20260801_000003_work_task_template;
+mod m20260802_000001_deliverable_turn_link;
 mod m20260803_000001_folder_link;
 mod m20260803_000001_token_usage;
+mod m20260804_000001_prompt_accepted_at;
 mod m20260807_000001_work_task_scheduled_at;
 mod m20260808_000001_custom_agent_supports_mcp;
+mod m20260813_000001_conversation_branch;
+mod m20260814_000001_conversation_branch_inheritance;
+mod m20260816_000001_chat_channel_final_outbox;
+mod m20260816_000002_conversation_branch_lifecycle;
 mod m20260817_000001_work_task_conversation_title;
 pub struct Migrator;
 
@@ -70,6 +80,10 @@ impl MigratorTrait for Migrator {
             Box::new(m20260630_000001_conversation_parent_id_index::Migration),
             Box::new(m20260703_000001_chat_channel_thread_binding::Migration),
             Box::new(m20260717_000001_folder_alias::Migration),
+            Box::new(m20260717_000001_conversation_turn_artifacts::Migration),
+            Box::new(m20260718_000001_conversation_deliverables::Migration),
+            Box::new(m20260720_000001_deliverable_management::Migration),
+            Box::new(m20260725_000001_deliverable_reconciliation::Migration),
             Box::new(m20260726_000001_custom_agent::Migration),
             Box::new(m20260727_000001_custom_agent_skills::Migration),
             Box::new(m20260728_000001_custom_agent_skills_dir::Migration),
@@ -77,10 +91,16 @@ impl MigratorTrait for Migrator {
             Box::new(m20260801_000001_work_task::Migration),
             Box::new(m20260801_000002_work_task_p2::Migration),
             Box::new(m20260801_000003_work_task_template::Migration),
+            Box::new(m20260802_000001_deliverable_turn_link::Migration),
             Box::new(m20260803_000001_folder_link::Migration),
             Box::new(m20260803_000001_token_usage::Migration),
+            Box::new(m20260804_000001_prompt_accepted_at::Migration),
             Box::new(m20260807_000001_work_task_scheduled_at::Migration),
             Box::new(m20260808_000001_custom_agent_supports_mcp::Migration),
+            Box::new(m20260813_000001_conversation_branch::Migration),
+            Box::new(m20260814_000001_conversation_branch_inheritance::Migration),
+            Box::new(m20260816_000001_chat_channel_final_outbox::Migration),
+            Box::new(m20260816_000002_conversation_branch_lifecycle::Migration),
             Box::new(m20260817_000001_work_task_conversation_title::Migration),
         ]
     }

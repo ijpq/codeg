@@ -17,7 +17,30 @@ const h = vi.hoisted(() => ({
   deleteConversation: vi.fn(async () => {}),
   updateConversationStatus: vi.fn(async () => {}),
   updateConversationPinned: vi.fn(async () => {}),
+  createConversationBranch: vi.fn(async () => ({
+    branchConversationId: 9,
+    sourceConversationId: 1,
+    folderId: 1,
+    connectionId: "branch-connection",
+    branchSessionId: "branch-session",
+    sessionReady: true,
+    promptReady: true,
+    lifecycleState: "ready",
+    forkMode: "native" as const,
+    inheritanceMode: "native_fork" as const,
+    inheritedMessageCount: 12,
+    inheritanceTruncated: false,
+  })),
+  getConversationBranchInfo: vi.fn(async () => null),
+  listConversationDeliverables: vi.fn(async () => []),
+  mergeConversationBranch: vi.fn(async () => ({
+    mergeId: "merge-1",
+    targetConversationId: 1,
+    copiedDeliverableCount: 0,
+    deduplicated: false,
+  })),
   closeTab: vi.fn(),
+  openTab: vi.fn(),
   openNewConversationTab: vi.fn(),
   updateConversationLocal: vi.fn(),
   refreshConversations: vi.fn(),
@@ -28,10 +51,15 @@ vi.mock("@/lib/api", () => ({
   deleteConversation: h.deleteConversation,
   updateConversationStatus: h.updateConversationStatus,
   updateConversationPinned: h.updateConversationPinned,
+  createConversationBranch: h.createConversationBranch,
+  getConversationBranchInfo: h.getConversationBranchInfo,
+  listConversationDeliverables: h.listConversationDeliverables,
+  mergeConversationBranch: h.mergeConversationBranch,
 }))
 vi.mock("@/contexts/tab-context", () => ({
   useTabActions: () => ({
     closeTab: h.closeTab,
+    openTab: h.openTab,
     openNewConversationTab: h.openNewConversationTab,
   }),
 }))
@@ -39,14 +67,20 @@ vi.mock("@/stores/app-workspace-store", () => {
   const state = {
     updateConversationLocal: h.updateConversationLocal,
     refreshConversations: h.refreshConversations,
-    conversations: [] as unknown[],
+    conversations: [
+      { id: 1, folder_id: 1, agent_type: "codex", title: "conv-a" },
+      { id: 2, folder_id: 1, agent_type: "codex", title: "conv-b" },
+    ],
   }
   const useStore = (selector: (s: typeof state) => unknown) => selector(state)
   useStore.getState = () => state
   return { useAppWorkspaceStore: useStore }
 })
 vi.mock("@/stores/conversation-runtime-store", () => ({
-  getRuntimeSession: () => null,
+  getRuntimeSession: () => ({ detail: { turns: [] }, localTurns: [] }),
+}))
+vi.mock("@/contexts/acp-connections-context", () => ({
+  getCachedSelectors: () => null,
 }))
 vi.mock("./session-details-dialog", () => ({
   SessionDetailsDialog: () => null,
@@ -134,5 +168,61 @@ describe("ConversationDetailHeader dialog target snapshot", () => {
       expect(h.updateConversationTitle).toHaveBeenCalledWith(1, "renamed")
     })
     expect(h.updateConversationTitle).not.toHaveBeenCalledWith(2, "renamed")
+  })
+
+  it("creates and opens an independent branch from the conversation menu", async () => {
+    const user = userEvent.setup({ pointerEventsCheck: 0 })
+    const { getByLabelText, getByRole } = render(
+      withIntl(<ConversationDetailHeader {...A} />)
+    )
+
+    await user.click(getByLabelText("More actions"))
+    await user.click(getByRole("menuitem", { name: "Create branch" }))
+
+    await waitFor(() => {
+      expect(h.createConversationBranch).toHaveBeenCalledWith(
+        expect.objectContaining({ sourceConversationId: 1 })
+      )
+      expect(h.createConversationBranch.mock.calls[0]?.[0]).not.toHaveProperty(
+        "snapshotContext"
+      )
+      expect(h.openTab).toHaveBeenCalledWith(
+        1,
+        9,
+        "codex",
+        true,
+        "conv-a · 分支"
+      )
+    })
+  })
+
+  it("opens a provisional snapshot branch before its first ACP prompt is ready", async () => {
+    h.createConversationBranch.mockResolvedValueOnce({
+      branchConversationId: 9,
+      sourceConversationId: 1,
+      folderId: 1,
+      connectionId: null,
+      branchSessionId: null,
+      sessionReady: false,
+      promptReady: false,
+      lifecycleState: "provisional",
+      forkMode: "snapshot",
+      inheritanceMode: "full_replay",
+      inheritedMessageCount: 12,
+      inheritanceTruncated: false,
+    })
+    const user = userEvent.setup({ pointerEventsCheck: 0 })
+    const { getByLabelText, getByRole } = render(
+      withIntl(<ConversationDetailHeader {...A} />)
+    )
+
+    await user.click(getByLabelText("More actions"))
+    await user.click(getByRole("menuitem", { name: "Create branch" }))
+
+    await waitFor(() => {
+      expect(h.createConversationBranch).toHaveBeenCalledTimes(1)
+    })
+    expect(h.refreshConversations).toHaveBeenCalled()
+    expect(h.openTab).toHaveBeenCalledWith(1, 9, "codex", true, "conv-a · 分支")
   })
 })
