@@ -36,13 +36,12 @@ pub struct CreateConversationBranchResult {
     pub source_conversation_id: i32,
     pub folder_id: i32,
     pub connection_id: Option<String>,
-    /// Real ACP session id returned by session/fork or session/new.
-    pub branch_session_id: String,
-    /// Successful branch creation implies both of these are true. They are
-    /// explicit on the wire so the frontend never has to infer readiness from
-    /// an HTTP 200 or a process-level Connected state.
+    /// A durable ACP session id. Snapshot fallbacks intentionally leave this
+    /// empty until their first real prompt creates a resumable rollout.
+    pub branch_session_id: Option<String>,
     pub session_ready: bool,
     pub prompt_ready: bool,
+    pub lifecycle_state: String,
     pub fork_mode: String,
     pub inheritance_mode: String,
     pub inherited_message_count: i32,
@@ -253,10 +252,9 @@ pub async fn create_conversation_branch_core(
                     .bind_connection_to_conversation(&connection_id, branch.id, branch.folder_id)
                     .await
                 {
-                    let cleanup = conversation_branch_service::remove_incomplete_branch(
-                        &db.conn, branch.id,
-                    )
-                    .await;
+                    let cleanup =
+                        conversation_branch_service::remove_incomplete_branch(&db.conn, branch.id)
+                            .await;
                     let _ = manager.disconnect(&connection_id).await;
                     tracing::error!(
                         branch_conversation_id = branch.id,
@@ -284,9 +282,10 @@ pub async fn create_conversation_branch_core(
                     source_conversation_id: source.id,
                     folder_id: branch.folder_id,
                     connection_id: Some(connection_id),
-                    branch_session_id: forked_session_id,
+                    branch_session_id: Some(forked_session_id),
                     session_ready: true,
                     prompt_ready: true,
+                    lifecycle_state: "ready".into(),
                     fork_mode: "native".into(),
                     inheritance_mode: "native_fork".into(),
                     inherited_message_count: inheritance.inherited_message_count,
@@ -306,112 +305,61 @@ pub async fn create_conversation_branch_core(
         fallback_reason = Some("source conversation has no resumable ACP session".into());
     }
 
-    // A snapshot fallback is useful only when it owns a real independent ACP
-    // session. Start and fully initialize that session BEFORE writing any
-    // branch rows; otherwise a failed session/new leaves a conversation whose
-    // external id can never be restored.
+    // session/new does not create a durable Codex rollout until a real prompt
+    // is accepted. Persist the inheritance as a provisional branch instead of
+    // pretending that an idle in-memory session id can be resumed forever.
+    // Opening the branch may prewarm a connection, but the first real user
+    // prompt atomically injects this snapshot and promotes the session id.
     tracing::info!(
         source_conversation_id = source.id,
         source_generating = source.status == "in_progress",
-        stage = "branch_session_create_started",
+        lifecycle_state = "snapshot_ready",
+        stage = "branch_snapshot_persist_started",
         fallback_reason = ?fallback_reason,
-        "[ACP][branch] creating independent snapshot session"
+        "[ACP][branch] persisting provisional snapshot branch"
     );
-    let runtime_env = build_session_runtime_env(db, source.agent_type, None, data_dir)
-        .await
-        .map_err(|error| {
-            branch_session_start_error("Branch session runtime could not be prepared", &error)
-        })?;
-    let (snapshot_connection_id, branch_session_id) = manager
-        .spawn_fresh_session_ready(
-            source.agent_type,
-            Some(folder.path.clone()),
-            runtime_env,
-            owner_label,
-            emitter.clone(),
-            request.preferred_mode_id,
-            request.preferred_config_values,
-        )
-        .await
-        .map_err(|error| {
-            branch_session_start_error("Branch session did not become ready", &error)
-        })?;
-    tracing::info!(
-        source_conversation_id = source.id,
-        connection_id = %snapshot_connection_id,
-        branch_session_id = %branch_session_id,
-        stage = "branch_prompt_ready",
-        "[ACP][branch] independent snapshot session accepts prompts"
-    );
-
     let snapshot = inheritance.context.clone();
-    let (branch, _) = match conversation_branch_service::create_branch_row(
+    let (branch, relation) = conversation_branch_service::create_branch_row(
         &db.conn,
         &source,
-        Some(branch_session_id.clone()),
+        None,
         inheritance.fork_message_id.clone(),
         "snapshot",
         inheritance_record(
             &inheritance,
             source.external_id.clone(),
-            Some(branch_session_id.clone()),
+            None,
             Some(snapshot),
         ),
     )
     .await
-    {
-        Ok(created) => created,
-        Err(error) => {
-            let _ = manager.disconnect(&snapshot_connection_id).await;
-            return Err(AppCommandError::from(error));
-        }
-    };
-    if let Err(error) = manager
-        .bind_connection_to_conversation(
-            &snapshot_connection_id,
-            branch.id,
-            branch.folder_id,
-        )
-        .await
-    {
-        let cleanup =
-            conversation_branch_service::remove_incomplete_branch(&db.conn, branch.id).await;
-        let _ = manager.disconnect(&snapshot_connection_id).await;
-        tracing::error!(
-            branch_conversation_id = branch.id,
-            connection_id = %snapshot_connection_id,
-            branch_session_id = %branch_session_id,
-            error = %error,
-            cleanup_error = ?cleanup.as_ref().err(),
-            "[ACP][branch] snapshot branch bind failed; incomplete row removed"
-        );
-        return Err(branch_session_start_error(
-            "Branch session was created but could not be attached",
-            &error,
-        ));
-    }
+    .map_err(AppCommandError::from)?;
     emit_conversation_upsert(emitter, &db.conn, branch.id).await;
     tracing::info!(
         source_conversation_id = source.id,
         branch_conversation_id = branch.id,
-        connection_id = %snapshot_connection_id,
-        branch_session_id = %branch_session_id,
+        connection_id = ?Option::<String>::None,
+        external_session_id = ?Option::<String>::None,
+        snapshot_digest = ?relation.snapshot_digest,
+        snapshot_consumed_at = ?relation.snapshot_consumed_at,
+        lifecycle_state = relation.lifecycle_state,
         inheritance_mode = inheritance.inheritance_mode,
         inherited_message_count = inheritance.inherited_message_count,
         inherited_estimated_tokens = inheritance.estimated_tokens,
         truncated = inheritance.truncated,
         fallback_reason = ?fallback_reason,
         stage = "branch_ready",
-        "[ACP][branch] independent snapshot branch persisted and attached"
+        "[ACP][branch] provisional snapshot branch persisted"
     );
     Ok(CreateConversationBranchResult {
         branch_conversation_id: branch.id,
         source_conversation_id: source.id,
         folder_id: branch.folder_id,
-        connection_id: Some(snapshot_connection_id),
-        branch_session_id,
-        session_ready: true,
-        prompt_ready: true,
+        connection_id: None,
+        branch_session_id: None,
+        session_ready: false,
+        prompt_ready: false,
+        lifecycle_state: "provisional".into(),
         fork_mode: "snapshot".into(),
         inheritance_mode: inheritance.inheritance_mode,
         inherited_message_count: inheritance.inherited_message_count,
@@ -514,12 +462,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_snapshot_session_start_leaves_no_partial_branch() {
+    async fn snapshot_branch_creation_does_not_require_a_live_agent() {
         let db = fresh_in_memory_db().await;
         let folder_id = seed_folder(&db, "/tmp/codeg-message-branch").await;
         let unavailable_agent = AgentType::custom("branch-ready-missing-agent").unwrap();
         let source_id = seed_conversation(&db, folder_id, unavailable_agent).await;
-        let error = create_conversation_branch_core(
+        let result = create_conversation_branch_core(
             &db,
             &ConnectionManager::new(),
             &EventEmitter::Noop,
@@ -534,27 +482,30 @@ mod tests {
             },
         )
         .await
-        .expect_err("an unavailable ACP agent cannot create a ready branch");
+        .expect("snapshot persistence is independent of ACP availability");
 
-        assert!(error.message.contains("Branch session"));
+        assert_eq!(result.lifecycle_state, "provisional");
+        assert!(!result.session_ready);
+        assert!(!result.prompt_ready);
+        assert!(result.connection_id.is_none());
+        assert!(result.branch_session_id.is_none());
         assert_eq!(
             conversation_branch::Entity::find()
                 .count(&db.conn)
                 .await
                 .unwrap(),
-            0
+            1
         );
         assert_eq!(
-            conversation::Entity::find()
-                .count(&db.conn)
-                .await
-                .unwrap(),
-            1,
-            "only the source conversation may remain"
+            conversation::Entity::find().count(&db.conn).await.unwrap(),
+            2,
+            "the source and durable provisional branch both remain"
         );
-        assert!(conversation_branch_service::get_info(&db.conn, source_id)
+        let info = conversation_branch_service::get_info(&db.conn, result.branch_conversation_id)
             .await
             .unwrap()
-            .is_none());
+            .unwrap();
+        assert_eq!(info.lifecycle_state, "provisional");
+        assert!(info.snapshot_consumed_at.is_none());
     }
 }

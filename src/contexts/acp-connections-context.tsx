@@ -4814,10 +4814,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       // `reconnect()` has nothing else to go on.
       lastConnectParamsRef.current.set(contextKey, request)
       const shouldRestorePersisted =
-        agentType === "codex" &&
-        conversationId != null &&
-        conversationId > 0 &&
-        Boolean(sessionId)
+        agentType === "codex" && conversationId != null && conversationId > 0
       desiredConnectRequestsRef.current.set(contextKey, request)
       if (connectingKeysRef.current.has(contextKey)) {
         pendingConnectRequestsRef.current.set(contextKey, request)
@@ -5039,7 +5036,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         // re-open (the snapshot frame doesn't carry a `session_modes` event,
         // so the apply-on-event hook never fired).
         const savedPrefs = getSavedPrefsForConnect(agentType)
-        let connectionId: string
+        let connectionId = ""
         let isViewer = false
         let restoredConversationId: number | null = null
         let restoredCodegMcpAvailable = false
@@ -5047,27 +5044,61 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         let backendReplacedConnectionIds: string[] = []
 
         if (shouldRestorePersisted && conversationId != null) {
-          const restored = await restoreFlightsRef.current.run(
-            conversationId,
-            () =>
+          let restored: Awaited<
+            ReturnType<typeof acpRestoreConversation>
+          > | null = null
+          try {
+            restored = await restoreFlightsRef.current.run(conversationId, () =>
               acpRestoreConversation(
                 conversationId,
                 savedPrefs.modeId,
                 savedPrefs.configValues
               )
-          )
-          if (restored.externalSessionId !== sessionId) {
+            )
+          } catch (error) {
+            // A persisted but never-used ordinary conversation has no session
+            // to restore. Preserve its historical session/new path; provisional
+            // branches are handled by the same backend call above and do not
+            // reach this fallback.
+            if (
+              !sessionId &&
+              normalizeErrorMessage(error).includes("has no external session")
+            ) {
+              connectionId = await acpConnect(
+                agentType,
+                workingDir,
+                undefined,
+                savedPrefs.modeId,
+                savedPrefs.configValues
+              )
+            } else {
+              throw error
+            }
+          }
+          if (!restored) {
+            // Ordinary empty-conversation fallback already assigned the fresh
+            // unbound connection; its first prompt performs the normal link.
+          } else if (
+            sessionId &&
+            restored.externalSessionId !== sessionId &&
+            restored.durableSession !== false
+          ) {
             throw new Error(
               `Restored session mismatch: expected ${sessionId}, got ${restored.externalSessionId}`
             )
+          } else {
+            connectionId = restored.connectionId
+            restoredConversationId = conversationId
+            restoredCodegMcpAvailable = restored.codegMcpAvailable
+            restoredMcpServerCount = restored.mcpServerCount
+            backendReplacedConnectionIds = restored.replacedConnectionIds
+            isViewer =
+              restored.reusedExisting && !isConnectionOwnedLocally(connectionId)
+            if (restored.durableSession === false) {
+              request.sessionId = restored.externalSessionId
+              desiredConnectRequestsRef.current.set(contextKey, request)
+            }
           }
-          connectionId = restored.connectionId
-          restoredConversationId = conversationId
-          restoredCodegMcpAvailable = restored.codegMcpAvailable
-          restoredMcpServerCount = restored.mcpServerCount
-          backendReplacedConnectionIds = restored.replacedConnectionIds
-          isViewer =
-            restored.reusedExisting && !isConnectionOwnedLocally(connectionId)
         } else {
           connectionId = await acpConnect(
             agentType,
@@ -5075,6 +5106,11 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             sessionId,
             savedPrefs.modeId,
             savedPrefs.configValues
+          )
+        }
+        if (!connectionId) {
+          throw new Error(
+            "ACP connection initialization returned no connection id"
           )
         }
 

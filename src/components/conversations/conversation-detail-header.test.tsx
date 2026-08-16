@@ -25,6 +25,7 @@ const h = vi.hoisted(() => ({
     branchSessionId: "branch-session",
     sessionReady: true,
     promptReady: true,
+    lifecycleState: "ready",
     forkMode: "native" as const,
     inheritanceMode: "native_fork" as const,
     inheritedMessageCount: 12,
@@ -195,15 +196,16 @@ describe("ConversationDetailHeader dialog target snapshot", () => {
     })
   })
 
-  it("does not open a branch tab unless the backend explicitly reports prompt readiness", async () => {
+  it("opens a provisional snapshot branch before its first ACP prompt is ready", async () => {
     h.createConversationBranch.mockResolvedValueOnce({
       branchConversationId: 9,
       sourceConversationId: 1,
       folderId: 1,
-      connectionId: "branch-connection",
-      branchSessionId: "branch-session",
-      sessionReady: true,
+      connectionId: null,
+      branchSessionId: null,
+      sessionReady: false,
       promptReady: false,
+      lifecycleState: "provisional",
       forkMode: "snapshot",
       inheritanceMode: "full_replay",
       inheritedMessageCount: 12,
@@ -220,7 +222,7 @@ describe("ConversationDetailHeader dialog target snapshot", () => {
     await waitFor(() => {
       expect(h.createConversationBranch).toHaveBeenCalledTimes(1)
     })
-    expect(h.refreshConversations).not.toHaveBeenCalled()
-    expect(h.openTab).not.toHaveBeenCalled()
+    expect(h.refreshConversations).toHaveBeenCalled()
+    expect(h.openTab).toHaveBeenCalledWith(1, 9, "codex", true, "conv-a · 分支")
   })
 })

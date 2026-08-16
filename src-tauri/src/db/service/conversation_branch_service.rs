@@ -4,6 +4,7 @@ use sea_orm::{
     QueryOrder, Set, TransactionError, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::db::entities::{
     conversation, conversation_branch, conversation_branch_merge, conversation_deliverable,
@@ -34,6 +35,17 @@ pub struct ConversationBranchInfo {
     pub inheritance_note: Option<String>,
     pub forked_through_at: Option<chrono::DateTime<Utc>>,
     pub snapshot_version: i32,
+    pub snapshot_consumed_at: Option<chrono::DateTime<Utc>>,
+    pub lifecycle_state: String,
+    pub lifecycle_error: Option<String>,
+    pub lifecycle_updated_at: Option<chrono::DateTime<Utc>>,
+    pub session_verified_at: Option<chrono::DateTime<Utc>>,
+    pub first_prompt_client_message_id: Option<String>,
+    pub first_prompt_queued_at: Option<chrono::DateTime<Utc>>,
+    pub first_prompt_accepted_at: Option<chrono::DateTime<Utc>>,
+    pub initialization_retry_count: i32,
+    pub last_connection_id: Option<String>,
+    pub snapshot_digest: Option<String>,
     pub created_at: chrono::DateTime<Utc>,
     pub last_merged_at: Option<chrono::DateTime<Utc>>,
     pub merge_target_conversation_id: Option<i32>,
@@ -59,6 +71,17 @@ impl From<conversation_branch::Model> for ConversationBranchInfo {
             inheritance_note: value.inheritance_note,
             forked_through_at: value.forked_through_at,
             snapshot_version: value.snapshot_version,
+            snapshot_consumed_at: value.snapshot_consumed_at,
+            lifecycle_state: value.lifecycle_state,
+            lifecycle_error: value.lifecycle_error,
+            lifecycle_updated_at: value.lifecycle_updated_at,
+            session_verified_at: value.session_verified_at,
+            first_prompt_client_message_id: value.first_prompt_client_message_id,
+            first_prompt_queued_at: value.first_prompt_queued_at,
+            first_prompt_accepted_at: value.first_prompt_accepted_at,
+            initialization_retry_count: value.initialization_retry_count,
+            last_connection_id: value.last_connection_id,
+            snapshot_digest: value.snapshot_digest,
             created_at: value.created_at,
             last_merged_at: value.last_merged_at,
             merge_target_conversation_id: value.merge_target_conversation_id,
@@ -121,6 +144,10 @@ pub async fn create_branch_row(
     active.model = Set(source.model.clone());
     active.external_id = Set(external_id);
     active.origin_cwd = Set(source.origin_cwd.clone());
+    // A branch with no user turn is idle, not running. In particular this
+    // prevents a transient ACP disconnect from being interpreted as a user
+    // cancellation before the first prompt exists.
+    active.status = Set(conversation::ConversationStatus::PendingReview);
     let created = match active.update(conn).await {
         Ok(created) => created,
         Err(error) => {
@@ -129,6 +156,12 @@ pub async fn create_branch_row(
         }
     };
     let now = Utc::now();
+    let provisional = fork_mode == "snapshot" && inheritance.snapshot_context.is_some();
+    let snapshot_digest = inheritance.snapshot_context.as_deref().map(|context| {
+        let mut digest = Sha256::new();
+        digest.update(context.as_bytes());
+        format!("{:x}", digest.finalize())
+    });
     let relation = conversation_branch::ActiveModel {
         branch_conversation_id: Set(created.id),
         source_conversation_id: Set(source.id),
@@ -151,6 +184,20 @@ pub async fn create_branch_row(
         })),
         snapshot_context: Set(inheritance.snapshot_context),
         snapshot_consumed_at: Set(None),
+        lifecycle_state: Set(if provisional {
+            "provisional".into()
+        } else {
+            "ready".into()
+        }),
+        lifecycle_error: Set(None),
+        lifecycle_updated_at: Set(Some(now)),
+        session_verified_at: Set((!provisional).then_some(now)),
+        first_prompt_client_message_id: Set(None),
+        first_prompt_queued_at: Set(None),
+        first_prompt_accepted_at: Set(None),
+        initialization_retry_count: Set(0),
+        last_connection_id: Set(None),
+        snapshot_digest: Set(snapshot_digest),
         created_at: Set(now),
         last_merged_at: Set(None),
         last_merge_key: Set(None),
@@ -182,6 +229,274 @@ pub async fn update_branch_session_id(
         active.update(conn).await?;
     }
     Ok(())
+}
+
+pub const PROVISIONAL_STATES: &[&str] = &[
+    "snapshot_ready",
+    "provisional",
+    "session_creating",
+    "connection_ready",
+    "prompt_ready",
+    "retryable_failed",
+];
+
+/// Runtime compatibility repair for branches created by builds that persisted
+/// session/new's ephemeral id before any prompt created a durable rollout.
+/// The shape is deliberately strict: an unconsumed snapshot, zero parsed
+/// messages and no turn-run receipt. Anything with user work is left alone.
+pub async fn repair_empty_snapshot_as_provisional(
+    conn: &DatabaseConnection,
+    conversation_id: i32,
+) -> Result<bool, DbError> {
+    let Some(branch) = conversation_branch::Entity::find_by_id(conversation_id)
+        .one(conn)
+        .await?
+    else {
+        return Ok(false);
+    };
+    if branch.fork_mode != "snapshot"
+        || branch.snapshot_consumed_at.is_some()
+        || branch
+            .snapshot_context
+            .as_deref()
+            .is_none_or(|context| context.trim().is_empty())
+    {
+        return Ok(false);
+    }
+    let Some(conversation) = conversation::Entity::find_by_id(conversation_id)
+        .filter(conversation::Column::DeletedAt.is_null())
+        .one(conn)
+        .await?
+    else {
+        return Ok(false);
+    };
+    if branch.branch_session_id.is_none()
+        && conversation.external_id.is_none()
+        && conversation.status == conversation::ConversationStatus::PendingReview
+        && PROVISIONAL_STATES.contains(&branch.lifecycle_state.as_str())
+    {
+        return Ok(false);
+    }
+    if conversation.message_count != 0
+        || conversation_turn_run::Entity::find()
+            .filter(conversation_turn_run::Column::ConversationId.eq(conversation_id))
+            .one(conn)
+            .await?
+            .is_some()
+    {
+        return Ok(false);
+    }
+
+    let now = Utc::now();
+    let prior_external_id = conversation.external_id.clone();
+    let prior_external_id_for_tx = prior_external_id.clone();
+    let result = conn
+        .transaction::<_, (), sea_orm::DbErr>(|txn| {
+            Box::pin(async move {
+                let mut branch_active = branch.into_active_model();
+                branch_active.branch_session_id = Set(None);
+                branch_active.lifecycle_state = Set("provisional".into());
+                branch_active.lifecycle_error = Set(prior_external_id_for_tx.as_ref().map(|_| {
+                    "The previous empty session was not durable; it will be recreated on first use."
+                        .into()
+                }));
+                branch_active.lifecycle_updated_at = Set(Some(now));
+                branch_active.session_verified_at = Set(None);
+                branch_active.last_connection_id = Set(None);
+                branch_active.update(txn).await?;
+
+                let mut conversation_active = conversation.into_active_model();
+                conversation_active.external_id = Set(None);
+                conversation_active.status = Set(conversation::ConversationStatus::PendingReview);
+                conversation_active.updated_at = Set(now);
+                conversation_active.update(txn).await?;
+                Ok(())
+            })
+        })
+        .await;
+    match result {
+        Ok(()) => {
+            tracing::warn!(
+                branch_conversation_id = conversation_id,
+                lifecycle_state = "provisional",
+                prior_external_session_id = ?prior_external_id,
+                snapshot_consumed_at = ?Option::<chrono::DateTime<Utc>>::None,
+                failure_classification = "missing_durable_session",
+                "[ACP][branch] repaired empty snapshot branch as provisional"
+            );
+            Ok(true)
+        }
+        Err(TransactionError::Connection(error) | TransactionError::Transaction(error)) => {
+            Err(DbError::Database(error))
+        }
+    }
+}
+
+pub async fn is_provisional_snapshot(
+    conn: &DatabaseConnection,
+    conversation_id: i32,
+) -> Result<bool, DbError> {
+    let Some(branch) = conversation_branch::Entity::find_by_id(conversation_id)
+        .one(conn)
+        .await?
+    else {
+        return Ok(false);
+    };
+    Ok(branch.fork_mode == "snapshot"
+        && branch.snapshot_consumed_at.is_none()
+        && PROVISIONAL_STATES.contains(&branch.lifecycle_state.as_str()))
+}
+
+pub async fn mark_initialization_state(
+    conn: &DatabaseConnection,
+    conversation_id: i32,
+    lifecycle_state: &str,
+    connection_id: Option<String>,
+    error: Option<String>,
+    increment_retry: bool,
+) -> Result<(), DbError> {
+    let Some(row) = conversation_branch::Entity::find_by_id(conversation_id)
+        .one(conn)
+        .await?
+    else {
+        return Ok(());
+    };
+    if row.snapshot_consumed_at.is_some() {
+        return Ok(());
+    }
+    // SessionStarted is handled by a DB subscriber and can arrive after the
+    // synchronous restore path already reached prompt_ready (or failed). Do
+    // not let that delayed lower-level event move the durable state backward.
+    if lifecycle_state == "connection_ready"
+        && !matches!(
+            row.lifecycle_state.as_str(),
+            "snapshot_ready" | "provisional" | "session_creating" | "connection_ready"
+        )
+    {
+        return Ok(());
+    }
+    let retry_count = row.initialization_retry_count;
+    let mut active = row.into_active_model();
+    active.lifecycle_state = Set(lifecycle_state.to_string());
+    active.lifecycle_error = Set(error);
+    active.lifecycle_updated_at = Set(Some(Utc::now()));
+    active.last_connection_id = Set(connection_id);
+    if increment_retry {
+        active.initialization_retry_count = Set(retry_count.saturating_add(1));
+    }
+    active.update(conn).await?;
+    Ok(())
+}
+
+pub async fn mark_first_prompt_queued(
+    conn: &DatabaseConnection,
+    conversation_id: i32,
+    client_message_id: Option<&str>,
+    connection_id: &str,
+) -> Result<(), DbError> {
+    let Some(row) = conversation_branch::Entity::find_by_id(conversation_id)
+        .one(conn)
+        .await?
+    else {
+        return Ok(());
+    };
+    if row.snapshot_consumed_at.is_some() {
+        return Ok(());
+    }
+    let has_client_message_id = row.first_prompt_client_message_id.is_some();
+    let has_queued_at = row.first_prompt_queued_at.is_some();
+    let now = Utc::now();
+    let mut active = row.into_active_model();
+    if !has_client_message_id {
+        active.first_prompt_client_message_id = Set(client_message_id.map(str::to_owned));
+    }
+    if !has_queued_at {
+        active.first_prompt_queued_at = Set(Some(now));
+    }
+    active.lifecycle_state = Set("prompt_ready".into());
+    active.lifecycle_error = Set(None);
+    active.lifecycle_updated_at = Set(Some(now));
+    active.last_connection_id = Set(Some(connection_id.to_string()));
+    active.update(conn).await?;
+    Ok(())
+}
+
+/// Commit the point at which the private snapshot and the first real user
+/// prompt have both entered the target connection. Until this transaction
+/// succeeds the session id remains provisional and the snapshot remains
+/// retryable; after it succeeds the normal restore path owns the branch.
+pub async fn finalize_first_prompt(
+    conn: &DatabaseConnection,
+    conversation_id: i32,
+    session_id: &str,
+    connection_id: &str,
+    client_message_id: Option<&str>,
+) -> Result<(), DbError> {
+    let now = Utc::now();
+    let session_id = session_id.to_string();
+    let connection_id = connection_id.to_string();
+    let client_message_id = client_message_id.map(str::to_owned);
+    let result = conn
+        .transaction::<_, (), sea_orm::DbErr>(|txn| {
+            Box::pin(async move {
+                let Some(branch) = conversation_branch::Entity::find_by_id(conversation_id)
+                    .one(txn)
+                    .await?
+                else {
+                    return Ok(());
+                };
+                if branch.snapshot_consumed_at.is_some() {
+                    return Ok(());
+                }
+                let mut active = branch.into_active_model();
+                active.branch_session_id = Set(Some(session_id.clone()));
+                active.snapshot_consumed_at = Set(Some(now));
+                active.lifecycle_state = Set("ready".into());
+                active.lifecycle_error = Set(None);
+                active.lifecycle_updated_at = Set(Some(now));
+                active.session_verified_at = Set(Some(now));
+                active.first_prompt_client_message_id = Set(client_message_id.clone());
+                active.first_prompt_queued_at = Set(Some(now));
+                active.first_prompt_accepted_at = Set(Some(now));
+                active.last_connection_id = Set(Some(connection_id));
+                active.update(txn).await?;
+
+                let Some(conversation) = conversation::Entity::find_by_id(conversation_id)
+                    .one(txn)
+                    .await?
+                else {
+                    return Ok(());
+                };
+                let mut conversation_active = conversation.into_active_model();
+                conversation_active.external_id = Set(Some(session_id));
+                conversation_active.updated_at = Set(now);
+                conversation_active.update(txn).await?;
+                Ok(())
+            })
+        })
+        .await;
+    match result {
+        Ok(()) => Ok(()),
+        Err(TransactionError::Connection(error) | TransactionError::Transaction(error)) => {
+            Err(DbError::Database(error))
+        }
+    }
+}
+
+pub async fn was_first_prompt_accepted(
+    conn: &DatabaseConnection,
+    conversation_id: i32,
+    client_message_id: &str,
+) -> Result<bool, DbError> {
+    Ok(conversation_branch::Entity::find_by_id(conversation_id)
+        .filter(
+            conversation_branch::Column::FirstPromptClientMessageId
+                .eq(client_message_id.to_string()),
+        )
+        .filter(conversation_branch::Column::FirstPromptAcceptedAt.is_not_null())
+        .one(conn)
+        .await?
+        .is_some())
 }
 
 /// Hard-delete a branch row that was created during the current request but
@@ -663,6 +978,13 @@ mod tests {
         assert_eq!(info.source_conversation_id, source_id);
         assert!(info.source_available);
         assert_eq!(info.fork_message_id.as_deref(), Some("turn-3"));
+        assert_eq!(info.lifecycle_state, "provisional");
+        assert!(info.branch_session_id.is_none());
+        assert_eq!(branch.external_id, None);
+        assert_eq!(
+            branch.status,
+            conversation::ConversationStatus::PendingReview
+        );
         assert_eq!(
             pending_snapshot(&db.conn, branch.id)
                 .await
@@ -673,14 +995,72 @@ mod tests {
         assert!(can_reinitialize_empty_snapshot_session(&db.conn, branch.id)
             .await
             .unwrap());
-        mark_snapshot_consumed(&db.conn, branch.id).await.unwrap();
+        mark_first_prompt_queued(&db.conn, branch.id, Some("optimistic-first"), "conn-first")
+            .await
+            .unwrap();
+        mark_initialization_state(
+            &db.conn,
+            branch.id,
+            "connection_ready",
+            Some("conn-first".into()),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            get_info(&db.conn, branch.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .lifecycle_state,
+            "prompt_ready",
+            "a delayed SessionStarted event must not regress prompt readiness"
+        );
+        finalize_first_prompt(
+            &db.conn,
+            branch.id,
+            "real-session",
+            "conn-first",
+            Some("optimistic-first"),
+        )
+        .await
+        .unwrap();
         assert!(pending_snapshot(&db.conn, branch.id)
             .await
             .unwrap()
             .is_none());
-        assert!(!can_reinitialize_empty_snapshot_session(&db.conn, branch.id)
-            .await
-            .unwrap());
+        assert!(
+            !can_reinitialize_empty_snapshot_session(&db.conn, branch.id)
+                .await
+                .unwrap()
+        );
+        let promoted = get_info(&db.conn, branch.id).await.unwrap().unwrap();
+        assert_eq!(promoted.lifecycle_state, "ready");
+        assert_eq!(promoted.branch_session_id.as_deref(), Some("real-session"));
+        assert_eq!(
+            promoted.first_prompt_client_message_id.as_deref(),
+            Some("optimistic-first")
+        );
+        assert!(promoted.first_prompt_accepted_at.is_some());
+        assert!(
+            was_first_prompt_accepted(&db.conn, branch.id, "optimistic-first")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !was_first_prompt_accepted(&db.conn, branch.id, "different-id")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            conversation_service::get_by_id(&db.conn, branch.id)
+                .await
+                .unwrap()
+                .external_id
+                .as_deref(),
+            Some("real-session")
+        );
 
         conversation_service::soft_delete(&db.conn, source_id)
             .await
@@ -690,6 +1070,74 @@ mod tests {
         assert!(conversation_service::get_by_id(&db.conn, branch.id)
             .await
             .is_ok());
+    }
+
+    #[tokio::test]
+    async fn damaged_empty_snapshot_branch_is_repaired_without_losing_snapshot() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/codeg-branch-repair-test").await;
+        let source_id = seed_conversation(&db, folder_id, AgentType::Codex).await;
+        let source = conversation_service::get_by_id(&db.conn, source_id)
+            .await
+            .unwrap();
+        let (branch, _) = create_branch_row(
+            &db.conn,
+            &source,
+            None,
+            None,
+            "snapshot",
+            BranchInheritanceRecord {
+                source_session_id: None,
+                branch_session_id: None,
+                inheritance_mode: "structured_snapshot".into(),
+                inherited_message_count: 12,
+                inherited_context_chars: 42,
+                inherited_estimated_tokens: 11,
+                inheritance_compressed: true,
+                inheritance_truncated: false,
+                inheritance_note: None,
+                forked_through_at: None,
+                snapshot_version: 2,
+                snapshot_context: Some("important context".into()),
+                snapshot_images: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        conversation_service::update_external_id(&db.conn, branch.id, "fake-session".into())
+            .await
+            .unwrap();
+        update_branch_session_id(&db.conn, branch.id, "fake-session".into())
+            .await
+            .unwrap();
+        conversation_service::update_status(
+            &db.conn,
+            branch.id,
+            conversation::ConversationStatus::Cancelled,
+        )
+        .await
+        .unwrap();
+
+        assert!(repair_empty_snapshot_as_provisional(&db.conn, branch.id)
+            .await
+            .unwrap());
+        let repaired = get_info(&db.conn, branch.id).await.unwrap().unwrap();
+        assert_eq!(repaired.lifecycle_state, "provisional");
+        assert!(repaired.branch_session_id.is_none());
+        assert!(repaired.snapshot_consumed_at.is_none());
+        assert_eq!(
+            pending_snapshot(&db.conn, branch.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .context,
+            "important context"
+        );
+        let conversation = conversation_service::get_by_id(&db.conn, branch.id)
+            .await
+            .unwrap();
+        assert_eq!(conversation.external_id, None);
+        assert_eq!(conversation.status, "pending_review");
     }
 
     #[tokio::test]

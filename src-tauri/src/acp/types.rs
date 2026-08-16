@@ -788,6 +788,11 @@ pub struct RestoredConversationConnectionInfo {
     /// Connections removed from the manager during the atomic switchover.
     /// Their process loops are asked to stop immediately after the map update.
     pub replaced_connection_ids: Vec<String>,
+    /// Branch lifecycle observed after the connection was attached. `ready`
+    /// is durable; `prompt_ready` is an intentionally ephemeral pre-first-turn
+    /// snapshot connection whose id must not yet be treated as a rollout.
+    pub lifecycle_state: String,
+    pub durable_session: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -1165,6 +1165,148 @@ describe("AcpConnectionsProvider persisted Codex restore lifecycle", () => {
     })
   }
 
+  it("prepares a provisional branch with no durable session id", async () => {
+    h.acpRestoreConversation.mockResolvedValueOnce({
+      connectionId: "provisional-conn",
+      externalSessionId: "ephemeral-session",
+      reusedExisting: false,
+      codegMcpAvailable: true,
+      mcpServerCount: 1,
+      replacedConnectionIds: [],
+      lifecycleState: "prompt_ready",
+      durableSession: false,
+    })
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(CODEX_TAB, "codex", "/tmp/x", undefined, 42)
+    })
+
+    expect(h.acpRestoreConversation).toHaveBeenCalledWith(42, undefined, {})
+    expect(h.acpConnect).not.toHaveBeenCalled()
+    expect(h.store!.getConnection(CODEX_TAB)).toMatchObject({
+      connectionId: "provisional-conn",
+      sessionId: null,
+      conversationId: 42,
+      codegMcpAvailable: true,
+    })
+    const handlers = latestAttachHandlers()
+    emitAcpEvent(handlers, {
+      seq: 1,
+      connection_id: "provisional-conn",
+      type: "session_started",
+      session_id: "ephemeral-session",
+    })
+    act(() => handlers.onReplay([], 1))
+    await act(async () => {
+      await h.actions!.sendPrompt(
+        CODEX_TAB,
+        [{ type: "text", text: "first branch prompt" }],
+        {
+          folderId: 1,
+          conversationId: 42,
+          clientMessageId: "optimistic-first",
+        }
+      )
+    })
+    expect(h.acpPrompt).toHaveBeenCalledWith(
+      "provisional-conn",
+      [{ type: "text", text: "first branch prompt" }],
+      1,
+      42,
+      "optimistic-first"
+    )
+  })
+
+  it("falls back to normal session/new for an empty non-branch conversation", async () => {
+    h.acpRestoreConversation.mockRejectedValueOnce(
+      new Error("conversation 42 has no external session to restore")
+    )
+    h.acpConnect.mockResolvedValueOnce("ordinary-new-session")
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(CODEX_TAB, "codex", "/tmp/x", undefined, 42)
+    })
+    expect(h.acpRestoreConversation).toHaveBeenCalledTimes(1)
+    expect(h.acpConnect).toHaveBeenCalledWith(
+      "codex",
+      "/tmp/x",
+      undefined,
+      undefined,
+      {}
+    )
+    expect(h.store!.getConnection(CODEX_TAB)).toMatchObject({
+      connectionId: "ordinary-new-session",
+      conversationId: null,
+    })
+  })
+
+  it("accepts a replacement ephemeral id while repairing an old damaged branch", async () => {
+    h.acpRestoreConversation.mockResolvedValueOnce({
+      connectionId: "repaired-conn",
+      externalSessionId: "new-ephemeral",
+      reusedExisting: false,
+      codegMcpAvailable: true,
+      mcpServerCount: 1,
+      replacedConnectionIds: [],
+      lifecycleState: "prompt_ready",
+      durableSession: false,
+    })
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(
+        CODEX_TAB,
+        "codex",
+        "/tmp/x",
+        "missing-rollout-id",
+        42
+      )
+    })
+    expect(h.store!.getConnection(CODEX_TAB)).toMatchObject({
+      connectionId: "repaired-conn",
+      conversationId: 42,
+    })
+  })
+
+  it("reinitializes a provisional branch after its idle connection disappears", async () => {
+    h.acpRestoreConversation.mockResolvedValueOnce({
+      connectionId: "provisional-before-idle",
+      externalSessionId: "ephemeral-before-idle",
+      reusedExisting: false,
+      codegMcpAvailable: true,
+      mcpServerCount: 1,
+      replacedConnectionIds: [],
+      lifecycleState: "prompt_ready",
+      durableSession: false,
+    })
+    await mountProvider()
+    h.actions!.registerOpenTabKeys(new Set([CODEX_TAB]))
+    await act(async () => {
+      await h.actions!.connect(CODEX_TAB, "codex", "/tmp/x", undefined, 42)
+    })
+    const oldHandlers = latestAttachHandlers()
+    h.acpRestoreConversation.mockResolvedValueOnce({
+      connectionId: "provisional-after-idle",
+      externalSessionId: "ephemeral-after-idle",
+      reusedExisting: false,
+      codegMcpAvailable: true,
+      mcpServerCount: 1,
+      replacedConnectionIds: [],
+      lifecycleState: "prompt_ready",
+      durableSession: false,
+    })
+
+    await act(async () => {
+      oldHandlers.onDetached("connection_gone")
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    expect(h.acpRestoreConversation).toHaveBeenCalledTimes(2)
+    expect(h.store!.getConnection(CODEX_TAB)).toMatchObject({
+      connectionId: "provisional-after-idle",
+      conversationId: 42,
+    })
+  })
+
   it("records the backend conversation binding when a new session becomes persisted", async () => {
     await mountProvider()
     await act(async () => {

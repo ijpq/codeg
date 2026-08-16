@@ -27,7 +27,7 @@ use crate::acp::types::{AcpEvent, ConnectionStatus, EventEnvelope};
 use crate::artifact_tracker::ArtifactTurnFinishStatus;
 use crate::db::entities::conversation::ConversationStatus;
 use crate::db::error::DbError;
-use crate::db::service::conversation_service;
+use crate::db::service::{conversation_branch_service, conversation_service};
 use crate::logging::throttle::{LagLogThrottle, LAG_LOG_WINDOW};
 use crate::models::AgentType;
 use crate::web::event_bridge::{emit_with_state, EventEmitter};
@@ -205,6 +205,29 @@ pub(crate) async fn handle_event(
             };
             let conversation_id = state_arc.read().await.conversation_id;
             if let Some(cid) = conversation_id {
+                // session/new publishes an id before Codex has a durable
+                // rollout. A provisional snapshot branch promotes that id only
+                // after the snapshot and first real user prompt are accepted.
+                if conversation_branch_service::is_provisional_snapshot(db_conn, cid).await? {
+                    conversation_branch_service::mark_initialization_state(
+                        db_conn,
+                        cid,
+                        "connection_ready",
+                        Some(envelope.connection_id.clone()),
+                        None,
+                        false,
+                    )
+                    .await?;
+                    tracing::info!(
+                        branch_conversation_id = cid,
+                        connection_id = %envelope.connection_id,
+                        external_session_id = %session_id,
+                        lifecycle_state = "connection_ready",
+                        session_verification_result = "not_durable_until_first_prompt",
+                        "[ACP][branch] skipped premature external session persistence"
+                    );
+                    return Ok(());
+                }
                 conversation_service::update_external_id(db_conn, cid, session_id.clone()).await?;
                 // The external_id just landed on the row. The create-time
                 // sidebar upsert carried `external_id: null` (no session yet),
@@ -437,6 +460,17 @@ async fn handle_terminal_event(
         return Ok(());
     };
     let cid = entry.conversation_id;
+    if conversation_branch_service::is_provisional_snapshot(db_conn, cid).await? {
+        tracing::info!(
+            branch_conversation_id = cid,
+            connection_id,
+            lifecycle_state = "provisional",
+            idle_sweep_action = "connection_disconnected_branch_preserved",
+            snapshot_consumed_at = ?Option::<chrono::DateTime<chrono::Utc>>::None,
+            "[ACP][branch] transient disconnect preserved provisional branch"
+        );
+        return Ok(());
+    }
     let changed = conversation_service::update_status_if(
         db_conn,
         cid,
@@ -2152,6 +2186,69 @@ mod tests {
         assert!(
             !cache.contains_key("c1"),
             "cache entry must be drained after first terminal event"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_disconnect_preserves_unconsumed_provisional_branch() {
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/term-provisional").await;
+        let source_id =
+            test_helpers::seed_conversation(&db, folder_id, AgentType::ClaudeCode).await;
+        let source = conversation_service::get_by_id(&db.conn, source_id)
+            .await
+            .unwrap();
+        let (branch, _) = conversation_branch_service::create_branch_row(
+            &db.conn,
+            &source,
+            None,
+            None,
+            "snapshot",
+            conversation_branch_service::BranchInheritanceRecord {
+                source_session_id: None,
+                branch_session_id: None,
+                inheritance_mode: "structured_snapshot".into(),
+                inherited_message_count: 1,
+                inherited_context_chars: 7,
+                inherited_estimated_tokens: 2,
+                inheritance_compressed: false,
+                inheritance_truncated: false,
+                inheritance_note: None,
+                forked_through_at: None,
+                snapshot_version: 2,
+                snapshot_context: Some("context".into()),
+                snapshot_images: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        // Reproduce the old bad status so the lifecycle guard, rather than the
+        // create-time PendingReview default alone, proves the idle invariant.
+        conversation_service::update_status(&db.conn, branch.id, ConversationStatus::InProgress)
+            .await
+            .unwrap();
+
+        let mgr = ConnectionManager::new();
+        mgr.connections.lock().await.insert(
+            "branch-idle".into(),
+            fake_connection_with_state("branch-idle", Some(branch.id)),
+        );
+        let mut cache = HashMap::new();
+        seed_cache(&mut cache, &mgr, "branch-idle", branch.id).await;
+        handle_terminal_event(&db.conn, &mut cache, "branch-idle")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            read_row_status(&db, branch.id).await,
+            ConversationStatus::InProgress,
+            "an idle disconnect is not a user cancellation"
+        );
+        assert!(
+            conversation_branch_service::pending_snapshot(&db.conn, branch.id)
+                .await
+                .unwrap()
+                .is_some()
         );
     }
 

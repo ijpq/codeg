@@ -194,17 +194,37 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
 
   useEffect(() => {
     let cancelled = false
+    let timer: ReturnType<typeof setTimeout> | null = null
     setBranchInfo(null)
     if (conversationId == null) return
-    getConversationBranchInfo(conversationId)
-      .then((info) => {
-        if (!cancelled) setBranchInfo(info)
-      })
-      .catch((error) => {
-        console.error("[ConversationDetailHeader] branch info:", error)
-      })
+    const load = () => {
+      getConversationBranchInfo(conversationId)
+        .then((info) => {
+          if (cancelled) return
+          setBranchInfo(info)
+          if (
+            info &&
+            [
+              "snapshot_ready",
+              "provisional",
+              "session_creating",
+              "connection_ready",
+              "prompt_ready",
+              "retryable_failed",
+            ].includes(info.lifecycleState)
+          ) {
+            timer = setTimeout(load, 2_000)
+          }
+        })
+        .catch((error) => {
+          console.error("[ConversationDetailHeader] branch info:", error)
+          if (!cancelled) timer = setTimeout(load, 2_000)
+        })
+    }
+    load()
     return () => {
       cancelled = true
+      if (timer) clearTimeout(timer)
     }
   }, [conversationId])
 
@@ -226,14 +246,6 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
         preferredModeId: selectors?.modes?.current_mode_id ?? null,
         preferredConfigValues,
       })
-      if (
-        !result.sessionReady ||
-        !result.promptReady ||
-        !result.connectionId ||
-        !result.branchSessionId
-      ) {
-        throw new Error("Branch session did not become ready")
-      }
       await refreshConversations()
       openTab(
         result.folderId,
@@ -245,7 +257,7 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
       toast.success(
         result.inheritanceMode === "native_fork"
           ? tBranch("nativeCreated")
-          : tBranch("snapshotCreated")
+          : tBranch("provisionalCreated")
       )
     } catch (error) {
       toast.error(error instanceof Error ? error.message : String(error))
@@ -503,6 +515,11 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
             <span className="hidden xl:inline">
               {` · ${branchInfo.inheritanceMode === "native_fork" ? tBranch("nativeMode") : tBranch("snapshotMode")}`}
             </span>
+            {branchInfo.lifecycleState !== "ready" && (
+              <span className="hidden 2xl:inline">
+                {` · ${branchInfo.lifecycleState === "retryable_failed" ? tBranch("retryableFailed") : tBranch("pendingFirstPrompt")}`}
+              </span>
+            )}
           </button>
         )}
       </div>

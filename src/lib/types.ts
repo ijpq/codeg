@@ -2466,6 +2466,8 @@ export interface RestoredConversationConnectionInfo {
   codegMcpAvailable: boolean
   mcpServerCount: number
   replacedConnectionIds: string[]
+  lifecycleState?: string
+  durableSession?: boolean
 }
 
 // ACP agent info returned by acp_list_agents

@@ -1675,6 +1675,9 @@ impl ConnectionManager {
                 if artifact_service::was_prompt_accepted(&db.conn, cid, id)
                     .await
                     .map_err(|e| AcpError::protocol(e.to_string()))?
+                    || conversation_branch_service::was_first_prompt_accepted(&db.conn, cid, id)
+                        .await
+                        .map_err(|e| AcpError::protocol(e.to_string()))?
                 {
                     tracing::info!(
                         conversation_id = cid,
@@ -1995,6 +1998,26 @@ impl ConnectionManager {
         } else {
             None
         };
+        if branch_snapshot.is_some() {
+            if let Some(cid) = conversation_id_for_status {
+                conversation_branch_service::mark_first_prompt_queued(
+                    &db.conn,
+                    cid,
+                    client_message_id.as_deref(),
+                    conn_id,
+                )
+                .await
+                .map_err(|e| AcpError::protocol(e.to_string()))?;
+                tracing::info!(
+                    branch_conversation_id = cid,
+                    connection_id = conn_id,
+                    client_message_id = ?client_message_id,
+                    lifecycle_state = "prompt_ready",
+                    stage = "first_prompt_queued",
+                    "[ACP][branch] first prompt entered durable client-id admission"
+                );
+            }
+        }
         if let Some(snapshot) = branch_snapshot.as_ref() {
             blocks.insert(
                 0,
@@ -2084,13 +2107,47 @@ impl ConnectionManager {
             Ok(()) => {
                 if branch_snapshot.is_some() {
                     if let Some(cid) = conversation_id_for_status {
-                        if let Err(error) =
-                            conversation_branch_service::mark_snapshot_consumed(&db.conn, cid).await
-                        {
+                        let session_id = state_arc.read().await.external_id.clone();
+                        let finalize_result = if let Some(session_id) = session_id.as_deref() {
+                            conversation_branch_service::finalize_first_prompt(
+                                &db.conn,
+                                cid,
+                                session_id,
+                                conn_id,
+                                client_message_id.as_deref(),
+                            )
+                            .await
+                        } else {
+                            Err(crate::db::error::DbError::Validation(
+                                "provisional branch prompt was accepted without a session id"
+                                    .into(),
+                            ))
+                        };
+                        if let Err(error) = finalize_result {
                             tracing::error!(
-                                conversation_id = cid,
+                                branch_conversation_id = cid,
+                                connection_id = conn_id,
+                                client_message_id = ?client_message_id,
                                 error = %error,
-                                "[ACP][branch] failed to mark snapshot context consumed"
+                                rollback_result = "snapshot_preserved",
+                                failure_classification = "first_prompt_persistence_failed",
+                                "[ACP][branch] prompt reached agent but durable branch promotion failed"
+                            );
+                        } else {
+                            crate::commands::conversations::emit_conversation_upsert(
+                                &emitter,
+                                &db.conn,
+                                cid,
+                            )
+                            .await;
+                            tracing::info!(
+                                branch_conversation_id = cid,
+                                connection_id = conn_id,
+                                client_message_id = ?client_message_id,
+                                lifecycle_state = "ready",
+                                snapshot_consumed = true,
+                                stage = "first_prompt_accepted",
+                                "[ACP][branch] first prompt accepted and durable session promoted"
                             );
                         }
                     }
@@ -2166,10 +2223,27 @@ impl ConnectionManager {
                     self.artifact_tracker.cancel_unsent_turn(conn_id).await;
                 }
                 if let Some(cid) = conversation_id_for_status {
+                    let pending_branch = branch_snapshot.is_some();
+                    if pending_branch {
+                        let _ = conversation_branch_service::mark_initialization_state(
+                            &db.conn,
+                            cid,
+                            "retryable_failed",
+                            Some(conn_id.to_string()),
+                            Some(send_err.to_string()),
+                            true,
+                        )
+                        .await;
+                    }
+                    let rollback_status = if pending_branch {
+                        ConversationStatus::PendingReview
+                    } else {
+                        ConversationStatus::Cancelled
+                    };
                     match conversation_service::update_status(
                         &db.conn,
                         cid,
-                        ConversationStatus::Cancelled,
+                        rollback_status.clone(),
                     )
                     .await
                     {
@@ -2179,7 +2253,7 @@ impl ConnectionManager {
                                 &emitter,
                                 AcpEvent::ConversationStatusChanged {
                                     conversation_id: cid,
-                                    status: ConversationStatus::Cancelled,
+                                    status: rollback_status,
                                 },
                             )
                             .await;

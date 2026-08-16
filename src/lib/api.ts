@@ -2850,9 +2850,10 @@ export interface CreateConversationBranchResult {
   sourceConversationId: number
   folderId: number
   connectionId?: string | null
-  branchSessionId: string
+  branchSessionId?: string | null
   sessionReady: boolean
   promptReady: boolean
+  lifecycleState: string
   forkMode: "native" | "snapshot"
   inheritanceMode: "native_fork" | "full_replay" | "structured_snapshot"
   inheritedMessageCount: number
@@ -2878,6 +2879,17 @@ export interface ConversationBranchInfo {
   inheritanceNote?: string | null
   forkedThroughAt?: string | null
   snapshotVersion: number
+  snapshotConsumedAt?: string | null
+  lifecycleState: string
+  lifecycleError?: string | null
+  lifecycleUpdatedAt?: string | null
+  sessionVerifiedAt?: string | null
+  firstPromptClientMessageId?: string | null
+  firstPromptQueuedAt?: string | null
+  firstPromptAcceptedAt?: string | null
+  initializationRetryCount: number
+  lastConnectionId?: string | null
+  snapshotDigest?: string | null
   createdAt: string
   lastMergedAt?: string | null
   mergeTargetConversationId?: number | null
