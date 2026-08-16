@@ -244,7 +244,6 @@ async fn send_dispatch_message(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 #[cfg(test)]
 async fn dispatch_command(
     text: &str,
