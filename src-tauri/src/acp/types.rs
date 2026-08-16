@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PromptInputBlock {
     Text {
@@ -37,6 +37,18 @@ pub struct PromptCapabilitiesInfo {
     pub image: bool,
     pub audio: bool,
     pub embedded_context: bool,
+}
+
+/// Successful native in-turn steering response. The legacy Codeg compatibility
+/// adapter returns Codex app-server's concrete `turn/steer` id. Upstream
+/// codex-acp's `_session/steering` response intentionally carries only an
+/// outcome, so `turn_id` is absent on that protocol.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SteerResult {
+    pub turn_id: Option<String>,
+    pub message_id: String,
+    #[serde(default)]
+    pub deduplicated: bool,
 }
 
 /// Image attached to a tool call on the ACP wire (e.g. codex-acp v0.14+
@@ -266,12 +278,23 @@ pub enum AcpEvent {
     },
     /// Whether the agent supports session/fork
     ForkSupported { supported: bool },
+    /// Per-connection native steering capability negotiated from initialize.
+    /// May transition from true to false if the runtime returns method-not-found.
+    SteerSupported { supported: bool },
     /// Current session mode changed
     ModeChanged { mode_id: String },
     /// Agent reported plan update for current turn
     PlanUpdate { entries: Vec<PlanEntryInfo> },
     /// Connection status changed
     StatusChanged { status: ConnectionStatus },
+    /// A user message successfully injected into the current in-flight turn via
+    /// native `turn/steer`. Separate from `UserMessage`: it must not replace the
+    /// turn's original prompt or clear turn-scoped feedback state.
+    SteerMessage {
+        message_id: String,
+        blocks: Vec<UserMessageBlock>,
+        turn_id: Option<String>,
+    },
     /// Error occurred
     Error {
         message: String,
@@ -495,10 +518,7 @@ pub enum AcpEvent {
     /// clear its "restart to apply" banner. Carried into `SessionState` so a
     /// snapshot attach (web reconnect, window refresh, new tile) recovers the
     /// staleness the one-shot event won't replay for it.
-    SessionConfigStale {
-        stale: bool,
-        kind: ConfigStaleKind,
-    },
+    SessionConfigStale { stale: bool, kind: ConfigStaleKind },
 }
 
 /// One background task settled by a `<task-notification>` transcript record,
@@ -802,6 +822,30 @@ pub struct ConnectionInfo {
 pub struct ConversationConnectionInfo {
     pub connection_id: String,
     pub event_seq: u64,
+}
+
+/// Result of atomically restoring a persisted conversation onto a live ACP
+/// connection. The backend does not publish this result until the requested
+/// external session is active, the required Codeg MCP companion is configured,
+/// and the conversation mapping has switched to `connection_id`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoredConversationConnectionInfo {
+    pub connection_id: String,
+    pub external_session_id: String,
+    /// True when a compatible live connection already represented this logical
+    /// session. A client that did not already own it attaches as a viewer.
+    pub reused_existing: bool,
+    pub codeg_mcp_available: bool,
+    pub mcp_server_count: u32,
+    /// Connections removed from the manager during the atomic switchover.
+    /// Their process loops are asked to stop immediately after the map update.
+    pub replaced_connection_ids: Vec<String>,
+    /// Branch lifecycle observed after the connection was attached. `ready`
+    /// is durable; `prompt_ready` is an intentionally ephemeral pre-first-turn
+    /// snapshot connection whose id must not yet be treated as a rollout.
+    pub lifecycle_state: String,
+    pub durable_session: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

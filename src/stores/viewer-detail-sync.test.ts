@@ -17,6 +17,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import type { DbConversationDetail, MessageTurn } from "@/lib/types"
 import type { LiveMessage } from "@/contexts/acp-connections-context"
 import {
+  HISTORY_PAGE_USER_TURNS,
   resetConversationRuntimeStore,
   useConversationRuntimeStore,
   type ConversationRuntimeSession,
@@ -95,6 +96,7 @@ function emptySession(conversationId: number): ConversationRuntimeSession {
     pendingBackgroundSettlements: [],
     optimisticTurns: [],
     liveMessage: null,
+    promptDeliveries: {},
     syncState: "idle",
     activeTurnToken: null,
     lastTurnOwned: false,
@@ -131,6 +133,83 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.useRealTimers()
+})
+
+describe("detail hydration — refresh recovery", () => {
+  it("restores the active client message and running phase after a cold refresh", async () => {
+    const clientMessageId = "optimistic-image-refresh"
+    const startedAt = "2026-07-18T00:05:00.000Z"
+    mockGet.mockResolvedValue({
+      ...detail(
+        [userTurn(clientMessageId, "image + text")],
+        null,
+        clientMessageId
+      ),
+      artifact_runs: [
+        {
+          id: "artifact-run-1",
+          conversation_id: CID,
+          connection_id: "connection-1",
+          client_message_id: clientMessageId,
+          folder_id: 1,
+          root_path: "/tmp/codeg",
+          status: "running",
+          capture_incomplete: false,
+          stop_reason: null,
+          started_at: startedAt,
+          completed_at: null,
+          changes: [],
+        },
+      ],
+    })
+
+    useConversationRuntimeStore.getState().actions.fetchDetail(CID)
+    await vi.waitFor(() => {
+      expect(session()?.detailLoading).toBe(false)
+    })
+
+    expect(session()?.activeTurnToken).toBe(clientMessageId)
+    expect(session()?.promptDeliveries[clientMessageId]).toMatchObject({
+      clientMessageId,
+      phase: "running",
+      submittedAt: Date.parse(startedAt),
+      acceptedAt: Date.parse(startedAt),
+    })
+  })
+
+  it("does not resurrect a completed historical run as active", async () => {
+    const clientMessageId = "optimistic-completed"
+    mockGet.mockResolvedValue({
+      ...detail([
+        userTurn(clientMessageId, "done"),
+        assistantTurn("answer", "finished"),
+      ]),
+      artifact_runs: [
+        {
+          id: "artifact-run-completed",
+          conversation_id: CID,
+          connection_id: "connection-1",
+          client_message_id: clientMessageId,
+          folder_id: 1,
+          root_path: "/tmp/codeg",
+          status: "completed",
+          capture_incomplete: false,
+          stop_reason: "end_turn",
+          started_at: "2026-07-18T00:01:00.000Z",
+          completed_at: "2026-07-18T00:02:00.000Z",
+          changes: [],
+        },
+      ],
+    })
+
+    useConversationRuntimeStore.getState().actions.fetchDetail(CID)
+    await vi.waitFor(() => {
+      expect(session()?.detailLoading).toBe(false)
+    })
+
+    expect(session()?.activeTurnToken).toBeNull()
+    expect(session()?.promptDeliveries).toEqual({})
+  })
 })
 
 describe("syncViewerDetail — owner/guard no-ops", () => {
@@ -246,6 +325,157 @@ describe("syncViewerDetail — owner/guard no-ops", () => {
   })
 })
 
+describe("reconcileCompletedTurn — lost stream recovery", () => {
+  it("polls past a trailing user record and folds the persisted final reply", async () => {
+    vi.useFakeTimers()
+    const stale = detail([userTurn("u", "image + text")])
+    const settled = detail([
+      userTurn("u", "image + text"),
+      assistantTurn("a", "final reply"),
+    ])
+    seed({
+      detail: stale,
+      localTurns: [userTurn("optimistic-image", "image + text")],
+      historyAssistantBaseline: 0,
+      lastTurnOwned: true,
+    })
+    mockGet.mockResolvedValueOnce(stale).mockResolvedValue(settled)
+    const reconciled = vi.fn()
+
+    useConversationRuntimeStore
+      .getState()
+      .actions.reconcileCompletedTurn(CID, CID, "optimistic-image", reconciled)
+    await vi.advanceTimersByTimeAsync(10_000)
+
+    expect(mockGet).toHaveBeenCalledTimes(2)
+    expect(session()?.localTurns).toEqual([])
+    const turns = session()?.detail?.turns ?? []
+    expect(turns[turns.length - 1]?.role).toBe("assistant")
+    expect(reconciled).toHaveBeenCalledTimes(1)
+  })
+
+  it("retires a promoted reply when a publish refresh already counted the persisted assistant", async () => {
+    vi.useFakeTimers()
+    const clientMessageId = "optimistic-published"
+    const persisted = {
+      ...detail([
+        userTurn("parser-user", "generate a PDF"),
+        assistantTurn("parser-assistant", "PDF created"),
+      ]),
+      artifact_runs: [
+        {
+          id: "run-published",
+          conversation_id: CID,
+          connection_id: "connection-1",
+          client_message_id: clientMessageId,
+          folder_id: 1,
+          root_path: "/tmp/codeg",
+          status: "completed" as const,
+          capture_incomplete: false,
+          stop_reason: "end_turn",
+          started_at: "2026-08-05T03:01:20.000Z",
+          completed_at: "2026-08-05T03:13:10.000Z",
+          changes: [],
+        },
+      ],
+      deliverable_runs: [
+        {
+          turn_run_id: "run-published",
+          conversation_id: CID,
+          client_message_id: clientMessageId,
+          user_turn_id: "parser-user",
+          started_at: "2026-08-05T03:01:20.000Z",
+          completed_at: "2026-08-05T03:13:10.000Z",
+          // The reconciliation proof uses the durable run/user link; card
+          // payload rendering is covered by message-list-view tests.
+          deliverables: [],
+        },
+      ],
+    }
+    const promotedReply = assistantTurn("live-assistant", "PDF created")
+    seed({
+      detail: persisted,
+      localTurns: [userTurn(clientMessageId, "generate a PDF"), promotedReply],
+      // A publish event refreshed detail after the parser had already created
+      // its assistant row, so the old count-growth test can never succeed.
+      historyAssistantBaseline: 1,
+      lastTurnOwned: true,
+    })
+    mockGet.mockResolvedValue(persisted)
+
+    useConversationRuntimeStore
+      .getState()
+      .actions.reconcileCompletedTurn(CID, CID, clientMessageId)
+    await vi.advanceTimersByTimeAsync(100)
+
+    expect(mockGet).toHaveBeenCalledTimes(1)
+    expect(session()?.localTurns).toEqual([])
+    expect(session()?.detail).toBe(persisted)
+  })
+
+  it("never replaces a promoted reply with an incompletely flushed transcript", async () => {
+    vi.useFakeTimers()
+    const stale = detail([userTurn("u", "prompt")])
+    const promotedReply = assistantTurn("live-a", "complete stream reply")
+    seed({
+      detail: stale,
+      localTurns: [userTurn("optimistic-1", "prompt"), promotedReply],
+      historyAssistantBaseline: 0,
+      lastTurnOwned: true,
+    })
+    mockGet.mockResolvedValue(stale)
+
+    useConversationRuntimeStore
+      .getState()
+      .actions.reconcileCompletedTurn(CID, CID, "optimistic-1")
+    await vi.advanceTimersByTimeAsync(20_000)
+
+    expect(session()?.localTurns).toContainEqual(promotedReply)
+    expect(session()?.detail).toBe(stale)
+  })
+
+  it("does not erase an unaccepted optimistic prompt by mistaking the previous reply for its final", async () => {
+    vi.useFakeTimers()
+    const oldDetail = detail([
+      userTurn("old-u", "old prompt"),
+      assistantTurn("old-a", "old reply"),
+    ])
+    const failedPrompt = userTurn("optimistic-failed", "image prompt")
+    seed({
+      detail: oldDetail,
+      optimisticTurns: [failedPrompt],
+      activeTurnToken: failedPrompt.id,
+      syncState: "idle",
+      historyAssistantBaseline: 1,
+    })
+    mockGet.mockResolvedValue(oldDetail)
+
+    useConversationRuntimeStore
+      .getState()
+      .actions.reconcileCompletedTurn(CID, CID, failedPrompt.id)
+    await vi.advanceTimersByTimeAsync(20_000)
+
+    expect(session()?.optimisticTurns).toContainEqual(failedPrompt)
+    expect(session()?.detail).toBe(oldDetail)
+  })
+
+  it("stops an older reconciliation when a queued follow-up starts", async () => {
+    vi.useFakeTimers()
+    seed({
+      detail: detail([userTurn("u", "first")]),
+      localTurns: [assistantTurn("a", "first reply")],
+      syncState: "awaiting_persist",
+    })
+
+    useConversationRuntimeStore
+      .getState()
+      .actions.reconcileCompletedTurn(CID, CID, "optimistic-first")
+    await vi.advanceTimersByTimeAsync(100)
+
+    expect(mockGet).not.toHaveBeenCalled()
+  })
+})
+
 describe("syncViewerDetail — pure viewer refetch", () => {
   it("lands a completed reply on the first fetch and does not schedule a retry", async () => {
     vi.useFakeTimers()
@@ -263,7 +493,9 @@ describe("syncViewerDetail — pure viewer refetch", () => {
     await vi.advanceTimersByTimeAsync(0)
 
     expect(mockGet).toHaveBeenCalledTimes(1)
-    expect(mockGet).toHaveBeenCalledWith(CID, { tailTurns: 120 })
+    expect(mockGet).toHaveBeenCalledWith(CID, {
+      userTurnLimit: HISTORY_PAGE_USER_TURNS,
+    })
     const turns = session()?.detail?.turns ?? []
     expect(turns.map((t) => t.role)).toEqual(["user", "assistant"])
     // The persisted load replaces the synthesized optimistic prompt.
@@ -395,7 +627,9 @@ describe("syncViewerDetail — pure viewer refetch", () => {
 
     useConversationRuntimeStore.getState().actions.syncViewerDetail(-7)
     await vi.advanceTimersByTimeAsync(0)
-    expect(mockGet).toHaveBeenCalledWith(500, { tailTurns: 120 })
+    expect(mockGet).toHaveBeenCalledWith(500, {
+      userTurnLimit: HISTORY_PAGE_USER_TURNS,
+    })
   })
 
   it("routes a positive-id nudge to a draft tab keyed by a negative runtime id", async () => {
@@ -425,7 +659,9 @@ describe("syncViewerDetail — pure viewer refetch", () => {
     useConversationRuntimeStore.getState().actions.syncViewerDetail(CID)
     await vi.advanceTimersByTimeAsync(0)
 
-    expect(mockGet).toHaveBeenCalledWith(CID, { tailTurns: 120 })
+    expect(mockGet).toHaveBeenCalledWith(CID, {
+      userTurnLimit: HISTORY_PAGE_USER_TURNS,
+    })
     const turns =
       useConversationRuntimeStore.getState().byConversationId.get(-7)?.detail
         ?.turns ?? []

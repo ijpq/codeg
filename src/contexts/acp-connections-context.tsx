@@ -18,10 +18,14 @@ import type {
 } from "@/lib/transport/types"
 import { randomUUID } from "@/lib/utils"
 import { inferLiveToolName } from "@/lib/tool-call-normalization"
+import { isTurnInProgressRejection } from "@/lib/turn-busy"
+import { extractAppCommandError } from "@/lib/app-error"
 import {
   acpConnect,
+  acpRestoreConversation,
   acpGetAgentStatus,
   acpPrompt,
+  acpSteer,
   acpSetMode,
   acpSetConfigOption,
   acpGoalControl,
@@ -40,6 +44,8 @@ import {
   isConnectionBusy,
   isConnectionGoneError,
 } from "@/lib/connection-teardown"
+import { SessionRestorePendingError } from "@/lib/session-restore"
+import { ConversationRestoreSingleFlight } from "@/lib/conversation-restore-single-flight"
 import {
   getConversationIdByExternalIdFromStore,
   useConversationRuntimeStore,
@@ -66,6 +72,7 @@ import type {
   SessionUsageUpdateInfo,
   PromptCapabilitiesInfo,
   PromptInputBlock,
+  SteerResult,
   ToolCallImageWire,
   UserMessageBlock,
 } from "@/lib/types"
@@ -187,13 +194,30 @@ export interface LiveMessage {
 export interface ConnectionState {
   connectionId: string
   contextKey: string
+  /** Persisted conversation currently bound by the backend. */
+  conversationId: number | null
   agentType: AgentType
   workingDir: string | null
   status: ConnectionStatus
   promptCapabilities: PromptCapabilitiesInfo
   supportsFork: boolean
+  /** Capability published by the concrete adapter connection. */
+  supportsSteer: boolean
+  /** Distinguishes an explicit false from the pre-handshake default, so a
+   * stale snapshot cannot resurrect steer after method-not-found. */
+  steerCapabilityKnown: boolean
   selectorsReady: boolean
+  /**
+   * True only after this concrete connection's initial snapshot/replay (or the
+   * legacy snapshot handoff) has completed. Reset for every WS re-attach so a
+   * stale `connected` state cannot submit against a half-restored session.
+   */
+  promptReady: boolean
   sessionId: string | null
+  /** Built-in Codeg MCP was configured on this concrete ACP session. */
+  codegMcpAvailable: boolean
+  /** Total MCP servers configured on this connection; diagnostic only. */
+  mcpServerCount: number
   modes: SessionModeStateInfo | null
   configOptions: SessionConfigOptionInfo[] | null
   availableCommands: AvailableCommandInfo[] | null
@@ -204,6 +228,8 @@ export interface ConnectionState {
    *  event or a snapshot's `pending_user_message`. A VIEWER mirrors this into
    *  the runtime as a synthesized user turn; `null` outside an active turn. */
   pendingUserMessage: PendingUserMessage | null
+  /** Native guide messages accepted into the current in-flight turn. */
+  steerMessages: PendingUserMessage[]
   pendingQuestion: PendingQuestion | null
   /** Awaiting-answer multiple-choice `ask_user_question` (the codeg-mcp blocking
    *  tool). Set from a `question_request` event or a snapshot's
@@ -333,10 +359,10 @@ type ConnectRequest = {
   agentType: AgentType
   workingDir?: string
   sessionId?: string
-  // Persisted conversation id (when known) — drives the cross-client viewer
-  // discovery gate in connect(). Not part of `sameConnectRequest` equality
-  // (sessionId already distinguishes), but carried so a re-fired pending
-  // request still runs discovery.
+  // Persisted conversation id (when known) — drives the backend-owned atomic
+  // restore path and must be part of request identity. The same external id is
+  // only unique per agent and must never make two DB conversations share a tab
+  // binding accidentally.
   conversationId?: number
 }
 
@@ -344,7 +370,8 @@ function sameConnectRequest(a: ConnectRequest, b: ConnectRequest) {
   return (
     a.agentType === b.agentType &&
     (a.workingDir ?? null) === (b.workingDir ?? null) &&
-    (a.sessionId ?? null) === (b.sessionId ?? null)
+    (a.sessionId ?? null) === (b.sessionId ?? null) &&
+    (a.conversationId ?? null) === (b.conversationId ?? null)
   )
 }
 
@@ -357,14 +384,27 @@ type Action =
       connectionId: string
       agentType: AgentType
       workingDir: string | null
+      conversationId?: number | null
+      codegMcpAvailable?: boolean
+      mcpServerCount?: number
       // Set when attaching to a connection another client owns (viewer).
       // Defaults to false (owner) when omitted.
       isViewer?: boolean
     }
   | {
+      type: "CONVERSATION_LINKED"
+      contextKey: string
+      conversationId: number
+    }
+  | {
       type: "HYDRATE_FROM_SNAPSHOT"
       contextKey: string
       patch: import("@/lib/snapshot-denormalize").SnapshotPatch
+    }
+  | {
+      type: "PROMPT_READINESS_CHANGED"
+      contextKey: string
+      ready: boolean
     }
   | { type: "CONNECTION_REMOVED"; contextKey: string }
   | { type: "REMOVE_ALL" }
@@ -563,6 +603,16 @@ type Action =
       type: "FORK_SUPPORTED"
       contextKey: string
       supported: boolean
+    }
+  | {
+      type: "STEER_SUPPORTED"
+      contextKey: string
+      supported: boolean
+    }
+  | {
+      type: "STEER_MESSAGE"
+      contextKey: string
+      message: PendingUserMessage
     }
   | { type: "MODE_CHANGED"; contextKey: string; modeId: string }
   | {
@@ -1278,6 +1328,7 @@ function connectionsReducer(
       next.set(action.contextKey, {
         connectionId: action.connectionId,
         contextKey: action.contextKey,
+        conversationId: action.conversationId ?? null,
         agentType: action.agentType,
         workingDir: action.workingDir,
         status: "connecting",
@@ -1287,8 +1338,13 @@ function connectionsReducer(
           embedded_context: false,
         },
         supportsFork: false,
+        supportsSteer: false,
+        steerCapabilityKnown: false,
         selectorsReady: false,
+        promptReady: false,
         sessionId: null,
+        codegMcpAvailable: action.codegMcpAvailable ?? false,
+        mcpServerCount: action.mcpServerCount ?? 0,
         modes: null,
         configOptions: null,
         availableCommands: null,
@@ -1296,6 +1352,7 @@ function connectionsReducer(
         liveMessage: null,
         pendingPermission: null,
         pendingUserMessage: null,
+        steerMessages: [],
         pendingQuestion: null,
         pendingAskQuestion: null,
         pendingPlanApproval: null,
@@ -1317,6 +1374,18 @@ function connectionsReducer(
       })
       return next
     }
+    case "CONVERSATION_LINKED": {
+      const current = state.get(action.contextKey)
+      if (!current || current.conversationId === action.conversationId) {
+        return state
+      }
+      const next = new Map(state)
+      next.set(action.contextKey, {
+        ...current,
+        conversationId: action.conversationId,
+      })
+      return next
+    }
 
     case "DELEGATION_CHILD_ATTACH": {
       // Idempotent: if an entry already exists for this key with the
@@ -1333,6 +1402,7 @@ function connectionsReducer(
       next.set(action.contextKey, {
         connectionId: action.connectionId,
         contextKey: action.contextKey,
+        conversationId: null,
         agentType: action.agentType,
         workingDir: null,
         // The child is already alive in the backend by the time
@@ -1345,8 +1415,13 @@ function connectionsReducer(
           embedded_context: false,
         },
         supportsFork: false,
+        supportsSteer: false,
+        steerCapabilityKnown: false,
         selectorsReady: true,
+        promptReady: true,
         sessionId: null,
+        codegMcpAvailable: false,
+        mcpServerCount: 0,
         modes: null,
         configOptions: null,
         availableCommands: null,
@@ -1354,6 +1429,7 @@ function connectionsReducer(
         liveMessage: null,
         pendingPermission: null,
         pendingUserMessage: null,
+        steerMessages: [],
         pendingQuestion: null,
         pendingAskQuestion: null,
         pendingPlanApproval: null,
@@ -1409,6 +1485,10 @@ function connectionsReducer(
         action.patch.selectorsReady || current.selectorsReady
       const mergedSupportsFork =
         action.patch.supportsFork || current.supportsFork
+      const mergedSupportsSteer = current.steerCapabilityKnown
+        ? current.supportsSteer
+        : action.patch.supportsSteer
+      const mergedSteerCapabilityKnown = true
       const mergedModes = current.modes ?? action.patch.modes
       const mergedConfigOptions =
         current.configOptions ?? action.patch.configOptions
@@ -1416,6 +1496,14 @@ function connectionsReducer(
         current.availableCommands ?? action.patch.availableCommands
       const mergedPromptCapabilities =
         action.patch.promptCapabilities ?? current.promptCapabilities
+      const mergedConversationId =
+        current.conversationId ?? action.patch.conversationId
+      const mergedCodegMcpAvailable =
+        current.codegMcpAvailable || action.patch.codegMcpAvailable
+      const mergedMcpServerCount = Math.max(
+        current.mcpServerCount,
+        action.patch.mcpServerCount
+      )
 
       // Race guard: the snapshot may have been generated BEFORE events
       // that have since arrived and been applied to in-memory state.
@@ -1440,11 +1528,17 @@ function connectionsReducer(
         if (
           mergedSelectorsReady === current.selectorsReady &&
           mergedSupportsFork === current.supportsFork &&
+          mergedSupportsSteer === current.supportsSteer &&
+          mergedSteerCapabilityKnown === current.steerCapabilityKnown &&
           mergedModes === current.modes &&
           mergedConfigOptions === current.configOptions &&
           mergedAvailableCommands === current.availableCommands &&
           mergedPromptCapabilities === current.promptCapabilities &&
-          mergedSessionFailures === current.sessionFailures
+          mergedSessionFailures === current.sessionFailures &&
+          mergedConversationId === current.conversationId &&
+          mergedCodegMcpAvailable === current.codegMcpAvailable &&
+          mergedMcpServerCount === current.mcpServerCount &&
+          current.promptReady
         ) {
           return state
         }
@@ -1455,9 +1549,15 @@ function connectionsReducer(
           configOptions: mergedConfigOptions,
           availableCommands: mergedAvailableCommands,
           promptCapabilities: mergedPromptCapabilities,
+          conversationId: mergedConversationId,
+          codegMcpAvailable: mergedCodegMcpAvailable,
+          mcpServerCount: mergedMcpServerCount,
           selectorsReady: mergedSelectorsReady,
+          promptReady: true,
           supportsFork: mergedSupportsFork,
           sessionFailures: mergedSessionFailures,
+          supportsSteer: mergedSupportsSteer,
+          steerCapabilityKnown: mergedSteerCapabilityKnown,
         })
         return next
       }
@@ -1471,7 +1571,10 @@ function connectionsReducer(
       next.set(action.contextKey, {
         ...current,
         status: action.patch.status,
+        conversationId: action.patch.conversationId,
         sessionId: action.patch.sessionId,
+        codegMcpAvailable: action.patch.codegMcpAvailable,
+        mcpServerCount: action.patch.mcpServerCount,
         modes: action.patch.modes,
         configOptions: action.patch.configOptions,
         availableCommands: action.patch.availableCommands,
@@ -1481,9 +1584,13 @@ function connectionsReducer(
         pendingAskQuestion: action.patch.pendingAskQuestion,
         pendingPlanApproval: action.patch.pendingPlanApproval,
         pendingUserMessage: action.patch.pendingUserMessage,
+        steerMessages: action.patch.steerMessages,
         promptCapabilities: mergedPromptCapabilities,
         selectorsReady: mergedSelectorsReady,
+        promptReady: true,
         supportsFork: mergedSupportsFork,
+        supportsSteer: action.patch.supportsSteer,
+        steerCapabilityKnown: true,
         // Staleness is a current-state field (like status): apply the snapshot's
         // value on the fresh path. `configStaleDismissed` is client-local and
         // preserved via `...current`.
@@ -1497,6 +1604,14 @@ function connectionsReducer(
         error: action.patch.lastError,
         lastAppliedSeq: action.patch.eventSeq,
       })
+      return next
+    }
+
+    case "PROMPT_READINESS_CHANGED": {
+      const current = state.get(action.contextKey)
+      if (!current || current.promptReady === action.ready) return state
+      const next = new Map(state)
+      next.set(action.contextKey, { ...current, promptReady: action.ready })
       return next
     }
 
@@ -1555,6 +1670,7 @@ function connectionsReducer(
           conn.sessionFailures,
           "all"
         )
+        updated.steerMessages = []
         // The out-of-turn window ended: its tool-call contexts (kept only for
         // background permission enrichment) are stale for the new turn.
         updated.outOfTurnToolCalls = null
@@ -1574,6 +1690,7 @@ function connectionsReducer(
         // Likewise a blocked exit_plan_mode approval — cleared via
         // `plan_approval_resolved` normally; this is the turn-end safety net.
         updated.pendingPlanApproval = null
+        updated.steerMessages = []
       }
       next.set(action.contextKey, updated)
       return next
@@ -2151,6 +2268,11 @@ function connectionsReducer(
       next.set(action.contextKey, {
         ...conn,
         sessionId: action.sessionId,
+        // A native session/fork keeps the same ACP process/connection. Do not
+        // carry the source session's readiness latch across the session-id
+        // transition; the new session publishes its own selectors_ready.
+        selectorsReady:
+          conn.sessionId === action.sessionId ? conn.selectorsReady : false,
       })
       return next
     }
@@ -2254,6 +2376,42 @@ function connectionsReducer(
       next.set(action.contextKey, {
         ...conn,
         supportsFork: action.supported,
+      })
+      return next
+    }
+
+    case "STEER_SUPPORTED": {
+      const conn = state.get(action.contextKey)
+      if (!conn) return state
+      if (
+        conn.supportsSteer === action.supported &&
+        conn.steerCapabilityKnown
+      ) {
+        return state
+      }
+      const next = new Map(state)
+      next.set(action.contextKey, {
+        ...conn,
+        supportsSteer: action.supported,
+        steerCapabilityKnown: true,
+      })
+      return next
+    }
+
+    case "STEER_MESSAGE": {
+      const conn = state.get(action.contextKey)
+      if (!conn) return state
+      if (
+        conn.steerMessages.some(
+          (message) => message.messageId === action.message.messageId
+        )
+      ) {
+        return state
+      }
+      const next = new Map(state)
+      next.set(action.contextKey, {
+        ...conn,
+        steerMessages: [...conn.steerMessages, action.message],
       })
       return next
     }
@@ -2553,6 +2711,11 @@ export interface AcpActionsValue {
       clientMessageId?: string | null
     }
   ): Promise<void>
+  steer(
+    contextKey: string,
+    blocks: PromptInputBlock[],
+    clientMessageId: string
+  ): Promise<SteerResult>
   setMode(contextKey: string, modeId: string): Promise<void>
   setConfigOption(
     contextKey: string,
@@ -2765,6 +2928,25 @@ function normalizeErrorMessage(error: unknown): string {
   return String(error)
 }
 
+/** A deterministic pre-accept failure: unlike a timeout/network loss, these
+ * errors guarantee that this concrete ACP connection cannot receive the
+ * prompt, so restoring and retrying the same client id cannot duplicate it. */
+export function isRecoverablePromptConnectionLoss(error: unknown): boolean {
+  const code = extractAppCommandError(error)?.code
+  if (code === "connection_not_found" || code === "process_exited") {
+    return true
+  }
+  const message =
+    error instanceof Error
+      ? error.message
+      : typeof error === "string"
+        ? error
+        : ""
+  return /^(connection not found:|agent process exited unexpectedly)/i.test(
+    message.trim()
+  )
+}
+
 type AlertedError = Error & { alerted: true }
 
 function createAlertedError(message: string): AlertedError {
@@ -2836,6 +3018,11 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
 
   // Guard against concurrent connect() calls
   const connectingKeysRef = useRef(new Set<string>())
+  const restoreFlightsRef = useRef(
+    new ConversationRestoreSingleFlight<
+      Awaited<ReturnType<typeof acpRestoreConversation>>
+    >()
+  )
   const pendingConnectRequestsRef = useRef(new Map<string, ConnectRequest>())
   // Last params `connect()` was called with, per contextKey — kept AFTER the
   // connection is gone (teardown removes the store entry entirely, so a
@@ -2848,6 +3035,16 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   // at all, so the request as issued would reconnect into a FRESH session and
   // silently abandon the conversation's history.
   const lastConnectParamsRef = useRef(new Map<string, ConnectRequest>())
+  // Latest target for every open context. Event-stream `connection_gone`
+  // uses this to rebuild the same persisted session after a Server restart.
+  const desiredConnectRequestsRef = useRef(new Map<string, ConnectRequest>())
+  // Request that produced the currently registered frontend connection. This
+  // makes repeat effects idempotent even before the attach snapshot arrives.
+  const boundConnectRequestsRef = useRef(new Map<string, ConnectRequest>())
+  // A legacy no-MCP connection may still be finishing a turn when an existing
+  // conversation is reopened. Preserve it until TurnComplete, then retry the
+  // atomic restore exactly once instead of interrupting the active turn.
+  const deferredRestoreKeysRef = useRef(new Set<string>())
   // Keys whose disconnect was requested while connect was still in flight
   const abandonedKeysRef = useRef(new Set<string>())
   // Resolvers waiting for an in-flight connect() on a key to settle. Only a
@@ -3636,6 +3833,15 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           break
         case "session_started":
           flushStreamingQueue()
+          {
+            const desired = desiredConnectRequestsRef.current.get(contextKey)
+            if (desired && desired.sessionId !== e.session_id) {
+              desiredConnectRequestsRef.current.set(contextKey, {
+                ...desired,
+                sessionId: e.session_id,
+              })
+            }
+          }
           dispatch({
             type: "SESSION_STARTED",
             contextKey,
@@ -3647,11 +3853,24 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           rememberResolvedIdentity(contextKey, { sessionId: e.session_id })
           break
         case "conversation_linked":
-          // Backend just bound (or reaffirmed) the connection's DB conversation
-          // row. Phase 3a frontend pre-creates rows for new-tab sends so this
-          // event is mostly a confirmation; we log it for visibility. Phase 3b
-          // will use this to drive UI mapping when the frontend stops creating
-          // rows itself.
+          // Keep the tab's routing identity synchronized with the backend even
+          // for a draft that became persisted on its first prompt. Restored
+          // conversations receive the same id in the atomic RPC response; this
+          // event is an idempotent confirmation in that path.
+          dispatch({
+            type: "CONVERSATION_LINKED",
+            contextKey,
+            conversationId: e.conversation_id,
+          })
+          {
+            const desired = desiredConnectRequestsRef.current.get(contextKey)
+            if (desired && desired.conversationId !== e.conversation_id) {
+              desiredConnectRequestsRef.current.set(contextKey, {
+                ...desired,
+                conversationId: e.conversation_id,
+              })
+            }
+          }
           console.log("[acp-context] conversation_linked", {
             contextKey,
             connectionId: e.connection_id,
@@ -3759,6 +3978,25 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             type: "FORK_SUPPORTED",
             contextKey,
             supported: e.supported,
+          })
+          break
+        case "steer_supported":
+          flushStreamingQueue()
+          dispatch({
+            type: "STEER_SUPPORTED",
+            contextKey,
+            supported: e.supported,
+          })
+          break
+        case "steer_message":
+          flushStreamingQueue()
+          dispatch({
+            type: "STEER_MESSAGE",
+            contextKey,
+            message: {
+              messageId: e.message_id,
+              blocks: e.blocks,
+            },
           })
           break
         case "mode_changed":
@@ -3877,6 +4115,35 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
                 title,
                 t("notificationTurnComplete", { agent: agentLabel })
               ).catch(() => {})
+            }
+          }
+          if (deferredRestoreKeysRef.current.delete(contextKey)) {
+            const desired = desiredConnectRequestsRef.current.get(contextKey)
+            if (desired) {
+              console.info(
+                "[acp-context] active turn completed; retrying deferred restore",
+                {
+                  conversationId: desired.conversationId ?? null,
+                  externalSessionId: desired.sessionId ?? null,
+                  oldConnectionId: turnConn?.connectionId ?? null,
+                }
+              )
+              queueMicrotask(() => {
+                connectRef
+                  .current?.(
+                    contextKey,
+                    desired.agentType,
+                    desired.workingDir,
+                    desired.sessionId,
+                    desired.conversationId
+                  )
+                  .catch((error: unknown) => {
+                    console.error(
+                      "[acp-context] deferred conversation restore failed",
+                      error
+                    )
+                  })
+              })
             }
           }
           break
@@ -4214,6 +4481,13 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
 
       let activeSub: EventStreamSubscription | null = null
       const handlers: AttachHandlers = {
+        onAttaching: () => {
+          dispatch({
+            type: "PROMPT_READINESS_CHANGED",
+            contextKey,
+            ready: false,
+          })
+        },
         onSnapshot: (snapshot) => {
           const patch = denormalizeSnapshot(snapshot)
           dispatch({ type: "HYDRATE_FROM_SNAPSHOT", contextKey, patch })
@@ -4239,6 +4513,11 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
               applyMappedEnvelope(contextKey, envelope)
             }
           })
+          dispatch({
+            type: "PROMPT_READINESS_CHANGED",
+            contextKey,
+            ready: true,
+          })
         },
         onEvent: (envelope) => {
           applyMappedEnvelope(contextKey, envelope)
@@ -4261,13 +4540,41 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             return
           }
           // connection_gone: backend GC'd the connection. Mirror to UI
-          // so the user sees the conversation tab go away rather than
-          // staring at stale state forever.
+          // and, for a still-open tab, rebuild it from the same authoritative
+          // conversation/session request. This is the Server-restart path:
+          // re-attaching the old id correctly returns connection_gone, then the
+          // atomic restore creates a new ACP + codeg-mcp process exactly once.
           attachSubscriptionsRef.current.delete(contextKey)
           // The composer that survives this is exactly the one whose Reconnect
           // button has to resume the session rather than start a new one.
           captureIdentityBeforeRemoval(contextKey)
+          boundConnectRequestsRef.current.delete(contextKey)
+          deferredRestoreKeysRef.current.delete(contextKey)
           dispatch({ type: "CONNECTION_REMOVED", contextKey })
+          const desired = desiredConnectRequestsRef.current.get(contextKey)
+          if (desired && openTabKeysRef.current.has(contextKey)) {
+            console.info("[acp-context] connection gone; restoring open tab", {
+              conversationId: desired.conversationId ?? null,
+              externalSessionId: desired.sessionId ?? null,
+              oldConnectionId: connectionId,
+            })
+            queueMicrotask(() => {
+              const reconnect = connectRef.current
+              if (!reconnect) return
+              reconnect(
+                contextKey,
+                desired.agentType,
+                desired.workingDir,
+                desired.sessionId,
+                desired.conversationId
+              ).catch((error: unknown) => {
+                console.error(
+                  "[acp-context] connection-gone restore failed",
+                  error
+                )
+              })
+            })
+          }
         },
       }
 
@@ -4395,14 +4702,13 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   }, [bufferUnmappedEvent, dispatch, resolveListenerReadyWaiters])
 
   // ── Backend keepalive timer ──
-  // Frontend is the only side that knows which conversation tabs the
-  // user has open. Without this, the backend's idle sweep
-  // (CODEG_ACP_IDLE_TIMEOUT_SECS, default 180s) would reap connections
-  // backing visible tabs whenever the user was just reading without
-  // sending — forcing them to re-spawn the agent on next message.
-  // Touching only bumps last_activity_at; it does not emit any event.
+  // The WS attach receiver is the primary server-observed lease for web tabs;
+  // this touch loop remains a fallback for IPC/legacy transports and short
+  // reconnect windows. Touching only bumps last_activity_at; it emits no event.
+  // Run once immediately after wake/online as browser intervals may have been
+  // suspended for minutes while the page was backgrounded.
   useEffect(() => {
-    const timer = setInterval(() => {
+    const touchOpenConnections = () => {
       const currentActiveKey = storeRef.current.activeKey
       const currentOpenTabKeys = openTabKeysRef.current
       const seen = new Set<string>()
@@ -4423,9 +4729,23 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       for (const connectionId of toTouch) {
         acpTouchConnection(connectionId).catch(() => {})
       }
-    }, CONNECTION_KEEPALIVE_INTERVAL_MS)
+    }
 
-    return () => clearInterval(timer)
+    const onVisible = () => {
+      if (document.visibilityState === "visible") touchOpenConnections()
+    }
+    const timer = setInterval(
+      touchOpenConnections,
+      CONNECTION_KEEPALIVE_INTERVAL_MS
+    )
+    window.addEventListener("online", touchOpenConnections)
+    document.addEventListener("visibilitychange", onVisible)
+
+    return () => {
+      clearInterval(timer)
+      window.removeEventListener("online", touchOpenConnections)
+      document.removeEventListener("visibilitychange", onVisible)
+    }
   }, [])
 
   // ── Idle sweep timer ──
@@ -4486,6 +4806,9 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         // Reclaimed for idleness, not closed: the tab is still open and its
         // Reconnect button must resume this session, not start a new one.
         captureIdentityBeforeRemoval(contextKey)
+        desiredConnectRequestsRef.current.delete(contextKey)
+        boundConnectRequestsRef.current.delete(contextKey)
+        deferredRestoreKeysRef.current.delete(contextKey)
         dispatch({ type: "CONNECTION_REMOVED", contextKey })
       }
     }, IDLE_SWEEP_INTERVAL_MS)
@@ -4562,7 +4885,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       contextKey: string,
       connectionId: string,
       agentType: AgentType,
-      workingDir: string | null
+      workingDir: string | null,
+      conversationId?: number
     ) => {
       dispatch({
         type: "CONNECTION_CREATED",
@@ -4570,6 +4894,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         connectionId,
         agentType,
         workingDir,
+        conversationId: conversationId ?? null,
         isViewer: true,
       })
       lastActivityRef.current.set(contextKey, Date.now())
@@ -4623,6 +4948,11 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       for (const env of consumeBufferedEvents(connectionId)) {
         applyMappedEnvelope(contextKey, env)
       }
+      dispatch({
+        type: "PROMPT_READINESS_CHANGED",
+        contextKey,
+        ready: true,
+      })
     },
     [
       applyMappedEnvelope,
@@ -4651,6 +4981,9 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       // throw: a connect that never produced a store entry is precisely when
       // `reconnect()` has nothing else to go on.
       lastConnectParamsRef.current.set(contextKey, request)
+      const shouldRestorePersisted =
+        agentType === "codex" && conversationId != null && conversationId > 0
+      desiredConnectRequestsRef.current.set(contextKey, request)
       if (connectingKeysRef.current.has(contextKey)) {
         pendingConnectRequestsRef.current.set(contextKey, request)
         return
@@ -4707,30 +5040,21 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
 
         const nextWorkingDir = workingDir ?? null
         const existing = storeRef.current.connections.get(contextKey)
-        if (existing) {
-          if (
-            existing.agentType === agentType &&
-            existing.workingDir === nextWorkingDir &&
-            existing.status !== "disconnected" &&
-            existing.status !== "error"
-          ) {
-            return
-          }
-          if (
-            existing.status !== "disconnected" &&
-            existing.status !== "error"
-          ) {
-            // A viewer doesn't own the backend connection — detach only, never
-            // acpDisconnect (that would kill the owner's agent). Owners are
-            // disconnected normally before re-spawning under new params.
-            if (!existing.isViewer) {
-              await acpDisconnect(existing.connectionId).catch(() => {})
-            }
-            reverseMapRef.current.delete(existing.connectionId)
-            teardownAttachSubscription(contextKey)
-            lastActivityRef.current.delete(contextKey)
-            pendingUnmappedEventsRef.current.delete(existing.connectionId)
-          }
+        const boundRequest = boundConnectRequestsRef.current.get(contextKey)
+        const requiresHistoricalCodegMcp =
+          agentType === "codex" &&
+          conversationId != null &&
+          conversationId > 0 &&
+          Boolean(sessionId)
+        if (
+          existing &&
+          boundRequest &&
+          sameConnectRequest(boundRequest, request) &&
+          existing.status !== "disconnected" &&
+          existing.status !== "error" &&
+          (!requiresHistoricalCodegMcp || existing.codegMcpAvailable)
+        ) {
+          return
         }
 
         // Orphan rescue: when no entry exists at this contextKey but an
@@ -4751,6 +5075,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
               conn.sessionId === sessionId &&
               conn.agentType === agentType &&
               conn.workingDir === nextWorkingDir &&
+              (agentType !== "codex" || conn.codegMcpAvailable) &&
               conn.status !== "disconnected" &&
               conn.status !== "error"
             ) {
@@ -4781,6 +5106,13 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
               fromKey: orphanKey,
               toKey: contextKey,
             })
+            const orphanBound = boundConnectRequestsRef.current.get(orphanKey)
+            boundConnectRequestsRef.current.delete(orphanKey)
+            boundConnectRequestsRef.current.set(
+              contextKey,
+              orphanBound ?? request
+            )
+            desiredConnectRequestsRef.current.delete(orphanKey)
             setupAttachSubscription(
               contextKey,
               orphanConn.connectionId,
@@ -4797,7 +5129,11 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         // streaming). Only for real persisted conversations (id > 0) — a
         // brand-new conversation has no live owner yet, so we spawn + own.
         // Best-effort: a discovery failure falls through to the owner spawn.
-        if (conversationId != null && conversationId > 0) {
+        if (
+          conversationId != null &&
+          conversationId > 0 &&
+          !shouldRestorePersisted
+        ) {
           let discovered: ConversationConnectionInfo | null = null
           try {
             // Pass sessionId so discovery can fall back to external_id when the
@@ -4841,8 +5177,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
               contextKey,
               discovered.connection_id,
               agentType,
-              nextWorkingDir
+              nextWorkingDir,
+              conversationId
             )
+            boundConnectRequestsRef.current.set(contextKey, request)
             return
           }
         }
@@ -4866,13 +5204,83 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         // re-open (the snapshot frame doesn't carry a `session_modes` event,
         // so the apply-on-event hook never fired).
         const savedPrefs = getSavedPrefsForConnect(agentType)
-        const connectionId = await acpConnect(
-          agentType,
-          workingDir,
-          sessionId,
-          savedPrefs.modeId,
-          savedPrefs.configValues
-        )
+        let connectionId = ""
+        let isViewer = false
+        let restoredConversationId: number | null = null
+        let restoredCodegMcpAvailable = false
+        let restoredMcpServerCount = 0
+        let backendReplacedConnectionIds: string[] = []
+
+        if (shouldRestorePersisted && conversationId != null) {
+          let restored: Awaited<
+            ReturnType<typeof acpRestoreConversation>
+          > | null = null
+          try {
+            restored = await restoreFlightsRef.current.run(conversationId, () =>
+              acpRestoreConversation(
+                conversationId,
+                savedPrefs.modeId,
+                savedPrefs.configValues
+              )
+            )
+          } catch (error) {
+            // A persisted but never-used ordinary conversation has no session
+            // to restore. Preserve its historical session/new path; provisional
+            // branches are handled by the same backend call above and do not
+            // reach this fallback.
+            if (
+              !sessionId &&
+              normalizeErrorMessage(error).includes("has no external session")
+            ) {
+              connectionId = await acpConnect(
+                agentType,
+                workingDir,
+                undefined,
+                savedPrefs.modeId,
+                savedPrefs.configValues
+              )
+            } else {
+              throw error
+            }
+          }
+          if (!restored) {
+            // Ordinary empty-conversation fallback already assigned the fresh
+            // unbound connection; its first prompt performs the normal link.
+          } else if (
+            sessionId &&
+            restored.externalSessionId !== sessionId &&
+            restored.durableSession !== false
+          ) {
+            throw new Error(
+              `Restored session mismatch: expected ${sessionId}, got ${restored.externalSessionId}`
+            )
+          } else {
+            connectionId = restored.connectionId
+            restoredConversationId = conversationId
+            restoredCodegMcpAvailable = restored.codegMcpAvailable
+            restoredMcpServerCount = restored.mcpServerCount
+            backendReplacedConnectionIds = restored.replacedConnectionIds
+            isViewer =
+              restored.reusedExisting && !isConnectionOwnedLocally(connectionId)
+            if (restored.durableSession === false) {
+              request.sessionId = restored.externalSessionId
+              desiredConnectRequestsRef.current.set(contextKey, request)
+            }
+          }
+        } else {
+          connectionId = await acpConnect(
+            agentType,
+            workingDir,
+            sessionId,
+            savedPrefs.modeId,
+            savedPrefs.configValues
+          )
+        }
+        if (!connectionId) {
+          throw new Error(
+            "ACP connection initialization returned no connection id"
+          )
+        }
 
         // If disconnect was requested while connect was in flight, tear down
         // immediately instead of registering the connection — but tear down
@@ -4883,26 +5291,63 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         // would end a turn nobody asked to stop; it stays reachable at its own
         // key and is reclaimed by the sweeps.
         if (abandonedKeysRef.current.delete(contextKey)) {
-          if (!isConnectionOwnedLocally(connectionId)) {
+          if (
+            restoredConversationId == null &&
+            !isViewer &&
+            !isConnectionOwnedLocally(connectionId)
+          ) {
             acpDisconnect(connectionId).catch(() => {})
           }
           return
         }
         const pendingRequest = pendingConnectRequestsRef.current.get(contextKey)
         if (pendingRequest && !sameConnectRequest(pendingRequest, request)) {
-          if (!isConnectionOwnedLocally(connectionId)) {
+          if (
+            restoredConversationId == null &&
+            !isViewer &&
+            !isConnectionOwnedLocally(connectionId)
+          ) {
             acpDisconnect(connectionId).catch(() => {})
           }
           return
         }
 
+        // Preserve the previous frontend/backend binding until the replacement
+        // is fully restored. Only now tear down its local routing. The backend
+        // atomic restore may already have removed an old connection for this
+        // conversation; avoid a redundant disconnect in that case.
+        const currentExisting = storeRef.current.connections.get(contextKey)
+        if (currentExisting && currentExisting.connectionId !== connectionId) {
+          if (
+            !currentExisting.isViewer &&
+            !backendReplacedConnectionIds.includes(currentExisting.connectionId)
+          ) {
+            await acpDisconnect(currentExisting.connectionId).catch(() => {})
+          }
+          reverseMapRef.current.delete(currentExisting.connectionId)
+          teardownAttachSubscription(contextKey)
+          lastActivityRef.current.delete(contextKey)
+          pendingUnmappedEventsRef.current.delete(currentExisting.connectionId)
+        } else if (currentExisting?.connectionId === connectionId) {
+          // A concurrent restore reused the connection this context already
+          // owns/views. Do not dispatch CONNECTION_CREATED — that would wipe its
+          // in-flight snapshot state and ownership bit.
+          boundConnectRequestsRef.current.set(contextKey, request)
+          return
+        }
+
         lastActivityRef.current.set(contextKey, Date.now())
+        boundConnectRequestsRef.current.set(contextKey, request)
         dispatch({
           type: "CONNECTION_CREATED",
           contextKey,
           connectionId,
           agentType,
           workingDir: nextWorkingDir,
+          conversationId: restoredConversationId,
+          codegMcpAvailable: restoredCodegMcpAvailable,
+          mcpServerCount: restoredMcpServerCount,
+          isViewer,
         })
 
         // Subscribe-with-Snapshot path. When the active transport supports
@@ -4966,12 +5411,37 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
               applyMappedEnvelope(contextKey, event)
             }
           }
+          dispatch({
+            type: "PROMPT_READINESS_CHANGED",
+            contextKey,
+            ready: true,
+          })
         }
+        deferredRestoreKeysRef.current.delete(contextKey)
       } catch (err) {
         const pendingRequest = pendingConnectRequestsRef.current.get(contextKey)
         const superseded =
           pendingRequest != null && !sameConnectRequest(pendingRequest, request)
-        if (!superseded && !isAlertedError(err)) {
+        const restoreDeferred =
+          !superseded &&
+          shouldRestorePersisted &&
+          isTurnInProgressRejection(err)
+        if (restoreDeferred) {
+          deferredRestoreKeysRef.current.add(contextKey)
+          console.info(
+            "[acp-context] restore deferred until the active turn completes",
+            {
+              conversationId: conversationId ?? null,
+              externalSessionId: sessionId ?? null,
+              oldConnectionId:
+                storeRef.current.connections.get(contextKey)?.connectionId ??
+                null,
+            }
+          )
+        } else {
+          deferredRestoreKeysRef.current.delete(contextKey)
+        }
+        if (!superseded && !restoreDeferred && !isAlertedError(err)) {
           const message = normalizeErrorMessage(err)
           const agentLabel = getAgentLabel(agentType)
           // Backend safety net: if the agent turned out to be not
@@ -5007,7 +5477,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             )
           }
         }
-        if (!superseded) {
+        if (!superseded && !restoreDeferred) {
           throw err
         }
       } finally {
@@ -5058,6 +5528,9 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   const disconnect = useCallback(
     async (contextKey: string): Promise<boolean> => {
       pendingConnectRequestsRef.current.delete(contextKey)
+      desiredConnectRequestsRef.current.delete(contextKey)
+      boundConnectRequestsRef.current.delete(contextKey)
+      deferredRestoreKeysRef.current.delete(contextKey)
       const conn = storeRef.current.connections.get(contextKey)
       if (!conn) {
         // connect() is still in flight — mark as abandoned so it
@@ -5144,13 +5617,14 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       if (!conn || conn.isViewer || conn.isDelegationChild) return false
       // Capture identity BEFORE teardown. `sessionId` is what makes the new
       // process resume this conversation (session/load) rather than start fresh.
-      const { agentType, workingDir, sessionId } = conn
+      const { agentType, workingDir, sessionId, conversationId } = conn
       const tornDown = await disconnect(contextKey)
       await connect(
         contextKey,
         agentType,
         workingDir ?? undefined,
-        sessionId ?? undefined
+        sessionId ?? undefined,
+        conversationId ?? undefined
       )
       // Reconnect regardless — the user is left with a working connection
       // either way — but an unconfirmed teardown means the old process may
@@ -5300,6 +5774,9 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   const disconnectAll = useCallback(async () => {
     const promises: Promise<void>[] = []
     pendingConnectRequestsRef.current.clear()
+    desiredConnectRequestsRef.current.clear()
+    boundConnectRequestsRef.current.clear()
+    deferredRestoreKeysRef.current.clear()
     for (const [contextKey, conn] of storeRef.current.connections) {
       // Viewers attach to a connection another client owns — detach our
       // read-only subscription but never acpDisconnect (that would kill the
@@ -5322,6 +5799,70 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     dispatch({ type: "REMOVE_ALL" })
   }, [dispatch, teardownAttachSubscription])
 
+  const recoverPromptConnection = useCallback(
+    async (contextKey: string, staleConnectionId?: string) => {
+      const desired = desiredConnectRequestsRef.current.get(contextKey)
+      if (!desired) {
+        throw new Error(`No restorable connection target for ${contextKey}`)
+      }
+
+      const before = storeRef.current.connections.get(contextKey)
+      if (
+        staleConnectionId &&
+        before &&
+        before.connectionId !== staleConnectionId
+      ) {
+        return before
+      }
+      if (
+        before &&
+        (!staleConnectionId || before.connectionId === staleConnectionId)
+      ) {
+        reverseMapRef.current.delete(before.connectionId)
+        teardownAttachSubscription(contextKey)
+        pendingUnmappedEventsRef.current.delete(before.connectionId)
+        lastActivityRef.current.delete(contextKey)
+        boundConnectRequestsRef.current.delete(contextKey)
+        deferredRestoreKeysRef.current.delete(contextKey)
+        dispatch({ type: "CONNECTION_REMOVED", contextKey })
+      }
+
+      const reconnect = connectRef.current
+      if (!reconnect) {
+        throw new Error(`Connection recovery is not ready for ${contextKey}`)
+      }
+      await reconnect(
+        contextKey,
+        desired.agentType,
+        desired.workingDir,
+        desired.sessionId,
+        desired.conversationId
+      )
+
+      // `connect()` coalesces concurrent calls. If connection_gone already
+      // started the restore, our call returns early and waits here for that
+      // single authoritative attempt instead of spawning another process.
+      const deadline = Date.now() + 70_000
+      while (
+        connectingKeysRef.current.has(contextKey) &&
+        Date.now() < deadline
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 25))
+      }
+      const recovered = storeRef.current.connections.get(contextKey)
+      if (
+        !recovered ||
+        (staleConnectionId && recovered.connectionId === staleConnectionId)
+      ) {
+        throw new Error(
+          `ACP connection recovery did not complete for ${contextKey}`
+        )
+      }
+      return recovered
+    },
+    [dispatch, teardownAttachSubscription]
+  )
+
   const sendPrompt = useCallback(
     async (
       contextKey: string,
@@ -5332,16 +5873,130 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         clientMessageId?: string | null
       }
     ) => {
-      const conn = storeRef.current.connections.get(contextKey)
-      if (!conn) return
+      let conn = storeRef.current.connections.get(contextKey)
+      if (!conn) {
+        conn = await recoverPromptConnection(contextKey)
+      }
+      const desired = desiredConnectRequestsRef.current.get(contextKey)
+      const requestedConversationId = opts?.conversationId ?? null
+      if (
+        requestedConversationId != null &&
+        conn.conversationId != null &&
+        conn.conversationId !== requestedConversationId
+      ) {
+        console.warn("[acp-context] prompt binding mismatch", {
+          conversationId: requestedConversationId,
+          boundConversationId: conn.conversationId,
+          connectionId: conn.connectionId,
+        })
+        throw new Error("Active ACP connection belongs to another conversation")
+      }
+      if (!conn.promptReady) {
+        throw new SessionRestorePendingError()
+      }
+      if (desired?.sessionId && conn.sessionId !== desired.sessionId) {
+        console.warn("[acp-context] prompt session mismatch", {
+          conversationId: requestedConversationId,
+          expectedExternalSessionId: desired.sessionId,
+          activeExternalSessionId: conn.sessionId,
+          connectionId: conn.connectionId,
+        })
+        throw new SessionRestorePendingError()
+      }
+      if (
+        desired?.agentType === "codex" &&
+        desired.conversationId != null &&
+        desired.sessionId &&
+        !conn.codegMcpAvailable
+      ) {
+        console.warn("[acp-context] prompt blocked: Codeg MCP unavailable", {
+          conversationId: desired.conversationId,
+          externalSessionId: desired.sessionId,
+          connectionId: conn.connectionId,
+          mcpServerCount: conn.mcpServerCount,
+        })
+        throw new Error("Codeg MCP is not ready on the restored Codex session")
+      }
+      console.info("[acp-context] prompt routing resolved", {
+        conversationId: requestedConversationId,
+        externalSessionId: conn.sessionId,
+        connectionId: conn.connectionId,
+        codegMcpAvailable: conn.codegMcpAvailable,
+        mcpServerCount: conn.mcpServerCount,
+      })
       lastActivityRef.current.set(contextKey, Date.now())
-      await acpPrompt(
-        conn.connectionId,
-        blocks,
-        opts?.folderId ?? null,
-        opts?.conversationId ?? null,
-        opts?.clientMessageId ?? null
-      )
+      const submit = (connectionId: string) =>
+        acpPrompt(
+          connectionId,
+          blocks,
+          opts?.folderId ?? null,
+          opts?.conversationId ?? null,
+          opts?.clientMessageId ?? null
+        )
+      try {
+        await submit(conn.connectionId)
+      } catch (error) {
+        if (!isRecoverablePromptConnectionLoss(error)) throw error
+        const staleConnectionId = conn.connectionId
+        console.warn(
+          "[acp-context] prompt target disappeared; restoring and retrying once",
+          {
+            conversationId: requestedConversationId,
+            staleConnectionId,
+            clientMessageId: opts?.clientMessageId ?? null,
+          }
+        )
+        conn = await recoverPromptConnection(contextKey, staleConnectionId)
+        // Recovery only establishes the replacement connection. Its replayed
+        // snapshot is the point at which the exact historical session becomes
+        // prompt-safe, so let the durable caller queue retry after that signal
+        // instead of racing a prompt into a half-restored replacement.
+        if (!conn.promptReady) {
+          throw new SessionRestorePendingError()
+        }
+        if (desired?.sessionId && conn.sessionId !== desired.sessionId) {
+          throw new SessionRestorePendingError()
+        }
+        if (
+          requestedConversationId != null &&
+          conn.conversationId != null &&
+          conn.conversationId !== requestedConversationId
+        ) {
+          throw new Error(
+            "Recovered ACP connection belongs to another conversation"
+          )
+        }
+        if (
+          desired?.agentType === "codex" &&
+          desired.conversationId != null &&
+          desired.sessionId &&
+          !conn.codegMcpAvailable
+        ) {
+          throw new Error(
+            "Codeg MCP is not ready on the restored Codex session"
+          )
+        }
+        await submit(conn.connectionId)
+      }
+    },
+    [recoverPromptConnection]
+  )
+
+  const steer = useCallback(
+    async (
+      contextKey: string,
+      blocks: PromptInputBlock[],
+      clientMessageId: string
+    ): Promise<SteerResult> => {
+      const conn = storeRef.current.connections.get(contextKey)
+      if (!conn) {
+        throw new Error(`No live connection for ${contextKey}`)
+      }
+      if (!conn.promptReady) {
+        throw new SessionRestorePendingError()
+      }
+      lastActivityRef.current.set(contextKey, Date.now())
+      return acpSteer(conn.connectionId, blocks, clientMessageId)
     },
     []
   )
@@ -5616,6 +6271,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       disconnectIfIdle,
       disconnectAll,
       sendPrompt,
+      steer,
       setMode,
       setConfigOption,
       cancel,
@@ -5642,6 +6298,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       disconnectIfIdle,
       disconnectAll,
       sendPrompt,
+      steer,
       setMode,
       setConfigOption,
       cancel,
