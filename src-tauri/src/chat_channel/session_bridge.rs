@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::acp::types::PermissionOptionInfo;
+use crate::chat_channel::types::WeixinPushMode;
 use crate::chat_channel::types::{ChannelMessageTarget, SentMessageId};
 use crate::models::agent::AgentType;
 
@@ -11,6 +12,14 @@ pub struct PendingPrompt {
     pub text: String,
     pub folder_id: i32,
     pub conversation_id: i32,
+    pub delivery: Option<TurnDeliveryRoute>,
+}
+
+#[derive(Clone)]
+pub struct TurnDeliveryRoute {
+    pub origin_id: String,
+    pub client_message_id: String,
+    pub push_mode: WeixinPushMode,
 }
 
 pub struct PendingPermission {
@@ -55,6 +64,7 @@ pub struct ActiveSession {
 pub struct SessionBridge {
     sessions: HashMap<String, ActiveSession>,
     restore_locks: HashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    active_deliveries: HashMap<String, TurnDeliveryRoute>,
 }
 
 impl SessionBridge {
@@ -78,6 +88,7 @@ impl SessionBridge {
     }
 
     pub fn remove(&mut self, connection_id: &str) -> Option<ActiveSession> {
+        self.active_deliveries.remove(connection_id);
         self.sessions.remove(connection_id)
     }
 
@@ -126,6 +137,31 @@ impl SessionBridge {
 
     pub fn all_sessions_mut(&mut self) -> impl Iterator<Item = &mut ActiveSession> {
         self.sessions.values_mut()
+    }
+
+    pub fn set_active_delivery(
+        &mut self,
+        connection_id: impl Into<String>,
+        delivery: TurnDeliveryRoute,
+    ) {
+        self.active_deliveries
+            .insert(connection_id.into(), delivery);
+    }
+
+    pub fn active_delivery(&self, connection_id: &str) -> Option<&TurnDeliveryRoute> {
+        self.active_deliveries.get(connection_id)
+    }
+
+    pub fn take_active_delivery(&mut self, connection_id: &str) -> Option<TurnDeliveryRoute> {
+        self.active_deliveries.remove(connection_id)
+    }
+
+    pub fn progress_disabled_connections(&self) -> HashSet<String> {
+        self.active_deliveries
+            .iter()
+            .filter(|(_, delivery)| !delivery.push_mode.allows_progress())
+            .map(|(connection_id, _)| connection_id.clone())
+            .collect()
     }
 }
 

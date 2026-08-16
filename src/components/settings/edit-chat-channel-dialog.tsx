@@ -16,6 +16,13 @@ import {
 } from "@/components/ui/dialog"
 import { Switch } from "@/components/ui/switch"
 import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
+import {
   updateChatChannel,
   saveChatChannelToken,
   getChatChannelHasToken,
@@ -54,6 +61,9 @@ export function EditChatChannelDialog({
   )
   const [defaultConversationId, setDefaultConversationId] = useState(
     config.default_conversation_id?.toString() ?? ""
+  )
+  const [pushMode, setPushMode] = useState(
+    config.push_mode ?? "final_and_interactions"
   )
   const [topicMode, setTopicMode] = useState(Boolean(config.topic_mode))
   const [dailyReportEnabled, setDailyReportEnabled] = useState(
@@ -101,6 +111,7 @@ export function EditChatChannelDialog({
               default_conversation_id: optionalPositiveId(
                 defaultConversationId
               ),
+              push_mode: pushMode,
             })
           : channel.channel_type === "lark"
             ? JSON.stringify({ app_id: appId, chat_id: chatId })
@@ -137,6 +148,7 @@ export function EditChatChannelDialog({
     defaultFolderId,
     defaultAgentType,
     defaultConversationId,
+    pushMode,
     topicMode,
     dailyReportEnabled,
     dailyReportTime,
@@ -235,6 +247,30 @@ export function EditChatChannelDialog({
 
           {channel.channel_type === "weixin" && (
             <div className="space-y-3 rounded-md border border-border/70 p-3">
+              <div className="space-y-1.5">
+                <label className="text-xs font-medium">
+                  {t("weixinPushMode")}
+                </label>
+                <Select value={pushMode} onValueChange={setPushMode}>
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="final_only">
+                      {t("weixinPushFinalOnly")}
+                    </SelectItem>
+                    <SelectItem value="final_and_interactions">
+                      {t("weixinPushFinalAndInteractions")}
+                    </SelectItem>
+                    <SelectItem value="debug">
+                      {t("weixinPushDebug")}
+                    </SelectItem>
+                  </SelectContent>
+                </Select>
+                <p className="text-xs text-muted-foreground">
+                  {t("weixinPushModeHint")}
+                </p>
+              </div>
               <div>
                 <p className="text-xs font-medium">
                   {t("defaultConversation")}

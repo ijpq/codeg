@@ -45,6 +45,7 @@ mod m20260807_000001_work_task_scheduled_at;
 mod m20260808_000001_custom_agent_supports_mcp;
 mod m20260813_000001_conversation_branch;
 mod m20260814_000001_conversation_branch_inheritance;
+mod m20260816_000001_chat_channel_final_outbox;
 pub struct Migrator;
 
 #[async_trait::async_trait]
@@ -96,6 +97,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260808_000001_custom_agent_supports_mcp::Migration),
             Box::new(m20260813_000001_conversation_branch::Migration),
             Box::new(m20260814_000001_conversation_branch_inheritance::Migration),
+            Box::new(m20260816_000001_chat_channel_final_outbox::Migration),
         ]
     }
 }

@@ -161,6 +161,25 @@ impl ChatChannelManager {
         backend.send_rich_message_to(message, target).await
     }
 
+    pub async fn send_outbox_to_target(
+        &self,
+        target: &ChannelMessageTarget,
+        text: &str,
+        idempotency_key: &str,
+    ) -> Result<DeliveryOutcome, ChatChannelError> {
+        let backend = {
+            let channels = self.inner.channels.lock().await;
+            channels
+                .get(&target.channel_id)
+                .ok_or(ChatChannelError::NotFound(target.channel_id))?
+                .backend
+                .clone()
+        };
+        backend
+            .send_outbox_message_to(text, idempotency_key, target)
+            .await
+    }
+
     pub async fn send_interactive_to_target(
         &self,
         target: &ChannelMessageTarget,
@@ -387,7 +406,9 @@ impl ChatChannelManager {
                 bridge,
             );
         } else {
-            tracing::warn!("[ChatChannel] WARNING: command_rx already taken, dispatcher NOT started");
+            tracing::warn!(
+                "[ChatChannel] WARNING: command_rx already taken, dispatcher NOT started"
+            );
         }
 
         // Spawn daily report scheduler
@@ -414,7 +435,9 @@ impl ChatChannelManager {
                     Err(_) => {
                         tracing::warn!(
                             "[ChatChannel] unknown channel type '{}' for '{}' (id={}), skipping",
-                            ch.channel_type, ch.name, ch.id
+                            ch.channel_type,
+                            ch.name,
+                            ch.id
                         );
                         continue;
                     }
@@ -425,7 +448,8 @@ impl ChatChannelManager {
                 Err(e) => {
                     tracing::warn!(
                         "[ChatChannel] invalid config for '{}' (id={}): {e}, skipping",
-                        ch.name, ch.id
+                        ch.name,
+                        ch.id
                     );
                     continue;
                 }
@@ -436,7 +460,8 @@ impl ChatChannelManager {
                 None => {
                     tracing::warn!(
                         "[ChatChannel] no token found for '{}' (id={}), skipping auto-connect",
-                        ch.name, ch.id
+                        ch.name,
+                        ch.id
                     );
                     continue;
                 }
@@ -448,7 +473,8 @@ impl ChatChannelManager {
                 Err(e) => {
                     tracing::error!(
                         "[ChatChannel] failed to create backend for '{}' (id={}): {e}",
-                        ch.name, ch.id
+                        ch.name,
+                        ch.id
                     );
                     continue;
                 }
@@ -460,7 +486,8 @@ impl ChatChannelManager {
             {
                 tracing::error!(
                     "[ChatChannel] failed to auto-connect '{}' (id={}): {e}",
-                    ch.name, ch.id
+                    ch.name,
+                    ch.id
                 );
             } else {
                 tracing::info!("[ChatChannel] auto-connected '{}' (id={})", ch.name, ch.id);
@@ -470,5 +497,8 @@ impl ChatChannelManager {
 }
 
 fn topic_title_for_conversation(conversation_id: i32, title: &str) -> String {
-    format!("#{conversation_id} {title}").chars().take(128).collect()
+    format!("#{conversation_id} {title}")
+        .chars()
+        .take(128)
+        .collect()
 }

@@ -2993,8 +2993,7 @@
         "elapsedMinutes": "{value} 分鐘",
         "elapsedSeconds": "{value} 秒",
         "outputSpeedAria": "估算輸出速度",
-        "outputSpeedTooltip": "估算輸出速度（正文 + 思考）"
-,
+        "outputSpeedTooltip": "估算輸出速度（正文 + 思考）",
         "toolUseCount": "{count} 次工具呼叫",
         "diagnostics": {
           "open": "連線診斷",
@@ -3642,6 +3641,11 @@
     "defaultFolderId": "資料夾 ID",
     "defaultConversationId": "對話 ID",
     "defaultAgentType": "Agent 類型",
+    "weixinPushMode": "微信推送模式",
+    "weixinPushFinalOnly": "僅最終結果",
+    "weixinPushFinalAndInteractions": "最終結果與必要互動",
+    "weixinPushDebug": "偵錯模式",
+    "weixinPushModeHint": "預設僅推送本次微信任務的最終回答；權杖過期時會保留結果，待下一則微信訊息後補發。",
     "loadFailed": "載入頻道失敗。",
     "saveFailed": "儲存失敗。",
     "connectSuccess": "頻道已連線。",

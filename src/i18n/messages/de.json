@@ -2993,8 +2993,7 @@
         "elapsedMinutes": "{value} Min",
         "elapsedSeconds": "{value} Sek",
         "outputSpeedAria": "Geschätzte Ausgabegeschwindigkeit",
-        "outputSpeedTooltip": "Geschätzte Ausgabegeschwindigkeit (Text + Denken)"
-,
+        "outputSpeedTooltip": "Geschätzte Ausgabegeschwindigkeit (Text + Denken)",
         "toolUseCount": "{count, plural, one {# Tool-Aufruf} other {# Tool-Aufrufe}}",
         "diagnostics": {
           "open": "Verbindungsdiagnose",
@@ -3642,6 +3641,11 @@
     "defaultFolderId": "Folder ID",
     "defaultConversationId": "Conversation ID",
     "defaultAgentType": "Agent type",
+    "weixinPushMode": "WeChat push mode",
+    "weixinPushFinalOnly": "Final result only",
+    "weixinPushFinalAndInteractions": "Final result and required interactions",
+    "weixinPushDebug": "Debug mode",
+    "weixinPushModeHint": "Only the final answer is pushed by default. Expired reply tokens keep the result pending until the next inbound message.",
     "loadFailed": "Kanäle konnten nicht geladen werden.",
     "saveFailed": "Änderungen konnten nicht gespeichert werden.",
     "connectSuccess": "Kanal verbunden.",

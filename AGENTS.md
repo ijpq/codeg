@@ -60,7 +60,9 @@ INSTA_UPDATE=auto cargo test --features test-utils     # 自动写新 .snap
 
 当用户只说“发版”“release”或“完成 release 发版”时，直接执行
 [`docs/release-workflow.md`](docs/release-workflow.md)，无需再次询问流程。除非用户指定版本或
-发布通道，否则默认发布 `origin` 最新稳定版本的下一个 patch 版本。
+发布通道，否则默认以 `upstream` 最新正式 Release 为基线，并发布同一基线下尚未使用的
+下一个 `v<upstream-version>-fixN` 版本。默认资产仅包含 Windows x64 Setup、Windows x64
+Server ZIP 及其校验文件。
 
 固定顺序为：解析并拉取 `upstream` 最新已发布稳定版对应的 commit → 将本地待发版分支
 rebase 到该 commit → 完成检查和版本提交 → 先推送分支到 `origin` 默认分支并确认该 commit

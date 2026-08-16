@@ -119,57 +119,104 @@ pub(super) async fn handle_acp_envelope(
 
     match &envelope.payload {
         AcpEvent::SessionStarted { session_id } => {
-            let mut guard = bridge.lock().await;
-            if let Some(session) = guard.get_mut(connection_id) {
-                let _ = conversation_service::update_external_id(
-                    db,
-                    session.conversation_id,
-                    session_id.clone(),
-                )
-                .await;
-
-                if let Some(pending) = session.pending_prompts.pop_front() {
-                    // Clone so the prompt can be RESTORED (not dropped) if a turn
-                    // is already in flight — see the TurnInProgress arm below.
-                    let blocks = vec![PromptInputBlock::Text {
-                        text: pending.text.clone(),
-                    }];
+            let (conversation_id, target, pending) = {
+                let mut guard = bridge.lock().await;
+                let Some(session) = guard.get_mut(connection_id) else {
+                    return;
+                };
+                let pending = session.pending_prompts.pop_front();
+                if pending.is_some() {
                     session.forward_events = true;
-                    if let Err(e) = conn_mgr
-                        .send_prompt_linked(
-                            &crate::db::AppDatabase { conn: db.clone() },
-                            connection_id,
-                            blocks,
-                            Some(pending.folder_id),
-                            Some(pending.conversation_id),
-                            None,
-                        )
+                }
+                (session.conversation_id, session.target.clone(), pending)
+            };
+            let _ =
+                conversation_service::update_external_id(db, conversation_id, session_id.clone())
+                    .await;
+
+            if let Some(pending) = pending {
+                let blocks = vec![PromptInputBlock::Text {
+                    text: pending.text.clone(),
+                }];
+                if let Some(delivery) = pending.delivery.clone() {
+                    bridge
+                        .lock()
                         .await
-                    {
-                        session.forward_events = false;
-                        // A turn is already in flight on this shared connection
-                        // (another client raced this kickoff between
-                        // SessionStarted and here). Transient, not a failure —
-                        // RESTORE the pending prompt so the TurnComplete handler
-                        // retries the kickoff once the in-flight turn finishes,
-                        // instead of silently dropping the task's initial prompt.
-                        if matches!(e, crate::acp::error::AcpError::TurnInProgress) {
-                            session.pending_prompts.push_front(pending);
+                        .set_active_delivery(connection_id.to_string(), delivery);
+                }
+                let result = conn_mgr
+                    .send_prompt_linked_with_message_id(
+                        &crate::db::AppDatabase { conn: db.clone() },
+                        connection_id,
+                        blocks,
+                        Some(pending.folder_id),
+                        Some(pending.conversation_id),
+                        None,
+                        pending
+                            .delivery
+                            .as_ref()
+                            .map(|delivery| delivery.client_message_id.clone()),
+                    )
+                    .await;
+                match result {
+                    Ok(_) => {
+                        if let Some(delivery) = pending.delivery.as_ref() {
+                            let _ =
+                                crate::db::service::chat_channel_delivery_service::mark_dispatched(
+                                    db,
+                                    &delivery.origin_id,
+                                    connection_id,
+                                )
+                                .await;
+                        }
+                    }
+                    Err(error) => {
+                        let mut guard = bridge.lock().await;
+                        guard.take_active_delivery(connection_id);
+                        if let Some(session) = guard.get_mut(connection_id) {
+                            session.forward_events = false;
+                            if matches!(error, crate::acp::error::AcpError::TurnInProgress) {
+                                session.pending_prompts.push_front(pending.clone());
+                            }
+                        }
+                        drop(guard);
+                        if matches!(error, crate::acp::error::AcpError::TurnInProgress) {
                             tracing::warn!(
-                                "[SessionEventSub] kickoff deferred; a turn is already in \
-                                 progress, will retry on TurnComplete"
+                                "[SessionEventSub] kickoff deferred; a turn is already in progress, will retry on TurnComplete"
                             );
-                            let target = session.target.clone();
-                            let lang = get_lang(db).await;
-                            let msg = RichMessage::info(
-                                super::i18n::task_deferred_busy(lang).to_string(),
-                            );
-                            let _ = manager.send_to_target(&target, &msg).await;
+                            let mode = pending
+                                .delivery
+                                .as_ref()
+                                .map(|delivery| delivery.push_mode)
+                                .unwrap_or(super::types::WeixinPushMode::Debug);
+                            if mode.allows_progress() {
+                                let lang = get_lang(db).await;
+                                let msg = RichMessage::info(
+                                    super::i18n::task_deferred_busy(lang).to_string(),
+                                );
+                                let _ = manager.send_to_target(&target, &msg).await;
+                            }
                         } else {
-                            tracing::error!("[SessionEventSub] failed to send pending prompt: {e}");
-                            let target = session.target.clone();
-                            let msg = RichMessage::error(format!("Failed to send task: {e}"));
-                            let _ = manager.send_to_target(&target, &msg).await;
+                            if let Some(delivery) = pending.delivery.as_ref() {
+                                let _ =
+                                    crate::db::service::chat_channel_delivery_service::mark_failed(
+                                        db,
+                                        &delivery.origin_id,
+                                    )
+                                    .await;
+                            }
+                            tracing::error!(
+                                "[SessionEventSub] failed to send pending prompt: {error}"
+                            );
+                            if pending
+                                .delivery
+                                .as_ref()
+                                .is_none_or(|delivery| delivery.push_mode.allows_interactions())
+                            {
+                                let msg =
+                                    RichMessage::error(format!("Failed to send task: {error}"));
+                                let _ = manager.send_to_target(&target, &msg).await;
+                            }
                         }
                     }
                 }
@@ -189,13 +236,18 @@ pub(super) async fn handle_acp_envelope(
             // Collect flush info under the lock, then release before any IO.
             let flush_info: Option<(ChannelMessageTarget, String, Option<String>)> = {
                 let mut guard = bridge.lock().await;
+                let allow_progress = guard
+                    .active_delivery(connection_id)
+                    .map(|delivery| delivery.push_mode.allows_progress())
+                    .unwrap_or(true);
                 match guard.get_mut(connection_id) {
                     Some(session) => {
                         if !session.forward_events {
                             return;
                         }
                         session.content_buffer.push_str(text);
-                        if session.content_buffer.len() >= BUFFER_FLUSH_THRESHOLD
+                        if allow_progress
+                            && session.content_buffer.len() >= BUFFER_FLUSH_THRESHOLD
                             && session.last_flushed.elapsed() >= Duration::from_secs(2)
                         {
                             session.last_flushed = Instant::now();
@@ -242,8 +294,15 @@ pub(super) async fn handle_acp_envelope(
             };
 
             let mut guard = bridge.lock().await;
+            let allow_progress = guard
+                .active_delivery(connection_id)
+                .map(|delivery| delivery.push_mode.allows_progress())
+                .unwrap_or(true);
             if let Some(session) = guard.get_mut(connection_id) {
                 if !session.forward_events {
+                    return;
+                }
+                if !allow_progress {
                     return;
                 }
                 // Store title for progress indicator; store raw_input for later
@@ -271,8 +330,15 @@ pub(super) async fn handle_acp_envelope(
             ..
         } => {
             let mut guard = bridge.lock().await;
+            let allow_progress = guard
+                .active_delivery(connection_id)
+                .map(|delivery| delivery.push_mode.allows_progress())
+                .unwrap_or(true);
             if let Some(session) = guard.get_mut(connection_id) {
                 if !session.forward_events {
+                    return;
+                }
+                if !allow_progress {
                     return;
                 }
                 // Accumulate raw_input if newly available
@@ -366,8 +432,15 @@ pub(super) async fn handle_acp_envelope(
             ..
         } => {
             let mut guard = bridge.lock().await;
+            let allow_progress = guard
+                .active_delivery(connection_id)
+                .map(|delivery| delivery.push_mode.allows_progress())
+                .unwrap_or(true);
             if let Some(session) = guard.get_mut(connection_id) {
                 if !session.forward_events {
+                    return;
+                }
+                if !allow_progress {
                     return;
                 }
                 // Render EXACTLY ONCE, gated on the `delegation_rendered` marker:
@@ -402,6 +475,7 @@ pub(super) async fn handle_acp_envelope(
             queued: _,
         } => {
             let mut guard = bridge.lock().await;
+            let delivery = guard.active_delivery(connection_id).cloned();
             if let Some(session) = guard.get_mut(connection_id) {
                 if !session.forward_events {
                     return;
@@ -479,6 +553,66 @@ pub(super) async fn handle_acp_envelope(
                     fields: Vec::new(),
                     level: MessageLevel::Warning,
                 };
+                if let Some(delivery) = delivery.filter(|route| !route.push_mode.allows_progress())
+                {
+                    if let Ok(Some(origin)) =
+                        crate::db::service::chat_channel_delivery_service::find_by_id(
+                            db,
+                            &delivery.origin_id,
+                        )
+                        .await
+                    {
+                        let _ = super::final_delivery::capture_and_deliver(
+                            db,
+                            manager,
+                            origin,
+                            "permission_request",
+                            &msg.to_plain_text(),
+                        )
+                        .await;
+                    }
+                } else {
+                    let _ = manager.send_to_target(&target, &msg).await;
+                }
+            }
+        }
+
+        AcpEvent::QuestionRequest { questions, .. } => {
+            let (target, delivery, owned) = {
+                let guard = bridge.lock().await;
+                let session = guard.get(connection_id);
+                (
+                    session.map(|session| session.target.clone()),
+                    guard.active_delivery(connection_id).cloned(),
+                    session.is_some_and(|session| session.forward_events),
+                )
+            };
+            if !owned {
+                return;
+            }
+            let lang = get_lang(db).await;
+            let msg = super::message_formatter::format_question_request(questions, lang);
+            if let Some(delivery) = delivery.filter(|route| !route.push_mode.allows_progress()) {
+                if !delivery.push_mode.allows_interactions() {
+                    return;
+                }
+                if let Ok(Some(origin)) =
+                    crate::db::service::chat_channel_delivery_service::find_by_id(
+                        db,
+                        &delivery.origin_id,
+                    )
+                    .await
+                {
+                    let _ = super::final_delivery::capture_and_deliver(
+                        db,
+                        manager,
+                        origin,
+                        "blocking_question",
+                        &msg.to_plain_text(),
+                    )
+                    .await;
+                }
+            } else if let Some(target) = target {
                 let _ = manager.send_to_target(&target, &msg).await;
             }
         }
@@ -489,6 +623,7 @@ pub(super) async fn handle_acp_envelope(
             ..
         } => {
             let mut guard = bridge.lock().await;
+            let delivery = guard.take_active_delivery(connection_id);
             if let Some(session) = guard.get_mut(connection_id) {
                 let target = session.target.clone();
                 let conv_id = session.conversation_id;
@@ -515,21 +650,94 @@ pub(super) async fn handle_acp_envelope(
 
                 let lang = get_lang(db).await;
                 if owned_turn {
-                    let body = format_completion(&content, tool_count, lang);
-                    let msg = RichMessage::info(body)
-                        .with_title(match lang {
-                            Lang::ZhCn | Lang::ZhTw => "任务完成",
-                            _ => "Turn Complete",
-                        })
-                        .with_field("Agent", agent_type)
-                        .with_field(
-                            match lang {
-                                Lang::ZhCn | Lang::ZhTw => "结束原因",
-                                _ => "Stop Reason",
-                            },
-                            localize_stop_reason(stop_reason, lang),
-                        );
-                    let _ = manager.send_to_target(&target, &msg).await;
+                    if let Some(delivery) = delivery
+                        .as_ref()
+                        .filter(|route| !route.push_mode.allows_progress())
+                    {
+                        if let Ok(Some(origin)) =
+                            crate::db::service::chat_channel_delivery_service::find_by_id(
+                                db,
+                                &delivery.origin_id,
+                            )
+                            .await
+                        {
+                            let _ = crate::db::service::chat_channel_message_log_service::create_correlated_log(
+                                db,
+                                origin.channel_id,
+                                "internal",
+                                "stale_progress_dropped",
+                                "",
+                                "dropped",
+                                Some(format!(
+                                    "suppressed_stream_chars={}, suppressed_tool_events={tool_count}",
+                                    content.chars().count()
+                                )),
+                                Some(&origin.origin_message_id),
+                                origin.turn_run_id.as_deref(),
+                                None,
+                            )
+                            .await;
+                            let final_text =
+                                if let Some(state) = conn_mgr.get_state(connection_id).await {
+                                    state.read().await.last_assistant_text.clone()
+                                } else {
+                                    None
+                                };
+                            let (kind, body) = if stop_reason == "end_turn" {
+                                (
+                                    "final",
+                                    final_text.unwrap_or_else(|| match lang {
+                                        Lang::ZhCn | Lang::ZhTw => {
+                                            "任务已结束，但没有生成可发送的最终回答。".to_string()
+                                        }
+                                        _ => "The task ended without a final answer.".to_string(),
+                                    }),
+                                )
+                            } else if stop_reason == "cancelled" {
+                                (
+                                    "cancelled",
+                                    match lang {
+                                        Lang::ZhCn | Lang::ZhTw => "任务已取消。".to_string(),
+                                        _ => "The task was cancelled.".to_string(),
+                                    },
+                                )
+                            } else {
+                                (
+                                    "terminal_error",
+                                    match lang {
+                                        Lang::ZhCn | Lang::ZhTw => format!(
+                                            "任务未能完成：{}",
+                                            localize_stop_reason(stop_reason, lang)
+                                        ),
+                                        _ => format!(
+                                            "The task did not complete: {}",
+                                            localize_stop_reason(stop_reason, lang)
+                                        ),
+                                    },
+                                )
+                            };
+                            let _ = super::final_delivery::capture_and_deliver(
+                                db, manager, origin, kind, &body,
+                            )
+                            .await;
+                        }
+                    } else {
+                        let body = format_completion(&content, tool_count, lang);
+                        let msg = RichMessage::info(body)
+                            .with_title(match lang {
+                                Lang::ZhCn | Lang::ZhTw => "任务完成",
+                                _ => "Turn Complete",
+                            })
+                            .with_field("Agent", agent_type)
+                            .with_field(
+                                match lang {
+                                    Lang::ZhCn | Lang::ZhTw => "结束原因",
+                                    _ => "Stop Reason",
+                                },
+                                localize_stop_reason(stop_reason, lang),
+                            );
+                        let _ = manager.send_to_target(&target, &msg).await;
+                    }
                 }
 
                 if owned_turn && stop_reason == "end_turn" {
@@ -549,22 +757,33 @@ pub(super) async fn handle_acp_envelope(
                     let blocks = vec![PromptInputBlock::Text {
                         text: pending.text.clone(),
                     }];
-                    if let Some(session) = bridge.lock().await.get_mut(connection_id) {
-                        session.forward_events = true;
+                    {
+                        let mut next_guard = bridge.lock().await;
+                        if let Some(session) = next_guard.get_mut(connection_id) {
+                            session.forward_events = true;
+                        }
+                        if let Some(delivery) = pending.delivery.clone() {
+                            next_guard.set_active_delivery(connection_id.to_string(), delivery);
+                        }
                     }
                     if let Err(e) = conn_mgr
-                        .send_prompt_linked(
+                        .send_prompt_linked_with_message_id(
                             &crate::db::AppDatabase { conn: db.clone() },
                             connection_id,
                             blocks,
                             Some(pending.folder_id),
                             Some(pending.conversation_id),
                             None,
+                            pending
+                                .delivery
+                                .as_ref()
+                                .map(|delivery| delivery.client_message_id.clone()),
                         )
                         .await
                     {
                         if matches!(e, crate::acp::error::AcpError::TurnInProgress) {
                             let mut g = bridge.lock().await;
+                            g.take_active_delivery(connection_id);
                             if let Some(s) = g.get_mut(connection_id) {
                                 s.forward_events = false;
                                 s.pending_prompts.push_front(pending);
@@ -574,8 +793,20 @@ pub(super) async fn handle_acp_envelope(
                                  next TurnComplete"
                             );
                         } else {
-                            if let Some(s) = bridge.lock().await.get_mut(connection_id) {
-                                s.forward_events = false;
+                            {
+                                let mut g = bridge.lock().await;
+                                g.take_active_delivery(connection_id);
+                                if let Some(s) = g.get_mut(connection_id) {
+                                    s.forward_events = false;
+                                }
+                            }
+                            if let Some(delivery) = pending.delivery.as_ref() {
+                                let _ =
+                                    crate::db::service::chat_channel_delivery_service::mark_failed(
+                                        db,
+                                        &delivery.origin_id,
+                                    )
+                                    .await;
                             }
                             tracing::error!(
                                 "[SessionEventSub] failed to send deferred kickoff: {e}"
@@ -583,6 +814,13 @@ pub(super) async fn handle_acp_envelope(
                             let msg = RichMessage::error(format!("Failed to send task: {e}"));
                             let _ = manager.send_to_target(&target, &msg).await;
                         }
+                    } else if let Some(delivery) = pending.delivery.as_ref() {
+                        let _ = crate::db::service::chat_channel_delivery_service::mark_dispatched(
+                            db,
+                            &delivery.origin_id,
+                            connection_id,
+                        )
+                        .await;
                     }
                 }
             }
@@ -616,20 +854,36 @@ pub(super) async fn handle_acp_envelope(
             };
 
             if !*terminal {
-                let target = {
+                let (target, allow_progress) = {
                     let guard = bridge.lock().await;
                     guard
                         .get(connection_id)
                         .filter(|s| s.forward_events)
-                        .map(|s| s.target.clone())
+                        .map(|s| {
+                            (
+                                s.target.clone(),
+                                guard
+                                    .active_delivery(connection_id)
+                                    .map(|route| route.push_mode.allows_progress())
+                                    .unwrap_or(true),
+                            )
+                        })
+                        .unwrap_or((ChannelMessageTarget::channel(0), false))
                 };
-                if let Some(target) = target {
+                if allow_progress {
                     let _ = manager.send_to_target(&target, &msg).await;
+                } else {
+                    tracing::debug!(
+                        stage = "stale_progress_dropped",
+                        connection_id,
+                        "[ChatChannel][final_delivery] non-terminal ACP error suppressed"
+                    );
                 }
                 return;
             }
 
             let mut guard = bridge.lock().await;
+            let delivery = guard.take_active_delivery(connection_id);
             if let Some(session) = guard.remove(connection_id) {
                 let channel_id = session.channel_id;
                 let sender_id = session.sender_id.clone();
@@ -638,7 +892,28 @@ pub(super) async fn handle_acp_envelope(
                 drop(guard);
 
                 if session.forward_events {
-                    let _ = manager.send_to_target(&target, &msg).await;
+                    if let Some(delivery) =
+                        delivery.filter(|route| !route.push_mode.allows_progress())
+                    {
+                        if let Ok(Some(origin)) =
+                            crate::db::service::chat_channel_delivery_service::find_by_id(
+                                db,
+                                &delivery.origin_id,
+                            )
+                            .await
+                        {
+                            let _ = super::final_delivery::capture_and_deliver(
+                                db,
+                                manager,
+                                origin,
+                                "terminal_error",
+                                &msg.to_plain_text(),
+                            )
+                            .await;
+                        }
+                    } else {
+                        let _ = manager.send_to_target(&target, &msg).await;
+                    }
                 }
 
                 let _ = conversation_service::update_status(
@@ -680,9 +955,11 @@ async fn flush_progress(
     let lang = get_lang(db).await;
     let updates: Vec<(ChannelMessageTarget, String)> = {
         let mut guard = bridge.lock().await;
+        let progress_disabled = guard.progress_disabled_connections();
         let mut out = Vec::new();
         for session in guard.all_sessions_mut() {
             if session.forward_events
+                && !progress_disabled.contains(&session.connection_id)
                 && !session.content_buffer.is_empty()
                 && session.last_flushed.elapsed() >= Duration::from_secs(FLUSH_INTERVAL_SECS)
             {
@@ -1172,10 +1449,11 @@ mod async_relay_dedup_tests {
     use crate::acp::manager::ConnectionManager;
     use crate::chat_channel::error::ChatChannelError;
     use crate::chat_channel::manager::ChatChannelManager;
-    use crate::chat_channel::session_bridge::{ActiveSession, SessionBridge};
+    use crate::chat_channel::session_bridge::{ActiveSession, SessionBridge, TurnDeliveryRoute};
     use crate::chat_channel::traits::ChatChannelBackend;
     use crate::chat_channel::types::{
         ChannelConnectionStatus, ChannelType, IncomingCommand, RichMessage, SentMessageId,
+        WeixinPushMode,
     };
     use crate::db::test_helpers;
     use crate::models::agent::AgentType;
@@ -1311,6 +1589,168 @@ mod async_relay_dedup_tests {
 
     async fn sent(rec: &Recorder) -> Vec<String> {
         rec.msgs.lock().await.clone()
+    }
+
+    #[tokio::test]
+    async fn weixin_final_mode_drops_progress_and_delivers_only_authoritative_final() {
+        let db = test_helpers::fresh_in_memory_db().await;
+        let channel = crate::db::service::chat_channel_service::create(
+            &db.conn,
+            "Weixin".into(),
+            "weixin".into(),
+            r#"{"base_url":"https://example.invalid","push_mode":"final_and_interactions"}"#.into(),
+            true,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/codeg-weixin-final-mode").await;
+        let conversation_id =
+            test_helpers::seed_conversation(&db, folder_id, AgentType::Codex).await;
+        let conn = ConnectionManager::new();
+        let _rx = conn
+            .insert_test_connection_live(
+                "wx-conn",
+                AgentType::Codex,
+                None,
+                crate::web::event_bridge::EventEmitter::Noop,
+            )
+            .await;
+        {
+            let state = conn.get_state("wx-conn").await.unwrap();
+            let mut state = state.write().await;
+            state.conversation_id = Some(conversation_id);
+            state.last_assistant_text = Some("这是完整最终回答。".into());
+        }
+
+        let target = crate::chat_channel::types::ChannelMessageTarget {
+            channel_id: channel.id,
+            chat_id: None,
+            thread_key: None,
+            thread_kind: None,
+            provider_payload: Some(serde_json::json!({"weixin_sender_id":"wx-user"})),
+        };
+        let origin = super::super::final_delivery::register_origin(
+            &db.conn,
+            super::super::final_delivery::OriginRegistration {
+                channel_id: channel.id,
+                sender_id: "wx-user",
+                conversation_id,
+                connection_id: Some("wx-conn"),
+                origin_message_id: "message_id:100",
+                client_message_id: "chat-1-final-test",
+                target: &target,
+            },
+        )
+        .await
+        .unwrap();
+        let bridge = Arc::new(Mutex::new(SessionBridge::new()));
+        bridge.lock().await.register(
+            "wx-conn".into(),
+            ActiveSession {
+                channel_id: channel.id,
+                sender_id: "wx-user".into(),
+                target: target.clone(),
+                conversation_id,
+                connection_id: "wx-conn".into(),
+                agent_type: AgentType::Codex,
+                content_buffer: String::new(),
+                tool_calls: Vec::new(),
+                tool_call_inputs: HashMap::new(),
+                delegation_rendered: HashSet::new(),
+                last_flushed: Instant::now(),
+                pending_prompts: std::collections::VecDeque::new(),
+                forward_events: true,
+                permission_pending: None,
+            },
+        );
+        bridge.lock().await.set_active_delivery(
+            "wx-conn",
+            TurnDeliveryRoute {
+                origin_id: origin.id,
+                client_message_id: origin.client_message_id,
+                push_mode: WeixinPushMode::FinalAndInteractions,
+            },
+        );
+        let chat = ChatChannelManager::new();
+        let rec = Recorder::default();
+        chat.add_channel(
+            channel.id,
+            "test".into(),
+            ChannelType::Weixin,
+            Box::new(RecordingBackend { rec: rec.clone() }),
+        )
+        .await
+        .unwrap();
+
+        handle_acp_envelope(
+            &EventEnvelope {
+                seq: 1,
+                connection_id: "wx-conn".into(),
+                payload: AcpEvent::ContentDelta {
+                    text: "过程说明".repeat(300),
+                    parent_tool_use_id: None,
+                },
+            },
+            &bridge,
+            &chat,
+            &conn,
+            &db.conn,
+        )
+        .await;
+        handle_acp_envelope(
+            &EventEnvelope {
+                seq: 2,
+                connection_id: "wx-conn".into(),
+                payload: AcpEvent::ToolCall {
+                    tool_call_id: "tool-1".into(),
+                    title: "Bash".into(),
+                    kind: "execute".into(),
+                    status: "running".into(),
+                    content: None,
+                    raw_input: Some(r#"{"cmd":"secret command"}"#.into()),
+                    raw_output: None,
+                    locations: None,
+                    meta: None,
+                    images: None,
+                },
+            },
+            &bridge,
+            &chat,
+            &conn,
+            &db.conn,
+        )
+        .await;
+        assert!(
+            sent(&rec).await.is_empty(),
+            "progress and tools must be silent"
+        );
+
+        handle_acp_envelope(
+            &EventEnvelope {
+                seq: 3,
+                connection_id: "wx-conn".into(),
+                payload: AcpEvent::TurnComplete {
+                    session_id: "session-1".into(),
+                    stop_reason: "end_turn".into(),
+                    agent_type: "codex".into(),
+                },
+            },
+            &bridge,
+            &chat,
+            &conn,
+            &db.conn,
+        )
+        .await;
+        assert_eq!(sent(&rec).await, vec!["这是完整最终回答。"]);
+        use sea_orm::EntityTrait;
+        let outbox = crate::db::entities::chat_channel_outbox::Entity::find()
+            .all(&db.conn)
+            .await
+            .unwrap();
+        assert_eq!(outbox.len(), 1, "only the final may enter the outbox");
+        assert_eq!(outbox[0].message_kind, "final");
     }
 
     const ACK: &str =
@@ -1502,6 +1942,7 @@ mod async_relay_dedup_tests {
                 text: "do the task".into(),
                 folder_id,
                 conversation_id,
+                delivery: None,
             });
         conn.get_state("conn")
             .await

@@ -13,6 +13,7 @@ use super::session_bridge::SessionBridge;
 use super::session_commands;
 use super::types::{
     sender_log_key, ChannelMessageTarget, IncomingCommand, InteractiveMessage, RichMessage,
+    WeixinPushMode,
 };
 use crate::acp::manager::ConnectionManager;
 use crate::db::service::{app_metadata_service, chat_channel_message_log_service};
@@ -70,6 +71,9 @@ pub fn spawn_command_dispatcher(
 
         while let Some(cmd) = command_rx.recv().await {
             let text = cmd.command_text.trim();
+            let origin_message_id = super::final_delivery::stable_origin_message_id(&cmd.metadata);
+            let push_mode = super::final_delivery::push_mode(&db_conn, cmd.channel_id).await;
+            let is_final_weixin_mode = push_mode != WeixinPushMode::Debug;
             tracing::info!(
                 channel_id = cmd.channel_id,
                 sender_key = %sender_log_key(&cmd.sender_id),
@@ -78,20 +82,48 @@ pub fn spawn_command_dispatcher(
             );
 
             // Log inbound command
-            let _ = chat_channel_message_log_service::create_log(
+            let _ = chat_channel_message_log_service::create_correlated_log(
                 &db_conn,
                 cmd.channel_id,
                 "inbound",
-                "command_query",
+                "inbound_user_message",
                 text,
                 "sent",
+                None,
+                Some(&origin_message_id),
+                None,
                 None,
             )
             .await;
 
+            if is_final_weixin_mode {
+                let replay_db = db_conn.clone();
+                let replay_manager = manager.clone_ref();
+                let replay_sender = cmd.sender_id.clone();
+                let replay_channel_id = cmd.channel_id;
+                tokio::spawn(async move {
+                    if let Err(error) = super::final_delivery::replay_pending(
+                        &replay_db,
+                        &replay_manager,
+                        replay_channel_id,
+                        &replay_sender,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            stage = "pending_final_replay_failed",
+                            channel_id = replay_channel_id,
+                            sender_key = %sender_log_key(&replay_sender),
+                            error,
+                            "[ChatChannel][final_delivery] pending final replay failed"
+                        );
+                    }
+                });
+            }
+
             config.refresh_if_needed(&db_conn).await;
 
-            let response = dispatch_command(
+            let response = dispatch_command_with_origin(
                 text,
                 &config.prefix,
                 &db_conn,
@@ -105,6 +137,8 @@ pub fn spawn_command_dispatcher(
                 &cmd.target,
                 cmd.callback_data.as_deref(),
                 config.lang,
+                Some(&origin_message_id),
+                push_mode,
             )
             .await;
 
@@ -123,14 +157,32 @@ pub fn spawn_command_dispatcher(
             messages.extend(response.extra_messages);
 
             for (message, target) in messages {
+                if is_final_weixin_mode && is_session_ack_message(&message, config.lang) {
+                    tracing::debug!(
+                        stage = "stale_progress_dropped",
+                        channel_id = cmd.channel_id,
+                        "[ChatChannel][final_delivery] delivery acknowledgement suppressed"
+                    );
+                    continue;
+                }
                 send_dispatch_message(&db_conn, &manager, cmd.channel_id, text, message, target)
                     .await;
             }
 
             if let Some(action) = response.post_action {
-                if let Some((message, target)) =
-                    session_commands::handle_post_action(action, &db_conn, &conn_mgr, &bridge).await
+                if let Some((message, target)) = session_commands::handle_post_action(
+                    action,
+                    &db_conn,
+                    &conn_mgr,
+                    &bridge,
+                    Some(&origin_message_id),
+                    push_mode,
+                )
+                .await
                 {
+                    if is_final_weixin_mode && message.body == i18n::message_sent(config.lang) {
+                        continue;
+                    }
                     send_dispatch_message(
                         &db_conn,
                         &manager,
@@ -192,6 +244,8 @@ async fn send_dispatch_message(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn dispatch_command(
     text: &str,
     prefix: &str,
@@ -206,6 +260,44 @@ async fn dispatch_command(
     target: &ChannelMessageTarget,
     callback_data: Option<&str>,
     lang: Lang,
+) -> DispatchResponse {
+    dispatch_command_with_origin(
+        text,
+        prefix,
+        db,
+        manager,
+        conn_mgr,
+        emitter,
+        bridge,
+        data_dir,
+        channel_id,
+        sender_id,
+        target,
+        callback_data,
+        lang,
+        None,
+        WeixinPushMode::Debug,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_command_with_origin(
+    text: &str,
+    prefix: &str,
+    db: &DatabaseConnection,
+    manager: &ChatChannelManager,
+    conn_mgr: &ConnectionManager,
+    emitter: &EventEmitter,
+    bridge: &Arc<Mutex<SessionBridge>>,
+    data_dir: &Path,
+    channel_id: i32,
+    sender_id: &str,
+    target: &ChannelMessageTarget,
+    callback_data: Option<&str>,
+    lang: Lang,
+    origin_message_id: Option<&str>,
+    push_mode: WeixinPushMode,
 ) -> DispatchResponse {
     if let Some(data) = callback_data {
         return DispatchResponse::current(
@@ -236,6 +328,8 @@ async fn dispatch_command(
                         data_dir,
                         lang,
                         prefix,
+                        origin_message_id,
+                        push_mode,
                     })
                     .await,
                     target,
@@ -265,6 +359,8 @@ async fn dispatch_command(
                     data_dir,
                     lang,
                     prefix,
+                    origin_message_id,
+                    push_mode,
                 })
                 .await,
                 target,
@@ -468,6 +564,18 @@ impl DispatchMessage {
             Self::Interactive(message) => message.to_rich_fallback().to_plain_text(),
         }
     }
+}
+
+fn is_session_ack_message(message: &DispatchMessage, lang: Lang) -> bool {
+    let (title, body) = match message {
+        DispatchMessage::Rich(message) => (message.title.as_deref(), message.body.as_str()),
+        DispatchMessage::Interactive(message) => {
+            (message.base.title.as_deref(), message.base.body.as_str())
+        }
+    };
+    body == i18n::message_sent(lang)
+        || body == i18n::task_deferred_busy(lang)
+        || title == Some(i18n::task_started_title(lang))
 }
 
 #[cfg(test)]
@@ -951,16 +1059,11 @@ mod tests {
             agent_commands.try_recv().is_err(),
             "the original message must be submitted exactly once"
         );
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if !recorder.messages.lock().await.is_empty() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("dispatcher acknowledgement timed out");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            recorder.messages.lock().await.is_empty(),
+            "final-result mode must not send a Message sent acknowledgement"
+        );
 
         let active = bridge.lock().await;
         let session = active
@@ -997,6 +1100,14 @@ mod tests {
             &db.conn,
         )
         .await;
+        {
+            let state = conn_mgr
+                .get_state("weixin-restored-connection")
+                .await
+                .expect("restored ACP state");
+            state.write().await.last_assistant_text =
+                Some("你好，我已经恢复了原会话。".into());
+        }
         super::super::session_event_subscriber::handle_acp_envelope(
             &EventEnvelope {
                 seq: 2,
@@ -1015,7 +1126,7 @@ mod tests {
         .await;
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if recorder.messages.lock().await.len() >= 2 {
+                if !recorder.messages.lock().await.is_empty() {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1024,9 +1135,7 @@ mod tests {
         .await
         .expect("Weixin model reply timed out");
         let sent = recorder.messages.lock().await.clone();
-        assert_eq!(sent.len(), 2, "one acknowledgement and one model reply");
-        assert_eq!(sent[0], "Message sent.");
-        assert!(sent[1].contains("你好，我已经恢复了原会话。"));
+        assert_eq!(sent, vec!["你好，我已经恢复了原会话。"]);
         dispatcher.abort();
     }
 }

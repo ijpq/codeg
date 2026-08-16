@@ -8,10 +8,10 @@ use tokio::sync::Mutex;
 
 use super::i18n::{self, Lang};
 use super::manager::ChatChannelManager;
-use super::session_bridge::{ActiveSession, PendingPrompt, SessionBridge};
+use super::session_bridge::{ActiveSession, PendingPrompt, SessionBridge, TurnDeliveryRoute};
 use super::types::{
     sender_log_key, ButtonStyle, ChannelMessageTarget, InteractiveMessage, MessageButton,
-    MessageLevel, RichMessage,
+    MessageLevel, RichMessage, WeixinPushMode,
 };
 use crate::acp::manager::ConnectionManager;
 use crate::acp::registry::all_acp_agents;
@@ -39,6 +39,8 @@ pub struct FollowupRequest<'a> {
     pub data_dir: &'a Path,
     pub lang: Lang,
     pub prefix: &'a str,
+    pub origin_message_id: Option<&'a str>,
+    pub push_mode: WeixinPushMode,
 }
 
 pub struct CommandMessageResult {
@@ -675,6 +677,8 @@ pub async fn handle_post_action(
     db: &DatabaseConnection,
     conn_mgr: &ConnectionManager,
     bridge: &Arc<Mutex<SessionBridge>>,
+    origin_message_id: Option<&str>,
+    push_mode: WeixinPushMode,
 ) -> Option<(RichMessage, ChannelMessageTarget)> {
     match action {
         CommandPostAction::SendLinkedPrompt {
@@ -687,6 +691,32 @@ pub async fn handle_post_action(
             response_target,
             lang,
         } => {
+            let route = match prepare_delivery_route(
+                db,
+                channel_id,
+                &sender_id,
+                conversation_id,
+                &connection_id,
+                origin_message_id,
+                push_mode,
+                &response_target,
+            )
+            .await
+            {
+                Ok(route) => route,
+                Err(error) => {
+                    return Some((RichMessage::error(error), response_target));
+                }
+            };
+            if origin_message_id.is_some() && route.is_none() {
+                return None;
+            }
+            if let Some(route) = route.clone() {
+                bridge
+                    .lock()
+                    .await
+                    .set_active_delivery(connection_id.clone(), route);
+            }
             if let Err(e) = send_chat_prompt_linked(
                 db,
                 conn_mgr,
@@ -694,9 +724,18 @@ pub async fn handle_post_action(
                 folder_id,
                 conversation_id,
                 &text,
+                route.as_ref().map(|route| route.client_message_id.clone()),
             )
             .await
             {
+                bridge.lock().await.take_active_delivery(&connection_id);
+                if let Some(route) = route {
+                    let _ = crate::db::service::chat_channel_delivery_service::mark_failed(
+                        db,
+                        &route.origin_id,
+                    )
+                    .await;
+                }
                 bridge.lock().await.remove(&connection_id);
                 if response_target.is_telegram_forum_topic() {
                     if let Ok(Some(binding)) =
@@ -723,6 +762,14 @@ pub async fn handle_post_action(
                     )),
                     response_target,
                 ));
+            }
+            if let Some(route) = route {
+                let _ = crate::db::service::chat_channel_delivery_service::mark_dispatched(
+                    db,
+                    &route.origin_id,
+                    &connection_id,
+                )
+                .await;
             }
             None
         }
@@ -1463,10 +1510,31 @@ async fn send_restored_followup(
     conversation_id: i32,
 ) -> RichMessage {
     let sender_key = sender_log_key(req.sender_id);
+    let route = match prepare_delivery_route(
+        req.db,
+        req.channel_id,
+        req.sender_id,
+        conversation_id,
+        &connection_id,
+        req.origin_message_id,
+        req.push_mode,
+        req.target,
+    )
+    .await
+    {
+        Ok(route) => route,
+        Err(error) => return RichMessage::error(error),
+    };
+    if req.origin_message_id.is_some() && route.is_none() {
+        return RichMessage::info(i18n::message_sent(req.lang));
+    }
     {
         let mut guard = req.bridge.lock().await;
         if let Some(session) = guard.get_mut(&connection_id) {
             session.forward_events = true;
+        }
+        if let Some(route) = route.clone() {
+            guard.set_active_delivery(connection_id.clone(), route);
         }
     }
     match send_chat_prompt_linked(
@@ -1476,10 +1544,19 @@ async fn send_restored_followup(
         folder_id,
         conversation_id,
         req.text,
+        route.as_ref().map(|route| route.client_message_id.clone()),
     )
     .await
     {
         Ok(()) => {
+            if let Some(route) = route.as_ref() {
+                let _ = crate::db::service::chat_channel_delivery_service::mark_dispatched(
+                    req.db,
+                    &route.origin_id,
+                    &connection_id,
+                )
+                .await;
+            }
             tracing::info!(
                 stage = "original_message_forwarded_after_restore",
                 channel_id = req.channel_id,
@@ -1493,12 +1570,14 @@ async fn send_restored_followup(
         }
         Err(crate::acp::error::AcpError::TurnInProgress) => {
             let mut guard = req.bridge.lock().await;
+            guard.take_active_delivery(&connection_id);
             if let Some(session) = guard.get_mut(&connection_id) {
                 session.forward_events = false;
                 session.pending_prompts.push_back(PendingPrompt {
                     text: req.text.to_string(),
                     folder_id,
                     conversation_id,
+                    delivery: route,
                 });
             }
             tracing::info!(
@@ -1513,6 +1592,14 @@ async fn send_restored_followup(
             RichMessage::info(i18n::task_deferred_busy(req.lang).to_string())
         }
         Err(e) => {
+            req.bridge.lock().await.take_active_delivery(&connection_id);
+            if let Some(route) = route {
+                let _ = crate::db::service::chat_channel_delivery_service::mark_failed(
+                    req.db,
+                    &route.origin_id,
+                )
+                .await;
+            }
             req.bridge.lock().await.remove(&connection_id);
             let _ = sender_context_service::clear_connection(req.db, req.channel_id, req.sender_id)
                 .await;
@@ -1592,6 +1679,13 @@ async fn send_followup_to_session(
     session_ref: CommandSessionRef,
 ) -> RichMessage {
     let connection_id = session_ref.connection_id;
+    let Some(conversation_id) = session_ref.conversation_id else {
+        return RichMessage::info(i18n::session_connection_lost(req.lang, req.prefix));
+    };
+    let conversation = match conversation_service::get_by_id(req.db, conversation_id).await {
+        Ok(conversation) => conversation,
+        Err(error) => return RichMessage::error(error.to_string()),
+    };
     {
         let bridge_guard = req.bridge.lock().await;
         if bridge_guard.get(&connection_id).is_none() {
@@ -1607,45 +1701,74 @@ async fn send_followup_to_session(
         }
     }
 
+    let route = match prepare_delivery_route(
+        req.db,
+        req.channel_id,
+        req.sender_id,
+        conversation_id,
+        &connection_id,
+        req.origin_message_id,
+        req.push_mode,
+        req.target,
+    )
+    .await
+    {
+        Ok(route) => route,
+        Err(error) => return RichMessage::error(error),
+    };
+    if req.origin_message_id.is_some() && route.is_none() {
+        return RichMessage::info(i18n::message_sent(req.lang));
+    }
     let was_forwarding = {
         let mut guard = req.bridge.lock().await;
         let Some(session) = guard.get_mut(&connection_id) else {
             return RichMessage::info(i18n::session_connection_lost(req.lang, req.prefix));
         };
-        std::mem::replace(&mut session.forward_events, true)
+        let was = std::mem::replace(&mut session.forward_events, true);
+        if let Some(route) = route.clone() {
+            guard.set_active_delivery(connection_id.clone(), route);
+        }
+        was
     };
-    if let Err(e) = send_chat_prompt(req.conn_mgr, &connection_id, req.text).await {
-        if let Some(session) = req.bridge.lock().await.get_mut(&connection_id) {
-            session.forward_events = was_forwarding;
+    if let Err(e) = send_chat_prompt_linked(
+        req.db,
+        req.conn_mgr,
+        &connection_id,
+        conversation.folder_id,
+        conversation_id,
+        req.text,
+        route.as_ref().map(|route| route.client_message_id.clone()),
+    )
+    .await
+    {
+        {
+            let mut guard = req.bridge.lock().await;
+            guard.take_active_delivery(&connection_id);
+            if let Some(session) = guard.get_mut(&connection_id) {
+                session.forward_events = was_forwarding;
+            }
         }
         if matches!(e, crate::acp::error::AcpError::TurnInProgress) {
             // Ordinary channel messages are durable user input. Keep bursts
             // that arrive during a cold restore / active turn in FIFO order;
             // Telegram forum topics retain their established busy response.
             if !req.target.is_telegram_forum_topic() {
-                if let Some(conversation_id) = session_ref.conversation_id {
-                    if let Ok(conversation) =
-                        conversation_service::get_by_id(req.db, conversation_id).await
-                    {
-                        if let Some(session) = req.bridge.lock().await.get_mut(&connection_id) {
-                            session.pending_prompts.push_back(PendingPrompt {
-                                text: req.text.to_string(),
-                                folder_id: conversation.folder_id,
-                                conversation_id,
-                            });
-                            tracing::info!(
-                                stage = "ordinary_message_queued",
-                                channel_id = req.channel_id,
-                                sender_key = sender_log_key(req.sender_id),
-                                conversation_id,
-                                queue_depth = session.pending_prompts.len(),
-                                "[ChatChannel] ordinary message queued behind active turn"
-                            );
-                            return RichMessage::info(
-                                i18n::task_deferred_busy(req.lang).to_string(),
-                            );
-                        }
-                    }
+                if let Some(session) = req.bridge.lock().await.get_mut(&connection_id) {
+                    session.pending_prompts.push_back(PendingPrompt {
+                        text: req.text.to_string(),
+                        folder_id: conversation.folder_id,
+                        conversation_id,
+                        delivery: route,
+                    });
+                    tracing::info!(
+                        stage = "ordinary_message_queued",
+                        channel_id = req.channel_id,
+                        sender_key = sender_log_key(req.sender_id),
+                        conversation_id,
+                        queue_depth = session.pending_prompts.len(),
+                        "[ChatChannel] ordinary message queued behind active turn"
+                    );
+                    return RichMessage::info(i18n::task_deferred_busy(req.lang).to_string());
                 }
             }
             return RichMessage::info(i18n::agent_busy_retry(req.lang).to_string());
@@ -1657,11 +1780,26 @@ async fn send_followup_to_session(
             let _ = sender_context_service::clear_connection(req.db, req.channel_id, req.sender_id)
                 .await;
         }
+        if let Some(route) = route {
+            let _ = crate::db::service::chat_channel_delivery_service::mark_failed(
+                req.db,
+                &route.origin_id,
+            )
+            .await;
+        }
         return RichMessage::error(format!(
             "{}{}",
             i18n::failed_to_send_message_label(req.lang),
             e
         ));
+    }
+    if let Some(route) = route.as_ref() {
+        let _ = crate::db::service::chat_channel_delivery_service::mark_dispatched(
+            req.db,
+            &route.origin_id,
+            &connection_id,
+        )
+        .await;
     }
 
     RichMessage::info(i18n::message_sent(req.lang))
@@ -1746,6 +1884,7 @@ async fn resume_topic_binding_and_send_followup(
         folder.id,
         conv.id,
         req.text,
+        None,
     )
     .await
     {
@@ -1945,21 +2084,6 @@ async fn spawn_chat_connection_for_conversation(
     Ok((connection_id, folder))
 }
 
-async fn send_chat_prompt(
-    conn_mgr: &ConnectionManager,
-    connection_id: &str,
-    text: &str,
-) -> Result<(), crate::acp::error::AcpError> {
-    conn_mgr
-        .send_prompt(
-            connection_id,
-            vec![PromptInputBlock::Text {
-                text: text.to_string(),
-            }],
-        )
-        .await
-}
-
 async fn send_chat_prompt_linked(
     db: &DatabaseConnection,
     conn_mgr: &ConnectionManager,
@@ -1967,9 +2091,10 @@ async fn send_chat_prompt_linked(
     folder_id: i32,
     conversation_id: i32,
     text: &str,
+    client_message_id: Option<String>,
 ) -> Result<(), crate::acp::error::AcpError> {
     conn_mgr
-        .send_prompt_linked(
+        .send_prompt_linked_with_message_id(
             &AppDatabase { conn: db.clone() },
             connection_id,
             vec![PromptInputBlock::Text {
@@ -1978,9 +2103,57 @@ async fn send_chat_prompt_linked(
             Some(folder_id),
             Some(conversation_id),
             None,
+            client_message_id,
         )
         .await
         .map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn prepare_delivery_route(
+    db: &DatabaseConnection,
+    channel_id: i32,
+    sender_id: &str,
+    conversation_id: i32,
+    connection_id: &str,
+    origin_message_id: Option<&str>,
+    push_mode: WeixinPushMode,
+    target: &ChannelMessageTarget,
+) -> Result<Option<TurnDeliveryRoute>, String> {
+    let Some(origin_message_id) = origin_message_id else {
+        return Ok(None);
+    };
+    let client_message_id = super::final_delivery::client_message_id(channel_id, origin_message_id);
+    let origin = super::final_delivery::register_origin(
+        db,
+        super::final_delivery::OriginRegistration {
+            channel_id,
+            sender_id,
+            conversation_id,
+            connection_id: Some(connection_id),
+            origin_message_id,
+            client_message_id: &client_message_id,
+            target,
+        },
+    )
+    .await?;
+    // Provider retries and process restarts may replay an inbound message.
+    // Only a route that has not yet been admitted may create a new agent turn.
+    if !matches!(origin.status.as_str(), "queued" | "dispatch_failed") {
+        tracing::info!(
+            stage = "inbound_origin_deduplicated",
+            channel_id,
+            conversation_id,
+            origin_status = %origin.status,
+            "[ChatChannel][final_delivery] duplicate inbound origin ignored"
+        );
+        return Ok(None);
+    }
+    Ok(Some(TurnDeliveryRoute {
+        origin_id: origin.id,
+        client_message_id,
+        push_mode,
+    }))
 }
 
 fn topic_has_active_session(lang: Lang, prefix: &str) -> String {
@@ -2172,6 +2345,8 @@ mod tests {
             data_dir: std::path::Path::new("/tmp/codeg-channel-restore-test"),
             lang: Lang::En,
             prefix: "/",
+            origin_message_id: None,
+            push_mode: WeixinPushMode::Debug,
         }
     }
 
@@ -2373,6 +2548,8 @@ mod tests {
             &db.conn,
             &ConnectionManager::new(),
             &Arc::new(Mutex::new(SessionBridge::new())),
+            None,
+            WeixinPushMode::Debug,
         )
         .await;
 
@@ -2781,6 +2958,7 @@ mod tests {
             folder_id,
             conv_id,
             "first task prompt",
+            None,
         )
         .await
         .expect("linked prompt send");
@@ -2855,6 +3033,8 @@ mod tests {
             data_dir: std::path::Path::new("/tmp/codeg-topic-followup-data"),
             lang: Lang::En,
             prefix: "/",
+            origin_message_id: None,
+            push_mode: WeixinPushMode::Debug,
         })
         .await;
 
@@ -2931,6 +3111,8 @@ mod tests {
             data_dir: std::path::Path::new("/tmp/codeg-topic-followup-data"),
             lang: Lang::En,
             prefix: "/",
+            origin_message_id: None,
+            push_mode: WeixinPushMode::Debug,
         })
         .await;
 

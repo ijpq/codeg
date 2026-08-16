@@ -1,21 +1,22 @@
 use sea_orm::entity::prelude::*;
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
-#[sea_orm(table_name = "chat_channel_message_log")]
+#[sea_orm(table_name = "chat_channel_turn_origin")]
 pub struct Model {
-    #[sea_orm(primary_key)]
-    pub id: i32,
+    #[sea_orm(primary_key, auto_increment = false)]
+    pub id: String,
     pub channel_id: i32,
-    pub direction: String,
-    pub message_type: String,
-    pub content_preview: String,
-    pub status: String,
-    pub error_detail: Option<String>,
-    pub origin_message_id: Option<String>,
+    pub sender_id: String,
+    pub conversation_id: i32,
+    pub connection_id: Option<String>,
+    pub origin_message_id: String,
+    pub client_message_id: String,
     pub turn_run_id: Option<String>,
-    pub final_result_id: Option<String>,
-    pub content_length: Option<i32>,
+    pub target_json: String,
+    pub status: String,
     pub created_at: DateTimeUtc,
+    pub updated_at: DateTimeUtc,
+    pub final_captured_at: Option<DateTimeUtc>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -26,11 +27,19 @@ pub enum Relation {
         to = "super::chat_channel::Column::Id"
     )]
     ChatChannel,
+    #[sea_orm(has_many = "super::chat_channel_outbox::Entity")]
+    Outbox,
 }
 
 impl Related<super::chat_channel::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::ChatChannel.def()
+    }
+}
+
+impl Related<super::chat_channel_outbox::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Outbox.def()
     }
 }
 

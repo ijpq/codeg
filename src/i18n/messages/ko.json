@@ -2993,8 +2993,7 @@
         "elapsedMinutes": "{value}분",
         "elapsedSeconds": "{value}초",
         "outputSpeedAria": "예상 출력 속도",
-        "outputSpeedTooltip": "예상 출력 속도（텍스트 + 추론）"
-,
+        "outputSpeedTooltip": "예상 출력 속도（텍스트 + 추론）",
         "toolUseCount": "도구 {count}회 사용",
         "diagnostics": {
           "open": "연결 진단",
@@ -3642,6 +3641,11 @@
     "defaultFolderId": "Folder ID",
     "defaultConversationId": "Conversation ID",
     "defaultAgentType": "Agent type",
+    "weixinPushMode": "WeChat push mode",
+    "weixinPushFinalOnly": "Final result only",
+    "weixinPushFinalAndInteractions": "Final result and required interactions",
+    "weixinPushDebug": "Debug mode",
+    "weixinPushModeHint": "Only the final answer is pushed by default. Expired reply tokens keep the result pending until the next inbound message.",
     "loadFailed": "채널 로딩에 실패했습니다.",
     "saveFailed": "저장에 실패했습니다.",
     "connectSuccess": "채널이 연결되었습니다.",

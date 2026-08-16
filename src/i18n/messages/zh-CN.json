@@ -2993,8 +2993,7 @@
         "elapsedMinutes": "{value} 分钟",
         "elapsedSeconds": "{value} 秒",
         "outputSpeedAria": "估算输出速度",
-        "outputSpeedTooltip": "估算输出速度（正文 + 思考）"
-,
+        "outputSpeedTooltip": "估算输出速度（正文 + 思考）",
         "toolUseCount": "{count} 次工具调用",
         "diagnostics": {
           "open": "连接诊断",
@@ -3654,6 +3653,11 @@
     "defaultFolderId": "文件夹 ID",
     "defaultConversationId": "会话 ID",
     "defaultAgentType": "Agent 类型",
+    "weixinPushMode": "微信推送模式",
+    "weixinPushFinalOnly": "仅最终结果",
+    "weixinPushFinalAndInteractions": "最终结果与必要交互",
+    "weixinPushDebug": "调试模式",
+    "weixinPushModeHint": "默认仅推送本次微信任务的最终回答；令牌过期时会保留结果，待下一条微信消息后补发。",
     "loadFailed": "加载渠道失败。",
     "saveFailed": "保存失败。",
     "connectSuccess": "渠道已连接。",

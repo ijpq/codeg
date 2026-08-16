@@ -2993,8 +2993,7 @@
         "elapsedMinutes": "{value}m",
         "elapsedSeconds": "{value}s",
         "outputSpeedAria": "Estimated output speed",
-        "outputSpeedTooltip": "Estimated output speed (text + thinking)"
-,
+        "outputSpeedTooltip": "Estimated output speed (text + thinking)",
         "toolUseCount": "{count} tool {count, plural, one {use} other {uses}}",
         "diagnostics": {
           "open": "Connection diagnostics",
@@ -3654,6 +3653,11 @@
     "defaultFolderId": "Folder ID",
     "defaultConversationId": "Conversation ID",
     "defaultAgentType": "Agent type",
+    "weixinPushMode": "WeChat push mode",
+    "weixinPushFinalOnly": "Final result only",
+    "weixinPushFinalAndInteractions": "Final result and required interactions",
+    "weixinPushDebug": "Debug mode",
+    "weixinPushModeHint": "By default, only this WeChat task's final answer is pushed. If the reply token expires, the result is retained until the next inbound message.",
     "loadFailed": "Failed to load channels.",
     "saveFailed": "Failed to save changes.",
     "connectSuccess": "Channel connected.",

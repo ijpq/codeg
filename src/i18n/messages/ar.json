@@ -2993,8 +2993,7 @@
         "elapsedMinutes": "{value}د",
         "elapsedSeconds": "{value}ث",
         "outputSpeedAria": "السرعة التقديرية للإخراج",
-        "outputSpeedTooltip": "السرعة التقديرية للإخراج (نص + تفكير)"
-,
+        "outputSpeedTooltip": "السرعة التقديرية للإخراج (نص + تفكير)",
         "toolUseCount": "{count} استخدام للأداة",
         "diagnostics": {
           "open": "تشخيص الاتصال",
@@ -3642,6 +3641,11 @@
     "defaultFolderId": "Folder ID",
     "defaultConversationId": "Conversation ID",
     "defaultAgentType": "Agent type",
+    "weixinPushMode": "WeChat push mode",
+    "weixinPushFinalOnly": "Final result only",
+    "weixinPushFinalAndInteractions": "Final result and required interactions",
+    "weixinPushDebug": "Debug mode",
+    "weixinPushModeHint": "Only the final answer is pushed by default. Expired reply tokens keep the result pending until the next inbound message.",
     "loadFailed": "فشل في تحميل القنوات.",
     "saveFailed": "فشل في حفظ التغييرات.",
     "connectSuccess": "تم توصيل القناة.",
