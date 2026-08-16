@@ -1794,7 +1794,9 @@ describe("TabProvider sub-session tabs", () => {
       latestContext?.openTab(1, 99, "codex", true)
     })
     await act(async () => {})
-    expect(getFolderConversationMock).toHaveBeenCalledWith(99)
+    expect(getFolderConversationMock).toHaveBeenCalledWith(99, {
+      userTurnLimit: 1,
+    })
     expect(
       latestContext?.tabs.find((tab) => tab.conversationId === 99)?.title
     ).toBe("Review the auth module")

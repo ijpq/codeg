@@ -7,7 +7,7 @@ use sea_orm::{
 };
 
 use crate::db::entities::conversation::ConversationKind;
-use crate::db::entities::{conversation, folder};
+use crate::db::entities::{conversation, conversation_branch, folder};
 use crate::db::error::DbError;
 use crate::models::{AgentType, DbConversationSummary};
 
@@ -946,7 +946,10 @@ pub async fn renormalize_external_id_alias(
 ) -> Result<(), DbError> {
     use sea_orm::sea_query::Expr;
     let mut query = conversation::Entity::update_many()
-        .col_expr(conversation::Column::ExternalId, Expr::value(external_id))
+        .col_expr(
+            conversation::Column::ExternalId,
+            Expr::value(external_id.clone()),
+        )
         .col_expr(conversation::Column::UpdatedAt, Expr::value(Utc::now()))
         .filter(conversation::Column::Id.eq(conversation_id))
         .filter(conversation::Column::DeletedAt.is_null());
@@ -954,7 +957,23 @@ pub async fn renormalize_external_id_alias(
         Some(old) => query.filter(conversation::Column::ExternalId.eq(old)),
         None => query.filter(conversation::Column::ExternalId.is_null()),
     };
-    query.exec(conn).await?;
+    let updated = query.exec(conn).await?;
+    // Keep branch audit metadata converged whenever a restored connection
+    // refreshes a conversation's external id. New branches now persist only
+    // after session/new is prompt-ready, but older rows may still need this
+    // repair path; ordinary rows simply match no branch row.
+    // Respect the alias CAS above: a concurrent rebind that made the
+    // conversation update a no-op must not update branch metadata either.
+    if updated.rows_affected > 0 {
+        conversation_branch::Entity::update_many()
+            .col_expr(
+                conversation_branch::Column::BranchSessionId,
+                Expr::value(external_id),
+            )
+            .filter(conversation_branch::Column::BranchConversationId.eq(conversation_id))
+            .exec(conn)
+            .await?;
+    }
     Ok(())
 }
 

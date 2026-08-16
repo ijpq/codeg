@@ -74,14 +74,11 @@ describe("ConversationDetailPanel new conversation layout", () => {
     expect(welcomeBranch).toContain("tall")
   })
 
-  it("snaps the hidden keep-alive tab so `transition-all` descendants don't ghost", () => {
-    // Inactive tabs stay mounted and hide with `visibility: hidden` (`invisible`).
-    // In Tailwind v4 `transition-all` transitions `visibility` too, so welcome
-    // controls (agent pills, quick-action tabs, composer buttons) would linger
-    // 150–300ms as ghosts over the newly-active conversation. The wrapper must
-    // carry `conversation-tab-hidden` next to `invisible`, and globals.css must
-    // drop transitions for that subtree so visibility snaps. Both halves are
-    // required — assert they stay coupled.
+  it("snaps the hidden controller wrapper so transitions cannot ghost", () => {
+    // The inactive tab's lightweight controller stays mounted while its heavy
+    // content subtree is suspended. Keep the visibility snap coupled to the
+    // wrapper so a just-deactivated subtree cannot transition over the newly
+    // active conversation during the same commit.
     expect(source).toContain(
       '"conversation-tab-hidden absolute inset-0 invisible pointer-events-none"'
     )
@@ -153,6 +150,46 @@ describe("ConversationDetailPanel new conversation layout", () => {
     // A backgrounded conversation tab behind the selected one.
     expect(source).toContain(
       "<OverlayHostHiddenProvider hidden={!canTileG && !visible}>"
+    )
+  })
+
+  it("loads persisted history only for visible keep-alive tabs", () => {
+    expect(source).toContain("shouldLoadDetail={visible}")
+    expect(source).toContain(
+      "useConversationDetail(effectiveConversationId, {\n    enabled: shouldLoadDetail,"
+    )
+    expect(source).toContain(
+      "preserveLiveOnInitialFetch: usesPersistedDetailIdentity"
+    )
+  })
+
+  it("suspends hidden heavy UI while keeping the tab controller mounted", () => {
+    expect(source).toContain("shouldRenderContent={visible}")
+    expect(source).toContain("if (!shouldRenderContent) {")
+
+    const controllerStart = source.indexOf(
+      "const ConversationTabView = memo(function ConversationTabView"
+    )
+    const connectionController = source.indexOf(
+      "useConnectionLifecycle({",
+      controllerStart
+    )
+    const contentGate = source.indexOf(
+      "if (!shouldRenderContent) {",
+      controllerStart
+    )
+    const heavyContent = source.indexOf("<ConversationShell", contentGate)
+
+    expect(connectionController).toBeGreaterThan(controllerStart)
+    expect(contentGate).toBeGreaterThan(connectionController)
+    expect(heavyContent).toBeGreaterThan(contentGate)
+  })
+
+  it("flushes the active draft before its composer is suspended", () => {
+    expect(messageInputSource).toContain("const persistDraftNow = useCallback(")
+    expect(messageInputSource).toContain("onBlur={persistDraftNow}")
+    expect(messageInputSource).toContain(
+      "saveMessageInputDraft(effectiveDraftStorageKey, text)"
     )
   })
 
@@ -356,7 +393,15 @@ describe("ConversationDetailPanel chat-mode send path", () => {
     // allowOfflineCompose let the user send before connecting, which is what
     // parked the first prompt in the never-flushed queue. The composer now
     // waits for `connected` like a normal conversation.
-    expect(source).not.toContain("allowOfflineCompose")
+    const welcomeStart = source.indexOf("<ChatInput")
+    const welcomeEnd = source.indexOf("</ScrollArea>", welcomeStart)
+    const welcomeComposer = source.slice(welcomeStart, welcomeEnd)
+    expect(welcomeComposer).not.toContain("allowOfflineCompose")
+    // Historical conversations are intentionally different: their persisted
+    // queue accepts drafts while session/load is still restoring.
+    expect(source).toContain(
+      "allowOfflineCompose={hasPersistedConversation && !connectionReady}"
+    )
   })
 
   it("surfaces a non-silent error when the eager scratch-dir prepare fails", () => {
@@ -378,7 +423,14 @@ describe("ConversationDetailPanel send-path hardening", () => {
     // cwd; sending then would hit the wrong workspace. handleSend must gate on
     // the readiness predicate (connected AND cwd matches), like the flush effect.
     expect(source).toContain("isConnectionReady(")
-    expect(source).toContain("if (!connectionReady) return")
+    expect(source).toContain("if (!connectionReady) {")
+    expect(source).toContain('state: "waiting_session_restore"')
+  })
+
+  it("settles reload-surviving queue items from durable acceptance receipts", () => {
+    expect(source).toContain("Boolean(run.prompt_accepted_at)")
+    expect(source).toContain("acceptedIds.has(item.clientMessageId)")
+    expect(source).toContain("mqRemove(item.id)")
   })
 
   it("gates the queue auto-flush on the SAME readiness predicate as the send", () => {

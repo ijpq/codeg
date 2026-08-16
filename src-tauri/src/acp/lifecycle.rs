@@ -24,9 +24,10 @@ use crate::acp::internal_bus::InternalEventBus;
 use crate::acp::manager::ConnectionManager;
 use crate::acp::session_state::SessionState;
 use crate::acp::types::{AcpEvent, ConnectionStatus, EventEnvelope};
+use crate::artifact_tracker::ArtifactTurnFinishStatus;
 use crate::db::entities::conversation::ConversationStatus;
 use crate::db::error::DbError;
-use crate::db::service::conversation_service;
+use crate::db::service::{conversation_branch_service, conversation_service};
 use crate::logging::throttle::{LagLogThrottle, LAG_LOG_WINDOW};
 use crate::models::AgentType;
 use crate::web::event_bridge::{emit_with_state, EventEmitter};
@@ -208,14 +209,32 @@ pub(crate) async fn handle_event(
                 (snap.conversation_id, snap.agent_type)
             };
             if let Some(cid) = conversation_id {
-                // Guarded bind: the row may already be bound to a DIFFERENT
-                // session. That is legitimate for a fork (which has already
-                // inserted the sibling holding the outgoing id, so this is a
-                // plain re-point) and for a custom agent continuing its
-                // conversation under a new session (`continues`), and
-                // destructive otherwise — a session re-minted under a live
-                // binding would otherwise overwrite the id the row's whole
-                // history hangs off. See codeg#500.
+                // session/new publishes an id before Codex has a durable
+                // rollout. A provisional snapshot branch promotes that id only
+                // after the snapshot and first real user prompt are accepted.
+                if conversation_branch_service::is_provisional_snapshot(db_conn, cid).await? {
+                    conversation_branch_service::mark_initialization_state(
+                        db_conn,
+                        cid,
+                        "connection_ready",
+                        Some(envelope.connection_id.clone()),
+                        None,
+                        false,
+                    )
+                    .await?;
+                    tracing::info!(
+                        branch_conversation_id = cid,
+                        connection_id = %envelope.connection_id,
+                        external_session_id = %session_id,
+                        lifecycle_state = "connection_ready",
+                        session_verification_result = "not_durable_until_first_prompt",
+                        "[ACP][branch] skipped premature external session persistence"
+                    );
+                    return Ok(());
+                }
+                // Guarded bind: a non-provisional row may already be bound to a
+                // different session. Preserve that history instead of silently
+                // overwriting its owning id (codeg#500).
                 let continues = crate::acp::continued_session_ids(agent_type, session_id);
                 let preserved =
                     conversation_service::bind_external_id(db_conn, cid, session_id, &continues)
@@ -235,6 +254,20 @@ pub(crate) async fn handle_event(
             Ok(())
         }
         AcpEvent::TurnComplete { stop_reason, .. } => {
+            let artifact_status = if stop_reason == "end_turn" {
+                ArtifactTurnFinishStatus::Completed
+            } else {
+                ArtifactTurnFinishStatus::Cancelled
+            };
+            manager
+                .finish_artifact_turn(
+                    &envelope.connection_id,
+                    envelope.seq,
+                    artifact_status,
+                    Some(stop_reason.clone()),
+                )
+                .await;
+
             // Centralized status transition: when the agent reports the turn
             // is done, flip the conversation row and re-broadcast the change
             // as `ConversationStatusChanged`. This lives in the lifecycle
@@ -478,6 +511,17 @@ async fn handle_terminal_event(
         return Ok(());
     };
     let cid = entry.conversation_id;
+    if conversation_branch_service::is_provisional_snapshot(db_conn, cid).await? {
+        tracing::info!(
+            branch_conversation_id = cid,
+            connection_id,
+            lifecycle_state = "provisional",
+            idle_sweep_action = "connection_disconnected_branch_preserved",
+            snapshot_consumed_at = ?Option::<chrono::DateTime<chrono::Utc>>::None,
+            "[ACP][branch] transient disconnect preserved provisional branch"
+        );
+        return Ok(());
+    }
     let changed = conversation_service::update_status_if(
         db_conn,
         cid,
@@ -1497,6 +1541,14 @@ async fn connection_worker_loop(
                 if terminal_dispatched {
                     continue;
                 }
+                manager
+                    .finish_artifact_turn(
+                        &connection_id,
+                        envelope.seq,
+                        ArtifactTurnFinishStatus::Interrupted,
+                        Some("connection_disconnected".to_string()),
+                    )
+                    .await;
                 if let Err(e) = handle_terminal_event(&db, &mut cache, &connection_id).await {
                     tracing::error!("[lifecycle][ERROR] terminal event for {connection_id}: {e}");
                 }
@@ -1529,6 +1581,18 @@ async fn connection_worker_loop(
                 if terminal_dispatched {
                     continue;
                 }
+                manager
+                    .finish_artifact_turn(
+                        &connection_id,
+                        envelope.seq,
+                        ArtifactTurnFinishStatus::Interrupted,
+                        Some(
+                            code.as_deref()
+                                .map(|code| format!("terminal_error:{code}"))
+                                .unwrap_or_else(|| "terminal_error".to_string()),
+                        ),
+                    )
+                    .await;
                 // Genuinely terminal (the `run_connection` failure path at
                 // `connection.rs:493`). Drain the broker NOW with the error
                 // detail instead of waiting for the trailing `Disconnected`.
@@ -1745,6 +1809,13 @@ mod tests {
             state: Arc::new(RwLock::new(state)),
             emitter: EventEmitter::Noop,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
+            steer_lock: Arc::new(tokio::sync::Mutex::new(())),
+            completed_steers: Arc::new(tokio::sync::Mutex::new(
+                std::collections::VecDeque::new(),
+            )),
+            accepted_prompt_ids: Arc::new(tokio::sync::Mutex::new(
+                std::collections::VecDeque::new(),
+            )),
             config_fingerprint: String::new(),
             last_observed_fingerprint: String::new(),
             child_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -2264,6 +2335,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn idle_disconnect_preserves_unconsumed_provisional_branch() {
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/term-provisional").await;
+        let source_id =
+            test_helpers::seed_conversation(&db, folder_id, AgentType::ClaudeCode).await;
+        let source = conversation_service::get_by_id(&db.conn, source_id)
+            .await
+            .unwrap();
+        let (branch, _) = conversation_branch_service::create_branch_row(
+            &db.conn,
+            &source,
+            None,
+            None,
+            "snapshot",
+            conversation_branch_service::BranchInheritanceRecord {
+                source_session_id: None,
+                branch_session_id: None,
+                inheritance_mode: "structured_snapshot".into(),
+                inherited_message_count: 1,
+                inherited_context_chars: 7,
+                inherited_estimated_tokens: 2,
+                inheritance_compressed: false,
+                inheritance_truncated: false,
+                inheritance_note: None,
+                forked_through_at: None,
+                snapshot_version: 2,
+                snapshot_context: Some("context".into()),
+                snapshot_images: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        // Reproduce the old bad status so the lifecycle guard, rather than the
+        // create-time PendingReview default alone, proves the idle invariant.
+        conversation_service::update_status(&db.conn, branch.id, ConversationStatus::InProgress)
+            .await
+            .unwrap();
+
+        let mgr = ConnectionManager::new();
+        mgr.connections.lock().await.insert(
+            "branch-idle".into(),
+            fake_connection_with_state("branch-idle", Some(branch.id)),
+        );
+        let mut cache = HashMap::new();
+        seed_cache(&mut cache, &mgr, "branch-idle", branch.id).await;
+        handle_terminal_event(&db.conn, &mut cache, "branch-idle")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            read_row_status(&db, branch.id).await,
+            ConversationStatus::InProgress,
+            "an idle disconnect is not a user cancellation"
+        );
+        assert!(
+            conversation_branch_service::pending_snapshot(&db.conn, branch.id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
     async fn handle_terminal_event_preserves_pending_review() {
         let db = test_helpers::fresh_in_memory_db().await;
         let folder_id = test_helpers::seed_folder(&db, "/tmp/term-pr").await;
@@ -2443,7 +2577,10 @@ mod tests {
         let env = EventEnvelope {
             seq: 1,
             connection_id: "c1".to_string(),
-            payload: AcpEvent::ContentDelta { text: "hi".into(), parent_tool_use_id: None },
+            payload: AcpEvent::ContentDelta {
+                text: "hi".into(),
+                parent_tool_use_id: None,
+            },
         };
         handle_event(&db.conn, &mgr, &env, None).await.unwrap();
 

@@ -2198,7 +2198,7 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
       if (childSummaryInFlight.has(id)) continue
       childSummaryInFlight.add(id)
       const epoch = seedEpoch
-      void getFolderConversation(id)
+      void getFolderConversation(id, { userTurnLimit: 1 })
         .then((detail) => {
           if (seedEpoch !== epoch) return
           const buffered = childSeedBuffer.get(id)

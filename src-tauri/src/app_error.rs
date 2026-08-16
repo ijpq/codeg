@@ -86,10 +86,22 @@ pub enum AppErrorCode {
     ExternalCommandFailed,
     WindowOperationFailed,
     TaskExecutionFailed,
+    /// The frontend referenced an ACP connection that has already been
+    /// detached or reaped. Callers may restore the conversation and retry the
+    /// same client message id.
+    ConnectionNotFound,
+    /// The ACP process ended before it could accept the requested operation.
+    /// Callers may restore the conversation and retry the same client message
+    /// id when the operation is known not to have been accepted.
+    ProcessExited,
     /// A prompt was rejected because a turn is already in flight on the
     /// connection (a second, concurrent send). Maps to HTTP 409 — an expected,
     /// recoverable condition in multi-client co-control, not a server fault.
     TurnInProgress,
+    /// Native guide request raced a completed turn.
+    NoActiveSteerTurn,
+    /// The adapter/app-server does not implement native steering.
+    SteerUnsupported,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, thiserror::Error)]
@@ -191,6 +203,14 @@ impl AppCommandError {
 
     pub fn task_execution_failed(message: impl Into<String>) -> Self {
         Self::new(AppErrorCode::TaskExecutionFailed, message)
+    }
+
+    pub fn connection_not_found(message: impl Into<String>) -> Self {
+        Self::new(AppErrorCode::ConnectionNotFound, message)
+    }
+
+    pub fn process_exited(message: impl Into<String>) -> Self {
+        Self::new(AppErrorCode::ProcessExited, message)
     }
 
     pub fn io(err: std::io::Error) -> Self {
