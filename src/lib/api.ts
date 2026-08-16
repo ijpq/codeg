@@ -1,5 +1,6 @@
 import {
   getActiveRemoteConnectionId,
+  getServerBaseUrl,
   getShellTransport,
   getTransport,
   isDesktop,
@@ -59,6 +60,7 @@ import type {
   SidebarData,
   ConnectionInfo,
   ConversationConnectionInfo,
+  RestoredConversationConnectionInfo,
   LiveSessionSnapshot,
   FeedbackItem,
   QuestionAnswer,
@@ -100,6 +102,9 @@ import type {
   ImportSelectedResult,
   ScanResult,
   SelectedSessionKey,
+  ConversationDeliverable,
+  ConversationDeliverableHistoryPage,
+  ConversationTurnDeliverableSet,
   OpenedTab,
   OpenedTabsSnapshot,
   SaveTabsOutcome,
@@ -120,12 +125,14 @@ import type {
   FolderCommand,
   TerminalInfo,
   PromptInputBlock,
+  SteerResult,
   FileTreeNode,
   WorkspaceFileEntry,
   DirectoryEntry,
   DirectoryItem,
   UploadAttachmentResult,
   FilePreviewContent,
+  WorkspaceFileStat,
   FileEditContent,
   FileSaveResult,
   WorkspaceSnapshotResponse,
@@ -158,6 +165,7 @@ import type {
   ChatChannelMessageLog,
   WebhookConfig,
   ModelProviderInfo,
+  ModelProviderProbeResult,
   UpdateModelProviderResult,
   PluginCheckSummary,
   OpenCodeCatalogProvider,
@@ -269,6 +277,23 @@ export function stripUploadedImagePayloads(
   })
 }
 
+/**
+ * Restore a persisted conversation using the DB row's authoritative agent,
+ * folder and external session id. The backend returns only after resume/load,
+ * MCP configuration and the conversation→connection switchover all succeed.
+ */
+export async function acpRestoreConversation(
+  conversationId: number,
+  preferredModeId?: string | null,
+  preferredConfigValues?: Record<string, string> | null
+): Promise<RestoredConversationConnectionInfo> {
+  return getTransport().call("acp_restore_conversation", {
+    conversationId,
+    preferredModeId: preferredModeId ?? null,
+    preferredConfigValues: preferredConfigValues ?? null,
+  })
+}
+
 export async function acpPrompt(
   connectionId: string,
   blocks: PromptInputBlock[],
@@ -277,22 +302,47 @@ export async function acpPrompt(
   clientMessageId: string | null = null
 ): Promise<void> {
   try {
-    await getTransport().call("acp_prompt", {
-      connectionId,
-      // Strip in every mode where the prompt leaves through an HTTP body:
-      // pure web (`!isDesktop`) and desktop-attached-to-remote-workspace.
-      blocks: stripUploadedImagePayloads(
-        blocks,
-        !isDesktop() || getActiveRemoteConnectionId() !== null
-      ),
-      folderId,
-      conversationId,
-      clientMessageId,
-    })
+    const transport = getTransport()
+    // A remote-desktop window can retain a healthy HTTP path while its event
+    // WebSocket is still re-attaching. Wait for the stream first so the
+    // cross-client UserMessage acknowledgement cannot fall into that gap.
+    await transport.waitForReady?.()
+    await transport.call(
+      "acp_prompt",
+      {
+        connectionId,
+        // Strip in every mode where the prompt leaves through an HTTP body:
+        // pure web (`!isDesktop`) and desktop-attached-to-remote-workspace.
+        blocks: stripUploadedImagePayloads(
+          blocks,
+          !isDesktop() || getActiveRemoteConnectionId() !== null
+        ),
+        folderId,
+        conversationId,
+        clientMessageId,
+      },
+      // RemoteDesktopTransport otherwise cancels the request after 30s. Cold
+      // recursive workspace watcher setup happens before prompt enqueue so a
+      // large/network workspace can legitimately need longer; cancellation in
+      // that window means the agent never receives the message.
+      { timeoutMs: 120_000 }
+    )
   } catch (e) {
     if (isTurnInProgressRejection(e)) throw new TurnBusyError()
     throw e
   }
+}
+
+export async function acpSteer(
+  connectionId: string,
+  blocks: PromptInputBlock[],
+  clientMessageId: string
+): Promise<SteerResult> {
+  return getTransport().call("acp_steer", {
+    connectionId,
+    blocks,
+    clientMessageId,
+  })
 }
 
 export async function acpSetMode(
@@ -2077,12 +2127,23 @@ export async function importSelectedSessions(
  */
 export async function getFolderConversation(
   conversationId: number,
-  window?: { tailTurns?: number; fromIndex?: number }
+  options?: {
+    tailTurns?: number
+    fromIndex?: number
+    beforeCursor?: string | null
+    userTurnLimit?: number | null
+  }
 ): Promise<DbConversationDetail> {
   return getTransport().call("get_folder_conversation", {
     conversationId,
-    ...(window?.tailTurns != null ? { tailTurns: window.tailTurns } : {}),
-    ...(window?.fromIndex != null ? { fromIndex: window.fromIndex } : {}),
+    ...(options?.tailTurns != null ? { tailTurns: options.tailTurns } : {}),
+    ...(options?.fromIndex != null ? { fromIndex: options.fromIndex } : {}),
+    ...(options?.beforeCursor !== undefined
+      ? { beforeCursor: options.beforeCursor }
+      : {}),
+    ...(options?.userTurnLimit !== undefined
+      ? { userTurnLimit: options.userTurnLimit }
+      : {}),
   })
 }
 
@@ -2967,6 +3028,105 @@ export async function createConversation(
   })
 }
 
+export interface CreateConversationBranchRequest {
+  sourceConversationId: number
+  forkMessageId?: string | null
+  preferredModeId?: string | null
+  preferredConfigValues?: Record<string, string>
+}
+
+export interface CreateConversationBranchResult {
+  branchConversationId: number
+  sourceConversationId: number
+  folderId: number
+  connectionId?: string | null
+  branchSessionId?: string | null
+  sessionReady: boolean
+  promptReady: boolean
+  lifecycleState: string
+  forkMode: "native" | "snapshot"
+  inheritanceMode: "native_fork" | "full_replay" | "structured_snapshot"
+  inheritedMessageCount: number
+  inheritanceTruncated: boolean
+  fallbackReason?: string | null
+}
+
+export interface ConversationBranchInfo {
+  branchConversationId: number
+  sourceConversationId: number
+  sourceTitle?: string | null
+  sourceAvailable: boolean
+  forkMessageId?: string | null
+  forkMode: "native" | "snapshot"
+  sourceSessionId?: string | null
+  branchSessionId?: string | null
+  inheritanceMode: "native_fork" | "full_replay" | "structured_snapshot"
+  inheritedMessageCount: number
+  inheritedContextChars: number
+  inheritedEstimatedTokens: number
+  inheritanceCompressed: boolean
+  inheritanceTruncated: boolean
+  inheritanceNote?: string | null
+  forkedThroughAt?: string | null
+  snapshotVersion: number
+  snapshotConsumedAt?: string | null
+  lifecycleState: string
+  lifecycleError?: string | null
+  lifecycleUpdatedAt?: string | null
+  sessionVerifiedAt?: string | null
+  firstPromptClientMessageId?: string | null
+  firstPromptQueuedAt?: string | null
+  firstPromptAcceptedAt?: string | null
+  initializationRetryCount: number
+  lastConnectionId?: string | null
+  snapshotDigest?: string | null
+  createdAt: string
+  lastMergedAt?: string | null
+  mergeTargetConversationId?: number | null
+}
+
+export interface MergeConversationBranchResult {
+  mergeId: string
+  targetConversationId: number
+  copiedDeliverableCount: number
+  deduplicated: boolean
+}
+
+export async function createConversationBranch(
+  request: CreateConversationBranchRequest
+): Promise<CreateConversationBranchResult> {
+  return getTransport().call(
+    "create_conversation_branch",
+    { request },
+    // Native fork may spend one handshake timeout proving the source session
+    // unusable before the independent snapshot session/new fallback performs
+    // its own full readiness handshake.
+    { timeoutMs: 180_000 }
+  )
+}
+
+export async function getConversationBranchInfo(
+  conversationId: number
+): Promise<ConversationBranchInfo | null> {
+  return getTransport().call("get_conversation_branch_info", {
+    conversationId,
+  })
+}
+
+export async function mergeConversationBranch(params: {
+  branchConversationId: number
+  requestId: string
+  summary: string
+  deliverableIds?: string[]
+}): Promise<MergeConversationBranchResult> {
+  return getTransport().call("merge_conversation_branch", {
+    branchConversationId: params.branchConversationId,
+    requestId: params.requestId,
+    summary: params.summary,
+    deliverableIds: params.deliverableIds ?? [],
+  })
+}
+
 /**
  * Create a folderless "chat mode" conversation. The backend lazily creates a
  * dated per-conversation scratch dir and a dedicated hidden chat folder
@@ -3526,12 +3686,10 @@ export async function listDirectoryWithFiles(
   return getTransport().call("list_directory_with_files", { path })
 }
 
-// Hard ceiling for a single attachment, kept in lockstep with the server's
-// `UPLOAD_MAX_BYTES` (`web/handlers/files.rs`, mirrored in
-// `commands/remote_proxy.rs`). Sized to match the desktop drag-drop image
-// limit (`DRAG_DROP_IMAGE_MAX_BYTES`) so the same screenshot attaches in
-// every mode; oversize is rejected up front with a visible toast.
-export const UPLOAD_MAX_BYTES = 20 * 1024 * 1024
+// Attachments upload with no per-file size limit by default. An optional cap
+// (`CODEG_UPLOAD_MAX_ATTACHMENT_BYTES`) is enforced server-side; when it fires,
+// the handler stamps `UPLOAD_I18N_KEY_TOO_LARGE` with the effective `limit`, so
+// the client no longer pre-filters by a hardcoded ceiling.
 
 // `btoa` only accepts a binary string, and `String.fromCharCode(...bytes)`
 // hits the call-stack limit somewhere around a few hundred KB. Chunk the
@@ -4178,6 +4336,13 @@ export async function readFilePreview(
   return getTransport().call("read_file_preview", { rootPath, path })
 }
 
+export async function statWorkspaceFile(
+  rootPath: string,
+  path: string
+): Promise<WorkspaceFileStat> {
+  return getTransport().call("stat_workspace_file", { rootPath, path })
+}
+
 export async function readFileForEdit(
   rootPath: string,
   path: string
@@ -4614,6 +4779,15 @@ export async function updateModelProvider(params: {
 
 export async function deleteModelProvider(id: number): Promise<void> {
   return getTransport().call("delete_model_provider", { id })
+}
+
+/** Probe the reachability + latency of the custom provider bound to `agentType`.
+ *  Used by the streaming-diagnostics panel's "test link" button to tell a
+ *  stalled network path (CF tunnel / VPS) apart from a model still working. */
+export async function probeActiveModelProvider(
+  agentType: string
+): Promise<ModelProviderProbeResult> {
+  return getTransport().call("probe_active_model_provider", { agentType })
 }
 
 // ─── Delegation settings ───────────────────────────────────────────────
@@ -5381,4 +5555,190 @@ export async function forgeSettingsSet(
   settings: ForgePanelSettings | null
 ): Promise<ForgeSettingsStore> {
   return getTransport().call("forge_settings_set", { folderId, settings })
+}
+
+// ─── Confirmed deliverables ───
+
+export interface DeliverableCapabilities {
+  hostOs: string
+  openWithDefaultApp: boolean
+  copyFiles: boolean
+  revealInFolder: boolean
+  /** Native open/copy/reveal actions affect the Codeg host, not this browser. */
+  hostActionNotice: boolean
+}
+
+export interface DeliverableOperationResult {
+  affected: number
+}
+
+export interface DeliverableSaveResult {
+  savedPath: string
+  bytes: number
+}
+
+export async function getDeliverableCapabilities(): Promise<DeliverableCapabilities> {
+  return getTransport().call<DeliverableCapabilities>(
+    "deliverable_capabilities",
+    {}
+  )
+}
+
+export async function listConversationDeliverables(
+  conversationId: number
+): Promise<ConversationDeliverable[]> {
+  return getTransport().call<ConversationDeliverable[]>(
+    "list_conversation_deliverables",
+    { conversationId }
+  )
+}
+
+export async function listConversationDeliverableHistory(
+  conversationId: number,
+  offset = 0,
+  limit = 25
+): Promise<ConversationDeliverableHistoryPage> {
+  return getTransport().call<ConversationDeliverableHistoryPage>(
+    "list_conversation_deliverable_history",
+    { conversationId, offset, limit }
+  )
+}
+
+export async function listTurnDeliverables(
+  conversationId: number,
+  turnRunId: string
+): Promise<ConversationDeliverable[]> {
+  return getTransport().call<ConversationDeliverable[]>(
+    "list_turn_deliverables",
+    { conversationId, turnRunId }
+  )
+}
+
+export async function listConversationDeliverableRuns(
+  conversationId: number
+): Promise<ConversationTurnDeliverableSet[]> {
+  return getTransport().call<ConversationTurnDeliverableSet[]>(
+    "list_conversation_deliverable_runs",
+    { conversationId }
+  )
+}
+
+export async function copyDeliverableFiles(
+  conversationId: number,
+  deliverableIds: string[]
+): Promise<DeliverableOperationResult> {
+  return getTransport().call<DeliverableOperationResult>("copy_deliverables", {
+    conversationId,
+    deliverableIds,
+  })
+}
+
+export async function openDeliverable(
+  conversationId: number,
+  deliverableId: string
+): Promise<DeliverableOperationResult> {
+  return getTransport().call<DeliverableOperationResult>("open_deliverable", {
+    conversationId,
+    deliverableId,
+  })
+}
+
+export async function revealDeliverable(
+  conversationId: number,
+  deliverableId: string
+): Promise<DeliverableOperationResult> {
+  return getTransport().call<DeliverableOperationResult>("reveal_deliverable", {
+    conversationId,
+    deliverableId,
+  })
+}
+
+export async function hideDeliverables(
+  conversationId: number,
+  deliverableIds: string[]
+): Promise<DeliverableOperationResult> {
+  return getTransport().call<DeliverableOperationResult>("hide_deliverables", {
+    conversationId,
+    deliverableIds,
+  })
+}
+
+export async function downloadDeliverables(args: {
+  conversationId: number
+  deliverableIds: string[]
+  archive?: boolean
+  suggestedName?: string
+}): Promise<WorkspaceDownloadResult> {
+  const archive = Boolean(args.archive || args.deliverableIds.length !== 1)
+  const suggestedName =
+    args.suggestedName ??
+    (archive ? `codeg-deliverables-${args.conversationId}.zip` : "deliverable")
+
+  if (isDesktop() && !isRemoteDesktopMode()) {
+    const { save } = await import("@tauri-apps/plugin-dialog")
+    const destination = await save({ defaultPath: suggestedName })
+    if (!destination) return { status: WORKSPACE_DOWNLOAD_CANCELLED }
+    const result = await getShellTransport().call<DeliverableSaveResult>(
+      "save_deliverables",
+      {
+        conversationId: args.conversationId,
+        deliverableIds: args.deliverableIds,
+        archive,
+        destination,
+      },
+      { timeoutMs: 600_000 }
+    )
+    return {
+      status: "done",
+      savedPath: result.savedPath,
+      bytes: result.bytes,
+    }
+  }
+
+  if (isRemoteDesktopMode()) {
+    const connectionId = getActiveRemoteConnectionId()
+    if (connectionId === null) {
+      throw new Error("downloadDeliverables (remote): no active connection")
+    }
+    const { save } = await import("@tauri-apps/plugin-dialog")
+    const savePath = await save({ defaultPath: suggestedName })
+    if (!savePath) return { status: WORKSPACE_DOWNLOAD_CANCELLED }
+    const { invoke } = await import("@tauri-apps/api/core")
+    try {
+      const result = await invoke<{ transferId: string; bytes: number }>(
+        "remote_download_deliverables",
+        {
+          connectionId,
+          conversationId: args.conversationId,
+          deliverableIds: args.deliverableIds,
+          archive,
+          savePath,
+        }
+      )
+      return {
+        status: "done",
+        savedPath: savePath,
+        bytes: result.bytes,
+        transferId: result.transferId,
+      }
+    } catch (error) {
+      if (isRemoteAuthenticationFailed(error)) {
+        notifyRemoteDesktopUnauthorized()
+      }
+      throw error
+    }
+  }
+
+  const ticket = await getTransport().call<WorkspaceDownloadTicket>(
+    "create_deliverable_download_ticket",
+    {
+      conversationId: args.conversationId,
+      deliverableIds: args.deliverableIds,
+      archive,
+    }
+  )
+  const base = getServerBaseUrl() || window.location.origin
+  const url = new URL(ticket.url, `${base.replace(/\/+$/, "")}/`).toString()
+  openBrowserDownloadUrl(url, ticket.filename || suggestedName)
+  return { status: "started" }
 }

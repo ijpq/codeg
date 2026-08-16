@@ -119,6 +119,26 @@ pub struct DbConversationDetail {
     /// mid-stream, which would otherwise double-render against the live reply.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub in_flight_user_turn_id: Option<String>,
+    /// Filesystem changes captured by the backend for each accepted ACP turn.
+    /// Unlike transcript-derived tool calls these rows survive frontend
+    /// disconnects. They are diagnostic change records, not user-facing final
+    /// deliverables.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifact_runs: Vec<ConversationTurnArtifactRun>,
+    /// Legacy conversation-wide aggregate retained for wire compatibility.
+    /// Detail reads leave this empty; clients use `deliverable_runs` for inline
+    /// cards and the paged deliverable-history endpoint for the ledger.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deliverables: Vec<ConversationDeliverable>,
+    /// Per-turn associations for rendering the confirmed outputs directly
+    /// below the assistant reply that produced them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deliverable_runs: Vec<ConversationTurnDeliverableSet>,
+    /// Present when the caller requested a bounded cursor page. Cursor-based
+    /// reads can seek large Codex JSONL transcripts without parsing the entire
+    /// file; the index-based window metadata below remains for compatibility.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub history_page: Option<ConversationHistoryPage>,
     /// Turn-window metadata, present only when the request asked for a window
     /// (`tailTurns` / `fromIndex`). All four fields are set together; their
     /// absence tells the frontend this is a legacy full response and windowed
@@ -166,6 +186,168 @@ pub struct ConversationTurnsPage {
     pub prefix_hash_before_index: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uncovered_prefix_max_ts: Option<DateTime<Utc>>,
+}
+
+/// Cursor metadata for a bounded conversation-history response. The cursor is
+/// deliberately opaque: Codex pages use transcript byte offsets so the server
+/// can seek directly into very large JSONL files, while other parsers fall back
+/// to a turn-index cursor without exposing that distinction to the frontend.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationHistoryPage {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
+    pub loaded_turns: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationDeliverable {
+    pub id: String,
+    pub conversation_id: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_run_id: Option<String>,
+    pub root_path: String,
+    pub path: String,
+    /// file | directory
+    pub kind: String,
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// primary | supporting
+    pub role: String,
+    /// code_change | standalone_output
+    pub category: String,
+    /// created | modified | deleted | renamed
+    pub change_kind: String,
+    /// Zero-based order from the latest complete declaration.
+    pub position: i32,
+    /// `declared` for publish_deliverables, `inferred` for the conservative
+    /// filesystem-event compatibility fallback.
+    pub source: String,
+    pub file_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extension: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modified_at: Option<DateTime<Utc>>,
+    pub is_valid: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invalid_reason: Option<String>,
+    pub verified_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_checked_at: Option<DateTime<Utc>>,
+    /// Client-side user message id associated with the producing turn. This is
+    /// the stable bridge from backend turn-run rows to transcript rendering.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_client_message_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_started_at: Option<DateTime<Utc>>,
+    pub produced_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationTurnDeliverableSet {
+    pub turn_run_id: String,
+    pub conversation_id: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_message_id: Option<String>,
+    /// Parser-stable id of the user turn that opened this run. New runs are
+    /// resolved by prompt fingerprint; older rows may omit it and let the
+    /// frontend use the guarded timestamp fallback.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_turn_id: Option<String>,
+    pub started_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<DateTime<Utc>>,
+    pub deliverables: Vec<ConversationDeliverable>,
+}
+
+/// One user-facing file in the conversation-wide deliverable history. The
+/// representative is the newest valid version; explicit declarations suppress
+/// inferred duplicates within their turn. `versions` retains per-turn lineage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationDeliverableHistoryGroup {
+    pub path_key: String,
+    pub latest: ConversationDeliverable,
+    pub versions: Vec<ConversationDeliverable>,
+}
+
+/// Bounded conversation-wide deliverable history. This is deliberately
+/// separate from `DbConversationDetail::deliverable_runs`, whose only purpose
+/// is to render outputs next to their producing assistant turn.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationDeliverableHistoryPage {
+    pub items: Vec<ConversationDeliverableHistoryGroup>,
+    pub offset: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_offset: Option<u32>,
+    pub has_more: bool,
+    pub total: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationTurnFileChange {
+    pub id: i32,
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_path: Option<String>,
+    /// created | modified | deleted | renamed
+    pub kind: String,
+    pub source: String,
+    /// exclusive when only one turn watched the root; ambiguous when turns
+    /// overlapped in the same workspace and OS notifications cannot identify
+    /// the originating process.
+    pub attribution: String,
+    pub first_seen_at: DateTime<Utc>,
+    pub last_seen_at: DateTime<Utc>,
+    pub event_count: i32,
+    pub final_exists: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modified_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationTurnArtifactRun {
+    pub id: String,
+    pub conversation_id: i32,
+    pub connection_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_message_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_accepted_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub folder_id: Option<i32>,
+    pub root_path: String,
+    /// running | completed | cancelled | interrupted
+    pub status: String,
+    pub capture_incomplete: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+    pub started_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<DateTime<Utc>>,
+    /// not_called | success | success_empty | partial | failed
+    pub declaration_status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub declaration_attempted_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deliverables_declared_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub declaration_error: Option<String>,
+    /// Structured turn-level expectation captured before the prompt is sent.
+    pub expectation_json: String,
+    /// pending | settled | settled_incomplete
+    pub settlement_status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settled_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_expected_paths: Vec<String>,
+    pub changes: Vec<ConversationTurnFileChange>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

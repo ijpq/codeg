@@ -6,10 +6,13 @@ pub mod background;
 pub mod backup;
 pub mod chat_authoring;
 pub mod chat_channel;
+mod conversation_branch_context;
+pub mod conversation_branches;
 pub mod conversations;
 pub mod custom_agents;
 pub mod custom_skills;
 pub mod delegation;
+pub mod deliverables;
 pub mod experts;
 pub mod feedback;
 #[cfg(feature = "tauri-runtime")]

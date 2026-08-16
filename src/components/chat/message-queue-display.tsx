@@ -2,7 +2,7 @@
 
 import { useCallback, type PointerEvent } from "react"
 import { Reorder, useDragControls } from "motion/react"
-import { GripVertical, Pencil, X } from "lucide-react"
+import { ArrowRight, GripVertical, Pencil, RotateCcw, X } from "lucide-react"
 import { useTranslations } from "next-intl"
 import { cn } from "@/lib/utils"
 import type { QueuedMessage } from "@/hooks/use-message-queue"
@@ -12,6 +12,8 @@ interface MessageQueueDisplayProps {
   onReorder: (items: QueuedMessage[]) => void
   onEdit: (id: string) => void
   onDelete: (id: string) => void
+  onRetry?: (id: string) => void
+  onConvertGuideToPrompt?: (id: string) => void
   editingItemId: string | null
 }
 
@@ -21,6 +23,8 @@ interface QueueItemProps {
   isEditing: boolean
   onEdit: (id: string) => void
   onDelete: (id: string) => void
+  onRetry?: (id: string) => void
+  onConvertGuideToPrompt?: (id: string) => void
 }
 
 function QueueItem({
@@ -29,6 +33,8 @@ function QueueItem({
   isEditing,
   onEdit,
   onDelete,
+  onRetry,
+  onConvertGuideToPrompt,
 }: QueueItemProps) {
   const t = useTranslations("Folder.chat.messageQueue")
   const dragControls = useDragControls()
@@ -67,6 +73,32 @@ function QueueItem({
       <span className="min-w-0 flex-1 truncate text-3xs text-foreground/80">
         {item.draft.displayText}
       </span>
+      <span
+        className="shrink-0 text-[9px] text-muted-foreground"
+        title={item.error ?? undefined}
+      >
+        {t(item.state)}
+      </span>
+      {item.state === "failed" && onRetry ? (
+        <button
+          type="button"
+          onClick={() => onRetry(item.id)}
+          className="shrink-0 rounded-sm p-0.5 text-muted-foreground hover:bg-muted-foreground/15"
+          title={t("retry")}
+        >
+          <RotateCcw className="h-2.5 w-2.5" />
+        </button>
+      ) : null}
+      {item.state === "expired_guide" && onConvertGuideToPrompt ? (
+        <button
+          type="button"
+          onClick={() => onConvertGuideToPrompt(item.id)}
+          className="shrink-0 rounded-sm p-0.5 text-muted-foreground hover:bg-muted-foreground/15"
+          title={t("sendAsPrompt")}
+        >
+          <ArrowRight className="h-2.5 w-2.5" />
+        </button>
+      ) : null}
       <button
         type="button"
         onClick={() => onEdit(item.id)}
@@ -92,6 +124,8 @@ export function MessageQueueDisplay({
   onReorder,
   onEdit,
   onDelete,
+  onRetry,
+  onConvertGuideToPrompt,
   editingItemId,
 }: MessageQueueDisplayProps) {
   if (queue.length === 0) return null
@@ -113,6 +147,8 @@ export function MessageQueueDisplay({
             isEditing={editingItemId === item.id}
             onEdit={onEdit}
             onDelete={onDelete}
+            onRetry={onRetry}
+            onConvertGuideToPrompt={onConvertGuideToPrompt}
           />
         ))}
       </Reorder.Group>
