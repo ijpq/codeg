@@ -918,6 +918,7 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
         },
         AgentType::DeepSeek => AcpAgentMeta {
             agent_type,
+            supports_steer: false,
             supports_mcp: true,
             name: "DeepSeek Harness",
             description: "Editor-facing DeepSeek Harness agent (ACP via deepseek-acp)",
