@@ -314,9 +314,10 @@ pub async fn update_external_id(
         .filter(conversation::Column::DeletedAt.is_null())
         .exec(conn)
         .await?;
-    // A snapshot branch is born before session/new necessarily reports its
-    // external id. Keep its audit metadata converged at the same durable write
-    // that links the conversation; ordinary rows simply match no branch row.
+    // Keep branch audit metadata converged whenever a restored connection
+    // refreshes a conversation's external id. New branches now persist only
+    // after session/new is prompt-ready, but older rows may still need this
+    // repair path; ordinary rows simply match no branch row.
     conversation_branch::Entity::update_many()
         .col_expr(
             conversation_branch::Column::BranchSessionId,

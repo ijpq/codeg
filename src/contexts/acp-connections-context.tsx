@@ -2202,6 +2202,11 @@ function connectionsReducer(
       next.set(action.contextKey, {
         ...conn,
         sessionId: action.sessionId,
+        // A native session/fork keeps the same ACP process/connection. Do not
+        // carry the source session's readiness latch across the session-id
+        // transition; the new session publishes its own selectors_ready.
+        selectorsReady:
+          conn.sessionId === action.sessionId ? conn.selectorsReady : false,
       })
       return next
     }

@@ -604,8 +604,15 @@ impl SessionState {
     pub fn apply_event(&mut self, payload: &AcpEvent) {
         match payload {
             AcpEvent::SessionStarted { session_id } => {
-                if self.external_id.as_deref() != Some(session_id.as_str()) {
+                let session_changed =
+                    self.external_id.as_deref() != Some(session_id.as_str());
+                if session_changed {
                     self.external_id_changed_at = Some(std::time::SystemTime::now());
+                    // `session/fork` reuses the process and SessionState but
+                    // attaches a different ACP session. The old session's
+                    // readiness latch must not make the new session appear
+                    // prompt-capable before its modes/config have finished.
+                    self.selectors_ready = false;
                 }
                 self.external_id = Some(session_id.clone());
                 self.status = ConnectionStatus::Connected;
@@ -2187,6 +2194,25 @@ mod tests {
         assert!(s.selectors_ready);
         assert!(s.to_snapshot().selectors_ready);
         // Idempotent — staying true on a second apply.
+        s.apply_event(&AcpEvent::SelectorsReady);
+        assert!(s.selectors_ready);
+    }
+
+    #[test]
+    fn a_new_session_id_resets_the_previous_sessions_readiness_latch() {
+        let mut s = fresh_state();
+        s.apply_event(&AcpEvent::SessionStarted {
+            session_id: "source-session".into(),
+        });
+        s.apply_event(&AcpEvent::SelectorsReady);
+        assert!(s.selectors_ready);
+
+        s.apply_event(&AcpEvent::SessionStarted {
+            session_id: "branch-session".into(),
+        });
+        assert!(!s.selectors_ready);
+        assert_eq!(s.external_id.as_deref(), Some("branch-session"));
+
         s.apply_event(&AcpEvent::SelectorsReady);
         assert!(s.selectors_ready);
     }

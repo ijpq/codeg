@@ -23,7 +23,9 @@ use crate::acp::types::{
 };
 #[cfg(feature = "tauri-runtime")]
 use crate::acp::types::{ConnectionInfo, ForkResultInfo, PromptInputBlock};
-use crate::db::service::{agent_setting_service, conversation_service, folder_service};
+use crate::db::service::{
+    agent_setting_service, conversation_branch_service, conversation_service, folder_service,
+};
 use crate::db::service::model_provider_service;
 use crate::db::AppDatabase;
 use crate::models::agent::AgentType;
@@ -9403,6 +9405,159 @@ pub(crate) async fn acp_update_agent_preferences_and_refresh(
     .await)
 }
 
+/// Repair an old snapshot branch only while replacing its ACP session is
+/// provably lossless: the inheritance snapshot is still pending and no user
+/// message has been accepted. This covers branches created by older builds
+/// that persisted an id before session/new reached prompt readiness.
+#[allow(clippy::too_many_arguments)]
+async fn recover_empty_snapshot_branch_session(
+    conversation_id: i32,
+    failed_external_session_id: &str,
+    preferred_mode_id: Option<String>,
+    preferred_config_values: BTreeMap<String, String>,
+    manager: &ConnectionManager,
+    db: &AppDatabase,
+    data_dir: &Path,
+    owner_window_label: String,
+    emitter: EventEmitter,
+) -> Result<Option<RestoredConversationConnectionInfo>, AcpError> {
+    if !conversation_branch_service::can_reinitialize_empty_snapshot_session(
+        &db.conn,
+        conversation_id,
+    )
+    .await
+    .map_err(|error| AcpError::protocol(error.to_string()))?
+    {
+        return Ok(None);
+    }
+
+    let _recovery_guard = manager
+        .lock_branch_session_recovery(conversation_id)
+        .await;
+    // Re-check under the lock: a concurrent first prompt or snapshot consume
+    // permanently closes this recovery window.
+    if !conversation_branch_service::can_reinitialize_empty_snapshot_session(
+        &db.conn,
+        conversation_id,
+    )
+    .await
+    .map_err(|error| AcpError::protocol(error.to_string()))?
+    {
+        return Ok(None);
+    }
+
+    let conversation = conversation_service::get_by_id(&db.conn, conversation_id)
+        .await
+        .map_err(|error| AcpError::protocol(error.to_string()))?;
+    let folder = folder_service::get_folder_by_id(&db.conn, conversation.folder_id)
+        .await
+        .map_err(|error| AcpError::protocol(error.to_string()))?
+        .ok_or_else(|| {
+            AcpError::protocol(format!(
+                "folder {} for conversation {conversation_id} was not found",
+                conversation.folder_id
+            ))
+        })?;
+    if conversation.external_id.as_deref() != Some(failed_external_session_id) {
+        // The caller waited behind another repair that already replaced the
+        // durable id. Reuse its live prompt-ready binding instead of creating a
+        // second fresh session. If the winner disappeared in this tiny window,
+        // let this request fail normally; a later restore can safely repair the
+        // still-empty branch again.
+        let Some(replacement_session_id) = conversation.external_id.clone() else {
+            return Ok(None);
+        };
+        let Some(connection_id) = manager
+            .find_connection_by_conversation_id(conversation_id)
+            .await
+        else {
+            return Ok(None);
+        };
+        manager
+            .wait_for_prompt_ready(&connection_id, Some(&replacement_session_id))
+            .await?;
+        let state = manager
+            .get_state(&connection_id)
+            .await
+            .ok_or_else(|| AcpError::ConnectionNotFound(connection_id.clone()))?;
+        let state = state.read().await;
+        return Ok(Some(RestoredConversationConnectionInfo {
+            connection_id,
+            external_session_id: replacement_session_id,
+            reused_existing: true,
+            codeg_mcp_available: state.codeg_mcp_available,
+            mcp_server_count: state.mcp_server_count,
+            replaced_connection_ids: Vec::new(),
+        }));
+    }
+    tracing::warn!(
+        conversation_id,
+        failed_external_session_id,
+        stage = "branch_session_recovery_started",
+        "[ACP][branch] replacing an empty unconsumed snapshot branch session"
+    );
+    let runtime_env = build_session_runtime_env(db, conversation.agent_type, None, data_dir).await?;
+    verify_agent_installed(conversation.agent_type).await?;
+    let (connection_id, replacement_session_id) = manager
+        .spawn_fresh_session_ready(
+            conversation.agent_type,
+            Some(folder.path),
+            runtime_env,
+            owner_window_label,
+            emitter,
+            preferred_mode_id,
+            preferred_config_values,
+        )
+        .await?;
+
+    if let Err(error) = conversation_service::update_external_id(
+        &db.conn,
+        conversation_id,
+        replacement_session_id.clone(),
+    )
+    .await
+    {
+        let _ = manager.disconnect(&connection_id).await;
+        return Err(AcpError::protocol(error.to_string()));
+    }
+    let activation = manager
+        .activate_restored_conversation(
+            &connection_id,
+            conversation_id,
+            conversation.folder_id,
+            &replacement_session_id,
+            conversation.agent_type == AgentType::Codex,
+            conversation.parent_id,
+            conversation.parent_tool_use_id,
+        )
+        .await;
+    let activation = match activation {
+        Ok(activation) => activation,
+        Err(error) => {
+            let _ = manager.disconnect(&connection_id).await;
+            return Err(error);
+        }
+    };
+    tracing::info!(
+        conversation_id,
+        failed_external_session_id,
+        replacement_session_id = %replacement_session_id,
+        connection_id = %connection_id,
+        stage = "branch_session_recovery_completed",
+        session_ready = true,
+        prompt_ready = true,
+        "[ACP][branch] empty snapshot branch recovered with a real session"
+    );
+    Ok(Some(RestoredConversationConnectionInfo {
+        connection_id,
+        external_session_id: replacement_session_id,
+        reused_existing: false,
+        codeg_mcp_available: activation.codeg_mcp_available,
+        mcp_server_count: activation.mcp_server_count,
+        replaced_connection_ids: activation.replaced_connection_ids,
+    }))
+}
+
 /// Restore an existing DB conversation onto a fully initialized ACP
 /// connection, then atomically replace its previous live binding. The DB row is
 /// authoritative for agent, folder and external session identity; callers only
@@ -9553,10 +9708,10 @@ pub(crate) async fn acp_restore_conversation_core(
                 Some(folder.path.clone()),
                 external_session_id.clone(),
                 runtime_env,
-                owner_window_label,
-                emitter,
-                preferred_mode_id,
-                preferred_config_values,
+                owner_window_label.clone(),
+                emitter.clone(),
+                preferred_mode_id.clone(),
+                preferred_config_values.clone(),
                 require_codeg_mcp,
                 conversation_id,
             )
@@ -9570,6 +9725,79 @@ pub(crate) async fn acp_restore_conversation_core(
         stage_elapsed_ms = spawn_started.elapsed().as_millis() as u64,
         total_elapsed_ms = restore_started.elapsed().as_millis() as u64,
         "[ACP][restore] stage completed"
+    );
+
+    // `Connected` is published before session/load|resume and therefore only
+    // means the ACP process is reachable. Do not switch the durable
+    // conversation binding (or return HTTP 200) until the requested session is
+    // real and the existing SelectorsReady prompt latch has fired. This also
+    // protects warm reuse from a half-initialized connection whose external id
+    // was already observed but whose session later fails to load.
+    let readiness_started = std::time::Instant::now();
+    if let Err(error) = manager
+        .wait_for_prompt_ready(&spawned.connection_id, Some(&external_session_id))
+        .await
+    {
+        if !spawned.reused_existing {
+            let _ = manager.disconnect(&spawned.connection_id).await;
+        }
+        tracing::warn!(
+            conversation_id,
+            external_session_id = %external_session_id,
+            connection_id = %spawned.connection_id,
+            reused_existing = spawned.reused_existing,
+            stage = "prompt_ready_failed",
+            stage_elapsed_ms = readiness_started.elapsed().as_millis() as u64,
+            total_elapsed_ms = restore_started.elapsed().as_millis() as u64,
+            binding_updated = false,
+            error = %error,
+            "[ACP][restore] target session did not become prompt-ready"
+        );
+        match recover_empty_snapshot_branch_session(
+            conversation_id,
+            &external_session_id,
+            preferred_mode_id,
+            preferred_config_values,
+            manager,
+            db,
+            data_dir,
+            owner_window_label,
+            emitter,
+        )
+        .await
+        {
+            Ok(Some(recovered)) => return Ok(recovered),
+            Ok(None) => return Err(error),
+            Err(recovery_error) => {
+                tracing::warn!(
+                    conversation_id,
+                    external_session_id = %external_session_id,
+                    restore_error = %error,
+                    recovery_error = %recovery_error,
+                    "[ACP][branch] eligible empty snapshot branch recovery failed"
+                );
+                return Err(recovery_error);
+            }
+        }
+    }
+    tracing::info!(
+        conversation_id,
+        external_session_id = %external_session_id,
+        connection_id = %spawned.connection_id,
+        reused_existing = spawned.reused_existing,
+        stage = "session_ready",
+        stage_elapsed_ms = readiness_started.elapsed().as_millis() as u64,
+        total_elapsed_ms = restore_started.elapsed().as_millis() as u64,
+        "[ACP][restore] target external session verified"
+    );
+    tracing::info!(
+        conversation_id,
+        external_session_id = %external_session_id,
+        connection_id = %spawned.connection_id,
+        reused_existing = spawned.reused_existing,
+        stage = "prompt_ready",
+        total_elapsed_ms = restore_started.elapsed().as_millis() as u64,
+        "[ACP][restore] target session accepts prompts"
     );
 
     let activation_started = std::time::Instant::now();

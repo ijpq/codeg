@@ -22,6 +22,9 @@ const h = vi.hoisted(() => ({
     sourceConversationId: 1,
     folderId: 1,
     connectionId: "branch-connection",
+    branchSessionId: "branch-session",
+    sessionReady: true,
+    promptReady: true,
     forkMode: "native" as const,
     inheritanceMode: "native_fork" as const,
     inheritedMessageCount: 12,
@@ -190,5 +193,34 @@ describe("ConversationDetailHeader dialog target snapshot", () => {
         "conv-a · 分支"
       )
     })
+  })
+
+  it("does not open a branch tab unless the backend explicitly reports prompt readiness", async () => {
+    h.createConversationBranch.mockResolvedValueOnce({
+      branchConversationId: 9,
+      sourceConversationId: 1,
+      folderId: 1,
+      connectionId: "branch-connection",
+      branchSessionId: "branch-session",
+      sessionReady: true,
+      promptReady: false,
+      forkMode: "snapshot",
+      inheritanceMode: "full_replay",
+      inheritedMessageCount: 12,
+      inheritanceTruncated: false,
+    })
+    const user = userEvent.setup({ pointerEventsCheck: 0 })
+    const { getByLabelText, getByRole } = render(
+      withIntl(<ConversationDetailHeader {...A} />)
+    )
+
+    await user.click(getByLabelText("More actions"))
+    await user.click(getByRole("menuitem", { name: "Create branch" }))
+
+    await waitFor(() => {
+      expect(h.createConversationBranch).toHaveBeenCalledTimes(1)
+    })
+    expect(h.refreshConversations).not.toHaveBeenCalled()
+    expect(h.openTab).not.toHaveBeenCalled()
   })
 })

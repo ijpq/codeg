@@ -115,12 +115,19 @@ pub async fn create_branch_row(
         .await?
     };
 
+    let created_id = created.id;
     let mut active = created.into_active_model();
     active.title_locked = Set(true);
     active.model = Set(source.model.clone());
     active.external_id = Set(external_id);
     active.origin_cwd = Set(source.origin_cwd.clone());
-    let created = active.update(conn).await?;
+    let created = match active.update(conn).await {
+        Ok(created) => created,
+        Err(error) => {
+            let _ = remove_incomplete_branch(conn, created_id).await;
+            return Err(DbError::Database(error));
+        }
+    };
     let now = Utc::now();
     let relation = conversation_branch::ActiveModel {
         branch_conversation_id: Set(created.id),
@@ -150,7 +157,14 @@ pub async fn create_branch_row(
         merge_target_conversation_id: Set(None),
     }
     .insert(conn)
-    .await?;
+    .await;
+    let relation = match relation {
+        Ok(relation) => relation,
+        Err(error) => {
+            let _ = remove_incomplete_branch(conn, created.id).await;
+            return Err(DbError::Database(error));
+        }
+    };
     Ok((created, relation.into()))
 }
 
@@ -168,6 +182,37 @@ pub async fn update_branch_session_id(
         active.update(conn).await?;
     }
     Ok(())
+}
+
+/// Hard-delete a branch row that was created during the current request but
+/// could not be bound to its freshly-created ACP session. This is deliberately
+/// narrower than user-facing conversation deletion: the row has never been
+/// published or opened and cannot yet own messages, turns, or deliverables.
+/// Keeping the relation + conversation deletion in one transaction prevents a
+/// failed create from leaving either half behind.
+pub async fn remove_incomplete_branch(
+    conn: &DatabaseConnection,
+    conversation_id: i32,
+) -> Result<(), DbError> {
+    let result = conn
+        .transaction::<_, (), sea_orm::DbErr>(|txn| {
+            Box::pin(async move {
+                conversation_branch::Entity::delete_by_id(conversation_id)
+                    .exec(txn)
+                    .await?;
+                conversation::Entity::delete_by_id(conversation_id)
+                    .exec(txn)
+                    .await?;
+                Ok(())
+            })
+        })
+        .await;
+    match result {
+        Ok(()) => Ok(()),
+        Err(TransactionError::Connection(error) | TransactionError::Transaction(error)) => {
+            Err(DbError::Database(error))
+        }
+    }
 }
 
 pub async fn get_info(
@@ -218,6 +263,36 @@ pub async fn pending_snapshot(
             .unwrap_or_default();
         Some(PendingBranchSnapshot { context, images })
     }))
+}
+
+/// Whether it is safe to replace this branch's ACP session during restore.
+/// The replacement is lossless only before the inheritance snapshot or any
+/// user message has reached the old session. This also repairs branches made
+/// by older builds that persisted a session id before session/new was usable.
+pub async fn can_reinitialize_empty_snapshot_session(
+    conn: &DatabaseConnection,
+    conversation_id: i32,
+) -> Result<bool, DbError> {
+    let Some(branch) = conversation_branch::Entity::find_by_id(conversation_id)
+        .one(conn)
+        .await?
+    else {
+        return Ok(false);
+    };
+    if branch.fork_mode != "snapshot"
+        || branch.snapshot_consumed_at.is_some()
+        || branch
+            .snapshot_context
+            .as_deref()
+            .is_none_or(|context| context.trim().is_empty())
+    {
+        return Ok(false);
+    }
+    let conversation = conversation::Entity::find_by_id(conversation_id)
+        .filter(conversation::Column::DeletedAt.is_null())
+        .one(conn)
+        .await?;
+    Ok(conversation.is_some_and(|conversation| conversation.message_count == 0))
 }
 
 pub async fn mark_snapshot_consumed(
@@ -595,11 +670,17 @@ mod tests {
                 .map(|snapshot| snapshot.context),
             Some("User: hello".into())
         );
+        assert!(can_reinitialize_empty_snapshot_session(&db.conn, branch.id)
+            .await
+            .unwrap());
         mark_snapshot_consumed(&db.conn, branch.id).await.unwrap();
         assert!(pending_snapshot(&db.conn, branch.id)
             .await
             .unwrap()
             .is_none());
+        assert!(!can_reinitialize_empty_snapshot_session(&db.conn, branch.id)
+            .await
+            .unwrap());
 
         conversation_service::soft_delete(&db.conn, source_id)
             .await

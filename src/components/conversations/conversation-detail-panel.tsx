@@ -2041,6 +2041,14 @@ const ConversationTabView = memo(function ConversationTabView({
             ])
           ),
         })
+        if (
+          !result.sessionReady ||
+          !result.promptReady ||
+          !result.connectionId ||
+          !result.branchSessionId
+        ) {
+          throw new Error("Branch session did not become ready")
+        }
         await refreshConversations()
         openTab(
           result.folderId,

@@ -227,6 +227,12 @@ pub struct ConnectionManager {
     /// `spawn_locks`; this second lock serializes the shorter authoritative
     /// mapping update + old-connection removal phase.
     restore_locks: Arc<Mutex<HashMap<i32, Arc<Mutex<()>>>>>,
+    /// Serializes the narrowly-scoped repair of an empty, unconsumed snapshot
+    /// branch whose previously-recorded ACP session cannot be loaded. Fresh
+    /// session ids cannot use `spawn_locks` (the agent assigns the id), so this
+    /// conversation-keyed lock prevents concurrent restores from creating two
+    /// replacement sessions.
+    branch_recovery_locks: Arc<Mutex<HashMap<i32, Arc<Mutex<()>>>>>,
     /// Bound on how long `spawn_agent` waits for the agent's handshake
     /// before releasing the dedup lock. Configurable per-instance for
     /// tests; in production initialized from env via
@@ -301,6 +307,7 @@ impl ConnectionManager {
             connections: Arc::new(Mutex::new(HashMap::new())),
             spawn_locks: Arc::new(Mutex::new(HashMap::new())),
             restore_locks: Arc::new(Mutex::new(HashMap::new())),
+            branch_recovery_locks: Arc::new(Mutex::new(HashMap::new())),
             spawn_handshake_timeout: spawn_handshake_timeout_from_env(),
             terminal_shell_config: TerminalShellRuntimeConfig::new(),
             delegation_injection: Arc::new(std::sync::OnceLock::new()),
@@ -317,6 +324,7 @@ impl ConnectionManager {
             connections: self.connections.clone(),
             spawn_locks: self.spawn_locks.clone(),
             restore_locks: self.restore_locks.clone(),
+            branch_recovery_locks: self.branch_recovery_locks.clone(),
             spawn_handshake_timeout: self.spawn_handshake_timeout,
             terminal_shell_config: self.terminal_shell_config.clone(),
             delegation_injection: self.delegation_injection.clone(),
@@ -353,6 +361,7 @@ impl ConnectionManager {
             connections: Arc::new(Mutex::new(HashMap::new())),
             spawn_locks: Arc::new(Mutex::new(HashMap::new())),
             restore_locks: Arc::new(Mutex::new(HashMap::new())),
+            branch_recovery_locks: Arc::new(Mutex::new(HashMap::new())),
             spawn_handshake_timeout: timeout,
             terminal_shell_config: TerminalShellRuntimeConfig::new(),
             delegation_injection: Arc::new(std::sync::OnceLock::new()),
@@ -498,6 +507,120 @@ impl ConnectionManager {
             .connection_id)
     }
 
+    /// Start a brand-new ACP session and do not publish it to a caller until
+    /// the agent has returned its real session id and completed selector/config
+    /// initialization. A `Connected` status alone is intentionally
+    /// insufficient: `run_connection` publishes it before `session/new`, while
+    /// [`SessionState::selectors_ready`] is the existing prompt-readiness
+    /// latch emitted only after the new session is attached and configured.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn spawn_fresh_session_ready(
+        &self,
+        agent_type: AgentType,
+        working_dir: Option<String>,
+        runtime_env: BTreeMap<String, String>,
+        owner_window_label: String,
+        emitter: EventEmitter,
+        preferred_mode_id: Option<String>,
+        preferred_config_values: BTreeMap<String, String>,
+    ) -> Result<(String, String), AcpError> {
+        let connection_id = self
+            .spawn_agent(
+                agent_type,
+                working_dir,
+                None,
+                runtime_env,
+                owner_window_label,
+                emitter,
+                preferred_mode_id,
+                preferred_config_values,
+            )
+            .await?;
+        match self.wait_for_prompt_ready(&connection_id, None).await {
+            Ok(session_id) => Ok((connection_id, session_id)),
+            Err(error) => {
+                let _ = self.disconnect(&connection_id).await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Wait until an ACP connection is backed by a real, prompt-capable
+    /// session. This deliberately builds on the existing `selectors_ready`
+    /// state instead of introducing another readiness state machine.
+    pub(crate) async fn wait_for_prompt_ready(
+        &self,
+        connection_id: &str,
+        expected_session_id: Option<&str>,
+    ) -> Result<String, AcpError> {
+        let deadline = tokio::time::Instant::now() + self.spawn_handshake_timeout;
+        loop {
+            let state = self
+                .get_state(connection_id)
+                .await
+                .ok_or_else(|| AcpError::ConnectionNotFound(connection_id.to_string()))?;
+            let state = state.read().await;
+            if matches!(
+                state.status,
+                ConnectionStatus::Disconnected | ConnectionStatus::Error
+            ) {
+                let detail = state
+                    .last_error
+                    .as_ref()
+                    .map(|error| error.message.as_str())
+                    .unwrap_or("ACP connection ended during session initialization");
+                return Err(AcpError::protocol(detail));
+            }
+            if let (Some(expected), Some(actual)) =
+                (expected_session_id, state.external_id.as_deref())
+            {
+                if actual != expected {
+                    return Err(AcpError::protocol(format!(
+                        "ACP session mismatch: expected {expected}, got {actual}"
+                    )));
+                }
+            }
+            if state.selectors_ready
+                && matches!(
+                    state.status,
+                    ConnectionStatus::Connected | ConnectionStatus::Prompting
+                )
+            {
+                let session_id = state.external_id.clone().ok_or_else(|| {
+                    AcpError::protocol(
+                        "ACP reported prompt readiness without a real session id",
+                    )
+                })?;
+                if expected_session_id.is_none_or(|expected| expected == session_id) {
+                    return Ok(session_id);
+                }
+            }
+            drop(state);
+
+            if tokio::time::Instant::now() >= deadline {
+                return Err(AcpError::protocol(format!(
+                    "ACP session did not become prompt-ready within {} seconds",
+                    self.spawn_handshake_timeout.as_secs()
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    pub(crate) async fn lock_branch_session_recovery(
+        &self,
+        conversation_id: i32,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.branch_recovery_locks.lock().await;
+            locks
+                .entry(conversation_id)
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        lock.lock_owned().await
+    }
+
     /// Start a second process for an existing session without reuse. User
     /// conversation branching needs an isolated source handle: `session/fork`
     /// mutates the connection it runs on, so using the source tab's live
@@ -547,6 +670,13 @@ impl ConnectionManager {
                 outcome.as_str()
             )));
         }
+        if let Err(error) = self
+            .wait_for_prompt_ready(&connection_id, Some(&session_id))
+            .await
+        {
+            let _ = self.disconnect(&connection_id).await;
+            return Err(error);
+        }
         Ok(connection_id)
     }
 
@@ -586,6 +716,8 @@ impl ConnectionManager {
         loop {
             if state.read().await.external_id.as_deref() == Some(result.forked_session_id.as_str())
             {
+                self.wait_for_prompt_ready(conn_id, Some(&result.forked_session_id))
+                    .await?;
                 return Ok(result);
             }
             if tokio::time::Instant::now() >= deadline {
@@ -1080,6 +1212,11 @@ impl ConnectionManager {
                 ) {
                     return Err(AcpError::protocol(format!(
                         "restored connection {connection_id} is not ready"
+                    )));
+                }
+                if !state.selectors_ready {
+                    return Err(AcpError::protocol(format!(
+                        "restored connection {connection_id} is not prompt-ready"
                     )));
                 }
                 if require_codeg_mcp && !state.codeg_mcp_available {
@@ -6215,6 +6352,7 @@ mod tests {
             state.external_id = Some("session-42".into());
             state.codeg_mcp_available = true;
             state.mcp_server_count = 3;
+            state.selectors_ready = true;
         }
 
         let outcome = mgr
@@ -6253,6 +6391,7 @@ mod tests {
             let mut state = new.write().await;
             state.external_id = Some("session-42".into());
             state.codeg_mcp_available = false;
+            state.selectors_ready = true;
         }
 
         let error = mgr
@@ -6271,6 +6410,66 @@ mod tests {
         );
         assert_eq!(
             mgr.get_state("new")
+                .await
+                .unwrap()
+                .read()
+                .await
+                .conversation_id,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn connected_session_is_not_prompt_ready_until_selectors_latch() {
+        let mgr = ConnectionManager::with_spawn_handshake_timeout(Duration::from_millis(25));
+        let _rx = insert_live_connection(&mgr, "warming", AgentType::Codex, None).await;
+        {
+            let state = mgr.get_state("warming").await.unwrap();
+            let mut state = state.write().await;
+            state.external_id = Some("session-warming".into());
+            state.codeg_mcp_available = true;
+            assert_eq!(state.status, ConnectionStatus::Connected);
+            assert!(!state.selectors_ready);
+        }
+
+        let error = mgr
+            .wait_for_prompt_ready("warming", Some("session-warming"))
+            .await
+            .expect_err("Connected without SelectorsReady must not pass");
+        assert!(error.to_string().contains("prompt-ready"));
+
+        mgr.get_state("warming")
+            .await
+            .unwrap()
+            .write()
+            .await
+            .selectors_ready = true;
+        assert_eq!(
+            mgr.wait_for_prompt_ready("warming", Some("session-warming"))
+                .await
+                .unwrap(),
+            "session-warming"
+        );
+    }
+
+    #[tokio::test]
+    async fn activation_rejects_connected_session_before_prompt_ready() {
+        let mgr = ConnectionManager::new();
+        let _rx = insert_live_connection(&mgr, "warming", AgentType::Codex, None).await;
+        {
+            let state = mgr.get_state("warming").await.unwrap();
+            let mut state = state.write().await;
+            state.external_id = Some("session-42".into());
+            state.codeg_mcp_available = true;
+        }
+
+        let error = mgr
+            .activate_restored_conversation("warming", 42, 7, "session-42", true, None, None)
+            .await
+            .expect_err("half-initialized session must not activate");
+        assert!(error.to_string().contains("not prompt-ready"));
+        assert_eq!(
+            mgr.get_state("warming")
                 .await
                 .unwrap()
                 .read()

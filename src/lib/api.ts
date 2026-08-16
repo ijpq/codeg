@@ -2850,6 +2850,9 @@ export interface CreateConversationBranchResult {
   sourceConversationId: number
   folderId: number
   connectionId?: string | null
+  branchSessionId: string
+  sessionReady: boolean
+  promptReady: boolean
   forkMode: "native" | "snapshot"
   inheritanceMode: "native_fork" | "full_replay" | "structured_snapshot"
   inheritedMessageCount: number
@@ -2893,7 +2896,10 @@ export async function createConversationBranch(
   return getTransport().call(
     "create_conversation_branch",
     { request },
-    { timeoutMs: 120_000 }
+    // Native fork may spend one handshake timeout proving the source session
+    // unusable before the independent snapshot session/new fallback performs
+    // its own full readiness handshake.
+    { timeoutMs: 180_000 }
   )
 }
 

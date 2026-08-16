@@ -750,13 +750,15 @@ mod tests {
                 EventEmitter::Noop,
             )
             .await;
-        conn_mgr
-            .get_state("weixin-default-connection")
-            .await
-            .unwrap()
-            .write()
-            .await
-            .external_id = Some("weixin-default-session".into());
+        {
+            let state = conn_mgr
+                .get_state("weixin-default-connection")
+                .await
+                .unwrap();
+            let mut state = state.write().await;
+            state.external_id = Some("weixin-default-session".into());
+            state.selectors_ready = true;
+        }
         let bridge = Arc::new(Mutex::new(SessionBridge::new()));
         let response = dispatch_command(
             "你好",
@@ -888,7 +890,11 @@ mod tests {
             .get_state("weixin-restored-connection")
             .await
             .expect("test ACP state");
-        state.write().await.external_id = Some("weixin-persisted-session".into());
+        {
+            let mut state = state.write().await;
+            state.external_id = Some("weixin-persisted-session".into());
+            state.selectors_ready = true;
+        }
 
         // A fresh bridge models codeg-server restart/reconnect. The durable DB
         // route above is the only place that still knows the conversation.
