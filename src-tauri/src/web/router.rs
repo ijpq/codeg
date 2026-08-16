@@ -1,22 +1,31 @@
 use std::sync::Arc;
 
 use axum::{
+    body::Body,
     extract::{DefaultBodyLimit, Extension},
-    http::{StatusCode, Uri},
+    http::{header::CACHE_CONTROL, HeaderValue, StatusCode, Uri},
     middleware::{self, Next},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{any, get, post},
     Json, Router,
 };
 
-use crate::web::handlers::files::UPLOAD_MAX_BYTES;
+use futures_util::StreamExt;
+use tower_http::compression::CompressionLayer;
 use tower_http::cors::{Any, CorsLayer};
-use tower_http::services::{ServeDir, ServeFile};
+use tower_http::services::ServeDir;
 
 use super::shutdown::ShutdownSignal;
 use super::{auth, handlers, ws};
 use crate::app_state::AppState;
 use tracing::Instrument;
+
+// Prompt images are carried inline as base64 inside the JSON request. The
+// composer's native-path guard allows up to 20,000,000 decoded bytes, which
+// expands to about 25.5 MiB before the JSON envelope is added. Keep this route
+// bounded because `Json` buffers the request, while leaving enough headroom for
+// one maximum-size image plus prompt metadata.
+const ACP_PROMPT_BODY_MAX_BYTES: usize = 32 * 1024 * 1024;
 
 pub fn build_router(
     state: Arc<AppState>,
@@ -103,8 +112,41 @@ pub fn build_router(
         )
         .route(
             "/get_folder_conversation",
-            post(handlers::conversations::get_folder_conversation),
+            post(handlers::conversations::get_folder_conversation)
+                .layer(history_response_compression()),
         )
+        // ─── Confirmed deliverables ───
+        // JSON operations are authenticated and accept database ids only. A
+        // short-lived one-use ticket is the sole unauthenticated download
+        // capability so browsers can stream large files without buffering.
+        .route(
+            "/deliverable_capabilities",
+            post(handlers::deliverables::capabilities),
+        )
+        .route(
+            "/list_conversation_deliverables",
+            post(handlers::deliverables::list_for_conversation),
+        )
+        .route(
+            "/list_turn_deliverables",
+            post(handlers::deliverables::list_for_turn),
+        )
+        .route(
+            "/list_conversation_deliverable_runs",
+            post(handlers::deliverables::list_runs_for_conversation),
+        )
+        .route(
+            "/list_conversation_deliverable_history",
+            post(handlers::deliverables::list_history_for_conversation),
+        )
+        .route(
+            "/create_deliverable_download_ticket",
+            post(handlers::deliverables::create_download_ticket),
+        )
+        .route("/copy_deliverables", post(handlers::deliverables::copy))
+        .route("/open_deliverable", post(handlers::deliverables::open))
+        .route("/reveal_deliverable", post(handlers::deliverables::reveal))
+        .route("/hide_deliverables", post(handlers::deliverables::hide))
         .route(
             "/get_folder_conversation_turns",
             post(handlers::conversations::get_folder_conversation_turns),
@@ -138,6 +180,18 @@ pub fn build_router(
         .route(
             "/create_conversation",
             post(handlers::conversations::create_conversation),
+        )
+        .route(
+            "/create_conversation_branch",
+            post(handlers::conversations::create_conversation_branch),
+        )
+        .route(
+            "/get_conversation_branch_info",
+            post(handlers::conversations::get_conversation_branch_info),
+        )
+        .route(
+            "/merge_conversation_branch",
+            post(handlers::conversations::merge_conversation_branch),
         )
         .route(
             "/create_chat_conversation",
@@ -389,10 +443,7 @@ pub fn build_router(
         .route("/git_pull", post(handlers::git::git_pull))
         .route("/git_push", post(handlers::git::git_push))
         .route("/git_fetch", post(handlers::git::git_fetch))
-        .route(
-            "/git_update_branch",
-            post(handlers::git::git_update_branch),
-        )
+        .route("/git_update_branch", post(handlers::git::git_update_branch))
         .route("/git_commit", post(handlers::git::git_commit))
         .route("/git_fetch_remote", post(handlers::git::git_fetch_remote))
         .route("/git_delete_branch", post(handlers::git::git_delete_branch))
@@ -406,6 +457,10 @@ pub fn build_router(
         )
         .route("/clone_repository", post(handlers::git::clone_repository))
         // ─── Files ───
+        .route(
+            "/stat_workspace_file",
+            post(handlers::files::stat_workspace_file),
+        )
         .route(
             "/read_file_preview",
             post(handlers::files::read_file_preview),
@@ -442,16 +497,14 @@ pub fn build_router(
         )
         .route(
             "/upload_attachment",
-            // `UPLOAD_MAX_BYTES` is the *file payload* limit; the raw
-            // multipart body also carries boundary markers, the
-            // `Content-Disposition` headers, and the `session_id` field —
-            // ~256-512 bytes of overhead. Without this layer, axum's default
-            // 2MiB `DefaultBodyLimit` would reject anything bigger before our
-            // handler ever sees a chunk. Pad by 64KiB so the handler's own
-            // chunk-summing check (in `files.rs`) stays the authoritative
+            // Attachments upload with no per-file limit by default (streamed
+            // straight to disk, like `/upload_workspace_file`). Disable axum's
+            // 2MiB `DefaultBodyLimit` so it can't reject before our handler
+            // sees a chunk; the optional `CODEG_UPLOAD_MAX_ATTACHMENT_BYTES`
+            // cap (and the disk-total quota) are enforced by the handler's
+            // chunk-summing check in `files.rs`, which stays the authoritative
             // size boundary.
-            post(handlers::files::upload_attachment)
-                .layer(DefaultBodyLimit::max(UPLOAD_MAX_BYTES as usize + 64 * 1024)),
+            post(handlers::files::upload_attachment).layer(DefaultBodyLimit::disable()),
         )
         // ─── Workspace files (web upload/download) ───
         //
@@ -650,22 +703,27 @@ pub fn build_router(
             post(handlers::acp::acp_env_diagnostics),
         )
         .route("/acp_connect", post(handlers::acp::acp_connect))
+        .route(
+            "/acp_restore_conversation",
+            post(handlers::acp::acp_restore_conversation),
+        )
         .route("/acp_disconnect", post(handlers::acp::acp_disconnect))
         .route(
             "/acp_touch_connection",
             post(handlers::acp::acp_touch_connection),
         )
-        .route("/acp_prompt", post(handlers::acp::acp_prompt))
+        .route(
+            "/acp_prompt",
+            post(handlers::acp::acp_prompt).layer(DefaultBodyLimit::max(ACP_PROMPT_BODY_MAX_BYTES)),
+        )
+        .route("/acp_steer", post(handlers::acp::acp_steer))
         .route("/acp_preflight", post(handlers::acp::acp_preflight))
         .route("/acp_set_mode", post(handlers::acp::acp_set_mode))
         .route(
             "/acp_set_config_option",
             post(handlers::acp::acp_set_config_option),
         )
-        .route(
-            "/acp_goal_control",
-            post(handlers::acp::acp_goal_control),
-        )
+        .route("/acp_goal_control", post(handlers::acp::acp_goal_control))
         .route(
             "/acp_describe_agent_options",
             post(handlers::acp::acp_describe_agent_options),
@@ -1193,6 +1251,10 @@ pub fn build_router(
             "/delete_model_provider",
             post(handlers::model_provider::delete_model_provider),
         )
+        .route(
+            "/probe_active_model_provider",
+            post(handlers::model_provider::probe_active_model_provider),
+        )
         // ─── Quick Messages ───
         .route(
             "/quick_messages_list",
@@ -1219,7 +1281,10 @@ pub fn build_router(
             "/automation_list",
             post(handlers::automation::automation_list),
         )
-        .route("/automation_get", post(handlers::automation::automation_get))
+        .route(
+            "/automation_get",
+            post(handlers::automation::automation_get),
+        )
         .route(
             "/automation_runs",
             post(handlers::automation::automation_runs),
@@ -1518,6 +1583,10 @@ pub fn build_router(
             get(handlers::workspace_files::consume_download_ticket),
         )
         .route(
+            "/deliverable_download/{ticket}",
+            get(handlers::deliverables::consume_download_ticket),
+        )
+        .route(
             "/backup_download/{ticket}",
             get(handlers::backup::backup_download),
         )
@@ -1555,7 +1624,31 @@ pub fn build_router(
             let path = req.uri().path().to_string();
             let request_id = uuid::Uuid::new_v4();
             let span = tracing::info_span!("http", %method, %path, %request_id);
-            next.run(req).instrument(span).await
+            async move {
+                let started = std::time::Instant::now();
+                let response = next.run(req).await;
+                tracing::info!(
+                    route = %path,
+                    status_code = response.status().as_u16(),
+                    total_elapsed_ms = started.elapsed().as_millis() as u64,
+                    content_encoding = ?response
+                        .headers()
+                        .get(axum::http::header::CONTENT_ENCODING)
+                        .and_then(|value| value.to_str().ok()),
+                    response_content_length = ?response
+                        .headers()
+                        .get(axum::http::header::CONTENT_LENGTH)
+                        .and_then(|value| value.to_str().ok()),
+                    "[HTTP][perf] request completed"
+                );
+                if path.ends_with("/get_folder_conversation") {
+                    measure_history_response_body(response, path, request_id, started)
+                } else {
+                    response
+                }
+            }
+            .instrument(span)
+            .await
         },
     ));
 
@@ -1569,8 +1662,13 @@ pub fn build_router(
     // Static file serving.
     // Next.js static export produces "folder.html" for "/folder" route.
     // We use a middleware to rewrite "/folder" → "/folder.html" before ServeDir.
-    let fallback =
-        ServeDir::new(&static_dir).fallback(ServeFile::new(static_dir.join("index.html")));
+    // Do not attach index.html as ServeDir's not-found fallback. Static-export
+    // routes are rewritten to their real `.html` file below; a missing data
+    // request (notably `/local-enhancements/*.json`) must remain a tiny 404,
+    // never a 240 KiB workspace document that a watchdog downloads forever.
+    let static_files = Router::new()
+        .fallback_service(ServeDir::new(&static_dir))
+        .layer(middleware::from_fn(static_response_policy));
 
     let static_dir_for_mw = static_dir.clone();
     let html_rewrite = middleware::from_fn(move |req: axum::extract::Request, next: Next| {
@@ -1607,7 +1705,7 @@ pub fn build_router(
     Router::new()
         .nest("/api", api)
         .merge(ws_route)
-        .fallback_service(fallback)
+        .merge(static_files)
         .layer(html_rewrite)
         .layer(cors)
         .layer(Extension(state))
@@ -1617,6 +1715,98 @@ pub fn build_router(
         // remote proxy's progress source) and SSE stays unbuffered; see
         // `web::compression`.
         .layer(crate::web::compression::compression_layer())
+}
+
+fn measure_history_response_body(
+    response: Response,
+    route: String,
+    request_id: uuid::Uuid,
+    started: std::time::Instant,
+) -> Response {
+    let content_encoding = response
+        .headers()
+        .get(axum::http::header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let (parts, body) = response.into_parts();
+    let body_stream = body.into_data_stream();
+    let measured = futures_util::stream::unfold(
+        (body_stream, 0u64),
+        move |(mut body_stream, transmitted_bytes)| {
+            let route = route.clone();
+            let content_encoding = content_encoding.clone();
+            async move {
+                match body_stream.next().await {
+                    Some(Ok(chunk)) => {
+                        let transmitted_bytes = transmitted_bytes + chunk.len() as u64;
+                        Some((
+                            Ok::<_, axum::Error>(chunk),
+                            (body_stream, transmitted_bytes),
+                        ))
+                    }
+                    Some(Err(error)) => {
+                        tracing::warn!(
+                            route = %route,
+                            %request_id,
+                            transmitted_bytes,
+                            content_encoding = ?content_encoding,
+                            total_elapsed_ms = started.elapsed().as_millis() as u64,
+                            error = %error,
+                            "[HTTP][perf] response body interrupted"
+                        );
+                        Some((Err(error), (body_stream, transmitted_bytes)))
+                    }
+                    None => {
+                        tracing::info!(
+                            route = %route,
+                            %request_id,
+                            transmitted_bytes,
+                            compressed_bytes = content_encoding.as_ref().map(|_| transmitted_bytes),
+                            content_encoding = ?content_encoding,
+                            total_elapsed_ms = started.elapsed().as_millis() as u64,
+                            "[HTTP][perf] response body completed"
+                        );
+                        None
+                    }
+                }
+            }
+        },
+    );
+    Response::from_parts(parts, Body::from_stream(measured))
+}
+
+async fn static_response_policy(request: axum::extract::Request, next: Next) -> Response {
+    let path = request.uri().path().to_string();
+    let mut response = next.run(request).await;
+    if !response.status().is_success() && response.status() != StatusCode::NOT_MODIFIED {
+        return response;
+    }
+
+    let cache_control = if path.starts_with("/_next/static/") {
+        // Next filenames carry a content hash; a new build gets a new URL.
+        "public, max-age=31536000, immutable"
+    } else if path.starts_with("/local-enhancements/") && path.ends_with(".json") {
+        // Polling control files must always reflect their latest small payload.
+        "no-store"
+    } else if path == "/" || path.ends_with(".html") || !path.contains('.') {
+        // HTML owns the build's hashed asset graph and must revalidate after an
+        // upgrade. ServeDir's Last-Modified handling is the condition-request
+        // validator (304) for these files.
+        "no-cache"
+    } else {
+        "public, max-age=3600"
+    };
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static(cache_control));
+    response
+}
+
+fn history_response_compression() -> CompressionLayer {
+    // Historical detail is text-heavy JSON and can be several megabytes. Keep
+    // compression scoped to this route so archives and other already-compressed
+    // API downloads are never compressed a second time.
+    CompressionLayer::new()
 }
 
 async fn health_check() -> impl IntoResponse {
@@ -1640,4 +1830,129 @@ async fn api_not_found(uri: axum::http::Uri) -> impl IntoResponse {
             "message": format!("API endpoint '{}' is not available in web mode", command),
         })),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::header::{
+        ACCEPT_ENCODING, CACHE_CONTROL, CONTENT_ENCODING, IF_MODIFIED_SINCE, LAST_MODIFIED, RANGE,
+    };
+    use axum_test::TestServer;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn history_response_compression_negotiates_gzip() {
+        let app = Router::new()
+            .route(
+                "/history",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "turns": vec!["compressible historical turn"; 512],
+                    }))
+                }),
+            )
+            .layer(history_response_compression());
+        let server = TestServer::new(app).expect("test server should start");
+
+        let response = server
+            .get("/history")
+            .add_header(ACCEPT_ENCODING, "gzip")
+            .await;
+
+        response.assert_status_ok();
+        response.assert_header(CONTENT_ENCODING, "gzip");
+    }
+
+    #[tokio::test]
+    async fn static_assets_are_compressed_cached_and_missing_json_stays_small() {
+        let dir = tempfile::tempdir().expect("temp static dir");
+        std::fs::create_dir_all(dir.path().join("_next/static/chunks")).expect("create chunks dir");
+        std::fs::create_dir_all(dir.path().join("local-enhancements"))
+            .expect("create local enhancements dir");
+        std::fs::write(
+            dir.path().join("workspace.html"),
+            "workspace-shell".repeat(4_096),
+        )
+        .expect("write html");
+        std::fs::write(
+            dir.path().join("_next/static/chunks/app-deadbeef.js"),
+            "const value = 'compress me';\n".repeat(4_096),
+        )
+        .expect("write asset");
+        std::fs::write(
+            dir.path()
+                .join("local-enhancements/turn-watchdog-event.json"),
+            r#"{"status":"idle"}"#,
+        )
+        .expect("write turn watchdog");
+
+        let app = Router::new()
+            .fallback_service(ServeDir::new(dir.path()))
+            .layer(CompressionLayer::new())
+            .layer(middleware::from_fn(static_response_policy));
+        let server = TestServer::new(app).expect("test server should start");
+
+        let asset = server
+            .get("/_next/static/chunks/app-deadbeef.js")
+            .add_header(ACCEPT_ENCODING, "gzip")
+            .await;
+        asset.assert_status_ok();
+        asset.assert_header(CONTENT_ENCODING, "gzip");
+        asset.assert_header(CACHE_CONTROL, "public, max-age=31536000, immutable");
+        let last_modified = asset
+            .headers()
+            .get(LAST_MODIFIED)
+            .expect("ServeDir supplies a validator")
+            .clone();
+
+        let conditional = server
+            .get("/_next/static/chunks/app-deadbeef.js")
+            .add_header(IF_MODIFIED_SINCE, last_modified)
+            .await;
+        conditional.assert_status(StatusCode::NOT_MODIFIED);
+
+        let range = server
+            .get("/_next/static/chunks/app-deadbeef.js")
+            .add_header(ACCEPT_ENCODING, "gzip")
+            .add_header(RANGE, "bytes=0-9")
+            .await;
+        range.assert_status(StatusCode::PARTIAL_CONTENT);
+        assert!(
+            range.headers().get(CONTENT_ENCODING).is_none(),
+            "range responses must not be transformed by compression"
+        );
+        assert_eq!(range.as_bytes().len(), 10);
+
+        let html = server.get("/workspace.html").await;
+        html.assert_status_ok();
+        html.assert_header(CACHE_CONTROL, "no-cache");
+
+        let turn_watchdog = server
+            .get("/local-enhancements/turn-watchdog-event.json")
+            .await;
+        turn_watchdog.assert_status_ok();
+        turn_watchdog.assert_header(CACHE_CONTROL, "no-store");
+        assert_eq!(turn_watchdog.text(), r#"{"status":"idle"}"#);
+
+        let mut watchdog_bytes = 0usize;
+        for poll in 0..6 {
+            let missing = server
+                .get(&format!(
+                    "/local-enhancements/command-watchdog-event.json?t={poll}"
+                ))
+                .await;
+            missing.assert_status_not_found();
+            let bytes = missing.as_bytes().len();
+            assert!(
+                bytes < 1_024,
+                "missing watchdog response must not be the workspace HTML"
+            );
+            watchdog_bytes += bytes;
+        }
+        assert!(
+            watchdog_bytes < 6 * 1_024,
+            "six 5-second polls (30 seconds) must stay below 6 KiB"
+        );
+    }
 }

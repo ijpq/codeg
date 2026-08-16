@@ -1,0 +1,349 @@
+use sea_orm_migration::prelude::*;
+
+#[derive(DeriveMigrationName)]
+pub struct Migration;
+
+#[async_trait::async_trait]
+impl MigrationTrait for Migration {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .create_table(
+                Table::create()
+                    .table(ChatChannelTurnOrigin::Table)
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(ChatChannelTurnOrigin::Id)
+                            .string()
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(
+                        ColumnDef::new(ChatChannelTurnOrigin::ChannelId)
+                            .integer()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(ChatChannelTurnOrigin::SenderId)
+                            .text()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(ChatChannelTurnOrigin::ConversationId)
+                            .integer()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(ChatChannelTurnOrigin::ConnectionId)
+                            .string()
+                            .null(),
+                    )
+                    .col(
+                        ColumnDef::new(ChatChannelTurnOrigin::OriginMessageId)
+                            .string()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(ChatChannelTurnOrigin::ClientMessageId)
+                            .string()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(ChatChannelTurnOrigin::TurnRunId)
+                            .string()
+                            .null(),
+                    )
+                    .col(
+                        ColumnDef::new(ChatChannelTurnOrigin::TargetJson)
+                            .text()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(ChatChannelTurnOrigin::Status)
+                            .string()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(ChatChannelTurnOrigin::CreatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(ChatChannelTurnOrigin::UpdatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(ChatChannelTurnOrigin::FinalCapturedAt)
+                            .timestamp_with_time_zone()
+                            .null(),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_ccto_channel_id")
+                            .from(
+                                ChatChannelTurnOrigin::Table,
+                                ChatChannelTurnOrigin::ChannelId,
+                            )
+                            .to(ChatChannel::Table, ChatChannel::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_ccto_channel_sender_origin")
+                    .table(ChatChannelTurnOrigin::Table)
+                    .col(ChatChannelTurnOrigin::ChannelId)
+                    .col(ChatChannelTurnOrigin::SenderId)
+                    .col(ChatChannelTurnOrigin::OriginMessageId)
+                    .unique()
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_ccto_client_message")
+                    .table(ChatChannelTurnOrigin::Table)
+                    .col(ChatChannelTurnOrigin::ClientMessageId)
+                    .unique()
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_ccto_connection_status")
+                    .table(ChatChannelTurnOrigin::Table)
+                    .col(ChatChannelTurnOrigin::ConnectionId)
+                    .col(ChatChannelTurnOrigin::Status)
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table(ChatChannelOutbox::Table)
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(ChatChannelOutbox::Id)
+                            .string()
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(
+                        ColumnDef::new(ChatChannelOutbox::OriginId)
+                            .string()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(ChatChannelOutbox::ChannelId)
+                            .integer()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(ChatChannelOutbox::SenderId)
+                            .text()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(ChatChannelOutbox::ConversationId)
+                            .integer()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(ChatChannelOutbox::OriginMessageId)
+                            .string()
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(ChatChannelOutbox::TurnRunId).string().null())
+                    .col(
+                        ColumnDef::new(ChatChannelOutbox::MessageKind)
+                            .string()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(ChatChannelOutbox::FinalResultId)
+                            .string()
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(ChatChannelOutbox::Content).text().not_null())
+                    .col(
+                        ColumnDef::new(ChatChannelOutbox::ChunkIndex)
+                            .integer()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(ChatChannelOutbox::ChunkCount)
+                            .integer()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(ChatChannelOutbox::Status)
+                            .string()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(ChatChannelOutbox::AttemptCount)
+                            .integer()
+                            .not_null()
+                            .default(0),
+                    )
+                    .col(ColumnDef::new(ChatChannelOutbox::LastError).text().null())
+                    .col(
+                        ColumnDef::new(ChatChannelOutbox::ContextTokenGeneration)
+                            .big_integer()
+                            .null(),
+                    )
+                    .col(
+                        ColumnDef::new(ChatChannelOutbox::CreatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(ChatChannelOutbox::DeliveredAt)
+                            .timestamp_with_time_zone()
+                            .null(),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_cco_origin_id")
+                            .from(ChatChannelOutbox::Table, ChatChannelOutbox::OriginId)
+                            .to(ChatChannelTurnOrigin::Table, ChatChannelTurnOrigin::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_cco_channel_id")
+                            .from(ChatChannelOutbox::Table, ChatChannelOutbox::ChannelId)
+                            .to(ChatChannel::Table, ChatChannel::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_cco_final_chunk")
+                    .table(ChatChannelOutbox::Table)
+                    .col(ChatChannelOutbox::FinalResultId)
+                    .col(ChatChannelOutbox::ChunkIndex)
+                    .unique()
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_cco_pending_sender")
+                    .table(ChatChannelOutbox::Table)
+                    .col(ChatChannelOutbox::ChannelId)
+                    .col(ChatChannelOutbox::SenderId)
+                    .col(ChatChannelOutbox::Status)
+                    .col(ChatChannelOutbox::CreatedAt)
+                    .to_owned(),
+            )
+            .await?;
+
+        // SQLite accepts only one ADD COLUMN per ALTER TABLE statement.
+        for column in [
+            ColumnDef::new(ChatChannelMessageLog::OriginMessageId)
+                .string()
+                .null()
+                .to_owned(),
+            ColumnDef::new(ChatChannelMessageLog::TurnRunId)
+                .string()
+                .null()
+                .to_owned(),
+            ColumnDef::new(ChatChannelMessageLog::FinalResultId)
+                .string()
+                .null()
+                .to_owned(),
+            ColumnDef::new(ChatChannelMessageLog::ContentLength)
+                .integer()
+                .null()
+                .to_owned(),
+        ] {
+            manager
+                .alter_table(
+                    Table::alter()
+                        .table(ChatChannelMessageLog::Table)
+                        .add_column(column)
+                        .to_owned(),
+                )
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_table(Table::drop().table(ChatChannelOutbox::Table).to_owned())
+            .await?;
+        manager
+            .drop_table(Table::drop().table(ChatChannelTurnOrigin::Table).to_owned())
+            .await
+    }
+}
+
+#[derive(DeriveIden)]
+enum ChatChannelTurnOrigin {
+    Table,
+    Id,
+    ChannelId,
+    SenderId,
+    ConversationId,
+    ConnectionId,
+    OriginMessageId,
+    ClientMessageId,
+    TurnRunId,
+    TargetJson,
+    Status,
+    CreatedAt,
+    UpdatedAt,
+    FinalCapturedAt,
+}
+
+#[derive(DeriveIden)]
+enum ChatChannelOutbox {
+    Table,
+    Id,
+    OriginId,
+    ChannelId,
+    SenderId,
+    ConversationId,
+    OriginMessageId,
+    TurnRunId,
+    MessageKind,
+    FinalResultId,
+    Content,
+    ChunkIndex,
+    ChunkCount,
+    Status,
+    AttemptCount,
+    LastError,
+    ContextTokenGeneration,
+    CreatedAt,
+    DeliveredAt,
+}
+
+#[derive(DeriveIden)]
+enum ChatChannelMessageLog {
+    Table,
+    OriginMessageId,
+    TurnRunId,
+    FinalResultId,
+    ContentLength,
+}
+
+#[derive(DeriveIden)]
+enum ChatChannel {
+    Table,
+    Id,
+}

@@ -56,6 +56,7 @@ use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::acp::chat_authoring::{NewAutomationSpec, NewWorkTaskSpec};
+use crate::acp::deliverables::{DeliverableInput, PublishDeliverablesArgs};
 use crate::acp::question::QuestionSpec;
 
 /// One delegation call's worth of input forwarded from the companion to the
@@ -223,6 +224,26 @@ pub struct BrokerCreateWorkTaskRequest {
     pub spec: NewWorkTaskSpec,
 }
 
+/// Persist the agent's explicit final-output declaration for its current
+/// conversation. The listener re-validates token/connection ownership, then
+/// verifies every path against this launch's registered working directory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrokerDeliverablesRequest {
+    pub token: String,
+    pub parent_connection_id: String,
+    /// Idempotency key added in v0.22. An empty value identifies a legacy
+    /// companion request and remains valid without retry guarantees.
+    #[serde(default)]
+    pub request_id: String,
+    /// New merge/replace/remove envelope.
+    #[serde(default)]
+    pub args: Option<PublishDeliverablesArgs>,
+    /// Compatibility copy for older Codeg listeners, which know only the
+    /// original complete-set field and ignore `args`.
+    #[serde(default)]
+    pub deliverables: Vec<DeliverableInput>,
+}
+
 /// Tagged top-level message dispatched by the listener. Adding new variants
 /// is the wire-stable way to grow the broker protocol without touching the
 /// frame layer.
@@ -241,6 +262,7 @@ pub enum BrokerMessage {
     TaskComplete(BrokerTaskCompleteRequest),
     CreateAutomation(BrokerCreateAutomationRequest),
     CreateWorkTask(BrokerCreateWorkTaskRequest),
+    PublishDeliverables(BrokerDeliverablesRequest),
 }
 
 /// The wrapped outcome the main process returns over the same socket.
@@ -424,6 +446,19 @@ pub async fn client_create_work_task_round_trip(
     message_round_trip(socket_path, &BrokerMessage::CreateWorkTask(req.clone())).await
 }
 
+/// Dispatch a `publish_deliverables` declaration and read back the accepted +
+/// rejected item lists after workspace validation and persistence.
+pub async fn client_deliverables_round_trip(
+    socket_path: &str,
+    req: &BrokerDeliverablesRequest,
+) -> io::Result<BrokerResponse> {
+    message_round_trip(
+        socket_path,
+        &BrokerMessage::PublishDeliverables(req.clone()),
+    )
+    .await
+}
+
 /// Total budget for `open()` retries on Windows named pipes. Has to be
 /// short enough that it nests comfortably inside the companion's
 /// `BROKER_CANCEL_BUDGET` (500 ms) — leaving ≥ 300 ms for the actual
@@ -546,6 +581,56 @@ mod tests {
             }
             other => panic!("expected SessionInfo variant, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn deliverables_message_round_trip_in_memory() {
+        let (mut a, mut b) = duplex(8 * 1024);
+        let msg = BrokerMessage::PublishDeliverables(BrokerDeliverablesRequest {
+            token: "tok".into(),
+            parent_connection_id: "parent-1".into(),
+            request_id: "request-1".into(),
+            args: Some(PublishDeliverablesArgs {
+                deliverables: vec![crate::acp::deliverables::DeliverableInput {
+                    path: "output/report.pdf".into(),
+                    title: Some("Report".into()),
+                    description: None,
+                    role: Some("primary".into()),
+                    category: Some("standalone_output".into()),
+                    change_kind: Some("created".into()),
+                }],
+                mode: None,
+                remove: Vec::new(),
+            }),
+            deliverables: Vec::new(),
+        });
+        write_frame(&mut a, &msg).await.unwrap();
+        let got: BrokerMessage = read_frame(&mut b).await.unwrap();
+        match got {
+            BrokerMessage::PublishDeliverables(req) => {
+                assert_eq!(req.parent_connection_id, "parent-1");
+                assert_eq!(req.request_id, "request-1");
+                assert_eq!(req.args.unwrap().deliverables[0].path, "output/report.pdf");
+            }
+            other => panic!("expected PublishDeliverables variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deliverables_request_accepts_the_legacy_wire_shape() {
+        let message: BrokerMessage = serde_json::from_value(serde_json::json!({
+            "kind": "publish_deliverables",
+            "token": "legacy-token",
+            "parent_connection_id": "parent-1",
+            "deliverables": [{ "path": "src/lib.rs" }]
+        }))
+        .expect("legacy request");
+        let BrokerMessage::PublishDeliverables(request) = message else {
+            panic!("expected publish_deliverables");
+        };
+        assert!(request.request_id.is_empty());
+        assert!(request.args.is_none());
+        assert_eq!(request.deliverables[0].path, "src/lib.rs");
     }
 
     #[tokio::test]

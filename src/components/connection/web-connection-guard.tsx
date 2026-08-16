@@ -18,6 +18,7 @@ import {
   getWebConnectionSnapshot,
   reconnectWebNow,
   subscribeWebConnection,
+  verifyWebConnectionNow,
 } from "@/lib/transport/web-connection-store"
 import { redirectToCodegLogin } from "@/lib/transport/web-auth"
 
@@ -64,23 +65,20 @@ export function WebConnectionGuard() {
     }
   }, [state])
 
-  // Fast recovery on network restore / tab wake. Backoff caps at 32s, but the
-  // browser signals the instant connectivity returns (`online`) or the tab
-  // becomes visible after sleep — probe right away instead of waiting out the
-  // remaining backoff (sleep/wake and Wi‑Fi flaps are the common triggers).
-  // Guarded to "reconnecting" so a healthy link is never torn down; the store
-  // accessors are no-ops off web, so this is inert on desktop/SSR.
+  // Fast recovery on network restore / tab wake. A half-open socket can still
+  // report OPEN and leave the state as "connected", so every signal verifies
+  // the path with an application heartbeat; an already-reconnecting transport
+  // upgrades that verification to an immediate authenticated health probe.
+  // The store accessor is a no-op off web, so this stays inert on desktop/SSR.
   useEffect(() => {
-    const nudgeIfReconnecting = () => {
-      if (getWebConnectionSnapshot() === "reconnecting") reconnectWebNow()
-    }
+    const verify = () => verifyWebConnectionNow()
     const onVisible = () => {
-      if (document.visibilityState === "visible") nudgeIfReconnecting()
+      if (document.visibilityState === "visible") verify()
     }
-    window.addEventListener("online", nudgeIfReconnecting)
+    window.addEventListener("online", verify)
     document.addEventListener("visibilitychange", onVisible)
     return () => {
-      window.removeEventListener("online", nudgeIfReconnecting)
+      window.removeEventListener("online", verify)
       document.removeEventListener("visibilitychange", onVisible)
     }
   }, [])

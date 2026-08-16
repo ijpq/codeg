@@ -55,6 +55,30 @@ impl From<crate::db::entities::model_provider::Model> for ModelProviderInfo {
     }
 }
 
+/// Result of probing a model provider's `api_url` reachability. Drives the
+/// "test link" button in the streaming-diagnostics panel, which needs to tell a
+/// stalled network path (CF tunnel / VPS unreachable) apart from a model that is
+/// simply still working — codeg can't see the subprocess's model HTTP traffic,
+/// so it issues its own lightweight probe instead.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelProviderProbeResult {
+    /// False when the agent has no custom provider bound (official/direct
+    /// connection) — there is nothing to probe.
+    pub configured: bool,
+    /// True when the endpoint returned any HTTP response (even 4xx/5xx): the
+    /// tunnel + VPS are alive. False on connect/timeout/DNS errors.
+    pub reachable: bool,
+    /// HTTP status code of the response, when one was received.
+    pub status: Option<u16>,
+    /// Round-trip latency in milliseconds, when a response was received.
+    pub latency_ms: Option<u64>,
+    /// The provider's configured base URL (for display), when configured.
+    pub api_url: Option<String>,
+    /// Error string on a failed probe (connection refused / timeout / DNS).
+    pub error: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::mask_api_key;

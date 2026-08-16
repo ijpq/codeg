@@ -23,6 +23,7 @@ import { extendPrefixFingerprint, FNV_SEED_HEX } from "@/lib/turn-window"
 import {
   resetConversationRuntimeStore,
   useConversationRuntimeStore,
+  HISTORY_PAGE_USER_TURNS,
   TAIL_TURNS_DEFAULT,
   OLDER_TURNS_PAGE_SIZE,
   type ConversationRuntimeSession,
@@ -144,6 +145,7 @@ function emptySession(conversationId: number): ConversationRuntimeSession {
     pendingBackgroundSettlements: [],
     optimisticTurns: [],
     liveMessage: null,
+    promptDeliveries: {},
     syncState: "idle",
     activeTurnToken: null,
     lastTurnOwned: false,
@@ -190,12 +192,14 @@ afterEach(() => {
 })
 
 describe("windowed fetch/refetch", () => {
-  it("cold fetch requests the default tail window", async () => {
+  it("cold fetch requests the bounded cursor page", async () => {
     seed({})
     mockGet.mockResolvedValue(windowedDetail(4))
     actions().fetchDetail(CID)
     await flush()
-    expect(mockGet).toHaveBeenCalledWith(CID, { tailTurns: TAIL_TURNS_DEFAULT })
+    expect(mockGet).toHaveBeenCalledWith(CID, {
+      userTurnLimit: HISTORY_PAGE_USER_TURNS,
+    })
     expect(session()?.detail?.turns_offset).toBe(4)
   })
 

@@ -11,7 +11,10 @@ use super::i18n::{self, Lang};
 use super::manager::ChatChannelManager;
 use super::session_bridge::SessionBridge;
 use super::session_commands;
-use super::types::{ChannelMessageTarget, IncomingCommand, InteractiveMessage, RichMessage};
+use super::types::{
+    sender_log_key, ChannelMessageTarget, IncomingCommand, InteractiveMessage, RichMessage,
+    WeixinPushMode,
+};
 use crate::acp::manager::ConnectionManager;
 use crate::db::service::{app_metadata_service, chat_channel_message_log_service};
 use crate::web::event_bridge::EventEmitter;
@@ -68,28 +71,59 @@ pub fn spawn_command_dispatcher(
 
         while let Some(cmd) = command_rx.recv().await {
             let text = cmd.command_text.trim();
+            let origin_message_id = super::final_delivery::stable_origin_message_id(&cmd.metadata);
+            let push_mode = super::final_delivery::push_mode(&db_conn, cmd.channel_id).await;
+            let is_final_weixin_mode = push_mode != WeixinPushMode::Debug;
             tracing::info!(
-                "[ChatChannel] received command from channel={} sender={}: {:?}",
-                cmd.channel_id,
-                cmd.sender_id,
-                text
+                channel_id = cmd.channel_id,
+                sender_key = %sender_log_key(&cmd.sender_id),
+                message_chars = text.chars().count(),
+                "[ChatChannel] received command"
             );
 
             // Log inbound command
-            let _ = chat_channel_message_log_service::create_log(
+            let _ = chat_channel_message_log_service::create_correlated_log(
                 &db_conn,
                 cmd.channel_id,
                 "inbound",
-                "command_query",
+                "inbound_user_message",
                 text,
                 "sent",
+                None,
+                Some(&origin_message_id),
+                None,
                 None,
             )
             .await;
 
+            if is_final_weixin_mode {
+                let replay_db = db_conn.clone();
+                let replay_manager = manager.clone_ref();
+                let replay_sender = cmd.sender_id.clone();
+                let replay_channel_id = cmd.channel_id;
+                tokio::spawn(async move {
+                    if let Err(error) = super::final_delivery::replay_pending(
+                        &replay_db,
+                        &replay_manager,
+                        replay_channel_id,
+                        &replay_sender,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            stage = "pending_final_replay_failed",
+                            channel_id = replay_channel_id,
+                            sender_key = %sender_log_key(&replay_sender),
+                            error,
+                            "[ChatChannel][final_delivery] pending final replay failed"
+                        );
+                    }
+                });
+            }
+
             config.refresh_if_needed(&db_conn).await;
 
-            let response = dispatch_command(
+            let response = dispatch_command_with_origin(
                 text,
                 &config.prefix,
                 &db_conn,
@@ -103,6 +137,8 @@ pub fn spawn_command_dispatcher(
                 &cmd.target,
                 cmd.callback_data.as_deref(),
                 config.lang,
+                Some(&origin_message_id),
+                push_mode,
             )
             .await;
 
@@ -121,14 +157,32 @@ pub fn spawn_command_dispatcher(
             messages.extend(response.extra_messages);
 
             for (message, target) in messages {
+                if is_final_weixin_mode && is_session_ack_message(&message, config.lang) {
+                    tracing::debug!(
+                        stage = "stale_progress_dropped",
+                        channel_id = cmd.channel_id,
+                        "[ChatChannel][final_delivery] delivery acknowledgement suppressed"
+                    );
+                    continue;
+                }
                 send_dispatch_message(&db_conn, &manager, cmd.channel_id, text, message, target)
                     .await;
             }
 
             if let Some(action) = response.post_action {
-                if let Some((message, target)) =
-                    session_commands::handle_post_action(action, &db_conn, &conn_mgr, &bridge).await
+                if let Some((message, target)) = session_commands::handle_post_action(
+                    action,
+                    &db_conn,
+                    &conn_mgr,
+                    &bridge,
+                    Some(&origin_message_id),
+                    push_mode,
+                )
+                .await
                 {
+                    if is_final_weixin_mode && message.body == i18n::message_sent(config.lang) {
+                        continue;
+                    }
                     send_dispatch_message(
                         &db_conn,
                         &manager,
@@ -168,9 +222,10 @@ async fn send_dispatch_message(
         Ok(_) => ("sent", None),
         Err(e) => {
             tracing::error!(
-                "[ChatChannel] failed to send response for {:?} to channel {}: {e}",
-                command_text,
-                channel_id
+                channel_id,
+                command_chars = command_text.chars().count(),
+                error = %e,
+                "[ChatChannel] failed to send response"
             );
             ("failed", Some(e.to_string()))
         }
@@ -189,6 +244,7 @@ async fn send_dispatch_message(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn dispatch_command(
     text: &str,
     prefix: &str,
@@ -203,6 +259,44 @@ async fn dispatch_command(
     target: &ChannelMessageTarget,
     callback_data: Option<&str>,
     lang: Lang,
+) -> DispatchResponse {
+    dispatch_command_with_origin(
+        text,
+        prefix,
+        db,
+        manager,
+        conn_mgr,
+        emitter,
+        bridge,
+        data_dir,
+        channel_id,
+        sender_id,
+        target,
+        callback_data,
+        lang,
+        None,
+        WeixinPushMode::Debug,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_command_with_origin(
+    text: &str,
+    prefix: &str,
+    db: &DatabaseConnection,
+    manager: &ChatChannelManager,
+    conn_mgr: &ConnectionManager,
+    emitter: &EventEmitter,
+    bridge: &Arc<Mutex<SessionBridge>>,
+    data_dir: &Path,
+    channel_id: i32,
+    sender_id: &str,
+    target: &ChannelMessageTarget,
+    callback_data: Option<&str>,
+    lang: Lang,
+    origin_message_id: Option<&str>,
+    push_mode: WeixinPushMode,
 ) -> DispatchResponse {
     if let Some(data) = callback_data {
         return DispatchResponse::current(
@@ -233,37 +327,43 @@ async fn dispatch_command(
                         data_dir,
                         lang,
                         prefix,
+                        origin_message_id,
+                        push_mode,
                     })
                     .await,
                     target,
                 );
             }
 
-            // Check if sender has an active session for follow-up
-            let has_session = {
-                let guard = bridge.lock().await;
-                guard.find_by_sender(channel_id, sender_id).is_some()
-            };
-            if has_session {
-                return DispatchResponse::current(
-                    session_commands::handle_followup(session_commands::FollowupRequest {
-                        db,
-                        text,
-                        channel_id,
-                        sender_id,
-                        target,
-                        conn_mgr,
-                        emitter,
-                        bridge,
-                        data_dir,
-                        lang,
-                        prefix,
-                    })
-                    .await,
+            // The bridge is intentionally in-memory. Always let follow-up
+            // routing inspect the durable sender context so the first message
+            // after a restart can restore its previous conversation instead
+            // of falling through to Help.
+            tracing::info!(
+                stage = "ordinary_message_followup_dispatched",
+                channel_id,
+                sender_key = %sender_log_key(sender_id),
+                "[ChatChannel][lazy_restore] ordinary message entered follow-up routing"
+            );
+            return DispatchResponse::current(
+                session_commands::handle_followup(session_commands::FollowupRequest {
+                    db,
+                    text,
+                    channel_id,
+                    sender_id,
                     target,
-                );
-            }
-            return DispatchResponse::current(command_handlers::handle_help(prefix, lang), target);
+                    conn_mgr,
+                    emitter,
+                    bridge,
+                    data_dir,
+                    lang,
+                    prefix,
+                    origin_message_id,
+                    push_mode,
+                })
+                .await,
+                target,
+            );
         }
     };
 
@@ -465,11 +565,126 @@ impl DispatchMessage {
     }
 }
 
+fn is_session_ack_message(message: &DispatchMessage, lang: Lang) -> bool {
+    let (title, body) = match message {
+        DispatchMessage::Rich(message) => (message.title.as_deref(), message.body.as_str()),
+        DispatchMessage::Interactive(message) => {
+            (message.base.title.as_deref(), message.base.body.as_str())
+        }
+    };
+    body == i18n::message_sent(lang)
+        || body == i18n::task_deferred_busy(lang)
+        || title == Some(i18n::task_started_title(lang))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::service::{chat_channel_service, sender_context_service};
-    use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+    use crate::acp::connection::ConnectionCommand;
+    use crate::acp::types::{AcpEvent, EventEnvelope, PromptInputBlock};
+    use crate::chat_channel::error::ChatChannelError;
+    use crate::chat_channel::traits::ChatChannelBackend;
+    use crate::chat_channel::types::{ChannelConnectionStatus, ChannelType, SentMessageId};
+    use crate::db::service::{chat_channel_service, conversation_service, sender_context_service};
+    use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
+    use crate::models::AgentType;
+    use async_trait::async_trait;
+    use std::sync::Arc;
+
+    #[derive(Clone, Default)]
+    struct Recorder {
+        messages: Arc<Mutex<Vec<String>>>,
+    }
+
+    struct RecordingWeixinBackend {
+        recorder: Recorder,
+    }
+
+    struct FailingWeixinBackend;
+
+    #[async_trait]
+    impl ChatChannelBackend for RecordingWeixinBackend {
+        fn channel_type(&self) -> ChannelType {
+            ChannelType::Weixin
+        }
+
+        async fn start(
+            &self,
+            _command_tx: mpsc::Sender<IncomingCommand>,
+        ) -> Result<(), ChatChannelError> {
+            Ok(())
+        }
+
+        async fn stop(&self) -> Result<(), ChatChannelError> {
+            Ok(())
+        }
+
+        async fn status(&self) -> ChannelConnectionStatus {
+            ChannelConnectionStatus::Connected
+        }
+
+        async fn send_message(&self, text: &str) -> Result<SentMessageId, ChatChannelError> {
+            self.recorder.messages.lock().await.push(text.to_string());
+            Ok(SentMessageId("weixin-test-message".into()))
+        }
+
+        async fn send_rich_message(
+            &self,
+            message: &RichMessage,
+        ) -> Result<SentMessageId, ChatChannelError> {
+            self.recorder
+                .messages
+                .lock()
+                .await
+                .push(message.body.clone());
+            Ok(SentMessageId("weixin-test-message".into()))
+        }
+
+        async fn test_connection(&self) -> Result<(), ChatChannelError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl ChatChannelBackend for FailingWeixinBackend {
+        fn channel_type(&self) -> ChannelType {
+            ChannelType::Weixin
+        }
+
+        async fn start(
+            &self,
+            _command_tx: mpsc::Sender<IncomingCommand>,
+        ) -> Result<(), ChatChannelError> {
+            Ok(())
+        }
+
+        async fn stop(&self) -> Result<(), ChatChannelError> {
+            Ok(())
+        }
+
+        async fn status(&self) -> ChannelConnectionStatus {
+            ChannelConnectionStatus::Connected
+        }
+
+        async fn send_message(&self, _text: &str) -> Result<SentMessageId, ChatChannelError> {
+            Err(ChatChannelError::SendFailed(
+                "temporary network error".into(),
+            ))
+        }
+
+        async fn send_rich_message(
+            &self,
+            _message: &RichMessage,
+        ) -> Result<SentMessageId, ChatChannelError> {
+            Err(ChatChannelError::SendFailed(
+                "temporary network error".into(),
+            ))
+        }
+
+        async fn test_connection(&self) -> Result<(), ChatChannelError> {
+            Ok(())
+        }
+    }
 
     async fn seed_chat_channel(db: &crate::db::AppDatabase) -> i32 {
         chat_channel_service::create(
@@ -483,6 +698,21 @@ mod tests {
         )
         .await
         .expect("seed chat channel")
+        .id
+    }
+
+    async fn seed_weixin_channel(db: &crate::db::AppDatabase) -> i32 {
+        chat_channel_service::create(
+            &db.conn,
+            "Weixin lazy restore test".to_string(),
+            "weixin".to_string(),
+            serde_json::json!({ "base_url": "https://example.invalid" }).to_string(),
+            true,
+            false,
+            None,
+        )
+        .await
+        .expect("seed Weixin chat channel")
         .id
     }
 
@@ -544,5 +774,367 @@ mod tests {
 
         assert!(response.message.is_none());
         assert_eq!(response.target, target);
+    }
+
+    #[tokio::test]
+    async fn ordinary_plain_text_uses_followup_router_instead_of_help_fallback() {
+        let db = fresh_in_memory_db().await;
+        let channel_id = seed_chat_channel(&db).await;
+        let target = ChannelMessageTarget::channel(channel_id);
+        let bridge = Arc::new(Mutex::new(SessionBridge::new()));
+
+        let response = dispatch_command(
+            "hello",
+            "/",
+            &db.conn,
+            &ChatChannelManager::new(),
+            &ConnectionManager::new(),
+            &EventEmitter::Noop,
+            &bridge,
+            std::path::Path::new("/tmp/codeg-dispatch-data"),
+            channel_id,
+            "sender-1",
+            &target,
+            None,
+            Lang::En,
+        )
+        .await;
+        let Some(DispatchMessage::Rich(message)) = response.message else {
+            panic!("ordinary text should receive follow-up status")
+        };
+        assert!(message.body.contains("/task"));
+        assert_ne!(message.title.as_deref(), Some("Codeg Bot Help"));
+        assert!(
+            sender_context_service::find(&db.conn, channel_id, "sender-1")
+                .await
+                .unwrap()
+                .is_none(),
+            "an unbound sender must not get a manufactured empty context row"
+        );
+    }
+
+    #[tokio::test]
+    async fn unbound_weixin_sender_applies_channel_default_and_forwards_once() {
+        let db = fresh_in_memory_db().await;
+        let channel_id = seed_weixin_channel(&db).await;
+        let folder_path = "/tmp/codeg-weixin-default-restore";
+        let folder_id = seed_folder(&db, folder_path).await;
+        let conversation_id = seed_conversation(&db, folder_id, AgentType::OpenCode).await;
+        conversation_service::update_external_id(
+            &db.conn,
+            conversation_id,
+            "weixin-default-session".into(),
+        )
+        .await
+        .unwrap();
+        chat_channel_service::update(
+            &db.conn,
+            channel_id,
+            None,
+            None,
+            Some(
+                serde_json::json!({
+                    "base_url": "https://example.invalid",
+                    "default_folder_id": folder_id,
+                    "default_agent_type": "open_code",
+                    "default_conversation_id": conversation_id,
+                })
+                .to_string(),
+            ),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let conn_mgr = ConnectionManager::new();
+        let mut agent_commands = conn_mgr
+            .insert_test_connection_live(
+                "weixin-default-connection",
+                AgentType::OpenCode,
+                Some(PathBuf::from(folder_path)),
+                EventEmitter::Noop,
+            )
+            .await;
+        {
+            let state = conn_mgr
+                .get_state("weixin-default-connection")
+                .await
+                .unwrap();
+            let mut state = state.write().await;
+            state.external_id = Some("weixin-default-session".into());
+            state.selectors_ready = true;
+        }
+        let bridge = Arc::new(Mutex::new(SessionBridge::new()));
+        let response = dispatch_command(
+            "你好",
+            "/",
+            &db.conn,
+            &ChatChannelManager::new(),
+            &conn_mgr,
+            &EventEmitter::Noop,
+            &bridge,
+            std::path::Path::new("/tmp/codeg-dispatch-data"),
+            channel_id,
+            "new-weixin-sender",
+            &ChannelMessageTarget::channel(channel_id),
+            None,
+            Lang::ZhCn,
+        )
+        .await;
+
+        let command = tokio::time::timeout(Duration::from_secs(2), agent_commands.recv())
+            .await
+            .expect("default restore timed out")
+            .expect("forwarded prompt");
+        let ConnectionCommand::Prompt { blocks, .. } = command else {
+            panic!("expected prompt command")
+        };
+        assert!(matches!(
+            blocks.as_slice(),
+            [PromptInputBlock::Text { text }] if text == "你好"
+        ));
+        assert!(agent_commands.try_recv().is_err());
+        let context = sender_context_service::find(&db.conn, channel_id, "new-weixin-sender")
+            .await
+            .unwrap()
+            .expect("default binding persisted");
+        assert_eq!(context.current_folder_id, Some(folder_id));
+        assert_eq!(context.current_agent_type.as_deref(), Some("open_code"));
+        assert_eq!(context.current_conversation_id, Some(conversation_id));
+        assert_eq!(
+            context.current_connection_id.as_deref(),
+            Some("weixin-default-connection")
+        );
+        let Some(DispatchMessage::Rich(message)) = response.message else {
+            panic!("default restore should acknowledge the forwarded message")
+        };
+        assert_eq!(message.body, i18n::message_sent(Lang::ZhCn));
+    }
+
+    #[tokio::test]
+    async fn weixin_reply_failure_does_not_clear_sender_binding() {
+        let db = fresh_in_memory_db().await;
+        let channel_id = seed_weixin_channel(&db).await;
+        let folder_id = seed_folder(&db, "/tmp/codeg-weixin-send-failure").await;
+        let conversation_id = seed_conversation(&db, folder_id, AgentType::Codex).await;
+        sender_context_service::update_session(
+            &db.conn,
+            channel_id,
+            "wx-user",
+            Some(conversation_id),
+            Some("still-valid".into()),
+        )
+        .await
+        .unwrap();
+        let manager = ChatChannelManager::new();
+        manager
+            .add_channel(
+                channel_id,
+                "Failing Weixin".into(),
+                ChannelType::Weixin,
+                Box::new(FailingWeixinBackend),
+            )
+            .await
+            .unwrap();
+
+        send_dispatch_message(
+            &db.conn,
+            &manager,
+            channel_id,
+            "hello",
+            DispatchMessage::Rich(RichMessage::info("reply")),
+            ChannelMessageTarget::channel(channel_id),
+        )
+        .await;
+
+        let context = sender_context_service::find(&db.conn, channel_id, "wx-user")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(context.current_conversation_id, Some(conversation_id));
+        assert_eq!(
+            context.current_connection_id.as_deref(),
+            Some("still-valid")
+        );
+    }
+
+    #[tokio::test]
+    async fn weixin_restart_lazily_restores_and_forwards_original_message_once() {
+        let db = fresh_in_memory_db().await;
+        let channel_id = seed_weixin_channel(&db).await;
+        let folder_path = "/tmp/codeg-weixin-lazy-restore";
+        let folder_id = seed_folder(&db, folder_path).await;
+        let conversation_id = seed_conversation(&db, folder_id, AgentType::OpenCode).await;
+        conversation_service::update_external_id(
+            &db.conn,
+            conversation_id,
+            "weixin-persisted-session".into(),
+        )
+        .await
+        .expect("persist external session");
+        sender_context_service::update_session(
+            &db.conn,
+            channel_id,
+            "wx-user",
+            Some(conversation_id),
+            Some("stale-before-restart".into()),
+        )
+        .await
+        .expect("persist sender conversation binding");
+
+        let conn_mgr = ConnectionManager::new();
+        let mut agent_commands = conn_mgr
+            .insert_test_connection_live(
+                "weixin-restored-connection",
+                AgentType::OpenCode,
+                Some(PathBuf::from(folder_path)),
+                EventEmitter::Noop,
+            )
+            .await;
+        let state = conn_mgr
+            .get_state("weixin-restored-connection")
+            .await
+            .expect("test ACP state");
+        {
+            let mut state = state.write().await;
+            state.external_id = Some("weixin-persisted-session".into());
+            state.selectors_ready = true;
+        }
+
+        // A fresh bridge models codeg-server restart/reconnect. The durable DB
+        // route above is the only place that still knows the conversation.
+        let bridge = Arc::new(Mutex::new(SessionBridge::new()));
+        let target = ChannelMessageTarget::channel(channel_id);
+        let manager = ChatChannelManager::new();
+        let recorder = Recorder::default();
+        manager
+            .add_channel(
+                channel_id,
+                "Weixin test".into(),
+                ChannelType::Weixin,
+                Box::new(RecordingWeixinBackend {
+                    recorder: recorder.clone(),
+                }),
+            )
+            .await
+            .expect("register recording Weixin backend");
+
+        let (command_tx, command_rx) = mpsc::channel(4);
+        let dispatcher = spawn_command_dispatcher(
+            command_rx,
+            manager.clone_ref(),
+            db.conn.clone(),
+            PathBuf::from("/tmp/codeg-dispatch-data"),
+            conn_mgr.clone_ref(),
+            EventEmitter::Noop,
+            bridge.clone(),
+        );
+        command_tx
+            .send(IncomingCommand {
+                channel_id,
+                sender_id: "wx-user".into(),
+                command_text: "你好".into(),
+                callback_data: None,
+                target: target.clone(),
+                metadata: serde_json::json!({ "provider": "weixin" }),
+            })
+            .await
+            .expect("submit ordinary Weixin text to dispatcher");
+
+        let command = tokio::time::timeout(Duration::from_secs(2), agent_commands.recv())
+            .await
+            .expect("dispatcher timed out")
+            .expect("forwarded ACP prompt");
+        let ConnectionCommand::Prompt { blocks, .. } = command else {
+            panic!("expected prompt command")
+        };
+        assert!(matches!(
+            blocks.as_slice(),
+            [PromptInputBlock::Text { text }] if text == "你好"
+        ));
+        assert!(
+            agent_commands.try_recv().is_err(),
+            "the original message must be submitted exactly once"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            recorder.messages.lock().await.is_empty(),
+            "final-result mode must not send a Message sent acknowledgement"
+        );
+
+        let active = bridge.lock().await;
+        let session = active
+            .find_by_sender(channel_id, "wx-user")
+            .expect("ActiveSession registered after restore");
+        assert_eq!(session.conversation_id, conversation_id);
+        assert_eq!(session.connection_id, "weixin-restored-connection");
+        assert!(session.forward_events);
+        drop(active);
+        let persisted = sender_context_service::find(&db.conn, channel_id, "wx-user")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.current_conversation_id, Some(conversation_id));
+        assert_eq!(
+            persisted.current_connection_id.as_deref(),
+            Some("weixin-restored-connection")
+        );
+
+        // Model output is still scoped to the Weixin-owned turn and reaches
+        // the channel backend after the lazy restore.
+        super::super::session_event_subscriber::handle_acp_envelope(
+            &EventEnvelope {
+                seq: 1,
+                connection_id: "weixin-restored-connection".into(),
+                payload: AcpEvent::ContentDelta {
+                    text: "你好，我已经恢复了原会话。".into(),
+                    parent_tool_use_id: None,
+                },
+            },
+            &bridge,
+            &manager,
+            &conn_mgr,
+            &db.conn,
+        )
+        .await;
+        {
+            let state = conn_mgr
+                .get_state("weixin-restored-connection")
+                .await
+                .expect("restored ACP state");
+            state.write().await.last_assistant_text =
+                Some("你好，我已经恢复了原会话。".into());
+        }
+        super::super::session_event_subscriber::handle_acp_envelope(
+            &EventEnvelope {
+                seq: 2,
+                connection_id: "weixin-restored-connection".into(),
+                payload: AcpEvent::TurnComplete {
+                    session_id: "weixin-persisted-session".into(),
+                    stop_reason: "end_turn".into(),
+                    agent_type: "opencode".into(),
+                },
+            },
+            &bridge,
+            &manager,
+            &conn_mgr,
+            &db.conn,
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !recorder.messages.lock().await.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Weixin model reply timed out");
+        let sent = recorder.messages.lock().await.clone();
+        assert_eq!(sent, vec!["你好，我已经恢复了原会话。"]);
+        dispatcher.abort();
     }
 }

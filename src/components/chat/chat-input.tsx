@@ -27,6 +27,8 @@ interface ChatInputProps {
   agentName?: string
   onFocus?: () => void
   onSend: (draft: PromptDraft, modeId?: string | null) => void
+  supportsSteer?: boolean
+  onGuide?: (draft: PromptDraft) => void | Promise<void>
   onCancel: () => void
   modes?: SessionModeInfo[]
   configOptions?: SessionConfigOptionInfo[]
@@ -49,6 +51,8 @@ interface ChatInputProps {
   onQueueReorder?: (items: QueuedMessage[]) => void
   onQueueEdit?: (id: string) => void
   onQueueDelete?: (id: string) => void
+  onQueueRetry?: (id: string) => void
+  onConvertGuideToPrompt?: (id: string) => void
   editingItemId?: string | null
   editingDraftText?: string | null
   editingDraftBlocks?: PromptInputBlock[] | null
@@ -65,11 +69,9 @@ interface ChatInputProps {
   onAddFeedback?: () => void
   feedbackAddDisabled?: boolean
   /**
-   * Keep the composer usable even while disconnected. Set for a folderless chat
-   * draft: it has no working dir yet (so it never auto-connects), and the FIRST
-   * send is precisely what lazily creates its conversation + scratch dir and
-   * triggers the connection. Without this the composer would be permanently
-   * disabled and the chat could never be started.
+   * Keep the composer usable while a persisted historical session is restoring.
+   * The parent retains those drafts in its durable per-conversation queue and
+   * sends them only after the exact ACP session finishes attaching.
    */
   allowOfflineCompose?: boolean
   injectContent?: ComposerInjectContent | null
@@ -90,6 +92,8 @@ export const ChatInput = memo(function ChatInput({
   agentName,
   onFocus,
   onSend,
+  supportsSteer = false,
+  onGuide,
   onCancel,
   modes,
   configOptions,
@@ -110,6 +114,8 @@ export const ChatInput = memo(function ChatInput({
   onQueueReorder,
   onQueueEdit,
   onQueueDelete,
+  onQueueRetry,
+  onConvertGuideToPrompt,
   editingItemId,
   editingDraftText,
   editingDraftBlocks,
@@ -142,6 +148,7 @@ export const ChatInput = memo(function ChatInput({
   // and is bounded: `selectors_ready` fires on every establishment path whether
   // or not the agent has any commands, so this can never hang on a spinner.
   const commandsLoading = isConnecting || selectorsLoading
+  const isNativeGuide = isPrompting && supportsSteer && Boolean(onGuide)
 
   // Active/historical conversations dock the composer at the very bottom of the
   // message list. The attached folder/branch selector row now sits at the
@@ -175,11 +182,15 @@ export const ChatInput = memo(function ChatInput({
             onReorder={onQueueReorder}
             onEdit={onQueueEdit}
             onDelete={onQueueDelete}
+            onRetry={onQueueRetry}
+            onConvertGuideToPrompt={onConvertGuideToPrompt}
             editingItemId={editingItemId ?? null}
           />
         )}
       <MessageInput
         onSend={onSend}
+        supportsSteer={supportsSteer}
+        onGuide={onGuide}
         promptCapabilities={promptCapabilities}
         onFocus={onFocus}
         defaultPath={defaultPath}
@@ -220,9 +231,11 @@ export const ChatInput = memo(function ChatInput({
         placeholder={
           isConnecting
             ? t("connecting")
-            : isPrompting
-              ? t("agentResponding", { agent: agentName ?? "Agent" })
-              : t("sendMessage")
+            : isNativeGuide
+              ? t("guideAgent", { agent: agentName ?? "Agent" })
+              : isPrompting
+                ? t("agentResponding", { agent: agentName ?? "Agent" })
+                : t("sendMessage")
         }
         className={cn(tall ? "min-h-30" : "min-h-24", "max-h-60")}
       />
