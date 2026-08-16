@@ -4,10 +4,17 @@ on:
   push:
     tags:
       - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing release tag whose server assets should be rebuilt"
+        required: true
+        type: string
 
 env:
   RUST_BACKTRACE: short
   HUSKY: 0
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
 
 concurrency:
   group: release-${{ github.ref }}
@@ -27,12 +34,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ env.RELEASE_TAG }}
 
       - id: meta
         name: Resolve release channel
         shell: bash
         run: |
-          if [[ "${GITHUB_REF_NAME}" == *"-rc"* ]]; then
+          if [[ "${RELEASE_TAG}" == *"-rc"* ]]; then
             echo "prerelease=true" >> "$GITHUB_OUTPUT"
           else
             echo "prerelease=false" >> "$GITHUB_OUTPUT"
@@ -43,12 +51,14 @@ jobs:
         run: |
           DEFAULT_BRANCH="${{ github.event.repository.default_branch }}"
           git fetch origin "${DEFAULT_BRANCH}"
+          git fetch --force origin \
+            "+refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
 
-          TAG_COMMIT=$(git rev-list -n 1 "${GITHUB_REF_NAME}")
+          TAG_COMMIT=$(git rev-list -n 1 "${RELEASE_TAG}")
           if git merge-base --is-ancestor "${TAG_COMMIT}" "origin/${DEFAULT_BRANCH}"; then
-            echo "Tag ${GITHUB_REF_NAME} is based on ${DEFAULT_BRANCH}"
+            echo "Tag ${RELEASE_TAG} is based on ${DEFAULT_BRANCH}"
           else
-            echo "Tag ${GITHUB_REF_NAME} is not based on ${DEFAULT_BRANCH}"
+            echo "Tag ${RELEASE_TAG} is not based on ${DEFAULT_BRANCH}"
             exit 1
           fi
 
@@ -61,8 +71,8 @@ jobs:
         shell: bash
         run: |
           APP_VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
-          if [[ "v$APP_VERSION" != "${GITHUB_REF_NAME}" ]]; then
-            echo "Tag ${GITHUB_REF_NAME} does not match app version v$APP_VERSION"
+          if [[ "v$APP_VERSION" != "${RELEASE_TAG}" ]]; then
+            echo "Tag ${RELEASE_TAG} does not match app version v$APP_VERSION"
             exit 1
           fi
 
@@ -71,11 +81,13 @@ jobs:
         uses: actions/github-script@v7
         env:
           PRERELEASE: ${{ steps.meta.outputs.prerelease }}
+          SERVER_ONLY: ${{ github.event_name == 'workflow_dispatch' }}
         with:
           script: |
-            const tag = context.ref.replace("refs/tags/", "");
+            const tag = process.env.RELEASE_TAG;
             const { owner, repo } = context.repo;
             const prerelease = process.env.PRERELEASE === "true";
+            const serverOnly = process.env.SERVER_ONLY === "true";
             const releaseName = `codeg ${tag}`;
             const { data: tagRef } = await github.rest.git.getRef({
               owner,
@@ -105,8 +117,16 @@ jobs:
               ref: commitSha,
             });
 
-            const releaseBody =
+            let releaseBody =
               commit.commit.message?.trim() || "_No commit message._";
+            if (context.payload.repository?.fork) {
+              releaseBody +=
+                "\n\n> [!WARNING]\n" +
+                "> This fork release is built without the upstream signing and " +
+                "notarization credentials. Desktop installers and server archives " +
+                "are unsigned; server archives include SHA-256 checksums. Use " +
+                "manual installation instead of the signed automatic updater.";
+            }
             let release;
 
             try {
@@ -116,33 +136,45 @@ jobs:
                 tag,
               });
 
-              if (!existing.data.draft) {
-                core.setFailed(
-                  `Release for tag ${tag} already exists and is not a draft.`,
-                );
-                return;
-              }
-
               release = existing.data;
-              if (
-                release.prerelease !== prerelease ||
-                release.name !== releaseName ||
-                (release.body ?? "").trim() !== releaseBody
-              ) {
-                const updated = await github.rest.repos.updateRelease({
-                  owner,
-                  repo,
-                  release_id: release.id,
-                  name: releaseName,
-                  prerelease,
-                  body: releaseBody,
-                });
-                release = updated.data;
+              if (!release.draft) {
+                if (!serverOnly) {
+                  core.setFailed(
+                    `Release for tag ${tag} already exists and is not a draft.`,
+                  );
+                  return;
+                }
+                core.info(
+                  `Reusing published release #${release.id} for server asset repair`,
+                );
+              } else {
+                if (
+                  release.prerelease !== prerelease ||
+                  release.name !== releaseName ||
+                  (release.body ?? "").trim() !== releaseBody
+                ) {
+                  const updated = await github.rest.repos.updateRelease({
+                    owner,
+                    repo,
+                    release_id: release.id,
+                    name: releaseName,
+                    prerelease,
+                    body: releaseBody,
+                  });
+                  release = updated.data;
+                }
+                core.info(`Reusing existing draft release #${release.id}`);
               }
-              core.info(`Reusing existing draft release #${release.id}`);
             } catch (error) {
               if (error.status !== 404) {
                 throw error;
+              }
+
+              if (serverOnly) {
+                core.setFailed(
+                  `Release for tag ${tag} does not exist; server-only mode only repairs an existing release.`,
+                );
+                return;
               }
 
               const created = await github.rest.repos.createRelease({
@@ -161,10 +193,11 @@ jobs:
 
             core.setOutput("release_id", String(release.id));
             core.setOutput("release_url", release.html_url);
-            core.setOutput("release_body", releaseBody);
+            core.setOutput("release_body", release.body ?? releaseBody);
 
   build-tauri:
     needs: create-draft-release
+    if: github.event_name == 'push'
     name: Build ${{ matrix.name }}
     permissions:
       contents: write
@@ -172,28 +205,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: "macOS x64"
-            runner: "macos-latest"
-            target: "x86_64-apple-darwin"
-          - name: "macOS arm64"
-            runner: "macos-latest"
-            target: "aarch64-apple-darwin"
-          - name: "Linux x64"
-            runner: "ubuntu-22.04"
-            target: "x86_64-unknown-linux-gnu"
-          - name: "Linux arm64"
-            runner: "ubuntu-22.04"
-            target: "aarch64-unknown-linux-gnu"
           - name: "Windows x64"
             runner: "windows-2022"
             target: "x86_64-pc-windows-msvc"
-          - name: "Windows arm64"
-            runner: "windows-latest"
-            target: "aarch64-pc-windows-msvc"
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ env.RELEASE_TAG }}
           fetch-depth: 0
 
       - name: Setup pnpm
@@ -328,7 +347,7 @@ jobs:
           ls -la "$file"
 
       - name: Import Apple Developer ID certificate
-        if: contains(matrix.target, 'apple-darwin')
+        if: contains(matrix.target, 'apple-darwin') && github.event.repository.fork == false
         shell: bash
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -403,7 +422,7 @@ jobs:
           security find-identity -v -p codesigning "$keychain_path"
 
       - name: Resolve Apple Developer ID identity
-        if: contains(matrix.target, 'apple-darwin')
+        if: contains(matrix.target, 'apple-darwin') && github.event.repository.fork == false
         shell: bash
         run: |
           set -euo pipefail
@@ -425,7 +444,7 @@ jobs:
           echo "Using Apple signing identity: $cert_id"
 
       - name: Build and upload to draft release (Linux arm64)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        if: matrix.target == 'aarch64-unknown-linux-gnu' && github.event.repository.fork == false
         uses: tauri-apps/tauri-action@v0.6.1
         env:
           # The matrix-target sidecar is already staged and verified above.
@@ -457,7 +476,7 @@ jobs:
           retryAttempts: 2
 
       - name: Build and upload to draft release (Windows)
-        if: contains(matrix.target, 'windows')
+        if: contains(matrix.target, 'windows') && github.event.repository.fork == false
         uses: tauri-apps/tauri-action@v0.6.1
         env:
           # The matrix-target sidecar is already staged and verified above.
@@ -482,7 +501,7 @@ jobs:
           retryAttempts: 2
 
       - name: Build and upload to draft release (Linux x64)
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        if: matrix.target == 'x86_64-unknown-linux-gnu' && github.event.repository.fork == false
         uses: tauri-apps/tauri-action@v0.6.1
         env:
           # The matrix-target sidecar is already staged and verified above.
@@ -504,7 +523,7 @@ jobs:
           retryAttempts: 2
 
       - name: Build, sign, and upload to draft release (macOS)
-        if: contains(matrix.target, 'apple-darwin')
+        if: contains(matrix.target, 'apple-darwin') && github.event.repository.fork == false
         uses: tauri-apps/tauri-action@v0.6.1
         env:
           # The matrix-target sidecar is already staged and verified above.
@@ -531,8 +550,89 @@ jobs:
           includeUpdaterJson: true
           retryAttempts: 2
 
+      # Forks do not receive upstream repository secrets. Build ordinary
+      # installable bundles, but explicitly disable updater artifacts: those
+      # must never be published without the updater signing key.
+      - name: Build and upload unsigned fork bundle (Linux arm64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu' && github.event.repository.fork == true
+        uses: tauri-apps/tauri-action@v0.6.1
+        env:
+          CODEG_SKIP_SIDECAR: "1"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PKG_CONFIG_ALLOW_CROSS: 1
+          PKG_CONFIG_PATH: /usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig
+          PKG_CONFIG_LIBDIR: /usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig
+          PKG_CONFIG_SYSROOT_DIR: /usr/aarch64-linux-gnu
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_AR: aarch64-linux-gnu-gcc-ar
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -Clinker=aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc-ar
+        with:
+          releaseId: ${{ needs.create-draft-release.outputs.release_id }}
+          tagName: ${{ github.ref_name }}
+          releaseBody: ${{ needs.create-draft-release.outputs.release_body }}
+          releaseDraft: true
+          prerelease: ${{ needs.create-draft-release.outputs.prerelease }}
+          tauriScript: pnpm tauri
+          args: --target ${{ matrix.target }} --bundles deb,rpm --config '{"bundle":{"createUpdaterArtifacts":false}}'
+          includeUpdaterJson: false
+          retryAttempts: 2
+
+      - name: Build and upload unsigned fork bundle (Linux x64)
+        if: matrix.target == 'x86_64-unknown-linux-gnu' && github.event.repository.fork == true
+        uses: tauri-apps/tauri-action@v0.6.1
+        env:
+          CODEG_SKIP_SIDECAR: "1"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          releaseId: ${{ needs.create-draft-release.outputs.release_id }}
+          tagName: ${{ github.ref_name }}
+          releaseBody: ${{ needs.create-draft-release.outputs.release_body }}
+          releaseDraft: true
+          prerelease: ${{ needs.create-draft-release.outputs.prerelease }}
+          tauriScript: pnpm tauri
+          args: --target ${{ matrix.target }} --config '{"bundle":{"createUpdaterArtifacts":false}}'
+          includeUpdaterJson: false
+          retryAttempts: 2
+
+      - name: Build and upload unsigned fork bundle (Windows)
+        if: contains(matrix.target, 'windows') && github.event.repository.fork == true
+        uses: tauri-apps/tauri-action@v0.6.1
+        env:
+          CODEG_SKIP_SIDECAR: "1"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          releaseId: ${{ needs.create-draft-release.outputs.release_id }}
+          tagName: ${{ github.ref_name }}
+          releaseBody: ${{ needs.create-draft-release.outputs.release_body }}
+          releaseDraft: true
+          prerelease: ${{ needs.create-draft-release.outputs.prerelease }}
+          tauriScript: pnpm tauri
+          args: --target ${{ matrix.target }} --bundles nsis --config '{"bundle":{"createUpdaterArtifacts":false}}'
+          includeUpdaterJson: false
+          retryAttempts: 2
+
+      - name: Build and upload unsigned fork bundle (macOS)
+        if: contains(matrix.target, 'apple-darwin') && github.event.repository.fork == true
+        uses: tauri-apps/tauri-action@v0.6.1
+        env:
+          CODEG_SKIP_SIDECAR: "1"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          releaseId: ${{ needs.create-draft-release.outputs.release_id }}
+          tagName: ${{ github.ref_name }}
+          releaseBody: ${{ needs.create-draft-release.outputs.release_body }}
+          releaseDraft: true
+          prerelease: ${{ needs.create-draft-release.outputs.prerelease }}
+          tauriScript: pnpm tauri
+          args: --target ${{ matrix.target }} --bundles dmg --config '{"bundle":{"createUpdaterArtifacts":false}}'
+          includeUpdaterJson: false
+          retryAttempts: 2
+
       - name: Delete Apple signing keychain
-        if: always() && contains(matrix.target, 'apple-darwin')
+        if: always() && contains(matrix.target, 'apple-darwin') && github.event.repository.fork == false
         shell: bash
         run: |
           if [ -n "${APPLE_ORIGINAL_DEFAULT_KEYCHAIN:-}" ]; then
@@ -574,29 +674,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: "Linux x64"
-            runner: "ubuntu-22.04"
-            target: "x86_64-unknown-linux-gnu"
-            artifact: "codeg-server-linux-x64"
-          - name: "Linux arm64"
-            runner: "ubuntu-22.04"
-            target: "aarch64-unknown-linux-gnu"
-            artifact: "codeg-server-linux-arm64"
-          - name: "macOS x64"
-            runner: "macos-latest"
-            target: "x86_64-apple-darwin"
-            artifact: "codeg-server-darwin-x64"
-          - name: "macOS arm64"
-            runner: "macos-latest"
-            target: "aarch64-apple-darwin"
-            artifact: "codeg-server-darwin-arm64"
           - name: "Windows x64"
             runner: "windows-2022"
             target: "x86_64-pc-windows-msvc"
             artifact: "codeg-server-windows-x64"
+            archive: "codeg-server-windows-x64.zip"
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -737,8 +824,8 @@ jobs:
       # updater uses (`tauri signer sign` writes `<file>.sig`). The server's
       # `update::verify` module verifies this signature against the embedded
       # public key before installing — see src-tauri/src/update/verify.rs.
-      - name: Sign and checksum bundle (Unix)
-        if: runner.os != 'Windows'
+      - name: Sign bundle (Unix)
+        if: runner.os != 'Windows' && github.event.repository.fork == false
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
@@ -746,10 +833,15 @@ jobs:
           set -euo pipefail
           pnpm tauri signer sign "dist/${{ matrix.artifact }}.tar.gz"
           test -f "dist/${{ matrix.artifact }}.tar.gz.sig"
+
+      - name: Checksum bundle (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
           ( cd dist && shasum -a 256 "${{ matrix.artifact }}.tar.gz" > "${{ matrix.artifact }}.tar.gz.sha256" )
 
-      - name: Sign and checksum bundle (Windows)
-        if: runner.os == 'Windows'
+      - name: Sign bundle (Windows)
+        if: runner.os == 'Windows' && github.event.repository.fork == false
         shell: pwsh
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -759,114 +851,194 @@ jobs:
           if (-not (Test-Path "dist/${{ matrix.artifact }}.zip.sig")) {
             throw "signature not produced for ${{ matrix.artifact }}.zip"
           }
-          $hash = (Get-FileHash -Algorithm SHA256 "dist/${{ matrix.artifact }}.zip").Hash.ToLower()
-          "$hash  ${{ matrix.artifact }}.zip" | Out-File -Encoding ascii "dist/${{ matrix.artifact }}.zip.sha256"
 
-      - name: Upload to release (Unix)
-        if: runner.os != 'Windows'
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release upload "${{ github.ref_name }}" \
-            "dist/${{ matrix.artifact }}.tar.gz" \
-            "dist/${{ matrix.artifact }}.tar.gz.sig" \
-            "dist/${{ matrix.artifact }}.tar.gz.sha256" \
-            --clobber
-
-      - name: Upload to release (Windows)
+      - name: Checksum bundle (Windows)
         if: runner.os == 'Windows'
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${{ github.ref_name }}" "dist/${{ matrix.artifact }}.zip" "dist/${{ matrix.artifact }}.zip.sig" "dist/${{ matrix.artifact }}.zip.sha256" --clobber
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash -Algorithm SHA256 "dist/${{ matrix.artifact }}.zip").Hash.ToLower()
+          "$hash  ${{ matrix.artifact }}.zip`n" | Out-File -Encoding ascii -NoNewline "dist/${{ matrix.artifact }}.zip.sha256"
 
-  build-docker:
+      # Keep release files as immutable workflow artifacts while desktop
+      # matrix jobs are still mutating the draft release. A single collector
+      # uploads the complete server set after every desktop job has finished.
+      - name: Stage signed upstream release assets
+        if: github.event.repository.fork == false
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-server-${{ matrix.artifact }}
+          path: |
+            dist/${{ matrix.archive }}
+            dist/${{ matrix.archive }}.sig
+            dist/${{ matrix.archive }}.sha256
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Stage unsigned fork release assets
+        if: github.event.repository.fork == true
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-server-${{ matrix.artifact }}
+          path: |
+            dist/${{ matrix.archive }}
+            dist/${{ matrix.archive }}.sha256
+          retention-days: 7
+          if-no-files-found: error
+
+  upload-server-assets:
     needs:
       - create-draft-release
+      - build-tauri
       - build-server
-    name: Build Docker image
+    if: >-
+      always() &&
+      needs.create-draft-release.result == 'success' &&
+      needs.build-server.result == 'success' &&
+      (github.event_name == 'workflow_dispatch' || needs.build-tauri.result == 'success')
+    name: Upload complete server asset set
     runs-on: ubuntu-22.04
     permissions:
-      contents: read
-      packages: write
+      actions: read
+      contents: write
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Download Linux x64 artifact
+      - name: Download server release assets
         uses: actions/download-artifact@v4
         with:
-          name: codeg-server-linux-x64
-          path: artifacts/linux-x64
+          pattern: release-server-*
+          path: server-release-assets
+          merge-multiple: true
 
-      - name: Download Linux arm64 artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: codeg-server-linux-arm64
-          path: artifacts/linux-arm64
-
-      - name: Prepare Docker build context
+      - name: Validate complete server asset set
+        shell: bash
         run: |
           set -euo pipefail
-          mkdir -p dist/amd64 dist/arm64
-          cp artifacts/linux-x64/codeg-server dist/amd64/codeg-server
-          cp artifacts/linux-x64/codeg-mcp dist/amd64/codeg-mcp
-          cp artifacts/linux-arm64/codeg-server dist/arm64/codeg-server
-          cp artifacts/linux-arm64/codeg-mcp dist/arm64/codeg-mcp
-          cp -r artifacts/linux-x64/web dist/web
-          chmod +x dist/amd64/codeg-server dist/amd64/codeg-mcp \
-                   dist/arm64/codeg-server dist/arm64/codeg-mcp
-          # Fail fast if any companion went missing — Docker would otherwise
-          # produce an image where delegation silently degrades.
-          for f in dist/amd64/codeg-mcp dist/arm64/codeg-mcp; do
-            test -x "$f" || { echo "FATAL: $f missing or non-exec"; exit 1; }
+
+          archives=(
+            codeg-server-windows-x64.zip
+          )
+
+          for archive in "${archives[@]}"; do
+            test -s "server-release-assets/$archive"
+            test -s "server-release-assets/$archive.sha256"
+            if [ "${{ github.event.repository.fork }}" = "false" ]; then
+              test -s "server-release-assets/$archive.sig"
+            fi
           done
 
-      - name: Set up QEMU (for multi-arch manifest)
-        uses: docker/setup-qemu-action@v3
+          expected_count=2
+          if [ "${{ github.event.repository.fork }}" = "false" ]; then
+            expected_count=3
+          fi
+          actual_count="$(find server-release-assets -maxdepth 1 -type f | wc -l)"
+          if [ "$actual_count" -ne "$expected_count" ]; then
+            echo "Expected $expected_count server release files, found $actual_count"
+            find server-release-assets -maxdepth 1 -type f -printf '%f\n' | sort
+            exit 1
+          fi
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+          # PowerShell-produced checksum files from older workflow runs may
+          # use CRLF. Normalize before feeding them to GNU sha256sum so the
+          # trailing CR is not interpreted as part of the archive filename.
+          sed -i 's/\r$//' server-release-assets/*.sha256
 
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          (
+            cd server-release-assets
+            for checksum in *.sha256; do
+              sha256sum --check "$checksum"
+            done
+          )
 
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Upload complete server asset set to release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release upload "$RELEASE_TAG"
+          server-release-assets/*
+          --clobber
+          --repo "$GITHUB_REPOSITORY"
 
-      - name: Extract version from tag
-        id: version
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Verify server assets persisted on release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
 
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile.ci
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: |
-            ghcr.io/${{ github.repository }}:${{ steps.version.outputs.version }}
-            ghcr.io/${{ github.repository }}:latest
-            ${{ secrets.DOCKERHUB_USERNAME }}/codeg:${{ steps.version.outputs.version }}
-            ${{ secrets.DOCKERHUB_USERNAME }}/codeg:latest
+          remote_assets="$(
+            gh release view "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json assets \
+              --jq '.assets[].name'
+          )"
+          archives=(
+            codeg-server-windows-x64.zip
+          )
+
+          for archive in "${archives[@]}"; do
+            grep -Fqx "$archive" <<< "$remote_assets"
+            grep -Fqx "$archive.sha256" <<< "$remote_assets"
+            if [ "${{ github.event.repository.fork }}" = "false" ]; then
+              grep -Fqx "$archive.sig" <<< "$remote_assets"
+            fi
+          done
 
   publish-release:
     needs:
       - create-draft-release
       - build-tauri
       - build-server
-      - build-docker
-    if: ${{ needs.build-tauri.result == 'success' && needs.build-server.result == 'success' && needs.build-docker.result == 'success' }}
+      - upload-server-assets
+    if: >-
+      github.event_name == 'push' &&
+      needs.build-tauri.result == 'success' &&
+      needs.build-server.result == 'success' &&
+      needs.upload-server-assets.result == 'success'
     runs-on: ubuntu-22.04
     permissions:
       contents: write
     steps:
+      - name: Validate Windows-only fork release assets
+        if: github.event.repository.fork == true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          mapfile -t remote_assets < <(
+            gh release view "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json assets \
+              --jq '.assets[].name'
+          )
+
+          printf '%s\n' "${remote_assets[@]}"
+          printf '%s\n' "${remote_assets[@]}" \
+            | grep -Fqx 'codeg-server-windows-x64.zip'
+          printf '%s\n' "${remote_assets[@]}" \
+            | grep -Fqx 'codeg-server-windows-x64.zip.sha256'
+
+          setup_count=0
+          for asset in "${remote_assets[@]}"; do
+            case "$asset" in
+              codeg_*_x64-setup.exe)
+                setup_count=$((setup_count + 1))
+                ;;
+              codeg-server-windows-x64.zip|codeg-server-windows-x64.zip.sha256)
+                ;;
+              *)
+                echo "Unexpected release asset: $asset"
+                exit 1
+                ;;
+            esac
+          done
+
+          if [ "$setup_count" -ne 1 ] || [ "${#remote_assets[@]}" -ne 3 ]; then
+            echo "Expected one Windows setup and two Windows Server files"
+            exit 1
+          fi
+
       - name: Publish draft release
         uses: actions/github-script@v7
         env:

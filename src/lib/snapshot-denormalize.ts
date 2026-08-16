@@ -38,8 +38,11 @@ export interface SnapshotPatch {
   // eventSeq race window allows an old connection's snapshot to overwrite
   // a freshly-started replacement at the same contextKey.
   connectionId: string
+  conversationId: number | null
   status: ConnectionStatus
   sessionId: string | null
+  codegMcpAvailable: boolean
+  mcpServerCount: number
   modes: SessionModeStateInfo | null
   configOptions: SessionConfigOptionInfo[] | null
   availableCommands: AvailableCommandInfo[] | null
@@ -62,6 +65,8 @@ export interface SnapshotPatch {
   promptCapabilities: PromptCapabilitiesInfo | null
   selectorsReady: boolean
   supportsFork: boolean
+  supportsSteer: boolean
+  steerMessages: PendingUserMessage[]
   /** Whether the running session is on stale (launch-time) config — recovered
    *  from the snapshot so a reconnect/refresh/new tile sees the banner state
    *  that the one-shot `session_config_stale` event won't replay. */
@@ -112,8 +117,11 @@ export function denormalizeSnapshot(wire: LiveSessionSnapshot): SnapshotPatch {
 
   return {
     connectionId: wire.connection_id,
+    conversationId: wire.conversation_id,
     status: wire.status,
     sessionId: wire.external_id,
+    codegMcpAvailable: wire.codeg_mcp_available ?? false,
+    mcpServerCount: wire.mcp_server_count ?? 0,
     modes: wire.modes,
     configOptions: wire.config_options,
     availableCommands: wire.available_commands ?? null,
@@ -149,6 +157,11 @@ export function denormalizeSnapshot(wire: LiveSessionSnapshot): SnapshotPatch {
     promptCapabilities: wire.prompt_capabilities ?? DEFAULT_PROMPT_CAPS,
     selectorsReady: wire.selectors_ready,
     supportsFork: wire.fork_supported,
+    supportsSteer: wire.supports_steer ?? false,
+    steerMessages: (wire.steer_messages ?? []).map((message) => ({
+      messageId: message.message_id,
+      blocks: message.blocks,
+    })),
     configStale: wire.config_stale ?? false,
     configStaleKind: wire.config_stale_kind ?? null,
     backgroundOutstanding: wire.background_outstanding ?? 0,

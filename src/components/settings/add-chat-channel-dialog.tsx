@@ -47,6 +47,7 @@ export function AddChatChannelDialog({
   const [appId, setAppId] = useState("")
   const [baseUrl, setBaseUrl] = useState("https://ilinkai.weixin.qq.com")
   const [topicMode, setTopicMode] = useState(false)
+  const [pushMode, setPushMode] = useState("final_and_interactions")
   const [dailyReportEnabled, setDailyReportEnabled] = useState(false)
   const [dailyReportTime, setDailyReportTime] = useState("18:00")
   const topicModeId = useId()
@@ -59,6 +60,7 @@ export function AddChatChannelDialog({
     setAppId("")
     setBaseUrl("https://ilinkai.weixin.qq.com")
     setTopicMode(false)
+    setPushMode("final_and_interactions")
     setDailyReportEnabled(false)
     setDailyReportTime("18:00")
     setError(null)
@@ -91,7 +93,7 @@ export function AddChatChannelDialog({
     try {
       const configJson =
         channelType === "weixin"
-          ? JSON.stringify({ base_url: baseUrl })
+          ? JSON.stringify({ base_url: baseUrl, push_mode: pushMode })
           : channelType === "lark"
             ? JSON.stringify({ app_id: appId, chat_id: chatId })
             : JSON.stringify({ chat_id: chatId, topic_mode: topicMode })
@@ -125,6 +127,7 @@ export function AddChatChannelDialog({
     appId,
     baseUrl,
     topicMode,
+    pushMode,
     dailyReportEnabled,
     dailyReportTime,
     handleOpenChange,
@@ -227,9 +230,35 @@ export function AddChatChannelDialog({
           )}
 
           {channelType === "weixin" && (
-            <p className="text-xs text-muted-foreground">
-              {t("weixinScanDescription")}
-            </p>
+            <div className="space-y-3">
+              <p className="text-xs text-muted-foreground">
+                {t("weixinScanDescription")}
+              </p>
+              <div className="space-y-1.5">
+                <label className="text-xs font-medium">
+                  {t("weixinPushMode")}
+                </label>
+                <Select value={pushMode} onValueChange={setPushMode}>
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="final_only">
+                      {t("weixinPushFinalOnly")}
+                    </SelectItem>
+                    <SelectItem value="final_and_interactions">
+                      {t("weixinPushFinalAndInteractions")}
+                    </SelectItem>
+                    <SelectItem value="debug">
+                      {t("weixinPushDebug")}
+                    </SelectItem>
+                  </SelectContent>
+                </Select>
+                <p className="text-xs text-muted-foreground">
+                  {t("weixinPushModeHint")}
+                </p>
+              </div>
+            </div>
           )}
 
           <div className="flex items-center justify-between">

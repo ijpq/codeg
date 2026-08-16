@@ -15,6 +15,7 @@ pub use acp::{
 pub use network::proxy::init_proxy_from_db;
 mod app_error;
 pub mod app_state;
+pub mod artifact_tracker;
 pub mod automation;
 pub mod backgrounds;
 pub mod chat_channel;
@@ -62,15 +63,15 @@ mod tauri_app {
     use crate::acp::manager::ConnectionManager;
     use crate::chat_channel::manager::ChatChannelManager;
     use crate::commands::{
-        acp as acp_commands, app_update as app_update_commands,
-        automation as automation_commands, background as background_commands, backup,
-        chat_authoring as chat_authoring_commands, chat_channel as chat_channel_commands,
-        conversations,
+        acp as acp_commands, app_update as app_update_commands, automation as automation_commands,
+        background as background_commands, backup, chat_authoring as chat_authoring_commands,
+        chat_channel as chat_channel_commands, conversation_branches, conversations,
         custom_skills as custom_skills_commands, delegation as delegation_commands,
-        experts as experts_commands, feedback as feedback_commands, file_io, folder_commands,
-        folder_links, office_tools as office_tools_commands,
-        folders, logging as logging_commands, mcp as mcp_commands,
-        model_provider as model_provider_commands, notification, pet as pet_commands, project_boot,
+        deliverables as deliverable_commands, experts as experts_commands,
+        feedback as feedback_commands, file_io, folder_commands, folder_links, folders,
+        logging as logging_commands, mcp as mcp_commands,
+        model_provider as model_provider_commands, notification,
+        office_tools as office_tools_commands, pet as pet_commands, project_boot,
         question as question_commands, quick_messages as quick_messages_commands,
         remote_proxy as remote_proxy_commands,
         remote_workspace as remote_workspace_commands, science as science_commands,
@@ -704,6 +705,12 @@ mod tauri_app {
                                 chat_authoring_config.clone(),
                             ),
                         ),
+                        crate::acp::deliverables::shared_access(
+                            db_conn.clone(),
+                            crate::web::event_bridge::EventEmitter::Tauri(
+                                app.handle().clone(),
+                            ),
+                        ),
                     );
                     tauri::async_runtime::spawn(async move {
                         if let Err(e) = listener.run(socket_path).await {
@@ -1037,6 +1044,19 @@ mod tauri_app {
                 conversations::update_conversation_title,
                 conversations::update_conversation_pinned,
                 conversations::delete_conversation,
+                conversation_branches::create_conversation_branch,
+                conversation_branches::get_conversation_branch_info,
+                conversation_branches::merge_conversation_branch,
+                deliverable_commands::deliverable_capabilities,
+                deliverable_commands::list_conversation_deliverables,
+                deliverable_commands::list_turn_deliverables,
+                deliverable_commands::list_conversation_deliverable_runs,
+                deliverable_commands::list_conversation_deliverable_history,
+                deliverable_commands::copy_deliverables,
+                deliverable_commands::open_deliverable,
+                deliverable_commands::reveal_deliverable,
+                deliverable_commands::hide_deliverables,
+                deliverable_commands::save_deliverables,
                 folders::load_folder_history,
                 folders::get_folder,
                 folders::list_open_folder_details,
@@ -1118,6 +1138,7 @@ mod tauri_app {
                 folders::list_workspace_files,
                 folders::read_file_base64,
                 folders::read_workspace_file_base64,
+                folders::stat_workspace_file,
                 folders::read_file_preview,
                 folders::read_file_for_edit,
                 folders::save_file_content,
@@ -1153,6 +1174,7 @@ mod tauri_app {
                 remote_proxy_commands::remote_cancel_workspace_transfer,
                 remote_proxy_commands::remote_download_workspace_file,
                 remote_proxy_commands::remote_download_workspace_dir,
+                remote_proxy_commands::remote_download_deliverables,
                 remote_proxy_commands::read_local_file_for_upload,
                 remote_proxy_commands::remote_ws_subscribe,
                 remote_proxy_commands::remote_ws_unsubscribe,
@@ -1242,7 +1264,9 @@ mod tauri_app {
                 acp_commands::acp_cursor_list_models,
                 acp_commands::acp_qoder_auth_status,
                 acp_commands::acp_connect,
+                acp_commands::acp_restore_conversation,
                 acp_commands::acp_prompt,
+                acp_commands::acp_steer,
                 acp_commands::acp_set_mode,
                 acp_commands::acp_set_config_option,
                 acp_commands::acp_goal_control,
@@ -1455,6 +1479,7 @@ mod tauri_app {
                 model_provider_commands::create_model_provider,
                 model_provider_commands::update_model_provider,
                 model_provider_commands::delete_model_provider,
+                model_provider_commands::probe_active_model_provider,
                 web::start_web_server,
                 web::stop_web_server,
                 web::get_web_server_status,

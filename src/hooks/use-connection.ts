@@ -31,12 +31,14 @@ const DEFAULT_PROMPT_CAPABILITIES: PromptCapabilitiesInfo = {
   audio: false,
   embedded_context: false,
 }
+const EMPTY_STEER_MESSAGES: PendingUserMessage[] = []
 
 /** Stable empty table so the no-failures common case never re-renders. */
 const EMPTY_SESSION_FAILURES: SessionFailureRecord[] = []
 
 export interface UseConnectionReturn {
   connectionId: string | null
+  conversationId: number | null
   /** The agent type of the live connection at this contextKey (null when no
    *  connection exists yet). Lets callers detect a connection still bound to a
    *  PREVIOUS agent — e.g. a draft mid-switch, or a switch the not-installed
@@ -53,9 +55,14 @@ export interface UseConnectionReturn {
   status: ConnectionStatus | null
   promptCapabilities: PromptCapabilitiesInfo
   supportsFork: boolean
+  supportsSteer: boolean
   selectorsReady: boolean
+  /** Exact connection snapshot/attach has completed and prompts may be sent. */
+  promptReady: boolean
   hasCachedSelectors: boolean
   sessionId: string | null
+  codegMcpAvailable: boolean
+  mcpServerCount: number
   /** The working directory the live connection was established with (null when
    *  not connected). Lets callers detect a connection that is mid-reconnect to a
    *  different cwd and avoid acting on the stale one. */
@@ -65,6 +72,7 @@ export interface UseConnectionReturn {
   availableCommands: AvailableCommandInfo[] | null
   pendingPermission: PendingPermission | null
   pendingUserMessage: PendingUserMessage | null
+  steerMessages: PendingUserMessage[]
   pendingQuestion: PendingQuestion | null
   pendingAskQuestion: PendingQuestionState | null
   pendingPlanApproval: PendingPlanApprovalState | null
@@ -202,14 +210,19 @@ export function useConnection(contextKey: string): UseConnectionReturn {
   const connection = useSyncExternalStore(subscribe, getSnapshot, getSnapshot)
 
   const connectionId = connection?.connectionId ?? null
+  const conversationId = connection?.conversationId ?? null
   const agentType = connection?.agentType ?? null
   const isViewer = connection?.isViewer ?? false
   const status = connection?.status ?? null
   const promptCapabilities =
     connection?.promptCapabilities ?? DEFAULT_PROMPT_CAPABILITIES
   const supportsFork = connection?.supportsFork ?? false
+  const supportsSteer = connection?.supportsSteer ?? false
   const selectorsReady = connection?.selectorsReady ?? false
+  const promptReady = connection?.promptReady ?? false
   const sessionId = connection?.sessionId ?? null
+  const codegMcpAvailable = connection?.codegMcpAvailable ?? false
+  const mcpServerCount = connection?.mcpServerCount ?? 0
   const cached = connection?.agentType
     ? getCachedSelectors(connection.agentType)
     : null
@@ -221,6 +234,7 @@ export function useConnection(contextKey: string): UseConnectionReturn {
   const availableCommands = connection?.availableCommands ?? null
   const pendingPermission = connection?.pendingPermission ?? null
   const pendingUserMessage = connection?.pendingUserMessage ?? null
+  const steerMessages = connection?.steerMessages ?? EMPTY_STEER_MESSAGES
   const pendingQuestion = connection?.pendingQuestion ?? null
   const pendingAskQuestion = connection?.pendingAskQuestion ?? null
   const pendingPlanApproval = connection?.pendingPlanApproval ?? null
@@ -311,20 +325,26 @@ export function useConnection(contextKey: string): UseConnectionReturn {
   return useMemo(
     () => ({
       connectionId,
+      conversationId,
       agentType,
       isViewer,
       status,
       promptCapabilities,
       supportsFork,
+      supportsSteer,
       selectorsReady,
+      promptReady,
       hasCachedSelectors,
       sessionId,
+      codegMcpAvailable,
+      mcpServerCount,
       connectedWorkingDir,
       modes,
       configOptions,
       availableCommands,
       pendingPermission,
       pendingUserMessage,
+      steerMessages,
       pendingQuestion,
       pendingAskQuestion,
       pendingPlanApproval,
@@ -350,20 +370,26 @@ export function useConnection(contextKey: string): UseConnectionReturn {
     }),
     [
       connectionId,
+      conversationId,
       agentType,
       isViewer,
       status,
       promptCapabilities,
       supportsFork,
+      supportsSteer,
       selectorsReady,
+      promptReady,
       hasCachedSelectors,
       sessionId,
+      codegMcpAvailable,
+      mcpServerCount,
       connectedWorkingDir,
       modes,
       configOptions,
       availableCommands,
       pendingPermission,
       pendingUserMessage,
+      steerMessages,
       pendingQuestion,
       pendingAskQuestion,
       pendingPlanApproval,

@@ -44,7 +44,10 @@ export function ComposerImageThumbnails({
             className="cursor-pointer transition-opacity hover:opacity-80"
           >
             <Image
-              src={`data:${attachment.mimeType};base64,${attachment.data}`}
+              src={
+                attachment.previewUrl ??
+                `data:${attachment.mimeType};base64,${attachment.data}`
+              }
               alt={attachment.name}
               width={56}
               height={56}
@@ -70,7 +73,12 @@ export function ComposerImageThumbnails({
         </div>
       ))}
       <ImagePreviewDialog
-        src={preview ? `data:${preview.mimeType};base64,${preview.data}` : ""}
+        src={
+          preview
+            ? (preview.previewUrl ??
+              `data:${preview.mimeType};base64,${preview.data}`)
+            : ""
+        }
         alt={preview?.name ?? ""}
         open={preview !== null}
         onOpenChange={(open) => {

@@ -30,6 +30,8 @@ export type AttachDetachReason =
  * frame; subsequent `onEvent` envelopes have `envelope.seq > highWaterSeq`.
  */
 export interface AttachHandlers {
+  /** The transport is (re-)issuing this subscription's attach request. */
+  onAttaching?(): void
   onSnapshot(snapshot: LiveSessionSnapshot, eventSeq: number): void
   onReplay(events: EventEnvelope[], highWaterSeq: number): void
   onEvent(envelope: EventEnvelope): void

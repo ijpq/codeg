@@ -1,10 +1,11 @@
 use std::sync::Arc;
 
-use axum::{extract::Extension, Json};
+use axum::{extract::Extension, response::IntoResponse, Json};
 use serde::Deserialize;
 
 use crate::app_error::AppCommandError;
 use crate::app_state::AppState;
+use crate::commands::conversation_branches as branch_commands;
 use crate::commands::conversations as conv_commands;
 use crate::models::*;
 
@@ -135,24 +136,69 @@ pub struct GetFolderConversationParams {
     pub tail_turns: Option<usize>,
     #[serde(default)]
     pub from_index: Option<usize>,
+    #[serde(default)]
+    pub before_cursor: Option<String>,
+    #[serde(default)]
+    pub user_turn_limit: Option<u32>,
 }
 
 pub async fn get_folder_conversation(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<GetFolderConversationParams>,
-) -> Result<Json<DbConversationDetail>, AppCommandError> {
+) -> Result<axum::response::Response, AppCommandError> {
+    let started = std::time::Instant::now();
     let db = &state.db;
-    let window = conv_commands::resolve_turn_window_req(params.tail_turns, params.from_index)?;
-    let result = conv_commands::get_folder_conversation_with_live_core(
-        &db.conn,
-        &state.connection_manager,
-        &state.chat_channel_manager,
-        &state.emitter,
-        params.conversation_id,
-        window,
-    )
-    .await?;
-    Ok(Json(result))
+    let cursor_requested = params.before_cursor.is_some() || params.user_turn_limit.is_some();
+    let result = if cursor_requested {
+        conv_commands::get_folder_conversation_page_with_live_core(
+            &db.conn,
+            &state.connection_manager,
+            &state.chat_channel_manager,
+            &state.emitter,
+            params.conversation_id,
+            conv_commands::ConversationHistoryRequest {
+                before_cursor: params.before_cursor,
+                user_turn_limit: params
+                    .user_turn_limit
+                    .unwrap_or(conv_commands::DEFAULT_HISTORY_PAGE_USER_TURNS),
+            },
+        )
+        .await?
+    } else {
+        let window = conv_commands::resolve_turn_window_req(params.tail_turns, params.from_index)?;
+        conv_commands::get_folder_conversation_with_live_core(
+            &db.conn,
+            &state.connection_manager,
+            &state.chat_channel_manager,
+            &state.emitter,
+            params.conversation_id,
+            window,
+        )
+        .await?
+    };
+    let data_read_elapsed_ms = started.elapsed().as_millis() as u64;
+    let serialization_started = std::time::Instant::now();
+    let response_bytes = serde_json::to_vec(&result).map_err(|error| {
+        AppCommandError::task_execution_failed("Failed to serialize conversation detail")
+            .with_detail(error.to_string())
+    })?;
+    let uncompressed_bytes = response_bytes.len();
+    let serialization_elapsed_ms = serialization_started.elapsed().as_millis() as u64;
+    tracing::info!(
+        route = "/api/get_folder_conversation",
+        conversation_id = params.conversation_id,
+        bounded_history = result.history_page.is_some() || result.turns_offset.is_some(),
+        loaded_turns = result.turns.len(),
+        has_more = result
+            .history_page
+            .as_ref()
+            .is_some_and(|page| page.has_more),
+        data_read_elapsed_ms,
+        serialization_elapsed_ms,
+        uncompressed_bytes,
+        "[HTTP][perf] conversation detail prepared"
+    );
+    Ok(([("content-type", "application/json")], response_bytes).into_response())
 }
 
 #[derive(Deserialize)]
@@ -268,6 +314,79 @@ pub async fn create_conversation(
     .await?;
     conv_commands::emit_conversation_upsert(&state.emitter, &db.conn, result).await;
     Ok(Json(result))
+}
+
+#[derive(Deserialize)]
+pub struct CreateConversationBranchParams {
+    pub request: branch_commands::CreateConversationBranchRequest,
+}
+
+pub async fn create_conversation_branch(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<CreateConversationBranchParams>,
+) -> Result<Json<branch_commands::CreateConversationBranchResult>, AppCommandError> {
+    Ok(Json(
+        branch_commands::create_conversation_branch_core(
+            &state.db,
+            &state.connection_manager,
+            &state.emitter,
+            &state.data_dir,
+            "web:conversation-branch".into(),
+            params.request,
+        )
+        .await?,
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetConversationBranchInfoParams {
+    pub conversation_id: i32,
+}
+
+pub async fn get_conversation_branch_info(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<GetConversationBranchInfoParams>,
+) -> Result<
+    Json<Option<crate::db::service::conversation_branch_service::ConversationBranchInfo>>,
+    AppCommandError,
+> {
+    Ok(Json(
+        crate::db::service::conversation_branch_service::get_info(
+            &state.db.conn,
+            params.conversation_id,
+        )
+        .await
+        .map_err(AppCommandError::from)?,
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergeConversationBranchParams {
+    pub branch_conversation_id: i32,
+    pub request_id: String,
+    pub summary: String,
+    #[serde(default)]
+    pub deliverable_ids: Vec<String>,
+}
+
+pub async fn merge_conversation_branch(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<MergeConversationBranchParams>,
+) -> Result<Json<crate::db::service::conversation_branch_service::MergeBranchResult>, AppCommandError>
+{
+    Ok(Json(
+        branch_commands::merge_conversation_branch_core(
+            &state.db,
+            &state.emitter,
+            params.branch_conversation_id,
+            params.request_id,
+            params.summary,
+            params.deliverable_ids,
+        )
+        .await?,
+    ))
 }
 
 #[derive(Deserialize)]
