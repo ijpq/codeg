@@ -450,6 +450,11 @@ async fn async_main() -> ExitCode {
         state.acp_event_bus.clone(),
         Some(state.delegation_broker.clone()),
     ));
+    tokio::spawn(codeg_lib::turn_reconciliation_task(
+        state.connection_manager.clone_ref(),
+        state.db.conn.clone(),
+        std::time::Duration::from_secs(codeg_lib::TURN_RECONCILIATION_INTERVAL_SECS),
+    ));
 
     // Spawn the desktop pet state mapper so server-mode browsers viewing
     // /pet receive `pet://state` and `pet://oneshot` over the WebSocket

@@ -25,6 +25,7 @@ import type {
   SessionModeStateInfo,
   PromptInputBlock,
 } from "@/lib/types"
+import type { AcpCancelResult } from "@/lib/api"
 
 const DEFAULT_PROMPT_CAPABILITIES: PromptCapabilitiesInfo = {
   image: false,
@@ -125,7 +126,9 @@ export interface UseConnectionReturn {
   ) => Promise<void>
   setMode: (modeId: string) => Promise<void>
   setConfigOption: (configId: string, valueId: string) => Promise<void>
-  cancel: () => Promise<void>
+  cancel: () => Promise<AcpCancelResult | null>
+  refreshSnapshot: () => Promise<ConnectionStatus | null>
+  reconnect: () => Promise<boolean>
   respondPermission: (requestId: string, optionId: string) => Promise<void>
   answerQuestion: (questionId: string, answer: QuestionAnswer) => Promise<void>
 }
@@ -305,6 +308,16 @@ export function useConnection(contextKey: string): UseConnectionReturn {
     [actions, contextKey]
   )
 
+  const refreshSnapshot = useCallback(
+    () => actions.refreshSnapshot(contextKey),
+    [actions, contextKey]
+  )
+
+  const reconnect = useCallback(
+    () => actions.reconnect(contextKey),
+    [actions, contextKey]
+  )
+
   const respondPermission = useCallback(
     (requestId: string, optionId: string) =>
       actions.respondPermission(contextKey, requestId, optionId),
@@ -371,6 +384,8 @@ export function useConnection(contextKey: string): UseConnectionReturn {
       setMode,
       setConfigOption,
       cancel,
+      refreshSnapshot,
+      reconnect,
       respondPermission,
       answerQuestion,
     }),
@@ -417,6 +432,8 @@ export function useConnection(contextKey: string): UseConnectionReturn {
       setMode,
       setConfigOption,
       cancel,
+      refreshSnapshot,
+      reconnect,
       respondPermission,
       answerQuestion,
     ]
