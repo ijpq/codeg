@@ -2752,6 +2752,7 @@
       "chatInput": {
         "connecting": "連線中...",
         "agentResponding": "{agent} 正在回應...",
+        "stopping": "正在停止...",
         "guideAgent": "引導 {agent} 的目前輪次...",
         "sendMessage": "傳送訊息..."
       },
@@ -2784,6 +2785,7 @@
         "modelListLabel": "模型",
         "noModels": "找不到模型",
         "cancel": "取消",
+        "stopping": "正在停止...",
         "send": "傳送",
         "steer": "引導目前輪次",
         "steerSending": "正在注入引導...",

@@ -361,7 +361,21 @@ export async function acpGoalControl(
   return getTransport().call("acp_goal_control", { connectionId, action })
 }
 
-export async function acpCancel(connectionId: string): Promise<void> {
+export interface AcpCancelResult {
+  outcome:
+    | "cancel_requested"
+    | "already_cancelling"
+    | "already_finished"
+    | "run_not_found"
+  cancelRequestId: string
+  turnRunId?: string | null
+  conversationId?: number | null
+  deadlineAt?: string | null
+}
+
+export async function acpCancel(
+  connectionId: string
+): Promise<AcpCancelResult> {
   return getTransport().call("acp_cancel", { connectionId })
 }
 

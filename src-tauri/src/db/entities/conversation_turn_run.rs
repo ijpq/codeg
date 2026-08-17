@@ -7,12 +7,16 @@ use serde::{Deserialize, Serialize};
 pub enum ConversationTurnRunStatus {
     #[sea_orm(string_value = "running")]
     Running,
+    #[sea_orm(string_value = "cancelling")]
+    Cancelling,
     #[sea_orm(string_value = "completed")]
     Completed,
     #[sea_orm(string_value = "cancelled")]
     Cancelled,
     #[sea_orm(string_value = "interrupted")]
     Interrupted,
+    #[sea_orm(string_value = "failed")]
+    Failed,
 }
 
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
@@ -31,6 +35,11 @@ pub struct Model {
     /// reloaded viewer bind the run to the parser's durable user-turn id
     /// without relying on the sender-only optimistic id or wall-clock guesses.
     pub prompt_fingerprint: Option<String>,
+    /// Stable id of the first accepted cancellation request. Repeated cancel
+    /// calls read this receipt instead of notifying the agent again.
+    pub cancel_request_id: Option<String>,
+    pub cancel_requested_at: Option<DateTimeUtc>,
+    pub cancel_deadline_at: Option<DateTimeUtc>,
     pub folder_id: Option<i32>,
     pub root_path: String,
     pub status: ConversationTurnRunStatus,

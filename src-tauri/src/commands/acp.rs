@@ -10244,6 +10244,36 @@ pub(crate) async fn acp_restore_conversation_core(
         })?;
     let agent_type = conversation.agent_type;
     let require_codeg_mcp = agent_type == AgentType::Codex;
+    let reconciled_runs = manager
+        .reconcile_conversation_runs(&db.conn, conversation_id)
+        .await?;
+    if reconciled_runs > 0 {
+        tracing::info!(
+            conversation_id,
+            reconciled_runs,
+            stage = "restore_run_reconciliation",
+            "[ACP][restore] stale turn state reconciled before connection selection"
+        );
+    }
+    let durable_active_runs = crate::db::service::artifact_service::active_runs_for_conversation(
+        &db.conn,
+        conversation_id,
+    )
+    .await
+    .map_err(|error| AcpError::protocol(error.to_string()))?;
+    if !durable_active_runs.is_empty() {
+        tracing::info!(
+            conversation_id,
+            active_run_count = durable_active_runs.len(),
+            active_run_statuses = ?durable_active_runs
+                .iter()
+                .map(|run| (&run.id, &run.status))
+                .collect::<Vec<_>>(),
+            stage = "restore_active_turn_preserved",
+            "[ACP][restore] durable active turn blocks warm connection reuse"
+        );
+        return Err(AcpError::TurnInProgress);
+    }
     tracing::info!(
         conversation_id,
         stage = "restore_metadata_loaded",
@@ -10252,7 +10282,7 @@ pub(crate) async fn acp_restore_conversation_core(
         "[ACP][restore] stage completed"
     );
 
-    let old_connection_id = manager
+    let mut old_connection_id = manager
         .find_connection_by_conversation_id(conversation_id)
         .await;
     let mut old_mcp_server_count = 0;
@@ -10267,6 +10297,26 @@ pub(crate) async fn acp_restore_conversation_core(
             old_status = Some(state.status.clone());
             old_turn_in_flight = state.turn_in_flight;
         }
+    }
+    if old_turn_in_flight || old_status == Some(ConnectionStatus::Prompting) {
+        // A connection that claims a turn without any durable active run is a
+        // phantom warm handle. Never reuse it: it cannot be reconciled by a
+        // future TurnComplete because there is no run owner left.
+        if let Some(old_id) = old_connection_id.take() {
+            tracing::warn!(
+                conversation_id,
+                old_connection_id = %old_id,
+                old_turn_in_flight,
+                old_status = ?old_status,
+                stage = "restore_phantom_turn_cleanup",
+                "[ACP][restore] discarding warm connection with no active turn run"
+            );
+            let _ = manager.disconnect(&old_id).await;
+        }
+        old_status = None;
+        old_turn_in_flight = false;
+        old_codeg_mcp_available = false;
+        old_mcp_server_count = 0;
     }
     tracing::info!(
         conversation_id,
@@ -10680,7 +10730,7 @@ pub async fn acp_cancel(
     connection_id: String,
     db: State<'_, AppDatabase>,
     manager: State<'_, ConnectionManager>,
-) -> Result<(), AcpError> {
+) -> Result<crate::acp::types::AcpCancelResult, AcpError> {
     manager.cancel(&db.conn, &connection_id).await
 }
 

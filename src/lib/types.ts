@@ -724,9 +724,11 @@ export interface ConversationDeliverableHistoryPage {
 
 export type ConversationTurnArtifactStatus =
   | "running"
+  | "cancelling"
   | "completed"
   | "cancelled"
   | "interrupted"
+  | "failed"
 
 export type ConversationTurnFileChangeKind =
   | "created"
@@ -763,6 +765,9 @@ export interface ConversationTurnArtifactRun {
   stop_reason?: string | null
   started_at: string
   completed_at?: string | null
+  cancel_request_id?: string | null
+  cancel_requested_at?: string | null
+  cancel_deadline_at?: string | null
   declaration_status?:
     | "not_called"
     | "success"
@@ -1218,6 +1223,7 @@ export type ConnectionStatus =
   | "connecting"
   | "connected"
   | "prompting"
+  | "cancelling"
   | "disconnected"
   | "error"
 

@@ -2752,6 +2752,7 @@
       "chatInput": {
         "connecting": "Connecting...",
         "agentResponding": "{agent} is responding...",
+        "stopping": "Stopping...",
         "guideAgent": "Guide {agent}'s current turn...",
         "sendMessage": "Send a message..."
       },
@@ -2786,6 +2787,7 @@
         "modelListLabel": "Models",
         "noModels": "No models found",
         "cancel": "Cancel",
+        "stopping": "Stopping...",
         "send": "Send",
         "steer": "Guide current turn",
         "steerSending": "Injecting guidance...",
