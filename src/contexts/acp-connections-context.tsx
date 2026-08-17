@@ -37,6 +37,7 @@ import {
   acpTouchConnection,
   acpGetSessionSnapshot,
   acpFindConnectionForConversation,
+  type AcpCancelResult,
 } from "@/lib/api"
 import { denormalizeSnapshot } from "@/lib/snapshot-denormalize"
 import { buildDelegationSeedEnvelopes } from "@/lib/delegation-seed"
@@ -2698,7 +2699,11 @@ export interface AcpActionsValue {
     configId: string,
     valueId: string
   ): Promise<void>
-  cancel(contextKey: string): Promise<void>
+  cancel(contextKey: string): Promise<AcpCancelResult | null>
+  /** Fetch and apply the backend's authoritative connection snapshot. Used as
+   *  a bounded convergence check when a terminal WebSocket event may have
+   *  been missed. Returns null when the connection no longer exists. */
+  refreshSnapshot(contextKey: string): Promise<ConnectionStatus | null>
   respondPermission(
     contextKey: string,
     requestId: string,
@@ -5965,9 +5970,33 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
 
   const cancel = useCallback(async (contextKey: string) => {
     const conn = storeRef.current.connections.get(contextKey)
-    if (!conn) return
-    await acpCancel(conn.connectionId)
+    if (!conn) return null
+    return acpCancel(conn.connectionId)
   }, [])
+
+  const refreshSnapshot = useCallback(
+    async (contextKey: string): Promise<ConnectionStatus | null> => {
+      const current = storeRef.current.connections.get(contextKey)
+      if (!current) return null
+      const connectionId = current.connectionId
+      const snapshot = await acpGetSessionSnapshot(connectionId)
+      if (!snapshot) return null
+      // Do not apply a late fetch to a context that reconnected while the
+      // request was in flight.
+      if (
+        storeRef.current.connections.get(contextKey)?.connectionId !==
+        connectionId
+      ) {
+        return null
+      }
+      const patch = denormalizeSnapshot(snapshot)
+      dispatch({ type: "HYDRATE_FROM_SNAPSHOT", contextKey, patch })
+      surfaceSnapshotErrorDetailsRef.current(contextKey, patch)
+      lastActivityRef.current.set(contextKey, Date.now())
+      return patch.status
+    },
+    [dispatch]
+  )
 
   const goalControl = useCallback(
     async (contextKey: string, action: "pause" | "clear") => {
@@ -6202,6 +6231,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       setMode,
       setConfigOption,
       cancel,
+      refreshSnapshot,
       goalControl,
       respondPermission,
       answerQuestion,
@@ -6228,6 +6258,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       setMode,
       setConfigOption,
       cancel,
+      refreshSnapshot,
       goalControl,
       respondPermission,
       answerQuestion,

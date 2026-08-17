@@ -47,6 +47,7 @@ mod m20260813_000001_conversation_branch;
 mod m20260814_000001_conversation_branch_inheritance;
 mod m20260816_000001_chat_channel_final_outbox;
 mod m20260816_000002_conversation_branch_lifecycle;
+mod m20260817_000002_turn_cancellation;
 pub struct Migrator;
 
 #[async_trait::async_trait]
@@ -100,6 +101,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260814_000001_conversation_branch_inheritance::Migration),
             Box::new(m20260816_000001_chat_channel_final_outbox::Migration),
             Box::new(m20260816_000002_conversation_branch_lifecycle::Migration),
+            Box::new(m20260817_000002_turn_cancellation::Migration),
         ]
     }
 }

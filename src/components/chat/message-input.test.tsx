@@ -787,6 +787,23 @@ describe("MessageInput native steering (insert into current turn)", () => {
     })
   }
 
+  it("disables Stop and shows an explicit stopping state while cancellation is pending", async () => {
+    const onCancel = vi.fn()
+    renderInput({
+      isCancelling: true,
+      disabled: true,
+      onCancel,
+    })
+    await waitFor(
+      () => expect(composerHandle.current?.getEditor()).toBeTruthy(),
+      { timeout: 5000 }
+    )
+    const button = screen.getByTitle(MI.stopping)
+    expect(button).toBeDisabled()
+    await userEvent.setup().click(button)
+    expect(onCancel).not.toHaveBeenCalled()
+  })
+
   it("keeps the historical Stop-only form when onSteer is absent", async () => {
     const editor = await mountPrompting()
     typeDraft(editor, "draft text")

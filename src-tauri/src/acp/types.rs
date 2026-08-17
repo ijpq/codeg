@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -803,6 +804,18 @@ pub enum ConnectionStatus {
     Prompting,
     Disconnected,
     Error,
+}
+
+/// Durable result of one cancellation request. HTTP 200 means the request was
+/// understood; `outcome` says whether this caller actually claimed the run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpCancelResult {
+    pub outcome: String,
+    pub cancel_request_id: String,
+    pub turn_run_id: Option<String>,
+    pub conversation_id: Option<i32>,
+    pub deadline_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
