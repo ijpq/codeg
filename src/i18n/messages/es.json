@@ -2716,6 +2716,7 @@
       "chatInput": {
         "connecting": "Conectando...",
         "agentResponding": "{agent} está respondiendo...",
+        "stopping": "Deteniendo...",
         "guideAgent": "Guiar el turno actual de {agent}...",
         "sendMessage": "Enviar un mensaje..."
       },
@@ -2748,6 +2749,7 @@
         "modelListLabel": "Modelos",
         "noModels": "No se encontraron modelos",
         "cancel": "Cancelar",
+        "stopping": "Deteniendo...",
         "send": "Enviar",
         "steer": "Guiar turno actual",
         "steerSending": "Inyectando instrucción...",

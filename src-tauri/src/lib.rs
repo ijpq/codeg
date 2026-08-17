@@ -10,7 +10,8 @@
 pub mod acp;
 pub mod acp_transcript;
 pub use acp::{
-    idle_sweep_task, idle_timeout_from_env, lifecycle_subscriber_task, SWEEP_INTERVAL_SECS,
+    idle_sweep_task, idle_timeout_from_env, lifecycle_subscriber_task, turn_reconciliation_task,
+    SWEEP_INTERVAL_SECS, TURN_RECONCILIATION_INTERVAL_SECS,
 };
 pub use network::proxy::init_proxy_from_db;
 mod app_error;
@@ -725,6 +726,13 @@ mod tauri_app {
                         cm,
                         bus,
                         Some(broker_for_lifecycle),
+                    ));
+                    tauri::async_runtime::spawn(crate::acp::turn_reconciliation_task(
+                        app.state::<ConnectionManager>().clone_ref(),
+                        app.state::<db::AppDatabase>().conn.clone(),
+                        std::time::Duration::from_secs(
+                            crate::acp::TURN_RECONCILIATION_INTERVAL_SECS,
+                        ),
                     ));
                 }
 

@@ -9,7 +9,7 @@ use crate::acp::opencode_plugins::PluginCheckSummary;
 use crate::acp::preflight::PreflightResult;
 use crate::acp::types::{
     AcpAgentInfo, AcpAgentStatus, AgentDiagnosticsReport, AgentSkillContent, AgentSkillLayout,
-    AgentSkillScope, AgentSkillsListResult, ConnectionInfo, ForkResultInfo,
+    AcpCancelResult, AgentSkillScope, AgentSkillsListResult, ConnectionInfo, ForkResultInfo,
     RestoredConversationConnectionInfo, SteerResult,
 };
 use crate::app_error::{AppCommandError, AppErrorCode};
@@ -488,13 +488,13 @@ pub async fn acp_describe_agent_options(
 pub async fn acp_cancel(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<AcpConnectionIdParams>,
-) -> Result<Json<()>, AppCommandError> {
+) -> Result<Json<AcpCancelResult>, AppCommandError> {
     let manager = &state.connection_manager;
-    manager
+    let result = manager
         .cancel(&state.db.conn, &params.connection_id)
         .await
         .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
-    Ok(Json(()))
+    Ok(Json(result))
 }
 
 pub async fn acp_fork(

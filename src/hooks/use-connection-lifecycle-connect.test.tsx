@@ -1,4 +1,4 @@
-import { render, waitFor } from "@testing-library/react"
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { beforeEach, describe, expect, it, vi } from "vitest"
 import { useConnectionLifecycle } from "@/hooks/use-connection-lifecycle"
 import type { AgentType } from "@/lib/types"
@@ -8,6 +8,10 @@ const h = vi.hoisted(() => ({
   disconnect: vi.fn(async () => undefined),
   setActiveKey: vi.fn(),
   touchActivity: vi.fn(),
+  cancel: vi.fn(),
+  refreshSnapshot: vi.fn(),
+  reconnect: vi.fn(),
+  status: null as "prompting" | "connected" | null,
 }))
 
 vi.mock("next-intl", () => ({
@@ -35,7 +39,7 @@ vi.mock("@/hooks/use-connection", () => ({
     conversationId: null,
     agentType: null,
     isViewer: false,
-    status: null,
+    status: h.status,
     promptCapabilities: {
       image: false,
       audio: false,
@@ -73,7 +77,9 @@ vi.mock("@/hooks/use-connection", () => ({
     sendPrompt: vi.fn(),
     setMode: vi.fn(),
     setConfigOption: vi.fn(),
-    cancel: vi.fn(),
+    cancel: h.cancel,
+    refreshSnapshot: h.refreshSnapshot,
+    reconnect: h.reconnect,
     respondPermission: vi.fn(),
     answerQuestion: vi.fn(),
   }),
@@ -90,7 +96,7 @@ function Harness({
   conversationId,
   agentType = "codex",
 }: HarnessProps) {
-  useConnectionLifecycle({
+  const lifecycle = useConnectionLifecycle({
     contextKey: "codex-tab",
     agentType,
     isActive: true,
@@ -98,7 +104,11 @@ function Harness({
     sessionId,
     conversationId,
   })
-  return null
+  return (
+    <button onClick={lifecycle.handleCancel}>
+      {lifecycle.isCancelling ? "stopping" : "stop"}
+    </button>
+  )
 }
 
 describe("useConnectionLifecycle persisted identity changes", () => {
@@ -107,6 +117,13 @@ describe("useConnectionLifecycle persisted identity changes", () => {
     h.disconnect.mockClear()
     h.setActiveKey.mockClear()
     h.touchActivity.mockClear()
+    h.cancel.mockReset()
+    h.cancel.mockResolvedValue(null)
+    h.refreshSnapshot.mockReset()
+    h.refreshSnapshot.mockResolvedValue("connected")
+    h.reconnect.mockReset()
+    h.reconnect.mockResolvedValue(true)
+    h.status = null
   })
 
   it("connects again when an asynchronously loaded external session id becomes available", async () => {
@@ -142,5 +159,62 @@ describe("useConnectionLifecycle persisted identity changes", () => {
     view.rerender(<Harness {...props} />)
     await Promise.resolve()
     expect(h.connect).toHaveBeenCalledTimes(1)
+  })
+
+  it("sends only one cancel while a fast double-click is in flight", async () => {
+    h.status = "prompting"
+    let resolveCancel: (value: {
+      outcome: "cancel_requested"
+      cancelRequestId: string
+    }) => void = () => {}
+    h.cancel.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveCancel = resolve
+        })
+    )
+    const view = render(<Harness conversationId={42} sessionId="session-42" />)
+
+    fireEvent.click(screen.getByRole("button"))
+    fireEvent.click(screen.getByRole("button"))
+    expect(h.cancel).toHaveBeenCalledTimes(1)
+    expect(screen.getByText("stopping")).toBeInTheDocument()
+
+    await act(async () => {
+      resolveCancel({
+        outcome: "cancel_requested",
+        cancelRequestId: "request-1",
+      })
+    })
+    expect(screen.getByText("stopping")).toBeInTheDocument()
+
+    h.status = "connected"
+    view.rerender(<Harness conversationId={42} sessionId="session-42" />)
+    await waitFor(() => expect(screen.getByText("stop")).toBeInTheDocument())
+  })
+
+  it("queries authoritative state and reconnects when the terminal event is lost", async () => {
+    vi.useFakeTimers()
+    try {
+      h.status = "prompting"
+      h.refreshSnapshot.mockResolvedValue("prompting")
+      h.cancel.mockResolvedValue({
+        outcome: "cancel_requested",
+        cancelRequestId: "request-timeout",
+        deadlineAt: new Date(Date.now() + 1_000).toISOString(),
+      })
+      render(<Harness conversationId={42} sessionId="session-42" />)
+
+      fireEvent.click(screen.getByRole("button"))
+      await act(async () => {
+        await Promise.resolve()
+        await vi.advanceTimersByTimeAsync(13_001)
+      })
+
+      expect(h.refreshSnapshot).toHaveBeenCalledTimes(1)
+      expect(h.reconnect).toHaveBeenCalledTimes(1)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

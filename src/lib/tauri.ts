@@ -139,7 +139,21 @@ export async function acpSetConfigOption(
   return invoke("acp_set_config_option", { connectionId, configId, valueId })
 }
 
-export async function acpCancel(connectionId: string): Promise<void> {
+export interface AcpCancelResult {
+  outcome:
+    | "cancel_requested"
+    | "already_cancelling"
+    | "already_finished"
+    | "run_not_found"
+  cancelRequestId: string
+  turnRunId?: string | null
+  conversationId?: number | null
+  deadlineAt?: string | null
+}
+
+export async function acpCancel(
+  connectionId: string
+): Promise<AcpCancelResult> {
   return invoke("acp_cancel", { connectionId })
 }
 
