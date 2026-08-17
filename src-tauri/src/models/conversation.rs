@@ -323,7 +323,7 @@ pub struct ConversationTurnArtifactRun {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub folder_id: Option<i32>,
     pub root_path: String,
-    /// running | completed | cancelled | interrupted
+    /// running | cancelling | completed | cancelled | interrupted
     pub status: String,
     pub capture_incomplete: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -331,6 +331,12 @@ pub struct ConversationTurnArtifactRun {
     pub started_at: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cancel_request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cancel_requested_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cancel_deadline_at: Option<DateTime<Utc>>,
     /// not_called | success | success_empty | partial | failed
     pub declaration_status: String,
     #[serde(skip_serializing_if = "Option::is_none")]

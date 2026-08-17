@@ -34,7 +34,10 @@ pub mod terminal_runtime;
 pub mod types;
 pub mod work_task_tools;
 
-pub use idle_sweep::{idle_sweep_task, idle_timeout_from_env, SWEEP_INTERVAL_SECS};
+pub use idle_sweep::{
+    idle_sweep_task, idle_timeout_from_env, turn_reconciliation_task, SWEEP_INTERVAL_SECS,
+    TURN_RECONCILIATION_INTERVAL_SECS,
+};
 pub use internal_bus::{EventBusMetrics, EventBusMetricsSnapshot, InternalEventBus};
 pub use lifecycle::lifecycle_subscriber_task;
 pub use session_state::{LiveSessionSnapshot, SessionState};

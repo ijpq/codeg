@@ -685,6 +685,7 @@ const ConversationTabView = memo(function ConversationTabView({
     handleFocus,
     handleSend: lifecycleSend,
     handleSetConfigOption,
+    isCancelling,
     handleCancel,
     handleRespondPermission,
   } = useConnectionLifecycle({
@@ -2504,7 +2505,7 @@ const ConversationTabView = memo(function ConversationTabView({
           <BackgroundTasksChip contextKey={tabId} />
         </>
       }
-      status={connStatus}
+      status={isCancelling ? "cancelling" : connStatus}
       promptCapabilities={conn.promptCapabilities}
       defaultPath={workingDirForConnection}
       agentName={getAgentLabel(selectedAgent)}

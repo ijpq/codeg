@@ -2686,6 +2686,7 @@
       "chatInput": {
         "connecting": "연결 중...",
         "agentResponding": "{agent} 응답 중...",
+        "stopping": "중지하는 중...",
         "guideAgent": "{agent}의 현재 턴 안내...",
         "sendMessage": "메시지 보내기..."
       },
@@ -2718,6 +2719,7 @@
         "modelListLabel": "모델",
         "noModels": "모델을 찾을 수 없습니다",
         "cancel": "취소",
+        "stopping": "중지하는 중...",
         "send": "보내기",
         "steer": "현재 턴 안내",
         "steerSending": "지시 주입 중...",

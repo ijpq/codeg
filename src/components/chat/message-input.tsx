@@ -158,6 +158,7 @@ interface MessageInputProps {
   onFocus?: () => void
   className?: string
   isPrompting?: boolean
+  isCancelling?: boolean
   onCancel?: () => void
   modes?: SessionModeInfo[]
   configOptions?: SessionConfigOptionInfo[]
@@ -291,6 +292,7 @@ export function MessageInput({
   onFocus,
   className,
   isPrompting = false,
+  isCancelling = false,
   onCancel,
   modes,
   configOptions,
@@ -1698,6 +1700,17 @@ export function MessageInput({
         )}
       </Button>
     </div>
+  ) : isCancelling ? (
+    <Button
+      disabled
+      variant="destructive"
+      size="icon"
+      className="h-8 w-8"
+      title={t("stopping")}
+      aria-label={t("stopping")}
+    >
+      <Loader2 className="size-4 animate-spin" />
+    </Button>
   ) : isPrompting && onCancel ? (
     onSteer && onEnqueue && hasSendableContent ? (
       // Native-steering sessions surface the mid-turn actions that already

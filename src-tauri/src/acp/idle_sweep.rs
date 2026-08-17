@@ -9,6 +9,7 @@
 use std::time::Duration;
 
 use crate::acp::manager::ConnectionManager;
+use sea_orm::DatabaseConnection;
 
 /// Default idle threshold (3 minutes). Override at startup via
 /// `CODEG_ACP_IDLE_TIMEOUT_SECS`. The sweep only runs against
@@ -21,6 +22,9 @@ pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 180;
 /// connections map plus per-state `try_read`s, so a 1-minute interval is
 /// trivially cheap relative to the wall-clock idle threshold.
 pub const SWEEP_INTERVAL_SECS: u64 = 60;
+/// Faster than the resource idle sweep: cancellation deadlines are user-facing
+/// and should converge promptly even if the original timeout task was lost.
+pub const TURN_RECONCILIATION_INTERVAL_SECS: u64 = 10;
 
 /// Read the idle timeout from `CODEG_ACP_IDLE_TIMEOUT_SECS`, falling back
 /// to `DEFAULT_IDLE_TIMEOUT_SECS`. A `0` value disables the sweep
@@ -34,6 +38,34 @@ pub fn idle_timeout_from_env() -> Option<Duration> {
         return None;
     }
     Some(Duration::from_secs(secs))
+}
+
+/// Periodic second line of defence for cancellation tasks and broken
+/// connection lifecycles. The manager only finalizes runs when connection/DB
+/// evidence contradicts active execution, so healthy long generations are
+/// retained regardless of duration.
+pub async fn turn_reconciliation_task(
+    manager: ConnectionManager,
+    db: DatabaseConnection,
+    interval: Duration,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        match manager.reconcile_all_runs(&db).await {
+            Ok(0) => {}
+            Ok(count) => tracing::warn!(
+                reconciled_runs = count,
+                "[ACP][reconcile] periodic turn reconciliation completed"
+            ),
+            Err(error) => tracing::error!(
+                error = %error,
+                "[ACP][reconcile] periodic turn reconciliation failed"
+            ),
+        }
+    }
 }
 
 /// Long-running task that calls `ConnectionManager::sweep_idle` on a

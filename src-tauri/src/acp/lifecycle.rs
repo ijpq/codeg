@@ -27,7 +27,7 @@ use crate::acp::types::{AcpEvent, ConnectionStatus, EventEnvelope};
 use crate::artifact_tracker::ArtifactTurnFinishStatus;
 use crate::db::entities::conversation::ConversationStatus;
 use crate::db::error::DbError;
-use crate::db::service::{conversation_branch_service, conversation_service};
+use crate::db::service::{artifact_service, conversation_branch_service, conversation_service};
 use crate::logging::throttle::{LagLogThrottle, LAG_LOG_WINDOW};
 use crate::models::AgentType;
 use crate::web::event_bridge::{emit_with_state, EventEmitter};
@@ -253,10 +253,18 @@ pub(crate) async fn handle_event(
             Ok(())
         }
         AcpEvent::TurnComplete { stop_reason, .. } => {
-            let artifact_status = if stop_reason == "end_turn" {
-                ArtifactTurnFinishStatus::Completed
-            } else {
-                ArtifactTurnFinishStatus::Cancelled
+            let artifact_status = match stop_reason.as_str() {
+                "end_turn" => ArtifactTurnFinishStatus::Completed,
+                "cancelled" | "cancel_timeout" | "cancel_command_channel_closed" => {
+                    ArtifactTurnFinishStatus::Cancelled
+                }
+                "refusal" | "max_tokens" | "max_turn_requests" | "unknown" | "empty" => {
+                    ArtifactTurnFinishStatus::Failed
+                }
+                // Transport/process loss is finalized by the terminal Error or
+                // Disconnected lifecycle path as `interrupted`. An unrecognised
+                // protocol stop is a completed turn with a failed outcome.
+                _ => ArtifactTurnFinishStatus::Failed,
             };
             manager
                 .finish_artifact_turn(
@@ -284,12 +292,14 @@ pub(crate) async fn handle_event(
             // with OpenCode — a silent EndTurn that produced no output), so
             // we flip to `Cancelled` and pair the transition with an
             // `AcpEvent::Error` toast emitted upstream by `connection.rs`.
-            // `cancelled` is already written by `manager.cancel()` (eager
-            // CAS InProgress → Cancelled at the user-cancel entry point), so
-            // we leave it alone here. `completed` transitions remain
-            // frontend-driven.
-            let target_status = match stop_reason.as_str() {
+            // Cancellation first moves the turn run to `cancelling`; this
+            // terminal event owns the conversation's final `cancelled` write.
+            // `completed` transitions remain frontend-driven.
+            let mut target_status = match stop_reason.as_str() {
                 "end_turn" => Some(ConversationStatus::PendingReview),
+                "cancelled" | "cancel_timeout" | "cancel_command_channel_closed" => {
+                    Some(ConversationStatus::Cancelled)
+                }
                 "refusal" | "max_tokens" | "max_turn_requests" | "unknown" | "empty" => {
                     Some(ConversationStatus::Cancelled)
                 }
@@ -311,6 +321,26 @@ pub(crate) async fn handle_event(
             let Some(cid) = conversation_id else {
                 return Ok(());
             };
+            // Cancellation owns the first terminal CAS. If an agent delivers a
+            // late `end_turn` after the timeout path already finalized the run,
+            // do not resurrect the conversation as pending_review.
+            if stop_reason == "end_turn"
+                && artifact_service::latest_run_for_connection(
+                    db_conn,
+                    &envelope.connection_id,
+                )
+                .await?
+                .is_some_and(|run| {
+                    matches!(
+                        run.status,
+                        crate::db::entities::conversation_turn_run::ConversationTurnRunStatus::Cancelled
+                            | crate::db::entities::conversation_turn_run::ConversationTurnRunStatus::Interrupted
+                            | crate::db::entities::conversation_turn_run::ConversationTurnRunStatus::Failed
+                    )
+                })
+            {
+                target_status = Some(ConversationStatus::Cancelled);
+            }
             if let Some(ts) = target_status.clone() {
                 // DB write before emit so any downstream subscriber that observes
                 // the ConversationStatusChanged event can assume the row is
@@ -2077,10 +2107,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_event_skips_write_on_cancelled_stop_reason() {
-        // `cancelled` is already written by `manager.cancel()` (eager CAS
-        // InProgress → Cancelled at the user-cancel entry point), so the
-        // TurnComplete arm must not double-write.
+    async fn handle_event_writes_cancelled_on_cancelled_stop_reason() {
+        // The durable turn enters `cancelling` at request time; TurnComplete
+        // owns the conversation's terminal transition.
         let db = test_helpers::fresh_in_memory_db().await;
         let folder_id = test_helpers::seed_folder(&db, "/tmp/turn-cancelled").await;
         let conv =
@@ -2108,8 +2137,8 @@ mod tests {
         handle_event(&db.conn, &mgr, &env, None).await.unwrap();
         assert_eq!(
             read_row_status(&db, conv.id).await,
-            ConversationStatus::InProgress,
-            "TurnComplete{{cancelled}} must not overwrite the row — user-cancel path owns it"
+            ConversationStatus::Cancelled,
+            "TurnComplete{{cancelled}} must close the conversation state"
         );
     }
 

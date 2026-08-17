@@ -74,6 +74,7 @@ export interface UseConnectionLifecycleReturn {
     }
   ) => Promise<void>
   handleSetConfigOption: (configId: string, valueId: string) => void
+  isCancelling: boolean
   handleCancel: () => void
   handleRespondPermission: (requestId: string, optionId: string) => void
 }
@@ -140,6 +141,8 @@ export function useConnectionLifecycle({
     setMode: connSetMode,
     setConfigOption: connSetConfigOption,
     cancel: connCancel,
+    refreshSnapshot: connRefreshSnapshot,
+    reconnect: connReconnect,
     respondPermission: connRespondPermission,
     modes,
     configOptions,
@@ -161,6 +164,32 @@ export function useConnectionLifecycle({
     !hasCachedSelectors &&
     (status === "connecting" ||
       (isInteractiveStatus && !effectiveSelectorsReady))
+  const [isCancelling, setIsCancelling] = useState(false)
+  const cancelRequestInFlightRef = useRef(false)
+  const cancelReconcileTimerRef = useRef<number | null>(null)
+  useEffect(() => {
+    if (status === "prompting") return
+    // Status is an external ACP snapshot. Defer the local visual reset to the
+    // subscription turn rather than cascading a synchronous render from the
+    // effect body.
+    const timer = window.setTimeout(() => {
+      cancelRequestInFlightRef.current = false
+      setIsCancelling(false)
+      if (cancelReconcileTimerRef.current !== null) {
+        window.clearTimeout(cancelReconcileTimerRef.current)
+        cancelReconcileTimerRef.current = null
+      }
+    }, 0)
+    return () => window.clearTimeout(timer)
+  }, [status])
+  useEffect(
+    () => () => {
+      if (cancelReconcileTimerRef.current !== null) {
+        window.clearTimeout(cancelReconcileTimerRef.current)
+      }
+    },
+    []
+  )
   // Gate for send button: block until the backend session is fully
   // initialized (selectorsReady from the real backend event, not cache).
   const selectorsLoading = isInteractiveStatus && !selectorsReady
@@ -491,10 +520,64 @@ export function useConnectionLifecycle({
   )
 
   const handleCancel = useCallback(() => {
-    connCancel().catch((e: unknown) =>
-      console.error("[ConnLifecycle] cancel:", e)
-    )
-  }, [connCancel])
+    // The button stays mounted while the first HTTP request is in flight, so a
+    // double click previously invoked /acp_cancel twice. This synchronous ref
+    // closes that render gap; the backend's run CAS covers other tabs/devices.
+    if (cancelRequestInFlightRef.current) return
+    cancelRequestInFlightRef.current = true
+    setIsCancelling(true)
+    connCancel()
+      .then((result) => {
+        if (
+          !result ||
+          result.outcome === "already_finished" ||
+          result.outcome === "run_not_found"
+        ) {
+          cancelRequestInFlightRef.current = false
+          setIsCancelling(false)
+          return
+        }
+        // Attach/replay normally delivers the terminal event. This one-shot
+        // authoritative snapshot check is the backstop for a lost event: wait
+        // through the backend cancel deadline and its 10s reconciliation tick,
+        // then hydrate the real state. A still-prompting or missing connection
+        // is re-established through the existing targeted reconnect path.
+        if (result.deadlineAt) {
+          const deadlineMs = Date.parse(result.deadlineAt)
+          const delay = Number.isFinite(deadlineMs)
+            ? Math.max(0, deadlineMs - Date.now()) + 12_000
+            : 37_000
+          if (cancelReconcileTimerRef.current !== null) {
+            window.clearTimeout(cancelReconcileTimerRef.current)
+          }
+          cancelReconcileTimerRef.current = window.setTimeout(() => {
+            cancelReconcileTimerRef.current = null
+            void connRefreshSnapshot()
+              .then((authoritativeStatus) => {
+                if (
+                  authoritativeStatus === null ||
+                  authoritativeStatus === "prompting"
+                ) {
+                  return connReconnect()
+                }
+                return false
+              })
+              .catch((error: unknown) => {
+                console.warn("[ConnLifecycle] cancel reconciliation:", error)
+                return connReconnect()
+              })
+          }, delay)
+        }
+      })
+      .catch((e: unknown) => {
+        cancelRequestInFlightRef.current = false
+        setIsCancelling(false)
+        console.error("[ConnLifecycle] cancel:", e)
+        toast.error(
+          e instanceof Error ? e.message : String(e ?? "Unable to stop task")
+        )
+      })
+  }, [connCancel, connReconnect, connRefreshSnapshot])
 
   const handleSetConfigOption = useCallback(
     (configId: string, valueId: string) => {
@@ -525,6 +608,7 @@ export function useConnectionLifecycle({
     handleFocus,
     handleSend,
     handleSetConfigOption,
+    isCancelling,
     handleCancel,
     handleRespondPermission,
   }
