@@ -2769,6 +2769,7 @@
       "chatInput": {
         "connecting": "جارٍ الاتصال...",
         "agentResponding": "{agent} يرد...",
+        "stopping": "جارٍ الإيقاف...",
         "guideAgent": "وجّه الجولة الحالية لـ {agent}...",
         "sendMessage": "أرسل رسالة..."
       },
@@ -2801,6 +2802,7 @@
         "modelListLabel": "النماذج",
         "noModels": "لم يتم العثور على نماذج",
         "cancel": "إلغاء",
+        "stopping": "جارٍ الإيقاف...",
         "send": "إرسال",
         "steer": "توجيه الجولة الحالية",
         "steerSending": "جارٍ حقن التوجيه...",

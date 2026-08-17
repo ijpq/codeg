@@ -19,6 +19,7 @@ import {
 } from "@/components/chat/message-input"
 import { MessageQueueDisplay } from "@/components/chat/message-queue-display"
 import { cn } from "@/lib/utils"
+import { Loader2 } from "lucide-react"
 
 interface ChatInputProps {
   status: ConnectionStatus | null
@@ -135,6 +136,7 @@ export const ChatInput = memo(function ChatInput({
   const t = useTranslations("Folder.chat.chatInput")
   const isConnected = status === "connected"
   const isPrompting = status === "prompting"
+  const isCancelling = status === "cancelling"
   const isConnecting = status === "connecting"
   // The agent names its slash commands as part of coming up, so until it has
   // the composer's `/` panel shows a loading row rather than refusing to open.
@@ -172,6 +174,12 @@ export const ChatInput = memo(function ChatInput({
         if (event.pointerType !== "mouse") event.stopPropagation()
       }}
     >
+      {isCancelling && (
+        <div className="mb-2 flex items-center gap-2 text-xs text-muted-foreground">
+          <Loader2 className="size-3.5 animate-spin" />
+          {t("stopping")}
+        </div>
+      )}
       {queue &&
         queue.length > 0 &&
         onQueueReorder &&
@@ -200,6 +208,7 @@ export const ChatInput = memo(function ChatInput({
             : (!isConnected && !isPrompting) || selectorsLoading
         }
         isPrompting={isPrompting}
+        isCancelling={isCancelling}
         onCancel={onCancel}
         modes={modes}
         configOptions={configOptions}

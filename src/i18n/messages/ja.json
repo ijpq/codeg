@@ -2769,6 +2769,7 @@
       "chatInput": {
         "connecting": "接続中...",
         "agentResponding": "{agent} が応答中...",
+        "stopping": "停止しています...",
         "guideAgent": "{agent} の現在のターンを誘導...",
         "sendMessage": "メッセージを送信..."
       },
@@ -2801,6 +2802,7 @@
         "modelListLabel": "モデル",
         "noModels": "モデルが見つかりません",
         "cancel": "キャンセル",
+        "stopping": "停止しています...",
         "send": "送信",
         "steer": "現在のターンを誘導",
         "steerSending": "指示を注入中...",
