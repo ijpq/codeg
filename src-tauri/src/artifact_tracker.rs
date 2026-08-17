@@ -333,11 +333,12 @@ pub(crate) fn expectation_from_prompt(
 /// the watcher lease.
 const FINAL_EVENT_GRACE: Duration = Duration::from_millis(450);
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArtifactTurnFinishStatus {
     Completed,
     Cancelled,
     Interrupted,
+    Failed,
 }
 
 impl ArtifactTurnFinishStatus {
@@ -346,6 +347,7 @@ impl ArtifactTurnFinishStatus {
             Self::Completed => ConversationTurnRunStatus::Completed,
             Self::Cancelled => ConversationTurnRunStatus::Cancelled,
             Self::Interrupted => ConversationTurnRunStatus::Interrupted,
+            Self::Failed => ConversationTurnRunStatus::Failed,
         }
     }
 }
@@ -603,6 +605,31 @@ impl ArtifactTracker {
             .await;
         }
     }
+
+    /// Force-close the capture owned by one connection without relying on an
+    /// ACP event sequence. Used only after cancellation reaches its durable
+    /// deadline or reconciliation proves the connection is gone. Removal from
+    /// the map is the exactly-once gate shared with normal TurnComplete.
+    pub async fn force_finish_turn(
+        &self,
+        connection_id: &str,
+        status: ArtifactTurnFinishStatus,
+        stop_reason: String,
+    ) -> bool {
+        let capture = self.active.lock().await.remove(connection_id);
+        let Some(capture) = capture else {
+            return false;
+        };
+        settle_capture(
+            capture,
+            FinishCommand {
+                status,
+                stop_reason: Some(stop_reason),
+            },
+        )
+        .await;
+        true
+    }
 }
 
 async fn settle_capture(capture: ActiveCapture, command: FinishCommand) {
@@ -728,24 +755,34 @@ async fn capture_loop(args: CaptureLoopArgs) {
         );
     }
 
-    // Terminal settlement always runs so status/missing-path diagnostics are
-    // finalized. Inference itself is fallback-only: a successful explicit
-    // declaration is the authoritative user-visible set, while a failed or
-    // absent declaration can still recover verified filesystem changes.
-    match deliverable_service::infer_for_turn(&db, conversation_id, &run_id).await {
-        Ok(inferred) if !inferred.is_empty() => {
-            crate::acp::deliverables::emit_deliverables_changed(
-                &emitter,
-                conversation_id,
-                inferred.into_iter().map(|item| item.id).collect(),
-            );
+    // Only a normally completed turn may infer fallback deliverables. A
+    // cancelled/interrupted capture can contain half-written files and must not
+    // turn those into apparent successful output. Explicit declarations are
+    // already durable and remain visible; we only close settlement here.
+    if finish.status == ArtifactTurnFinishStatus::Completed {
+        match deliverable_service::infer_for_turn(&db, conversation_id, &run_id).await {
+            Ok(inferred) if !inferred.is_empty() => {
+                crate::acp::deliverables::emit_deliverables_changed(
+                    &emitter,
+                    conversation_id,
+                    inferred.into_iter().map(|item| item.id).collect(),
+                );
+            }
+            Ok(_) => {}
+            Err(err) => tracing::error!(
+                "[artifact-tracker] fallback deliverable inference failed for run {}: {}",
+                run_id,
+                err
+            ),
         }
-        Ok(_) => {}
-        Err(err) => tracing::error!(
-            "[artifact-tracker] fallback deliverable inference failed for run {}: {}",
+    } else if let Err(err) =
+        artifact_service::mark_settled(&db, &run_id, "settled_incomplete", &[]).await
+    {
+        tracing::error!(
+            "[artifact-tracker] cancelled settlement failed for run {}: {}",
             run_id,
             err
-        ),
+        );
     }
 
     tracing::info!(
