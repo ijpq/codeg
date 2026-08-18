@@ -379,6 +379,10 @@ pub struct SessionState {
     // 事件锚点
     pub event_seq: u64,
     pub last_activity_at: DateTime<Utc>,
+    /// Last event proving an in-flight turn is making real progress. Status,
+    /// usage and selector heartbeats deliberately do not update this clock:
+    /// they can continue forever after an adapter has lost its terminal event.
+    pub last_turn_progress_at: DateTime<Utc>,
 
     /// Per-connection event broadcaster used by the WS attach protocol.
     /// New subscribers register receivers here while holding the SessionState
@@ -612,6 +616,7 @@ impl SessionState {
             session_started_tx: None,
             event_seq: 0,
             last_activity_at: Utc::now(),
+            last_turn_progress_at: Utc::now(),
             event_stream: Arc::new(ConnectionEventStream::new()),
             recent_events: RecentEventsBuffer::new(),
             delegation_token: None,
@@ -677,10 +682,26 @@ impl SessionState {
     /// 单一分发器：把一个 AcpEvent 应用到 self。注意此方法**不**自增 event_seq——
     /// seq 由 emit_with_state 在外层管理（这样 apply_event 可独立单元测试）。
     pub fn apply_event(&mut self, payload: &AcpEvent) {
+        if matches!(
+            payload,
+            AcpEvent::ContentDelta { .. }
+                | AcpEvent::Thinking { .. }
+                | AcpEvent::ToolCall { .. }
+                | AcpEvent::ToolCallUpdate { .. }
+                | AcpEvent::PermissionRequest { .. }
+                | AcpEvent::PermissionResolved { .. }
+                | AcpEvent::QuestionRequest { .. }
+                | AcpEvent::QuestionResolved { .. }
+                | AcpEvent::PlanApprovalRequest { .. }
+                | AcpEvent::PlanApprovalResolved { .. }
+                | AcpEvent::UserMessage { .. }
+                | AcpEvent::BackgroundActivity { .. }
+        ) {
+            self.last_turn_progress_at = Utc::now();
+        }
         match payload {
             AcpEvent::SessionStarted { session_id } => {
-                let session_changed =
-                    self.external_id.as_deref() != Some(session_id.as_str());
+                let session_changed = self.external_id.as_deref() != Some(session_id.as_str());
                 if session_changed {
                     self.external_id_changed_at = Some(std::time::SystemTime::now());
                     // `session/fork` reuses the process and SessionState but
@@ -1323,6 +1344,33 @@ impl SessionState {
             Some(at) => now.signed_duration_since(at) < background_keepalive_max_age(),
             None => false,
         }
+    }
+
+    /// Whitespace-only streaming payloads are protocol noise, not evidence of
+    /// an answer. Used by zombie reconciliation and intentionally ignores tool
+    /// references; tool liveness is evaluated independently from their status.
+    pub fn has_effective_live_text(&self) -> bool {
+        self.live_message.as_ref().is_some_and(|message| {
+            message.content.iter().any(|block| match block {
+                LiveContentBlock::Text { text, .. } | LiveContentBlock::Thinking { text, .. } => {
+                    !text.trim().is_empty()
+                }
+                _ => false,
+            })
+        })
+    }
+
+    pub fn has_active_turn_interaction(&self) -> bool {
+        self.pending_permission.is_some()
+            || self.pending_question.is_some()
+            || self.pending_plan_approval.is_some()
+            || self.active_tool_calls.values().any(|tool| {
+                matches!(
+                    tool.status,
+                    ToolCallStatus::Pending | ToolCallStatus::InProgress
+                )
+            })
+            || self.background_outstanding > 0
     }
 
     /// A single-line "what the sub-agent is doing right now" hint, used by the
@@ -1973,6 +2021,27 @@ mod tests {
     }
 
     #[test]
+    fn whitespace_stream_is_not_progress_and_finished_tools_are_not_active() {
+        let mut state = fresh_state();
+        state.apply_event(&AcpEvent::ContentDelta {
+            text: " \n\t".into(),
+            parent_tool_use_id: None,
+        });
+        assert!(!state.has_effective_live_text());
+
+        state.apply_event(&tool_call_event("finished", "command"));
+        assert!(state.has_active_turn_interaction());
+        state.active_tool_calls.get_mut("finished").unwrap().status = ToolCallStatus::Completed;
+        assert!(!state.has_active_turn_interaction());
+
+        state.apply_event(&AcpEvent::ContentDelta {
+            text: "real output".into(),
+            parent_tool_use_id: None,
+        });
+        assert!(state.has_effective_live_text());
+    }
+
+    #[test]
     fn plan_approval_applies_clears_by_id_and_survives_snapshot() {
         let mut s = fresh_state();
         // Request → pending set + carried on the snapshot for mid-turn attach.
@@ -2104,7 +2173,12 @@ mod tests {
             }
         }
         let mut s = fresh_state();
-        s.apply_event(&failure("t1:error", 5, "warning", "Reconnecting, attempt 5 of 5."));
+        s.apply_event(&failure(
+            "t1:error",
+            5,
+            "warning",
+            "Reconnecting, attempt 5 of 5.",
+        ));
 
         // A cancelled/failed/empty exit is NOT recovery — the incident (e.g.
         // reconnect attempts with the network still down) must stay active
@@ -3530,7 +3604,10 @@ mod tests {
         s.apply_event(&AcpEvent::PermissionQueueDepth { depth: 2 });
         let p = s.pending_permission.as_ref().expect("card still up");
         assert_eq!(p.queued, 2);
-        assert_eq!(p.request_id, "p-1", "depth must not change which card is up");
+        assert_eq!(
+            p.request_id, "p-1",
+            "depth must not change which card is up"
+        );
     }
 
     #[test]

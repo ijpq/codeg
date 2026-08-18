@@ -6,6 +6,7 @@ use sea_orm::{
     EntityTrait, IntoActiveModel, QueryFilter, QueryOrder, Set, TransactionTrait,
 };
 
+use crate::db::entities::conversation::{self, ConversationStatus};
 use crate::db::entities::conversation_turn_file_change::{self, ConversationTurnFileChangeKind};
 use crate::db::entities::conversation_turn_run::{self, ConversationTurnRunStatus};
 use crate::db::error::DbError;
@@ -44,6 +45,127 @@ pub enum CancelRequestDisposition {
 pub struct CancelRequestTransition {
     pub disposition: CancelRequestDisposition,
     pub run: Option<conversation_turn_run::Model>,
+}
+
+/// Atomically close the user-visible turn lifecycle. File inspection and
+/// deliverable inference deliberately happen after this transaction: they are
+/// useful metadata, but a slow/locked artifact writer must never leave the
+/// conversation looking active after the agent has already stopped.
+pub async fn finalize_turn_state(
+    conn: &DatabaseConnection,
+    run_id: &str,
+    run_status: ConversationTurnRunStatus,
+    stop_reason: &str,
+    conversation_status: ConversationStatus,
+    capture_incomplete: bool,
+    settle_incomplete: bool,
+) -> Result<bool, DbError> {
+    let txn = conn.begin().await?;
+    let now = Utc::now();
+    let Some(current) = conversation_turn_run::Entity::find_by_id(run_id.to_string())
+        .one(&txn)
+        .await?
+    else {
+        txn.rollback().await?;
+        return Ok(false);
+    };
+    if !matches!(
+        current.status,
+        ConversationTurnRunStatus::Running | ConversationTurnRunStatus::Cancelling
+    ) {
+        txn.rollback().await?;
+        return Ok(false);
+    }
+    // Cancellation owns the terminal transition. An agent may race a late
+    // end_turn against the user's stop request; once the durable row entered
+    // `cancelling`, that late event must not resurrect a successful turn.
+    let cancellation_won = current.status == ConversationTurnRunStatus::Cancelling;
+    let explicit_cancellation_finalizer = run_status == ConversationTurnRunStatus::Cancelled;
+    let final_run_status = if cancellation_won {
+        ConversationTurnRunStatus::Cancelled
+    } else {
+        run_status
+    };
+    let final_stop_reason = if cancellation_won && !explicit_cancellation_finalizer {
+        // A late successful/failed agent event must not overwrite a durable
+        // cancellation request.  Explicit cancellation finalizers, however,
+        // carry useful auditable reasons such as `cancel_timeout` or
+        // `cancelled_during_restart`; retain those.
+        "cancelled"
+    } else {
+        stop_reason
+    };
+    let final_conversation_status = if cancellation_won {
+        ConversationStatus::Cancelled
+    } else {
+        conversation_status
+    };
+    let final_capture_incomplete = capture_incomplete || cancellation_won;
+    let final_settle_incomplete = settle_incomplete || cancellation_won;
+    let mut update = conversation_turn_run::Entity::update_many()
+        .col_expr(
+            conversation_turn_run::Column::Status,
+            Expr::value(final_run_status),
+        )
+        .col_expr(
+            conversation_turn_run::Column::StopReason,
+            Expr::value(Some(final_stop_reason.to_string())),
+        )
+        .col_expr(
+            conversation_turn_run::Column::CompletedAt,
+            Expr::value(Some(now)),
+        )
+        .filter(conversation_turn_run::Column::Id.eq(run_id.to_string()))
+        .filter(conversation_turn_run::Column::Status.is_in([
+            ConversationTurnRunStatus::Running,
+            ConversationTurnRunStatus::Cancelling,
+        ]));
+    if final_capture_incomplete {
+        update = update.col_expr(
+            conversation_turn_run::Column::CaptureIncomplete,
+            Expr::value(true),
+        );
+    }
+    if final_settle_incomplete {
+        update = update
+            .col_expr(
+                conversation_turn_run::Column::SettlementStatus,
+                Expr::value("settled_incomplete"),
+            )
+            .col_expr(
+                conversation_turn_run::Column::SettledAt,
+                Expr::value(Some(now)),
+            );
+    }
+    let changed = update.exec(&txn).await?.rows_affected == 1;
+    if changed {
+        conversation::Entity::update_many()
+            .col_expr(
+                conversation::Column::Status,
+                Expr::value(final_conversation_status),
+            )
+            .col_expr(conversation::Column::UpdatedAt, Expr::value(now))
+            .filter(conversation::Column::Id.eq(current.conversation_id))
+            .exec(&txn)
+            .await?;
+    }
+    txn.commit().await?;
+    Ok(changed)
+}
+
+/// A terminal run may still be settling its optional filesystem metadata.
+/// Admission uses this to queue the next prompt instead of superseding the old
+/// capture and producing a second, contradictory run.
+pub async fn has_unsettled_run(
+    conn: &DatabaseConnection,
+    conversation_id: i32,
+) -> Result<bool, DbError> {
+    Ok(conversation_turn_run::Entity::find()
+        .filter(conversation_turn_run::Column::ConversationId.eq(conversation_id))
+        .filter(conversation_turn_run::Column::SettlementStatus.eq("pending"))
+        .one(conn)
+        .await?
+        .is_some())
 }
 
 pub async fn create_run(
@@ -308,9 +430,7 @@ pub async fn finish_run(
                 Expr::value(Some(Utc::now())),
             )
             .filter(conversation_turn_run::Column::Id.eq(run_id.to_string()))
-            .filter(
-                conversation_turn_run::Column::Status.eq(ConversationTurnRunStatus::Running),
-            )
+            .filter(conversation_turn_run::Column::Status.eq(ConversationTurnRunStatus::Running))
             .exec(conn)
             .await?;
     }
@@ -330,12 +450,10 @@ pub async fn request_cancel(
 ) -> Result<CancelRequestTransition, DbError> {
     let active = conversation_turn_run::Entity::find()
         .filter(conversation_turn_run::Column::ConnectionId.eq(connection_id.to_string()))
-        .filter(
-            conversation_turn_run::Column::Status.is_in([
-                ConversationTurnRunStatus::Running,
-                ConversationTurnRunStatus::Cancelling,
-            ]),
-        )
+        .filter(conversation_turn_run::Column::Status.is_in([
+            ConversationTurnRunStatus::Running,
+            ConversationTurnRunStatus::Cancelling,
+        ]))
         .order_by_desc(conversation_turn_run::Column::StartedAt)
         .one(conn)
         .await?;
@@ -395,9 +513,10 @@ pub async fn request_cancel(
     Ok(CancelRequestTransition {
         disposition: if result.rows_affected == 1 {
             CancelRequestDisposition::CancelRequested
-        } else if updated.as_ref().is_some_and(|run| {
-            run.status == ConversationTurnRunStatus::Cancelling
-        }) {
+        } else if updated
+            .as_ref()
+            .is_some_and(|run| run.status == ConversationTurnRunStatus::Cancelling)
+        {
             CancelRequestDisposition::AlreadyCancelling
         } else {
             CancelRequestDisposition::AlreadyFinished
@@ -423,12 +542,10 @@ pub async fn active_runs_for_conversation(
 ) -> Result<Vec<conversation_turn_run::Model>, DbError> {
     Ok(conversation_turn_run::Entity::find()
         .filter(conversation_turn_run::Column::ConversationId.eq(conversation_id))
-        .filter(
-            conversation_turn_run::Column::Status.is_in([
-                ConversationTurnRunStatus::Running,
-                ConversationTurnRunStatus::Cancelling,
-            ]),
-        )
+        .filter(conversation_turn_run::Column::Status.is_in([
+            ConversationTurnRunStatus::Running,
+            ConversationTurnRunStatus::Cancelling,
+        ]))
         .order_by_desc(conversation_turn_run::Column::StartedAt)
         .all(conn)
         .await?)
@@ -438,12 +555,10 @@ pub async fn list_active_runs(
     conn: &DatabaseConnection,
 ) -> Result<Vec<conversation_turn_run::Model>, DbError> {
     Ok(conversation_turn_run::Entity::find()
-        .filter(
-            conversation_turn_run::Column::Status.is_in([
-                ConversationTurnRunStatus::Running,
-                ConversationTurnRunStatus::Cancelling,
-            ]),
-        )
+        .filter(conversation_turn_run::Column::Status.is_in([
+            ConversationTurnRunStatus::Running,
+            ConversationTurnRunStatus::Cancelling,
+        ]))
         .order_by_asc(conversation_turn_run::Column::StartedAt)
         .all(conn)
         .await?)
@@ -483,12 +598,10 @@ pub async fn force_finish_incomplete(
             Expr::value(Some(now)),
         )
         .filter(conversation_turn_run::Column::Id.eq(run_id.to_string()))
-        .filter(
-            conversation_turn_run::Column::Status.is_in([
-                ConversationTurnRunStatus::Running,
-                ConversationTurnRunStatus::Cancelling,
-            ]),
-        )
+        .filter(conversation_turn_run::Column::Status.is_in([
+            ConversationTurnRunStatus::Running,
+            ConversationTurnRunStatus::Cancelling,
+        ]))
         .exec(conn)
         .await?;
     Ok(result.rows_affected == 1)
@@ -512,8 +625,7 @@ pub async fn mark_settled(
         .col_expr(
             conversation_turn_run::Column::MissingExpectedPathsJson,
             Expr::value(
-                serde_json::to_string(missing_expected_paths)
-                    .unwrap_or_else(|_| "[]".to_string()),
+                serde_json::to_string(missing_expected_paths).unwrap_or_else(|_| "[]".to_string()),
             ),
         )
         .filter(conversation_turn_run::Column::Id.eq(run_id.to_string()))
@@ -528,33 +640,40 @@ pub async fn mark_settled(
 /// persisted paths but mark the capture explicitly incomplete/interrupted.
 pub async fn recover_interrupted_runs(conn: &DatabaseConnection) -> Result<u64, DbError> {
     let rows = conversation_turn_run::Entity::find()
-        .filter(
-            conversation_turn_run::Column::Status.is_in([
-                ConversationTurnRunStatus::Running,
-                ConversationTurnRunStatus::Cancelling,
-            ]),
-        )
+        .filter(conversation_turn_run::Column::Status.is_in([
+            ConversationTurnRunStatus::Running,
+            ConversationTurnRunStatus::Cancelling,
+        ]))
         .all(conn)
         .await?;
-    let count = rows.len() as u64;
+    let mut count = 0;
     for row in rows {
         let was_cancelling = row.status == ConversationTurnRunStatus::Cancelling;
-        let mut active = row.into_active_model();
-        active.status = Set(if was_cancelling {
-            ConversationTurnRunStatus::Cancelled
-        } else {
-            ConversationTurnRunStatus::Interrupted
-        });
-        active.capture_incomplete = Set(true);
-        active.stop_reason = Set(Some(if was_cancelling {
-            "cancelled_during_restart".to_string()
-        } else {
-            "app_restarted".to_string()
-        }));
-        active.completed_at = Set(Some(Utc::now()));
-        active.settlement_status = Set("settled_incomplete".to_string());
-        active.settled_at = Set(Some(Utc::now()));
-        active.update(conn).await?;
+        if finalize_turn_state(
+            conn,
+            &row.id,
+            if was_cancelling {
+                ConversationTurnRunStatus::Cancelled
+            } else {
+                ConversationTurnRunStatus::Interrupted
+            },
+            if was_cancelling {
+                "cancelled_during_restart"
+            } else {
+                "app_restarted"
+            },
+            if was_cancelling {
+                ConversationStatus::Cancelled
+            } else {
+                ConversationStatus::PendingReview
+            },
+            true,
+            true,
+        )
+        .await?
+        {
+            count += 1;
+        }
     }
     Ok(count)
 }
@@ -824,6 +943,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_transaction_closes_run_settlement_and_conversation_together() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let run_id = seed_cancel_run(&db, "conn-atomic").await;
+        let run = conversation_turn_run::Entity::find_by_id(run_id.clone())
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(finalize_turn_state(
+            &db.conn,
+            &run_id,
+            ConversationTurnRunStatus::Interrupted,
+            "connection_lost",
+            ConversationStatus::PendingReview,
+            true,
+            true,
+        )
+        .await
+        .unwrap());
+
+        let closed = conversation_turn_run::Entity::find_by_id(run_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let conversation = conversation::Entity::find_by_id(run.conversation_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(closed.status, ConversationTurnRunStatus::Interrupted);
+        assert_eq!(closed.settlement_status, "settled_incomplete");
+        assert!(closed.completed_at.is_some());
+        assert!(closed.settled_at.is_some());
+        assert_eq!(conversation.status, ConversationStatus::PendingReview);
+    }
+
+    #[tokio::test]
     async fn failed_turn_is_distinct_from_cancelled_and_interrupted() {
         let db = crate::db::test_helpers::fresh_in_memory_db().await;
         let run_id = seed_cancel_run(&db, "conn-failed").await;
@@ -873,5 +1031,11 @@ mod tests {
         assert_eq!(run.settlement_status, "settled_incomplete");
         assert!(run.completed_at.is_some());
         assert!(run.settled_at.is_some());
+        let conversation = conversation::Entity::find_by_id(run.conversation_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(conversation.status, ConversationStatus::Cancelled);
     }
 }

@@ -2074,7 +2074,7 @@ describe("AcpConnectionsProvider liveMessage sink (mirror out of React)", () => 
     const handlers = await connectOwner()
     const calls: Array<{ content: unknown; isLive: boolean }> = []
     h.actions!.registerLiveMessageSink(TAB, (lm, isLive) =>
-      calls.push({ content: lm.content, isLive })
+      calls.push({ content: lm?.content ?? null, isLive })
     )
 
     // status → prompting resets liveMessage to a fresh empty assistant message.
@@ -2085,16 +2085,16 @@ describe("AcpConnectionsProvider liveMessage sink (mirror out of React)", () => 
       status: "prompting",
     })
 
-    expect(calls).toHaveLength(1)
-    expect(calls[0]!.isLive).toBe(true)
-    expect(calls[0]!.content).toEqual([])
+    expect(calls).toHaveLength(2)
+    expect(calls.at(-1)!.isLive).toBe(true)
+    expect(calls.at(-1)!.content).toEqual([])
   })
 
   it("relays a subsequent liveMessage change (tool call appended) to the sink", async () => {
     const handlers = await connectOwner()
     const calls: Array<{ len: number; isLive: boolean }> = []
     h.actions!.registerLiveMessageSink(TAB, (lm, isLive) =>
-      calls.push({ len: lm.content.length, isLive })
+      calls.push({ len: lm?.content.length ?? 0, isLive })
     )
 
     emitAcpEvent(handlers, {
@@ -2135,7 +2135,7 @@ describe("AcpConnectionsProvider liveMessage sink (mirror out of React)", () => 
       type: "status_changed",
       status: "prompting",
     })
-    expect(count).toBe(1)
+    expect(count).toBe(2)
 
     unregister()
     emitAcpEvent(handlers, {
@@ -2144,7 +2144,7 @@ describe("AcpConnectionsProvider liveMessage sink (mirror out of React)", () => 
       type: "status_changed",
       status: "prompting",
     })
-    expect(count).toBe(1) // no further fire
+    expect(count).toBe(2) // no further fire
   })
 
   it("does not fire when a transition leaves liveMessage unchanged", async () => {
@@ -2161,7 +2161,7 @@ describe("AcpConnectionsProvider liveMessage sink (mirror out of React)", () => 
       type: "status_changed",
       status: "connected",
     })
-    expect(count).toBe(0)
+    expect(count).toBe(1) // immediate authoritative null; no transition write
   })
 
   it("replays the current liveMessage immediately when registering over a live connection", async () => {
@@ -2192,17 +2192,48 @@ describe("AcpConnectionsProvider liveMessage sink (mirror out of React)", () => 
     // blank until the next change.
     const calls: Array<{ len: number; isLive: boolean }> = []
     h.actions!.registerLiveMessageSink(TAB, (lm, isLive) =>
-      calls.push({ len: lm.content.length, isLive })
+      calls.push({ len: lm?.content.length ?? 0, isLive })
     )
     expect(calls).toHaveLength(1)
     expect(calls[0]!.isLive).toBe(true) // still prompting
     expect(calls[0]!.len).toBe(1) // the tool_call block already present
   })
 
+  it("clears a stale live turn immediately when its connection disconnects", async () => {
+    const handlers = await connectOwner()
+    const calls: Array<{ live: boolean; isLive: boolean }> = []
+    h.actions!.registerLiveMessageSink(TAB, (message, isLive) =>
+      calls.push({ live: message != null, isLive })
+    )
+
+    emitAcpEvent(handlers, {
+      seq: 1,
+      connection_id: "spawned-conn",
+      type: "status_changed",
+      status: "prompting",
+    })
+    emitAcpEvent(handlers, {
+      seq: 2,
+      connection_id: "spawned-conn",
+      type: "content_delta",
+      text: "working",
+      parent_tool_use_id: null,
+    })
+    emitAcpEvent(handlers, {
+      seq: 3,
+      connection_id: "spawned-conn",
+      type: "status_changed",
+      status: "disconnected",
+    })
+
+    expect(calls.at(-1)).toEqual({ live: false, isLive: false })
+  })
+
   it("mirrors to the sink BEFORE notifying connection key subscribers", async () => {
     const handlers = await connectOwner()
     const order: string[] = []
     h.actions!.registerLiveMessageSink(TAB, () => order.push("sink"))
+    order.length = 0 // ignore the registration-time authoritative null replay
     const unsub = h.store!.subscribeKey(TAB, () => order.push("notify"))
 
     emitAcpEvent(handlers, {

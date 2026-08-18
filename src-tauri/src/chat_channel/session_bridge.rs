@@ -2,14 +2,14 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::acp::types::PermissionOptionInfo;
+use crate::acp::types::{PermissionOptionInfo, PromptInputBlock};
 use crate::chat_channel::types::WeixinPushMode;
 use crate::chat_channel::types::{ChannelMessageTarget, SentMessageId};
 use crate::models::agent::AgentType;
 
 #[derive(Clone)]
 pub struct PendingPrompt {
-    pub text: String,
+    pub blocks: Vec<PromptInputBlock>,
     pub folder_id: i32,
     pub conversation_id: i32,
     pub delivery: Option<TurnDeliveryRoute>,
