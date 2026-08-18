@@ -33,6 +33,7 @@ pub struct FollowupRequest<'a> {
     pub channel_id: i32,
     pub sender_id: &'a str,
     pub target: &'a ChannelMessageTarget,
+    pub blocks: Vec<PromptInputBlock>,
     pub conn_mgr: &'a ConnectionManager,
     pub emitter: &'a EventEmitter,
     pub bridge: &'a Arc<Mutex<SessionBridge>>,
@@ -691,15 +692,17 @@ pub async fn handle_post_action(
             response_target,
             lang,
         } => {
+            let blocks = vec![PromptInputBlock::Text { text: text.clone() }];
             let route = match prepare_delivery_route(
                 db,
                 channel_id,
                 &sender_id,
                 conversation_id,
-                &connection_id,
+                Some(&connection_id),
                 origin_message_id,
                 push_mode,
                 &response_target,
+                &blocks,
             )
             .await
             {
@@ -723,7 +726,7 @@ pub async fn handle_post_action(
                 &connection_id,
                 folder_id,
                 conversation_id,
-                &text,
+                blocks,
                 route.as_ref().map(|route| route.client_message_id.clone()),
             )
             .await
@@ -1302,6 +1305,28 @@ async fn restore_sender_context_and_send_followup(req: FollowupRequest<'_>) -> R
         }
     };
     let conversation_id = conversation.id;
+    // Persist the complete inbound prompt before a potentially slow/cold ACP
+    // restore. A process restart or restore error can then retry this exact
+    // origin without asking the user to resend and without duplicating it.
+    let registered_route = match prepare_delivery_route(
+        req.db,
+        req.channel_id,
+        req.sender_id,
+        conversation_id,
+        None,
+        req.origin_message_id,
+        req.push_mode,
+        req.target,
+        &req.blocks,
+    )
+    .await
+    {
+        Ok(route) => route,
+        Err(error) => return RichMessage::error(error),
+    };
+    if req.origin_message_id.is_some() && registered_route.is_none() {
+        return RichMessage::info(i18n::message_received(req.lang));
+    }
 
     tracing::info!(
         stage = "lazy_restore_started",
@@ -1510,28 +1535,51 @@ async fn send_restored_followup(
     conversation_id: i32,
 ) -> RichMessage {
     let sender_key = sender_log_key(req.sender_id);
-    let route = match prepare_delivery_route(
-        req.db,
-        req.channel_id,
-        req.sender_id,
-        conversation_id,
-        &connection_id,
-        req.origin_message_id,
-        req.push_mode,
-        req.target,
-    )
-    .await
-    {
-        Ok(route) => route,
-        Err(error) => return RichMessage::error(error),
-    };
-    if req.origin_message_id.is_some() && route.is_none() {
-        return RichMessage::info(i18n::message_sent(req.lang));
-    }
+    let mut durable_prompts =
+        match crate::db::service::chat_channel_delivery_service::list_retryable_origins(
+            req.db,
+            req.channel_id,
+            req.sender_id,
+            conversation_id,
+            100,
+        )
+        .await
+        {
+            Ok(origins) => origins
+                .into_iter()
+                .filter_map(|origin| {
+                    let blocks = serde_json::from_str::<Vec<PromptInputBlock>>(
+                        origin.prompt_json.as_deref()?,
+                    )
+                    .ok()?;
+                    Some(PendingPrompt {
+                        blocks,
+                        folder_id,
+                        conversation_id,
+                        delivery: Some(TurnDeliveryRoute {
+                            origin_id: origin.id,
+                            client_message_id: origin.client_message_id,
+                            push_mode: req.push_mode,
+                        }),
+                    })
+                })
+                .collect::<std::collections::VecDeque<_>>(),
+            Err(error) => return RichMessage::error(error.to_string()),
+        };
+    let current = durable_prompts
+        .pop_front()
+        .unwrap_or_else(|| PendingPrompt {
+            blocks: req.blocks.clone(),
+            folder_id,
+            conversation_id,
+            delivery: None,
+        });
+    let route = current.delivery.clone();
     {
         let mut guard = req.bridge.lock().await;
         if let Some(session) = guard.get_mut(&connection_id) {
             session.forward_events = true;
+            session.pending_prompts.extend(durable_prompts);
         }
         if let Some(route) = route.clone() {
             guard.set_active_delivery(connection_id.clone(), route);
@@ -1543,7 +1591,7 @@ async fn send_restored_followup(
         &connection_id,
         folder_id,
         conversation_id,
-        req.text,
+        current.blocks.clone(),
         route.as_ref().map(|route| route.client_message_id.clone()),
     )
     .await
@@ -1566,7 +1614,7 @@ async fn send_restored_followup(
                 message_chars = req.text.chars().count(),
                 "[ChatChannel][lazy_restore] original message forwarded"
             );
-            RichMessage::info(i18n::message_sent(req.lang))
+            RichMessage::info(i18n::message_received(req.lang))
         }
         Err(crate::acp::error::AcpError::TurnInProgress) => {
             let mut guard = req.bridge.lock().await;
@@ -1574,7 +1622,7 @@ async fn send_restored_followup(
             if let Some(session) = guard.get_mut(&connection_id) {
                 session.forward_events = false;
                 session.pending_prompts.push_back(PendingPrompt {
-                    text: req.text.to_string(),
+                    blocks: current.blocks,
                     folder_id,
                     conversation_id,
                     delivery: route,
@@ -1589,7 +1637,11 @@ async fn send_restored_followup(
                 message_chars = req.text.chars().count(),
                 "[ChatChannel][lazy_restore] original message retained until active turn completes"
             );
-            RichMessage::info(i18n::task_deferred_busy(req.lang).to_string())
+            RichMessage::info(if req.push_mode == WeixinPushMode::Debug {
+                i18n::task_deferred_busy(req.lang)
+            } else {
+                i18n::message_received(req.lang)
+            })
         }
         Err(e) => {
             req.bridge.lock().await.take_active_delivery(&connection_id);
@@ -1706,10 +1758,11 @@ async fn send_followup_to_session(
         req.channel_id,
         req.sender_id,
         conversation_id,
-        &connection_id,
+        Some(&connection_id),
         req.origin_message_id,
         req.push_mode,
         req.target,
+        &req.blocks,
     )
     .await
     {
@@ -1717,7 +1770,11 @@ async fn send_followup_to_session(
         Err(error) => return RichMessage::error(error),
     };
     if req.origin_message_id.is_some() && route.is_none() {
-        return RichMessage::info(i18n::message_sent(req.lang));
+        return RichMessage::info(if req.push_mode == WeixinPushMode::Debug {
+            i18n::message_sent(req.lang)
+        } else {
+            i18n::message_received(req.lang)
+        });
     }
     let was_forwarding = {
         let mut guard = req.bridge.lock().await;
@@ -1736,7 +1793,7 @@ async fn send_followup_to_session(
         &connection_id,
         conversation.folder_id,
         conversation_id,
-        req.text,
+        req.blocks.clone(),
         route.as_ref().map(|route| route.client_message_id.clone()),
     )
     .await
@@ -1755,7 +1812,7 @@ async fn send_followup_to_session(
             if !req.target.is_telegram_forum_topic() {
                 if let Some(session) = req.bridge.lock().await.get_mut(&connection_id) {
                     session.pending_prompts.push_back(PendingPrompt {
-                        text: req.text.to_string(),
+                        blocks: req.blocks.clone(),
                         folder_id: conversation.folder_id,
                         conversation_id,
                         delivery: route,
@@ -1768,7 +1825,11 @@ async fn send_followup_to_session(
                         queue_depth = session.pending_prompts.len(),
                         "[ChatChannel] ordinary message queued behind active turn"
                     );
-                    return RichMessage::info(i18n::task_deferred_busy(req.lang).to_string());
+                    return RichMessage::info(if req.push_mode == WeixinPushMode::Debug {
+                        i18n::task_deferred_busy(req.lang)
+                    } else {
+                        i18n::message_received(req.lang)
+                    });
                 }
             }
             return RichMessage::info(i18n::agent_busy_retry(req.lang).to_string());
@@ -1802,7 +1863,11 @@ async fn send_followup_to_session(
         .await;
     }
 
-    RichMessage::info(i18n::message_sent(req.lang))
+    RichMessage::info(if req.push_mode == WeixinPushMode::Debug {
+        i18n::message_sent(req.lang)
+    } else {
+        i18n::message_received(req.lang)
+    })
 }
 
 async fn resume_topic_binding_and_send_followup(
@@ -1883,7 +1948,7 @@ async fn resume_topic_binding_and_send_followup(
         &connection_id,
         folder.id,
         conv.id,
-        req.text,
+        req.blocks.clone(),
         None,
     )
     .await
@@ -2090,16 +2155,14 @@ async fn send_chat_prompt_linked(
     connection_id: &str,
     folder_id: i32,
     conversation_id: i32,
-    text: &str,
+    blocks: Vec<PromptInputBlock>,
     client_message_id: Option<String>,
 ) -> Result<(), crate::acp::error::AcpError> {
     conn_mgr
         .send_prompt_linked_with_message_id(
             &AppDatabase { conn: db.clone() },
             connection_id,
-            vec![PromptInputBlock::Text {
-                text: text.to_string(),
-            }],
+            blocks,
             Some(folder_id),
             Some(conversation_id),
             None,
@@ -2115,10 +2178,11 @@ async fn prepare_delivery_route(
     channel_id: i32,
     sender_id: &str,
     conversation_id: i32,
-    connection_id: &str,
+    connection_id: Option<&str>,
     origin_message_id: Option<&str>,
     push_mode: WeixinPushMode,
     target: &ChannelMessageTarget,
+    prompt_blocks: &[PromptInputBlock],
 ) -> Result<Option<TurnDeliveryRoute>, String> {
     let Some(origin_message_id) = origin_message_id else {
         return Ok(None);
@@ -2130,10 +2194,11 @@ async fn prepare_delivery_route(
             channel_id,
             sender_id,
             conversation_id,
-            connection_id: Some(connection_id),
+            connection_id,
             origin_message_id,
             client_message_id: &client_message_id,
             target,
+            prompt_blocks,
         },
     )
     .await?;
@@ -2336,6 +2401,9 @@ mod tests {
         FollowupRequest {
             db,
             text,
+            blocks: vec![PromptInputBlock::Text {
+                text: text.to_string(),
+            }],
             channel_id,
             sender_id: "sender-1",
             target,
@@ -2475,7 +2543,10 @@ mod tests {
             .unwrap()
             .pending_prompts
             .iter()
-            .map(|pending| pending.text.clone())
+            .filter_map(|pending| match pending.blocks.first() {
+                Some(PromptInputBlock::Text { text }) => Some(text.clone()),
+                _ => None,
+            })
             .collect();
         assert_eq!(queued, ["second", "third"]);
     }
@@ -2957,7 +3028,9 @@ mod tests {
             "conn-linked",
             folder_id,
             conv_id,
-            "first task prompt",
+            vec![PromptInputBlock::Text {
+                text: "first task prompt".to_string(),
+            }],
             None,
         )
         .await
@@ -3024,6 +3097,9 @@ mod tests {
         let message = handle_followup(FollowupRequest {
             db: &db.conn,
             text: "continue task",
+            blocks: vec![PromptInputBlock::Text {
+                text: "continue task".into(),
+            }],
             channel_id,
             sender_id: "sender-1",
             target: &target,
@@ -3102,6 +3178,9 @@ mod tests {
         let message = handle_followup(FollowupRequest {
             db: &db.conn,
             text: "do not queue me",
+            blocks: vec![PromptInputBlock::Text {
+                text: "do not queue me".into(),
+            }],
             channel_id,
             sender_id: "sender-1",
             target: &target,

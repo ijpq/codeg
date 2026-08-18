@@ -7,16 +7,14 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 use super::i18n::Lang;
-#[cfg(test)]
-use super::session_bridge::PendingPrompt;
-use super::session_bridge::{PendingPermission, SessionBridge};
+use super::session_bridge::{PendingPermission, PendingPrompt, SessionBridge};
 use super::tool_detail::{format_tool_call_detail, truncate_str};
 use super::types::{ChannelMessageTarget, MessageLevel, RichMessage};
 use crate::acp::internal_bus::InternalEventBus;
 use crate::acp::manager::ConnectionManager;
-use crate::acp::types::{
-    AcpEvent, ConnectionStatus, DelegationResultSummary, EventEnvelope, PromptInputBlock,
-};
+#[cfg(test)]
+use crate::acp::types::PromptInputBlock;
+use crate::acp::types::{AcpEvent, ConnectionStatus, DelegationResultSummary, EventEnvelope};
 
 use crate::db::service::{
     app_metadata_service, conversation_service, sender_context_service, thread_binding_service,
@@ -113,6 +111,132 @@ async fn get_prefix(db: &DatabaseConnection) -> String {
         .ok()
         .flatten()
         .unwrap_or_else(|| DEFAULT_COMMAND_PREFIX.to_string())
+}
+
+/// A TurnComplete is now broadcast after the core reply/run transaction but
+/// before the optional artifact tracker finishes its short settlement window.
+/// Keep the channel prompt locally (and durably in turn_origin) while that gate
+/// is closed, then retry without requiring another ACP event to wake it. This
+/// task owns the popped prompt, so concurrent terminal events cannot submit it
+/// twice; the stable client_message_id remains the final cross-process guard.
+fn retry_prompt_after_settlement(
+    bridge: Arc<Mutex<SessionBridge>>,
+    manager: ChatChannelManager,
+    conn_mgr: ConnectionManager,
+    db: DatabaseConnection,
+    connection_id: String,
+    target: ChannelMessageTarget,
+    pending: PendingPrompt,
+) {
+    tokio::spawn(async move {
+        for attempt in 1..=40u32 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            {
+                let mut guard = bridge.lock().await;
+                let Some(session) = guard.get_mut(&connection_id) else {
+                    tracing::warn!(
+                        connection_id,
+                        conversation_id = pending.conversation_id,
+                        client_message_id = ?pending.delivery.as_ref().map(|route| &route.client_message_id),
+                        retry_count = attempt,
+                        "[SessionEventSub] settlement retry paused after connection removal; durable prompt retained"
+                    );
+                    return;
+                };
+                session.forward_events = true;
+                if let Some(delivery) = pending.delivery.clone() {
+                    guard.set_active_delivery(connection_id.clone(), delivery);
+                }
+            }
+
+            let result = conn_mgr
+                .send_prompt_linked_with_message_id(
+                    &crate::db::AppDatabase { conn: db.clone() },
+                    &connection_id,
+                    pending.blocks.clone(),
+                    Some(pending.folder_id),
+                    Some(pending.conversation_id),
+                    None,
+                    pending
+                        .delivery
+                        .as_ref()
+                        .map(|delivery| delivery.client_message_id.clone()),
+                )
+                .await;
+            match result {
+                Ok(_) => {
+                    if let Some(delivery) = pending.delivery.as_ref() {
+                        let _ = crate::db::service::chat_channel_delivery_service::mark_dispatched(
+                            &db,
+                            &delivery.origin_id,
+                            &connection_id,
+                        )
+                        .await;
+                    }
+                    tracing::info!(
+                        connection_id,
+                        conversation_id = pending.conversation_id,
+                        client_message_id = ?pending.delivery.as_ref().map(|route| &route.client_message_id),
+                        retry_count = attempt,
+                        "[SessionEventSub] queued prompt submitted after turn settlement"
+                    );
+                    return;
+                }
+                Err(crate::acp::error::AcpError::TurnInProgress) => {
+                    let mut guard = bridge.lock().await;
+                    guard.take_active_delivery(&connection_id);
+                    if let Some(session) = guard.get_mut(&connection_id) {
+                        session.forward_events = false;
+                    }
+                }
+                Err(error) => {
+                    {
+                        let mut guard = bridge.lock().await;
+                        guard.take_active_delivery(&connection_id);
+                        if let Some(session) = guard.get_mut(&connection_id) {
+                            session.forward_events = false;
+                        }
+                    }
+                    if let Some(delivery) = pending.delivery.as_ref() {
+                        let _ = crate::db::service::chat_channel_delivery_service::mark_failed(
+                            &db,
+                            &delivery.origin_id,
+                        )
+                        .await;
+                        if delivery.push_mode.allows_interactions() {
+                            let message =
+                                RichMessage::error(format!("Failed to send queued task: {error}"));
+                            let _ = manager.send_to_target(&target, &message).await;
+                        }
+                    }
+                    tracing::error!(
+                        connection_id,
+                        conversation_id = pending.conversation_id,
+                        retry_count = attempt,
+                        error = %error,
+                        "[SessionEventSub] queued prompt retry failed; durable prompt remains retryable"
+                    );
+                    return;
+                }
+            }
+        }
+
+        // Do not lose a legacy non-durable prompt merely because settlement
+        // exceeded the bounded retry window. Durable Weixin prompts also stay
+        // in turn_origin and are recovered after reconnect/restart.
+        let mut guard = bridge.lock().await;
+        guard.take_active_delivery(&connection_id);
+        if let Some(session) = guard.get_mut(&connection_id) {
+            session.forward_events = false;
+            session.pending_prompts.push_front(pending.clone());
+        }
+        tracing::warn!(
+            connection_id,
+            conversation_id = pending.conversation_id,
+            retry_count = 40,
+            "[SessionEventSub] settlement retry window expired; prompt remains queued"
+        );
+    });
 }
 
 /// Phase 5: typed-envelope dispatcher. Replaces the prior JSON
@@ -229,9 +353,7 @@ pub(super) async fn handle_acp_envelope(
             };
 
             if let Some(pending) = pending {
-                let blocks = vec![PromptInputBlock::Text {
-                    text: pending.text.clone(),
-                }];
+                let blocks = pending.blocks.clone();
                 if let Some(delivery) = pending.delivery.clone() {
                     bridge
                         .lock()
@@ -848,9 +970,7 @@ pub(super) async fn handle_acp_envelope(
                 // TurnComplete), restore the prompt for the next TurnComplete —
                 // never drop it.
                 if let Some(pending) = deferred_kickoff {
-                    let blocks = vec![PromptInputBlock::Text {
-                        text: pending.text.clone(),
-                    }];
+                    let blocks = pending.blocks.clone();
                     {
                         let mut next_guard = bridge.lock().await;
                         if let Some(session) = next_guard.get_mut(connection_id) {
@@ -876,15 +996,24 @@ pub(super) async fn handle_acp_envelope(
                         .await
                     {
                         if matches!(e, crate::acp::error::AcpError::TurnInProgress) {
-                            let mut g = bridge.lock().await;
-                            g.take_active_delivery(connection_id);
-                            if let Some(s) = g.get_mut(connection_id) {
-                                s.forward_events = false;
-                                s.pending_prompts.push_front(pending);
+                            {
+                                let mut g = bridge.lock().await;
+                                g.take_active_delivery(connection_id);
+                                if let Some(s) = g.get_mut(connection_id) {
+                                    s.forward_events = false;
+                                }
                             }
+                            retry_prompt_after_settlement(
+                                Arc::clone(bridge),
+                                manager.clone_ref(),
+                                conn_mgr.clone_ref(),
+                                db.clone(),
+                                connection_id.to_string(),
+                                target.clone(),
+                                pending,
+                            );
                             tracing::warn!(
-                                "[SessionEventSub] deferred kickoff still blocked; will retry on \
-                                 next TurnComplete"
+                                "[SessionEventSub] deferred kickoff still blocked; settlement retry scheduled"
                             );
                         } else {
                             {
@@ -1735,6 +1864,7 @@ mod async_relay_dedup_tests {
                 origin_message_id: "message_id:100",
                 client_message_id: "chat-1-final-test",
                 target: &target,
+                prompt_blocks: &[],
             },
         )
         .await
@@ -2038,7 +2168,9 @@ mod async_relay_dedup_tests {
             .unwrap()
             .pending_prompts
             .push_back(PendingPrompt {
-                text: "do the task".into(),
+                blocks: vec![PromptInputBlock::Text {
+                    text: "do the task".into(),
+                }],
                 folder_id,
                 conversation_id,
                 delivery: None,
@@ -2068,7 +2200,11 @@ mod async_relay_dedup_tests {
                 .unwrap()
                 .pending_prompts
                 .front()
-                .map(|pending| pending.text.as_str()),
+                .and_then(|pending| pending.blocks.first())
+                .and_then(|block| match block {
+                    PromptInputBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                }),
             Some("do the task"),
             "a deferred kickoff must be RESTORED, not dropped"
         );
@@ -2124,6 +2260,104 @@ mod async_relay_dedup_tests {
             matches!(blocks.as_slice(), [PromptInputBlock::Text { text }] if text == "do the task"),
             "the retried prompt must carry the deferred text, got {blocks:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn queued_prompt_wakes_after_artifact_settlement_without_another_turn_event() {
+        use crate::acp::connection::ConnectionCommand;
+        use crate::db::entities::conversation_turn_run::ConversationTurnRunStatus;
+        use crate::db::service::artifact_service;
+        use crate::web::event_bridge::EventEmitter;
+
+        let (bridge, chat, _rec) = harness().await;
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/codeg-settlement-queue").await;
+        let conversation_id =
+            test_helpers::seed_conversation(&db, folder_id, AgentType::ClaudeCode).await;
+        artifact_service::create_run(
+            &db.conn,
+            artifact_service::NewTurnRun {
+                id: "settling-run".into(),
+                conversation_id,
+                connection_id: "conn".into(),
+                client_message_id: Some("previous-message".into()),
+                prompt_fingerprint: None,
+                folder_id: Some(folder_id),
+                root_path: "/tmp/codeg-settlement-queue".into(),
+                capture_incomplete: false,
+                input_paths_json: "[]".into(),
+                expectation_json: "{}".into(),
+            },
+        )
+        .await
+        .unwrap();
+        artifact_service::finalize_turn_state(
+            &db.conn,
+            "settling-run",
+            ConversationTurnRunStatus::Completed,
+            "end_turn",
+            crate::db::entities::conversation::ConversationStatus::PendingReview,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let conn = ConnectionManager::new();
+        let mut cmd_rx = conn
+            .insert_test_connection_live("conn", AgentType::ClaudeCode, None, EventEmitter::Noop)
+            .await;
+        {
+            let state = conn.get_state("conn").await.unwrap();
+            let mut state = state.write().await;
+            state.conversation_id = Some(conversation_id);
+            state.folder_id = Some(folder_id);
+        }
+        bridge
+            .lock()
+            .await
+            .get_mut("conn")
+            .unwrap()
+            .pending_prompts
+            .push_back(PendingPrompt {
+                blocks: vec![PromptInputBlock::Text {
+                    text: "run after settlement".into(),
+                }],
+                folder_id,
+                conversation_id,
+                delivery: None,
+            });
+
+        handle_acp_envelope(
+            &EventEnvelope {
+                seq: 10,
+                connection_id: "conn".into(),
+                payload: AcpEvent::TurnComplete {
+                    session_id: "S1".into(),
+                    stop_reason: "end_turn".into(),
+                    agent_type: "claude".into(),
+                },
+            },
+            &bridge,
+            &chat,
+            &conn,
+            &db.conn,
+        )
+        .await;
+        assert!(cmd_rx.try_recv().is_err());
+
+        artifact_service::mark_settled(&db.conn, "settling-run", "settled", &[])
+            .await
+            .unwrap();
+        let command = tokio::time::timeout(Duration::from_secs(2), cmd_rx.recv())
+            .await
+            .expect("queued prompt did not wake after settlement")
+            .expect("connection command channel closed");
+        assert!(matches!(
+            command,
+            ConnectionCommand::Prompt { blocks, .. }
+                if matches!(blocks.as_slice(), [PromptInputBlock::Text { text }] if text == "run after settlement")
+        ));
     }
 }
 

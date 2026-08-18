@@ -363,6 +363,7 @@ export async function acpGoalControl(
 
 export interface AcpCancelResult {
   outcome:
+    | "cancelled"
     | "cancel_requested"
     | "already_cancelling"
     | "already_finished"

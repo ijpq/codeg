@@ -16,6 +16,7 @@ pub struct NewTurnOrigin {
     pub origin_message_id: String,
     pub client_message_id: String,
     pub target_json: String,
+    pub prompt_json: Option<String>,
 }
 
 pub async fn register_origin(
@@ -31,6 +32,15 @@ pub async fn register_origin(
         .one(conn)
         .await?
     {
+        if existing.prompt_json.is_none()
+            && input.prompt_json.is_some()
+            && matches!(existing.status.as_str(), "queued" | "dispatch_failed")
+        {
+            let mut active = existing.into_active_model();
+            active.prompt_json = Set(input.prompt_json);
+            active.updated_at = Set(Utc::now());
+            return Ok(active.update(conn).await?);
+        }
         return Ok(existing);
     }
     let now = Utc::now();
@@ -44,7 +54,10 @@ pub async fn register_origin(
         client_message_id: Set(input.client_message_id),
         turn_run_id: Set(None),
         target_json: Set(input.target_json),
+        prompt_json: Set(input.prompt_json),
         status: Set("queued".to_string()),
+        attempt_count: Set(0),
+        last_error: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
         final_captured_at: Set(None),
@@ -75,6 +88,7 @@ pub async fn mark_dispatched(
     active.connection_id = Set(Some(connection_id.to_string()));
     active.turn_run_id = Set(turn_run_id);
     active.status = Set("dispatched".to_string());
+    active.last_error = Set(None);
     active.updated_at = Set(Utc::now());
     let updated = active.update(conn).await?;
     for message_type in ["task_dispatched", "turn_started"] {
@@ -102,10 +116,32 @@ pub async fn mark_failed(conn: &DatabaseConnection, origin_id: &str) -> Result<(
     {
         let mut active = model.into_active_model();
         active.status = Set("dispatch_failed".to_string());
+        active.attempt_count = Set(active.attempt_count.take().unwrap_or_default() + 1);
+        active.last_error = Set(Some("prompt_dispatch_failed".to_string()));
         active.updated_at = Set(Utc::now());
         active.update(conn).await?;
     }
     Ok(())
+}
+
+pub async fn list_retryable_origins(
+    conn: &DatabaseConnection,
+    channel_id: i32,
+    sender_id: &str,
+    conversation_id: i32,
+    limit: u64,
+) -> Result<Vec<chat_channel_turn_origin::Model>, DbError> {
+    use sea_orm::QuerySelect;
+    Ok(chat_channel_turn_origin::Entity::find()
+        .filter(chat_channel_turn_origin::Column::ChannelId.eq(channel_id))
+        .filter(chat_channel_turn_origin::Column::SenderId.eq(sender_id.to_string()))
+        .filter(chat_channel_turn_origin::Column::ConversationId.eq(conversation_id))
+        .filter(chat_channel_turn_origin::Column::Status.is_in(["queued", "dispatch_failed"]))
+        .filter(chat_channel_turn_origin::Column::PromptJson.is_not_null())
+        .order_by_asc(chat_channel_turn_origin::Column::CreatedAt)
+        .limit(limit)
+        .all(conn)
+        .await?)
 }
 
 pub async fn find_active_by_connection(
@@ -304,6 +340,7 @@ mod tests {
                 connection_id: Some("conn-1".into()),
                 origin_message_id: "message_id:42".into(),
                 client_message_id: "chat-1-test".into(),
+                prompt_json: None,
                 target_json: serde_json::json!({
                     "channel_id": channel.id,
                     "chat_id": null,
@@ -366,6 +403,7 @@ mod tests {
                 origin_message_id: origin.origin_message_id.clone(),
                 client_message_id: "different-client-id".into(),
                 target_json: origin.target_json.clone(),
+                prompt_json: None,
             },
         )
         .await
@@ -400,6 +438,7 @@ mod tests {
                 connection_id: Some("conn".into()),
                 origin_message_id: "message_id:restart".into(),
                 client_message_id: "chat-restart".into(),
+                prompt_json: None,
                 target_json: serde_json::json!({
                     "channel_id": channel.id,
                     "provider_payload": {"weixin_sender_id": "wx-user"}
@@ -427,6 +466,84 @@ mod tests {
             .unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].content, "durable answer");
+        reopened.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn queued_mixed_prompt_survives_database_reopen_exactly_once() {
+        use crate::acp::types::PromptInputBlock;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_disk_db(dir.path()).await;
+        let channel = chat_channel_service::create(
+            &db.conn,
+            "Weixin".into(),
+            "weixin".into(),
+            r#"{"push_mode":"final_and_interactions"}"#.into(),
+            true,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        let folder_id = seed_folder(&db, "/tmp/codeg-inbound-restart").await;
+        let conversation_id = seed_conversation(&db, folder_id, AgentType::Codex).await;
+        let blocks = vec![
+            PromptInputBlock::Text {
+                text: "请看附件".into(),
+            },
+            PromptInputBlock::ResourceLink {
+                uri: "file:///tmp/codeg_uploads/chat-channel/weixin/m1/report.pdf".into(),
+                name: "report.pdf".into(),
+                mime_type: Some("application/pdf".into()),
+                description: Some("Weixin inbound attachment".into()),
+            },
+        ];
+        let prompt_json = serde_json::to_string(&blocks).unwrap();
+        let first = register_origin(
+            &db.conn,
+            NewTurnOrigin {
+                channel_id: channel.id,
+                sender_id: "wx-user".into(),
+                conversation_id,
+                connection_id: None,
+                origin_message_id: "message_id:mixed-restart".into(),
+                client_message_id: "chat-mixed-restart".into(),
+                prompt_json: Some(prompt_json.clone()),
+                target_json: "{}".into(),
+            },
+        )
+        .await
+        .unwrap();
+        // A provider retry reuses the same durable origin rather than creating
+        // a second executable turn.
+        let duplicate = register_origin(
+            &db.conn,
+            NewTurnOrigin {
+                channel_id: channel.id,
+                sender_id: "wx-user".into(),
+                conversation_id,
+                connection_id: None,
+                origin_message_id: "message_id:mixed-restart".into(),
+                client_message_id: "ignored-duplicate".into(),
+                prompt_json: Some(prompt_json),
+                target_json: "{}".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.id, duplicate.id);
+        db.conn.close().await.unwrap();
+
+        let url = format!("sqlite:{}?mode=rw", dir.path().join("source.db").display());
+        let reopened = Database::connect(url).await.unwrap();
+        let queued = list_retryable_origins(&reopened, channel.id, "wx-user", conversation_id, 10)
+            .await
+            .unwrap();
+        assert_eq!(queued.len(), 1);
+        let restored: Vec<PromptInputBlock> =
+            serde_json::from_str(queued[0].prompt_json.as_deref().unwrap()).unwrap();
+        assert_eq!(restored, blocks);
         reopened.close().await.unwrap();
     }
 }

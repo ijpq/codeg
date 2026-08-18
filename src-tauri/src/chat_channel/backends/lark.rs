@@ -512,6 +512,7 @@ async fn handle_lark_event(
                 channel_id,
                 sender_id,
                 command_text: clean_text,
+                prompt_blocks: Vec::new(),
                 callback_data: None,
                 target: ChannelMessageTarget::channel(channel_id),
                 metadata: event.clone(),
