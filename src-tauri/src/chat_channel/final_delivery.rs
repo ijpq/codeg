@@ -81,6 +81,7 @@ pub struct OriginRegistration<'a> {
     pub origin_message_id: &'a str,
     pub client_message_id: &'a str,
     pub target: &'a ChannelMessageTarget,
+    pub prompt_blocks: &'a [crate::acp::types::PromptInputBlock],
 }
 
 pub async fn register_origin(
@@ -97,6 +98,9 @@ pub async fn register_origin(
             origin_message_id: input.origin_message_id.to_string(),
             client_message_id: input.client_message_id.to_string(),
             target_json: serde_json::to_string(input.target).map_err(|error| error.to_string())?,
+            prompt_json: Some(
+                serde_json::to_string(input.prompt_blocks).map_err(|error| error.to_string())?,
+            ),
         },
     )
     .await
@@ -614,6 +618,7 @@ mod tests {
                 origin_message_id: "message_id:1",
                 client_message_id: "chat-client-1",
                 target: &target,
+                prompt_blocks: &[],
             },
         )
         .await
