@@ -433,6 +433,21 @@ describe("ConversationDetailPanel send-path hardening", () => {
     expect(source).toContain("mqRemove(item.id)")
   })
 
+  it("returns the runtime to idle when a busy rejection re-queues the prompt", () => {
+    const busyStart = source.indexOf("const onTurnInProgress = () => {")
+    const busyEnd = source.indexOf("const onAccepted = () => {", busyStart)
+    expect(busyStart).toBeGreaterThan(-1)
+    expect(busyEnd).toBeGreaterThan(busyStart)
+    const busyHandler = source.slice(busyStart, busyEnd)
+
+    expect(busyHandler).toContain(
+      'setSyncState(effectiveConversationId, "idle")'
+    )
+    expect(
+      busyHandler.indexOf('setSyncState(effectiveConversationId, "idle")')
+    ).toBeLessThan(busyHandler.indexOf('mqMarkState(queueItemId, "queued")'))
+  })
+
   it("disables the welcome composer while connected-but-not-ready", () => {
     // The composer reads a downgraded status so its send affordance is disabled
     // during the transient mismatch window instead of inviting a rejected send.
