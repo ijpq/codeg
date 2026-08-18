@@ -153,21 +153,6 @@ pub async fn finalize_turn_state(
     Ok(changed)
 }
 
-/// A terminal run may still be settling its optional filesystem metadata.
-/// Admission uses this to queue the next prompt instead of superseding the old
-/// capture and producing a second, contradictory run.
-pub async fn has_unsettled_run(
-    conn: &DatabaseConnection,
-    conversation_id: i32,
-) -> Result<bool, DbError> {
-    Ok(conversation_turn_run::Entity::find()
-        .filter(conversation_turn_run::Column::ConversationId.eq(conversation_id))
-        .filter(conversation_turn_run::Column::SettlementStatus.eq("pending"))
-        .one(conn)
-        .await?
-        .is_some())
-}
-
 pub async fn create_run(
     conn: &DatabaseConnection,
     input: NewTurnRun,
@@ -678,6 +663,46 @@ pub async fn recover_interrupted_runs(conn: &DatabaseConnection) -> Result<u64, 
     Ok(count)
 }
 
+/// Close terminal runs whose optional artifact settlement owner disappeared
+/// with the previous process. A completed/cancelled/failed run is already safe
+/// for another prompt; leaving its metadata status at `pending` is both
+/// misleading and, before v0.26.1-fix3, could permanently trip prompt
+/// admission for the whole conversation.
+///
+/// This only runs during database startup, before a process-local
+/// [`ArtifactTracker`](crate::artifact_tracker::ArtifactTracker) can own any
+/// capture, so every matching terminal row is necessarily orphaned. Explicitly
+/// declared deliverables remain durable; only the optional inferred capture is
+/// marked incomplete.
+pub async fn recover_orphaned_terminal_settlements(
+    conn: &DatabaseConnection,
+) -> Result<u64, DbError> {
+    let now = Utc::now();
+    let result = conversation_turn_run::Entity::update_many()
+        .col_expr(
+            conversation_turn_run::Column::CaptureIncomplete,
+            Expr::value(true),
+        )
+        .col_expr(
+            conversation_turn_run::Column::SettlementStatus,
+            Expr::value("settled_incomplete"),
+        )
+        .col_expr(
+            conversation_turn_run::Column::SettledAt,
+            Expr::value(Some(now)),
+        )
+        .filter(conversation_turn_run::Column::SettlementStatus.eq("pending"))
+        .filter(conversation_turn_run::Column::Status.is_in([
+            ConversationTurnRunStatus::Completed,
+            ConversationTurnRunStatus::Cancelled,
+            ConversationTurnRunStatus::Interrupted,
+            ConversationTurnRunStatus::Failed,
+        ]))
+        .exec(conn)
+        .await?;
+    Ok(result.rows_affected)
+}
+
 fn run_status_str(status: &ConversationTurnRunStatus) -> &'static str {
     match status {
         ConversationTurnRunStatus::Running => "running",
@@ -979,6 +1004,47 @@ mod tests {
         assert!(closed.completed_at.is_some());
         assert!(closed.settled_at.is_some());
         assert_eq!(conversation.status, ConversationStatus::PendingReview);
+    }
+
+    #[tokio::test]
+    async fn startup_closes_only_orphaned_terminal_settlements() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let terminal_run_id = seed_cancel_run(&db, "terminal-pending").await;
+        finish_run(
+            &db.conn,
+            &terminal_run_id,
+            ConversationTurnRunStatus::Completed,
+            Some("end_turn".into()),
+        )
+        .await
+        .unwrap();
+        let active_run_id = seed_cancel_run(&db, "active-pending").await;
+
+        assert_eq!(
+            recover_orphaned_terminal_settlements(&db.conn)
+                .await
+                .unwrap(),
+            1
+        );
+
+        let terminal = conversation_turn_run::Entity::find_by_id(terminal_run_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(terminal.status, ConversationTurnRunStatus::Completed);
+        assert_eq!(terminal.settlement_status, "settled_incomplete");
+        assert!(terminal.capture_incomplete);
+        assert!(terminal.settled_at.is_some());
+
+        let active = conversation_turn_run::Entity::find_by_id(active_run_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.status, ConversationTurnRunStatus::Running);
+        assert_eq!(active.settlement_status, "pending");
+        assert!(active.settled_at.is_none());
     }
 
     #[tokio::test]

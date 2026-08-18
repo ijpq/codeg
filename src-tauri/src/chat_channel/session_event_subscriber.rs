@@ -2263,11 +2263,12 @@ mod async_relay_dedup_tests {
     }
 
     #[tokio::test]
-    async fn queued_prompt_wakes_after_artifact_settlement_without_another_turn_event() {
+    async fn queued_prompt_does_not_wait_for_artifact_settlement() {
         use crate::acp::connection::ConnectionCommand;
         use crate::db::entities::conversation_turn_run::ConversationTurnRunStatus;
         use crate::db::service::artifact_service;
         use crate::web::event_bridge::EventEmitter;
+        use sea_orm::EntityTrait;
 
         let (bridge, chat, _rec) = harness().await;
         let db = test_helpers::fresh_in_memory_db().await;
@@ -2344,20 +2345,27 @@ mod async_relay_dedup_tests {
             &db.conn,
         )
         .await;
-        assert!(cmd_rx.try_recv().is_err());
-
-        artifact_service::mark_settled(&db.conn, "settling-run", "settled", &[])
-            .await
-            .unwrap();
         let command = tokio::time::timeout(Duration::from_secs(2), cmd_rx.recv())
             .await
-            .expect("queued prompt did not wake after settlement")
+            .expect("queued prompt remained blocked on optional artifact settlement")
             .expect("connection command channel closed");
         assert!(matches!(
             command,
             ConnectionCommand::Prompt { blocks, .. }
                 if matches!(blocks.as_slice(), [PromptInputBlock::Text { text }] if text == "run after settlement")
         ));
+
+        let prior = crate::db::entities::conversation_turn_run::Entity::find_by_id(
+            "settling-run".to_string(),
+        )
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            prior.settlement_status, "pending",
+            "the prompt must be accepted independently of optional settlement"
+        );
     }
 }
 

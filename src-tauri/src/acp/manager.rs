@@ -1739,27 +1739,13 @@ impl ConnectionManager {
             return Err(AcpError::TurnInProgress);
         }
 
-        // Turn completion commits the reply and terminal run state before the
-        // optional artifact tracker finishes its bounded filesystem debounce.
-        // Do not supersede that still-settling capture with a new run: callers
-        // already translate TurnInProgress into the persistent message queue.
-        // This keeps a follow-up exactly-once while the previous run's
-        // deliverables are being finalized and prevents two captures from
-        // competing for the same connection key.
-        if let Some(cid) = linked_conversation_id.or(conversation_id) {
-            if artifact_service::has_unsettled_run(&db.conn, cid)
-                .await
-                .map_err(|error| AcpError::protocol(error.to_string()))?
-            {
-                tracing::info!(
-                    conversation_id = cid,
-                    connection_id = conn_id,
-                    transition_reason = "previous_turn_settling",
-                    "[ACP] prompt queued until durable turn settlement completes"
-                );
-                return Err(AcpError::TurnInProgress);
-            }
-        }
+        // A terminal turn's filesystem/deliverable settlement is auxiliary and
+        // must never gate the next user prompt. `turn_in_flight` above remains
+        // the authoritative core-turn gate. ArtifactTracker::begin_turn owns
+        // the narrower process-local handoff: if the prior capture has not yet
+        // consumed TurnComplete it settles that exact generation before
+        // installing the new one. Historical `settlement_status=pending` rows
+        // therefore cannot strand the frontend queue.
 
         // Re-hydrate uploaded image attachments (web / remote-workspace mode
         // sends empty-payload marker blocks with a `file://` uri into the
@@ -6521,6 +6507,76 @@ mod tests {
             1,
             "only the first prompt reaches the loop; the second is rejected, not queued"
         );
+    }
+
+    #[tokio::test]
+    async fn historical_pending_artifact_settlement_does_not_block_prompt() {
+        use crate::db::test_helpers;
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/settlement-admission").await;
+        let conversation_id =
+            test_helpers::seed_conversation(&db, folder_id, AgentType::ClaudeCode).await;
+        let mgr = ConnectionManager::new();
+        let conn_id = "conn-settlement-admission";
+        let mut cmd_rx = insert_live_connection(
+            &mgr,
+            conn_id,
+            AgentType::ClaudeCode,
+            Some(PathBuf::from("/tmp/settlement-admission")),
+        )
+        .await;
+        {
+            let state = mgr.get_state(conn_id).await.unwrap();
+            let mut state = state.write().await;
+            state.conversation_id = Some(conversation_id);
+            state.external_id = Some("session-settlement-admission".into());
+        }
+
+        artifact_service::create_run(
+            &db.conn,
+            artifact_service::NewTurnRun {
+                id: "old-terminal-pending".into(),
+                conversation_id,
+                connection_id: conn_id.into(),
+                client_message_id: Some("old-message".into()),
+                prompt_fingerprint: None,
+                folder_id: Some(folder_id),
+                root_path: "/tmp/settlement-admission".into(),
+                capture_incomplete: false,
+                input_paths_json: "[]".into(),
+                expectation_json: "{}".into(),
+            },
+        )
+        .await
+        .unwrap();
+        artifact_service::finish_run(
+            &db.conn,
+            "old-terminal-pending",
+            ConversationTurnRunStatus::Completed,
+            Some("end_turn".into()),
+        )
+        .await
+        .unwrap();
+
+        let result = mgr
+            .send_prompt_linked_with_message_id(
+                &db,
+                conn_id,
+                vec![PromptInputBlock::Text {
+                    text: "follow-up after initialization".into(),
+                }],
+                Some(folder_id),
+                Some(conversation_id),
+                None,
+                Some("new-message".into()),
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "optional historical settlement must not reject a ready prompt: {result:?}"
+        );
+        let prompts = drain_prompt_user_messages(&mut cmd_rx);
+        assert_eq!(prompts.len(), 1);
     }
 
     #[tokio::test]
