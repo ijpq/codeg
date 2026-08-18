@@ -1296,6 +1296,12 @@ const ConversationTabView = memo(function ConversationTabView({
         }
         lastFlushBounceAtRef.current = Date.now()
         removeOptimisticTurn(effectiveConversationId, optimisticTurn.id)
+        // The optimistic send moved the runtime into `awaiting_persist`. This
+        // prompt was NOT accepted, so no turn_complete can ever reset it. Put
+        // the runtime back at idle before retaining the queue head; otherwise
+        // the auto-flush effect permanently refuses to retry this message even
+        // after the backend becomes ready.
+        setSyncState(effectiveConversationId, "idle")
         setPromptDeliveryPhase(
           effectiveConversationId,
           clientMessageId,
