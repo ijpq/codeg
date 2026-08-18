@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use sea_orm::DatabaseConnection;
+use sea_orm::{DatabaseConnection, EntityTrait};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{broadcast, oneshot, Mutex};
@@ -358,6 +358,41 @@ struct FinishCommand {
     stop_reason: Option<String>,
 }
 
+fn finish_command_for_superseded_capture(
+    run: Option<crate::db::entities::conversation_turn_run::Model>,
+) -> FinishCommand {
+    use ConversationTurnRunStatus as RunStatus;
+
+    let Some(run) = run else {
+        return FinishCommand {
+            status: ArtifactTurnFinishStatus::Interrupted,
+            stop_reason: Some("superseded_capture_row_missing".to_string()),
+        };
+    };
+    let status = match &run.status {
+        RunStatus::Completed => ArtifactTurnFinishStatus::Completed,
+        RunStatus::Cancelled | RunStatus::Cancelling => ArtifactTurnFinishStatus::Cancelled,
+        RunStatus::Failed => ArtifactTurnFinishStatus::Failed,
+        RunStatus::Interrupted | RunStatus::Running => ArtifactTurnFinishStatus::Interrupted,
+    };
+    FinishCommand {
+        status,
+        stop_reason: run.stop_reason.or_else(|| {
+            Some(
+                match &run.status {
+                    RunStatus::Completed => "end_turn",
+                    RunStatus::Cancelled | RunStatus::Cancelling => "cancelled",
+                    RunStatus::Failed => "failed",
+                    RunStatus::Interrupted | RunStatus::Running => {
+                        "superseded_before_lifecycle_finalize"
+                    }
+                }
+                .to_string(),
+            )
+        }),
+    }
+}
+
 struct ActiveCapture {
     run_id: String,
     root_key: String,
@@ -425,19 +460,33 @@ impl ArtifactTracker {
             active.remove(connection_id)
         };
         if let Some(previous) = previous {
+            let durable_run = crate::db::entities::conversation_turn_run::Entity::find_by_id(
+                previous.run_id.clone(),
+            )
+            .one(db)
+            .await;
+            let finish = match durable_run {
+                Ok(run) => finish_command_for_superseded_capture(run),
+                Err(error) => {
+                    tracing::error!(
+                        turn_run_id = previous.run_id,
+                        connection_id,
+                        error = %error,
+                        "[artifact-tracker] failed to read superseded capture state"
+                    );
+                    FinishCommand {
+                        status: ArtifactTurnFinishStatus::Interrupted,
+                        stop_reason: Some("superseded_capture_state_unavailable".to_string()),
+                    }
+                }
+            };
             tracing::warn!(
-                "[artifact-tracker] superseding unfinished capture {} on {}",
+                settlement_status = ?finish.status,
+                "[artifact-tracker] settling previous capture {} before new prompt on {}",
                 previous.run_id,
                 connection_id
             );
-            settle_capture(
-                previous,
-                FinishCommand {
-                    status: ArtifactTurnFinishStatus::Interrupted,
-                    stop_reason: Some("superseded_before_lifecycle_finalize".to_string()),
-                },
-            )
-            .await;
+            settle_capture(previous, finish).await;
         }
 
         let requested_root = root_path.to_string_lossy().to_string();

@@ -446,7 +446,7 @@ describe("ConversationDetailPanel send-path hardening", () => {
     // elsewhere in the file (answering a question, forking), so banning it
     // outright would be wrong.
     const start = source.indexOf("// Flush queued messages whenever the agent")
-    const end = source.indexOf("autoSendQueueRef.current()", start)
+    const end = source.indexOf('autoSendQueueRef.current("prompt")', start)
     expect(start).toBeGreaterThan(-1)
     expect(end).toBeGreaterThan(start)
     const flushEffect = source.slice(start, end)
@@ -455,8 +455,23 @@ describe("ConversationDetailPanel send-path hardening", () => {
     expect(flushEffect).toContain("if (!connectionReadyRef.current) return")
     // No re-spelling of the predicate: the connection is judged ONLY through
     // the shared variable.
-    expect(flushEffect).not.toContain("connStatus")
-    expect(flushEffect).not.toContain("connectedWorkingDir")
+    expect(flushEffect).not.toContain("if (connStatus")
+    expect(flushEffect).not.toContain("conn.connectedWorkingDir")
+  })
+
+  it("returns the runtime to idle when a busy rejection re-queues the prompt", () => {
+    const busyStart = source.indexOf("const onTurnInProgress = () => {")
+    const busyEnd = source.indexOf("const onAccepted = () => {", busyStart)
+    expect(busyStart).toBeGreaterThan(-1)
+    expect(busyEnd).toBeGreaterThan(busyStart)
+    const busyHandler = source.slice(busyStart, busyEnd)
+
+    expect(busyHandler).toContain(
+      'setSyncState(effectiveConversationId, "idle")'
+    )
+    expect(
+      busyHandler.indexOf('setSyncState(effectiveConversationId, "idle")')
+    ).toBeLessThan(busyHandler.indexOf('mqMarkState(queueItemId, "queued")'))
   })
 
   it("disables the welcome composer while connected-but-not-ready", () => {
