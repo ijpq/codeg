@@ -141,6 +141,7 @@ export async function acpSetConfigOption(
 
 export interface AcpCancelResult {
   outcome:
+    | "cancelled"
     | "cancel_requested"
     | "already_cancelling"
     | "already_finished"

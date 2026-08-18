@@ -1716,6 +1716,13 @@ function connectionsReducer(
         // `plan_approval_resolved` normally; this is the turn-end safety net.
         updated.pendingPlanApproval = null
         updated.steerMessages = []
+        if (action.status === "disconnected" || action.status === "error") {
+          // A terminal transport state has no live turn to resume locally.
+          // The next authoritative restore snapshot will create a new live
+          // message if a real prompt is active; retaining this one binds the UI
+          // forever to a dead connection id.
+          updated.liveMessage = null
+        }
       }
       next.set(action.contextKey, updated)
       return next
@@ -2671,7 +2678,7 @@ export function useConnectionStore(): ConnectionStoreApi {
  * runtime reducer uses to bypass its stale-reconnect-replay guard.
  */
 export type LiveMessageSink = (
-  liveMessage: LiveMessage,
+  liveMessage: LiveMessage | null,
   isLive: boolean
 ) => void
 
@@ -3274,8 +3281,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       // the keep-alive conversation panel no longer has to re-render per
       // streaming token just to run a mirror effect. Fires only when the
       // reference actually changed and a sink is registered for the key; writes
-      // non-null values (turn-end clearing is owned by COMPLETE_TURN, unmount by
-      // removeConversation). `isLive = status === "prompting"`.
+      // values including an authoritative null. A disconnected/replaced
+      // connection must clear the runtime immediately; otherwise the removed
+      // connection's spinner survives until a later turn happens to replace it.
+      // `isLive = status === "prompting"`.
       //
       // Ordering: mirror BEFORE notifying the connection's key listeners, so the
       // runtime store is updated before React observes the connection change —
@@ -3285,12 +3294,15 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         const sink = liveMessageSinksRef.current.get(key)
         if (!sink) return
         const nextConn = next.get(key)
-        if (!nextConn || nextConn.liveMessage == null) return
-        if (nextConn.liveMessage === prev.get(key)?.liveMessage) return
-        sink(nextConn.liveMessage, nextConn.status === "prompting")
+        const nextLiveMessage = nextConn?.liveMessage ?? null
+        if (nextLiveMessage === (prev.get(key)?.liveMessage ?? null)) return
+        sink(nextLiveMessage, nextConn?.status === "prompting")
       }
 
       if (action.type === "REMOVE_ALL") {
+        for (const [key, sink] of liveMessageSinksRef.current) {
+          if (prev.get(key)?.liveMessage != null) sink(null, false)
+        }
         notifyAllKeyListeners()
       } else if (action.type === "STREAM_BATCH") {
         const keys = new Set(action.actions.map((item) => item.contextKey))
@@ -3383,9 +3395,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       // arrive to trigger the sink. Without this replay the runtime store, and
       // thus the message list, would stay blank/stale until the next change.
       const conn = storeRef.current.connections.get(contextKey)
-      if (conn?.liveMessage != null) {
-        sink(conn.liveMessage, conn.status === "prompting")
-      }
+      sink(conn?.liveMessage ?? null, conn?.status === "prompting")
       return () => {
         // Idempotent: only drop the entry if it still points at this sink (a
         // remount may have already replaced it).

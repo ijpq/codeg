@@ -34,6 +34,7 @@ use crate::acp::types::{
 };
 use crate::artifact_tracker::{ArtifactTracker, ArtifactTurnFinishStatus};
 use crate::db::entities::conversation::{self, ConversationKind, ConversationStatus};
+use crate::db::entities::conversation_turn_run::{self, ConversationTurnRunStatus};
 use crate::db::service::{artifact_service, conversation_branch_service, conversation_service};
 use crate::db::AppDatabase;
 use crate::models::agent::AgentType;
@@ -49,6 +50,7 @@ const STEER_CLIENT_MESSAGE_ID_MAX_CHARS: usize = 256;
 const STEER_RESPONSE_TIMEOUT_SECS: u64 = 30;
 const ACCEPTED_PROMPT_ID_CACHE_LIMIT: usize = 128;
 const DEFAULT_CANCEL_TIMEOUT_SECS: u64 = 25;
+const DEFAULT_ZOMBIE_PROMPT_TIMEOUT_SECS: u64 = 600;
 const RUN_TERMINAL_SETTLEMENT_GRACE_SECS: i64 = 5;
 
 fn cancel_timeout_from_env() -> Duration {
@@ -58,6 +60,15 @@ fn cancel_timeout_from_env() -> Duration {
         .unwrap_or(DEFAULT_CANCEL_TIMEOUT_SECS)
         .clamp(1, 300);
     Duration::from_secs(seconds)
+}
+
+fn zombie_prompt_timeout_from_env() -> chrono::Duration {
+    let seconds = std::env::var("CODEG_ACP_ZOMBIE_PROMPT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|raw| raw.parse::<i64>().ok())
+        .unwrap_or(DEFAULT_ZOMBIE_PROMPT_TIMEOUT_SECS as i64)
+        .clamp(30, 3_600);
+    chrono::Duration::seconds(seconds)
 }
 
 /// Grace window `disconnect_all` waits after firing every `Disconnect` before
@@ -622,9 +633,7 @@ impl ConnectionManager {
                 )
             {
                 let session_id = state.external_id.clone().ok_or_else(|| {
-                    AcpError::protocol(
-                        "ACP reported prompt readiness without a real session id",
-                    )
+                    AcpError::protocol("ACP reported prompt readiness without a real session id")
                 })?;
                 if expected_session_id.is_none_or(|expected| expected == session_id) {
                     return Ok(session_id);
@@ -1753,6 +1762,28 @@ impl ConnectionManager {
             return Err(AcpError::TurnInProgress);
         }
 
+        // Turn completion commits the reply and terminal run state before the
+        // optional artifact tracker finishes its bounded filesystem debounce.
+        // Do not supersede that still-settling capture with a new run: callers
+        // already translate TurnInProgress into the persistent message queue.
+        // This keeps a follow-up exactly-once while the previous run's
+        // deliverables are being finalized and prevents two captures from
+        // competing for the same connection key.
+        if let Some(cid) = linked_conversation_id.or(conversation_id) {
+            if artifact_service::has_unsettled_run(&db.conn, cid)
+                .await
+                .map_err(|error| AcpError::protocol(error.to_string()))?
+            {
+                tracing::info!(
+                    conversation_id = cid,
+                    connection_id = conn_id,
+                    transition_reason = "previous_turn_settling",
+                    "[ACP] prompt queued until durable turn settlement completes"
+                );
+                return Err(AcpError::TurnInProgress);
+            }
+        }
+
         // Re-hydrate uploaded image attachments (web / remote-workspace mode
         // sends empty-payload marker blocks with a `file://` uri into the
         // uploads root; see `prompt_hydration`). Deliberately placed AFTER
@@ -2299,9 +2330,7 @@ impl ConnectionManager {
                             );
                         } else {
                             crate::commands::conversations::emit_conversation_upsert(
-                                &emitter,
-                                &db.conn,
-                                cid,
+                                &emitter, &db.conn, cid,
                             )
                             .await;
                             tracing::info!(
@@ -2615,7 +2644,7 @@ impl ConnectionManager {
                 .clone()
         };
         cmd_tx
-            .send(ConnectionCommand::Cancel)
+            .send(ConnectionCommand::Cancel { reply: None })
             .await
             .map_err(|_| AcpError::ProcessExited)
     }
@@ -2625,6 +2654,8 @@ impl ConnectionManager {
         db: &DatabaseConnection,
         conn_id: &str,
     ) -> Result<AcpCancelResult, AcpError> {
+        let prompt_lock = self.clone_prompt_lock(conn_id).await?;
+        let _cancel_guard = prompt_lock.lock_owned().await;
         let (cmd_tx, state_arc) = {
             let connections = self.connections.lock().await;
             let conn = connections
@@ -2632,12 +2663,29 @@ impl ConnectionManager {
                 .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?;
             (conn.cmd_tx.clone(), conn.state.clone())
         };
-        let (conversation_id, external_session_id, client_message_id) = {
+        let (
+            conversation_id,
+            external_session_id,
+            client_message_id,
+            folder_id,
+            root_path,
+            turn_in_flight,
+        ) = {
             let state = state_arc.read().await;
             (
                 state.conversation_id,
                 state.external_id.clone(),
-                state.pending_user_message.as_ref().map(|item| item.message_id.clone()),
+                state
+                    .pending_user_message
+                    .as_ref()
+                    .map(|item| item.message_id.clone()),
+                state.folder_id,
+                state
+                    .working_dir
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+                state.turn_in_flight,
             )
         };
         let cancel_request_id = uuid::Uuid::new_v4().to_string();
@@ -2646,7 +2694,7 @@ impl ConnectionManager {
         let deadline_at = requested_at
             + chrono::Duration::from_std(timeout)
                 .unwrap_or_else(|_| chrono::Duration::seconds(DEFAULT_CANCEL_TIMEOUT_SECS as i64));
-        let transition = artifact_service::request_cancel(
+        let mut transition = artifact_service::request_cancel(
             db,
             conn_id,
             &cancel_request_id,
@@ -2655,6 +2703,57 @@ impl ConnectionManager {
         )
         .await
         .map_err(|error| AcpError::protocol(error.to_string()))?;
+        // Artifact capture is deliberately best-effort during prompt admission.
+        // If its initial INSERT lost a SQLite lock race, the agent can still be
+        // running with no turn row. Repair that observability gap before
+        // cancelling so a successful response can still prove all durable
+        // layers reached a terminal state.
+        if transition.disposition == artifact_service::CancelRequestDisposition::RunNotFound
+            && turn_in_flight
+        {
+            let conversation_id = conversation_id.ok_or_else(|| {
+                AcpError::protocol(
+                    "active ACP turn has no durable conversation binding".to_string(),
+                )
+            })?;
+            let run_id = uuid::Uuid::new_v4().to_string();
+            artifact_service::create_run(
+                db,
+                artifact_service::NewTurnRun {
+                    id: run_id.clone(),
+                    conversation_id,
+                    connection_id: conn_id.to_string(),
+                    client_message_id: client_message_id.clone(),
+                    prompt_fingerprint: None,
+                    folder_id,
+                    root_path,
+                    capture_incomplete: true,
+                    input_paths_json: "[]".to_string(),
+                    expectation_json: r#"{"publish_required":false,"expects_code_changes":false,"requested_paths":[]}"#.to_string(),
+                },
+            )
+            .await
+            .map_err(|error| AcpError::protocol(error.to_string()))?;
+            artifact_service::mark_prompt_accepted(db, &run_id)
+                .await
+                .map_err(|error| AcpError::protocol(error.to_string()))?;
+            transition = artifact_service::request_cancel(
+                db,
+                conn_id,
+                &cancel_request_id,
+                requested_at,
+                deadline_at,
+            )
+            .await
+            .map_err(|error| AcpError::protocol(error.to_string()))?;
+            tracing::warn!(
+                conversation_id,
+                turn_run_id = %run_id,
+                connection_id = conn_id,
+                transition_reason = "missing_artifact_run_repaired",
+                "[ACP][cancel] reconstructed missing durable turn before cancellation"
+            );
+        }
         let stored_request_id = transition
             .run
             .as_ref()
@@ -2684,7 +2783,14 @@ impl ConnectionManager {
         );
 
         if transition.disposition == artifact_service::CancelRequestDisposition::CancelRequested {
-            if cmd_tx.send(ConnectionCommand::Cancel).await.is_err() {
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            if cmd_tx
+                .send(ConnectionCommand::Cancel {
+                    reply: Some(ack_tx),
+                })
+                .await
+                .is_err()
+            {
                 if let Some(run_id) = run_id.as_deref() {
                     self.force_finish_cancelled_run(
                         db,
@@ -2693,33 +2799,70 @@ impl ConnectionManager {
                         "cancel_command_channel_closed",
                         true,
                     )
-                    .await;
+                    .await?;
                 }
                 return Err(AcpError::ProcessExited);
             }
 
-            let manager = self.clone_ref();
-            let db = db.clone();
-            let connection_id = conn_id.to_string();
-            let timeout_run_id = run_id.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(timeout).await;
-                if let Some(run_id) = timeout_run_id.as_deref() {
-                    manager
-                        .force_finish_cancelled_run(
-                            &db,
-                            &connection_id,
-                            run_id,
-                            "cancel_timeout",
-                            true,
-                        )
-                        .await;
-                }
-            });
+            let acknowledgment = tokio::time::timeout(Duration::from_secs(5), ack_rx).await;
+            let acknowledgment_error = match acknowledgment {
+                Ok(Ok(Ok(()))) => None,
+                Ok(Ok(Err(error))) => Some(format!(
+                    "ACP rejected the cancel notification before delivery: {error}"
+                )),
+                Ok(Err(_)) => Some(
+                    "ACP connection closed before acknowledging the cancel notification"
+                        .to_string(),
+                ),
+                Err(_) => Some(
+                    "ACP connection did not acknowledge the cancel notification within 5 seconds"
+                        .to_string(),
+                ),
+            };
+            if let Some(acknowledgment_error) = acknowledgment_error {
+                let manager = self.clone_ref();
+                let db = db.clone();
+                let connection_id = conn_id.to_string();
+                let timeout_run_id = run_id.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(timeout).await;
+                    if let Some(run_id) = timeout_run_id.as_deref() {
+                        if let Err(error) = manager
+                            .force_finish_cancelled_run(
+                                &db,
+                                &connection_id,
+                                run_id,
+                                "cancel_timeout",
+                                true,
+                            )
+                            .await
+                        {
+                            tracing::error!(
+                                turn_run_id = run_id,
+                                connection_id,
+                                error = %error,
+                                "[ACP][cancel] timeout finalization failed"
+                            );
+                        }
+                    }
+                });
+                return Err(AcpError::protocol(format!(
+                    "{acknowledgment_error}; targeted recovery is scheduled"
+                )));
+            }
+
+            if let Some(run_id) = run_id.as_deref() {
+                self.force_finish_cancelled_run(db, conn_id, run_id, "cancelled", false)
+                    .await?;
+            }
         }
 
         Ok(AcpCancelResult {
-            outcome: disposition.to_string(),
+            outcome: if disposition == "cancel_requested" {
+                "cancelled".to_string()
+            } else {
+                disposition.to_string()
+            },
             cancel_request_id: stored_request_id,
             turn_run_id: run_id,
             conversation_id,
@@ -2734,20 +2877,33 @@ impl ConnectionManager {
         run_id: &str,
         stop_reason: &str,
         disconnect: bool,
-    ) {
-        let Ok(Some(run)) = artifact_service::latest_run_for_connection(db, connection_id).await
+    ) -> Result<bool, AcpError> {
+        let Some(run) = conversation_turn_run::Entity::find_by_id(run_id.to_string())
+            .one(db)
+            .await
+            .map_err(|error| AcpError::protocol(error.to_string()))?
         else {
-            return;
+            return Err(AcpError::protocol(format!(
+                "turn run {run_id} was not found"
+            )));
         };
-        if run.id != run_id
-            || !matches!(
-                run.status,
-                crate::db::entities::conversation_turn_run::ConversationTurnRunStatus::Running
-                    | crate::db::entities::conversation_turn_run::ConversationTurnRunStatus::Cancelling
-            )
-        {
-            return;
+        if run.connection_id != connection_id {
+            return Err(AcpError::protocol(format!(
+                "turn run {run_id} belongs to another connection"
+            )));
         }
+
+        let finalized = artifact_service::finalize_turn_state(
+            db,
+            run_id,
+            ConversationTurnRunStatus::Cancelled,
+            stop_reason,
+            ConversationStatus::Cancelled,
+            true,
+            true,
+        )
+        .await
+        .map_err(|error| AcpError::protocol(error.to_string()))?;
 
         let state_and_emitter = self.get_state_and_emitter(connection_id).await;
         if let Some((state, emitter)) = state_and_emitter.as_ref() {
@@ -2758,16 +2914,18 @@ impl ConnectionManager {
                     snapshot.agent_type.to_string(),
                 )
             };
-            emit_with_state(
-                state,
-                emitter,
-                AcpEvent::TurnComplete {
-                    session_id,
-                    stop_reason: stop_reason.to_string(),
-                    agent_type,
-                },
-            )
-            .await;
+            if state.read().await.turn_in_flight {
+                emit_with_state(
+                    state,
+                    emitter,
+                    AcpEvent::TurnComplete {
+                        session_id,
+                        stop_reason: stop_reason.to_string(),
+                        agent_type,
+                    },
+                )
+                .await;
+            }
         }
 
         let capture_finished = self
@@ -2778,24 +2936,6 @@ impl ConnectionManager {
                 stop_reason.to_string(),
             )
             .await;
-        // A live capture owns finalization. If it was absent (restart, bus
-        // loss, already torn-down connection), close the durable row directly.
-        if !capture_finished {
-            let _ = artifact_service::force_finish_incomplete(
-                db,
-                run_id,
-                crate::db::entities::conversation_turn_run::ConversationTurnRunStatus::Cancelled,
-                stop_reason,
-            )
-            .await;
-        }
-
-        let _ = conversation_service::update_status(
-            db,
-            run.conversation_id,
-            ConversationStatus::Cancelled,
-        )
-        .await;
         if let Some((state, emitter)) = state_and_emitter {
             emit_with_state(
                 &state,
@@ -2815,6 +2955,7 @@ impl ConnectionManager {
             cancel_request_id = ?run.cancel_request_id,
             current_state = ?run.status,
             target_state = "cancelled",
+            durable_state_changed = finalized,
             forced_finalization = true,
             final_stop_reason = stop_reason,
             artifact_tracker_settled = capture_finished,
@@ -2824,6 +2965,7 @@ impl ConnectionManager {
         if disconnect {
             let _ = self.disconnect(connection_id).await;
         }
+        Ok(finalized)
     }
 
     /// Reconcile durable active runs against the process-local connection map.
@@ -2857,7 +2999,9 @@ impl ConnectionManager {
                 connections.get(&run.connection_id).map(|connection| {
                     (
                         Arc::clone(&connection.state),
-                        connection.child_pid.load(std::sync::atomic::Ordering::SeqCst),
+                        connection
+                            .child_pid
+                            .load(std::sync::atomic::Ordering::SeqCst),
                     )
                 })
             };
@@ -2871,26 +3015,57 @@ impl ConnectionManager {
                         state.status.clone(),
                         state.turn_in_flight,
                         state.last_activity_at,
+                        state.last_turn_progress_at,
+                        state.has_effective_live_text(),
+                        state.has_active_turn_interaction(),
+                        !state.active_tool_calls.is_empty()
+                            && state.active_tool_calls.values().all(|tool| {
+                                matches!(
+                                    tool.status,
+                                    crate::acp::session_state::ToolCallStatus::Completed
+                                        | crate::acp::session_state::ToolCallStatus::Failed
+                                )
+                            }),
                         child_pid,
                     ))
                 }
                 None => None,
             };
-            let deadline_expired = run.cancel_deadline_at.is_some_and(|deadline| deadline <= now);
+            let deadline_expired = run
+                .cancel_deadline_at
+                .is_some_and(|deadline| deadline <= now);
             let contradiction = conversation_status == "cancelled";
-            let live_invalid = live
-                .as_ref()
-                .is_some_and(|(status, turn_in_flight, _, _)| {
-                    !(*status == ConnectionStatus::Prompting && *turn_in_flight)
-                });
+            let live_invalid = live.as_ref().is_some_and(|(status, turn_in_flight, ..)| {
+                !(*status == ConnectionStatus::Prompting && *turn_in_flight)
+            });
             // TurnComplete clears the in-memory flag before the artifact
             // subscriber's 450ms filesystem grace and durable finish. Avoid
             // misclassifying that normal handoff as an orphaned run.
             let live_invalid_after_grace = live_invalid
-                && live.as_ref().is_some_and(|(_, _, last_activity, _)| {
+                && live.as_ref().is_some_and(|(_, _, last_activity, ..)| {
                     now.signed_duration_since(*last_activity).num_seconds()
                         >= RUN_TERMINAL_SETTLEMENT_GRACE_SECS
                 });
+            let stalled_terminal_tools = live.as_ref().is_some_and(
+                |(
+                    status,
+                    turn_in_flight,
+                    _,
+                    last_progress,
+                    has_live_text,
+                    has_interaction,
+                    all_tools_terminal,
+                    _,
+                )| {
+                    *status == ConnectionStatus::Prompting
+                        && *turn_in_flight
+                        && *all_tools_terminal
+                        && !*has_live_text
+                        && !*has_interaction
+                        && now.signed_duration_since(*last_progress)
+                            >= zombie_prompt_timeout_from_env()
+                },
+            );
 
             match run.status {
                 ConversationTurnRunStatus::Cancelling
@@ -2902,31 +3077,64 @@ impl ConnectionManager {
                         connection_id = run.connection_id,
                         current_state = "cancelling",
                         cancel_deadline = ?run.cancel_deadline_at,
-                        recent_heartbeat = ?live.as_ref().map(|(_, _, last, _)| last),
-                        process_id = ?live.as_ref().map(|(_, _, _, pid)| pid),
+                        recent_heartbeat = ?live.as_ref().map(|(_, _, last, ..)| last),
+                        recent_output = ?live.as_ref().map(|(_, _, _, progress, ..)| progress),
+                        process_id = ?live.as_ref().map(|tuple| tuple.7),
                         connection_exists = live.is_some(),
                         contradiction,
                         failure_classification = "stale_cancelling_run",
                         "[ACP][reconcile] forcing expired/orphaned cancellation"
                     );
-                    self.force_finish_cancelled_run(
-                        db,
-                        &run.connection_id,
-                        &run.id,
-                        if deadline_expired {
-                            "cancel_timeout"
-                        } else {
-                            "cancel_connection_missing"
-                        },
-                        live.is_some(),
-                    )
-                    .await;
+                    if let Err(error) = self
+                        .force_finish_cancelled_run(
+                            db,
+                            &run.connection_id,
+                            &run.id,
+                            if deadline_expired {
+                                "cancel_timeout"
+                            } else {
+                                "cancel_connection_missing"
+                            },
+                            live.is_some(),
+                        )
+                        .await
+                    {
+                        tracing::error!(
+                            conversation_id,
+                            turn_run_id = %run.id,
+                            connection_id = %run.connection_id,
+                            error = %error,
+                            "[ACP][reconcile] stale cancelling turn finalization failed"
+                        );
+                        continue;
+                    }
                     reconciled += 1;
                 }
                 ConversationTurnRunStatus::Running
-                    if live.is_none() || live_invalid_after_grace || contradiction =>
+                    if live.is_none()
+                        || live_invalid_after_grace
+                        || contradiction
+                        || stalled_terminal_tools =>
                 {
                     let state_and_emitter = self.get_state_and_emitter(&run.connection_id).await;
+                    // Persist the terminal state before broadcasting it. A
+                    // client observing TurnComplete can therefore immediately
+                    // re-query without ever seeing the old running row.
+                    let finalized = artifact_service::finalize_turn_state(
+                        db,
+                        &run.id,
+                        ConversationTurnRunStatus::Interrupted,
+                        if stalled_terminal_tools {
+                            "zombie_prompting_reconciled"
+                        } else {
+                            "stale_run_reconciled"
+                        },
+                        ConversationStatus::PendingReview,
+                        true,
+                        true,
+                    )
+                    .await
+                    .map_err(|error| AcpError::protocol(error.to_string()))?;
                     if let Some((state, emitter)) = state_and_emitter.as_ref() {
                         let (session_id, agent_type) = {
                             let snapshot = state.read().await;
@@ -2940,7 +3148,11 @@ impl ConnectionManager {
                             emitter,
                             AcpEvent::TurnComplete {
                                 session_id,
-                                stop_reason: "stale_run_reconciled".to_string(),
+                                stop_reason: if stalled_terminal_tools {
+                                    "zombie_prompting_reconciled".to_string()
+                                } else {
+                                    "stale_run_reconciled".to_string()
+                                },
                                 agent_type,
                             },
                         )
@@ -2954,28 +3166,13 @@ impl ConnectionManager {
                             "stale_run_reconciled".to_string(),
                         )
                         .await;
-                    if !capture_finished {
-                        let _ = artifact_service::force_finish_incomplete(
-                            db,
-                            &run.id,
-                            ConversationTurnRunStatus::Interrupted,
-                            "stale_run_reconciled",
-                        )
-                        .await;
-                    }
-                    let _ = conversation_service::update_status(
-                        db,
-                        conversation_id,
-                        ConversationStatus::Cancelled,
-                    )
-                    .await;
                     if let Some((state, emitter)) = state_and_emitter {
                         emit_with_state(
                             &state,
                             &emitter,
                             AcpEvent::ConversationStatusChanged {
                                 conversation_id,
-                                status: ConversationStatus::Cancelled,
+                                status: ConversationStatus::PendingReview,
                             },
                         )
                         .await;
@@ -2986,9 +3183,12 @@ impl ConnectionManager {
                         connection_id = run.connection_id,
                         current_state = "running",
                         target_state = "interrupted",
-                        recent_heartbeat = ?live.as_ref().map(|(_, _, last, _)| last),
+                        recent_heartbeat = ?live.as_ref().map(|(_, _, last, ..)| last),
+                        recent_output = ?live.as_ref().map(|(_, _, _, progress, ..)| progress),
                         connection_exists = live.is_some(),
                         contradiction,
+                        stalled_terminal_tools,
+                        durable_state_changed = finalized,
                         artifact_tracker_settled = capture_finished,
                         "[ACP][reconcile] stale running turn finalized"
                     );
@@ -3003,7 +3203,7 @@ impl ConnectionManager {
                         turn_run_id = run.id,
                         connection_id = run.connection_id,
                         current_state = ?run.status,
-                        recent_heartbeat = ?live.as_ref().map(|(_, _, last, _)| last),
+                        recent_heartbeat = ?live.as_ref().map(|(_, _, last, ..)| last),
                         connection_exists = live.is_some(),
                         "[ACP][reconcile] active run retained"
                     );
@@ -3462,6 +3662,93 @@ impl ConnectionManager {
         }
     }
 
+    /// User/API initiated disconnect with a durable lifecycle boundary. The
+    /// low-level [`disconnect`] remains available to cleanup paths that have
+    /// already settled their run; public endpoints must use this method so a
+    /// removed process cannot leave a `running` row behind.
+    pub async fn disconnect_reconciled(
+        &self,
+        db: &DatabaseConnection,
+        conn_id: &str,
+    ) -> Result<(), AcpError> {
+        if let Some(run) = artifact_service::latest_run_for_connection(db, conn_id)
+            .await
+            .map_err(|error| AcpError::protocol(error.to_string()))?
+            .filter(|run| {
+                matches!(
+                    run.status,
+                    ConversationTurnRunStatus::Running | ConversationTurnRunStatus::Cancelling
+                )
+            })
+        {
+            if run.status == ConversationTurnRunStatus::Cancelling {
+                self.force_finish_cancelled_run(
+                    db,
+                    conn_id,
+                    &run.id,
+                    "disconnect_during_cancel",
+                    false,
+                )
+                .await?;
+            } else {
+                artifact_service::finalize_turn_state(
+                    db,
+                    &run.id,
+                    ConversationTurnRunStatus::Interrupted,
+                    "connection_disconnected",
+                    ConversationStatus::Cancelled,
+                    true,
+                    true,
+                )
+                .await
+                .map_err(|error| AcpError::protocol(error.to_string()))?;
+                let state_and_emitter = self.get_state_and_emitter(conn_id).await;
+                if let Some((state, emitter)) = state_and_emitter.as_ref() {
+                    let snapshot = state.read().await;
+                    let session_id = snapshot.external_id.clone().unwrap_or_default();
+                    let agent_type = snapshot.agent_type.to_string();
+                    drop(snapshot);
+                    emit_with_state(
+                        state,
+                        emitter,
+                        AcpEvent::TurnComplete {
+                            session_id,
+                            stop_reason: "connection_disconnected".to_string(),
+                            agent_type,
+                        },
+                    )
+                    .await;
+                    emit_with_state(
+                        state,
+                        emitter,
+                        AcpEvent::ConversationStatusChanged {
+                            conversation_id: run.conversation_id,
+                            status: ConversationStatus::Cancelled,
+                        },
+                    )
+                    .await;
+                }
+                self.artifact_tracker
+                    .force_finish_turn(
+                        conn_id,
+                        ArtifactTurnFinishStatus::Interrupted,
+                        "connection_disconnected".to_string(),
+                    )
+                    .await;
+                tracing::warn!(
+                    conversation_id = run.conversation_id,
+                    turn_run_id = %run.id,
+                    connection_id = conn_id,
+                    old_state = ?run.status,
+                    new_state = "interrupted",
+                    transition_reason = "explicit_disconnect",
+                    "[ACP][disconnect] active turn settled before connection removal"
+                );
+            }
+        }
+        self.disconnect(conn_id).await
+    }
+
     /// Probe an agent for the modes / config_options it advertises on a fresh
     /// session, then immediately disconnect. The probe runs with
     /// `EventEmitter::Noop` so no event reaches the desktop webview, the
@@ -3596,13 +3883,7 @@ impl ConnectionManager {
         let grace_period = Duration::from_millis(500);
         let mut selectors_ready_at: Option<std::time::Instant> = None;
         loop {
-            let (
-                config_options,
-                modes,
-                available_commands,
-                prompt_capabilities,
-                selectors_ready,
-            ) = {
+            let (config_options, modes, available_commands, prompt_capabilities, selectors_ready) = {
                 let conns = self.connections.lock().await;
                 let conn = conns
                     .get(conn_id)
@@ -5292,12 +5573,8 @@ mod tests {
         conn_id: &str,
     ) -> (i32, String) {
         let folder_id = crate::db::test_helpers::seed_folder(db, "/tmp/cancel-manager").await;
-        let conversation_id = crate::db::test_helpers::seed_conversation(
-            db,
-            folder_id,
-            AgentType::Codex,
-        )
-        .await;
+        let conversation_id =
+            crate::db::test_helpers::seed_conversation(db, folder_id, AgentType::Codex).await;
         let run_id = format!("run-{conn_id}");
         artifact_service::create_run(
             &db.conn,
@@ -5332,24 +5609,76 @@ mod tests {
         let mut rx = insert_live_connection(&mgr, "cancel-once", AgentType::Codex, None).await;
         seed_live_turn_run(&db, &mgr, "cancel-once").await;
 
-        let (first, second) = tokio::join!(
-            mgr.cancel(&db.conn, "cancel-once"),
-            mgr.cancel(&db.conn, "cancel-once")
-        );
+        let cancel_manager = mgr.clone_ref();
+        let cancel_db = db.conn.clone();
+        let first =
+            tokio::spawn(async move { cancel_manager.cancel(&cancel_db, "cancel-once").await });
+        match rx.recv().await.expect("cancel reaches connection loop") {
+            ConnectionCommand::Cancel { reply } => {
+                reply
+                    .expect("API cancel has an acknowledgement")
+                    .send(Ok(()))
+                    .expect("cancel caller remains alive");
+            }
+            _ => panic!("expected cancel command"),
+        }
+        let first = first.await.unwrap();
+        let second = mgr.cancel(&db.conn, "cancel-once").await;
         let outcomes = [first.unwrap().outcome, second.unwrap().outcome];
         assert_eq!(
-            outcomes.iter().filter(|value| *value == "cancel_requested").count(),
+            outcomes
+                .iter()
+                .filter(|value| *value == "cancelled")
+                .count(),
             1
         );
         assert_eq!(
             outcomes
                 .iter()
-                .filter(|value| *value == "already_cancelling")
+                .filter(|value| *value == "already_finished")
                 .count(),
             1
         );
-        assert!(matches!(rx.try_recv(), Ok(ConnectionCommand::Cancel)));
         assert!(rx.try_recv().is_err(), "duplicate cancel reached the agent");
+    }
+
+    #[tokio::test]
+    async fn failed_cancel_delivery_is_not_reported_as_success() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let mgr = ConnectionManager::new();
+        let mut rx =
+            insert_live_connection(&mgr, "cancel-delivery-fails", AgentType::Codex, None).await;
+        let (_, run_id) = seed_live_turn_run(&db, &mgr, "cancel-delivery-fails").await;
+
+        let cancel_manager = mgr.clone_ref();
+        let cancel_db = db.conn.clone();
+        let cancel = tokio::spawn(async move {
+            cancel_manager
+                .cancel(&cancel_db, "cancel-delivery-fails")
+                .await
+        });
+        match rx.recv().await.expect("cancel reaches connection loop") {
+            ConnectionCommand::Cancel { reply } => {
+                reply
+                    .expect("API cancel has an acknowledgement")
+                    .send(Err("notification channel closed".to_string()))
+                    .expect("cancel caller remains alive");
+            }
+            _ => panic!("expected cancel command"),
+        }
+
+        let error = cancel
+            .await
+            .unwrap()
+            .expect_err("failed protocol delivery must not be a successful cancel");
+        assert!(error.to_string().contains("recovery is scheduled"));
+        let run = conversation_turn_run::Entity::find_by_id(run_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.status, ConversationTurnRunStatus::Cancelling);
+        assert!(run.completed_at.is_none());
     }
 
     #[tokio::test]
@@ -5382,8 +5711,7 @@ mod tests {
         let db = crate::db::test_helpers::fresh_in_memory_db().await;
         let mgr = ConnectionManager::new();
         let _rx = insert_live_connection(&mgr, "settlement-grace", AgentType::Codex, None).await;
-        let (conversation_id, run_id) =
-            seed_live_turn_run(&db, &mgr, "settlement-grace").await;
+        let (conversation_id, run_id) = seed_live_turn_run(&db, &mgr, "settlement-grace").await;
         let state = mgr.get_state("settlement-grace").await.unwrap();
         {
             let mut state = state.write().await;
@@ -5399,8 +5727,8 @@ mod tests {
             0,
             "the normal TurnComplete -> artifact settlement handoff gets a grace window"
         );
-        state.write().await.last_activity_at = chrono::Utc::now()
-            - chrono::Duration::seconds(RUN_TERMINAL_SETTLEMENT_GRACE_SECS + 1);
+        state.write().await.last_activity_at =
+            chrono::Utc::now() - chrono::Duration::seconds(RUN_TERMINAL_SETTLEMENT_GRACE_SECS + 1);
         assert_eq!(
             mgr.reconcile_conversation_runs(&db.conn, conversation_id)
                 .await
@@ -5445,19 +5773,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconciled_disconnect_cannot_leave_a_running_turn() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let mgr = ConnectionManager::new();
+        let _rx = insert_live_connection(&mgr, "disconnect-active", AgentType::Codex, None).await;
+        let (conversation_id, run_id) = seed_live_turn_run(&db, &mgr, "disconnect-active").await;
+
+        mgr.disconnect_reconciled(&db.conn, "disconnect-active")
+            .await
+            .unwrap();
+
+        let run = crate::db::entities::conversation_turn_run::Entity::find_by_id(run_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let conversation = crate::db::entities::conversation::Entity::find_by_id(conversation_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            run.status,
+            crate::db::entities::conversation_turn_run::ConversationTurnRunStatus::Interrupted
+        );
+        assert_eq!(run.settlement_status, "settled_incomplete");
+        assert_eq!(
+            conversation.status,
+            crate::db::entities::conversation::ConversationStatus::Cancelled
+        );
+        assert!(mgr.get_state("disconnect-active").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn reconciliation_closes_blank_zombie_after_all_tools_finished() {
+        use crate::acp::session_state::{
+            LiveContentBlock, LiveMessage, ToolCallState, ToolCallStatus, ToolKind,
+        };
+        use crate::models::message::MessageRole;
+
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let mgr = ConnectionManager::new();
+        let _rx = insert_live_connection(&mgr, "blank-zombie", AgentType::Codex, None).await;
+        let (conversation_id, run_id) = seed_live_turn_run(&db, &mgr, "blank-zombie").await;
+        let state = mgr.get_state("blank-zombie").await.unwrap();
+        {
+            let mut state = state.write().await;
+            state.last_turn_progress_at = chrono::Utc::now() - chrono::Duration::hours(1);
+            state.live_message = Some(LiveMessage {
+                id: "blank-live".into(),
+                role: MessageRole::Assistant,
+                content: vec![LiveContentBlock::Text {
+                    text: " \n\t".into(),
+                    parent_tool_use_id: None,
+                }],
+                started_at: chrono::Utc::now(),
+            });
+            state.active_tool_calls.insert(
+                "finished-tool".into(),
+                ToolCallState {
+                    id: "finished-tool".into(),
+                    kind: ToolKind::Execute,
+                    label: "finished".into(),
+                    status: ToolCallStatus::Completed,
+                    input: None,
+                    output: None,
+                    content: None,
+                    locations: None,
+                    meta: None,
+                    images: Vec::new(),
+                    raw_input_chunks: Vec::new(),
+                },
+            );
+        }
+
+        assert_eq!(
+            mgr.reconcile_conversation_runs(&db.conn, conversation_id)
+                .await
+                .unwrap(),
+            1
+        );
+        let run = crate::db::entities::conversation_turn_run::Entity::find_by_id(run_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            run.status,
+            crate::db::entities::conversation_turn_run::ConversationTurnRunStatus::Interrupted
+        );
+        assert_eq!(
+            run.stop_reason.as_deref(),
+            Some("zombie_prompting_reconciled")
+        );
+        assert!(mgr.get_state("blank-zombie").await.is_none());
+    }
+
+    #[tokio::test]
     async fn cancel_timeout_finalizes_only_its_connection_and_settles_once() {
         let db = crate::db::test_helpers::fresh_in_memory_db().await;
         let mgr = ConnectionManager::new();
-        let mut target_rx =
+        let _target_rx =
             insert_live_connection(&mgr, "timeout-target", AgentType::Codex, None).await;
         let _neighbor_rx =
             insert_live_connection(&mgr, "timeout-neighbor", AgentType::Codex, None).await;
         let (_, target_run_id) = seed_live_turn_run(&db, &mgr, "timeout-target").await;
         let (_, neighbor_run_id) = seed_live_turn_run(&db, &mgr, "timeout-neighbor").await;
 
-        let result = mgr.cancel(&db.conn, "timeout-target").await.unwrap();
-        assert_eq!(result.outcome, "cancel_requested");
-        assert!(matches!(target_rx.try_recv(), Ok(ConnectionCommand::Cancel)));
         tokio::time::timeout(
             Duration::from_secs(2),
             mgr.force_finish_cancelled_run(
@@ -5469,7 +5891,8 @@ mod tests {
             ),
         )
         .await
-        .expect("targeted cancellation finalization must not block");
+        .expect("targeted cancellation finalization must not block")
+        .expect("targeted finalization succeeds");
         // A repeated deadline/reconciliation race is a no-op.
         mgr.force_finish_cancelled_run(
             &db.conn,
@@ -5478,7 +5901,8 @@ mod tests {
             "cancel_timeout",
             true,
         )
-        .await;
+        .await
+        .expect("duplicate finalization is idempotent");
 
         let target = crate::db::entities::conversation_turn_run::Entity::find_by_id(target_run_id)
             .one(&db.conn)
@@ -5521,8 +5945,9 @@ mod tests {
         mut rx: tokio::sync::mpsc::Receiver<crate::acp::connection::ConnectionCommand>,
         expected: GoalControlAction,
         landed: bool,
-    ) -> tokio::task::JoinHandle<tokio::sync::mpsc::Receiver<crate::acp::connection::ConnectionCommand>>
-    {
+    ) -> tokio::task::JoinHandle<
+        tokio::sync::mpsc::Receiver<crate::acp::connection::ConnectionCommand>,
+    > {
         tokio::spawn(async move {
             match rx.recv().await.expect("goal control enqueued") {
                 ConnectionCommand::GoalControl { action, reply } => {
@@ -5559,7 +5984,10 @@ mod tests {
             .unwrap();
 
         let mut rx = loop_stub.await.unwrap();
-        assert!(matches!(rx.try_recv(), Ok(ConnectionCommand::Cancel)));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ConnectionCommand::Cancel { .. })
+        ));
         assert!(rx.try_recv().is_err(), "nothing else is enqueued");
     }
 
@@ -5607,7 +6035,10 @@ mod tests {
             .unwrap();
 
         let mut rx = loop_stub.await.unwrap();
-        assert!(matches!(rx.try_recv(), Ok(ConnectionCommand::Cancel)));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ConnectionCommand::Cancel { .. })
+        ));
         assert!(rx.try_recv().is_err(), "nothing else is enqueued");
     }
 
@@ -5622,7 +6053,7 @@ mod tests {
         let mgr = ConnectionManager::new();
         let mut rx = insert_live_connection(&mgr, "c-goal-paused", AgentType::Codex, None).await;
         mark_prompting(&mgr, "c-goal-paused").await; // the user's own prompt
-        // `goal_active` stays false: the last snapshot was `paused`.
+                                                     // `goal_active` stays false: the last snapshot was `paused`.
 
         mgr.goal_control(&db.conn, "c-goal-paused", GoalControlAction::Clear)
             .await

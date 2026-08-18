@@ -8,8 +8,8 @@ use crate::acp::error::AcpError;
 use crate::acp::opencode_plugins::PluginCheckSummary;
 use crate::acp::preflight::PreflightResult;
 use crate::acp::types::{
-    AcpAgentInfo, AcpAgentStatus, AgentDiagnosticsReport, AgentSkillContent, AgentSkillLayout,
-    AcpCancelResult, AgentSkillScope, AgentSkillsListResult, ConnectionInfo, ForkResultInfo,
+    AcpAgentInfo, AcpAgentStatus, AcpCancelResult, AgentDiagnosticsReport, AgentSkillContent,
+    AgentSkillLayout, AgentSkillScope, AgentSkillsListResult, ConnectionInfo, ForkResultInfo,
     RestoredConversationConnectionInfo, SteerResult,
 };
 use crate::app_error::{AppCommandError, AppErrorCode};
@@ -163,7 +163,7 @@ pub async fn acp_disconnect(
 ) -> Result<Json<()>, AppCommandError> {
     let manager = &state.connection_manager;
     manager
-        .disconnect(&params.connection_id)
+        .disconnect_reconciled(&state.db.conn, &params.connection_id)
         .await
         .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
     Ok(Json(()))
