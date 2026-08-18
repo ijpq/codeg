@@ -53,7 +53,6 @@ pub async fn turn_reconciliation_task(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ticker.tick().await;
     loop {
-        ticker.tick().await;
         match manager.reconcile_all_runs(&db).await {
             Ok(0) => {}
             Ok(count) => tracing::warn!(
@@ -65,6 +64,7 @@ pub async fn turn_reconciliation_task(
                 "[ACP][reconcile] periodic turn reconciliation failed"
             ),
         }
+        ticker.tick().await;
     }
 }
 

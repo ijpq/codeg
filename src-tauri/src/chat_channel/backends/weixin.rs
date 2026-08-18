@@ -3,6 +3,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use aes_gcm::aes::{
+    cipher::{BlockDecrypt, KeyInit},
+    Aes128,
+};
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use rand::Rng;
@@ -18,6 +22,7 @@ const ILINK_BASE_URL: &str = "https://ilinkai.weixin.qq.com";
 const ILINK_CHANNEL_VERSION: &str = "1.0.2";
 const MAX_SEEN_INBOUND_MESSAGES: usize = 1024;
 const MAX_SEND_RETRIES: usize = 3;
+const WEIXIN_MEDIA_MAX_BYTES: usize = 100 * 1024 * 1024;
 
 /// Shared HTTP client for QR code auth requests (avoids re-creating TLS state).
 fn qr_client() -> reqwest::Client {
@@ -95,6 +100,210 @@ fn weixin_message_key(message: &serde_json::Value) -> Option<String> {
                 .map(|id| format!("{field}:{id}"))
                 .or_else(|| value.as_i64().map(|id| format!("{field}:{id}")))
         })
+}
+
+fn parse_media_key(item: &serde_json::Value, media: &serde_json::Value) -> Option<[u8; 16]> {
+    let decoded = if let Some(hex) = item.get("aeskey").and_then(|value| value.as_str()) {
+        decode_hex_key(hex)?
+    } else {
+        let encoded = media.get("aes_key")?.as_str()?;
+        let decoded = B64.decode(encoded).ok()?;
+        if decoded.len() == 16 {
+            decoded
+        } else if decoded.len() == 32 {
+            decode_hex_key(std::str::from_utf8(&decoded).ok()?)?
+        } else {
+            return None;
+        }
+    };
+    decoded.try_into().ok()
+}
+
+fn decode_hex_key(value: &str) -> Option<Vec<u8>> {
+    if value.len() != 32 {
+        return None;
+    }
+    (0..value.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&value[index..index + 2], 16).ok())
+        .collect()
+}
+
+fn decrypt_media(mut bytes: Vec<u8>, key: [u8; 16]) -> Result<Vec<u8>, ChatChannelError> {
+    if bytes.is_empty() || !bytes.len().is_multiple_of(16) {
+        return Err(ChatChannelError::ConnectionFailed(
+            "Weixin media ciphertext has invalid block length".into(),
+        ));
+    }
+    let cipher = Aes128::new_from_slice(&key).map_err(|_| {
+        ChatChannelError::ConnectionFailed("Weixin media AES key is invalid".into())
+    })?;
+    for block in bytes.chunks_exact_mut(16) {
+        cipher.decrypt_block(block.into());
+    }
+    let padding = *bytes.last().unwrap_or(&0) as usize;
+    if padding == 0
+        || padding > 16
+        || padding > bytes.len()
+        || !bytes[bytes.len() - padding..]
+            .iter()
+            .all(|byte| *byte as usize == padding)
+    {
+        return Err(ChatChannelError::ConnectionFailed(
+            "Weixin media has invalid PKCS7 padding".into(),
+        ));
+    }
+    bytes.truncate(bytes.len() - padding);
+    Ok(bytes)
+}
+
+fn media_mime(filename: &str, image: bool) -> String {
+    let extension = std::path::Path::new(filename)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "pdf" => "application/pdf",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "txt" | "md" => "text/plain",
+        _ if image => "image/jpeg",
+        _ => "application/octet-stream",
+    }
+    .to_string()
+}
+
+async fn download_inbound_media(
+    client: &reqwest::Client,
+    base_url: &str,
+    message_key: &str,
+    item_index: usize,
+    item: &serde_json::Value,
+) -> Result<Option<crate::acp::types::PromptInputBlock>, ChatChannelError> {
+    let item_type = item.get("type").and_then(|value| value.as_i64());
+    let (payload, is_image, filename) = match item_type {
+        Some(2) => (
+            item.get("image_item"),
+            true,
+            format!("image-{}.jpg", item_index + 1),
+        ),
+        Some(4) => {
+            let payload = item.get("file_item");
+            let filename = payload
+                .and_then(|value| value.get("file_name"))
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.is_empty())
+                .unwrap_or("attachment.bin")
+                .to_string();
+            (payload, false, filename)
+        }
+        _ => return Ok(None),
+    };
+    let Some(payload) = payload else {
+        return Ok(None);
+    };
+    let Some(media) = payload.get("media") else {
+        return Ok(None);
+    };
+    let url = if let Some(full_url) = media
+        .get("full_url")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+    {
+        full_url.to_string()
+    } else if let Some(query) = media
+        .get("encrypted_query_param")
+        .or_else(|| media.get("encrypt_query_param"))
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+    {
+        format!(
+            "{base_url}/download?encrypted_query_param={}",
+            urlencoding::encode(query)
+        )
+    } else {
+        return Ok(None);
+    };
+    let response = client.get(url).send().await.map_err(|error| {
+        ChatChannelError::ConnectionFailed(format!("Weixin media download failed: {error}"))
+    })?;
+    if !response.status().is_success() {
+        return Err(ChatChannelError::ConnectionFailed(format!(
+            "Weixin media download returned HTTP {}",
+            response.status()
+        )));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > WEIXIN_MEDIA_MAX_BYTES as u64)
+    {
+        return Err(ChatChannelError::ConnectionFailed(
+            "Weixin media exceeds the 100 MiB limit".into(),
+        ));
+    }
+    let mut bytes = response
+        .bytes()
+        .await
+        .map_err(|error| {
+            ChatChannelError::ConnectionFailed(format!("Weixin media read failed: {error}"))
+        })?
+        .to_vec();
+    if bytes.len() > WEIXIN_MEDIA_MAX_BYTES {
+        return Err(ChatChannelError::ConnectionFailed(
+            "Weixin media exceeds the 100 MiB limit".into(),
+        ));
+    }
+    if let Some(key) = parse_media_key(payload, media) {
+        bytes = decrypt_media(bytes, key)?;
+    } else if !is_image {
+        return Err(ChatChannelError::ConnectionFailed(
+            "Weixin file is missing its media decryption key".into(),
+        ));
+    }
+    let safe_key = message_key
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect::<String>();
+    let safe_name = std::path::Path::new(&filename)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("attachment.bin");
+    let directory = crate::paths::codeg_uploads_root()
+        .join("chat-channel")
+        .join("weixin")
+        .join(safe_key);
+    tokio::fs::create_dir_all(&directory)
+        .await
+        .map_err(|error| {
+            ChatChannelError::ConnectionFailed(format!("Weixin media directory failed: {error}"))
+        })?;
+    let path = directory.join(format!("{:02}-{safe_name}", item_index + 1));
+    tokio::fs::write(&path, bytes).await.map_err(|error| {
+        ChatChannelError::ConnectionFailed(format!("Weixin media save failed: {error}"))
+    })?;
+    let uri = reqwest::Url::from_file_path(&path)
+        .map_err(|_| ChatChannelError::ConnectionFailed("Invalid Weixin media path".into()))?
+        .to_string();
+    let mime_type = media_mime(safe_name, is_image);
+    Ok(Some(if is_image {
+        crate::acp::types::PromptInputBlock::Image {
+            data: String::new(),
+            mime_type,
+            uri: Some(uri),
+        }
+    } else {
+        crate::acp::types::PromptInputBlock::ResourceLink {
+            uri,
+            name: safe_name.to_string(),
+            mime_type: Some(mime_type),
+            description: Some("Weixin inbound attachment".to_string()),
+        }
+    }))
 }
 
 // ── QR code auth functions (called before backend exists) ──
@@ -800,7 +1009,11 @@ impl ChatChannelBackend for WeixinBackend {
                                         continue;
                                     }
 
-                                    if let Some(message_key) = weixin_message_key(msg) {
+                                    let message_key =
+                                        weixin_message_key(msg).unwrap_or_else(|| {
+                                            format!("generated:{}", uuid::Uuid::new_v4())
+                                        });
+                                    {
                                         if !seen_message_keys.insert(message_key.clone()) {
                                             tracing::info!(
                                                 stage = "weixin_inbound_duplicate_ignored",
@@ -809,7 +1022,7 @@ impl ChatChannelBackend for WeixinBackend {
                                             );
                                             continue;
                                         }
-                                        seen_message_order.push_back(message_key);
+                                        seen_message_order.push_back(message_key.clone());
                                         if seen_message_order.len() > MAX_SEEN_INBOUND_MESSAGES {
                                             if let Some(expired) = seen_message_order.pop_front() {
                                                 seen_message_keys.remove(&expired);
@@ -817,32 +1030,79 @@ impl ChatChannelBackend for WeixinBackend {
                                         }
                                     }
 
-                                    // Extract text from type=1 (text) or type=3 (voice-to-text)
+                                    // Preserve every text/voice transcript and
+                                    // download image/file items before dispatch,
+                                    // so a mixed message becomes one ACP turn.
                                     let text = msg
                                         .get("item_list")
                                         .and_then(|v| v.as_array())
-                                        .and_then(|items| {
-                                            items.iter().find_map(|item| {
-                                                let t =
-                                                    item.get("type").and_then(|v| v.as_i64())?;
-                                                match t {
-                                                    1 => item
-                                                        .pointer("/text_item/text")
-                                                        .and_then(|v| v.as_str()),
-                                                    3 => item
-                                                        .pointer("/voice_item/text")
-                                                        .and_then(|v| v.as_str()),
-                                                    _ => None,
-                                                }
-                                            })
-                                        });
-
-                                    let text = match text {
-                                        Some(t) if !t.is_empty() => t,
-                                        _ => {
-                                            tracing::warn!("[Weixin] skipped non-text message");
-                                            continue;
+                                        .map(|items| {
+                                            items
+                                                .iter()
+                                                .filter_map(|item| {
+                                                    let t = item
+                                                        .get("type")
+                                                        .and_then(|v| v.as_i64())?;
+                                                    match t {
+                                                        1 => item
+                                                            .pointer("/text_item/text")
+                                                            .and_then(|v| v.as_str()),
+                                                        3 => item
+                                                            .pointer("/voice_item/text")
+                                                            .and_then(|v| v.as_str()),
+                                                        _ => None,
+                                                    }
+                                                })
+                                                .filter(|text| !text.trim().is_empty())
+                                                .collect::<Vec<_>>()
+                                                .join("\n")
+                                        })
+                                        .unwrap_or_default();
+                                    let mut prompt_blocks = Vec::new();
+                                    if !text.trim().is_empty() {
+                                        prompt_blocks.push(
+                                            crate::acp::types::PromptInputBlock::Text {
+                                                text: text.clone(),
+                                            },
+                                        );
+                                    }
+                                    if let Some(items) =
+                                        msg.get("item_list").and_then(|value| value.as_array())
+                                    {
+                                        for (index, item) in items.iter().enumerate() {
+                                            match download_inbound_media(
+                                                &client,
+                                                &base_url,
+                                                &message_key,
+                                                index,
+                                                item,
+                                            )
+                                            .await
+                                            {
+                                                Ok(Some(block)) => prompt_blocks.push(block),
+                                                Ok(None) => {}
+                                                Err(error) => tracing::error!(
+                                                    stage = "weixin_inbound_media_failed",
+                                                    channel_id,
+                                                    item_index = index,
+                                                    error = %error,
+                                                    "[Weixin] inbound media could not be retained"
+                                                ),
+                                            }
                                         }
+                                    }
+                                    if prompt_blocks.is_empty() {
+                                        tracing::warn!(
+                                            stage = "weixin_inbound_empty_dropped",
+                                            channel_id,
+                                            "[Weixin] skipped unsupported or failed empty message"
+                                        );
+                                        continue;
+                                    }
+                                    let command_text = if text.trim().is_empty() {
+                                        "请处理这条微信消息中的附件。".to_string()
+                                    } else {
+                                        text.clone()
                                     };
 
                                     let from_user_id = msg
@@ -879,14 +1139,16 @@ impl ChatChannelBackend for WeixinBackend {
                                     tracing::debug!(
                                         channel_id,
                                         sender_key = %sender_log_key(from_user_id),
-                                        message_chars = text.chars().count(),
+                                        message_chars = command_text.chars().count(),
+                                        attachment_count = prompt_blocks.len().saturating_sub((!text.trim().is_empty()) as usize),
                                         "[Weixin] dispatching inbound message"
                                     );
                                     let send_result = command_tx
                                         .send(IncomingCommand {
                                             channel_id,
                                             sender_id: from_user_id.to_string(),
-                                            command_text: text.to_string(),
+                                            command_text,
+                                            prompt_blocks,
                                             callback_data: None,
                                             target: ChannelMessageTarget {
                                                 channel_id,
@@ -1181,6 +1443,40 @@ mod tests {
             weixin_message_key(&serde_json::json!({ "text": "same text" })),
             None,
             "identical user text without a provider id must remain a legitimate repeat"
+        );
+    }
+
+    #[test]
+    fn encrypted_media_key_and_pkcs7_payload_round_trip() {
+        use aes_gcm::aes::cipher::BlockEncrypt;
+
+        let key = *b"0123456789abcdef";
+        let plaintext = b"mixed image and file";
+        let padding = 16 - (plaintext.len() % 16);
+        let mut ciphertext = plaintext.to_vec();
+        ciphertext.extend(std::iter::repeat_n(padding as u8, padding));
+        let cipher = Aes128::new_from_slice(&key).unwrap();
+        for block in ciphertext.chunks_exact_mut(16) {
+            cipher.encrypt_block(block.into());
+        }
+
+        let payload = serde_json::json!({
+            "aes_key": B64.encode(key),
+        });
+        let parsed = parse_media_key(&serde_json::json!({}), &payload).unwrap();
+        assert_eq!(parsed, key);
+        assert_eq!(decrypt_media(ciphertext, parsed).unwrap(), plaintext);
+
+        let hex_key = key
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(
+            parse_media_key(
+                &serde_json::json!({ "aeskey": hex_key }),
+                &serde_json::json!({})
+            ),
+            Some(key)
         );
     }
 }

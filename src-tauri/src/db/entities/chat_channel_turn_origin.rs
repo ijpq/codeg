@@ -13,7 +13,12 @@ pub struct Model {
     pub client_message_id: String,
     pub turn_run_id: Option<String>,
     pub target_json: String,
+    /// Serialized `Vec<PromptInputBlock>` retained until dispatch succeeds.
+    /// This is the durable inbound queue used across ACP/CodeG restarts.
+    pub prompt_json: Option<String>,
     pub status: String,
+    pub attempt_count: i32,
+    pub last_error: Option<String>,
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
     pub final_captured_at: Option<DateTimeUtc>,

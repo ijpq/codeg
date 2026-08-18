@@ -23,10 +23,10 @@ use crate::acp::types::{
 };
 #[cfg(feature = "tauri-runtime")]
 use crate::acp::types::{ConnectionInfo, ForkResultInfo, PromptInputBlock};
+use crate::db::service::model_provider_service;
 use crate::db::service::{
     agent_setting_service, conversation_branch_service, conversation_service, folder_service,
 };
-use crate::db::service::model_provider_service;
 use crate::db::AppDatabase;
 use crate::models::agent::AgentType;
 use crate::web::event_bridge::EventEmitter;
@@ -2344,7 +2344,12 @@ async fn install_npm_global_package_streaming(
         format!("$ npm install -g {NPM_INCLUDE_OPTIONAL} {package}"),
     );
 
-    let mut args = vec!["install", "-g", NPM_INCLUDE_OPTIONAL, NPM_FOREGROUND_SCRIPTS];
+    let mut args = vec![
+        "install",
+        "-g",
+        NPM_INCLUDE_OPTIONAL,
+        NPM_FOREGROUND_SCRIPTS,
+    ];
     if run_scripts {
         args.push(NPM_RUN_SCRIPTS_OVERRIDE);
     }
@@ -2463,7 +2468,12 @@ async fn install_npm_to_user_prefix_streaming(
         ),
     );
 
-    let mut args = vec!["install", "-g", NPM_INCLUDE_OPTIONAL, NPM_FOREGROUND_SCRIPTS];
+    let mut args = vec![
+        "install",
+        "-g",
+        NPM_INCLUDE_OPTIONAL,
+        NPM_FOREGROUND_SCRIPTS,
+    ];
     if run_scripts {
         args.push(NPM_RUN_SCRIPTS_OVERRIDE);
     }
@@ -5639,7 +5649,9 @@ pub(crate) async fn acp_pi_project_trust_state_core(
 /// Record that the user has seen and kept an existing trust grant, so the launch
 /// gate stops blocking this folder. Writes only codeg's own record — pi's
 /// `trust.json` is untouched, because the grant itself is not changing.
-pub(crate) async fn acp_pi_acknowledge_project_trust_core(workspace: String) -> Result<(), AcpError> {
+pub(crate) async fn acp_pi_acknowledge_project_trust_core(
+    workspace: String,
+) -> Result<(), AcpError> {
     tokio::task::spawn_blocking(move || {
         pi_set_trust_acknowledged_at(&pi_trust_ack_path(), Path::new(&workspace), true)
     })
@@ -10013,6 +10025,45 @@ pub(crate) async fn acp_restore_conversation_core(
         }
     };
 
+    // Activation is the publication boundary. Verify both lookup APIs against
+    // the freshly-bound state before returning HTTP 200; otherwise callers can
+    // receive a connection id that the next immediate find/snapshot request
+    // cannot resolve (the field failure that left the browser on its old id).
+    let published_connection = manager
+        .find_connection_by_conversation_id(conversation_id)
+        .await;
+    let published_state = manager.get_state(&spawned.connection_id).await;
+    let publication_valid = if let Some(state) = published_state.as_ref() {
+        let state = state.read().await;
+        published_connection.as_deref() == Some(spawned.connection_id.as_str())
+            && state.conversation_id == Some(conversation_id)
+            && state.external_id.as_deref() == Some(external_session_id.as_str())
+            && state.selectors_ready
+            && state.status == ConnectionStatus::Connected
+            && !state.turn_in_flight
+    } else {
+        false
+    };
+    if !publication_valid {
+        if !spawned.reused_existing {
+            let _ = manager.disconnect(&spawned.connection_id).await;
+        }
+        tracing::error!(
+            conversation_id,
+            external_session_id = %external_session_id,
+            new_connection_id = %spawned.connection_id,
+            published_connection_id = ?published_connection,
+            stage = "restore_publication_verification_failed",
+            binding_updated = false,
+            "[ACP][restore] activation did not produce a stable queryable mapping"
+        );
+        return Err(AcpError::protocol(
+            "restored connection could not be published as a stable conversation binding"
+                .to_string(),
+        ));
+    }
+    manager.touch(&spawned.connection_id).await;
+
     tracing::info!(
         conversation_id,
         external_session_id = %external_session_id,
@@ -10187,9 +10238,7 @@ pub async fn acp_goal_control(
     db: State<'_, AppDatabase>,
     manager: State<'_, ConnectionManager>,
 ) -> Result<(), AcpError> {
-    manager
-        .goal_control(&db.conn, &connection_id, action)
-        .await
+    manager.goal_control(&db.conn, &connection_id, action).await
 }
 
 /// Spawn a transient ACP connection for `agent_type` with a silent emitter,
@@ -10305,8 +10354,11 @@ pub async fn acp_answer_plan_approval(
 pub async fn acp_disconnect(
     connection_id: String,
     manager: State<'_, ConnectionManager>,
+    db: State<'_, AppDatabase>,
 ) -> Result<(), AcpError> {
-    manager.disconnect(&connection_id).await
+    manager
+        .disconnect_reconciled(&db.conn, &connection_id)
+        .await
 }
 
 #[cfg(feature = "tauri-runtime")]
@@ -14095,7 +14147,10 @@ mod tests {
 
         let after = read_json_object_or_empty(&trust);
         assert_eq!(after.get(&canonical_key(&ws)), None);
-        assert_eq!(after.get("/some/other"), Some(&serde_json::Value::Bool(true)));
+        assert_eq!(
+            after.get("/some/other"),
+            Some(&serde_json::Value::Bool(true))
+        );
         assert_eq!(after.get("/denied"), Some(&serde_json::Value::Bool(false)));
     }
 
@@ -14409,10 +14464,7 @@ mod tests {
     // composer sends is clamped straight back and the picker looks broken. These
     // pin the shape pi actually reads.
 
-    fn pi_reasoning_spec(
-        reasoning: bool,
-        map: &[(&str, Option<&str>)],
-    ) -> PiModelReasoningSpec {
+    fn pi_reasoning_spec(reasoning: bool, map: &[(&str, Option<&str>)]) -> PiModelReasoningSpec {
         PiModelReasoningSpec {
             reasoning,
             thinking_level_map: map
@@ -14439,7 +14491,11 @@ mod tests {
             "gpt-5.6-sol",
             Some(&pi_reasoning_spec(
                 true,
-                &[("off", Some("none")), ("minimal", None), ("xhigh", Some("xhigh"))],
+                &[
+                    ("off", Some("none")),
+                    ("minimal", None),
+                    ("xhigh", Some("xhigh")),
+                ],
             )),
         );
 
@@ -14583,7 +14639,11 @@ mod tests {
             "gpt-5.6-sol",
             Some(&pi_reasoning_spec(
                 true,
-                &[("off", Some("none")), ("minimal", None), ("low", Some("LOW"))],
+                &[
+                    ("off", Some("none")),
+                    ("minimal", None),
+                    ("low", Some("LOW")),
+                ],
             )),
         );
 
@@ -14592,7 +14652,10 @@ mod tests {
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "gpt-5.6-sol");
         assert_eq!(models[0].reasoning, Some(true));
-        assert_eq!(models[0].thinking_level_map["off"], Some("none".to_string()));
+        assert_eq!(
+            models[0].thinking_level_map["off"],
+            Some("none".to_string())
+        );
         assert_eq!(models[0].thinking_level_map["minimal"], None);
         assert_eq!(models[0].thinking_level_map["low"], Some("LOW".to_string()));
     }
@@ -15189,7 +15252,9 @@ wire_api = "chat"
     }
 
     fn auth_flag_of(table: &toml::map::Map<String, toml::Value>) -> Option<bool> {
-        table.get("requires_openai_auth").and_then(toml::Value::as_bool)
+        table
+            .get("requires_openai_auth")
+            .and_then(toml::Value::as_bool)
     }
 
     #[test]
@@ -15209,9 +15274,8 @@ wire_api = "chat"
         assert_eq!(auth_flag_of(&explicit_false), Some(false));
 
         // An explicit true is left alone rather than rewritten.
-        let mut explicit_true = provider_table_of(
-            "[model_providers.codeg]\nrequires_openai_auth = true\n",
-        );
+        let mut explicit_true =
+            provider_table_of("[model_providers.codeg]\nrequires_openai_auth = true\n");
         ensure_codex_provider_auth_default(&mut explicit_true);
         assert_eq!(auth_flag_of(&explicit_true), Some(true));
     }
@@ -17340,8 +17404,9 @@ wire_api = "chat"
                         || std::path::Path::new(first)
                             .file_name()
                             .and_then(|n| n.to_str())
-                            .is_some_and(|n| n.trim_end_matches(".cmd").trim_end_matches(".exe")
-                                == "hermes"),
+                            .is_some_and(
+                                |n| n.trim_end_matches(".cmd").trim_end_matches(".exe") == "hermes"
+                            ),
                     "unexpected launcher: {argv:?}"
                 );
             }
