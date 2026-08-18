@@ -16,6 +16,7 @@ use super::types::{
     WeixinPushMode,
 };
 use crate::acp::manager::ConnectionManager;
+use crate::acp::types::PromptInputBlock;
 use crate::db::service::{app_metadata_service, chat_channel_message_log_service};
 use crate::web::event_bridge::EventEmitter;
 
@@ -71,6 +72,13 @@ pub fn spawn_command_dispatcher(
 
         while let Some(cmd) = command_rx.recv().await {
             let text = cmd.command_text.trim();
+            let prompt_blocks = if cmd.prompt_blocks.is_empty() {
+                vec![PromptInputBlock::Text {
+                    text: text.to_string(),
+                }]
+            } else {
+                cmd.prompt_blocks.clone()
+            };
             let origin_message_id = super::final_delivery::stable_origin_message_id(&cmd.metadata);
             let push_mode = super::final_delivery::push_mode(&db_conn, cmd.channel_id).await;
             let is_final_weixin_mode = push_mode != WeixinPushMode::Debug;
@@ -135,6 +143,7 @@ pub fn spawn_command_dispatcher(
                 cmd.channel_id,
                 &cmd.sender_id,
                 &cmd.target,
+                &prompt_blocks,
                 cmd.callback_data.as_deref(),
                 config.lang,
                 Some(&origin_message_id),
@@ -260,6 +269,9 @@ async fn dispatch_command(
     callback_data: Option<&str>,
     lang: Lang,
 ) -> DispatchResponse {
+    let prompt_blocks = vec![PromptInputBlock::Text {
+        text: text.to_string(),
+    }];
     dispatch_command_with_origin(
         text,
         prefix,
@@ -272,6 +284,7 @@ async fn dispatch_command(
         channel_id,
         sender_id,
         target,
+        &prompt_blocks,
         callback_data,
         lang,
         None,
@@ -293,6 +306,7 @@ async fn dispatch_command_with_origin(
     channel_id: i32,
     sender_id: &str,
     target: &ChannelMessageTarget,
+    prompt_blocks: &[PromptInputBlock],
     callback_data: Option<&str>,
     lang: Lang,
     origin_message_id: Option<&str>,
@@ -321,6 +335,7 @@ async fn dispatch_command_with_origin(
                         channel_id,
                         sender_id,
                         target,
+                        blocks: prompt_blocks.to_vec(),
                         conn_mgr,
                         emitter,
                         bridge,
@@ -352,6 +367,7 @@ async fn dispatch_command_with_origin(
                     channel_id,
                     sender_id,
                     target,
+                    blocks: prompt_blocks.to_vec(),
                     conn_mgr,
                     emitter,
                     bridge,
@@ -910,7 +926,7 @@ mod tests {
         let Some(DispatchMessage::Rich(message)) = response.message else {
             panic!("default restore should acknowledge the forwarded message")
         };
-        assert_eq!(message.body, i18n::message_sent(Lang::ZhCn));
+        assert_eq!(message.body, i18n::message_received(Lang::ZhCn));
     }
 
     #[tokio::test]
@@ -1036,6 +1052,7 @@ mod tests {
                 channel_id,
                 sender_id: "wx-user".into(),
                 command_text: "你好".into(),
+                prompt_blocks: Vec::new(),
                 callback_data: None,
                 target: target.clone(),
                 metadata: serde_json::json!({ "provider": "weixin" }),
@@ -1059,10 +1076,13 @@ mod tests {
             "the original message must be submitted exactly once"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(
-            recorder.messages.lock().await.is_empty(),
-            "final-result mode must not send a Message sent acknowledgement"
-        );
+        let acknowledgements = recorder.messages.lock().await;
+        assert_eq!(acknowledgements.len(), 1);
+        // The dispatcher follows the persisted channel language, not the
+        // script used in an individual prompt.  The in-memory test DB has the
+        // default English locale.
+        assert_eq!(acknowledgements[0], i18n::message_received(Lang::En));
+        drop(acknowledgements);
 
         let active = bridge.lock().await;
         let session = active
@@ -1104,8 +1124,7 @@ mod tests {
                 .get_state("weixin-restored-connection")
                 .await
                 .expect("restored ACP state");
-            state.write().await.last_assistant_text =
-                Some("你好，我已经恢复了原会话。".into());
+            state.write().await.last_assistant_text = Some("你好，我已经恢复了原会话。".into());
         }
         super::super::session_event_subscriber::handle_acp_envelope(
             &EventEnvelope {
@@ -1134,7 +1153,13 @@ mod tests {
         .await
         .expect("Weixin model reply timed out");
         let sent = recorder.messages.lock().await.clone();
-        assert_eq!(sent, vec!["你好，我已经恢复了原会话。"]);
+        assert_eq!(
+            sent,
+            vec![
+                i18n::message_received(Lang::En).to_string(),
+                "你好，我已经恢复了原会话。".to_string(),
+            ]
+        );
         dispatcher.abort();
     }
 }

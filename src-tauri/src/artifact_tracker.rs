@@ -370,6 +370,10 @@ struct ActiveCapture {
 #[derive(Clone, Default)]
 pub struct ArtifactTracker {
     active: Arc<Mutex<HashMap<String, ActiveCapture>>>,
+    /// SQLite permits one writer. Capture tasks from different conversations
+    /// therefore serialize only their optional artifact writes, leaving the
+    /// core conversation/turn lifecycle free to commit first.
+    write_gate: Arc<Mutex<()>>,
 }
 
 #[derive(Serialize)]
@@ -463,27 +467,27 @@ impl ArtifactTracker {
             .unwrap_or(true);
         let run_id = uuid::Uuid::new_v4().to_string();
 
-        if let Err(err) = artifact_service::create_run(
-            db,
-            NewTurnRun {
-                id: run_id.clone(),
-                conversation_id,
-                connection_id: connection_id.to_string(),
-                client_message_id,
-                prompt_fingerprint,
-                folder_id,
-                root_path: stored_root.clone(),
-                capture_incomplete,
-                input_paths_json: serde_json::to_string(&input_paths)
-                    .unwrap_or_else(|_| "[]".to_string()),
-                expectation_json: serde_json::to_string(&expectation).unwrap_or_else(|_| {
-                    r#"{"publish_required":true,"expects_code_changes":false,"requested_paths":[]}"#
-                        .to_string()
-                }),
-            },
-        )
-        .await
-        {
+        let new_run = NewTurnRun {
+            id: run_id.clone(),
+            conversation_id,
+            connection_id: connection_id.to_string(),
+            client_message_id,
+            prompt_fingerprint,
+            folder_id,
+            root_path: stored_root.clone(),
+            capture_incomplete,
+            input_paths_json: serde_json::to_string(&input_paths)
+                .unwrap_or_else(|_| "[]".to_string()),
+            expectation_json: serde_json::to_string(&expectation).unwrap_or_else(|_| {
+                r#"{"publish_required":true,"expects_code_changes":false,"requested_paths":[]}"#
+                    .to_string()
+            }),
+        };
+        let create_result = {
+            let _write_guard = self.write_gate.lock().await;
+            artifact_service::create_run(db, new_run).await
+        };
+        if let Err(err) = create_result {
             if let Some(sub) = subscription {
                 workspace_state::unsubscribe_workspace_changes(sub.root_path).await;
             }
@@ -502,6 +506,7 @@ impl ArtifactTracker {
             ambiguous: Arc::clone(&ambiguous),
             finish_rx,
             emitter,
+            write_gate: Arc::clone(&self.write_gate),
         }));
 
         let overlapping = {
@@ -658,6 +663,7 @@ struct CaptureLoopArgs {
     ambiguous: Arc<AtomicBool>,
     finish_rx: oneshot::Receiver<FinishCommand>,
     emitter: EventEmitter,
+    write_gate: Arc<Mutex<()>>,
 }
 
 async fn capture_loop(args: CaptureLoopArgs) {
@@ -670,6 +676,7 @@ async fn capture_loop(args: CaptureLoopArgs) {
         ambiguous,
         mut finish_rx,
         emitter,
+        write_gate,
     } = args;
 
     let finish = if let Some(sub) = subscription.as_mut() {
@@ -683,7 +690,10 @@ async fn capture_loop(args: CaptureLoopArgs) {
                 }
                 event = sub.receiver.recv() => {
                     match event {
-                        Ok(batch) => persist_batch(&db, &run_id, &root_path, &ambiguous, batch).await,
+                        Ok(batch) => {
+                            let _write_guard = write_gate.lock().await;
+                            persist_batch(&db, &run_id, &root_path, &ambiguous, batch).await
+                        },
                         Err(broadcast::error::RecvError::Lagged(skipped)) => {
                             tracing::error!(
                                 "[artifact-tracker] run {} lagged by {} workspace batch(es)",
@@ -725,7 +735,10 @@ async fn capture_loop(args: CaptureLoopArgs) {
                 _ = &mut grace => break,
                 event = sub.receiver.recv() => {
                     match event {
-                        Ok(batch) => persist_batch(&db, &run_id, &root_path, &ambiguous, batch).await,
+                        Ok(batch) => {
+                            let _write_guard = write_gate.lock().await;
+                            persist_batch(&db, &run_id, &root_path, &ambiguous, batch).await
+                        },
                         Err(broadcast::error::RecvError::Lagged(_)) => {
                             let _ = artifact_service::mark_capture_incomplete(&db, &run_id).await;
                         }
@@ -739,8 +752,9 @@ async fn capture_loop(args: CaptureLoopArgs) {
     if let Some(sub) = subscription.take() {
         workspace_state::unsubscribe_workspace_changes(sub.root_path).await;
     }
+    let _write_guard = write_gate.lock().await;
     let final_stats = finalize_paths(&db, &run_id, &root_path).await;
-    if let Err(err) = artifact_service::finish_run(
+    let finish_failed = if let Err(err) = artifact_service::finish_run(
         &db,
         &run_id,
         finish.status.into_entity(),
@@ -753,7 +767,10 @@ async fn capture_loop(args: CaptureLoopArgs) {
             run_id,
             err
         );
-    }
+        true
+    } else {
+        false
+    };
 
     // Only a normally completed turn may infer fallback deliverables. A
     // cancelled/interrupted capture can contain half-written files and must not
@@ -769,11 +786,25 @@ async fn capture_loop(args: CaptureLoopArgs) {
                 );
             }
             Ok(_) => {}
-            Err(err) => tracing::error!(
-                "[artifact-tracker] fallback deliverable inference failed for run {}: {}",
-                run_id,
-                err
-            ),
+            Err(err) => {
+                tracing::error!(
+                    "[artifact-tracker] fallback deliverable inference failed for run {}: {}",
+                    run_id,
+                    err
+                );
+                // Settlement is an admission gate for a queued follow-up. A
+                // metadata failure must be loud and incomplete, but may never
+                // leave the conversation permanently blocked on `pending`.
+                if let Err(settle_err) =
+                    artifact_service::mark_settled(&db, &run_id, "settled_incomplete", &[]).await
+                {
+                    tracing::error!(
+                        "[artifact-tracker] failed to close incomplete settlement for run {}: {}",
+                        run_id,
+                        settle_err
+                    );
+                }
+            }
         }
     } else if let Err(err) =
         artifact_service::mark_settled(&db, &run_id, "settled_incomplete", &[]).await
@@ -783,6 +814,18 @@ async fn capture_loop(args: CaptureLoopArgs) {
             run_id,
             err
         );
+    }
+
+    if finish_failed {
+        if let Err(err) =
+            artifact_service::mark_settled(&db, &run_id, "settled_incomplete", &[]).await
+        {
+            tracing::error!(
+                "[artifact-tracker] failed to unblock settlement after finalization error for run {}: {}",
+                run_id,
+                err
+            );
+        }
     }
 
     tracing::info!(
@@ -837,7 +880,34 @@ async fn persist_batch(
         })
         .collect::<Vec<_>>();
 
-    if let Err(err) = artifact_service::upsert_changes(db, run_id, changes).await {
+    let mut attempt = 0usize;
+    let backoffs = [
+        Duration::from_millis(75),
+        Duration::from_millis(250),
+        Duration::from_millis(750),
+    ];
+    let result = loop {
+        match artifact_service::upsert_changes(db, run_id, changes.clone()).await {
+            Err(err)
+                if attempt < backoffs.len() && {
+                    let message = err.to_string().to_ascii_lowercase();
+                    message.contains("database is locked") || message.contains("database is busy")
+                } =>
+            {
+                let delay = backoffs[attempt];
+                attempt += 1;
+                tracing::warn!(
+                    turn_run_id = run_id,
+                    retry = attempt,
+                    delay_ms = delay.as_millis() as u64,
+                    "[artifact-tracker] SQLite writer busy; retrying bounded artifact batch"
+                );
+                tokio::time::sleep(delay).await;
+            }
+            other => break other,
+        }
+    };
+    if let Err(err) = result {
         tracing::error!(
             "[artifact-tracker] failed to persist workspace batch for run {} (root={}): {}",
             run_id,

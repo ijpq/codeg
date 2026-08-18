@@ -113,6 +113,9 @@ pub struct IncomingCommand {
     pub channel_id: i32,
     pub sender_id: String,
     pub command_text: String,
+    /// Provider attachments already normalized into ACP prompt blocks. Text is
+    /// still carried in `command_text` so command parsing remains unchanged.
+    pub prompt_blocks: Vec<crate::acp::types::PromptInputBlock>,
     pub callback_data: Option<String>,
     pub target: ChannelMessageTarget,
     pub metadata: serde_json::Value,

@@ -88,9 +88,7 @@ pub async fn init_database(
     service::app_metadata_service::update_app_version(&conn, app_version).await?;
     let recovered = service::artifact_service::recover_interrupted_runs(&conn).await?;
     if recovered > 0 {
-        tracing::info!(
-            "[artifact-tracker] recovered {recovered} interrupted turn capture(s)"
-        );
+        tracing::info!("[artifact-tracker] recovered {recovered} interrupted turn capture(s)");
     }
 
     // Publish user-registered ACP agents into the process-global launch
@@ -123,7 +121,10 @@ pub async fn init_database(
 async fn apply_sqlite_pragmas(conn: &DatabaseConnection) -> Result<(), DbError> {
     for pragma in [
         "PRAGMA journal_mode=WAL;",
-        "PRAGMA busy_timeout=5000;",
+        // Keep request-critical writes responsive. Artifact tracking applies
+        // its own bounded retry/serialization and must not make prompt/steer
+        // handlers sit on SQLite's internal lock wait for five seconds.
+        "PRAGMA busy_timeout=1500;",
         "PRAGMA synchronous=NORMAL;",
         "PRAGMA foreign_keys=ON;",
         "PRAGMA cache_size=-8000;",
