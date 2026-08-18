@@ -90,6 +90,16 @@ pub async fn init_database(
     if recovered > 0 {
         tracing::info!("[artifact-tracker] recovered {recovered} interrupted turn capture(s)");
     }
+    let recovered_settlements =
+        service::artifact_service::recover_orphaned_terminal_settlements(&conn).await?;
+    if recovered_settlements > 0 {
+        tracing::info!(
+            recovered_settlements,
+            transition_reason = "startup_orphaned_artifact_settlement",
+            new_state = "settled_incomplete",
+            "[artifact-tracker] recovered orphaned terminal settlement(s)"
+        );
+    }
 
     // Publish user-registered ACP agents into the process-global launch
     // registry before anything can ask for agent metadata. This is the single
