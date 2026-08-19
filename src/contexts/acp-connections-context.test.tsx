@@ -1423,6 +1423,93 @@ describe("AcpConnectionsProvider persisted Codex restore lifecycle", () => {
     })
   }
 
+  it("makes a restored active turn cancellable before its snapshot arrives", async () => {
+    h.acpRestoreConversation.mockResolvedValueOnce({
+      connectionId: "running-codex-conn",
+      externalSessionId: "sess-1",
+      reusedExisting: true,
+      codegMcpAvailable: true,
+      mcpServerCount: 1,
+      replacedConnectionIds: [],
+      lifecycleState: "active_turn_attached",
+      durableSession: true,
+    })
+    h.acpCancel.mockResolvedValueOnce({
+      outcome: "cancel_requested",
+      cancelRequestId: "cancel-after-refresh",
+      turnRunId: "run-before-refresh",
+      conversationId: 42,
+      deadlineAt: null,
+    })
+    await mountProvider()
+
+    await act(async () => {
+      await h.actions!.connect(CODEX_TAB, "codex", "/tmp/x", "sess-1", 42)
+    })
+
+    // The attach stream has not delivered a snapshot/replay yet.  The backend
+    // restore result is nevertheless authoritative enough to expose Stop;
+    // promptReady remains false so a new ordinary prompt cannot race restore.
+    expect(h.store!.getConnection(CODEX_TAB)).toMatchObject({
+      connectionId: "running-codex-conn",
+      conversationId: 42,
+      status: "prompting",
+      promptReady: false,
+      isViewer: true,
+    })
+
+    await act(async () => {
+      await h.actions!.cancel(CODEX_TAB)
+    })
+    expect(h.acpCancel).toHaveBeenCalledWith("running-codex-conn")
+  })
+
+  it("upgrades an attached legacy active turn after that turn completes", async () => {
+    h.acpRestoreConversation.mockResolvedValueOnce({
+      connectionId: "legacy-running-conn",
+      externalSessionId: "sess-1",
+      reusedExisting: true,
+      codegMcpAvailable: false,
+      mcpServerCount: 0,
+      replacedConnectionIds: [],
+      lifecycleState: "active_turn_attached",
+      durableSession: true,
+    })
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(CODEX_TAB, "codex", "/tmp/x", "sess-1", 42)
+    })
+
+    h.acpRestoreConversation.mockResolvedValueOnce({
+      connectionId: "upgraded-after-turn",
+      externalSessionId: "sess-1",
+      reusedExisting: false,
+      codegMcpAvailable: true,
+      mcpServerCount: 1,
+      replacedConnectionIds: ["legacy-running-conn"],
+      lifecycleState: "ready",
+      durableSession: true,
+    })
+    const handlers = latestAttachHandlers()
+    await act(async () => {
+      emitAcpEvent(handlers, {
+        seq: 1,
+        connection_id: "legacy-running-conn",
+        type: "turn_complete",
+        session_id: "sess-1",
+        stop_reason: "end_turn",
+      })
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(h.acpRestoreConversation).toHaveBeenCalledTimes(2)
+    expect(h.store!.getConnection(CODEX_TAB)).toMatchObject({
+      connectionId: "upgraded-after-turn",
+      codegMcpAvailable: true,
+    })
+  })
+
   it("prepares a provisional branch with no durable session id", async () => {
     h.acpRestoreConversation.mockResolvedValueOnce({
       connectionId: "provisional-conn",

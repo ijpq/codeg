@@ -279,8 +279,10 @@ export function stripUploadedImagePayloads(
 
 /**
  * Restore a persisted conversation using the DB row's authoritative agent,
- * folder and external session id. The backend returns only after resume/load,
- * MCP configuration and the conversation→connection switchover all succeed.
+ * folder and external session id. An already-running turn returns its verified
+ * live connection as `active_turn_attached`; an idle conversation returns only
+ * after resume/load, MCP configuration and the conversation→connection
+ * switchover all succeed.
  */
 export async function acpRestoreConversation(
   conversationId: number,
