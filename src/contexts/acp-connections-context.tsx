@@ -5398,6 +5398,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             return
           }
           if (
+            !shouldRestorePersisted &&
             existing.status !== "disconnected" &&
             existing.status !== "error"
           ) {

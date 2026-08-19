@@ -44,7 +44,6 @@ const h = vi.hoisted(() => {
     acpDisconnect: vi.fn(),
     acpTouchConnection: vi.fn(),
     acpGetSessionSnapshot: vi.fn(),
-    acpTouchConnection: vi.fn(),
     acpCancel: vi.fn(),
     buildDelegationSeedEnvelopes: vi.fn(() => []),
     denormalizeSnapshot: vi.fn(),
