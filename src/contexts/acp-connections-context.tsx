@@ -5538,6 +5538,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         let restoredConversationId: number | null = null
         let restoredCodegMcpAvailable = false
         let restoredMcpServerCount = 0
+        let restoredLifecycleState: string | null = null
         let backendReplacedConnectionIds: string[] = []
 
         if (shouldRestorePersisted && conversationId != null) {
@@ -5588,6 +5589,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             restoredConversationId = conversationId
             restoredCodegMcpAvailable = restored.codegMcpAvailable
             restoredMcpServerCount = restored.mcpServerCount
+            restoredLifecycleState = restored.lifecycleState ?? null
             backendReplacedConnectionIds = restored.replacedConnectionIds
             isViewer =
               restored.reusedExisting && !isConnectionOwnedLocally(connectionId)
@@ -5681,6 +5683,21 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           isViewer,
         })
 
+        // A refreshed client attaching to an already-running durable turn must
+        // be controllable immediately, even before its WebSocket snapshot
+        // arrives.  In particular the Stop button must not depend on
+        // `promptReady`: that latch protects NEW prompts, whereas cancel only
+        // needs the verified connection id returned by the backend.  The cold
+        // snapshot will shortly hydrate the full live transcript, native-steer
+        // capability and pending interaction state.
+        if (restoredLifecycleState === "active_turn_attached") {
+          dispatch({
+            type: "STATUS_CHANGED",
+            contextKey,
+            status: "prompting",
+          })
+        }
+
         // Subscribe-with-Snapshot path. When the active transport supports
         // the attach protocol (currently web mode), the per-connection WS
         // stream delivers snapshot + replay + live events atomically — no
@@ -5760,7 +5777,20 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             ready: true,
           })
         }
-        deferredRestoreKeysRef.current.delete(contextKey)
+        // A legacy active session without Codeg MCP is still safe to view and
+        // cancel. Once its turn ends, retry the normal atomic restore so the
+        // next ordinary prompt gets the required companion instead of
+        // remaining on the compatibility connection forever. All other
+        // successful restore paths clear any older deferral.
+        if (
+          restoredLifecycleState === "active_turn_attached" &&
+          requiresHistoricalCodegMcp &&
+          !restoredCodegMcpAvailable
+        ) {
+          deferredRestoreKeysRef.current.add(contextKey)
+        } else {
+          deferredRestoreKeysRef.current.delete(contextKey)
+        }
       } catch (err) {
         const pendingRequest = pendingConnectRequestsRef.current.get(contextKey)
         const superseded =
