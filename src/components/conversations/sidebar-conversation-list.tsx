@@ -174,7 +174,7 @@ const EMPTY_CONTAINER_CHILDREN: ReadonlyMap<number, readonly number[]> =
 // and how many each click adds. Recent deliberately re-lists what the Folders /
 // Chat sections already show, so an unbounded one pushes every section below it
 // off the screen — a page keeps it a glance-able "where was I" list.
-const RECENT_PAGE_SIZE = 15
+const RECENT_PAGE_SIZE = 5
 
 const FolderHeader = memo(function FolderHeader({
   folderId,

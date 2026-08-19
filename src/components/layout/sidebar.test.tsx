@@ -260,20 +260,20 @@ describe("Sidebar — Section order control", () => {
       .map((el) => el.getAttribute("aria-label") ?? "")
       .filter((label) => label.includes("position"))
 
-  it("defaults to Folders → Chat → Recent", async () => {
+  it("defaults to Recent → Folders → Chat", async () => {
     const user = userEvent.setup()
     renderSidebar()
     await user.click(screen.getByRole("button", { name: "View options" }))
 
     expect(orderRowNames()).toEqual([
-      "Folders — position 1 of 3",
-      "Chat — position 2 of 3",
-      "Recent — position 3 of 3",
+      "Recent — position 1 of 3",
+      "Folders — position 2 of 3",
+      "Chat — position 3 of 3",
     ])
     expect(spies.listProps?.sectionOrder).toEqual([
+      "recent",
       "folders",
       "chats",
-      "recent",
     ])
   })
 
@@ -281,7 +281,7 @@ describe("Sidebar — Section order control", () => {
     const user = userEvent.setup()
     renderSidebar()
     await user.click(screen.getByRole("button", { name: "View options" }))
-    await user.click(screen.getByRole("button", { name: "Recent — Move up" }))
+    await user.click(screen.getByRole("button", { name: "Folders — Move up" }))
 
     expect(orderRowNames()).toEqual([
       "Folders — position 1 of 3",
@@ -294,7 +294,9 @@ describe("Sidebar — Section order control", () => {
       "chats",
     ])
     expect(
-      JSON.parse(localStorage.getItem("workspace:sidebar-section-order") ?? "")
+      JSON.parse(
+        localStorage.getItem("workspace:sidebar-section-order:v2") ?? ""
+      )
     ).toEqual(["folders", "recent", "chats"])
   })
 
@@ -304,10 +306,10 @@ describe("Sidebar — Section order control", () => {
     await user.click(screen.getByRole("button", { name: "View options" }))
 
     expect(
-      screen.getByRole("button", { name: "Folders — Move up" })
+      screen.getByRole("button", { name: "Recent — Move up" })
     ).toBeDisabled()
     expect(
-      screen.getByRole("button", { name: "Recent — Move down" })
+      screen.getByRole("button", { name: "Chat — Move down" })
     ).toBeDisabled()
     expect(
       screen.getByRole("button", { name: "Folders — Move down" })
@@ -322,22 +324,22 @@ describe("Sidebar — Section order control", () => {
     // The nested move buttons are unreachable by Tab (Radix's menu swallows it)
     // and by the roving focus, so Alt+Arrow on the row is the ONLY keyboard
     // path — if this regresses, the control becomes mouse-only.
-    const foldersRow = screen.getByRole("menuitem", {
-      name: "Folders — position 1 of 3",
+    const recentRow = screen.getByRole("menuitem", {
+      name: "Recent — position 1 of 3",
     })
     // Focusing a menu item updates Radix's roving-focus state, so it has to run
     // inside act().
-    act(() => foldersRow.focus())
+    act(() => recentRow.focus())
     await user.keyboard("{Alt>}{ArrowDown}{/Alt}")
 
     expect(orderRowNames()).toEqual([
-      "Chat — position 1 of 3",
-      "Folders — position 2 of 3",
-      "Recent — position 3 of 3",
+      "Folders — position 1 of 3",
+      "Recent — position 2 of 3",
+      "Chat — position 3 of 3",
     ])
     // Focus follows the row it moved, so a second press keeps going.
     expect(document.activeElement?.getAttribute("aria-label")).toBe(
-      "Folders — position 2 of 3"
+      "Recent — position 2 of 3"
     )
   })
 
@@ -348,9 +350,9 @@ describe("Sidebar — Section order control", () => {
     await user.click(screen.getByRole("button", { name: "View options" }))
 
     expect(orderRowNames()).toEqual([
-      "Chat — position 1 of 3",
-      "Folders — position 2 of 3",
-      "Recent — position 3 of 3",
+      "Recent — position 1 of 3",
+      "Chat — position 2 of 3",
+      "Folders — position 3 of 3",
     ])
   })
 
@@ -362,7 +364,7 @@ describe("Sidebar — Section order control", () => {
 
     // Hiding is a separate preference from position: the row stays so the user
     // can park it where it will reappear.
-    await user.click(screen.getByRole("button", { name: "Recent — Move up" }))
+    await user.click(screen.getByRole("button", { name: "Recent — Move down" }))
     expect(spies.listProps?.sectionOrder).toEqual([
       "folders",
       "recent",

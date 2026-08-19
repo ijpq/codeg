@@ -8,7 +8,11 @@ const SHOW_RECENT_KEY = "workspace:sidebar-show-recent"
 // versioned key gives existing installations the new ordering once after the
 // upgrade, while still persisting an explicit user choice made afterwards.
 const SORT_MODE_KEY = "workspace:sidebar-sort-mode:v2"
-const SECTION_ORDER_KEY = "workspace:sidebar-section-order"
+// v2 promotes Recent to the top. The legacy key is read once and migrated so
+// existing installs receive the new product layout instead of remaining stuck
+// on the previously-persisted Folders-first default.
+const LEGACY_SECTION_ORDER_KEY = "workspace:sidebar-section-order"
+const SECTION_ORDER_KEY = "workspace:sidebar-section-order:v2"
 const SECTION_COLLAPSED_KEY = "workspace:sidebar-section-collapsed"
 const CONVERSATION_EXPANDED_KEY = "workspace:sidebar-conversation-expanded"
 
@@ -16,7 +20,7 @@ export type SidebarSortMode = "created" | "updated"
 
 /** The reorderable top-level sidebar sections. "Pinned" is deliberately absent:
  *  it is a transient override bucket and always stays on top. */
-export const SIDEBAR_SECTION_IDS = ["folders", "chats", "recent"] as const
+export const SIDEBAR_SECTION_IDS = ["recent", "folders", "chats"] as const
 
 export type SidebarSectionId = (typeof SIDEBAR_SECTION_IDS)[number]
 
@@ -33,8 +37,8 @@ export type SidebarSectionKey = "pinned" | SidebarSectionId
  */
 export type SidebarSectionOrder = readonly SidebarSectionId[]
 
-/** Folders, then Chat, then Recent — the historical layout with the (newest)
- *  Recent section appended at the bottom. */
+/** Recent, then Folders, then Chat — recent work stays immediately visible while
+ *  the full folder hierarchy remains directly below it. */
 export const DEFAULT_SECTION_ORDER: SidebarSectionOrder = SIDEBAR_SECTION_IDS
 
 /** Collapsed state of the top-level sidebar sections. Absent key = expanded
@@ -65,7 +69,7 @@ function isSectionId(value: unknown): value is SidebarSectionId {
  */
 export function normalizeSectionOrder(value: unknown): SidebarSectionOrder {
   if (value === "chats-first") return ["chats", "folders", "recent"]
-  if (value === "folders-first") return DEFAULT_SECTION_ORDER
+  if (value === "folders-first") return ["folders", "chats", "recent"]
   if (!Array.isArray(value)) return DEFAULT_SECTION_ORDER
   const seen = new Set<SidebarSectionId>()
   const out: SidebarSectionId[] = []
@@ -258,22 +262,42 @@ export function saveSortMode(value: SidebarSortMode): void {
 export function loadSectionOrder(): SidebarSectionOrder {
   if (typeof window === "undefined") return DEFAULT_SECTION_ORDER
   try {
-    const raw = localStorage.getItem(SECTION_ORDER_KEY)
-    if (!raw) return DEFAULT_SECTION_ORDER
-    // Current format is a JSON array; the legacy pre-Recent format was a bare
-    // `folders-first` / `chats-first` string, which is not valid JSON — fall
-    // back to the raw string so `normalizeSectionOrder` can migrate it.
-    let parsed: unknown
+    const current = localStorage.getItem(SECTION_ORDER_KEY)
+    if (current) return parseSectionOrder(current)
+
+    const legacy = localStorage.getItem(LEGACY_SECTION_ORDER_KEY)
+    if (!legacy) return DEFAULT_SECTION_ORDER
+
+    // Preserve the user's old Folders/Chat relative order, but deliberately
+    // promote Recent to the first slot as part of the v2 layout migration.
+    const oldOrder = parseSectionOrder(legacy)
+    const migrated: SidebarSectionOrder = [
+      "recent",
+      ...oldOrder.filter((section) => section !== "recent"),
+    ]
     try {
-      parsed = JSON.parse(raw)
+      localStorage.setItem(SECTION_ORDER_KEY, JSON.stringify(migrated))
     } catch {
-      parsed = raw
+      /* migration can still be used for this render */
     }
-    return normalizeSectionOrder(parsed)
+    return migrated
   } catch {
     /* ignore */
   }
   return DEFAULT_SECTION_ORDER
+}
+
+function parseSectionOrder(raw: string): SidebarSectionOrder {
+  // Current format is a JSON array; the legacy pre-Recent format was a bare
+  // `folders-first` / `chats-first` string, which is not valid JSON — fall
+  // back to the raw string so `normalizeSectionOrder` can migrate it.
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    parsed = raw
+  }
+  return normalizeSectionOrder(parsed)
 }
 
 export function saveSectionOrder(value: SidebarSectionOrder): void {
