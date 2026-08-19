@@ -1107,7 +1107,7 @@ mod tests {
         )
         .await
         .unwrap();
-        conversation_service::update_external_id(&db.conn, branch.id, "fake-session".into())
+        conversation_service::bind_external_id(&db.conn, branch.id, "fake-session", &[])
             .await
             .unwrap();
         update_branch_session_id(&db.conn, branch.id, "fake-session".into())
