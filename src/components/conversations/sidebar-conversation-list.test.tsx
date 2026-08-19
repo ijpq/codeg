@@ -6,7 +6,7 @@ import {
   useImperativeHandle,
   useState,
 } from "react"
-import { act, fireEvent, render } from "@testing-library/react"
+import { act, fireEvent, render, screen } from "@testing-library/react"
 import { NextIntlClientProvider } from "next-intl"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
@@ -1074,6 +1074,43 @@ describe("SidebarConversationList — Recent section", () => {
     // conv-13 lives in a folder that is not open, so it is unreachable in the
     // Folders section and must stay out of Recent too.
     expect(document.body.textContent).not.toContain("conv-13")
+  })
+
+  it("shows five recent conversations initially and reveals the rest on demand", () => {
+    const conversations = Array.from({ length: 7 }, (_, index) => {
+      const timestamp = new Date(FIXED + index * MINUTE).toISOString()
+      return conv(20 + index, 1, {
+        created_at: timestamp,
+        updated_at: timestamp,
+      })
+    })
+    useAppWorkspaceStore.setState({ conversations })
+
+    render(recentTree(true))
+
+    // All seven have one canonical Folder row. Only the newest five initially
+    // get a second copy in Recent; the two oldest wait behind Show more.
+    expect(
+      document.querySelectorAll('[data-conversation-id="26"]')
+    ).toHaveLength(2)
+    expect(
+      document.querySelectorAll('[data-conversation-id="22"]')
+    ).toHaveLength(2)
+    expect(
+      document.querySelectorAll('[data-conversation-id="21"]')
+    ).toHaveLength(1)
+    expect(
+      document.querySelectorAll('[data-conversation-id="20"]')
+    ).toHaveLength(1)
+
+    fireEvent.click(screen.getByRole("button", { name: "Show more (2)" }))
+    expect(
+      document.querySelectorAll('[data-conversation-id="21"]')
+    ).toHaveLength(2)
+    expect(
+      document.querySelectorAll('[data-conversation-id="20"]')
+    ).toHaveLength(2)
+    expect(screen.queryByRole("button", { name: "Show more (2)" })).toBeNull()
   })
 
   it("collapses independently of the other sections", () => {

@@ -940,11 +940,11 @@ describe("buildRows — Recent section", () => {
     const matches = rows.filter(
       (r) => r.kind === "conversation" && r.conversation.id === 1
     )
-    // The same conversation appears twice: once under its folder (untagged),
-    // once in Recent (tagged).
+    // The same conversation appears twice: first in Recent (tagged), then under
+    // its folder (untagged), matching the product's section order.
     expect(matches).toEqual([
-      { kind: "conversation", conversation: c1, depth: 0 },
       { kind: "conversation", conversation: c1, depth: 0, recent: true },
+      { kind: "conversation", conversation: c1, depth: 0 },
     ])
   })
 
@@ -964,8 +964,8 @@ describe("buildRows — Recent section", () => {
     expect(
       rows.filter((r) => r.kind === "conversation" && r.conversation.id === 2)
     ).toEqual([
-      { kind: "conversation", conversation: kid, depth: 1 },
       { kind: "conversation", conversation: kid, depth: 1, recent: true },
+      { kind: "conversation", conversation: kid, depth: 1 },
     ])
 
     const loadingRows = buildRows({
@@ -978,8 +978,8 @@ describe("buildRows — Recent section", () => {
       childrenLoading: new Set([1]),
     }).filter((r) => r.kind === "subsession-loading")
     expect(loadingRows).toEqual([
-      { kind: "subsession-loading", parentId: 1, depth: 1 },
       { kind: "subsession-loading", parentId: 1, depth: 1, recent: true },
+      { kind: "subsession-loading", parentId: 1, depth: 1 },
     ])
   })
 
