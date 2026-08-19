@@ -836,10 +836,11 @@ mod tests {
         let folder_path = "/tmp/codeg-weixin-default-restore";
         let folder_id = seed_folder(&db, folder_path).await;
         let conversation_id = seed_conversation(&db, folder_id, AgentType::OpenCode).await;
-        conversation_service::update_external_id(
+        conversation_service::bind_external_id(
             &db.conn,
             conversation_id,
-            "weixin-default-session".into(),
+            "weixin-default-session",
+            &[],
         )
         .await
         .unwrap();
@@ -983,10 +984,11 @@ mod tests {
         let folder_path = "/tmp/codeg-weixin-lazy-restore";
         let folder_id = seed_folder(&db, folder_path).await;
         let conversation_id = seed_conversation(&db, folder_id, AgentType::OpenCode).await;
-        conversation_service::update_external_id(
+        conversation_service::bind_external_id(
             &db.conn,
             conversation_id,
-            "weixin-persisted-session".into(),
+            "weixin-persisted-session",
+            &[],
         )
         .await
         .expect("persist external session");
@@ -1117,6 +1119,7 @@ mod tests {
             &manager,
             &conn_mgr,
             &db.conn,
+            &EventEmitter::Noop,
         )
         .await;
         {
@@ -1140,6 +1143,7 @@ mod tests {
             &manager,
             &conn_mgr,
             &db.conn,
+            &EventEmitter::Noop,
         )
         .await;
         tokio::time::timeout(Duration::from_secs(2), async {
