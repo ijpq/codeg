@@ -10057,6 +10057,69 @@ pub(crate) async fn acp_restore_conversation_core(
     .await
     .map_err(|error| AcpError::protocol(error.to_string()))?;
     if !durable_active_runs.is_empty() {
+        // A browser refresh (or a second client opening the same conversation)
+        // must ATTACH to the turn that is already running, not wait for that
+        // turn to finish before it can reconstruct the composer.  The latter
+        // left the refreshed page without any connection id, so it could
+        // neither steer nor cancel the still-live task.
+        //
+        // Do not trust the durable row alone: only publish an attachment when
+        // the exact run connection still owns this conversation/session and
+        // its in-memory state independently confirms a Prompting in-flight
+        // turn.  A stale database row continues into the existing rejection
+        // below and is handled by reconciliation rather than being exposed as
+        // a live connection.
+        for run in &durable_active_runs {
+            let Some(state) = manager.get_state(&run.connection_id).await else {
+                continue;
+            };
+            let active = {
+                let state = state.read().await;
+                if active_turn_matches_restore_target(
+                    &state,
+                    conversation_id,
+                    &external_session_id,
+                    agent_type,
+                ) {
+                    Some((
+                        state.codeg_mcp_available,
+                        state.mcp_server_count,
+                        state.status.clone(),
+                    ))
+                } else {
+                    None
+                }
+            };
+            let Some((codeg_mcp_available, mcp_server_count, status)) = active else {
+                continue;
+            };
+
+            manager.touch(&run.connection_id).await;
+            tracing::info!(
+                conversation_id,
+                turn_run_id = %run.id,
+                connection_id = %run.connection_id,
+                external_session_id = %external_session_id,
+                connection_status = ?status,
+                codeg_mcp_available,
+                mcp_server_count,
+                active_run_count = durable_active_runs.len(),
+                stage = "restore_active_turn_attached",
+                total_elapsed_ms = restore_started.elapsed().as_millis() as u64,
+                "[ACP][restore] attached refreshed client to the existing active turn"
+            );
+            return Ok(RestoredConversationConnectionInfo {
+                connection_id: run.connection_id.clone(),
+                external_session_id,
+                reused_existing: true,
+                codeg_mcp_available,
+                mcp_server_count,
+                replaced_connection_ids: Vec::new(),
+                lifecycle_state: "active_turn_attached".into(),
+                durable_session: true,
+            });
+        }
+
         tracing::info!(
             conversation_id,
             active_run_count = durable_active_runs.len(),
@@ -10360,6 +10423,24 @@ pub(crate) async fn acp_restore_conversation_core(
         lifecycle_state: "ready".into(),
         durable_session: true,
     })
+}
+
+/// A durable `running` row is not sufficient proof that a refreshed client can
+/// control a turn.  Require the process-local connection to independently
+/// confirm the exact conversation, external session, agent and in-flight
+/// Prompting state before the restore endpoint hands that connection to a new
+/// viewer.
+fn active_turn_matches_restore_target(
+    state: &crate::acp::session_state::SessionState,
+    conversation_id: i32,
+    external_session_id: &str,
+    agent_type: AgentType,
+) -> bool {
+    state.status == ConnectionStatus::Prompting
+        && state.turn_in_flight
+        && state.conversation_id == Some(conversation_id)
+        && state.external_id.as_deref() == Some(external_session_id)
+        && state.agent_type == agent_type
 }
 
 #[cfg(feature = "tauri-runtime")]
@@ -13254,6 +13335,70 @@ pub(crate) async fn codex_poll_device_code_core(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn active_turn_restore_target_requires_the_exact_live_prompt() {
+        let mut state = crate::acp::session_state::SessionState::new(
+            "active-connection".into(),
+            AgentType::Codex,
+            Some(PathBuf::from("/tmp/project")),
+            "test-owner".into(),
+            Some(8),
+        );
+        state.status = ConnectionStatus::Prompting;
+        state.turn_in_flight = true;
+        state.conversation_id = Some(75);
+        state.external_id = Some("session-75".into());
+
+        assert!(active_turn_matches_restore_target(
+            &state,
+            75,
+            "session-75",
+            AgentType::Codex,
+        ));
+        assert!(!active_turn_matches_restore_target(
+            &state,
+            76,
+            "session-75",
+            AgentType::Codex,
+        ));
+        assert!(!active_turn_matches_restore_target(
+            &state,
+            75,
+            "another-session",
+            AgentType::Codex,
+        ));
+    }
+
+    #[test]
+    fn active_turn_restore_target_rejects_idle_or_phantom_connections() {
+        let mut state = crate::acp::session_state::SessionState::new(
+            "idle-connection".into(),
+            AgentType::Codex,
+            None,
+            "test-owner".into(),
+            Some(8),
+        );
+        state.conversation_id = Some(75);
+        state.external_id = Some("session-75".into());
+
+        state.status = ConnectionStatus::Connected;
+        state.turn_in_flight = false;
+        assert!(!active_turn_matches_restore_target(
+            &state,
+            75,
+            "session-75",
+            AgentType::Codex,
+        ));
+
+        state.status = ConnectionStatus::Prompting;
+        assert!(!active_turn_matches_restore_target(
+            &state,
+            75,
+            "session-75",
+            AgentType::Codex,
+        ));
+    }
 
     #[test]
     fn extract_version_token_finds_the_version_in_common_banners() {
