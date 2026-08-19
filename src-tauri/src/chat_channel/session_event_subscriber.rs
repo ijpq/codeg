@@ -1921,6 +1921,7 @@ mod async_relay_dedup_tests {
             &chat,
             &conn,
             &db.conn,
+            &EventEmitter::Noop,
         )
         .await;
         handle_acp_envelope(
@@ -1944,6 +1945,7 @@ mod async_relay_dedup_tests {
             &chat,
             &conn,
             &db.conn,
+            &EventEmitter::Noop,
         )
         .await;
         assert!(
@@ -1965,6 +1967,7 @@ mod async_relay_dedup_tests {
             &chat,
             &conn,
             &db.conn,
+            &EventEmitter::Noop,
         )
         .await;
         assert_eq!(sent(&rec).await, vec!["这是完整最终回答。"]);
@@ -2118,6 +2121,7 @@ mod async_relay_dedup_tests {
             &chat,
             &conn,
             &db.conn,
+            &EventEmitter::Noop,
         )
         .await;
         handle_acp_envelope(
@@ -2134,6 +2138,7 @@ mod async_relay_dedup_tests {
             &chat,
             &conn,
             &db.conn,
+            &EventEmitter::Noop,
         )
         .await;
         assert!(sent(&rec).await.is_empty());
@@ -2343,6 +2348,7 @@ mod async_relay_dedup_tests {
             &chat,
             &conn,
             &db.conn,
+            &EventEmitter::Noop,
         )
         .await;
         let command = tokio::time::timeout(Duration::from_secs(2), cmd_rx.recv())
@@ -2585,7 +2591,15 @@ mod error_terminal_gate_tests {
             .await
             .get_mut("conn-owned-elsewhere")
             .unwrap()
-            .pending_prompt = Some("do the task".into());
+            .pending_prompts
+            .push_back(PendingPrompt {
+                blocks: vec![PromptInputBlock::Text {
+                    text: "do the task".into(),
+                }],
+                folder_id: holder.folder_id,
+                conversation_id: conv_id,
+                delivery: None,
+            });
 
         let envelope = EventEnvelope {
             seq: 1,
