@@ -1752,6 +1752,18 @@
         "cacheRead": "قراءة الكاش",
         "cacheWrite": "كتابة الكاش",
         "total": "الإجمالي"
+      },
+      "quota": {
+        "summary": "{plan} · المتبقي أسبوعيًا {remaining}",
+        "lastRoutedPlan": "الخطة المستخدمة في آخر طلب",
+        "weeklyShort": "المتبقي أسبوعيًا",
+        "weeklyRemaining": "المتبقي الأسبوعي",
+        "weeklyUsed": "المستخدم أسبوعيًا",
+        "resetsAt": "موعد إعادة الضبط",
+        "observedAt": "وقت التحديث",
+        "refresh": "تحديث الحصة",
+        "unknown": "غير معروف",
+        "sourceHint": "مقروء من آخر استجابة Codex فعلية دون طلب إضافي إلى المرحّل."
       }
     },
     "auxPanel": {

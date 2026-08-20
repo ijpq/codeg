@@ -1752,6 +1752,18 @@
         "cacheRead": "Lectura de caché",
         "cacheWrite": "Escritura de caché",
         "total": "Total de tokens"
+      },
+      "quota": {
+        "summary": "{plan} · queda {remaining} semanal",
+        "lastRoutedPlan": "Plan usado por la última solicitud",
+        "weeklyShort": "Sem. restante",
+        "weeklyRemaining": "Restante semanal",
+        "weeklyUsed": "Uso semanal",
+        "resetsAt": "Se restablece",
+        "observedAt": "Actualizado",
+        "refresh": "Actualizar cuota",
+        "unknown": "Desconocido",
+        "sourceHint": "Leído de la última respuesta real de Codex; sin solicitudes extra al relay."
       }
     },
     "auxPanel": {

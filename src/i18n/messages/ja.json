@@ -1752,6 +1752,18 @@
         "cacheRead": "キャッシュ読み取り",
         "cacheWrite": "キャッシュ書き込み",
         "total": "合計"
+      },
+      "quota": {
+        "summary": "{plan} · 週間残量 {remaining}",
+        "lastRoutedPlan": "直近のリクエストで使用したプラン",
+        "weeklyShort": "週残",
+        "weeklyRemaining": "週間残量",
+        "weeklyUsed": "週間使用量",
+        "resetsAt": "リセット日時",
+        "observedAt": "更新日時",
+        "refresh": "残量を更新",
+        "unknown": "不明",
+        "sourceHint": "直近の実 Codex 応答から取得し、中継への追加リクエストは行いません。"
       }
     },
     "auxPanel": {

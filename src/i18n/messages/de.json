@@ -1752,6 +1752,18 @@
         "cacheRead": "Cache lesen",
         "cacheWrite": "Cache schreiben",
         "total": "Gesamt"
+      },
+      "quota": {
+        "summary": "{plan} · wöchentlich {remaining} übrig",
+        "lastRoutedPlan": "Tarif der letzten Anfrage",
+        "weeklyShort": "Wo. übrig",
+        "weeklyRemaining": "Wöchentlicher Rest",
+        "weeklyUsed": "Wöchentlich verbraucht",
+        "resetsAt": "Zurücksetzung",
+        "observedAt": "Aktualisiert",
+        "refresh": "Kontingent aktualisieren",
+        "unknown": "Unbekannt",
+        "sourceHint": "Aus der letzten echten Codex-Antwort; keine zusätzliche Relay-Anfrage."
       }
     },
     "auxPanel": {
