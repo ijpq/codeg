@@ -1848,6 +1848,24 @@ export interface SessionUsageUpdateInfo {
   size: number
 }
 
+export interface CodexQuotaWindow {
+  usedPercent: number
+  windowMinutes: number
+  resetsAt: number | null
+}
+
+/** Last subscription allowance carried by a real Codex response. Account
+ * identifiers are intentionally absent; relays may use `limitName` as an
+ * anonymous package/pool label. */
+export interface CodexQuotaSnapshot {
+  planType: string
+  limitId: string | null
+  limitName: string | null
+  weekly: CodexQuotaWindow | null
+  shortWindow: CodexQuotaWindow | null
+  observedAt: string | null
+}
+
 /**
  * Wire-level image attached to a tool call (e.g. codex image generation).
  * Mirrors Rust's `ToolCallImageInfo`. Reused by snapshot endpoints and

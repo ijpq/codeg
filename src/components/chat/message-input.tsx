@@ -74,6 +74,7 @@ import {
   useConversationFolderBranchPickerVisible,
 } from "@/components/chat/conversation-context-bar"
 import { ComposerContextUsage } from "@/components/chat/composer-context-usage"
+import { ComposerCodexQuota } from "@/components/chat/composer-codex-quota"
 import { ComposerConnectionStatus } from "@/components/chat/composer-connection-status"
 import { InlineModeSelector } from "@/components/chat/mode-selector"
 import {
@@ -2081,6 +2082,11 @@ export function MessageInput({
                       </Popover>
                     </div>
                   )}
+                  <ComposerCodexQuota
+                    tabId={attachmentTabId ?? null}
+                    agentType={agentType}
+                    isPrompting={isPrompting}
+                  />
                 </div>
                 <div className="shrink-0">{actionButtons}</div>
               </div>

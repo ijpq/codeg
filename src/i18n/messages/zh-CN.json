@@ -1865,6 +1865,18 @@
           "more": "更多"
         },
         "showPet": "显示宠物"
+      },
+      "quota": {
+        "summary": "{plan} · 周余 {remaining}",
+        "lastRoutedPlan": "最近一次请求使用的套餐",
+        "weeklyShort": "周余",
+        "weeklyRemaining": "周余量",
+        "weeklyUsed": "本周已用",
+        "resetsAt": "重置时间",
+        "observedAt": "数据时间",
+        "refresh": "刷新余量",
+        "unknown": "未知",
+        "sourceHint": "来自最近一次真实 Codex 响应，不会额外请求中转。"
       }
     },
     "auxPanel": {
