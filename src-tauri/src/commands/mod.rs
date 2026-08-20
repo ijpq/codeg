@@ -7,6 +7,7 @@ pub mod backup;
 pub mod chat_authoring;
 pub mod chat_channel;
 mod conversation_branch_context;
+pub mod codex_quota;
 pub mod conversation_branches;
 pub mod conversations;
 pub mod custom_agents;

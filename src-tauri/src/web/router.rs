@@ -1342,6 +1342,10 @@ pub fn build_router(
             "/token_usage_sync",
             post(handlers::token_usage::token_usage_sync),
         )
+        .route(
+            "/codex_quota_snapshot",
+            post(handlers::codex_quota::codex_quota_snapshot),
+        )
         // ─── Work tasks ───
         .route("/work_task_list", post(handlers::work_task::work_task_list))
         .route("/work_task_get", post(handlers::work_task::work_task_get))

@@ -1946,6 +1946,18 @@
           "more": "Mais"
         },
         "showPet": "Mostrar pet"
+      },
+      "quota": {
+        "summary": "{plan} · {remaining} semanal restante",
+        "lastRoutedPlan": "Plano usado pela última solicitação",
+        "weeklyShort": "Sem. restante",
+        "weeklyRemaining": "Restante semanal",
+        "weeklyUsed": "Uso semanal",
+        "resetsAt": "Redefine em",
+        "observedAt": "Atualizado em",
+        "refresh": "Atualizar cota",
+        "unknown": "Desconhecido",
+        "sourceHint": "Lido da última resposta real do Codex, sem solicitação extra ao relay."
       }
     },
     "auxPanel": {

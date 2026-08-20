@@ -66,6 +66,7 @@ import type {
   CursorModelsResult,
   QoderAuthStatus,
   CodexModelInfo,
+  CodexQuotaSnapshot,
   AgentSkillScope,
   AgentSkillLayout,
   AgentSkillItem,
@@ -3209,6 +3210,16 @@ export async function tokenUsageSync(
   mode: "incremental" | "full" = "incremental"
 ): Promise<TokenUsageSyncResult> {
   return getTransport().call("token_usage_sync", { mode })
+}
+
+/** Read the latest Codex subscription allowance observed in the current
+ * session transcript. This is local I/O only; it never polls the relay. */
+export async function codexQuotaSnapshot(
+  conversationId: number | null
+): Promise<CodexQuotaSnapshot | null> {
+  return getTransport().call("codex_quota_snapshot", {
+    conversationId,
+  })
 }
 
 // Automations
