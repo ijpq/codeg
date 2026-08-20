@@ -1929,6 +1929,18 @@
           "more": "More"
         },
         "showPet": "Show pet"
+      },
+      "quota": {
+        "summary": "{plan} · {remaining} weekly left",
+        "lastRoutedPlan": "Plan used by the last request",
+        "weeklyShort": "Wk left",
+        "weeklyRemaining": "Weekly remaining",
+        "weeklyUsed": "Weekly used",
+        "resetsAt": "Resets at",
+        "observedAt": "Updated at",
+        "refresh": "Refresh allowance",
+        "unknown": "Unknown",
+        "sourceHint": "Read from the last real Codex response; no extra relay request."
       }
     },
     "auxPanel": {

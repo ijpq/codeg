@@ -1929,6 +1929,18 @@
           "more": "기타"
         },
         "showPet": "펫 표시"
+      },
+      "quota": {
+        "summary": "{plan} · 주간 {remaining} 남음",
+        "lastRoutedPlan": "최근 요청에서 사용한 요금제",
+        "weeklyShort": "주간 잔여",
+        "weeklyRemaining": "주간 잔여량",
+        "weeklyUsed": "주간 사용량",
+        "resetsAt": "초기화 시각",
+        "observedAt": "업데이트 시각",
+        "refresh": "잔여량 새로고침",
+        "unknown": "알 수 없음",
+        "sourceHint": "최근 실제 Codex 응답에서 읽으며 릴레이에 추가 요청하지 않습니다."
       }
     },
     "auxPanel": {
