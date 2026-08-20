@@ -5,6 +5,7 @@ pub mod background;
 pub mod backup;
 pub mod chat_authoring;
 pub mod chat_channel;
+pub mod codex_quota;
 pub mod conversations;
 pub mod custom_skills;
 pub mod delegation;

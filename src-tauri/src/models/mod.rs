@@ -2,6 +2,7 @@ pub mod agent;
 pub mod automation;
 pub mod background;
 pub mod chat_channel;
+pub mod codex_quota;
 pub mod conversation;
 pub mod folder;
 pub mod message;
@@ -20,6 +21,7 @@ pub use automation::{
 };
 #[allow(unused_imports)]
 pub use chat_channel::{ChannelStatusInfo, ChatChannelInfo, ChatChannelMessageLogInfo};
+pub use codex_quota::{CodexQuotaSnapshot, CodexQuotaWindow};
 pub use conversation::{
     AgentConversationCount, AgentStats, ConversationDeliverable, ConversationDetail,
     ConversationDeliverableHistoryGroup, ConversationDeliverableHistoryPage,
