@@ -352,12 +352,8 @@ pub async fn get_conversation_branch_info(
     AppCommandError,
 > {
     Ok(Json(
-        crate::db::service::conversation_branch_service::get_info(
-            &state.db.conn,
-            params.conversation_id,
-        )
-        .await
-        .map_err(AppCommandError::from)?,
+        branch_commands::get_conversation_branch_info_core(&state.db, params.conversation_id)
+            .await?,
     ))
 }
 

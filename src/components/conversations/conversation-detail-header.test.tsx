@@ -229,4 +229,65 @@ describe("ConversationDetailHeader dialog target snapshot", () => {
     expect(h.refreshConversations).toHaveBeenCalled()
     expect(h.openTab).toHaveBeenCalledWith(1, 9, "codex", true, "conv-a · 分支")
   })
+
+  it("refreshes branch controls when fork-send repoints the active conversation", async () => {
+    h.getConversationBranchInfo
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({
+        branchConversationId: 1,
+        sourceConversationId: 9,
+        sourceTitle: "conv-a",
+        sourceAvailable: true,
+        forkMessageId: null,
+        forkMode: "native",
+        sourceSessionId: "session-source",
+        branchSessionId: "session-fork",
+        inheritanceMode: "native_fork",
+        inheritedMessageCount: 12,
+        inheritedContextChars: 0,
+        inheritedEstimatedTokens: 0,
+        inheritanceCompressed: false,
+        inheritanceTruncated: false,
+        inheritanceNote: null,
+        forkedThroughAt: "2026-08-22T00:00:00Z",
+        snapshotVersion: 2,
+        snapshotConsumedAt: null,
+        lifecycleState: "ready",
+        lifecycleError: null,
+        lifecycleUpdatedAt: "2026-08-22T00:00:00Z",
+        sessionVerifiedAt: "2026-08-22T00:00:00Z",
+        firstPromptClientMessageId: null,
+        firstPromptQueuedAt: null,
+        firstPromptAcceptedAt: null,
+        initializationRetryCount: 0,
+        lastConnectionId: "connection-fork",
+        snapshotDigest: null,
+        createdAt: "2026-08-22T00:00:00Z",
+        lastMergedAt: null,
+        mergeTargetConversationId: null,
+      })
+    const { rerender, findByRole } = render(
+      withIntl(<ConversationDetailHeader {...A} />)
+    )
+    await waitFor(() => {
+      expect(h.getConversationBranchInfo).toHaveBeenCalledTimes(1)
+    })
+
+    // Fork & Send changes the row's title/external session in the workspace
+    // refresh without changing its DB id. That transition must still re-read
+    // the durable branch relation so Return/Merge appear without a reload.
+    rerender(
+      withIntl(<ConversationDetailHeader {...A} title="[Fork] conv-a" />)
+    )
+
+    expect(
+      await findByRole("button", { name: /Branched from: conv-a/ })
+    ).toBeInTheDocument()
+    await userEvent
+      .setup({ pointerEventsCheck: 0 })
+      .click(await findByRole("button", { name: "More actions" }))
+    expect(
+      await findByRole("menuitem", { name: "Merge into main conversation" })
+    ).toBeInTheDocument()
+  })
 })
