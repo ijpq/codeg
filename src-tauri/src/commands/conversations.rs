@@ -18,10 +18,9 @@ use crate::parsers::claude::ClaudeParser;
 use crate::parsers::cline::ClineParser;
 use crate::parsers::codebuddy::CodeBuddyParser;
 use crate::parsers::codex::CodexParser;
-use crate::parsers::deepseek::DeepSeekParser;
 use crate::parsers::antigravity::AntigravityParser;
-use crate::parsers::qoder::QoderParser;
 use crate::parsers::cursor::CursorParser;
+use crate::parsers::deepseek::DeepSeekParser;
 use crate::parsers::gemini::GeminiParser;
 use crate::parsers::grok::GrokParser;
 use crate::parsers::hermes::HermesParser;
@@ -29,6 +28,7 @@ use crate::parsers::kimi_code::KimiCodeParser;
 use crate::parsers::openclaw::OpenClawParser;
 use crate::parsers::opencode::OpenCodeParser;
 use crate::parsers::pi::PiParser;
+use crate::parsers::qoder::QoderParser;
 use crate::parsers::{
     folder_name_from_path, normalize_path_for_matching, path_eq_for_matching, AgentParser,
     ParseError,
@@ -128,8 +128,7 @@ pub async fn list_all_conversations(
 ) -> Result<Vec<DbConversationSummary>, AppCommandError> {
     let emitter = EventEmitter::Tauri(app.clone());
     let db = app.state::<AppDatabase>();
-    let chat_channel_manager =
-        app.state::<crate::chat_channel::manager::ChatChannelManager>();
+    let chat_channel_manager = app.state::<crate::chat_channel::manager::ChatChannelManager>();
     list_all_conversations_core(
         &db.conn,
         &emitter,
@@ -494,9 +493,7 @@ pub async fn import_local_conversations_core(
     // bound chat thread — the same treatment the scan and list paths give a
     // title discovered outside codeg. The importing client refetches the list
     // itself, which also covers the newly imported rows.
-    drop(
-        notify_conversation_title_updates(conn, emitter, chat_channel_manager, updated_ids).await,
-    );
+    drop(notify_conversation_title_updates(conn, emitter, chat_channel_manager, updated_ids).await);
 
     Ok(result)
 }
@@ -1148,11 +1145,68 @@ fn paginate_parsed_turns(
     })
 }
 
+fn branch_inherited_end(
+    turns: &[MessageTurn],
+    fork_message_id: Option<&str>,
+    forked_through_at: Option<chrono::DateTime<chrono::Utc>>,
+    inherited_message_count: i32,
+) -> usize {
+    if let Some(fork_message_id) = fork_message_id {
+        if let Some(index) = turns.iter().position(|turn| turn.id == fork_message_id) {
+            return index + 1;
+        }
+    }
+    if let Some(forked_through_at) = forked_through_at {
+        return turns.partition_point(|turn| turn.timestamp <= forked_through_at);
+    }
+    usize::try_from(inherited_message_count.max(0))
+        .unwrap_or(usize::MAX)
+        .min(turns.len())
+}
+
+fn native_branch_local_start(
+    branch_turns: &[MessageTurn],
+    source_turn_ids: &std::collections::HashSet<String>,
+    forked_through_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> usize {
+    // Codex native fork rollouts replay the parent's persisted transcript at
+    // their head. That replay is protocol context, not branch-local history;
+    // the source prefix is rendered separately through the durable fork
+    // boundary below. Strip only the contiguous opening replay so a later
+    // branch message can never disappear merely because its content resembles
+    // an older source message.
+    branch_turns
+        .iter()
+        .take_while(|turn| {
+            source_turn_ids.contains(&turn.id)
+                || forked_through_at.is_some_and(|boundary| turn.timestamp <= boundary)
+        })
+        .count()
+}
+
+fn inherited_run_belongs_to_boundary(
+    started_at: chrono::DateTime<chrono::Utc>,
+    user_turn_id: Option<&str>,
+    source_turn_ids: &std::collections::HashSet<String>,
+    boundary_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> bool {
+    match user_turn_id {
+        Some(turn_id) => source_turn_ids.contains(turn_id),
+        None => boundary_at.is_some_and(|boundary| started_at <= boundary),
+    }
+}
+
 pub async fn get_folder_conversation_core(
     conn: &sea_orm::DatabaseConnection,
     conversation_id: i32,
 ) -> Result<(DbConversationDetail, Option<String>), AppCommandError> {
-    get_folder_conversation_core_impl(conn, conversation_id, None).await
+    get_folder_conversation_core_impl(
+        conn,
+        conversation_id,
+        None,
+        std::collections::HashSet::new(),
+    )
+    .await
 }
 
 #[derive(Clone, Debug)]
@@ -1171,10 +1225,141 @@ pub async fn get_folder_conversation_page_core(
     conversation_id: i32,
     request: ConversationHistoryRequest,
 ) -> Result<(DbConversationDetail, Option<String>), AppCommandError> {
-    get_folder_conversation_core_impl(conn, conversation_id, Some(request)).await
+    get_folder_conversation_core_impl(
+        conn,
+        conversation_id,
+        Some(request),
+        std::collections::HashSet::new(),
+    )
+    .await
 }
 
 async fn get_folder_conversation_core_impl(
+    conn: &sea_orm::DatabaseConnection,
+    conversation_id: i32,
+    history_request: Option<ConversationHistoryRequest>,
+    mut branch_path: std::collections::HashSet<i32>,
+) -> Result<(DbConversationDetail, Option<String>), AppCommandError> {
+    if !branch_path.insert(conversation_id) {
+        return Err(AppCommandError::task_execution_failed(
+            "Invalid conversation branch cycle",
+        ));
+    }
+    let relation = conversation_branch_service::get_info(conn, conversation_id)
+        .await
+        .map_err(AppCommandError::from)?;
+    let Some(relation) = relation else {
+        return get_folder_conversation_raw_impl(conn, conversation_id, history_request).await;
+    };
+    if relation.source_conversation_id == conversation_id {
+        return Err(AppCommandError::task_execution_failed(
+            "Invalid conversation branch cycle",
+        ));
+    }
+
+    // Branch history is a read-only reference to the source prefix, not copied
+    // conversation rows. Parse both authoritative transcripts, freeze the
+    // source at the persisted fork boundary, then paginate the composed list.
+    // Source turns created after the fork can never leak into this branch.
+    let (mut branch_detail, branch_title) =
+        get_folder_conversation_raw_impl(conn, conversation_id, None).await?;
+    let (mut source_detail, _) = Box::pin(get_folder_conversation_core_impl(
+        conn,
+        relation.source_conversation_id,
+        None,
+        branch_path,
+    ))
+    .await?;
+    let inherited_end = branch_inherited_end(
+        &source_detail.turns,
+        relation.fork_message_id.as_deref(),
+        relation.forked_through_at,
+        relation.inherited_message_count,
+    );
+    source_detail.turns.truncate(inherited_end);
+
+    let source_turn_ids = source_detail
+        .turns
+        .iter()
+        .map(|turn| turn.id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    let inherited_boundary_at = source_detail.turns.last().map(|turn| turn.timestamp);
+    // Raw detail queries load every run owned by the source conversation. A
+    // branch must freeze artifacts at the same immutable boundary as its
+    // messages; otherwise files produced by later source turns leak into an
+    // already-created branch after refresh. Prefer the exact parser turn id
+    // for deliverables and use the run start time for legacy rows/artifacts.
+    source_detail.artifact_runs.retain(|run| {
+        inherited_run_belongs_to_boundary(
+            run.started_at,
+            None,
+            &source_turn_ids,
+            inherited_boundary_at,
+        )
+    });
+    source_detail.deliverable_runs.retain(|run| {
+        inherited_run_belongs_to_boundary(
+            run.started_at,
+            run.user_turn_id.as_deref(),
+            &source_turn_ids,
+            inherited_boundary_at,
+        )
+    });
+    if relation.inheritance_mode == "native_fork" {
+        let local_start = native_branch_local_start(
+            &branch_detail.turns,
+            &source_turn_ids,
+            relation.forked_through_at,
+        );
+        branch_detail.turns.drain(..local_start);
+    }
+
+    let mut inherited_ids = std::collections::HashMap::new();
+    for turn in &mut source_detail.turns {
+        let original = turn.id.clone();
+        let inherited = format!(
+            "branch-inherited:{}:{}:{}",
+            conversation_id, relation.source_conversation_id, original
+        );
+        inherited_ids.insert(original, inherited.clone());
+        turn.id = inherited;
+    }
+    for run in &mut source_detail.deliverable_runs {
+        if let Some(user_turn_id) = run.user_turn_id.as_mut() {
+            if let Some(inherited) = inherited_ids.get(user_turn_id) {
+                *user_turn_id = inherited.clone();
+            }
+        }
+    }
+
+    let inherited_turn_count = source_detail.turns.len();
+    let branch_turn_count = branch_detail.turns.len();
+    source_detail.turns.append(&mut branch_detail.turns);
+    source_detail
+        .artifact_runs
+        .append(&mut branch_detail.artifact_runs);
+    source_detail
+        .deliverable_runs
+        .append(&mut branch_detail.deliverable_runs);
+    branch_detail.turns = source_detail.turns;
+    branch_detail.artifact_runs = source_detail.artifact_runs;
+    branch_detail.deliverable_runs = source_detail.deliverable_runs;
+    branch_detail.summary.message_count = branch_detail.turns.len() as u32;
+    branch_detail.branch_history = Some(crate::models::conversation::ConversationBranchHistory {
+        source_conversation_id: relation.source_conversation_id,
+        fork_message_id: relation.fork_message_id,
+        inherited_turn_count,
+        branch_turn_count,
+        inheritance_mode: relation.inheritance_mode,
+    });
+    branch_detail.history_page = history_request
+        .as_ref()
+        .map(|request| paginate_parsed_turns(&mut branch_detail.turns, request))
+        .transpose()?;
+    Ok((branch_detail, branch_title))
+}
+
+async fn get_folder_conversation_raw_impl(
     conn: &sea_orm::DatabaseConnection,
     conversation_id: i32,
     history_request: Option<ConversationHistoryRequest>,
@@ -1484,6 +1669,7 @@ async fn get_folder_conversation_core_impl(
             deliverables,
             deliverable_runs,
             history_page,
+            branch_history: None,
         },
         parsed_title,
     ))
@@ -2793,6 +2979,82 @@ mod tests {
         assert!(matches!(
             &turns[0].blocks[1],
             ContentBlock::Image { uri: Some(uri), .. } if uri == "clipboard://current"
+        ));
+    }
+
+    #[test]
+    fn branch_history_boundary_is_fixed_and_excludes_later_source_turns() {
+        let base = chrono::DateTime::parse_from_rfc3339("2026-08-22T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let turn = |id: &str, seconds: i64| MessageTurn {
+            id: id.into(),
+            role: TurnRole::User,
+            blocks: vec![ContentBlock::Text { text: id.into() }],
+            timestamp: base + chrono::Duration::seconds(seconds),
+            usage: None,
+            duration_ms: None,
+            model: None,
+            completed_at: Some(base + chrono::Duration::seconds(seconds)),
+        };
+        let turns = vec![
+            turn("early", 1),
+            turn("fork-point", 2),
+            turn("source-after-fork", 3),
+        ];
+
+        assert_eq!(
+            branch_inherited_end(&turns, Some("fork-point"), None, 99),
+            2,
+            "an explicit message boundary wins over a stale count"
+        );
+        assert_eq!(
+            branch_inherited_end(&turns, None, Some(base + chrono::Duration::seconds(2)), 99,),
+            2,
+            "source messages persisted after the fork timestamp cannot leak"
+        );
+        assert_eq!(branch_inherited_end(&turns, None, None, 1), 1);
+
+        let source_ids = ["early".to_string(), "fork-point".to_string()]
+            .into_iter()
+            .collect();
+        let fork_rollout = vec![
+            turn("early", 1),
+            turn("fork-point", 2),
+            turn("branch-first-prompt", 4),
+        ];
+        assert_eq!(
+            native_branch_local_start(
+                &fork_rollout,
+                &source_ids,
+                Some(base + chrono::Duration::seconds(2)),
+            ),
+            2,
+            "the copied native-fork prefix is rendered only through the source reference"
+        );
+        assert!(inherited_run_belongs_to_boundary(
+            base + chrono::Duration::seconds(1),
+            None,
+            &source_ids,
+            Some(base + chrono::Duration::seconds(2)),
+        ));
+        assert!(!inherited_run_belongs_to_boundary(
+            base + chrono::Duration::seconds(3),
+            None,
+            &source_ids,
+            Some(base + chrono::Duration::seconds(2)),
+        ));
+        assert!(inherited_run_belongs_to_boundary(
+            base + chrono::Duration::seconds(99),
+            Some("fork-point"),
+            &source_ids,
+            Some(base + chrono::Duration::seconds(2)),
+        ));
+        assert!(!inherited_run_belongs_to_boundary(
+            base + chrono::Duration::seconds(1),
+            Some("source-after-fork"),
+            &source_ids,
+            Some(base + chrono::Duration::seconds(2)),
         ));
     }
 
@@ -4428,15 +4690,10 @@ mod tests {
         )
         .await;
 
-        notify_conversation_title_updates(
-            &db.conn,
-            &emitter,
-            &chat_channel_manager,
-            vec![row.id],
-        )
-        .await
-        .await
-        .expect("detached title sync task");
+        notify_conversation_title_updates(&db.conn, &emitter, &chat_channel_manager, vec![row.id])
+            .await
+            .await
+            .expect("detached title sync task");
 
         let recorded = title_edits.recorded().await;
         let current = conversation_service::get_by_id(&db.conn, row.id)
@@ -4852,8 +5109,8 @@ mod tests {
             &crate::chat_channel::manager::ChatChannelManager::new(),
             999_999,
         )
-            .await
-            .expect_err("missing folder must surface as error");
+        .await
+        .expect_err("missing folder must surface as error");
         let msg = format!("{err:?}");
         assert!(
             msg.to_lowercase().contains("not found") || msg.to_lowercase().contains("999999"),
@@ -5898,8 +6155,8 @@ mod tests {
             &crate::chat_channel::manager::ChatChannelManager::new(),
             folder_id,
         )
-            .await
-            .expect_err("legacy import must be rejected while an import is in progress");
+        .await
+        .expect_err("legacy import must be rejected while an import is in progress");
         let msg = format!("{err:?}").to_lowercase();
         assert!(
             msg.contains("already in progress"),
@@ -5991,6 +6248,7 @@ mod tests {
             deliverables: Vec::new(),
             deliverable_runs: Vec::new(),
             history_page: None,
+            branch_history: None,
             turns_offset: None,
             turns_total: None,
             assistant_turns_before_offset: None,

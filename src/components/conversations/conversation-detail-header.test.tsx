@@ -5,6 +5,12 @@ import { NextIntlClientProvider } from "next-intl"
 import { describe, expect, it, vi, beforeEach } from "vitest"
 
 import enMessages from "@/i18n/messages/en.json"
+import type {
+  ConversationBranchInfo,
+  CreateConversationBranchRequest,
+  CreateConversationBranchResult,
+  MergeConversationBranchResult,
+} from "@/lib/api"
 
 // The header is a SINGLE instance reused across active tabs, and the global
 // tab-switch / close-tab shortcuts still fire while a rename/delete dialog is
@@ -17,7 +23,11 @@ const h = vi.hoisted(() => ({
   deleteConversation: vi.fn(async () => {}),
   updateConversationStatus: vi.fn(async () => {}),
   updateConversationPinned: vi.fn(async () => {}),
-  createConversationBranch: vi.fn(async () => ({
+  createConversationBranch: vi.fn<
+    (
+      request: CreateConversationBranchRequest
+    ) => Promise<CreateConversationBranchResult>
+  >(async () => ({
     branchConversationId: 9,
     sourceConversationId: 1,
     folderId: 1,
@@ -26,14 +36,20 @@ const h = vi.hoisted(() => ({
     sessionReady: true,
     promptReady: true,
     lifecycleState: "ready",
-    forkMode: "native" as const,
-    inheritanceMode: "native_fork" as const,
+    forkMode: "native",
+    inheritanceMode: "native_fork",
     inheritedMessageCount: 12,
     inheritanceTruncated: false,
   })),
-  getConversationBranchInfo: vi.fn(async () => null),
-  listConversationDeliverables: vi.fn(async () => []),
-  mergeConversationBranch: vi.fn(async () => ({
+  getConversationBranchInfo: vi.fn<
+    (conversationId: number) => Promise<ConversationBranchInfo | null>
+  >(async () => null),
+  mergeConversationBranch: vi.fn<
+    (request: {
+      branchConversationId: number
+      requestId: string
+    }) => Promise<MergeConversationBranchResult>
+  >(async () => ({
     mergeId: "merge-1",
     targetConversationId: 1,
     copiedDeliverableCount: 0,
@@ -53,7 +69,6 @@ vi.mock("@/lib/api", () => ({
   updateConversationPinned: h.updateConversationPinned,
   createConversationBranch: h.createConversationBranch,
   getConversationBranchInfo: h.getConversationBranchInfo,
-  listConversationDeliverables: h.listConversationDeliverables,
   mergeConversationBranch: h.mergeConversationBranch,
 }))
 vi.mock("@/contexts/tab-context", () => ({
@@ -196,10 +211,40 @@ describe("ConversationDetailHeader dialog target snapshot", () => {
     })
   })
 
-  it("accepts the fork-send two-row mapping when the live source becomes the branch", async () => {
+  it("hands Create Branch to the durable tab queue when the runtime accepts it", async () => {
+    let queued: CustomEvent | null = null
+    const listener = (event: Event) => {
+      queued = event as CustomEvent
+      event.preventDefault()
+    }
+    window.addEventListener(
+      "codeg:queue-conversation-branch-creation",
+      listener
+    )
+    const user = userEvent.setup({ pointerEventsCheck: 0 })
+    const { getByLabelText, getByRole } = render(
+      withIntl(<ConversationDetailHeader {...A} />)
+    )
+
+    await user.click(getByLabelText("More actions"))
+    await user.click(getByRole("menuitem", { name: "Create branch" }))
+
+    expect(queued).not.toBeNull()
+    expect(queued!.detail).toMatchObject({
+      conversationId: 1,
+      requestId: expect.any(String),
+    })
+    expect(h.createConversationBranch).not.toHaveBeenCalled()
+    window.removeEventListener(
+      "codeg:queue-conversation-branch-creation",
+      listener
+    )
+  })
+
+  it("keeps the source row unchanged and opens only the new branch", async () => {
     h.createConversationBranch.mockResolvedValueOnce({
-      branchConversationId: 1,
-      sourceConversationId: 9,
+      branchConversationId: 9,
+      sourceConversationId: 1,
       folderId: 1,
       connectionId: "branch-connection",
       branchSessionId: "branch-session",
@@ -221,8 +266,7 @@ describe("ConversationDetailHeader dialog target snapshot", () => {
 
     await waitFor(() => {
       expect(h.openTab.mock.calls).toEqual([
-        [1, 9, "codex", true, "conv-a"],
-        [1, 1, "codex", true, "conv-a · 分支"],
+        [1, 9, "codex", true, "conv-a · 分支"],
       ])
     })
   })
@@ -257,64 +301,58 @@ describe("ConversationDetailHeader dialog target snapshot", () => {
     expect(h.openTab).toHaveBeenCalledWith(1, 9, "codex", true, "conv-a · 分支")
   })
 
-  it("refreshes branch controls when fork-send repoints the active conversation", async () => {
-    h.getConversationBranchInfo
-      .mockResolvedValueOnce(null)
-      .mockResolvedValueOnce({
-        branchConversationId: 1,
-        sourceConversationId: 9,
-        sourceTitle: "conv-a",
-        sourceAvailable: true,
-        forkMessageId: null,
-        forkMode: "native",
-        sourceSessionId: "session-source",
-        branchSessionId: "session-fork",
-        inheritanceMode: "native_fork",
-        inheritedMessageCount: 12,
-        inheritedContextChars: 0,
-        inheritedEstimatedTokens: 0,
-        inheritanceCompressed: false,
-        inheritanceTruncated: false,
-        inheritanceNote: null,
-        forkedThroughAt: "2026-08-22T00:00:00Z",
-        snapshotVersion: 2,
-        snapshotConsumedAt: null,
-        lifecycleState: "ready",
-        lifecycleError: null,
-        lifecycleUpdatedAt: "2026-08-22T00:00:00Z",
-        sessionVerifiedAt: "2026-08-22T00:00:00Z",
-        firstPromptClientMessageId: null,
-        firstPromptQueuedAt: null,
-        firstPromptAcceptedAt: null,
-        initializationRetryCount: 0,
-        lastConnectionId: "connection-fork",
-        snapshotDigest: null,
-        createdAt: "2026-08-22T00:00:00Z",
-        lastMergedAt: null,
-        mergeTargetConversationId: null,
-      })
-    const { rerender, findByRole } = render(
-      withIntl(<ConversationDetailHeader {...A} />)
-    )
-    await waitFor(() => {
-      expect(h.getConversationBranchInfo).toHaveBeenCalledTimes(1)
+  it("returns to the source in one click without a content-selection dialog", async () => {
+    h.getConversationBranchInfo.mockResolvedValueOnce({
+      branchConversationId: 2,
+      sourceConversationId: 1,
+      sourceTitle: "conv-a",
+      sourceAvailable: true,
+      forkMessageId: null,
+      forkMode: "native",
+      sourceSessionId: "session-source",
+      branchSessionId: "session-fork",
+      inheritanceMode: "native_fork",
+      inheritedMessageCount: 12,
+      inheritedContextChars: 0,
+      inheritedEstimatedTokens: 0,
+      inheritanceCompressed: false,
+      inheritanceTruncated: false,
+      inheritanceNote: null,
+      forkedThroughAt: "2026-08-22T00:00:00Z",
+      snapshotVersion: 2,
+      snapshotConsumedAt: null,
+      lifecycleState: "ready",
+      lifecycleError: null,
+      lifecycleUpdatedAt: "2026-08-22T00:00:00Z",
+      sessionVerifiedAt: "2026-08-22T00:00:00Z",
+      firstPromptClientMessageId: null,
+      firstPromptQueuedAt: null,
+      firstPromptAcceptedAt: null,
+      initializationRetryCount: 0,
+      lastConnectionId: "connection-branch",
+      snapshotDigest: null,
+      createdAt: "2026-08-22T00:00:00Z",
+      lastMergedAt: null,
+      mergeTargetConversationId: null,
     })
-
-    // Fork & Send changes the row's title/external session in the workspace
-    // refresh without changing its DB id. That transition must still re-read
-    // the durable branch relation so Return/Merge appear without a reload.
-    rerender(
-      withIntl(<ConversationDetailHeader {...A} title="[Fork] conv-a" />)
+    const user = userEvent.setup({ pointerEventsCheck: 0 })
+    const { findByRole, queryByRole } = render(
+      withIntl(<ConversationDetailHeader {...B} />)
     )
 
-    expect(
-      await findByRole("button", { name: /Branched from: conv-a/ })
-    ).toBeInTheDocument()
-    await userEvent
-      .setup({ pointerEventsCheck: 0 })
-      .click(await findByRole("button", { name: "More actions" }))
-    expect(
+    await user.click(await findByRole("button", { name: "More actions" }))
+    await user.click(
       await findByRole("menuitem", { name: "Merge into main conversation" })
-    ).toBeInTheDocument()
+    )
+
+    await waitFor(() => {
+      expect(h.mergeConversationBranch).toHaveBeenCalledWith({
+        branchConversationId: 2,
+        requestId: expect.any(String),
+      })
+      expect(h.openTab).toHaveBeenCalledWith(1, 1, "codex", true, "conv-a")
+      expect(h.closeTab).toHaveBeenCalledWith("tab-b")
+    })
+    expect(queryByRole("dialog")).not.toBeInTheDocument()
   })
 })

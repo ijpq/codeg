@@ -1173,7 +1173,19 @@ pub async fn list_by_folder(
         _ => query.order_by_desc(conversation::Column::CreatedAt),
     };
 
-    let rows = query.all(conn).await?;
+    let merged_branch_ids: std::collections::HashSet<i32> = conversation_branch::Entity::find()
+        .filter(conversation_branch::Column::LifecycleState.eq("merged"))
+        .all(conn)
+        .await?
+        .into_iter()
+        .map(|row| row.branch_conversation_id)
+        .collect();
+    let rows = query
+        .all(conn)
+        .await?
+        .into_iter()
+        .filter(|row| !merged_branch_ids.contains(&row.id))
+        .collect::<Vec<_>>();
 
     let mut summaries: Vec<DbConversationSummary> = rows.into_iter().map(conv_to_summary).collect();
     fill_child_counts(conn, &mut summaries).await?;
@@ -1256,7 +1268,19 @@ pub async fn list_all(
         _ => query.order_by_desc(conversation::Column::UpdatedAt),
     };
 
-    let rows = query.all(conn).await?;
+    let merged_branch_ids: std::collections::HashSet<i32> = conversation_branch::Entity::find()
+        .filter(conversation_branch::Column::LifecycleState.eq("merged"))
+        .all(conn)
+        .await?
+        .into_iter()
+        .map(|row| row.branch_conversation_id)
+        .collect();
+    let rows = query
+        .all(conn)
+        .await?
+        .into_iter()
+        .filter(|row| !merged_branch_ids.contains(&row.id))
+        .collect::<Vec<_>>();
     let mut summaries: Vec<DbConversationSummary> = rows.into_iter().map(conv_to_summary).collect();
     fill_child_counts(conn, &mut summaries).await?;
     Ok(summaries)

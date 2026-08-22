@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::{Arc, LazyLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -18,12 +19,36 @@ use crate::db::service::{
 };
 use crate::db::AppDatabase;
 use crate::web::event_bridge::EventEmitter;
+
+static BRANCH_CREATION_FLIGHTS: LazyLock<
+    tokio::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+> = LazyLock::new(|| tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
+async fn lock_branch_creation_request(request_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    let lock = {
+        let mut flights = BRANCH_CREATION_FLIGHTS.lock().await;
+        // The map retains one Arc after a completed request. Drop those idle
+        // keys opportunistically so long-running servers do not accumulate an
+        // entry for every branch ever created; active guards/waiters keep the
+        // strong count above one and are never removed.
+        flights.retain(|_, flight| Arc::strong_count(flight) > 1);
+        flights
+            .entry(request_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    };
+    lock.lock_owned().await
+}
 #[cfg(feature = "tauri-runtime")]
 use tauri::Manager;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateConversationBranchRequest {
+    /// Stable idempotency key shared by Create Branch and Fork & Send. A lost
+    /// HTTP response or a reloaded persisted queue must resolve to the same
+    /// branch instead of forking twice.
+    pub request_id: Option<String>,
     pub source_conversation_id: i32,
     pub fork_message_id: Option<String>,
     pub snapshot_context: Option<String>,
@@ -105,8 +130,7 @@ fn stable_source_turn_count(turns: &[crate::models::MessageTurn]) -> usize {
     turns
         .iter()
         .rposition(|turn| {
-            matches!(turn.role, crate::models::TurnRole::Assistant)
-                && turn.completed_at.is_some()
+            matches!(turn.role, crate::models::TurnRole::Assistant) && turn.completed_at.is_some()
         })
         .map_or(0, |index| index + 1)
 }
@@ -119,6 +143,67 @@ pub async fn create_conversation_branch_core(
     owner_label: String,
     request: CreateConversationBranchRequest,
 ) -> Result<CreateConversationBranchResult, AppCommandError> {
+    let creation_request_id = request
+        .request_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .or_else(|| Some(uuid::Uuid::new_v4().to_string()));
+    // The idempotency row does not exist until a potentially long native fork
+    // has created and verified S2. Single-flight the whole protocol operation,
+    // then re-read the durable result below; otherwise two retries with one
+    // client id could create two child sessions before the unique index becomes
+    // able to arbitrate.
+    let _creation_guard = match creation_request_id.as_deref() {
+        Some(request_id) => Some(lock_branch_creation_request(request_id).await),
+        None => None,
+    };
+    if let Some(request_id) = creation_request_id.as_deref() {
+        if let Some(existing) =
+            conversation_branch_service::get_by_creation_request_id(&db.conn, request_id)
+                .await
+                .map_err(AppCommandError::from)?
+        {
+            let branch = conversation_service::get_by_id(&db.conn, existing.branch_conversation_id)
+                .await
+                .map_err(AppCommandError::from)?;
+            let connection_id = manager
+                .find_connection_by_conversation_id(existing.branch_conversation_id)
+                .await;
+            let prompt_ready = if let Some(connection_id) = connection_id.as_deref() {
+                manager.get_state(connection_id).await.is_some_and(|state| {
+                    state
+                        .try_read()
+                        .is_ok_and(|state| state.status == ConnectionStatus::Connected)
+                })
+            } else {
+                false
+            };
+            tracing::info!(
+                creation_request_id = request_id,
+                source_conversation_id = existing.source_conversation_id,
+                branch_conversation_id = existing.branch_conversation_id,
+                lifecycle_state = existing.lifecycle_state,
+                "[ACP][branch] deduplicated branch creation request"
+            );
+            return Ok(CreateConversationBranchResult {
+                branch_conversation_id: existing.branch_conversation_id,
+                source_conversation_id: existing.source_conversation_id,
+                folder_id: branch.folder_id,
+                connection_id,
+                branch_session_id: existing.branch_session_id,
+                session_ready: existing.session_verified_at.is_some(),
+                prompt_ready,
+                lifecycle_state: existing.lifecycle_state,
+                fork_mode: existing.fork_mode,
+                inheritance_mode: existing.inheritance_mode,
+                inherited_message_count: existing.inherited_message_count,
+                inheritance_truncated: existing.inheritance_truncated,
+                fallback_reason: existing.lifecycle_error,
+            });
+        }
+    }
     // A stale `conversation.status = in_progress` must not force a latest-tail
     // branch down the lossy snapshot path. Reconcile durable runs first, then
     // use the live connection itself as the authority for whether the source
@@ -179,206 +264,190 @@ pub async fn create_conversation_branch_core(
     let fallback_reason;
     if native_candidate {
         let session_id = source.external_id.clone().unwrap_or_default();
-        // An idle source tab already owns the only writer Codex permits for
-        // this thread. Reuse the exact same atomic two-row operation as Fork &
-        // Send: the current row becomes S2 (the branch), a sibling row keeps S1
-        // (the source), and the durable branch relation is committed in the
-        // same transaction. Starting an isolated writer here used to race the
-        // source tab's restore and produced `already has an active writer`.
-        if let Some(connection_id) = idle_source_connection_id.clone() {
-            match manager
-                .fork_session(db, &connection_id, Some(source.id), Some(source.folder_id))
-                .await
-            {
-                Ok(result) => {
-                    if let Err(error) = ensure_independent_fork_session(
-                        &result.original_session_id,
-                        &result.forked_session_id,
-                    ) {
-                        return Err(branch_session_start_error(
-                            "Native branch did not return an independent session",
-                            &error,
-                        ));
-                    }
-                    let inherited_message_count =
-                        i32::try_from(source.message_count).unwrap_or(i32::MAX);
-                    tracing::info!(
-                        source_conversation_id = result.sibling_conversation_id,
-                        branch_conversation_id = source.id,
-                        source_session_id = result.original_session_id,
-                        branch_session_id = result.forked_session_id,
-                        connection_id,
-                        inheritance_mode = "native_fork",
-                        mapping_strategy = "fork_send_atomic_two_row",
-                        "[ACP][branch] menu branch reused the live native fork mapping"
-                    );
-                    return Ok(CreateConversationBranchResult {
-                        branch_conversation_id: source.id,
-                        source_conversation_id: result.sibling_conversation_id,
-                        folder_id: source.folder_id,
-                        connection_id: Some(connection_id),
-                        branch_session_id: Some(result.forked_session_id),
-                        session_ready: true,
-                        prompt_ready: true,
-                        lifecycle_state: "ready".into(),
-                        fork_mode: "native".into(),
-                        inheritance_mode: "native_fork".into(),
-                        inherited_message_count,
-                        inheritance_truncated: false,
-                        fallback_reason: None,
-                    });
-                }
-                Err(error) => {
-                    use_stable_boundary |= matches!(&error, AcpError::TurnInProgress);
-                    fallback_reason = Some(error.to_string());
-                }
-            }
-        } else {
-            let native_attempt: Result<(String, String), AcpError> = async {
-                // Native branching loads the source session on an isolated ACP
-                // handle. Serialize that writer with persisted-conversation
-                // restore; otherwise a tab switch during branch creation can
-                // issue resume/load for the same Codex thread and both fail
-                // with `already has an active writer`.
-                let _session_operation_guard = manager
-                    .lock_session_operation(
-                        source.agent_type,
-                        Some(Path::new(&folder.path)),
-                        &session_id,
-                    )
-                    .await?;
-                let runtime_env = build_session_runtime_env(
-                    db,
+        let native_attempt: Result<(String, String), AcpError> = async {
+            // One durable Codex thread may have only one writer.  Serialize the
+            // whole handoff by external session id, fork on the current writer
+            // when it exists, and retire that adapter before loading S2 in a
+            // fresh process.  The source conversation row is never renamed or
+            // rebound and can restore S1 normally after this lock is released.
+            let _source_session_guard = manager
+                .lock_session_operation(
                     source.agent_type,
-                    Some(session_id.as_str()),
-                    data_dir,
+                    Some(Path::new(&folder.path)),
+                    &session_id,
                 )
                 .await?;
-                let connection_id = manager
-                    .spawn_isolated_session(
+            let source_connection_id =
+                if let Some(connection_id) = idle_source_connection_id.clone() {
+                    connection_id
+                } else {
+                    let runtime_env = build_session_runtime_env(
+                        db,
                         source.agent_type,
-                        Some(folder.path.clone()),
-                        session_id.clone(),
-                        runtime_env,
-                        owner_label.clone(),
-                        emitter.clone(),
-                        request.preferred_mode_id.clone(),
-                        request.preferred_config_values.clone(),
+                        Some(session_id.as_str()),
+                        data_dir,
                     )
                     .await?;
-                match manager.fork_protocol_only(&connection_id).await {
-                    Ok(result) => {
-                        if let Err(error) = ensure_independent_fork_session(
-                            &session_id,
-                            &result.forked_session_id,
-                        ) {
-                            let _ = manager.disconnect(&connection_id).await;
-                            Err(error)
-                        } else {
-                            Ok((connection_id, result.forked_session_id))
-                        }
+                    manager
+                        .spawn_isolated_session(
+                            source.agent_type,
+                            Some(folder.path.clone()),
+                            session_id.clone(),
+                            runtime_env,
+                            owner_label.clone(),
+                            emitter.clone(),
+                            request.preferred_mode_id.clone(),
+                            request.preferred_config_values.clone(),
+                        )
+                        .await?
+                };
+            let protocol_result = match manager.fork_protocol_detached(&source_connection_id).await
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    if idle_source_connection_id.is_none() {
+                        let _ = manager.disconnect(&source_connection_id).await;
                     }
-                    Err(error) => {
-                        let _ = manager.disconnect(&connection_id).await;
-                        Err(error)
-                    }
+                    return Err(error);
                 }
-            }
-            .await;
-            match native_attempt {
-                Ok((connection_id, forked_session_id)) => {
-                    let inherited_message_count =
-                        i32::try_from(source.message_count).unwrap_or(i32::MAX);
-                    let (branch, _) = match conversation_branch_service::create_branch_row(
-                        &db.conn,
-                        &source,
-                        Some(forked_session_id.clone()),
-                        None,
-                        "native",
-                        conversation_branch_service::BranchInheritanceRecord {
-                            source_session_id: source.external_id.clone(),
-                            branch_session_id: Some(forked_session_id.clone()),
+            };
+            ensure_independent_fork_session(
+                &protocol_result.original_session_id,
+                &protocol_result.forked_session_id,
+            )?;
+
+            let branch_session_id = protocol_result.forked_session_id;
+            let _branch_session_guard = manager
+                .lock_session_operation(
+                    source.agent_type,
+                    Some(Path::new(&folder.path)),
+                    &branch_session_id,
+                )
+                .await?;
+            let runtime_env = build_session_runtime_env(
+                db,
+                source.agent_type,
+                Some(branch_session_id.as_str()),
+                data_dir,
+            )
+            .await?;
+            let branch_connection_id = manager
+                .spawn_isolated_session(
+                    source.agent_type,
+                    Some(folder.path.clone()),
+                    branch_session_id.clone(),
+                    runtime_env,
+                    owner_label.clone(),
+                    emitter.clone(),
+                    request.preferred_mode_id.clone(),
+                    request.preferred_config_values.clone(),
+                )
+                .await?;
+            Ok((branch_connection_id, branch_session_id))
+        }
+        .await;
+        match native_attempt {
+            Ok((connection_id, forked_session_id)) => {
+                let inherited_message_count =
+                    i32::try_from(source.message_count).unwrap_or(i32::MAX);
+                let persisted = conversation_branch_service::create_branch_row_with_request(
+                    &db.conn,
+                    &source,
+                    creation_request_id.clone(),
+                    Some(forked_session_id.clone()),
+                    None,
+                    "native",
+                    inheritance_record(
+                        &BranchInheritanceSnapshot {
+                            context: String::new(),
                             inheritance_mode: "native_fork".into(),
                             inherited_message_count,
-                            inherited_context_chars: 0,
-                            inherited_estimated_tokens: 0,
-                            inheritance_compressed: false,
-                            inheritance_truncated: false,
-                            inheritance_note: Some(
-                                "ACP session/fork created a distinct session with the complete native context; no CodeG snapshot was injected."
-                                    .into()
+                            context_chars: 0,
+                            estimated_tokens: 0,
+                            source_context_chars: 0,
+                            source_estimated_tokens: 0,
+                            compressed: false,
+                            truncated: false,
+                            note: Some(
+                                "ACP session/fork created an independent session with the complete native context."
+                                    .into(),
                             ),
+                            fork_message_id: None,
                             forked_through_at: Some(chrono::Utc::now()),
                             snapshot_version: 2,
-                            snapshot_context: None,
-                            snapshot_images: Vec::new(),
+                            images: Vec::new(),
                         },
-                    )
-                    .await
-                    {
-                        Ok(created) => created,
-                        Err(error) => {
-                            // The isolated writer now points at the fork.
-                            // Closing it leaves the source row on S1; the
-                            // unreferenced S2 rollout remains auditable.
-                            let _ = manager.disconnect(&connection_id).await;
-                            return Err(AppCommandError::from(error));
-                        }
-                    };
-                    if let Err(error) = manager
-                        .bind_connection_to_conversation(
-                            &connection_id,
-                            branch.id,
-                            branch.folder_id,
-                        )
-                        .await
-                    {
-                        let cleanup = conversation_branch_service::remove_incomplete_branch(
-                            &db.conn, branch.id,
-                        )
-                        .await;
-                        let _ = manager.disconnect(&connection_id).await;
+                        source.external_id.clone(),
+                        Some(forked_session_id.clone()),
+                        None,
+                    ),
+                )
+                .await;
+                let (branch, _) = match persisted {
+                    Ok(persisted) => persisted,
+                    Err(error) => {
+                        let connection_cleanup = manager.disconnect(&connection_id).await;
                         tracing::error!(
-                            branch_conversation_id = branch.id,
+                            source_conversation_id = source.id,
+                            branch_session_id = forked_session_id,
                             connection_id,
                             error = %error,
-                            cleanup_error = ?cleanup.as_ref().err(),
-                            "[ACP][branch] native branch bind failed; incomplete row removed"
+                            connection_cleanup_error = ?connection_cleanup.as_ref().err(),
+                            "[ACP][branch] native session was verified but its atomic database mapping failed"
                         );
-                        return Err(branch_session_start_error(
-                            "Branch session was created but could not be attached",
-                            &error,
-                        ));
+                        return Err(AppCommandError::from(error));
                     }
-                    emit_conversation_upsert(emitter, &db.conn, branch.id).await;
-                    tracing::info!(
-                        source_conversation_id = source.id,
+                };
+                if let Err(error) = manager
+                    .bind_connection_to_conversation(&connection_id, branch.id, branch.folder_id)
+                    .await
+                {
+                    let cleanup =
+                        conversation_branch_service::remove_incomplete_branch(&db.conn, branch.id)
+                            .await;
+                    let _ = manager.disconnect(&connection_id).await;
+                    tracing::error!(
                         branch_conversation_id = branch.id,
-                        source_session_id = source.external_id,
-                        branch_session_id = forked_session_id,
-                        inheritance_mode = "native_fork",
-                        "[ACP][branch] independent native branch persisted"
+                        connection_id,
+                        error = %error,
+                        cleanup_error = ?cleanup.as_ref().err(),
+                        "[ACP][branch] verified native branch bind failed; row rolled back"
                     );
-                    return Ok(CreateConversationBranchResult {
-                        branch_conversation_id: branch.id,
-                        source_conversation_id: source.id,
-                        folder_id: branch.folder_id,
-                        connection_id: Some(connection_id),
-                        branch_session_id: Some(forked_session_id),
-                        session_ready: true,
-                        prompt_ready: true,
-                        lifecycle_state: "ready".into(),
-                        fork_mode: "native".into(),
-                        inheritance_mode: "native_fork".into(),
-                        inherited_message_count,
-                        inheritance_truncated: false,
-                        fallback_reason: None,
-                    });
+                    return Err(branch_session_start_error(
+                        "Branch session was verified but could not be attached",
+                        &error,
+                    ));
                 }
-                Err(error) => {
-                    use_stable_boundary |= matches!(&error, AcpError::TurnInProgress);
-                    fallback_reason = Some(error.to_string());
-                }
+                emit_conversation_upsert(emitter, &db.conn, source.id).await;
+                emit_conversation_upsert(emitter, &db.conn, branch.id).await;
+                tracing::info!(
+                    source_conversation_id = source.id,
+                    branch_conversation_id = branch.id,
+                    source_session_id = source.external_id,
+                    branch_session_id = forked_session_id,
+                    connection_id,
+                    mapping_strategy = "immutable_source_detached_writer_handoff",
+                    "[ACP][branch] verified native branch persisted"
+                );
+                return Ok(CreateConversationBranchResult {
+                    branch_conversation_id: branch.id,
+                    source_conversation_id: source.id,
+                    folder_id: branch.folder_id,
+                    connection_id: Some(connection_id),
+                    branch_session_id: Some(forked_session_id),
+                    session_ready: true,
+                    prompt_ready: true,
+                    lifecycle_state: "ready".into(),
+                    fork_mode: "native".into(),
+                    inheritance_mode: "native_fork".into(),
+                    inherited_message_count,
+                    inheritance_truncated: false,
+                    fallback_reason: None,
+                });
+            }
+            Err(error) => {
+                use_stable_boundary |= matches!(&error, AcpError::TurnInProgress);
+                fallback_reason = Some(error.to_string());
             }
         }
     } else if request.fork_message_id.is_some() {
@@ -486,9 +555,10 @@ pub async fn create_conversation_branch_core(
         "[ACP][branch] persisting provisional snapshot branch"
     );
     let snapshot = inheritance.context.clone();
-    let (branch, relation) = conversation_branch_service::create_branch_row(
+    let (branch, relation) = conversation_branch_service::create_branch_row_with_request(
         &db.conn,
         &source,
+        creation_request_id,
         None,
         inheritance.fork_message_id.clone(),
         "snapshot",
@@ -537,22 +607,182 @@ pub async fn create_conversation_branch_core(
 
 pub async fn merge_conversation_branch_core(
     db: &AppDatabase,
+    manager: &ConnectionManager,
     emitter: &EventEmitter,
     branch_conversation_id: i32,
     request_id: String,
-    summary: String,
-    deliverable_ids: Vec<String>,
 ) -> Result<conversation_branch_service::MergeBranchResult, AppCommandError> {
+    tracing::info!(
+        branch_conversation_id,
+        merge_request_id = request_id,
+        stage = "branch_merge_started",
+        "[ACP][branch] one-click return to source started"
+    );
+    manager
+        .reconcile_conversation_runs(&db.conn, branch_conversation_id)
+        .await
+        .map_err(|error| {
+            AppCommandError::task_execution_failed(format!(
+                "The branch state could not be reconciled before returning to its source: {error}"
+            ))
+        })?;
+    let branch_connection_id = manager
+        .find_connection_by_conversation_id(branch_conversation_id)
+        .await;
+    if let Some(connection_id) = branch_connection_id.as_deref() {
+        let is_running = manager.get_state(connection_id).await.is_some_and(|state| {
+            state.try_read().is_ok_and(|state| {
+                state.turn_in_flight || state.status == ConnectionStatus::Prompting
+            })
+        });
+        if is_running {
+            manager
+                .cancel(&db.conn, connection_id)
+                .await
+                .map_err(|error| {
+                    AppCommandError::task_execution_failed(format!(
+                        "The branch could not be stopped before returning to its source: {error}"
+                    ))
+                })?;
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(35);
+            loop {
+                if artifact_service::active_runs_for_conversation(&db.conn, branch_conversation_id)
+                    .await?
+                    .is_empty()
+                {
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(AppCommandError::task_execution_failed(
+                        "The branch is still stopping; its results were preserved. Retry return to source shortly.",
+                    ));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+    }
+    if !artifact_service::active_runs_for_conversation(&db.conn, branch_conversation_id)
+        .await?
+        .is_empty()
+    {
+        return Err(AppCommandError::task_execution_failed(
+            "The branch still has an active turn without a controllable connection; its results were preserved. Retry after restoring the branch.",
+        ));
+    }
+
+    let (detail, _) = get_folder_conversation_core(&db.conn, branch_conversation_id).await?;
+    let inherited = detail
+        .branch_history
+        .as_ref()
+        .map_or(0, |history| history.inherited_turn_count)
+        .min(detail.turns.len());
+    let branch_title = detail.summary.title.as_deref().unwrap_or("未命名分支");
+    let mut sections = Vec::new();
+    for turn in detail.turns.iter().skip(inherited) {
+        let text = turn
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                crate::models::ContentBlock::Text { text } if !text.trim().is_empty() => {
+                    Some(text.trim())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if text.is_empty() {
+            continue;
+        }
+        let label = match turn.role {
+            crate::models::TurnRole::User => "用户",
+            crate::models::TurnRole::Assistant => "助手",
+            _ => continue,
+        };
+        sections.push(format!("### {label}\n{text}"));
+    }
+    let mut seen_changes = std::collections::HashSet::new();
+    let mut file_changes = Vec::new();
+    for run in detail
+        .artifact_runs
+        .iter()
+        .filter(|run| run.conversation_id == branch_conversation_id)
+    {
+        for change in &run.changes {
+            let path = change.path.trim();
+            if path.is_empty() {
+                continue;
+            }
+            let old_path = change.old_path.as_deref().map(str::trim).unwrap_or("");
+            let identity = (change.kind.as_str(), old_path, path);
+            if !seen_changes.insert(identity) {
+                continue;
+            }
+            let path = path.replace(['\r', '\n'], " ");
+            let old_path = old_path.replace(['\r', '\n'], " ");
+            let description = match (change.kind.as_str(), old_path.is_empty()) {
+                ("created", _) => format!("创建 `{path}`"),
+                ("modified", _) => format!("修改 `{path}`"),
+                ("deleted", _) => format!("删除 `{path}`"),
+                ("renamed", false) => format!("移动 `{old_path}` → `{path}`"),
+                (kind, _) => format!("{kind} `{path}`"),
+            };
+            file_changes.push(format!("- {description}"));
+        }
+    }
+    if !file_changes.is_empty() {
+        sections.push(format!("### 文件变更\n{}", file_changes.join("\n")));
+    }
+    let summary = format!(
+        "## 分支回归：{branch_title}\n\n合并时间：{}\n\n{}",
+        chrono::Utc::now().to_rfc3339(),
+        if sections.is_empty() {
+            "分支没有新增可见消息；有效产物和文件引用仍已一并回传。".to_string()
+        } else {
+            sections.join("\n\n")
+        }
+    );
     let result = conversation_branch_service::merge_branch(
         &db.conn,
         branch_conversation_id,
         request_id,
         summary,
-        deliverable_ids,
+        Vec::new(),
     )
     .await
     .map_err(AppCommandError::from)?;
+    if let Some(connection_id) = branch_connection_id.as_deref() {
+        if let Err(error) = manager.disconnect(connection_id).await {
+            tracing::warn!(
+                branch_conversation_id,
+                connection_id,
+                error = %error,
+                stage = "merged_branch_connection_cleanup_failed",
+                "[ACP][branch] merge committed; idle branch connection cleanup will retry via sweep"
+            );
+        }
+    }
     emit_conversation_upsert(emitter, &db.conn, result.target_conversation_id).await;
+    // A merged branch remains queryable/auditable in the database but leaves
+    // every client's active workspace immediately. Reuse the tab-version
+    // barrier so an older debounced save cannot resurrect its tab after a
+    // reload, and use the list's removal event without soft-deleting the row.
+    crate::commands::conversations::cleanup_tabs_for_deleted_conversation(
+        emitter,
+        &db.conn,
+        branch_conversation_id,
+    )
+    .await;
+    crate::commands::conversations::emit_conversation_deleted(emitter, branch_conversation_id);
+    tracing::info!(
+        branch_conversation_id,
+        source_conversation_id = result.target_conversation_id,
+        merge_id = result.merge_id,
+        copied_deliverable_count = result.copied_deliverable_count,
+        deduplicated = result.deduplicated,
+        lifecycle_state = "merged",
+        stage = "branch_merge_completed",
+        "[ACP][branch] one-click return to source committed"
+    );
     Ok(result)
 }
 
@@ -560,6 +790,12 @@ pub async fn get_conversation_branch_info_core(
     db: &AppDatabase,
     conversation_id: i32,
 ) -> Result<Option<conversation_branch_service::ConversationBranchInfo>, AppCommandError> {
+    conversation_branch_service::repair_empty_snapshot_as_provisional(&db.conn, conversation_id)
+        .await
+        .map_err(AppCommandError::from)?;
+    conversation_branch_service::normalize_legacy_branch_metadata(&db.conn, conversation_id)
+        .await
+        .map_err(AppCommandError::from)?;
     if let Some(info) = conversation_branch_service::get_info(&db.conn, conversation_id)
         .await
         .map_err(AppCommandError::from)?
@@ -605,13 +841,22 @@ pub async fn get_conversation_branch_info_core(
     let Some(parent_session_id) = parent_session_id else {
         return Ok(None);
     };
-    conversation_branch_service::repair_native_fork_relation(
+    let repaired = conversation_branch_service::repair_native_fork_relation(
         &db.conn,
         conversation_id,
         &parent_session_id,
     )
     .await
-    .map_err(AppCommandError::from)
+    .map_err(AppCommandError::from)?;
+    if repaired.is_some() {
+        conversation_branch_service::normalize_legacy_branch_metadata(&db.conn, conversation_id)
+            .await
+            .map_err(AppCommandError::from)?;
+        return conversation_branch_service::get_info(&db.conn, conversation_id)
+            .await
+            .map_err(AppCommandError::from);
+    }
+    Ok(None)
 }
 
 #[cfg(feature = "tauri-runtime")]
@@ -628,15 +873,29 @@ pub async fn create_conversation_branch(
         .app_data_dir()
         .map(|path| crate::paths::resolve_effective_data_dir(&path))
         .unwrap_or_else(|_| std::path::PathBuf::from("."));
-    create_conversation_branch_core(
-        &db,
-        &manager,
-        &EventEmitter::Tauri(app),
-        data_dir.as_path(),
-        window.label().to_string(),
-        request,
-    )
+    let owned_db = AppDatabase {
+        conn: db.conn.clone(),
+    };
+    let owned_manager = manager.clone_ref();
+    let emitter = EventEmitter::Tauri(app);
+    let owner_label = window.label().to_string();
+    tokio::spawn(async move {
+        create_conversation_branch_core(
+            &owned_db,
+            &owned_manager,
+            &emitter,
+            data_dir.as_path(),
+            owner_label,
+            request,
+        )
+        .await
+    })
     .await
+    .map_err(|error| {
+        AppCommandError::task_execution_failed(format!(
+            "Branch creation task stopped unexpectedly: {error}"
+        ))
+    })?
 }
 
 #[cfg(feature = "tauri-runtime")]
@@ -652,19 +911,17 @@ pub async fn get_conversation_branch_info(
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn merge_conversation_branch(
     db: tauri::State<'_, AppDatabase>,
+    manager: tauri::State<'_, ConnectionManager>,
     app: tauri::AppHandle,
     branch_conversation_id: i32,
     request_id: String,
-    summary: String,
-    deliverable_ids: Vec<String>,
 ) -> Result<conversation_branch_service::MergeBranchResult, AppCommandError> {
     merge_conversation_branch_core(
         &db,
+        &manager,
         &EventEmitter::Tauri(app),
         branch_conversation_id,
         request_id,
-        summary,
-        deliverable_ids,
     )
     .await
 }
@@ -744,6 +1001,7 @@ mod tests {
             Path::new("/tmp/codeg-message-branch-data"),
             "test".into(),
             CreateConversationBranchRequest {
+                request_id: None,
                 source_conversation_id: source_id,
                 fork_message_id: Some("message-4".into()),
                 snapshot_context: Some("User: context through message four".into()),
@@ -821,6 +1079,7 @@ mod tests {
             Path::new("/tmp/codeg-running-source-branch-data"),
             "test".into(),
             CreateConversationBranchRequest {
+                request_id: None,
                 source_conversation_id: source_id,
                 fork_message_id: None,
                 snapshot_context: Some("last committed context".into()),
@@ -848,22 +1107,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn menu_branch_reuses_idle_writer_and_the_fork_send_mapping() {
+    async fn native_fork_handoff_retires_the_source_writer() {
         use crate::acp::connection::ConnectionCommand;
 
-        let db = fresh_in_memory_db().await;
         let folder_path = "/tmp/codeg-menu-native-branch";
-        let folder_id = seed_folder(&db, folder_path).await;
-        let source_id = seed_conversation(&db, folder_id, AgentType::ClaudeCode).await;
-        conversation_service::bind_external_id(&db.conn, source_id, "session-source", &[])
-            .await
-            .unwrap();
-
         let manager = ConnectionManager::new();
         let mut commands = manager
             .insert_test_connection_live(
                 "idle-source-writer",
-                AgentType::ClaudeCode,
+                AgentType::Codex,
                 Some(std::path::PathBuf::from(folder_path)),
                 EventEmitter::Noop,
             )
@@ -872,52 +1124,26 @@ mod tests {
         {
             let mut state = state.write().await;
             state.external_id = Some("session-source".into());
-            state.conversation_id = Some(source_id);
-            state.folder_id = Some(folder_id);
         }
+        let manager_for_exit = manager.clone_ref();
         let fork_reply = tokio::spawn(async move {
-            if let Some(ConnectionCommand::Fork { reply }) = commands.recv().await {
+            if let Some(ConnectionCommand::ForkDetached { reply }) = commands.recv().await {
                 let _ = reply.send(Ok(crate::acp::types::ForkProtocolResult {
                     forked_session_id: "session-branch".into(),
                     original_session_id: "session-source".into(),
                 }));
+                let _ = manager_for_exit.disconnect("idle-source-writer").await;
             }
         });
 
-        let result = create_conversation_branch_core(
-            &db,
-            &manager,
-            &EventEmitter::Noop,
-            Path::new("/tmp/codeg-menu-native-branch-data"),
-            "test".into(),
-            CreateConversationBranchRequest {
-                source_conversation_id: source_id,
-                fork_message_id: None,
-                snapshot_context: None,
-                preferred_mode_id: None,
-                preferred_config_values: BTreeMap::new(),
-            },
-        )
-        .await
-        .expect("menu branch should fork the existing writer");
+        let result = manager
+            .fork_protocol_detached("idle-source-writer")
+            .await
+            .expect("detached fork result");
         fork_reply.await.unwrap();
 
-        assert_eq!(result.branch_conversation_id, source_id);
-        assert_ne!(result.source_conversation_id, source_id);
-        assert_eq!(result.branch_session_id.as_deref(), Some("session-branch"));
-        let branch = conversation_service::get_by_id(&db.conn, source_id)
-            .await
-            .unwrap();
-        let source = conversation_service::get_by_id(&db.conn, result.source_conversation_id)
-            .await
-            .unwrap();
-        assert_eq!(branch.external_id.as_deref(), Some("session-branch"));
-        assert_eq!(source.external_id.as_deref(), Some("session-source"));
-        let relation = conversation_branch_service::get_info(&db.conn, source_id)
-            .await
-            .unwrap()
-            .expect("fork-send relation");
-        assert_eq!(relation.source_conversation_id, result.source_conversation_id);
-        assert_eq!(relation.inheritance_mode, "native_fork");
+        assert_eq!(result.original_session_id, "session-source");
+        assert_eq!(result.forked_session_id, "session-branch");
+        assert!(manager.get_state("idle-source-writer").await.is_none());
     }
 }

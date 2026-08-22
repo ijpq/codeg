@@ -47,7 +47,10 @@ import { buildQuotedMarkdown } from "@/lib/message-quote"
 import { useConnectionLifecycle } from "@/hooks/use-connection-lifecycle"
 import {
   isQueuedGuideTargetCurrent,
+  enqueuePersistedMessageForConversation,
+  QUEUE_BRANCH_CREATION_EVENT,
   useMessageQueue,
+  type QueueBranchCreationRequest,
   type QueuedMessage,
 } from "@/hooks/use-message-queue"
 import { MessageListView } from "@/components/message/message-list-view"
@@ -84,7 +87,6 @@ import { useZoomLevel } from "@/hooks/use-appearance"
 import { isDesktop, isLocalDesktop } from "@/lib/platform"
 import { leftChromeReserve, rightChromeReserve } from "@/lib/window-chrome"
 import {
-  acpFork,
   createConversationBranch,
   createChatConversation,
   createChatDir,
@@ -105,12 +107,10 @@ import {
 } from "@/lib/prompt-delivery-state"
 import {
   flushRetryDelayMs,
-  forkSendBlockedByQueue,
   isConnectionReady,
   shouldQueueDirectSend,
   shouldRejectDuplicateCreate,
 } from "@/lib/queue-flush"
-import { TurnBusyError } from "@/lib/turn-busy"
 import {
   getConversationIdByExternalIdFromStore,
   getRuntimeSession,
@@ -1017,7 +1017,7 @@ const ConversationTabView = memo(function ConversationTabView({
     // the queued prompt to the wrong folder's agent. (No-op for normal
     // conversations, whose connection cwd always equals the intended one.)
     if (runtimeSyncState === "awaiting_persist") return
-    if (!mqPeekNext("prompt")) return
+    if (msgQueue[0]?.intent !== "prompt" || !mqPeekNext("prompt")) return
     // setTimeout (not microtask) so a COMPLETE_TURN commit settles first AND so
     // a just-bounced retry waits out the backoff window before re-sending.
     const wait = flushRetryDelayMs(Date.now(), lastFlushBounceAtRef.current)
@@ -1598,92 +1598,107 @@ const ConversationTabView = memo(function ConversationTabView({
   }, [handleSend])
 
   const handleForkSend = useCallback(
-    // Fire-and-forget: the input clears the draft synchronously on click (like a
-    // normal send), so there is no in-flight editable window. If the fork can't
-    // run right now — disconnected, or the queue is non-empty (a fork is an
-    // immediate session side effect and must not jump ahead of queued items) —
-    // the draft is NOT lost: it is queued as a normal send (it flushes after any
-    // queued items). The same on a fork failure.
-    async (draft: PromptDraft, selectedModeIdArg?: string | null) => {
-      const connectionId = conn.connectionId
-      if (
-        !connectionId ||
-        connStatus !== "connected" ||
-        // Read the queue length SYNCHRONOUSLY so a draft re-queued by a same-
-        // tick bounce is seen even before React commits. The UI also hides the
-        // fork affordance while the queue is non-empty; this is the guard.
-        forkSendBlockedByQueue(mqGetQueueLength())
-      ) {
-        mqEnqueue(draft, selectedModeIdArg ?? null)
-        return
-      }
-      try {
-        // Backend performs all DB writes in one transaction-shaped call:
-        // - current row: external_id=S2, title="[Fork] ..."
-        // - sibling row: created with external_id=S1, status=pending_review
-        // Pass (conversationId, folderId) so a conversation opened from history
-        // — whose connection resumed via session_id but isn't row-linked until
-        // its first prompt — is adopted by the backend before forking (a
-        // fork-send forks BEFORE that prompt). No-op once already linked. Use
-        // the real persisted DB id (`dbConvIdRef`, same as the send path below),
-        // NOT the runtime key `effectiveConversationId` which can be virtual.
-        const { forkedSessionId } = await acpFork(
-          connectionId,
-          dbConvIdRef.current,
-          folderId
-        )
-        // Update runtime session id to S2 (frontend in-memory state only)
-        sessionIdRef.current = forkedSessionId
-        setExternalId(effectiveConversationId, forkedSessionId)
-
-        // NOTE: a fork is a transcript discontinuity — the row's session flips
-        // S1→S2, and S2 is a COPY of S1's transcript plus the turns to come.
-        // The pre-fork history is NOT re-surfaced here: the backend background
-        // watcher correctly excludes the fork-copied prefix from the out-of-turn
-        // overlay (see `baseline_offset_since`), so `detail.turns` (S1 parse) +
-        // the new local turns render each exchange exactly once. No detail
-        // refetch is needed or wanted — an early one races the forked turn and
-        // can drop the just-sent message.
-        refreshConversations()
-        // Send the message on the forked session (S2)
-        handleSend(draft, selectedModeIdArg)
-      } catch (err) {
-        // Busy (a turn is in flight, e.g. another co-controlling client started
-        // one): NOT a fork failure — silently re-queue, like a normal bounce.
-        // It sends after the current turn.
-        if (err instanceof TurnBusyError) {
-          mqEnqueue(draft, selectedModeIdArg ?? null)
-          return
-        }
-        // Real fork failure: surface it. EXPLICIT product decision — fork-send
-        // is best-effort, so the draft is never lost; it is re-queued and sent
-        // on the current (un-forked) session.
-        toast.error(
-          t("forkSessionFailed", {
-            error:
-              err instanceof Error
-                ? err.message
-                : typeof err === "object" && err !== null
-                  ? JSON.stringify(err)
-                  : String(err),
-          })
-        )
-        mqEnqueue(draft, selectedModeIdArg ?? null)
-      }
+    (draft: PromptDraft, selectedModeIdArg?: string | null) => {
+      mqEnqueue(
+        draft,
+        selectedModeIdArg ?? null,
+        `optimistic-${randomUUID()}`,
+        { intent: "fork" }
+      )
     },
-    [
-      conn.connectionId,
-      connStatus,
-      mqGetQueueLength,
-      mqEnqueue,
-      effectiveConversationId,
-      folderId,
-      handleSend,
-      refreshConversations,
-      setExternalId,
-      t,
-    ]
+    [mqEnqueue]
   )
+
+  useEffect(() => {
+    const queueBranch = (rawEvent: Event) => {
+      const event = rawEvent as CustomEvent<QueueBranchCreationRequest>
+      if (event.detail.conversationId !== dbConversationId) return
+      event.preventDefault()
+      mqEnqueue(
+        { blocks: [], displayText: t("branch.create") },
+        event.detail.modeId,
+        event.detail.requestId,
+        { intent: "branch" }
+      )
+    }
+    window.addEventListener(QUEUE_BRANCH_CREATION_EVENT, queueBranch)
+    return () =>
+      window.removeEventListener(QUEUE_BRANCH_CREATION_EVENT, queueBranch)
+  }, [dbConversationId, mqEnqueue, t])
+
+  const forkSendInFlightRef = useRef<string | null>(null)
+  useEffect(() => {
+    const item = msgQueue[0]
+    if (!item || (item.intent !== "fork" && item.intent !== "branch")) return
+    const needsLiveSourceSession = item.intent === "fork"
+    const sourceTurnIsActive =
+      runtimeSyncState !== "idle" || connStatus === "prompting"
+    if (
+      forkSendInFlightRef.current ||
+      sourceTurnIsActive ||
+      (needsLiveSourceSession &&
+        (!connectionReady || connStatus !== "connected")) ||
+      webConnState !== "connected" ||
+      dbConversationId == null
+    ) {
+      return
+    }
+    forkSendInFlightRef.current = item.id
+    const selectors = getCachedSelectors(selectedAgent)
+    void createConversationBranch({
+      requestId: item.clientMessageId,
+      sourceConversationId: dbConversationId,
+      preferredModeId: item.modeId ?? selectors?.modes?.current_mode_id ?? null,
+      preferredConfigValues: Object.fromEntries(
+        (selectors?.configOptions ?? []).map((option) => [
+          option.id,
+          String(option.kind.current_value),
+        ])
+      ),
+    })
+      .then(async (result) => {
+        if (item.intent === "fork") {
+          enqueuePersistedMessageForConversation(
+            result.branchConversationId,
+            { ...item, intent: "prompt", state: "queued", error: null },
+            !isLocalDesktop()
+          )
+        }
+        mqRemove(item.id)
+        await refreshConversations()
+        const branchTitle = useAppWorkspaceStore
+          .getState()
+          .conversations.find(
+            (conversation) => conversation.id === result.branchConversationId
+          )?.title
+        openTab(
+          result.folderId,
+          result.branchConversationId,
+          selectedAgent,
+          true,
+          branchTitle ?? `${ownTab?.title ?? "未命名会话"} · 分支`
+        )
+      })
+      .catch((error: unknown) => {
+        mqMarkState(item.id, "failed", toErrorMessage(error))
+      })
+      .finally(() => {
+        forkSendInFlightRef.current = null
+      })
+  }, [
+    connectionReady,
+    connStatus,
+    dbConversationId,
+    mqMarkState,
+    mqRemove,
+    msgQueue,
+    openTab,
+    ownTab?.title,
+    refreshConversations,
+    runtimeSyncState,
+    selectedAgent,
+    webConnState,
+  ])
 
   const handleOpenAgentsSettings = useCallback(() => {
     openSettingsWindow("agents", { agentType: selectedAgent }).catch((err) => {
@@ -2148,11 +2163,22 @@ const ConversationTabView = memo(function ConversationTabView({
   // and the action would silently do nothing.
   const composerAvailable = !isWelcomeMode && !acpLoadError
 
+  const forkMessageRequestIdsRef = useRef(new Map<string, string>())
+  useEffect(() => {
+    forkMessageRequestIdsRef.current.clear()
+  }, [dbConversationId])
+
   const handleForkFromMessage = useCallback(
     async (messageId: string) => {
       if (dbConversationId == null || !folder) return
       try {
+        let requestId = forkMessageRequestIdsRef.current.get(messageId)
+        if (!requestId) {
+          requestId = crypto.randomUUID()
+          forkMessageRequestIdsRef.current.set(messageId, requestId)
+        }
         const result = await createConversationBranch({
+          requestId,
           sourceConversationId: dbConversationId,
           forkMessageId: messageId,
           preferredModeId: selectedModeId,
@@ -2164,13 +2190,19 @@ const ConversationTabView = memo(function ConversationTabView({
           ),
         })
         await refreshConversations()
+        const branchTitle = useAppWorkspaceStore
+          .getState()
+          .conversations.find(
+            (conversation) => conversation.id === result.branchConversationId
+          )?.title
         openTab(
           result.folderId,
           result.branchConversationId,
           selectedAgent,
           true,
-          `${ownTab?.title ?? "未命名会话"} · 分支`
+          branchTitle ?? `${ownTab?.title ?? "未命名会话"} · 分支`
         )
+        forkMessageRequestIdsRef.current.delete(messageId)
         toast.success(t("branch.snapshotCreated"))
       } catch (error) {
         toast.error(toErrorMessage(error))
@@ -2571,16 +2603,7 @@ const ConversationTabView = memo(function ConversationTabView({
       hideInput={isWelcomeMode || Boolean(acpLoadError)}
       injectContent={composerInject}
       onInjectConsumed={handleComposerInjectConsumed}
-      composerBanner={
-        acpLoadErrorBanner ??
-        (connStatus === "prompting" &&
-        conn.supportsFork &&
-        hasPersistedConversation ? (
-          <div className="rounded-lg border border-border/60 bg-muted/35 px-3 py-2 text-xs text-muted-foreground">
-            {t("branch.runningForkHint")}
-          </div>
-        ) : null)
-      }
+      composerBanner={acpLoadErrorBanner ?? null}
       feedbackList={
         feedback.showList ? (
           <FeedbackNotesDisplay notes={feedback.notes} />
@@ -2605,10 +2628,7 @@ const ConversationTabView = memo(function ConversationTabView({
       onCancelQueueEdit={handleQueueCancelEdit}
       allowOfflineCompose={hasPersistedConversation && !connectionReady}
       onForkSend={
-        connStatus === "connected" &&
-        hasPersistedConversation &&
-        conn.supportsFork &&
-        !forkSendBlockedByQueue(msgQueue.length)
+        hasPersistedConversation && conn.supportsFork
           ? handleForkSend
           : undefined
       }
