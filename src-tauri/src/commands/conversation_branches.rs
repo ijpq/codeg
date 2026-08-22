@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::acp::error::AcpError;
 use crate::acp::manager::ConnectionManager;
+use crate::acp::types::ConnectionStatus;
 use crate::app_error::AppCommandError;
 use crate::commands::acp::build_session_runtime_env;
 use crate::commands::conversation_branch_context::{
@@ -88,6 +89,16 @@ fn branch_session_start_error(context: &str, error: &AcpError) -> AppCommandErro
     AppCommandError::task_execution_failed(format!("{context}: {error}"))
 }
 
+fn should_attempt_native_fork(
+    fork_message_id: Option<&str>,
+    source_session_id: Option<&str>,
+    source_live_busy: bool,
+) -> bool {
+    fork_message_id.is_none()
+        && !source_live_busy
+        && source_session_id.is_some_and(|id| !id.trim().is_empty())
+}
+
 pub async fn create_conversation_branch_core(
     db: &AppDatabase,
     manager: &ConnectionManager,
@@ -96,6 +107,19 @@ pub async fn create_conversation_branch_core(
     owner_label: String,
     request: CreateConversationBranchRequest,
 ) -> Result<CreateConversationBranchResult, AppCommandError> {
+    // A stale `conversation.status = in_progress` must not force a latest-tail
+    // branch down the lossy snapshot path. Reconcile durable runs first, then
+    // use the live connection itself as the authority for whether the source
+    // is genuinely busy. This makes the menu action prefer the exact same ACP
+    // `session/fork` inheritance as Fork & Send whenever the source is idle.
+    manager
+        .reconcile_conversation_runs(&db.conn, request.source_conversation_id)
+        .await
+        .map_err(|error| {
+            AppCommandError::task_execution_failed(format!(
+                "Source conversation state could not be reconciled before branching: {error}"
+            ))
+        })?;
     let source = conversation_service::get_by_id(&db.conn, request.source_conversation_id)
         .await
         .map_err(AppCommandError::from)?;
@@ -104,75 +128,27 @@ pub async fn create_conversation_branch_core(
         .map_err(AppCommandError::from)?
         .ok_or_else(|| AppCommandError::not_found("Source conversation folder was not found"))?;
 
-    // Branch inheritance is assembled from the authoritative persisted source
-    // transcript, never from the browser's currently-loaded history page. This
-    // can parse a large source file, but branch creation is rare and correctness
-    // at an exact historical boundary is more important than reusing a partial
-    // UI cache.
-    let (mut source_detail, _) = get_folder_conversation_core(&db.conn, source.id).await?;
-    if source_detail.summary.origin_cwd.is_none() {
-        source_detail.summary.origin_cwd = Some(folder.path.clone());
-    }
-    let inheritance = match build_branch_inheritance_snapshot(
-        &source_detail,
-        request.fork_message_id.as_deref(),
-        None,
-    ) {
-        Ok(snapshot) => snapshot,
-        Err(error)
-            if request
-                .snapshot_context
-                .as_deref()
-                .is_some_and(|v| !v.trim().is_empty()) =>
-        {
-            // Compatibility for one release of older clients. New clients do
-            // not send this field. Mark it explicitly so it cannot be mistaken
-            // for a server-built complete replay.
-            let context = request.snapshot_context.clone().unwrap_or_default();
-            BranchInheritanceSnapshot {
-                context_chars: context.chars().count() as i64,
-                estimated_tokens: crate::commands::conversation_branch_context::estimate_tokens(&context) as i64,
-                source_context_chars: context.chars().count() as i64,
-                source_estimated_tokens: crate::commands::conversation_branch_context::estimate_tokens(&context) as i64,
-                context,
-                inheritance_mode: "structured_snapshot".into(),
-                inherited_message_count: 0,
-                compressed: true,
-                truncated: true,
-                note: Some(format!("Legacy client snapshot used because persisted boundary resolution failed: {error}")),
-                fork_message_id: request.fork_message_id.clone(),
-                forked_through_at: None,
-                snapshot_version: 1,
-                images: Vec::new(),
-            }
-        }
-        Err(error) => return Err(error),
-    };
-    tracing::info!(
-        source_conversation_id = source.id,
-        fork_message_id = ?inheritance.fork_message_id,
-        inheritance_mode = inheritance.inheritance_mode,
-        inherited_message_count = inheritance.inherited_message_count,
-        inherited_context_chars = inheritance.context_chars,
-        inherited_estimated_tokens = inheritance.estimated_tokens,
-        source_context_chars = inheritance.source_context_chars,
-        source_estimated_tokens = inheritance.source_estimated_tokens,
-        inherited_image_count = inheritance.images.len(),
-        compressed = inheritance.compressed,
-        truncated = inheritance.truncated,
-        snapshot_version = inheritance.snapshot_version,
-        "[ACP][branch] authoritative inheritance material prepared"
-    );
-
     // Forking from a specific visible message is a bounded snapshot operation:
     // ACP's native method can only fork its current tail, never an arbitrary
-    // historical point. Latest-tail requests prefer the native protocol.
-    let native_candidate = request.fork_message_id.is_none()
-        && source.status != "in_progress"
-        && source
-            .external_id
-            .as_deref()
-            .is_some_and(|id| !id.trim().is_empty());
+    // historical point. Latest-tail requests prefer the native protocol before
+    // parsing or compressing the transcript, matching Fork & Send's exact,
+    // full-session inheritance and keeping large native forks fast.
+    let source_live_busy =
+        if let Some(connection_id) = manager.find_connection_by_conversation_id(source.id).await {
+            if let Some(state) = manager.get_state(&connection_id).await {
+                let state = state.read().await;
+                state.turn_in_flight || state.status == ConnectionStatus::Prompting
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+    let native_candidate = should_attempt_native_fork(
+        request.fork_message_id.as_deref(),
+        source.external_id.as_deref(),
+        source_live_busy,
+    );
     let fallback_reason;
     if native_candidate {
         let session_id = source.external_id.clone().unwrap_or_default();
@@ -216,28 +192,31 @@ pub async fn create_conversation_branch_core(
         .await;
         match native_attempt {
             Ok((connection_id, forked_session_id)) => {
+                let inherited_message_count =
+                    i32::try_from(source.message_count).unwrap_or(i32::MAX);
                 let (branch, _) = match conversation_branch_service::create_branch_row(
                     &db.conn,
                     &source,
                     Some(forked_session_id.clone()),
-                    inheritance.fork_message_id.clone(),
+                    None,
                     "native",
                     conversation_branch_service::BranchInheritanceRecord {
+                        source_session_id: source.external_id.clone(),
+                        branch_session_id: Some(forked_session_id.clone()),
                         inheritance_mode: "native_fork".into(),
-                        inherited_context_chars: inheritance.source_context_chars,
-                        inherited_estimated_tokens: inheritance.source_estimated_tokens,
+                        inherited_message_count,
+                        inherited_context_chars: 0,
+                        inherited_estimated_tokens: 0,
                         inheritance_compressed: false,
                         inheritance_truncated: false,
                         inheritance_note: Some(
-                            "ACP session/fork created and verified a distinct branch session."
-                                .into(),
+                            "ACP session/fork created a distinct session with the complete native context; no CodeG snapshot was injected."
+                                .into()
                         ),
-                        ..inheritance_record(
-                            &inheritance,
-                            source.external_id.clone(),
-                            Some(forked_session_id.clone()),
-                            None,
-                        )
+                        forked_through_at: Some(chrono::Utc::now()),
+                        snapshot_version: 2,
+                        snapshot_context: None,
+                        snapshot_images: Vec::new(),
                     },
                 )
                 .await
@@ -288,7 +267,7 @@ pub async fn create_conversation_branch_core(
                     lifecycle_state: "ready".into(),
                     fork_mode: "native".into(),
                     inheritance_mode: "native_fork".into(),
-                    inherited_message_count: inheritance.inherited_message_count,
+                    inherited_message_count,
                     inheritance_truncated: false,
                     fallback_reason: None,
                 });
@@ -297,13 +276,79 @@ pub async fn create_conversation_branch_core(
         }
     } else if request.fork_message_id.is_some() {
         fallback_reason = Some("ACP native fork cannot target an earlier message".into());
-    } else if source.status == "in_progress" {
+    } else if source_live_busy {
         fallback_reason = Some(
             "source conversation is generating; used its latest stable persisted boundary".into(),
         );
     } else {
         fallback_reason = Some("source conversation has no resumable ACP session".into());
     }
+
+    // Native inheritance was unavailable or the user selected an earlier
+    // message. Only now parse the authoritative persisted transcript and build
+    // the honest replay/snapshot fallback. This is never sourced from the
+    // browser's bounded history page, so every persisted message up to the
+    // selected boundary participates before the context-budget rules apply.
+    let (mut source_detail, _) = get_folder_conversation_core(&db.conn, source.id).await?;
+    if source_detail.summary.origin_cwd.is_none() {
+        source_detail.summary.origin_cwd = Some(folder.path.clone());
+    }
+    let inheritance = match build_branch_inheritance_snapshot(
+        &source_detail,
+        request.fork_message_id.as_deref(),
+        None,
+    ) {
+        Ok(snapshot) => snapshot,
+        Err(error)
+            if request
+                .snapshot_context
+                .as_deref()
+                .is_some_and(|v| !v.trim().is_empty()) =>
+        {
+            // Compatibility for one release of older clients. New clients do
+            // not send this field. Mark it explicitly so it cannot be mistaken
+            // for a server-built complete replay.
+            let context = request.snapshot_context.clone().unwrap_or_default();
+            BranchInheritanceSnapshot {
+                context_chars: context.chars().count() as i64,
+                estimated_tokens: crate::commands::conversation_branch_context::estimate_tokens(
+                    &context,
+                ) as i64,
+                source_context_chars: context.chars().count() as i64,
+                source_estimated_tokens:
+                    crate::commands::conversation_branch_context::estimate_tokens(&context) as i64,
+                context,
+                inheritance_mode: "structured_snapshot".into(),
+                inherited_message_count: 0,
+                compressed: true,
+                truncated: true,
+                note: Some(format!(
+                    "Legacy client snapshot used because persisted boundary resolution failed: {error}"
+                )),
+                fork_message_id: request.fork_message_id.clone(),
+                forked_through_at: None,
+                snapshot_version: 1,
+                images: Vec::new(),
+            }
+        }
+        Err(error) => return Err(error),
+    };
+    tracing::info!(
+        source_conversation_id = source.id,
+        fork_message_id = ?inheritance.fork_message_id,
+        inheritance_mode = inheritance.inheritance_mode,
+        inherited_message_count = inheritance.inherited_message_count,
+        inherited_context_chars = inheritance.context_chars,
+        inherited_estimated_tokens = inheritance.estimated_tokens,
+        source_context_chars = inheritance.source_context_chars,
+        source_estimated_tokens = inheritance.source_estimated_tokens,
+        inherited_image_count = inheritance.images.len(),
+        compressed = inheritance.compressed,
+        truncated = inheritance.truncated,
+        snapshot_version = inheritance.snapshot_version,
+        fallback_reason = ?fallback_reason,
+        "[ACP][branch] authoritative snapshot fallback prepared"
+    );
 
     // session/new does not create a durable Codex rollout until a real prompt
     // is accepted. Persist the inheritance as a provisional branch instead of
@@ -389,6 +434,64 @@ pub async fn merge_conversation_branch_core(
     Ok(result)
 }
 
+pub async fn get_conversation_branch_info_core(
+    db: &AppDatabase,
+    conversation_id: i32,
+) -> Result<Option<conversation_branch_service::ConversationBranchInfo>, AppCommandError> {
+    if let Some(info) = conversation_branch_service::get_info(&db.conn, conversation_id)
+        .await
+        .map_err(AppCommandError::from)?
+    {
+        return Ok(Some(info));
+    }
+    let conversation = match conversation_service::get_by_id(&db.conn, conversation_id).await {
+        Ok(conversation) => conversation,
+        Err(crate::db::error::DbError::Migration(message))
+            if message.starts_with("Conversation not found:") =>
+        {
+            return Ok(None)
+        }
+        Err(error) => return Err(AppCommandError::from(error)),
+    };
+    if conversation.agent_type != crate::models::agent::AgentType::Codex
+        || conversation.parent_id.is_some()
+        || conversation
+            .title
+            .as_deref()
+            .is_none_or(|title| !title.trim_start().starts_with("[Fork]"))
+    {
+        return Ok(None);
+    }
+    let Some(session_id) = conversation.external_id else {
+        return Ok(None);
+    };
+    let parent_session_id = match tokio::task::spawn_blocking(move || {
+        crate::parsers::codex::native_fork_parent_session_id(&session_id)
+    })
+    .await
+    {
+        Ok(parent) => parent,
+        Err(error) => {
+            tracing::warn!(
+                conversation_id,
+                error = %error,
+                "[ACP][branch] legacy fork relation lookup task failed"
+            );
+            None
+        }
+    };
+    let Some(parent_session_id) = parent_session_id else {
+        return Ok(None);
+    };
+    conversation_branch_service::repair_native_fork_relation(
+        &db.conn,
+        conversation_id,
+        &parent_session_id,
+    )
+    .await
+    .map_err(AppCommandError::from)
+}
+
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn create_conversation_branch(
@@ -420,9 +523,7 @@ pub async fn get_conversation_branch_info(
     db: tauri::State<'_, AppDatabase>,
     conversation_id: i32,
 ) -> Result<Option<conversation_branch_service::ConversationBranchInfo>, AppCommandError> {
-    conversation_branch_service::get_info(&db.conn, conversation_id)
-        .await
-        .map_err(AppCommandError::from)
+    get_conversation_branch_info_core(&db, conversation_id).await
 }
 
 #[cfg(feature = "tauri-runtime")]
@@ -459,6 +560,26 @@ mod tests {
     fn native_fork_must_return_a_distinct_session() {
         assert!(ensure_independent_fork_session("source", "branch").is_ok());
         assert!(ensure_independent_fork_session("same", "same").is_err());
+    }
+
+    #[test]
+    fn latest_tail_uses_native_fork_when_the_live_session_is_idle() {
+        assert!(should_attempt_native_fork(
+            None,
+            Some("source-session"),
+            false
+        ));
+        assert!(!should_attempt_native_fork(
+            Some("older-message"),
+            Some("source-session"),
+            false
+        ));
+        assert!(!should_attempt_native_fork(
+            None,
+            Some("source-session"),
+            true
+        ));
+        assert!(!should_attempt_native_fork(None, None, false));
     }
 
     #[tokio::test]

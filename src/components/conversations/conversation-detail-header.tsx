@@ -226,7 +226,7 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
       cancelled = true
       if (timer) clearTimeout(timer)
     }
-  }, [conversationId])
+  }, [conversationId, persistedConversation?.external_id, title])
 
   const handleCreateBranch = useCallback(async () => {
     if (conversationId == null || !persistedConversation || branchBusy) {

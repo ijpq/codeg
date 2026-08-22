@@ -413,6 +413,70 @@ fn resolve_codex_home_dir_from(
         .unwrap_or_else(|| home_dir.unwrap_or_default().join(".codex"))
 }
 
+/// Resolve the parent session recorded by a native Codex fork. This is used
+/// only to repair fork-send conversations created by older CodeG builds, which
+/// persisted the two conversation rows but not their `conversation_branch`
+/// relation. Reading only the opening `session_meta` avoids parsing or exposing
+/// the copied transcript.
+pub(crate) fn native_fork_parent_session_id(session_id: &str) -> Option<String> {
+    native_fork_parent_session_id_in(&resolve_codex_home_dir().join("sessions"), session_id)
+}
+
+fn native_fork_parent_session_id_in(sessions_dir: &Path, session_id: &str) -> Option<String> {
+    let session_id = session_id.trim();
+    if session_id.is_empty()
+        || session_id.len() > 64
+        || !session_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return None;
+    }
+    let suffix = format!("-{session_id}.jsonl");
+    let mut candidates = WalkDir::new(sessions_dir)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+        .map(|entry| entry.into_path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(&suffix))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort();
+    for path in candidates.into_iter().rev() {
+        let Ok(file) = fs::File::open(path) else {
+            continue;
+        };
+        let mut opening = String::new();
+        if BufReader::new(file.take(64 * 1024))
+            .read_line(&mut opening)
+            .is_err()
+        {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&opening) else {
+            continue;
+        };
+        if value.get("type").and_then(serde_json::Value::as_str) != Some("session_meta")
+            || value.pointer("/payload/id").and_then(serde_json::Value::as_str) != Some(session_id)
+        {
+            continue;
+        }
+        let Some(parent) = value
+            .pointer("/payload/parent_thread_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|parent| !parent.is_empty() && *parent != session_id)
+        else {
+            continue;
+        };
+        return Some(parent.to_string());
+    }
+    None
+}
+
 /// A directly-seekable page from a Codex rollout. `start_offset` is also the
 /// cursor for the next (older) page; callers never need to know how the JSONL
 /// was split into render turns.
@@ -4998,6 +5062,7 @@ mod tests {
     use super::is_encrypted_envelope;
     use super::merge_codex_context_window_stats;
     use super::native_team_wait_input;
+    use super::native_fork_parent_session_id_in;
     use super::merge_codex_total_usage_stats;
     use super::parse_codex_subagent_stats;
     use super::redact_encrypted_args;
@@ -6501,6 +6566,28 @@ mod tests {
     fn codex_home_defaults_to_home_dot_codex() {
         let resolved = resolve_codex_home_dir_from(None, Some(PathBuf::from("/Users/default")));
         assert_eq!(resolved, PathBuf::from("/Users/default/.codex"));
+    }
+
+    #[test]
+    fn native_fork_parent_reads_only_the_matching_rollout_header() {
+        let root = tempfile::tempdir().expect("temp codex home");
+        let day = root.path().join("2026/08/22");
+        fs::create_dir_all(&day).expect("session day");
+        let child = "01a-child-session";
+        fs::write(
+            day.join(format!("rollout-2026-08-22T10-00-00-{child}.jsonl")),
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"01a-child-session\",\"parent_thread_id\":\"01a-parent-session\",\"cwd\":\"/tmp/demo\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"private transcript text\"}}\n"
+            ),
+        )
+        .expect("fork rollout");
+
+        assert_eq!(
+            native_fork_parent_session_id_in(root.path(), child).as_deref(),
+            Some("01a-parent-session")
+        );
+        assert!(native_fork_parent_session_id_in(root.path(), "../escape").is_none());
     }
 
     /// codex 0.129+ writes a generated image both as `event_msg.image_generation_end`
