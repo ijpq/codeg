@@ -933,7 +933,10 @@ pub async fn infer_for_turn(
         let expected_code_recovery = expectation.expects_code_changes
             && explicitly_expected
             && !ambiguous_standalone_candidate;
-        if change.source != "watcher"
+        if !matches!(
+            change.source.as_str(),
+            "watcher" | "agent_file_change_report"
+        )
             || (change.attribution != "exclusive"
                 && !explicitly_expected
                 && !ambiguous_standalone_candidate)
@@ -1743,7 +1746,9 @@ pub async fn resolve_for_access(
 mod tests {
     use super::*;
     use crate::acp::types::PromptInputBlock;
-    use crate::db::service::artifact_service::{self, NewTurnRun, PendingFileChange};
+    use crate::db::service::artifact_service::{
+        self, NewTurnRun, PendingFileChange, ReportedFileChange,
+    };
     use crate::models::{AgentType, ContentBlock, MessageTurn, TurnRole};
 
     async fn seed_run(
@@ -2168,6 +2173,20 @@ mod tests {
                 attribution: "exclusive".into(),
             })
             .collect(),
+        )
+        .await
+        .unwrap();
+        let final_metadata = std::fs::metadata(workspace.path().join("final.pdf")).unwrap();
+        artifact_service::upsert_reported_changes(
+            &db.conn,
+            "run-declared-authoritative",
+            vec![ReportedFileChange {
+                path: "final.pdf".into(),
+                kind: ConversationTurnFileChangeKind::Modified,
+                final_exists: true,
+                size_bytes: i64::try_from(final_metadata.len()).ok(),
+                modified_at: final_metadata.modified().ok().map(DateTime::<Utc>::from),
+            }],
         )
         .await
         .unwrap();

@@ -43,8 +43,8 @@ use crate::acp::terminal_runtime::{
     TerminalRuntime, TerminalRuntimeError, TerminalShellRuntimeConfig,
 };
 use crate::acp::types::{
-    AcpEvent, AvailableCommandInfo, ConnectionInfo, ConnectionStatus, GrokModelSpec,
-    PermissionOptionInfo, PlanEntryInfo, PromptCapabilitiesInfo, PromptInputBlock,
+    AcpEvent, AgentFileChangeReport, AvailableCommandInfo, ConnectionInfo, ConnectionStatus,
+    GrokModelSpec, PermissionOptionInfo, PlanEntryInfo, PromptCapabilitiesInfo, PromptInputBlock,
     SessionConfigBooleanInfo, SessionConfigKindInfo, SessionConfigOptionInfo,
     SessionConfigSelectGroupInfo, SessionConfigSelectInfo, SessionConfigSelectOptionInfo,
     SessionFailureRecord, SessionModeInfo, SessionModeStateInfo, SteerResult, ToolCallImageInfo,
@@ -53,7 +53,7 @@ use crate::acp::types::{
 use crate::logging::throttle::LeadingEdgeThrottle;
 use crate::models::agent::AgentType;
 use crate::network::proxy;
-use crate::web::event_bridge::{emit_with_state, EventEmitter};
+use crate::web::event_bridge::{emit_internal_with_state, emit_with_state, EventEmitter};
 
 const DEFAULT_COMMAND_COLOR_ENV: [(&str, &str); 1] = [("CLICOLOR_FORCE", "1")];
 
@@ -835,6 +835,11 @@ pub enum ConnectionCommand {
         /// prompt actually being processed. `None` for delegation children,
         /// empty prompts, unbound conversations, and non-linked senders.
         user_message: Option<(String, Vec<UserMessageBlock>)>,
+        /// Unique AIR audit request id. For persisted conversation prompts this
+        /// is exactly the durable turn-run id; unbound internal prompts still
+        /// get a unique id but their reports are intentionally ignored because
+        /// there is no conversation/turn to attach them to.
+        agent_file_change_report_request_id: Option<String>,
     },
     NativeSteer {
         blocks: Vec<PromptInputBlock>,
@@ -3715,31 +3720,22 @@ fn build_client_capabilities(
             serde_json::Value::Bool(true),
         );
     }
-    // The capabilities array is deliberately "sessionFailure" ONLY.
-    // claude-agent-acp 0.69.0 and codex-acp 1.4.0 added a second AIR
-    // capability, "agentFileChangeReport": advertise it and every prompt may
-    // carry `_meta.jetbrains.air.agentFileChangeReportRequest = {version: 1,
-    // requestId}`, after which the agent runs an EXTRA model round-trip at the
-    // end of the turn (claude: a Stop hook plus a hidden continuation calling
-    // `mcp__claude_agent_acp__report_changed_files`; codex: an ephemeral
-    // read-only `thread/fork`) and answers on
-    // `session_info_update._meta.jetbrains.air.agentFileChangeReport`.
-    //
-    // codeg does not ask for it, and the reason is not cost alone: both
-    // adapters CLAMP the reported paths to `cwd` + `additionalDirectories`
-    // (anything outside a root is dropped as truncated), which is exactly the
-    // tree `workspace_state` already watches recursively via `notify`. So the
-    // report can only ever name a SUBSET of what the watcher sees, less
-    // reliably — it is a model self-report that declares `complete: false`
-    // when unsure and truncates at 1024 paths / 256KB. It exists for clients
-    // with no filesystem watcher; codeg is not one. Nothing else in either
-    // release depends on it, and both adapters no-op without the
-    // advertisement, so staying out costs us nothing.
+    // codex-acp 1.4.0+ also supports AIR `agentFileChangeReport`. CodeG keeps
+    // the recursive workspace watcher as the primary source and requests the
+    // report only as a turn-scoped backfill: the request id is the durable
+    // `conversation_turn_run.id`, and lifecycle persistence rejects a report
+    // whose connection/run pair does not match. Claude remains on typed session
+    // failures only; this integration is deliberately scoped to Codex.
     if matches!(agent_type, AgentType::ClaudeCode | AgentType::Codex) {
+        let capabilities = if agent_type == AgentType::Codex {
+            serde_json::json!(["sessionFailure", "agentFileChangeReport"])
+        } else {
+            serde_json::json!(["sessionFailure"])
+        };
         meta.insert(
             "jetbrains".to_string(),
             serde_json::json!({
-                "air": { "version": 1, "capabilities": ["sessionFailure"] }
+                "air": { "version": 1, "capabilities": capabilities }
             }),
         );
     }
@@ -3747,6 +3743,34 @@ fn build_client_capabilities(
         client_capabilities = client_capabilities.meta(meta);
     }
     client_capabilities
+}
+
+fn agent_file_change_report_prompt_meta(
+    agent_type: AgentType,
+    request_id: Option<&str>,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let request_id = request_id?.trim();
+    if agent_type != AgentType::Codex
+        || request_id.is_empty()
+        || request_id.len() > 128
+        || !request_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte))
+    {
+        return None;
+    }
+    serde_json::json!({
+        "jetbrains": {
+            "air": {
+                "agentFileChangeReportRequest": {
+                    "version": 1,
+                    "requestId": request_id,
+                }
+            }
+        }
+    })
+    .as_object()
+    .cloned()
 }
 
 fn build_new_session_request(
@@ -8226,6 +8250,7 @@ async fn run_conversation_loop<'a>(
             Some(ConnectionCommand::Prompt {
                 blocks,
                 user_message,
+                agent_file_change_report_request_id,
             }) => {
                 // Fingerprint the outgoing prompt for the background watcher's
                 // foreground/out-of-turn classifier BEFORE the blocks are
@@ -8335,7 +8360,13 @@ async fn run_conversation_loop<'a>(
                 // this conversation as transcript-less (see `record_prompt`).
                 record_prompt(agent_type, &sid.0, &prompt_blocks).await;
                 let turn_started_at_ms = crate::acp_transcript::now_epoch_ms();
-                let prompt_request = PromptRequest::new(sid.clone(), prompt_blocks);
+                let mut prompt_request = PromptRequest::new(sid.clone(), prompt_blocks);
+                if let Some(meta) = agent_file_change_report_prompt_meta(
+                    agent_type,
+                    agent_file_change_report_request_id.as_deref(),
+                ) {
+                    prompt_request = prompt_request.meta(meta);
+                }
                 // Snapshot the stderr write position BEFORE the request is
                 // dispatched. An agent that fails the moment the prompt lands
                 // (bad credentials, unknown model) prints its error almost
@@ -10549,6 +10580,82 @@ fn air_session_failure(
     air.get("sessionFailure")
 }
 
+fn air_agent_file_change_report(
+    meta: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Option<AgentFileChangeReport> {
+    let air = meta?.get("jetbrains")?.get("air")?;
+    if air.get("version")?.as_i64()? < 1 {
+        return None;
+    }
+    let value = air.get("agentFileChangeReport")?;
+    if value.get("version")?.as_i64()? != 1 {
+        return None;
+    }
+    let request_id = value.get("requestId")?.as_str()?.trim();
+    if request_id.is_empty()
+        || request_id.len() > 128
+        || !request_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte))
+    {
+        return None;
+    }
+    let status = value.get("status")?.as_str()?;
+    match status {
+        "reported" => {
+            let raw_paths = value.get("paths")?.as_array()?;
+            if raw_paths.len() > 1024 {
+                return None;
+            }
+            let mut paths = Vec::with_capacity(raw_paths.len());
+            let mut total_path_bytes = 0usize;
+            for raw in raw_paths {
+                let path = raw.as_str()?.trim();
+                if path.is_empty()
+                    || path.len() > 4096
+                    || path
+                        .chars()
+                        .any(|character| matches!(character, '\0' | '\n' | '\r'))
+                {
+                    return None;
+                }
+                total_path_bytes = total_path_bytes.saturating_add(path.len());
+                if total_path_bytes > 256 * 1024 {
+                    return None;
+                }
+                paths.push(path.to_string());
+            }
+            Some(AgentFileChangeReport {
+                request_id: request_id.to_string(),
+                status: status.to_string(),
+                paths,
+                declared_complete: value
+                    .get("declaredComplete")
+                    .and_then(serde_json::Value::as_bool)?,
+                truncated: value
+                    .get("truncated")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                reason: None,
+            })
+        }
+        "unavailable" => Some(AgentFileChangeReport {
+            request_id: request_id.to_string(),
+            status: status.to_string(),
+            paths: Vec::new(),
+            declared_complete: false,
+            truncated: false,
+            reason: value
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|reason| !reason.is_empty())
+                .map(str::to_string),
+        }),
+        _ => None,
+    }
+}
+
 /// Validate one AIR failure upsert into a [`SessionFailureRecord`].
 ///
 /// `id` (non-blank string) and `revision` (integer >= 1) are HARD
@@ -12536,6 +12643,14 @@ async fn emit_conversation_update(
                     ),
                 }
             }
+            if let Some(report) = air_agent_file_change_report(info.meta.as_ref()) {
+                emit_internal_with_state(
+                    state,
+                    emitter,
+                    AcpEvent::AgentFileChangeReport { report },
+                )
+                .await;
+            }
             // codex-acp #289 (v1.1.3+): a retryable turn error rides under
             // `_meta.codex.error` (only when `willRetry == true`) and the turn
             // stays alive. Surface a transient retry indicator (the frontend
@@ -13610,16 +13725,12 @@ mod tests {
             assert!(capabilities
                 .iter()
                 .any(|v| v.as_str() == Some("sessionFailure")));
-            // And nothing else. Adding a capability here is not free: it is
-            // what turns a per-prompt request on, and "agentFileChangeReport"
-            // (claude-agent-acp 0.69.0 / codex-acp 1.4.0) buys an extra model
-            // round-trip per turn for a clamped, self-reported subset of what
-            // the `workspace_state` watcher already sees. See the reasoning at
-            // the advertisement site before relaxing this.
             assert_eq!(
-                capabilities,
-                &vec![serde_json::Value::String("sessionFailure".to_string())],
-                "{agent:?} must advertise ONLY sessionFailure"
+                capabilities.iter().any(|value| {
+                    value.as_str() == Some("agentFileChangeReport")
+                }),
+                agent == AgentType::Codex,
+                "only Codex enables the AIR audit backfill"
             );
         }
         // Claude keeps its subagent-transcript flag alongside.
@@ -13641,6 +13752,73 @@ mod tests {
                 serde_json::to_value(build_client_capabilities(agent, HostToolsPolicy::Default))
                     .unwrap();
             assert!(caps.get("_meta").and_then(|m| m.get("jetbrains")).is_none());
+        }
+    }
+
+    #[test]
+    fn codex_prompt_meta_requests_one_versioned_file_change_report() {
+        let meta = agent_file_change_report_prompt_meta(AgentType::Codex, Some("turn-run:42"))
+            .expect("valid Codex turn id");
+        assert_eq!(
+            meta["jetbrains"]["air"]["agentFileChangeReportRequest"]["version"],
+            1
+        );
+        assert_eq!(
+            meta["jetbrains"]["air"]["agentFileChangeReportRequest"]["requestId"],
+            "turn-run:42"
+        );
+        assert!(agent_file_change_report_prompt_meta(AgentType::ClaudeCode, Some("turn-run:42"))
+            .is_none());
+        assert!(agent_file_change_report_prompt_meta(AgentType::Codex, Some("bad id"))
+            .is_none());
+    }
+
+    #[test]
+    fn air_file_change_report_parser_accepts_terminal_shapes_only() {
+        let reported = meta_map(serde_json::json!({"jetbrains": {"air": {
+            "version": 1,
+            "agentFileChangeReport": {
+                "version": 1,
+                "requestId": "run-1",
+                "status": "reported",
+                "paths": ["/workspace/result.pdf", "/workspace/preview.png"],
+                "declaredComplete": true,
+                "truncated": false
+            }
+        }}}));
+        let parsed = air_agent_file_change_report(Some(&reported)).expect("reported audit");
+        assert_eq!(parsed.request_id, "run-1");
+        assert_eq!(parsed.paths.len(), 2);
+        assert!(parsed.declared_complete);
+
+        let unavailable = meta_map(serde_json::json!({"jetbrains": {"air": {
+            "version": 1,
+            "agentFileChangeReport": {
+                "version": 1,
+                "requestId": "run-2",
+                "status": "unavailable",
+                "reason": "timeout"
+            }
+        }}}));
+        let parsed =
+            air_agent_file_change_report(Some(&unavailable)).expect("unavailable audit");
+        assert_eq!(parsed.status, "unavailable");
+        assert_eq!(parsed.reason.as_deref(), Some("timeout"));
+        assert!(parsed.paths.is_empty());
+
+        for invalid in [
+            serde_json::json!({"jetbrains": {"air": {"version": 1,
+                "agentFileChangeReport": {"version": 1, "requestId": "run-3",
+                    "status": "reported", "paths": ["x"], "declaredComplete": "yes"}}}}),
+            serde_json::json!({"jetbrains": {"air": {"version": 1,
+                "agentFileChangeReport": {"version": 1, "requestId": "run 4",
+                    "status": "reported", "paths": [], "declaredComplete": true}}}}),
+            serde_json::json!({"jetbrains": {"air": {"version": 1,
+                "agentFileChangeReport": {"version": 1, "requestId": "run-5",
+                    "status": "collecting"}}}}),
+        ] {
+            let invalid = meta_map(invalid);
+            assert!(air_agent_file_change_report(Some(&invalid)).is_none());
         }
     }
 

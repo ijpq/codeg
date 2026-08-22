@@ -415,6 +415,34 @@ pub async fn emit_with_state(
     emit_with_state_gated(state, emitter, payload, |_| true).await;
 }
 
+/// Deliver a typed ACP event to backend subscribers without exposing it to the
+/// Tauri/web frontend stream or retaining it in the replay ring.
+///
+/// File-change audits can contain hundreds of absolute paths. They are
+/// persistence input, not conversation content, so broadcasting them would
+/// waste bandwidth and let an implementation detail leak into browser state.
+/// The envelope reuses the latest public sequence number: internal events do
+/// not create a gap in the frontend's attach cursor, while the internal bus's
+/// FIFO order still keeps an audit emitted before `TurnComplete` ahead of that
+/// terminal event in the lifecycle worker.
+pub async fn emit_internal_with_state(
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+    payload: AcpEvent,
+) {
+    let envelope = {
+        let state = state.read().await;
+        Arc::new(EventEnvelope {
+            seq: state.event_seq,
+            connection_id: state.connection_id.clone(),
+            payload,
+        })
+    };
+    if let Some(bus) = emitter.acp_event_bus() {
+        bus.send(envelope);
+    }
+}
+
 /// Like [`emit_with_state`], but a `gate` predicate — evaluated under the SAME
 /// write lock, BEFORE `apply_event` — can veto the emit: returning `false`
 /// aborts with no mutation, no seq bump, no broadcast, and returns `false`.
@@ -581,6 +609,42 @@ mod tests {
             rx.try_recv().is_err(),
             "non-status ACP events must not emit on conversation://changed"
         );
+    }
+
+    #[tokio::test]
+    async fn internal_file_change_report_reaches_only_backend_bus() {
+        let state = fresh_state();
+        let broadcaster = Arc::new(WebEventBroadcaster::new());
+        let mut browser_rx = broadcaster.subscribe();
+        let bus = Arc::new(InternalEventBus::new(Arc::new(EventBusMetrics::default())));
+        let mut internal_rx = bus.subscribe();
+        let emitter = EventEmitter::web_only(broadcaster, bus);
+        let original_seq = state.read().await.event_seq;
+
+        emit_internal_with_state(
+            &state,
+            &emitter,
+            AcpEvent::AgentFileChangeReport {
+                report: crate::acp::types::AgentFileChangeReport {
+                    request_id: "run-1".into(),
+                    status: "reported".into(),
+                    paths: vec!["/workspace/result.pdf".into()],
+                    declared_complete: true,
+                    truncated: false,
+                    reason: None,
+                },
+            },
+        )
+        .await;
+
+        let event = internal_rx.try_recv().expect("backend event");
+        assert!(matches!(
+            &event.payload,
+            AcpEvent::AgentFileChangeReport { report }
+                if report.request_id == "run-1"
+        ));
+        assert!(browser_rx.try_recv().is_err(), "report must not reach browsers");
+        assert_eq!(state.read().await.event_seq, original_seq);
     }
 
     #[test]
