@@ -138,7 +138,7 @@ fn decrypt_media(mut bytes: Vec<u8>, key: [u8; 16]) -> Result<Vec<u8>, ChatChann
     let cipher = Aes128::new_from_slice(&key).map_err(|_| {
         ChatChannelError::ConnectionFailed("Weixin media AES key is invalid".into())
     })?;
-    for block in bytes.chunks_exact_mut(16) {
+    for block in bytes.as_chunks_mut::<16>().0 {
         cipher.decrypt_block(block.into());
     }
     let padding = *bytes.last().unwrap_or(&0) as usize;
