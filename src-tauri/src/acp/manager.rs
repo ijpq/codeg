@@ -407,6 +407,25 @@ impl ConnectionManager {
             .await;
     }
 
+    pub(crate) async fn ingest_agent_file_change_report(
+        &self,
+        db: &DatabaseConnection,
+        connection_id: &str,
+        request_id: &str,
+        paths: &[String],
+        emitter: &EventEmitter,
+    ) -> Result<usize, crate::db::error::DbError> {
+        self.artifact_tracker
+            .ingest_agent_file_change_report(
+                db,
+                connection_id,
+                request_id,
+                paths,
+                emitter,
+            )
+            .await
+    }
+
     /// Insert a synthetic `AgentConnection` for tests that need to exercise
     /// downstream code (attach, event broadcast, conversation linking)
     /// without spawning a real agent process. The returned connection is
@@ -1363,6 +1382,7 @@ impl ConnectionManager {
         conn_id: &str,
         blocks: Vec<PromptInputBlock>,
         user_message: Option<(String, Vec<crate::acp::UserMessageBlock>)>,
+        agent_file_change_report_request_id: Option<String>,
     ) -> Result<(), AcpError> {
         // Reject an empty prompt BEFORE touching the concurrency gate. An empty
         // prompt produces no turn — and thus no `TurnComplete` to clear the gate
@@ -1418,6 +1438,7 @@ impl ConnectionManager {
         permit.send(ConnectionCommand::Prompt {
             blocks,
             user_message,
+            agent_file_change_report_request_id,
         });
         Ok(())
     }
@@ -1443,7 +1464,8 @@ impl ConnectionManager {
     ) -> Result<(), AcpError> {
         let prompt_lock = self.clone_prompt_lock(conn_id).await?;
         let _guard = prompt_lock.lock_owned().await;
-        self.send_prompt_inner(conn_id, blocks, None).await
+        self.send_prompt_inner(conn_id, blocks, None, Some(uuid::Uuid::new_v4().to_string()))
+            .await
     }
 
     /// Inject additional user input into the current native Codex app-server
@@ -2250,7 +2272,13 @@ impl ConnectionManager {
         // for a prompt that never reached the agent, so without this the
         // lifecycle subscriber's PendingReview write also never fires and the
         // row would be stuck until a follow-up `send_prompt_linked` re-flipped it.
-        match self.send_prompt_inner(conn_id, blocks, user_message).await {
+        let report_request_id = artifact_run_id
+            .clone()
+            .or_else(|| Some(uuid::Uuid::new_v4().to_string()));
+        match self
+            .send_prompt_inner(conn_id, blocks, user_message, report_request_id)
+            .await
+        {
             Ok(()) => {
                 if branch_snapshot.is_some() {
                     if let Some(cid) = conversation_id_for_status {
@@ -6945,6 +6973,7 @@ mod tests {
                     text: "filler".into(),
                 }],
                 user_message: None,
+                agent_file_change_report_request_id: None,
             })
             .await
             .unwrap();
@@ -6956,6 +6985,7 @@ mod tests {
             vec![PromptInputBlock::Text {
                 text: "blocked".into(),
             }],
+            None,
             None,
         );
         let res = tokio::time::timeout(std::time::Duration::from_millis(50), fut).await;

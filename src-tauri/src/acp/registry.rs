@@ -453,10 +453,11 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             // string literals in `acp-agent.js` are "collecting",
             // "notReported", "providerError", plus the new
             // `dist/file-change-audit.js`) — the AIR `agentFileChangeReport`
-            // capability, shipped in lockstep with codex-acp 1.4.0. It is
-            // OFF unless the client asks for it twice, and codeg deliberately
-            // asks for neither; see `build_client_capabilities` in
-            // connection.rs for the reasoning. The only ambient change is that
+            // capability, shipped in lockstep with codex-acp 1.4.0. It is OFF
+            // unless the client asks for it twice. CodeG enables the Codex
+            // implementation as a watcher backfill but deliberately leaves the
+            // Claude audit off; see `build_client_capabilities` in
+            // connection.rs. The only ambient change is that
             // `airSessionFailureCapabilityMeta` became variadic so the agent
             // can advertise `["sessionFailure", "agentFileChangeReport"]` — an
             // ADDITIVE element in an array codeg only ever membership-tests,
@@ -593,9 +594,9 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             // audit by forking the thread (`approvalPolicy: "never"`,
             // `sandbox: "read-only"`, `ephemeral: true`) and running an extra
             // turn on the fork; claude uses a Stop hook plus a hidden
-            // continuation. Either way it is an extra model round-trip per
-            // prompt, and it is gated on a client advertisement codeg does not
-            // make — see `build_client_capabilities` in connection.rs.
+            // continuation. CodeG advertises and requests the Codex report with
+            // the durable turn-run id, then merges it into the existing
+            // watcher/deliverable pipeline; the Claude capability remains off.
             // 1.5.0 preserves and switches providers for loaded sessions;
             // 1.5.1 upgrades the nested official CLI to `@openai/codex`
             // ^0.148.0. 1.6.x only hardens the adapter release/test pipeline.

@@ -110,6 +110,28 @@ pub struct SessionFailureRecord {
     pub resolved: bool,
 }
 
+/// JetBrains AIR file-change audit returned by codex-acp after a prompt.
+///
+/// This event is backend-internal: `connection.rs` publishes it only on the
+/// typed [`InternalEventBus`](crate::acp::InternalEventBus), never to a
+/// per-connection frontend stream. The request id is the durable CodeG turn-run
+/// id whenever the prompt belongs to a persisted conversation, which makes a
+/// late report safe to correlate without consulting mutable "current turn"
+/// state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentFileChangeReport {
+    pub request_id: String,
+    pub status: String,
+    #[serde(default)]
+    pub paths: Vec<String>,
+    #[serde(default)]
+    pub declared_complete: bool,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 /// Events pushed from Rust backend to frontend via Tauri event system.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -211,6 +233,10 @@ pub enum AcpEvent {
         stop_reason: String,
         agent_type: String,
     },
+    /// Internal-only AIR file-change audit. It is deliberately not rendered or
+    /// retained in a session snapshot; lifecycle persistence folds it into the
+    /// existing per-turn file-change/deliverable tables.
+    AgentFileChangeReport { report: AgentFileChangeReport },
     /// Session established with agent-assigned session ID
     SessionStarted { session_id: String },
     /// Backend has bound this connection to a conversation row. Emitted exactly

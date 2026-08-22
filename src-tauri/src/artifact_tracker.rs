@@ -606,6 +606,151 @@ impl ArtifactTracker {
         Ok(run_id)
     }
 
+    /// Fold one codex-acp AIR audit into the existing watcher-backed ledger.
+    /// `request_id` is expected to be a turn-run id. Unknown ids (unbound
+    /// prompts) and connection mismatches are ignored rather than falling back
+    /// to whichever run happens to be current.
+    pub async fn ingest_agent_file_change_report(
+        &self,
+        db: &DatabaseConnection,
+        connection_id: &str,
+        request_id: &str,
+        paths: &[String],
+        emitter: &EventEmitter,
+    ) -> Result<usize, crate::db::error::DbError> {
+        use crate::db::entities::conversation_turn_run;
+        use crate::db::service::artifact_service::ReportedFileChange;
+
+        let Some(run) = conversation_turn_run::Entity::find_by_id(request_id.to_string())
+            .one(db)
+            .await?
+        else {
+            tracing::debug!(
+                request_id,
+                connection_id,
+                "[artifact-tracker] ignored AIR report without a persisted turn"
+            );
+            return Ok(0);
+        };
+        if run.connection_id != connection_id {
+            tracing::warn!(
+                request_id,
+                connection_id,
+                expected_connection_id = run.connection_id,
+                conversation_id = run.conversation_id,
+                "[artifact-tracker] rejected cross-connection AIR report"
+            );
+            return Ok(0);
+        }
+
+        let root = PathBuf::from(&run.root_path);
+        let mut seen = std::collections::HashSet::new();
+        let mut changes = Vec::new();
+        for raw_path in paths {
+            let Some(path) = normalize_reported_path(&root, raw_path) else {
+                continue;
+            };
+            if !seen.insert(path.clone()) || !should_track_path(&path) {
+                continue;
+            }
+            let absolute = root.join(&path);
+            match std::fs::metadata(&absolute) {
+                Ok(metadata) if metadata.is_file() => {
+                    let modified_at = metadata.modified().ok().map(DateTime::<Utc>::from);
+                    // AIR v1 is a model-audited path list rather than an OS
+                    // change journal. Refuse a report-only existing file when
+                    // its filesystem timestamp proves it predates this turn.
+                    // The small tolerance accommodates coarse timestamp
+                    // resolution; watcher evidence remains authoritative and
+                    // does not depend on this check.
+                    if modified_at.is_some_and(|modified_at| {
+                        modified_at < run.started_at - chrono::Duration::seconds(2)
+                    }) {
+                        tracing::debug!(
+                            request_id,
+                            path,
+                            run_started_at = %run.started_at,
+                            modified_at = ?modified_at,
+                            "[artifact-tracker] ignored stale AIR-reported existing file"
+                        );
+                        continue;
+                    }
+                    changes.push(ReportedFileChange {
+                        path,
+                        // AIR v1 reports paths, not operation kinds. Preserve a
+                        // watcher's Created/Renamed evidence when present;
+                        // otherwise Modified is the only non-invented kind for
+                        // a path that exists at audit time.
+                        kind: ConversationTurnFileChangeKind::Modified,
+                        final_exists: true,
+                        size_bytes: i64::try_from(metadata.len()).ok(),
+                        modified_at,
+                    });
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    changes.push(ReportedFileChange {
+                        path,
+                        kind: ConversationTurnFileChangeKind::Deleted,
+                        final_exists: false,
+                        size_bytes: None,
+                        modified_at: None,
+                    });
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        request_id,
+                        path,
+                        error = %error,
+                        "[artifact-tracker] could not verify AIR-reported path"
+                    );
+                }
+            }
+        }
+        let accepted = changes.len();
+        if accepted == 0 {
+            return Ok(0);
+        }
+        {
+            let _write_guard = self.write_gate.lock().await;
+            artifact_service::upsert_reported_changes(db, &run.id, changes).await?;
+        }
+
+        // Normally the report precedes the prompt response and TurnComplete,
+        // so the ordinary settlement path sees these rows. If transport
+        // scheduling delivers it after the run was already closed, append the
+        // newly eligible inferred outputs now. Explicit declarations remain
+        // authoritative inside infer_for_turn and suppress this entire source.
+        let terminal_status = conversation_turn_run::Entity::find_by_id(run.id.clone())
+            .one(db)
+            .await?
+            .map(|current| current.status);
+        if terminal_status == Some(ConversationTurnRunStatus::Completed) {
+            let inferred = {
+                let _write_guard = self.write_gate.lock().await;
+                deliverable_service::infer_for_turn(db, run.conversation_id, &run.id).await?
+            };
+            if !inferred.is_empty() {
+                crate::acp::deliverables::emit_deliverables_changed(
+                    emitter,
+                    run.conversation_id,
+                    inferred.into_iter().map(|item| item.id).collect(),
+                );
+            }
+        }
+        emit_artifacts_changed(emitter, run.conversation_id, run.id.clone());
+        tracing::info!(
+            request_id,
+            turn_run_id = run.id,
+            conversation_id = run.conversation_id,
+            connection_id,
+            reported_paths = paths.len(),
+            accepted_paths = accepted,
+            "[artifact-tracker] AIR file-change report merged"
+        );
+        Ok(accepted)
+    }
+
     /// Finish only if this terminal envelope belongs to the active generation.
     /// A delayed TurnComplete from the previous prompt has a lower sequence than
     /// the baseline captured before the new prompt and is intentionally ignored.
@@ -684,6 +829,44 @@ impl ArtifactTracker {
         .await;
         true
     }
+}
+
+fn normalize_reported_path(root: &Path, raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.chars().any(|character| matches!(character, '\0' | '\n' | '\r')) {
+        return None;
+    }
+    let supplied = PathBuf::from(raw);
+    if !supplied.is_absolute()
+        && supplied.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return None;
+    }
+    let canonical_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let candidate = if supplied.is_absolute() {
+        supplied
+    } else {
+        canonical_root.join(supplied)
+    };
+    let checked_candidate = std::fs::canonicalize(&candidate).unwrap_or(candidate);
+    let relative = checked_candidate.strip_prefix(&canonical_root).ok()?;
+    if relative.as_os_str().is_empty()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return None;
+    }
+    let normalized = normalize_relative_path(&relative.to_string_lossy());
+    (!normalized.is_empty()).then_some(normalized)
 }
 
 async fn settle_capture(capture: ActiveCapture, command: FinishCommand) {
@@ -1105,6 +1288,35 @@ fn should_track_path(path: &str) -> bool {
 mod tests {
     use super::*;
     use crate::acp::types::PromptInputBlock;
+    use crate::db::service::artifact_service::NewTurnRun;
+    use crate::models::AgentType;
+
+    async fn seed_report_run(
+        db: &crate::db::AppDatabase,
+        conversation_id: i32,
+        folder_id: i32,
+        root: &Path,
+        run_id: &str,
+        connection_id: &str,
+    ) {
+        artifact_service::create_run(
+            &db.conn,
+            NewTurnRun {
+                id: run_id.to_string(),
+                conversation_id,
+                connection_id: connection_id.to_string(),
+                client_message_id: Some(format!("message-{run_id}")),
+                prompt_fingerprint: None,
+                folder_id: Some(folder_id),
+                root_path: root.to_string_lossy().to_string(),
+                capture_incomplete: false,
+                input_paths_json: "[]".into(),
+                expectation_json: r#"{"publish_required":true,"expects_code_changes":false,"requested_paths":[]}"#.into(),
+            },
+        )
+        .await
+        .unwrap();
+    }
 
     #[test]
     fn artifact_filter_drops_metadata_caches_and_office_lock_files() {
@@ -1162,5 +1374,289 @@ mod tests {
             Path::new("/workspace/project"),
         );
         assert!(prose.requested_paths.is_empty());
+    }
+
+    #[tokio::test]
+    async fn air_report_backfills_only_its_exact_turn_and_filters_noise() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(workspace.path().join("_qa")).unwrap();
+        let folder_id =
+            crate::db::test_helpers::seed_folder(&db, &workspace.path().to_string_lossy()).await;
+        let conversation_id =
+            crate::db::test_helpers::seed_conversation(&db, folder_id, AgentType::Codex).await;
+        seed_report_run(
+            &db,
+            conversation_id,
+            folder_id,
+            workspace.path(),
+            "run-report-1",
+            "conn-1",
+        )
+        .await;
+        std::fs::write(workspace.path().join("result.pdf"), b"pdf").unwrap();
+        std::fs::write(workspace.path().join("second.docx"), b"docx").unwrap();
+        std::fs::write(workspace.path().join("_qa/page-01.png"), b"preview").unwrap();
+        seed_report_run(
+            &db,
+            conversation_id,
+            folder_id,
+            workspace.path(),
+            "run-report-2",
+            "conn-2",
+        )
+        .await;
+
+        let tracker = ArtifactTracker::new();
+        let paths = vec![
+            workspace
+                .path()
+                .join("result.pdf")
+                .to_string_lossy()
+                .to_string(),
+            workspace
+                .path()
+                .join("_qa/page-01.png")
+                .to_string_lossy()
+                .to_string(),
+            workspace
+                .path()
+                .join(".cache/ignored.tmp")
+                .to_string_lossy()
+                .to_string(),
+        ];
+        let accepted = tracker
+            .ingest_agent_file_change_report(
+                &db.conn,
+                "conn-1",
+                "run-report-1",
+                &paths,
+                &EventEmitter::Noop,
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted, 2, "cache/tmp path must be filtered");
+        let first = artifact_service::list_changes_for_run(&db.conn, "run-report-1")
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 2);
+        assert!(first
+            .iter()
+            .all(|change| change.source == "agent_file_change_report"));
+        artifact_service::finish_run(
+            &db.conn,
+            "run-report-1",
+            ConversationTurnRunStatus::Completed,
+            Some("end_turn".into()),
+        )
+        .await
+        .unwrap();
+        let inferred = deliverable_service::infer_for_turn(
+            &db.conn,
+            conversation_id,
+            "run-report-1",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            inferred
+                .iter()
+                .map(|deliverable| deliverable.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["result.pdf"],
+            "QA preview must stay in the internal change ledger only"
+        );
+        assert_eq!(inferred[0].role, "primary");
+        let restored = deliverable_service::list_for_turn(
+            &db.conn,
+            conversation_id,
+            "run-report-1",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            restored
+                .iter()
+                .map(|deliverable| deliverable.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["result.pdf"],
+            "persisted history reload must keep the original turn association"
+        );
+        assert!(artifact_service::list_changes_for_run(&db.conn, "run-report-2")
+            .await
+            .unwrap()
+            .is_empty());
+
+        let rejected = tracker
+            .ingest_agent_file_change_report(
+                &db.conn,
+                "conn-2",
+                "run-report-1",
+                &paths,
+                &EventEmitter::Noop,
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected, 0, "connection mismatch must not cross turns");
+        let second_path = vec![workspace
+            .path()
+            .join("second.docx")
+            .to_string_lossy()
+            .to_string()];
+        assert_eq!(
+            tracker
+                .ingest_agent_file_change_report(
+                    &db.conn,
+                    "conn-2",
+                    "run-report-2",
+                    &second_path,
+                    &EventEmitter::Noop,
+                )
+                .await
+                .unwrap(),
+            1
+        );
+        let second = artifact_service::list_changes_for_run(&db.conn, "run-report-2")
+            .await
+            .unwrap();
+        assert_eq!(
+            second
+                .iter()
+                .map(|change| change.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["second.docx"]
+        );
+
+        artifact_service::upsert_changes(
+            &db.conn,
+            "run-report-2",
+            vec![crate::db::service::artifact_service::PendingFileChange {
+                path: "second.docx".into(),
+                kind: ConversationTurnFileChangeKind::Created,
+                attribution: "exclusive".into(),
+            }],
+        )
+        .await
+        .unwrap();
+        let upgraded = artifact_service::list_changes_for_run(&db.conn, "run-report-2")
+            .await
+            .unwrap();
+        assert_eq!(upgraded[0].source, "watcher");
+        assert_eq!(upgraded[0].attribution, "exclusive");
+    }
+
+    #[tokio::test]
+    async fn air_report_does_not_turn_read_files_into_changes() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("read-only.txt"), b"input").unwrap();
+        let folder_id =
+            crate::db::test_helpers::seed_folder(&db, &workspace.path().to_string_lossy()).await;
+        let conversation_id =
+            crate::db::test_helpers::seed_conversation(&db, folder_id, AgentType::Codex).await;
+        seed_report_run(
+            &db,
+            conversation_id,
+            folder_id,
+            workspace.path(),
+            "run-read-only",
+            "conn-read-only",
+        )
+        .await;
+        // Put the synthetic run boundary safely after the existing file's
+        // mtime. A provider that mistakenly reports the read-only path must
+        // not create a change ledger row.
+        use sea_orm::{ActiveModelTrait, IntoActiveModel, Set};
+        let run = crate::db::entities::conversation_turn_run::Entity::find_by_id(
+            "run-read-only".to_string(),
+        )
+        .one(&db.conn)
+        .await
+        .unwrap()
+        .unwrap();
+        let mut active = run.into_active_model();
+        active.started_at = Set(Utc::now() + chrono::Duration::seconds(5));
+        active.update(&db.conn).await.unwrap();
+        let tracker = ArtifactTracker::new();
+        assert_eq!(
+            tracker
+                .ingest_agent_file_change_report(
+                    &db.conn,
+                    "conn-read-only",
+                    "run-read-only",
+                    &[workspace
+                        .path()
+                        .join("read-only.txt")
+                        .to_string_lossy()
+                        .to_string()],
+                    &EventEmitter::Noop,
+                )
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(artifact_service::list_changes_for_run(&db.conn, "run-read-only")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn late_air_report_settles_into_its_completed_turn() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let workspace = tempfile::tempdir().unwrap();
+        let folder_id =
+            crate::db::test_helpers::seed_folder(&db, &workspace.path().to_string_lossy()).await;
+        let conversation_id =
+            crate::db::test_helpers::seed_conversation(&db, folder_id, AgentType::Codex).await;
+        seed_report_run(
+            &db,
+            conversation_id,
+            folder_id,
+            workspace.path(),
+            "run-late-report",
+            "conn-late-report",
+        )
+        .await;
+        std::fs::write(workspace.path().join("late.pdf"), b"late").unwrap();
+        artifact_service::finish_run(
+            &db.conn,
+            "run-late-report",
+            ConversationTurnRunStatus::Completed,
+            Some("end_turn".into()),
+        )
+        .await
+        .unwrap();
+
+        let tracker = ArtifactTracker::new();
+        tracker
+            .ingest_agent_file_change_report(
+                &db.conn,
+                "conn-late-report",
+                "run-late-report",
+                &[workspace
+                    .path()
+                    .join("late.pdf")
+                    .to_string_lossy()
+                    .to_string()],
+                &EventEmitter::Noop,
+            )
+            .await
+            .unwrap();
+
+        let restored = deliverable_service::list_for_turn(
+            &db.conn,
+            conversation_id,
+            "run-late-report",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            restored
+                .iter()
+                .map(|deliverable| deliverable.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["late.pdf"]
+        );
     }
 }
