@@ -552,6 +552,116 @@ pub async fn get_info(
     Ok(Some(info))
 }
 
+/// Backfill the durable branch relation omitted by the original Fork & Send
+/// implementation. The caller supplies the parent session read from Codex's
+/// own rollout header; that protocol-level identity is safer than guessing from
+/// titles or timestamps. The additional `[Fork]`/root checks prevent imported
+/// delegate sessions that also carry `parent_thread_id` from becoming
+/// user-created conversation branches.
+pub async fn repair_native_fork_relation(
+    conn: &DatabaseConnection,
+    conversation_id: i32,
+    parent_session_id: &str,
+) -> Result<Option<ConversationBranchInfo>, DbError> {
+    if let Some(info) = get_info(conn, conversation_id).await? {
+        return Ok(Some(info));
+    }
+    let Some(branch) = conversation::Entity::find_by_id(conversation_id)
+        .filter(conversation::Column::DeletedAt.is_null())
+        .one(conn)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let branch_session_id = branch
+        .external_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|session_id| !session_id.is_empty());
+    if branch.agent_type != "codex"
+        || branch.parent_id.is_some()
+        || branch_session_id.is_none()
+        || branch
+            .title
+            .as_deref()
+            .is_none_or(|title| !title.trim_start().starts_with("[Fork]"))
+    {
+        return Ok(None);
+    }
+    let parent_session_id = parent_session_id.trim();
+    if parent_session_id.is_empty() || Some(parent_session_id) == branch_session_id {
+        return Ok(None);
+    }
+    let Some(source) = conversation::Entity::find()
+        .filter(conversation::Column::ExternalId.eq(parent_session_id))
+        .filter(conversation::Column::FolderId.eq(branch.folder_id))
+        .filter(conversation::Column::AgentType.eq(branch.agent_type.clone()))
+        .filter(conversation::Column::ParentId.is_null())
+        .filter(conversation::Column::DeletedAt.is_null())
+        .filter(conversation::Column::Id.ne(conversation_id))
+        .order_by_desc(conversation::Column::CreatedAt)
+        .one(conn)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let now = Utc::now();
+    let relation = conversation_branch::ActiveModel {
+        branch_conversation_id: Set(conversation_id),
+        source_conversation_id: Set(source.id),
+        source_title: Set(source.title.clone()),
+        fork_message_id: Set(None),
+        fork_mode: Set("native".into()),
+        source_session_id: Set(Some(parent_session_id.to_string())),
+        branch_session_id: Set(branch.external_id.clone()),
+        inheritance_mode: Set("native_fork".into()),
+        inherited_message_count: Set(source.message_count),
+        inherited_context_chars: Set(0),
+        inherited_estimated_tokens: Set(0),
+        inheritance_compressed: Set(false),
+        inheritance_truncated: Set(false),
+        inheritance_note: Set(Some(
+            "Repaired from Codex session_meta.parent_thread_id; the complete native session context was inherited."
+                .into(),
+        )),
+        forked_through_at: Set(Some(source.created_at)),
+        snapshot_version: Set(2),
+        snapshot_images_json: Set(None),
+        snapshot_context: Set(None),
+        snapshot_consumed_at: Set(None),
+        lifecycle_state: Set("ready".into()),
+        lifecycle_error: Set(None),
+        lifecycle_updated_at: Set(Some(now)),
+        session_verified_at: Set(Some(now)),
+        first_prompt_client_message_id: Set(None),
+        first_prompt_queued_at: Set(None),
+        first_prompt_accepted_at: Set(None),
+        initialization_retry_count: Set(0),
+        last_connection_id: Set(None),
+        snapshot_digest: Set(None),
+        created_at: Set(now),
+        last_merged_at: Set(None),
+        last_merge_key: Set(None),
+        merge_target_conversation_id: Set(None),
+    }
+    .insert(conn)
+    .await;
+    if let Err(error) = relation {
+        if let Some(info) = get_info(conn, conversation_id).await? {
+            return Ok(Some(info));
+        }
+        return Err(DbError::Database(error));
+    }
+    tracing::info!(
+        branch_conversation_id = conversation_id,
+        source_conversation_id = source.id,
+        inheritance_mode = "native_fork",
+        repair = true,
+        "[ACP][branch] repaired legacy fork-send relation from Codex rollout metadata"
+    );
+    get_info(conn, conversation_id).await
+}
+
 #[derive(Debug, Clone)]
 pub struct PendingBranchSnapshot {
     pub context: String,
@@ -939,6 +1049,44 @@ mod tests {
     use super::*;
     use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
     use crate::models::AgentType;
+
+    #[tokio::test]
+    async fn legacy_fork_send_relation_repairs_from_native_parent_identity() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/codeg-native-fork-repair").await;
+        let source_id = seed_conversation(&db, folder_id, AgentType::Codex).await;
+        conversation_service::bind_external_id(&db.conn, source_id, "session-parent", &[])
+            .await
+            .unwrap();
+        let branch_id = seed_conversation(&db, folder_id, AgentType::Codex).await;
+        let branch = conversation::Entity::find_by_id(branch_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut active = branch.into_active_model();
+        active.title = Set(Some("[Fork] Topic".into()));
+        active.title_locked = Set(true);
+        active.external_id = Set(Some("session-child".into()));
+        active.update(&db.conn).await.unwrap();
+
+        let repaired = repair_native_fork_relation(&db.conn, branch_id, "session-parent")
+            .await
+            .unwrap()
+            .expect("legacy fork relation");
+        assert_eq!(repaired.source_conversation_id, source_id);
+        assert_eq!(repaired.inheritance_mode, "native_fork");
+        assert!(!repaired.inheritance_compressed);
+        assert_eq!(
+            repair_native_fork_relation(&db.conn, branch_id, "session-parent")
+                .await
+                .unwrap()
+                .unwrap()
+                .source_conversation_id,
+            source_id,
+            "repair is idempotent"
+        );
+    }
 
     #[tokio::test]
     async fn snapshot_branch_persists_relation_without_delegate_parentage() {

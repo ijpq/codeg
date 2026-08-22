@@ -35,6 +35,7 @@ use crate::acp::types::{
 use crate::artifact_tracker::{ArtifactTracker, ArtifactTurnFinishStatus};
 use crate::db::entities::conversation::{self, ConversationKind, ConversationStatus};
 use crate::db::entities::conversation_turn_run::{self, ConversationTurnRunStatus};
+use crate::db::entities::{conversation_branch, conversation_branch_merge};
 use crate::db::service::{artifact_service, conversation_branch_service, conversation_service};
 use crate::db::AppDatabase;
 use crate::models::agent::AgentType;
@@ -3401,6 +3402,7 @@ impl ConnectionManager {
                 let sibling_id = Self::persist_fork_outcome(
                     &db_conn,
                     conversation_id,
+                    &conn_id_for_task,
                     forked_session_id.clone(),
                     original_session_id.clone(),
                 )
@@ -3500,12 +3502,14 @@ impl ConnectionManager {
     async fn persist_fork_outcome(
         db_conn: &DatabaseConnection,
         conversation_id: i32,
+        connection_id: &str,
         forked_session_id: String,
         original_session_id: String,
     ) -> Result<i32, AcpError> {
         use sea_orm::sea_query::Expr;
         use sea_orm::{ColumnTrait, QueryFilter};
 
+        let connection_id = connection_id.to_string();
         db_conn
             .transaction::<_, i32, sea_orm::DbErr>(|txn| {
                 Box::pin(async move {
@@ -3555,9 +3559,15 @@ impl ConnectionManager {
                             .to_string()
                     });
 
+                    let previous_branch = conversation_branch::Entity::find_by_id(conversation_id)
+                        .one(txn)
+                        .await?;
+                    let inherited_message_count = current.message_count;
                     let folder_id = current.folder_id;
                     let agent_type_str = current.agent_type.clone();
                     let git_branch = current.git_branch.clone();
+                    let model = current.model.clone();
+                    let origin_cwd = current.origin_cwd.clone();
                     // The lock rides along with the title it protects: the
                     // sibling holds the pre-fork history of the very row the
                     // user renamed, so a hand-picked name has to stay locked
@@ -3600,7 +3610,7 @@ impl ConnectionManager {
                         // still give it its first name.
                         active.title_locked = Set(true);
                     }
-                    active.external_id = Set(Some(forked_session_id));
+                    active.external_id = Set(Some(forked_session_id.clone()));
                     active.updated_at = Set(now);
                     active.update(txn).await?;
 
@@ -3620,7 +3630,7 @@ impl ConnectionManager {
                     // instead and return ITS id — the caller feeds that straight
                     // into `ForkResultInfo.sibling_conversation_id` and the
                     // sidebar upsert, both of which must name a real row.
-                    if let Some(existing) = conversation::Entity::find()
+                    let sibling = if let Some(existing) = conversation::Entity::find()
                         .filter(conversation::Column::ExternalId.eq(original_session_id.clone()))
                         .filter(conversation::Column::AgentType.eq(agent_type_str.clone()))
                         .filter(conversation::Column::Id.ne(conversation_id))
@@ -3628,34 +3638,109 @@ impl ConnectionManager {
                         .one(txn)
                         .await?
                     {
-                        return Ok(existing.id);
+                        existing
+                    } else {
+                        // INSERT sibling row preserving pre-fork (S1) history.
+                        // PendingReview because no live agent is attached to S1.
+                        conversation::ActiveModel {
+                            id: NotSet,
+                            folder_id: Set(folder_id),
+                            title: Set(clean_title.clone()),
+                            title_locked: Set(title_locked),
+                            agent_type: Set(agent_type_str),
+                            status: Set(ConversationStatus::PendingReview),
+                            kind: Set(sibling_kind),
+                            model: Set(model),
+                            git_branch: Set(git_branch),
+                            external_id: Set(Some(original_session_id.clone())),
+                            parent_id: Set(None),
+                            parent_tool_use_id: Set(None),
+                            delegation_call_id: Set(None),
+                            message_count: Set(inherited_message_count),
+                            created_at: Set(now),
+                            updated_at: Set(now),
+                            deleted_at: Set(None),
+                            pinned_at: Set(None),
+                            origin_cwd: Set(origin_cwd),
+                        }
+                        .insert(txn)
+                        .await?
+                    };
+
+                    // `fork-send` historically persisted only the two
+                    // conversation rows. Record the same durable branch
+                    // relation used by the explicit "Create branch" flow so
+                    // both entry points expose Return/Merge and survive a
+                    // restart. Re-forking an existing branch moves its prior
+                    // relation (and merge audit rows) to the newly preserved S1
+                    // sibling, then records the current S2 row as that
+                    // sibling's child. This preserves the complete branch
+                    // chain instead of silently replacing its original root.
+                    if let Some(previous) = previous_branch {
+                        conversation_branch_merge::Entity::update_many()
+                            .col_expr(
+                                conversation_branch_merge::Column::BranchConversationId,
+                                Expr::value(sibling.id),
+                            )
+                            .filter(
+                                conversation_branch_merge::Column::BranchConversationId
+                                    .eq(conversation_id),
+                            )
+                            .exec(txn)
+                            .await?;
+                        conversation_branch::Entity::delete_by_id(conversation_id)
+                            .exec(txn)
+                            .await?;
+                        let mut moved: conversation_branch::ActiveModel = previous.into();
+                        moved.branch_conversation_id = Set(sibling.id);
+                        moved.branch_session_id = Set(Some(original_session_id.clone()));
+                        moved.last_connection_id = Set(None);
+                        moved.lifecycle_updated_at = Set(Some(now));
+                        moved.insert(txn).await?;
                     }
 
-                    // INSERT sibling row preserving pre-fork (S1) history.
-                    // PendingReview because no live agent is attached to S1.
-                    let sibling = conversation::ActiveModel {
-                        id: NotSet,
-                        folder_id: Set(folder_id),
-                        title: Set(clean_title),
-                        title_locked: Set(title_locked),
-                        agent_type: Set(agent_type_str),
-                        status: Set(ConversationStatus::PendingReview),
-                        kind: Set(sibling_kind),
-                        model: Set(None),
-                        git_branch: Set(git_branch),
-                        external_id: Set(Some(original_session_id)),
-                        parent_id: Set(None),
-                        parent_tool_use_id: Set(None),
-                        delegation_call_id: Set(None),
-                        message_count: Set(0),
+                    conversation_branch::ActiveModel {
+                        branch_conversation_id: Set(conversation_id),
+                        source_conversation_id: Set(sibling.id),
+                        source_title: Set(clean_title),
+                        fork_message_id: Set(None),
+                        fork_mode: Set("native".into()),
+                        source_session_id: Set(Some(original_session_id)),
+                        branch_session_id: Set(Some(forked_session_id)),
+                        inheritance_mode: Set("native_fork".into()),
+                        inherited_message_count: Set(inherited_message_count),
+                        inherited_context_chars: Set(0),
+                        inherited_estimated_tokens: Set(0),
+                        inheritance_compressed: Set(false),
+                        inheritance_truncated: Set(false),
+                        inheritance_note: Set(Some(
+                            "Created by Fork & Send using ACP session/fork; the complete native session context was inherited."
+                                .into(),
+                        )),
+                        forked_through_at: Set(Some(now)),
+                        snapshot_version: Set(2),
+                        snapshot_images_json: Set(None),
+                        snapshot_context: Set(None),
+                        snapshot_consumed_at: Set(None),
+                        lifecycle_state: Set("ready".into()),
+                        lifecycle_error: Set(None),
+                        lifecycle_updated_at: Set(Some(now)),
+                        session_verified_at: Set(Some(now)),
+                        first_prompt_client_message_id: Set(None),
+                        first_prompt_queued_at: Set(None),
+                        first_prompt_accepted_at: Set(None),
+                        initialization_retry_count: Set(0),
+                        last_connection_id: Set(Some(connection_id)),
+                        snapshot_digest: Set(None),
                         created_at: Set(now),
-                        updated_at: Set(now),
-                        deleted_at: Set(None),
-                        pinned_at: Set(None),
-                        origin_cwd: Set(None),
-                    };
-                    let inserted = sibling.insert(txn).await?;
-                    Ok(inserted.id)
+                        last_merged_at: Set(None),
+                        last_merge_key: Set(None),
+                        merge_target_conversation_id: Set(None),
+                    }
+                    .insert(txn)
+                    .await?;
+
+                    Ok(sibling.id)
                 })
             })
             .await
@@ -9086,6 +9171,80 @@ mod tests {
         assert_eq!(sibling.status, "pending_review");
         assert_eq!(sibling.folder_id, folder_id);
         assert_eq!(sibling.git_branch.as_deref(), Some("feature/x"));
+
+        // Fork & Send is a first-class conversation branch, not merely two
+        // rows with swapped session ids. The shared relation unlocks Return to
+        // source and the existing idempotent merge flow immediately.
+        let branch = conversation_branch_service::get_info(&db.conn, pre.id)
+            .await
+            .unwrap()
+            .expect("fork-send branch relation");
+        assert_eq!(branch.source_conversation_id, sibling_id);
+        assert_eq!(branch.fork_mode, "native");
+        assert_eq!(branch.inheritance_mode, "native_fork");
+        assert!(!branch.inheritance_compressed);
+        assert!(!branch.inheritance_truncated);
+        let merged = conversation_branch_service::merge_branch(
+            &db.conn,
+            pre.id,
+            "fork-send-merge".into(),
+            "Native fork result".into(),
+            Vec::new(),
+        )
+        .await
+        .expect("fork-send result merges through shared branch service");
+        assert_eq!(merged.target_conversation_id, sibling_id);
+    }
+
+    #[tokio::test]
+    async fn repeated_fork_send_preserves_the_branch_chain() {
+        use crate::db::test_helpers;
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/fork-chain").await;
+        let current = conversation_service::create(
+            &db.conn,
+            folder_id,
+            AgentType::Codex,
+            Some("Topic".into()),
+            None,
+        )
+        .await
+        .unwrap();
+        conversation_service::bind_external_id(&db.conn, current.id, "session-S1", &[])
+            .await
+            .unwrap();
+
+        let root_id = ConnectionManager::persist_fork_outcome(
+            &db.conn,
+            current.id,
+            "connection-S2",
+            "session-S2".into(),
+            "session-S1".into(),
+        )
+        .await
+        .unwrap();
+        let middle_id = ConnectionManager::persist_fork_outcome(
+            &db.conn,
+            current.id,
+            "connection-S3",
+            "session-S3".into(),
+            "session-S2".into(),
+        )
+        .await
+        .unwrap();
+
+        let latest = conversation_branch_service::get_info(&db.conn, current.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let middle = conversation_branch_service::get_info(&db.conn, middle_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.source_conversation_id, middle_id);
+        assert_eq!(middle.source_conversation_id, root_id);
+        assert_eq!(latest.branch_session_id.as_deref(), Some("session-S3"));
+        assert_eq!(middle.branch_session_id.as_deref(), Some("session-S2"));
     }
 
     #[tokio::test]
