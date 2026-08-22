@@ -36,6 +36,84 @@ const NPM_PREFIX_TIMEOUT: Duration = Duration::from_millis(1500);
 
 static NPM_GLOBAL_PREFIX_CACHE: tokio::sync::OnceCell<PathBuf> = tokio::sync::OnceCell::const_new();
 
+fn is_active_writer_restore_error(error: &AcpError) -> bool {
+    let normalized = error.to_string().to_ascii_lowercase();
+    normalized.contains("active writer") || normalized.contains("already has a writer")
+}
+
+fn has_live_external_session_owner_conflict(
+    requested_conversation_id: i32,
+    owner_conversation_id: Option<i32>,
+    owner_status: &ConnectionStatus,
+) -> bool {
+    owner_conversation_id.is_some_and(|owner| owner != requested_conversation_id)
+        && !matches!(
+            owner_status,
+            ConnectionStatus::Disconnected | ConnectionStatus::Error
+        )
+}
+
+async fn release_idle_legacy_fork_writer(
+    manager: &ConnectionManager,
+    db: &AppDatabase,
+    source_conversation_id: i32,
+    source_session_id: &str,
+) -> Result<bool, AcpError> {
+    let candidates =
+        conversation_branch_service::native_branch_sessions_for_source(&db.conn, source_session_id)
+            .await
+            .map_err(|error| AcpError::protocol(error.to_string()))?;
+    for (branch_conversation_id, branch_session_id) in candidates {
+        let connection_id = match manager
+            .find_connection_by_conversation_id(branch_conversation_id)
+            .await
+        {
+            Some(connection_id) => Some(connection_id),
+            None => {
+                manager
+                    .find_connection_by_external_id(&branch_session_id, AgentType::Codex)
+                    .await
+            }
+        };
+        let Some(connection_id) = connection_id else {
+            continue;
+        };
+        let Some(state) = manager.get_state(&connection_id).await else {
+            continue;
+        };
+        let can_handoff = {
+            let state = state.read().await;
+            state.external_id.as_deref() == Some(branch_session_id.as_str())
+                && state.status == ConnectionStatus::Connected
+                && !state.turn_in_flight
+        };
+        if !can_handoff {
+            tracing::warn!(
+                source_conversation_id,
+                source_session_id,
+                branch_conversation_id,
+                branch_session_id,
+                connection_id,
+                stage = "legacy_fork_writer_handoff_blocked",
+                "[ACP][restore] legacy native-fork owner is busy; preserving both sessions"
+            );
+            continue;
+        }
+        manager.disconnect_and_wait(&connection_id).await?;
+        tracing::warn!(
+            source_conversation_id,
+            source_session_id,
+            branch_conversation_id,
+            branch_session_id,
+            connection_id,
+            stage = "legacy_fork_writer_released",
+            "[ACP][restore] retired an idle legacy fork adapter that retained the source writer"
+        );
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "snake_case")]
 struct AcpAgentsUpdatedEventPayload {
@@ -8888,7 +8966,10 @@ fn resolve_qoder_binary() -> Option<PathBuf> {
 /// `PAT` is always materialized (empty when unset) so `run_qoder_probe` makes
 /// an explicit set-or-remove decision — an inherited token from the user's dev
 /// shell must not make the card claim an account that a launch would not use.
-async fn qoder_probe_env(db: &AppDatabase, personal_access_token: Option<&str>) -> BTreeMap<String, String> {
+async fn qoder_probe_env(
+    db: &AppDatabase,
+    personal_access_token: Option<&str>,
+) -> BTreeMap<String, String> {
     let mut env: BTreeMap<String, String> =
         agent_setting_service::get_by_agent_type(&db.conn, AgentType::Qoder)
             .await
@@ -8933,7 +9014,11 @@ async fn run_qoder_probe(
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     if !output.status.success() && stdout.trim().is_empty() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("qoder {} failed: {}", args.join(" "), stderr.trim()));
+        return Err(format!(
+            "qoder {} failed: {}",
+            args.join(" "),
+            stderr.trim()
+        ));
     }
     Ok(stdout)
 }
@@ -9001,9 +9086,7 @@ pub(crate) async fn acp_qoder_auth_status_core(
                         // The CLI emits 0/1 here rather than a JSON boolean.
                         allow_byok: v
                             .get("allow_byok")
-                            .and_then(|b| {
-                                b.as_bool().or_else(|| b.as_i64().map(|n| n != 0))
-                            }),
+                            .and_then(|b| b.as_bool().or_else(|| b.as_i64().map(|n| n != 0))),
                         error: None,
                         binary_path: binary_path.clone(),
                     }
@@ -10460,11 +10543,10 @@ pub(crate) async fn acp_restore_conversation_core(
         total_elapsed_ms = restore_started.elapsed().as_millis() as u64,
         "[ACP][restore] session writer single-flight acquired"
     );
-    // The fork operation may have owned this session lock while we were
-    // waiting and atomically moved the conversation row from S1 to S2. Never
-    // continue with the metadata snapshot read before the wait: doing so would
-    // publish an S1 connection under a row that now durably owns S2. Ask the
-    // caller to retry so the next generation re-reads the new mapping.
+    // A fork or administrator repair may have changed durable metadata while
+    // this request waited. Never publish a connection from the stale snapshot;
+    // current branch creation deliberately leaves the source mapping immutable,
+    // but this guard also protects upgrades from older swap-based releases.
     let current_conversation = conversation_service::get_by_id(&db.conn, conversation_id)
         .await
         .map_err(|error| AcpError::protocol(error.to_string()))?;
@@ -10484,6 +10566,37 @@ pub(crate) async fn acp_restore_conversation_core(
         return Err(AcpError::protocol(format!(
             "conversation {conversation_id} session changed during restore; retry"
         )));
+    }
+    if let Some(owner_connection_id) = manager
+        .find_connection_by_external_id(&external_session_id, agent_type)
+        .await
+    {
+        if let Some(owner_state) = manager.get_state(&owner_connection_id).await {
+            let (owner_conversation_id, owner_status) = {
+                let state = owner_state.read().await;
+                (state.conversation_id, state.status.clone())
+            };
+            if has_live_external_session_owner_conflict(
+                conversation_id,
+                owner_conversation_id,
+                &owner_status,
+            ) {
+                tracing::warn!(
+                    conversation_id,
+                    restore_request_id,
+                    external_session_id,
+                    owner_connection_id,
+                    owner_conversation_id = ?owner_conversation_id,
+                    owner_status = ?owner_status,
+                    stage = "restore_external_session_owner_conflict",
+                    "[ACP][restore] refused to start a second writer for one external session"
+                );
+                return Err(AcpError::protocol(format!(
+                    "ACP session {external_session_id} is already owned by conversation {}; repair the duplicate binding before retrying",
+                    owner_conversation_id.unwrap_or_default()
+                )));
+            }
+        }
     }
     let reconciled_runs = manager
         .reconcile_conversation_runs(&db.conn, conversation_id)
@@ -10664,7 +10777,7 @@ pub(crate) async fn acp_restore_conversation_core(
             Some(conversation_id),
         )
         .await;
-    let spawned = if let Some(connection_id) = reusable_connection {
+    let mut spawned = if let Some(connection_id) = reusable_connection {
         tracing::info!(
             conversation_id,
             connection_id = %connection_id,
@@ -10726,27 +10839,86 @@ pub(crate) async fn acp_restore_conversation_core(
     // real and the existing SelectorsReady prompt latch has fired. This also
     // protects warm reuse from a half-initialized connection whose external id
     // was already observed but whose session later fails to load.
-    let readiness_started = std::time::Instant::now();
-    if let Err(error) = manager
+    let mut readiness_started = std::time::Instant::now();
+    if let Err(mut error) = manager
         .wait_for_prompt_ready(&spawned.connection_id, Some(&external_session_id))
         .await
     {
+        let mut retry_succeeded = false;
         if !spawned.reused_existing {
             let _ = manager.disconnect(&spawned.connection_id).await;
         }
-        tracing::warn!(
-            conversation_id,
-            external_session_id = %external_session_id,
-            connection_id = %spawned.connection_id,
-            reused_existing = spawned.reused_existing,
-            stage = "prompt_ready_failed",
-            stage_elapsed_ms = readiness_started.elapsed().as_millis() as u64,
-            total_elapsed_ms = restore_started.elapsed().as_millis() as u64,
-            binding_updated = false,
-            error = %error,
-            "[ACP][restore] target session did not become prompt-ready"
-        );
-        return Err(error);
+        let released_legacy_writer = !spawned.reused_existing
+            && is_active_writer_restore_error(&error)
+            && release_idle_legacy_fork_writer(manager, db, conversation_id, &external_session_id)
+                .await?;
+        if released_legacy_writer {
+            // Older native-fork adapters retained the parent writer inside the
+            // child's process. Once that idle legacy owner is gone, retry the
+            // exact same persisted session once under the session lock. No new
+            // session is ever created and the child can restore independently.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let runtime_env = build_session_runtime_env(
+                db,
+                agent_type,
+                Some(external_session_id.as_str()),
+                data_dir,
+            )
+            .await?;
+            let retry = manager
+                .spawn_agent_for_restore(
+                    agent_type,
+                    Some(folder.path.clone()),
+                    external_session_id.clone(),
+                    runtime_env,
+                    owner_window_label.clone(),
+                    emitter.clone(),
+                    preferred_mode_id.clone(),
+                    preferred_config_values.clone(),
+                    require_codeg_mcp,
+                    conversation_id,
+                )
+                .await?;
+            readiness_started = std::time::Instant::now();
+            match manager
+                .wait_for_prompt_ready(&retry.connection_id, Some(&external_session_id))
+                .await
+            {
+                Ok(_) => {
+                    tracing::info!(
+                        conversation_id,
+                        external_session_id,
+                        connection_id = retry.connection_id,
+                        stage = "legacy_fork_writer_handoff_retry_succeeded",
+                        "[ACP][restore] source session recovered after retiring legacy fork writer"
+                    );
+                    spawned = retry;
+                    retry_succeeded = true;
+                }
+                Err(retry_error) => {
+                    if !retry.reused_existing {
+                        let _ = manager.disconnect(&retry.connection_id).await;
+                    }
+                    error = retry_error;
+                    spawned = retry;
+                }
+            }
+        }
+        if !retry_succeeded {
+            tracing::warn!(
+                conversation_id,
+                external_session_id = %external_session_id,
+                connection_id = %spawned.connection_id,
+                reused_existing = spawned.reused_existing,
+                stage = "prompt_ready_failed",
+                stage_elapsed_ms = readiness_started.elapsed().as_millis() as u64,
+                total_elapsed_ms = restore_started.elapsed().as_millis() as u64,
+                binding_updated = false,
+                error = %error,
+                "[ACP][restore] target session did not become prompt-ready"
+            );
+            return Err(error);
+        }
     }
     tracing::info!(
         conversation_id,
@@ -13856,6 +14028,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn external_session_writer_conflict_blocks_only_a_live_different_owner() {
+        assert!(has_live_external_session_owner_conflict(
+            91,
+            Some(89),
+            &ConnectionStatus::Connected,
+        ));
+        assert!(!has_live_external_session_owner_conflict(
+            91,
+            Some(91),
+            &ConnectionStatus::Prompting,
+        ));
+        assert!(!has_live_external_session_owner_conflict(
+            91,
+            Some(89),
+            &ConnectionStatus::Disconnected,
+        ));
+        assert!(!has_live_external_session_owner_conflict(
+            91,
+            None,
+            &ConnectionStatus::Connected,
+        ));
+    }
+
+    #[test]
     fn active_turn_restore_target_requires_the_exact_live_prompt() {
         let mut state = crate::acp::session_state::SessionState::new(
             "active-connection".into(),
@@ -16710,7 +16906,9 @@ wire_api = "chat"
         // any inherited one instead of probing a credential a launch wouldn't use.
         let cleared = qoder_probe_env(&db, Some("")).await;
         assert_eq!(
-            cleared.get("QODER_PERSONAL_ACCESS_TOKEN").map(String::as_str),
+            cleared
+                .get("QODER_PERSONAL_ACCESS_TOKEN")
+                .map(String::as_str),
             Some("")
         );
         let unset = qoder_probe_env(&db, None).await;

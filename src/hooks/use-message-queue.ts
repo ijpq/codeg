@@ -4,7 +4,7 @@ import { useCallback, useRef, useState } from "react"
 import type { PromptDraft } from "@/lib/types"
 import { randomUUID } from "@/lib/utils"
 
-export type QueuedMessageIntent = "prompt" | "guide"
+export type QueuedMessageIntent = "prompt" | "guide" | "fork" | "branch"
 export type QueuedMessageState =
   | "queued"
   | "waiting_session_restore"
@@ -97,6 +97,30 @@ function queueStorageKey(
   return persistKey != null ? `codeg:msg-queue:v1:${persistKey}` : null
 }
 
+export const QUEUE_BRANCH_CREATION_EVENT =
+  "codeg:queue-conversation-branch-creation"
+
+export interface QueueBranchCreationRequest {
+  conversationId: number
+  requestId: string
+  modeId: string | null
+}
+
+/** Ask the mounted conversation tab to persist a Create Branch operation in
+ * the same FIFO as Fork & Send. Returns true when a tab accepted the request;
+ * callers may fall back to the direct API when no tab runtime is mounted. */
+export function queueConversationBranchCreation(
+  request: QueueBranchCreationRequest
+): boolean {
+  if (typeof window === "undefined") return false
+  const event = new CustomEvent<QueueBranchCreationRequest>(
+    QUEUE_BRANCH_CREATION_EVENT,
+    { detail: request, cancelable: true }
+  )
+  window.dispatchEvent(event)
+  return event.defaultPrevented
+}
+
 function loadPersistedQueue(storageKey: string | null): QueuedMessage[] {
   if (!storageKey || typeof window === "undefined") return []
   try {
@@ -123,7 +147,14 @@ function loadPersistedQueue(storageKey: string | null): QueuedMessage[] {
           item.clientMessageId.length > 0
             ? item.clientMessageId
             : `optimistic-${item.id}`,
-        intent: item.intent === "guide" ? "guide" : "prompt",
+        intent:
+          item.intent === "guide"
+            ? "guide"
+            : item.intent === "fork"
+              ? "fork"
+              : item.intent === "branch"
+                ? "branch"
+                : "prompt",
         state: isQueuedMessageState(item.state) ? item.state : "queued",
         error: typeof item.error === "string" ? item.error : null,
         guideTarget: isQueuedGuideTarget(item.guideTarget)
@@ -201,6 +232,27 @@ function persistQueue(
   } catch {
     /* quota / serialization — keep the in-memory queue as source of truth */
   }
+}
+
+/** Persist a message into another conversation's queue before opening its tab.
+ * Used by Fork & Send: branch creation and the user's first prompt are two
+ * durable, idempotent operations, so a reload between them cannot lose or
+ * duplicate the prompt. */
+export function enqueuePersistedMessageForConversation(
+  persistKey: string | number,
+  item: QueuedMessage,
+  compactUploadedImages = false
+): void {
+  const storageKey = queueStorageKey(persistKey)
+  const current = loadPersistedQueue(storageKey)
+  if (
+    current.some(
+      (candidate) => candidate.clientMessageId === item.clientMessageId
+    )
+  ) {
+    return
+  }
+  persistQueue(storageKey, [...current, item], compactUploadedImages)
 }
 
 export interface UseMessageQueueReturn {
@@ -296,6 +348,13 @@ export function useMessageQueue(
         typeof clientMessageIdOrOptions === "string"
           ? options
           : clientMessageIdOrOptions
+      if (
+        queueRef.current.some(
+          (item) => item.clientMessageId === clientMessageId
+        )
+      ) {
+        return
+      }
       commit([
         ...queueRef.current,
         {

@@ -325,17 +325,33 @@ pub async fn create_conversation_branch(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<CreateConversationBranchParams>,
 ) -> Result<Json<branch_commands::CreateConversationBranchResult>, AppCommandError> {
-    Ok(Json(
+    // A native fork can take tens of seconds. Keep the transaction-shaped
+    // operation alive if the browser reloads or closes the response stream;
+    // its stable request id lets the reloaded queue retrieve the same result.
+    let db = crate::db::AppDatabase {
+        conn: state.db.conn.clone(),
+    };
+    let manager = state.connection_manager.clone_ref();
+    let emitter = state.emitter.clone();
+    let data_dir = state.data_dir.clone();
+    let result = tokio::spawn(async move {
         branch_commands::create_conversation_branch_core(
-            &state.db,
-            &state.connection_manager,
-            &state.emitter,
-            &state.data_dir,
+            &db,
+            &manager,
+            &emitter,
+            &data_dir,
             "web:conversation-branch".into(),
             params.request,
         )
-        .await?,
-    ))
+        .await
+    })
+    .await
+    .map_err(|error| {
+        AppCommandError::task_execution_failed(format!(
+            "Branch creation task stopped unexpectedly: {error}"
+        ))
+    })??;
+    Ok(Json(result))
 }
 
 #[derive(Deserialize)]
@@ -362,9 +378,6 @@ pub async fn get_conversation_branch_info(
 pub struct MergeConversationBranchParams {
     pub branch_conversation_id: i32,
     pub request_id: String,
-    pub summary: String,
-    #[serde(default)]
-    pub deliverable_ids: Vec<String>,
 }
 
 pub async fn merge_conversation_branch(
@@ -375,11 +388,10 @@ pub async fn merge_conversation_branch(
     Ok(Json(
         branch_commands::merge_conversation_branch_core(
             &state.db,
+            &state.connection_manager,
             &state.emitter,
             params.branch_conversation_id,
             params.request_id,
-            params.summary,
-            params.deliverable_ids,
         )
         .await?,
     ))
