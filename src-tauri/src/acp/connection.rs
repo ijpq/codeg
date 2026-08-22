@@ -1463,10 +1463,10 @@ async fn build_agent(
                 .await
                 .unwrap_or_else(|| PathBuf::from(crate::process::normalized_program(cmd)));
 
-            // Codex's upstream ACP adapter owns the app-server connection and
-            // active turn id. codex-acp 1.1.6+ launches unchanged and negotiates
-            // `_session/steering` during initialize. Only the older 1.1.2 bundle
-            // needs Codeg's anchor-verified compatibility copy.
+            // Codex's ACP adapter owns the app-server connection and active
+            // thread ids. The compatibility preparer leaves normal installs
+            // untouched except for two exact, anchor-verified bundles: legacy
+            // 1.1.2 steering and pinned 1.6.2's ACP-to-native thread/fork bridge.
             let prepared_steer = if meta.supports_steer {
                 match crate::acp::codex_steer_adapter::prepare(&resolved_launcher).await {
                     Ok(prepared) => prepared,
@@ -1476,7 +1476,7 @@ async fn build_agent(
                         // problem must not make an otherwise usable Codex
                         // connection fail to launch.
                         tracing::warn!(
-                            "[ACP][Codex] legacy steer adapter preparation failed: {error}"
+                            "[ACP][Codex] adapter compatibility preparation failed: {error}"
                         );
                         None
                     }
