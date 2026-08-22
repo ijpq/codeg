@@ -1800,6 +1800,7 @@
         "nativeCreated": "Branche native indépendante créée",
         "snapshotCreated": "Branche créée depuis un instantané de contexte",
         "provisionalCreated": "L’instantané de branche est prêt ; envoyez le premier message quand vous voulez",
+        "runningForkHint": "Fork & Send attend la fin du tour actuel. Pour créer une branche immédiatement, utilisez « Créer une branche » : elle héritera jusqu’au dernier tour terminé. Les deux conversations partagent le même dossier de travail ; évitez de modifier simultanément les mêmes fichiers.",
         "source": "Branche issue de : {title}",
         "sourceDeleted": "Source supprimée : {title}",
         "sourceDeletedHint": "La conversation source a été supprimée ; cette branche reste indépendante.",

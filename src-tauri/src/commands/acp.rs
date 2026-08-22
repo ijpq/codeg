@@ -10280,11 +10280,28 @@ pub(crate) async fn acp_restore_conversation_core(
     emitter: EventEmitter,
 ) -> Result<RestoredConversationConnectionInfo, AcpError> {
     let restore_started = std::time::Instant::now();
+    let restore_request_id = uuid::Uuid::new_v4().to_string();
     tracing::info!(
         conversation_id,
+        restore_request_id,
         stage = "restore_request_received",
         total_elapsed_ms = 0u64,
         "[ACP][restore] request received"
+    );
+    // Full-request single-flight. The older spawn dedup guarded only process
+    // creation and the publication lock guarded only the final mapping swap;
+    // two HTTP requests could still run resume/load concurrently between those
+    // points. The waiter re-runs the cheap lookup after the first request has
+    // published and therefore returns the same ready connection.
+    let restore_wait_started = std::time::Instant::now();
+    let _restore_request_guard = manager.lock_restore_request(conversation_id).await?;
+    tracing::info!(
+        conversation_id,
+        restore_request_id,
+        stage = "restore_single_flight_acquired",
+        wait_elapsed_ms = restore_wait_started.elapsed().as_millis() as u64,
+        total_elapsed_ms = restore_started.elapsed().as_millis() as u64,
+        "[ACP][restore] end-to-end single-flight acquired"
     );
     if let Some(prepared) = prepare_provisional_snapshot_branch(
         conversation_id,
@@ -10330,6 +10347,52 @@ pub(crate) async fn acp_restore_conversation_core(
         })?;
     let agent_type = conversation.agent_type;
     let require_codeg_mcp = agent_type == AgentType::Codex;
+    let working_dir = PathBuf::from(&folder.path);
+    // A native branch operation may temporarily load the same source session
+    // on an isolated connection. Serialize that protocol writer with restore,
+    // not merely with other restores for this conversation id.
+    let session_wait_started = std::time::Instant::now();
+    let _session_operation_guard = manager
+        .lock_session_operation(
+            agent_type,
+            Some(working_dir.as_path()),
+            &external_session_id,
+        )
+        .await?;
+    tracing::info!(
+        conversation_id,
+        restore_request_id,
+        external_session_id = %external_session_id,
+        stage = "restore_session_writer_acquired",
+        wait_elapsed_ms = session_wait_started.elapsed().as_millis() as u64,
+        total_elapsed_ms = restore_started.elapsed().as_millis() as u64,
+        "[ACP][restore] session writer single-flight acquired"
+    );
+    // The fork operation may have owned this session lock while we were
+    // waiting and atomically moved the conversation row from S1 to S2. Never
+    // continue with the metadata snapshot read before the wait: doing so would
+    // publish an S1 connection under a row that now durably owns S2. Ask the
+    // caller to retry so the next generation re-reads the new mapping.
+    let current_conversation = conversation_service::get_by_id(&db.conn, conversation_id)
+        .await
+        .map_err(|error| AcpError::protocol(error.to_string()))?;
+    if current_conversation.external_id.as_deref() != Some(external_session_id.as_str())
+        || current_conversation.agent_type != agent_type
+        || current_conversation.folder_id != conversation.folder_id
+    {
+        tracing::info!(
+            conversation_id,
+            restore_request_id,
+            expected_external_session_id = %external_session_id,
+            current_external_session_id = ?current_conversation.external_id,
+            stage = "restore_generation_superseded",
+            binding_updated = false,
+            "[ACP][restore] durable conversation mapping changed while restore waited"
+        );
+        return Err(AcpError::protocol(format!(
+            "conversation {conversation_id} session changed during restore; retry"
+        )));
+    }
     let reconciled_runs = manager
         .reconcile_conversation_runs(&db.conn, conversation_id)
         .await?;
@@ -10500,7 +10563,6 @@ pub(crate) async fn acp_restore_conversation_core(
     // the filesystem or requiring the agent executable to still be resolvable.
     // This also makes the channel restart path deterministic: reuse is checked
     // before any cold-start prerequisite can mask the durable conversation.
-    let working_dir = PathBuf::from(&folder.path);
     let reusable_connection = manager
         .find_connection_for_reuse_with_requirements(
             agent_type,

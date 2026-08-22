@@ -5536,6 +5536,67 @@ async fn run_connection(
                             .await;
                             return Ok(());
                         }
+                        // A persisted Codex session is authoritative. If both
+                        // resume and load failed, creating a new session is not
+                        // recovery: it produces a different id, loses the
+                        // native context and is rejected later by the durable
+                        // conversation binding check. In particular Codex's
+                        // "thread already has an active writer" is a transient
+                        // ownership conflict, not permission to replace the
+                        // thread. Surface a retryable restore failure and leave
+                        // the original session id untouched. Custom/transcript-
+                        // owned agents retain their intentional local-new
+                        // fallback below.
+                        if preserves_agent_owned_session_on_restore_failure(agent_type) {
+                            let code = if is_active_writer_failure(&err_str) {
+                                "active_writer"
+                            } else {
+                                "restore_failed"
+                            };
+                            tracing::warn!(
+                                conversation_id = ?restore_conversation_id,
+                                connection_id = %conn_id,
+                                external_session_id = %sid,
+                                failure_code = code,
+                                "[ACP][restore] preserving Codex session after resume/load failure"
+                            );
+                            emit_with_state(
+                                &state,
+                                &emitter_clone,
+                                AcpEvent::SessionLoadFailed {
+                                    session_id: sid.clone(),
+                                    message: err_str.clone(),
+                                    code: code.to_string(),
+                                },
+                            )
+                            .await;
+                            // `wait_for_prompt_ready` reads `last_error` when
+                            // the status turns terminal. SessionLoadFailed is a
+                            // UI notification only, so pair it with Error to
+                            // return the actual writer/restore cause to the
+                            // HTTP caller (rather than a generic init failure).
+                            emit_with_state(
+                                &state,
+                                &emitter_clone,
+                                AcpEvent::Error {
+                                    message: err_str,
+                                    agent_type: agent_type.to_string(),
+                                    code: Some(code.to_string()),
+                                    details: None,
+                                    terminal: true,
+                                },
+                            )
+                            .await;
+                            emit_with_state(
+                                &state,
+                                &emitter_clone,
+                                AcpEvent::StatusChanged {
+                                    status: ConnectionStatus::Error,
+                                },
+                            )
+                            .await;
+                            return Ok(());
+                        }
                         if attempted_load {
                             tracing::warn!(
                                 "[ACP] session/load failed ({err_str}), falling back to session/new"
@@ -7712,6 +7773,19 @@ fn classify_session_load_failure(
         return Some("session_unavailable");
     }
     None
+}
+
+/// Codex uses an exclusive rollout writer. This error is deliberately matched
+/// on the protocol text because current codex-acp releases do not expose a
+/// dedicated structured error code for it.
+fn is_active_writer_failure(message: &str) -> bool {
+    let lowered = message.to_ascii_lowercase();
+    lowered.contains("active writer")
+        || (lowered.contains("already has") && lowered.contains("writer"))
+}
+
+fn preserves_agent_owned_session_on_restore_failure(agent_type: AgentType) -> bool {
+    agent_type == AgentType::Codex
 }
 
 /// Whether codeg can absorb a "the agent forgot this session" load failure by
@@ -14042,6 +14116,25 @@ mod tests {
             ),
             None,
         );
+    }
+
+    #[test]
+    fn active_writer_failure_is_recognized_without_matching_unrelated_errors() {
+        assert!(is_active_writer_failure(
+            "thread 019e already has an active writer"
+        ));
+        assert!(is_active_writer_failure(
+            "Session already has another ACTIVE WRITER attached"
+        ));
+        assert!(!is_active_writer_failure(
+            "session load failed because the rollout was not found"
+        ));
+        assert!(preserves_agent_owned_session_on_restore_failure(
+            AgentType::Codex
+        ));
+        assert!(!preserves_agent_owned_session_on_restore_failure(
+            AgentType::ClaudeCode
+        ));
     }
 
     #[test]
