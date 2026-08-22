@@ -1783,6 +1783,7 @@
         "nativeCreated": "Ramificação nativa independente criada",
         "snapshotCreated": "Ramificação criada de um snapshot de contexto",
         "provisionalCreated": "O snapshot da ramificação está pronto; envie a primeira mensagem quando quiser",
+        "runningForkHint": "Fork & Send aguarda o término do turno atual. Para criar uma ramificação agora, use “Criar ramificação”: ela herdará até o último turno concluído. As duas conversas compartilham o diretório de trabalho; evite editar os mesmos arquivos ao mesmo tempo.",
         "source": "Ramificada de: {title}",
         "sourceDeleted": "Origem excluída: {title}",
         "sourceDeletedHint": "A conversa de origem foi excluída; esta ramificação continua independente.",

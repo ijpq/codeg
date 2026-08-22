@@ -158,6 +158,15 @@ struct SpawnDedupKey {
     session_id: String,
 }
 
+/// Agent-owned sessions have one writer regardless of which CodeG folder path
+/// a caller happened to resolve. Keeping cwd out of this key also protects
+/// corrupted/legacy rows whose folder changed after the session was created.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct SessionOperationKey {
+    agent_type: AgentType,
+    session_id: String,
+}
+
 /// Default upper bound on how long `spawn_agent` will hold the per-session
 /// dedup lock waiting for `SessionStarted`. Picked to comfortably cover
 /// cold-start agents (claude-code/codex warm: <2s; npx-fetched cold: 10–30s)
@@ -247,6 +256,17 @@ pub struct ConnectionManager {
     /// process lifetime — bounded by the number of distinct sessions ever
     /// connected.
     spawn_locks: Arc<Mutex<HashMap<SpawnDedupKey, Arc<Mutex<()>>>>>,
+    /// End-to-end restore single-flight keyed by the durable CodeG
+    /// conversation. Unlike `spawn_locks`, this guard covers metadata
+    /// reconciliation, ACP resume/load, prompt readiness and publication. A
+    /// duplicate HTTP request therefore waits for the first restore and then
+    /// observes/reuses its published connection instead of racing it.
+    restore_request_locks: Arc<Mutex<HashMap<i32, Arc<Mutex<()>>>>>,
+    /// Serializes every operation that needs an exclusive writer for a
+    /// persisted ACP session (restore and native fork source loading). Codex
+    /// rejects a second writer even when it comes from a different CodeG
+    /// conversation/window, so conversation-only locking is insufficient.
+    session_operation_locks: Arc<Mutex<HashMap<SessionOperationKey, Arc<Mutex<()>>>>>,
     /// Per-conversation switchover mutex. Session spawn is deduplicated by
     /// `spawn_locks`; this second lock serializes the shorter authoritative
     /// mapping update + old-connection removal phase.
@@ -334,6 +354,8 @@ impl ConnectionManager {
         Self {
             connections: Arc::new(Mutex::new(HashMap::new())),
             spawn_locks: Arc::new(Mutex::new(HashMap::new())),
+            restore_request_locks: Arc::new(Mutex::new(HashMap::new())),
+            session_operation_locks: Arc::new(Mutex::new(HashMap::new())),
             restore_locks: Arc::new(Mutex::new(HashMap::new())),
             branch_recovery_locks: Arc::new(Mutex::new(HashMap::new())),
             spawn_handshake_timeout: spawn_handshake_timeout_from_env(),
@@ -352,6 +374,8 @@ impl ConnectionManager {
         Self {
             connections: self.connections.clone(),
             spawn_locks: self.spawn_locks.clone(),
+            restore_request_locks: self.restore_request_locks.clone(),
+            session_operation_locks: self.session_operation_locks.clone(),
             restore_locks: self.restore_locks.clone(),
             branch_recovery_locks: self.branch_recovery_locks.clone(),
             spawn_handshake_timeout: self.spawn_handshake_timeout,
@@ -406,6 +430,8 @@ impl ConnectionManager {
         Self {
             connections: Arc::new(Mutex::new(HashMap::new())),
             spawn_locks: Arc::new(Mutex::new(HashMap::new())),
+            restore_request_locks: Arc::new(Mutex::new(HashMap::new())),
+            session_operation_locks: Arc::new(Mutex::new(HashMap::new())),
             restore_locks: Arc::new(Mutex::new(HashMap::new())),
             branch_recovery_locks: Arc::new(Mutex::new(HashMap::new())),
             spawn_handshake_timeout: timeout,
@@ -683,6 +709,64 @@ impl ConnectionManager {
                 .clone()
         };
         lock.lock_owned().await
+    }
+
+    /// Acquire the end-to-end single-flight for a durable conversation
+    /// restore. The wait is bounded so a cancelled or wedged caller cannot
+    /// leave every later browser tab on an unending "initializing" state.
+    pub(crate) async fn lock_restore_request(
+        &self,
+        conversation_id: i32,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, AcpError> {
+        let lock = {
+            let mut locks = self.restore_request_locks.lock().await;
+            locks
+                .entry(conversation_id)
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let timeout = self
+            .spawn_handshake_timeout
+            .saturating_add(Duration::from_secs(15));
+        tokio::time::timeout(timeout, lock.lock_owned())
+            .await
+            .map_err(|_| {
+                AcpError::protocol(format!(
+                    "conversation {conversation_id} restore is still in progress; retry"
+                ))
+            })
+    }
+
+    /// Acquire the exclusive-writer guard for one persisted ACP session.
+    /// Restore and native fork source loading both use this lock, preventing
+    /// Codex's `thread already has an active writer` failure inside CodeG.
+    pub(crate) async fn lock_session_operation(
+        &self,
+        agent_type: AgentType,
+        _working_dir: Option<&std::path::Path>,
+        session_id: &str,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, AcpError> {
+        let key = SessionOperationKey {
+            agent_type,
+            session_id: session_id.to_string(),
+        };
+        let lock = {
+            let mut locks = self.session_operation_locks.lock().await;
+            locks
+                .entry(key)
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let timeout = self
+            .spawn_handshake_timeout
+            .saturating_add(Duration::from_secs(15));
+        tokio::time::timeout(timeout, lock.lock_owned())
+            .await
+            .map_err(|_| {
+                AcpError::protocol(format!(
+                    "ACP session {session_id} is busy in another restore or fork; retry"
+                ))
+            })
     }
 
     /// Start a second process for an existing session without reuse. User
@@ -3303,6 +3387,65 @@ impl ConnectionManager {
             )
         };
 
+        // Lock order is session-operation → prompt-lock, matching restore
+        // (session-operation → activation prompt locks). Holding this guard
+        // through protocol fork and DB persistence prevents a restore request
+        // from loading S1 while the live writer is changing S1 → S2.
+        let (
+            session_agent,
+            session_cwd,
+            state_session_id,
+            state_conversation_id,
+            state_turn_in_flight,
+        ) = {
+            let state = state_arc.read().await;
+            (
+                state.agent_type,
+                state.working_dir.clone(),
+                state.external_id.clone(),
+                state.conversation_id,
+                state.turn_in_flight,
+            )
+        };
+        // A positive gate can be rejected before resolving durable metadata.
+        // The check under the prompt lock below remains authoritative for the
+        // false→true race; this early arm simply preserves the established
+        // TurnInProgress behavior for an already-busy connection.
+        if state_turn_in_flight {
+            return Err(AcpError::TurnInProgress);
+        }
+        let linkable_conversation_id = state_conversation_id.or_else(|| {
+            link_conversation_id.filter(|_| link_folder_id.is_some())
+        });
+        let Some(linkable_conversation_id) = linkable_conversation_id else {
+            return Err(AcpError::protocol(
+                "fork_session requires a linked conversation row".to_string(),
+            ));
+        };
+        // SessionState normally carries the external id after SessionStarted.
+        // A restored historical row can briefly be linkable before that cache
+        // is populated, though, so use its durable binding rather than losing
+        // the fork capability. This read is validated again after both locks.
+        let source_session_id = if let Some(session_id) = state_session_id {
+            session_id
+        } else {
+            conversation_service::get_by_id(&db.conn, linkable_conversation_id)
+                .await
+                .map_err(|error| AcpError::protocol(error.to_string()))?
+                .external_id
+                .filter(|session_id| !session_id.trim().is_empty())
+                .ok_or_else(|| {
+                    AcpError::protocol("fork_session requires an active ACP session id")
+                })?
+        };
+        let session_operation_guard = self
+            .lock_session_operation(
+                session_agent,
+                session_cwd.as_deref(),
+                &source_session_id,
+            )
+            .await?;
+
         // Serialize the fork against concurrent prompts on this connection via
         // the same per-connection `prompt_lock` that `send_prompt`/
         // `send_prompt_linked` hold. A fork re-points the live session, so a
@@ -3315,6 +3458,23 @@ impl ConnectionManager {
         // back to `Cancelled`.
         let prompt_lock = self.clone_prompt_lock(conn_id).await?;
         let prompt_guard = prompt_lock.lock_owned().await;
+        let current_session_id = state_arc.read().await.external_id.clone();
+        if let Some(current_session_id) = current_session_id {
+            if current_session_id != source_session_id {
+                return Err(AcpError::protocol(
+                    "ACP session changed while the fork operation was waiting",
+                ));
+            }
+        } else {
+            let durable = conversation_service::get_by_id(&db.conn, linkable_conversation_id)
+                .await
+                .map_err(|error| AcpError::protocol(error.to_string()))?;
+            if durable.external_id.as_deref() != Some(source_session_id.as_str()) {
+                return Err(AcpError::protocol(
+                    "ACP session changed while the fork operation was waiting",
+                ));
+            }
+        }
 
         // Link the conversation row on demand, under the prompt lock so it
         // can't race a concurrent first prompt. A conversation opened from
@@ -3384,6 +3544,7 @@ impl ConnectionManager {
         let handle = tokio::spawn(async move {
             // Holding the owned guard for the whole task is what shields the
             // persistence from caller cancellation.
+            let _session_operation_guard = session_operation_guard;
             let _prompt_guard = prompt_guard;
             let outcome: Result<ForkResultInfo, AcpError> = async {
                 // Protocol-only round trip — no DB writes inside the loop.
@@ -3714,7 +3875,7 @@ impl ConnectionManager {
                         inheritance_compressed: Set(false),
                         inheritance_truncated: Set(false),
                         inheritance_note: Set(Some(
-                            "Created by Fork & Send using ACP session/fork; the complete native session context was inherited."
+                            "Created with ACP session/fork; the complete native session context was inherited."
                                 .into(),
                         )),
                         forked_through_at: Set(Some(now)),
@@ -8833,6 +8994,52 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn restore_and_session_operation_locks_are_shared_across_clone_ref() {
+        let mgr = ConnectionManager::new();
+        let cloned = mgr.clone_ref();
+
+        let restore_guard = mgr
+            .lock_restore_request(42)
+            .await
+            .expect("first restore lock");
+        let restore_wait = cloned.lock_restore_request(42);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), restore_wait)
+                .await
+                .is_err(),
+            "a second manager clone must wait for the same conversation restore"
+        );
+        drop(restore_guard);
+        cloned
+            .lock_restore_request(42)
+            .await
+            .expect("restore lock is released");
+
+        let cwd = PathBuf::from("/tmp/session-operation-test");
+        let session_guard = mgr
+            .lock_session_operation(AgentType::Codex, Some(&cwd), "session-1")
+            .await
+            .expect("first session writer lock");
+        let other_cwd = PathBuf::from("/tmp/same-session-different-folder");
+        let session_wait = cloned.lock_session_operation(
+            AgentType::Codex,
+            Some(&other_cwd),
+            "session-1",
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), session_wait)
+                .await
+                .is_err(),
+            "restore and fork operations must not write one ACP session concurrently"
+        );
+        drop(session_guard);
+        cloned
+            .lock_session_operation(AgentType::Codex, Some(&cwd), "session-1")
+            .await
+            .expect("session writer lock is released");
+    }
+
     /// Two concurrent `send_prompt_linked` calls on the SAME connection
     /// must serialize through the per-connection `prompt_lock` so the
     /// backend-creates branch can't fire twice and produce duplicate
@@ -9081,6 +9288,7 @@ mod tests {
             None,
         );
         state.conversation_id = Some(conversation_id);
+        state.external_id = Some(original_session_id.to_string());
         state.status = ConnectionStatus::Connected;
         let conn = AgentConnection {
             id: conn_id.to_string(),

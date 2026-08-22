@@ -502,7 +502,8 @@ describe("ConversationDetailPanel session-load failure surface", () => {
       "hideInput={isWelcomeMode || Boolean(acpLoadError)}"
     )
     // …and the banner takes its place, explaining why and offering recovery.
-    expect(source).toContain("composerBanner={acpLoadErrorBanner}")
+    expect(source).toContain("composerBanner={")
+    expect(source).toContain("acpLoadErrorBanner ??")
     const bannerStart = source.indexOf("const acpLoadErrorBanner")
     expect(bannerStart).toBeGreaterThan(-1)
     const bannerEnd = source.indexOf("const goalControlValue", bannerStart)

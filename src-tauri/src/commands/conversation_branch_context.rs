@@ -86,7 +86,9 @@ pub fn build_branch_inheritance_snapshot(
     let boundary = bounded.last();
     let entries = visible_entries(bounded);
     let (images, omitted_images) = inherited_images(bounded);
-    let deliverables = visible_deliverable_paths(detail, boundary.map(|turn| turn.timestamp));
+    let deliverables = boundary
+        .map(|turn| visible_deliverable_paths(detail, Some(turn.timestamp)))
+        .unwrap_or_default();
     let max_tokens = detail
         .session_stats
         .as_ref()
