@@ -683,9 +683,18 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             // continuation. Either way it is an extra model round-trip per
             // prompt, and it is gated on a client advertisement codeg does not
             // make — see `build_client_capabilities` in connection.rs.
+            // 1.5.0 preserves and switches providers for loaded sessions;
+            // 1.5.1 upgrades the nested official CLI to `@openai/codex`
+            // ^0.148.0. 1.6.x only hardens the adapter release/test pipeline.
+            // The published 1.6.2 bundle has a typed app-server
+            // `thread/fork` client but still omits ACP `session/fork` from its
+            // capabilities and request router. `codex_steer_adapter` applies
+            // an exact-version, anchor-verified derived-bundle bridge so Codeg
+            // user branches use the official persistent fork. The installed
+            // npm package and user Codex files are never modified.
             distribution: AgentDistribution::Npx {
-                version: "1.4.0",
-                package: "@agentclientprotocol/codex-acp@1.4.0",
+                version: "1.6.2",
+                package: "@agentclientprotocol/codex-acp@1.6.2",
                 cmd: "codex-acp",
                 args: &[],
                 env: &[],
@@ -1148,6 +1157,7 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
         },
         AgentType::Qoder => AcpAgentMeta {
             agent_type,
+            supports_steer: false,
             supports_mcp: true,
             name: "Qoder",
             description: "Alibaba's Qoder coding agent CLI (native ACP via --acp)",
@@ -1559,8 +1569,8 @@ mod tests {
         );
         assert_npx_version(
             AgentType::Codex,
-            "1.4.0",
-            "@agentclientprotocol/codex-acp@1.4.0",
+            "1.6.2",
+            "@agentclientprotocol/codex-acp@1.6.2",
             Some("20.0.0"),
         );
         assert_npx_version(AgentType::Pi, "0.0.33", "pi-acp@0.0.33", Some("22.0.0"));
