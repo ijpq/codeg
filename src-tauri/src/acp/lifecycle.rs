@@ -64,6 +64,7 @@ fn is_lifecycle_relevant(event: &AcpEvent) -> bool {
     matches!(
         event,
         AcpEvent::SessionStarted { .. }
+            | AcpEvent::AgentFileChangeReport { .. }
             | AcpEvent::TurnComplete { .. }
             | AcpEvent::ConversationLinked { .. }
             | AcpEvent::NativeSessionTitle { .. }
@@ -251,6 +252,51 @@ pub(crate) async fn handle_event(
                 )
                 .await;
             }
+            Ok(())
+        }
+        AcpEvent::AgentFileChangeReport { report } => {
+            if report.status != "reported" {
+                tracing::info!(
+                    connection_id = %envelope.connection_id,
+                    request_id = %report.request_id,
+                    status = %report.status,
+                    reason = report.reason.as_deref().unwrap_or("not_reported"),
+                    "[artifact-tracker] AIR report unavailable; using workspace watcher fallback"
+                );
+                return Ok(());
+            }
+            let emitter = manager
+                .get_state_and_emitter(&envelope.connection_id)
+                .await
+                .map(|(_, emitter)| emitter)
+                .unwrap_or(EventEmitter::Noop);
+            match manager
+                .ingest_agent_file_change_report(
+                    db_conn,
+                    &envelope.connection_id,
+                    &report.request_id,
+                    &report.paths,
+                    &emitter,
+                )
+                .await
+            {
+                Ok(accepted) => tracing::info!(
+                    connection_id = %envelope.connection_id,
+                    request_id = %report.request_id,
+                    reported_paths = report.paths.len(),
+                    accepted_paths = accepted,
+                    declared_complete = report.declared_complete,
+                    truncated = report.truncated,
+                    "[artifact-tracker] AIR report processed"
+                ),
+                Err(error) => tracing::error!(
+                    connection_id = %envelope.connection_id,
+                    request_id = %report.request_id,
+                    error = %error,
+                    "[artifact-tracker] AIR report persistence failed; using workspace watcher fallback"
+                ),
+            }
+            // Audit metadata must never fail or delay the user's turn lifecycle.
             Ok(())
         }
         AcpEvent::TurnComplete { stop_reason, .. } => {
@@ -1721,7 +1767,7 @@ async fn connection_worker_loop(
 /// connections, workers run independently so a slow SQLite write on one
 /// connection doesn't backpressure the others.
 ///
-/// All forwarded events (the 6 types in `is_lifecycle_relevant`) use
+/// All forwarded events (the bounded set in `is_lifecycle_relevant`) use
 /// blocking `send().await` to guarantee delivery even when the worker
 /// mailbox is full — `SessionStarted` (writes external_id) and
 /// `TurnComplete` (writes terminal status) are correctness-critical and
@@ -2765,6 +2811,30 @@ mod tests {
     // dispatcher → per-conn worker → DB) so the integration between the
     // filter predicate and the worker's match arms cannot silently drift.
 
+    #[tokio::test]
+    async fn unavailable_agent_file_change_report_is_a_noop_fallback() {
+        let db = test_helpers::fresh_in_memory_db().await;
+        let mgr = ConnectionManager::new();
+        let env = EventEnvelope {
+            seq: 1,
+            connection_id: "gone-connection".to_string(),
+            payload: AcpEvent::AgentFileChangeReport {
+                report: crate::acp::types::AgentFileChangeReport {
+                    request_id: "run-timeout".into(),
+                    status: "unavailable".into(),
+                    paths: Vec::new(),
+                    declared_complete: false,
+                    truncated: false,
+                    reason: Some("timeout".into()),
+                },
+            },
+        };
+
+        handle_event(&db.conn, &mgr, &env, None)
+            .await
+            .expect("audit timeout must not fail the user's turn");
+    }
+
     use crate::acp::internal_bus::{EventBusMetrics, InternalEventBus};
     use std::time::Duration;
 
@@ -2781,6 +2851,16 @@ mod tests {
             session_id: "s".into(),
             stop_reason: "end_turn".into(),
             agent_type: "claude_code".into(),
+        }));
+        assert!(is_lifecycle_relevant(&AcpEvent::AgentFileChangeReport {
+            report: crate::acp::types::AgentFileChangeReport {
+                request_id: "run-1".into(),
+                status: "reported".into(),
+                paths: vec!["/workspace/result.pdf".into()],
+                declared_complete: true,
+                truncated: false,
+                reason: None,
+            },
         }));
         assert!(is_lifecycle_relevant(&AcpEvent::ConversationLinked {
             conversation_id: 1,

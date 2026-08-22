@@ -33,6 +33,15 @@ pub struct PendingFileChange {
     pub attribution: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct ReportedFileChange {
+    pub path: String,
+    pub kind: ConversationTurnFileChangeKind,
+    pub final_exists: bool,
+    pub size_bytes: Option<i64>,
+    pub modified_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CancelRequestDisposition {
     CancelRequested,
@@ -258,13 +267,20 @@ pub async fn upsert_changes(
             .await?;
 
         if let Some(existing) = existing {
+            let report_only_evidence = existing.source == "agent_file_change_report";
             let merged_kind = merge_kind(existing.kind, change.kind);
             let next_event_count = existing.event_count.saturating_add(1);
             let mut active = existing.into_active_model();
             active.kind = Set(merged_kind);
             active.last_seen_at = Set(now);
             active.event_count = Set(next_event_count);
-            if change.attribution == "ambiguous" {
+            if report_only_evidence {
+                // A later filesystem event is stronger evidence than the AIR
+                // path-only audit: retain the watcher's attribution and mark
+                // the row as watcher-owned from this point forward.
+                active.source = Set("watcher".to_string());
+                active.attribution = Set(change.attribution);
+            } else if change.attribution == "ambiguous" {
                 active.attribution = Set(change.attribution);
             }
             active.update(&txn).await?;
@@ -283,6 +299,60 @@ pub async fn upsert_changes(
                 final_exists: Set(None),
                 size_bytes: Set(None),
                 modified_at: Set(None),
+            }
+            .insert(&txn)
+            .await?;
+        }
+    }
+    txn.commit().await?;
+    Ok(())
+}
+
+/// Merge codex-acp's turn audit into the same path ledger the workspace watcher
+/// owns. Existing watcher evidence keeps its source and precise kind; the AIR
+/// report only creates a row when the watcher missed that path.
+pub async fn upsert_reported_changes(
+    conn: &DatabaseConnection,
+    turn_run_id: &str,
+    changes: Vec<ReportedFileChange>,
+) -> Result<(), DbError> {
+    if changes.is_empty() {
+        return Ok(());
+    }
+    let txn = conn.begin().await?;
+    let now = Utc::now();
+    for change in changes {
+        let existing = conversation_turn_file_change::Entity::find()
+            .filter(conversation_turn_file_change::Column::TurnRunId.eq(turn_run_id.to_string()))
+            .filter(conversation_turn_file_change::Column::Path.eq(change.path.clone()))
+            .one(&txn)
+            .await?;
+        if let Some(existing) = existing {
+            let merged_kind = merge_kind(existing.kind, change.kind);
+            let next_event_count = existing.event_count.saturating_add(1);
+            let mut active = existing.into_active_model();
+            active.kind = Set(merged_kind);
+            active.last_seen_at = Set(now);
+            active.event_count = Set(next_event_count);
+            active.final_exists = Set(Some(change.final_exists));
+            active.size_bytes = Set(change.size_bytes);
+            active.modified_at = Set(change.modified_at);
+            active.update(&txn).await?;
+        } else {
+            conversation_turn_file_change::ActiveModel {
+                id: NotSet,
+                turn_run_id: Set(turn_run_id.to_string()),
+                path: Set(change.path),
+                old_path: Set(None),
+                kind: Set(change.kind),
+                source: Set("agent_file_change_report".to_string()),
+                attribution: Set("reported".to_string()),
+                first_seen_at: Set(now),
+                last_seen_at: Set(now),
+                event_count: Set(1),
+                final_exists: Set(Some(change.final_exists)),
+                size_bytes: Set(change.size_bytes),
+                modified_at: Set(change.modified_at),
             }
             .insert(&txn)
             .await?;
