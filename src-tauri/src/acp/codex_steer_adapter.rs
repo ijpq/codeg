@@ -1,4 +1,4 @@
-//! Runtime compatibility shim for older `codex-acp` adapters.
+//! Runtime compatibility shims for `codex-acp` adapters.
 //!
 //! `@agentclientprotocol/codex-acp` 1.1.2 already tracks the active Codex
 //! app-server turn internally, but does not expose app-server's native
@@ -7,8 +7,12 @@
 //! The installed npm package, Codex configuration, credentials, transcripts,
 //! and user settings are never modified.
 //!
-//! codex-acp 1.1.6+ exposes its own `_session/steering` protocol. Those versions
-//! launch unchanged; `connection.rs` negotiates the capability from initialize.
+//! codex-acp 1.1.6+ exposes its own `_session/steering` protocol. The pinned
+//! 1.6.2 bundle also has the official Codex app-server `thread/fork` client but
+//! does not expose ACP `session/fork`. Codeg applies a second exact-version,
+//! anchor-verified patch that maps the standard ACP request to the official
+//! persistent fork and advertises the capability. Merge-back remains a Codeg
+//! product operation and is deliberately not implemented in the adapter.
 
 use std::path::{Path, PathBuf};
 
@@ -17,8 +21,10 @@ use sha2::{Digest, Sha256};
 use crate::acp::error::AcpError;
 
 const SUPPORTED_ADAPTER_VERSION: &str = "1.1.2";
+const NATIVE_FORK_ADAPTER_VERSION: &str = "1.6.2";
 const NATIVE_STEERING_MIN_VERSION: (u64, u64, u64) = (1, 1, 6);
 const PATCH_REVISION: &str = "codeg-steer-v1";
+const NATIVE_FORK_PATCH_REVISION: &str = "codeg-native-thread-fork-v1";
 
 #[derive(Debug, Clone)]
 pub struct PreparedCodexSteerAdapter {
@@ -128,6 +134,100 @@ if (process.argv.includes("--version")) {"#,
     },
 ];
 
+/// `codex-acp` 1.6.2 already owns the Codex app-server process and tracks all
+/// loaded threads, so the safest integration point is the adapter boundary:
+/// expose ACP `session/fork`, call the official persistent `thread/fork`, and
+/// register an independent adapter-side session state for the returned id.
+/// Every anchor is taken from the published npm bundle, not the source tree.
+const NATIVE_FORK_REPLACEMENTS: &[Replacement] = &[
+    Replacement {
+        before: r#"          delete: {},
+          additionalDirectories: {}"#,
+        after: r#"          delete: {},
+          fork: {
+            _meta: {
+              "codeg/nativeThreadFork": {
+                version: 1,
+                method: "thread/fork",
+                persistent: true
+              }
+            }
+          },
+          additionalDirectories: {}"#,
+    },
+    Replacement {
+        before: r#"  async closeSession(sessionId) {"#,
+        after: r#"  async forkSession(sessionId, cwd) {
+    return await this.codexClient.threadFork({
+      threadId: sessionId,
+      cwd
+    });
+  }
+  async closeSession(sessionId) {"#,
+    },
+    Replacement {
+        before: r#"  async loadSession(params) {"#,
+        after: r#"  async forkSession(params) {
+    if (this.providerUpdate !== null) {
+      await this.providerUpdate;
+    }
+    const source = this.sessions.get(params.sessionId);
+    if (!source) {
+      throw RequestError.invalidParams(void 0, `Unknown session: ${params.sessionId}`);
+    }
+    if (source.currentTurnId !== null || this.activePrompts.has(params.sessionId)) {
+      throw RequestError.invalidRequest(`Session ${params.sessionId} has an active turn`);
+    }
+    await this.checkAuthorization();
+    logger.log("Forking session with native thread/fork...", {
+      sourceSessionId: params.sessionId
+    });
+    const response = await this.runWithProcessCheck(() =>
+      this.codexAcpClient.forkSession(params.sessionId, params.cwd)
+    );
+    const sessionId = response.thread.id;
+    if (!sessionId || sessionId === params.sessionId) {
+      throw RequestError.internalError("thread/fork did not return an independent session");
+    }
+    const sessionState = {
+      ...source,
+      sessionId,
+      currentTurnId: null,
+      lastTokenUsage: null,
+      totalTokenUsage: null,
+      goalRevision: 0,
+      sessionTitle: null,
+      sessionTitleSource: "unset",
+      cwd: params.cwd,
+      availableModels: [...source.availableModels],
+      supportedReasoningEfforts: [...source.supportedReasoningEfforts],
+      supportedInputModalities: [...source.supportedInputModalities],
+      additionalDirectories: [...source.additionalDirectories],
+      mcpServers: source.mcpServers ? [...source.mcpServers] : void 0,
+      sessionMcpServers: source.sessionMcpServers ? [...source.sessionMcpServers] : void 0
+    };
+    this.sessions.set(sessionId, sessionState);
+    this.publishAvailableCommandsAsync(sessionState);
+    this.publishCurrentGoalAsync(sessionState, this.getSessionGeneration(sessionId));
+    logger.log("Native thread fork created", {
+      sourceSessionId: params.sessionId,
+      branchSessionId: sessionId
+    });
+    return {
+      sessionId,
+      models: this.createModelState(sessionState.availableModels, sessionState.currentModelId),
+      modes: sessionState.agentMode.toSessionModeState(),
+      ...this.createSessionConfigOptionsResponse(sessionState)
+    };
+  }
+  async loadSession(params) {"#,
+    },
+    Replacement {
+        before: r#").onRequest(methods.agent.session.load, (ctx) => getAgent().loadSession(ctx.params)).onRequest(methods.agent.session.list"#,
+        after: r#").onRequest(methods.agent.session.load, (ctx) => getAgent().loadSession(ctx.params)).onRequest(methods.agent.session.fork, (ctx) => getAgent().forkSession(ctx.params)).onRequest(methods.agent.session.list"#,
+    },
+];
+
 /// Apply every patch anchor exactly once. Refusing partial/ambiguous matches is
 /// what makes an unknown adapter version degrade to ordinary ACP safely instead
 /// of starting a subtly corrupted process.
@@ -138,6 +238,22 @@ pub(crate) fn patch_bundle(source: &str) -> Result<String, String> {
         if count != 1 {
             return Err(format!(
                 "codex-acp steer patch anchor {} matched {} times",
+                index + 1,
+                count
+            ));
+        }
+        patched = patched.replacen(replacement.before, replacement.after, 1);
+    }
+    Ok(patched)
+}
+
+pub(crate) fn patch_native_fork_bundle(source: &str) -> Result<String, String> {
+    let mut patched = source.to_string();
+    for (index, replacement) in NATIVE_FORK_REPLACEMENTS.iter().enumerate() {
+        let count = patched.matches(replacement.before).count();
+        if count != 1 {
+            return Err(format!(
+                "codex-acp native fork patch anchor {} matched {} times",
                 index + 1,
                 count
             ));
@@ -214,8 +330,8 @@ fn module_search_path(bundle: &Path, prefix: Option<&Path>) -> String {
 }
 
 /// Prepare the derived adapter in Codeg's cache. `Ok(None)` means the installed
-/// adapter launches unchanged: either it has upstream native steering, or it
-/// does not match the one legacy version this compatibility patch supports.
+/// adapter launches unchanged because it does not match one of the two exact
+/// versions this compatibility layer understands.
 pub async fn prepare(
     resolved_launcher: &Path,
 ) -> Result<Option<PreparedCodexSteerAdapter>, AcpError> {
@@ -243,48 +359,67 @@ pub async fn prepare(
         .find(|(candidate, _)| candidate.is_file());
     let Some((bundle, package_prefix)) = selected else {
         tracing::warn!(
-            "[ACP][Codex] native steer disabled: agentclientprotocol codex-acp bundle not found"
+            "[ACP][Codex] adapter compatibility disabled: agentclientprotocol codex-acp bundle not found"
         );
         return Ok(None);
     };
 
     let version = adapter_version(&bundle);
-    if version.as_deref().is_some_and(has_upstream_steering) {
-        tracing::info!(
-            "[ACP][Codex] codex-acp {} has upstream _session/steering; launching unchanged",
-            version.as_deref().unwrap_or_default()
-        );
-        return Ok(None);
-    }
-    if version.as_deref() != Some(SUPPORTED_ADAPTER_VERSION) {
-        tracing::warn!(
-            "[ACP][Codex] legacy steer compatibility unavailable: installed codex-acp version {:?}, patchable {}",
-            version,
-            SUPPORTED_ADAPTER_VERSION
-        );
-        return Ok(None);
-    }
-
-    let source = std::fs::read_to_string(&bundle).map_err(|error| {
-        AcpError::SpawnFailed(format!("failed to read codex-acp adapter: {error}"))
-    })?;
-    let patched = match patch_bundle(&source) {
-        Ok(patched) => patched,
-        Err(error) => {
-            tracing::warn!("[ACP][Codex] native steer disabled: {error}");
+    let patch_kind = match version.as_deref() {
+        Some(NATIVE_FORK_ADAPTER_VERSION) => "native_fork",
+        Some(SUPPORTED_ADAPTER_VERSION) => "legacy_steer",
+        _ => {
+            if version.as_deref().is_some_and(has_upstream_steering) {
+                tracing::warn!(
+                    version = version.as_deref().unwrap_or_default(),
+                    patchable_fork_version = NATIVE_FORK_ADAPTER_VERSION,
+                    "[ACP][Codex] adapter has upstream steering but no verified ACP session/fork bridge; launching unchanged"
+                );
+            } else {
+                tracing::warn!(
+                    version = ?version,
+                    patchable_legacy_steer_version = SUPPORTED_ADAPTER_VERSION,
+                    patchable_fork_version = NATIVE_FORK_ADAPTER_VERSION,
+                    "[ACP][Codex] adapter compatibility patch unavailable; launching unchanged"
+                );
+            }
             return Ok(None);
         }
     };
 
+    let source = std::fs::read_to_string(&bundle).map_err(|error| {
+        AcpError::SpawnFailed(format!("failed to read codex-acp adapter: {error}"))
+    })?;
+    let patched = match if patch_kind == "native_fork" {
+        patch_native_fork_bundle(&source)
+    } else {
+        patch_bundle(&source)
+    } {
+        Ok(patched) => patched,
+        Err(error) => {
+            tracing::warn!(
+                patch_kind,
+                "[ACP][Codex] compatibility patch disabled: {error}"
+            );
+            return Ok(None);
+        }
+    };
+
+    let (patch_revision, cache_version) = if patch_kind == "native_fork" {
+        (NATIVE_FORK_PATCH_REVISION, NATIVE_FORK_ADAPTER_VERSION)
+    } else {
+        (PATCH_REVISION, SUPPORTED_ADAPTER_VERSION)
+    };
+
     let mut hash = Sha256::new();
     hash.update(source.as_bytes());
-    hash.update(PATCH_REVISION.as_bytes());
+    hash.update(patch_revision.as_bytes());
     let digest = format!("{:x}", hash.finalize());
     let cache_dir = dirs::cache_dir()
         .ok_or_else(|| AcpError::SpawnFailed("system cache directory unavailable".into()))?
         .join("app.codeg")
         .join("acp-adapters")
-        .join(format!("codex-acp-{SUPPORTED_ADAPTER_VERSION}"));
+        .join(format!("codex-acp-{cache_version}"));
     std::fs::create_dir_all(&cache_dir).map_err(|error| {
         AcpError::SpawnFailed(format!("failed to create adapter cache: {error}"))
     })?;
@@ -318,6 +453,13 @@ pub async fn prepare(
         ));
     };
 
+    tracing::info!(
+        version = version.as_deref().unwrap_or_default(),
+        patch_kind,
+        derived_script = %script.display(),
+        "[ACP][Codex] launching verified derived adapter"
+    );
+
     Ok(Some(PreparedCodexSteerAdapter {
         node,
         script,
@@ -331,6 +473,14 @@ mod tests {
 
     fn fixture_bundle() -> String {
         REPLACEMENTS
+            .iter()
+            .map(|replacement| replacement.before)
+            .collect::<Vec<_>>()
+            .join("\n__separator__\n")
+    }
+
+    fn native_fork_fixture_bundle() -> String {
+        NATIVE_FORK_REPLACEMENTS
             .iter()
             .map(|replacement| replacement.before)
             .collect::<Vec<_>>()
@@ -354,6 +504,54 @@ mod tests {
         assert!(patch_bundle("unknown").is_err());
         let once = patch_bundle(&fixture_bundle()).expect("first patch");
         assert!(patch_bundle(&once).is_err());
+    }
+
+    #[test]
+    fn patch_exposes_official_persistent_thread_fork_over_acp() {
+        let patched = patch_native_fork_bundle(&native_fork_fixture_bundle())
+            .expect("published 1.6.2 anchors patch");
+        assert!(patched.contains("fork: {"));
+        assert!(patched.contains("\"codeg/nativeThreadFork\""));
+        assert!(patched.contains("this.codexClient.threadFork"));
+        assert!(patched.contains("threadId: sessionId"));
+        assert!(patched.contains("this.sessions.set(sessionId, sessionState)"));
+        assert!(patched.contains("methods.agent.session.fork"));
+        assert!(patched.contains("thread/fork did not return an independent session"));
+    }
+
+    #[test]
+    fn native_fork_patch_refuses_unknown_or_already_patched_bundle() {
+        assert!(patch_native_fork_bundle("unknown").is_err());
+        let once = patch_native_fork_bundle(&native_fork_fixture_bundle())
+            .expect("first native fork patch");
+        assert!(patch_native_fork_bundle(&once).is_err());
+    }
+
+    #[test]
+    fn published_native_fork_bundle_matches_when_fixture_path_is_supplied() {
+        let Ok(path) = std::env::var("CODEG_CODEX_ACP_PUBLISHED_BUNDLE") else {
+            return;
+        };
+        let source = std::fs::read_to_string(path).expect("read published codex-acp bundle");
+        let patched = patch_native_fork_bundle(&source)
+            .expect("published codex-acp 1.6.2 bundle must match every verified anchor");
+        assert!(patched.contains("methods.agent.session.fork"));
+        assert!(patched.contains("this.codexClient.threadFork"));
+
+        let fixture = tempfile::Builder::new()
+            .suffix(".mjs")
+            .tempfile()
+            .expect("create patched bundle fixture");
+        std::fs::write(fixture.path(), patched).expect("write patched bundle fixture");
+        let status = std::process::Command::new("node")
+            .arg("--check")
+            .arg(fixture.path())
+            .status()
+            .expect("run node syntax check");
+        assert!(
+            status.success(),
+            "patched published bundle must parse as ESM"
+        );
     }
 
     #[test]
