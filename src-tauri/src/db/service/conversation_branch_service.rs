@@ -1,24 +1,42 @@
 use chrono::Utc;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, IntoActiveModel, QueryFilter,
-    QueryOrder, Set, TransactionError, TransactionTrait,
+    ActiveModelTrait, ActiveValue::NotSet, ColumnTrait, DatabaseConnection, EntityTrait,
+    IntoActiveModel, QueryFilter, QueryOrder, Set, TransactionError, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::sync::LazyLock;
 
 use crate::db::entities::{
     conversation, conversation_branch, conversation_branch_merge, conversation_deliverable,
     conversation_turn_deliverable, conversation_turn_run,
 };
 use crate::db::error::DbError;
+#[cfg(test)]
 use crate::db::service::conversation_service;
 use crate::models::conversation::DbConversationSummary;
 use crate::models::message::{ContentBlock, ImageData, MessageTurn, TurnRole};
+
+static BRANCH_CREATE_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
+static BRANCH_MERGE_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+fn source_title_base(title: Option<&str>) -> String {
+    let title = title.unwrap_or("未命名会话").trim();
+    let title = title.strip_prefix("[Fork]").unwrap_or(title).trim();
+    if title.is_empty() {
+        "未命名会话".into()
+    } else {
+        title.into()
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConversationBranchInfo {
     pub branch_conversation_id: i32,
+    pub creation_request_id: Option<String>,
     pub source_conversation_id: i32,
     pub source_title: Option<String>,
     pub source_available: bool,
@@ -55,6 +73,7 @@ impl From<conversation_branch::Model> for ConversationBranchInfo {
     fn from(value: conversation_branch::Model) -> Self {
         Self {
             branch_conversation_id: value.branch_conversation_id,
+            creation_request_id: value.creation_request_id,
             source_conversation_id: value.source_conversation_id,
             source_title: value.source_title,
             source_available: true,
@@ -114,47 +133,59 @@ pub async fn create_branch_row(
     fork_mode: &str,
     inheritance: BranchInheritanceRecord,
 ) -> Result<(conversation::Model, ConversationBranchInfo), DbError> {
-    let title = Some(format!(
-        "{} · 分支",
-        source.title.as_deref().unwrap_or("未命名会话")
-    ));
-    let created = if source.kind == conversation::ConversationKind::Chat {
-        conversation_service::create_chat(
-            conn,
-            source.folder_id,
-            source.agent_type,
-            title,
-            source.git_branch.clone(),
-        )
-        .await?
-    } else {
-        conversation_service::create(
-            conn,
-            source.folder_id,
-            source.agent_type,
-            title,
-            source.git_branch.clone(),
-        )
-        .await?
-    };
+    create_branch_row_with_request(
+        conn,
+        source,
+        None,
+        external_id,
+        fork_message_id,
+        fork_mode,
+        inheritance,
+    )
+    .await
+}
 
-    let created_id = created.id;
-    let mut active = created.into_active_model();
-    active.title_locked = Set(true);
-    active.model = Set(source.model.clone());
-    active.external_id = Set(external_id);
-    active.origin_cwd = Set(source.origin_cwd.clone());
-    // A branch with no user turn is idle, not running. In particular this
-    // prevents a transient ACP disconnect from being interpreted as a user
-    // cancellation before the first prompt exists.
-    active.status = Set(conversation::ConversationStatus::PendingReview);
-    let created = match active.update(conn).await {
-        Ok(created) => created,
-        Err(error) => {
-            let _ = remove_incomplete_branch(conn, created_id).await;
-            return Err(DbError::Database(error));
+pub async fn create_branch_row_with_request(
+    conn: &DatabaseConnection,
+    source: &DbConversationSummary,
+    creation_request_id: Option<String>,
+    external_id: Option<String>,
+    fork_message_id: Option<String>,
+    fork_mode: &str,
+    inheritance: BranchInheritanceRecord,
+) -> Result<(conversation::Model, ConversationBranchInfo), DbError> {
+    let _create_guard = BRANCH_CREATE_LOCK.lock().await;
+    if let Some(request_id) = creation_request_id.as_deref() {
+        if let Some(existing) = conversation_branch::Entity::find()
+            .filter(conversation_branch::Column::CreationRequestId.eq(request_id))
+            .one(conn)
+            .await?
+        {
+            let branch = conversation::Entity::find_by_id(existing.branch_conversation_id)
+                .one(conn)
+                .await?
+                .ok_or_else(|| DbError::NotFound("idempotent branch conversation".into()))?;
+            return Ok((branch, existing.into()));
         }
+    }
+    let base_title = format!("{} · 分支", source_title_base(source.title.as_deref()));
+    let sibling_titles = conversation::Entity::find()
+        .filter(conversation::Column::FolderId.eq(source.folder_id))
+        .filter(conversation::Column::DeletedAt.is_null())
+        .all(conn)
+        .await?
+        .into_iter()
+        .filter_map(|row| row.title)
+        .collect::<std::collections::HashSet<_>>();
+    let title = if !sibling_titles.contains(&base_title) {
+        base_title
+    } else {
+        (2..)
+            .map(|number| format!("{base_title} {number}"))
+            .find(|candidate| !sibling_titles.contains(candidate))
+            .expect("the branch title number space is unbounded")
     };
+    let title = Some(title);
     let now = Utc::now();
     let provisional = fork_mode == "snapshot" && inheritance.snapshot_context.is_some();
     let snapshot_digest = inheritance.snapshot_context.as_deref().map(|context| {
@@ -162,57 +193,121 @@ pub async fn create_branch_row(
         digest.update(context.as_bytes());
         format!("{:x}", digest.finalize())
     });
-    let relation = conversation_branch::ActiveModel {
-        branch_conversation_id: Set(created.id),
-        source_conversation_id: Set(source.id),
-        source_title: Set(source.title.clone()),
-        fork_message_id: Set(fork_message_id),
-        fork_mode: Set(fork_mode.to_string()),
-        source_session_id: Set(inheritance.source_session_id),
-        branch_session_id: Set(inheritance.branch_session_id),
-        inheritance_mode: Set(inheritance.inheritance_mode),
-        inherited_message_count: Set(inheritance.inherited_message_count),
-        inherited_context_chars: Set(inheritance.inherited_context_chars),
-        inherited_estimated_tokens: Set(inheritance.inherited_estimated_tokens),
-        inheritance_compressed: Set(inheritance.inheritance_compressed),
-        inheritance_truncated: Set(inheritance.inheritance_truncated),
-        inheritance_note: Set(inheritance.inheritance_note),
-        forked_through_at: Set(inheritance.forked_through_at),
-        snapshot_version: Set(inheritance.snapshot_version),
-        snapshot_images_json: Set((!inheritance.snapshot_images.is_empty()).then(|| {
-            serde_json::to_string(&inheritance.snapshot_images).unwrap_or_else(|_| "[]".into())
-        })),
-        snapshot_context: Set(inheritance.snapshot_context),
-        snapshot_consumed_at: Set(None),
-        lifecycle_state: Set(if provisional {
-            "provisional".into()
-        } else {
-            "ready".into()
-        }),
-        lifecycle_error: Set(None),
-        lifecycle_updated_at: Set(Some(now)),
-        session_verified_at: Set((!provisional).then_some(now)),
-        first_prompt_client_message_id: Set(None),
-        first_prompt_queued_at: Set(None),
-        first_prompt_accepted_at: Set(None),
-        initialization_retry_count: Set(0),
-        last_connection_id: Set(None),
-        snapshot_digest: Set(snapshot_digest),
-        created_at: Set(now),
-        last_merged_at: Set(None),
-        last_merge_key: Set(None),
-        merge_target_conversation_id: Set(None),
-    }
-    .insert(conn)
-    .await;
-    let relation = match relation {
-        Ok(relation) => relation,
-        Err(error) => {
-            let _ = remove_incomplete_branch(conn, created.id).await;
-            return Err(DbError::Database(error));
+    let agent_type = serde_json::to_value(source.agent_type)
+        .ok()
+        .and_then(|value| value.as_str().map(String::from))
+        .unwrap_or_default();
+    let folder_id = source.folder_id;
+    let source_id = source.id;
+    let source_title = source.title.clone();
+    let source_kind = source.kind.clone();
+    let source_model = source.model.clone();
+    let source_git_branch = source.git_branch.clone();
+    let source_origin_cwd = source.origin_cwd.clone();
+    let fork_mode = fork_mode.to_string();
+    let result = conn
+        .transaction::<_, (conversation::Model, conversation_branch::Model), sea_orm::DbErr>(
+            |txn| {
+                Box::pin(async move {
+                    // Conversation ownership and its branch relation become
+                    // visible atomically. A cancelled HTTP request or process
+                    // error can therefore never expose a title-only branch.
+                    let created = conversation::ActiveModel {
+                        id: NotSet,
+                        folder_id: Set(folder_id),
+                        title: Set(title),
+                        title_locked: Set(true),
+                        agent_type: Set(agent_type),
+                        status: Set(conversation::ConversationStatus::PendingReview),
+                        kind: Set(source_kind),
+                        model: Set(source_model),
+                        git_branch: Set(source_git_branch),
+                        external_id: Set(external_id),
+                        parent_id: Set(None),
+                        parent_tool_use_id: Set(None),
+                        delegation_call_id: Set(None),
+                        message_count: Set(0),
+                        created_at: Set(now),
+                        updated_at: Set(now),
+                        deleted_at: Set(None),
+                        pinned_at: Set(None),
+                        origin_cwd: Set(source_origin_cwd),
+                    }
+                    .insert(txn)
+                    .await?;
+                    let relation = conversation_branch::ActiveModel {
+                        branch_conversation_id: Set(created.id),
+                        creation_request_id: Set(creation_request_id),
+                        source_conversation_id: Set(source_id),
+                        source_title: Set(source_title),
+                        fork_message_id: Set(fork_message_id),
+                        fork_mode: Set(fork_mode),
+                        source_session_id: Set(inheritance.source_session_id),
+                        branch_session_id: Set(inheritance.branch_session_id),
+                        inheritance_mode: Set(inheritance.inheritance_mode),
+                        inherited_message_count: Set(inheritance.inherited_message_count),
+                        inherited_context_chars: Set(inheritance.inherited_context_chars),
+                        inherited_estimated_tokens: Set(inheritance.inherited_estimated_tokens),
+                        inheritance_compressed: Set(inheritance.inheritance_compressed),
+                        inheritance_truncated: Set(inheritance.inheritance_truncated),
+                        inheritance_note: Set(inheritance.inheritance_note),
+                        forked_through_at: Set(inheritance.forked_through_at),
+                        snapshot_version: Set(inheritance.snapshot_version),
+                        snapshot_images_json: Set((!inheritance.snapshot_images.is_empty()).then(
+                            || {
+                                serde_json::to_string(&inheritance.snapshot_images)
+                                    .unwrap_or_else(|_| "[]".into())
+                            },
+                        )),
+                        snapshot_context: Set(inheritance.snapshot_context),
+                        snapshot_consumed_at: Set(None),
+                        lifecycle_state: Set(if provisional {
+                            "provisional".into()
+                        } else {
+                            "ready".into()
+                        }),
+                        lifecycle_error: Set(None),
+                        lifecycle_updated_at: Set(Some(now)),
+                        session_verified_at: Set((!provisional).then_some(now)),
+                        first_prompt_client_message_id: Set(None),
+                        first_prompt_queued_at: Set(None),
+                        first_prompt_accepted_at: Set(None),
+                        initialization_retry_count: Set(0),
+                        last_connection_id: Set(None),
+                        snapshot_digest: Set(snapshot_digest),
+                        created_at: Set(now),
+                        last_merged_at: Set(None),
+                        last_merge_key: Set(None),
+                        merge_target_conversation_id: Set(None),
+                    }
+                    .insert(txn)
+                    .await?;
+                    Ok((created, relation))
+                })
+            },
+        )
+        .await;
+    match result {
+        Ok((created, relation)) => Ok((created, relation.into())),
+        Err(TransactionError::Connection(error) | TransactionError::Transaction(error)) => {
+            Err(DbError::Database(error))
         }
-    };
-    Ok((created, relation.into()))
+    }
+}
+
+pub async fn get_by_creation_request_id(
+    conn: &DatabaseConnection,
+    request_id: &str,
+) -> Result<Option<ConversationBranchInfo>, DbError> {
+    let request_id = request_id.trim();
+    if request_id.is_empty() {
+        return Ok(None);
+    }
+    Ok(conversation_branch::Entity::find()
+        .filter(conversation_branch::Column::CreationRequestId.eq(request_id))
+        .one(conn)
+        .await?
+        .map(Into::into))
 }
 
 pub async fn update_branch_session_id(
@@ -237,6 +332,8 @@ pub const PROVISIONAL_STATES: &[&str] = &[
     "session_creating",
     "connection_ready",
     "prompt_ready",
+    "pending_first_prompt",
+    "first_prompt_queued",
     "retryable_failed",
 ];
 
@@ -270,10 +367,15 @@ pub async fn repair_empty_snapshot_as_provisional(
     else {
         return Ok(false);
     };
-    if branch.branch_session_id.is_none()
+    let already_safe = branch.branch_session_id.is_none()
         && conversation.external_id.is_none()
         && conversation.status == conversation::ConversationStatus::PendingReview
-        && PROVISIONAL_STATES.contains(&branch.lifecycle_state.as_str())
+        && PROVISIONAL_STATES.contains(&branch.lifecycle_state.as_str());
+    if already_safe
+        && matches!(
+            branch.lifecycle_state.as_str(),
+            "provisional" | "pending_first_prompt" | "first_prompt_queued" | "retryable_failed"
+        )
     {
         return Ok(false);
     }
@@ -347,6 +449,17 @@ pub async fn is_provisional_snapshot(
         && PROVISIONAL_STATES.contains(&branch.lifecycle_state.as_str()))
 }
 
+pub async fn is_merged_branch(
+    conn: &DatabaseConnection,
+    conversation_id: i32,
+) -> Result<bool, DbError> {
+    Ok(conversation_branch::Entity::find_by_id(conversation_id)
+        .filter(conversation_branch::Column::LifecycleState.eq("merged"))
+        .one(conn)
+        .await?
+        .is_some())
+}
+
 pub async fn mark_initialization_state(
     conn: &DatabaseConnection,
     conversation_id: i32,
@@ -413,7 +526,7 @@ pub async fn mark_first_prompt_queued(
     if !has_queued_at {
         active.first_prompt_queued_at = Set(Some(now));
     }
-    active.lifecycle_state = Set("prompt_ready".into());
+    active.lifecycle_state = Set("first_prompt_queued".into());
     active.lifecycle_error = Set(None);
     active.lifecycle_updated_at = Set(Some(now));
     active.last_connection_id = Set(Some(connection_id.to_string()));
@@ -552,6 +665,102 @@ pub async fn get_info(
     Ok(Some(info))
 }
 
+/// Native branches that may have been created by the legacy in-process fork
+/// path. Older codex-acp versions kept both the parent and child writer inside
+/// that one adapter process; if restoring the parent reports `active writer`,
+/// an idle child connection from this list is the only CodeG-owned process that
+/// can safely release it. The caller still verifies connection state before
+/// disconnecting anything.
+pub async fn native_branch_sessions_for_source(
+    conn: &DatabaseConnection,
+    source_session_id: &str,
+) -> Result<Vec<(i32, String)>, DbError> {
+    Ok(conversation_branch::Entity::find()
+        .filter(conversation_branch::Column::ForkMode.eq("native"))
+        .filter(conversation_branch::Column::SourceSessionId.eq(source_session_id))
+        // New detached-writer branches always persist a creation id. Only
+        // pre-upgrade rows used the adapter process that retained the parent
+        // writer, so never tear down a healthy modern branch during repair.
+        .filter(conversation_branch::Column::CreationRequestId.is_null())
+        .all(conn)
+        .await?
+        .into_iter()
+        .filter_map(|row| {
+            row.branch_session_id
+                .filter(|session_id| !session_id.trim().is_empty())
+                .map(|session_id| (row.branch_conversation_id, session_id))
+        })
+        .collect())
+}
+
+/// Normalize user-visible metadata left by the legacy two-row swap fork. This
+/// never changes either conversation's external session id or source/branch
+/// mapping; when ownership is ambiguous it deliberately leaves the data alone.
+pub async fn normalize_legacy_branch_metadata(
+    conn: &DatabaseConnection,
+    conversation_id: i32,
+) -> Result<bool, DbError> {
+    let _guard = BRANCH_CREATE_LOCK.lock().await;
+    let Some(relation) = conversation_branch::Entity::find_by_id(conversation_id)
+        .one(conn)
+        .await?
+    else {
+        return Ok(false);
+    };
+    let Some(branch) = conversation::Entity::find_by_id(conversation_id)
+        .filter(conversation::Column::DeletedAt.is_null())
+        .one(conn)
+        .await?
+    else {
+        return Ok(false);
+    };
+    let legacy_title = branch
+        .title
+        .as_deref()
+        .is_some_and(|title| title.trim_start().starts_with("[Fork]"));
+    if !legacy_title {
+        return Ok(false);
+    }
+    let Some(source) = conversation::Entity::find_by_id(relation.source_conversation_id)
+        .filter(conversation::Column::DeletedAt.is_null())
+        .one(conn)
+        .await?
+    else {
+        return Ok(false);
+    };
+    let base = format!("{} · 分支", source_title_base(source.title.as_deref()));
+    let used = conversation::Entity::find()
+        .filter(conversation::Column::FolderId.eq(branch.folder_id))
+        .filter(conversation::Column::DeletedAt.is_null())
+        .all(conn)
+        .await?
+        .into_iter()
+        .filter(|row| row.id != conversation_id)
+        .filter_map(|row| row.title)
+        .collect::<std::collections::HashSet<_>>();
+    let title = if !used.contains(&base) {
+        base
+    } else {
+        (2..)
+            .map(|number| format!("{base} {number}"))
+            .find(|candidate| !used.contains(candidate))
+            .expect("the branch title number space is unbounded")
+    };
+    let mut active = branch.into_active_model();
+    active.title = Set(Some(title.clone()));
+    active.title_locked = Set(true);
+    active.updated_at = Set(Utc::now());
+    active.update(conn).await?;
+    tracing::info!(
+        branch_conversation_id = conversation_id,
+        source_conversation_id = relation.source_conversation_id,
+        normalized_title = title,
+        repair = true,
+        "[ACP][branch] normalized legacy fork title without changing session ownership"
+    );
+    Ok(true)
+}
+
 /// Backfill the durable branch relation omitted by the original Fork & Send
 /// implementation. The caller supplies the parent session read from Codex's
 /// own rollout header; that protocol-level identity is safer than guessing from
@@ -608,6 +817,7 @@ pub async fn repair_native_fork_relation(
     let now = Utc::now();
     let relation = conversation_branch::ActiveModel {
         branch_conversation_id: Set(conversation_id),
+        creation_request_id: Set(None),
         source_conversation_id: Set(source.id),
         source_title: Set(source.title.clone()),
         fork_message_id: Set(None),
@@ -624,7 +834,12 @@ pub async fn repair_native_fork_relation(
             "Repaired from Codex session_meta.parent_thread_id; the complete native session context was inherited."
                 .into(),
         )),
-        forked_through_at: Set(Some(source.created_at)),
+        // The old fork implementation did not persist an explicit message
+        // boundary. The branch row's creation timestamp is the narrowest
+        // durable boundary available; using the source creation time hid
+        // virtually the entire inherited history, while using its current
+        // message count could leak source turns written after the fork.
+        forked_through_at: Set(Some(branch.created_at)),
         snapshot_version: Set(2),
         snapshot_images_json: Set(None),
         snapshot_context: Set(None),
@@ -757,6 +972,11 @@ pub async fn merge_branch(
             "request_id and merge summary are required".into(),
         ));
     }
+    // The desktop/server runtime owns one SQLite database in one process.
+    // Serialize the read → append → lifecycle transition so two browser tabs
+    // using different request ids still produce exactly one merge event. The
+    // stable request id remains the cross-retry idempotency key.
+    let _merge_guard = BRANCH_MERGE_LOCK.lock().await;
     if let Some(existing) = conversation_branch_merge::Entity::find_by_id(&request_id)
         .one(conn)
         .await?
@@ -775,6 +995,27 @@ pub async fn merge_branch(
         .one(conn)
         .await?
         .ok_or_else(|| DbError::NotFound("conversation branch".into()))?;
+    if relation.lifecycle_state == "merged" {
+        if let Some(existing_id) = relation.last_merge_key.as_deref() {
+            if let Some(existing) = conversation_branch_merge::Entity::find_by_id(existing_id)
+                .one(conn)
+                .await?
+            {
+                let copied = serde_json::from_str::<Vec<String>>(&existing.deliverable_ids_json)
+                    .unwrap_or_default()
+                    .len();
+                return Ok(MergeBranchResult {
+                    merge_id: existing.id,
+                    target_conversation_id: existing.target_conversation_id,
+                    copied_deliverable_count: copied,
+                    deduplicated: true,
+                });
+            }
+        }
+        return Err(DbError::Validation(
+            "This branch has already been returned to its source conversation".into(),
+        ));
+    }
     // Deletion is soft and relations intentionally do not cascade. Reject a
     // merge when the source is gone; deleting either side never deletes the
     // other side or the audit row.
@@ -784,17 +1025,18 @@ pub async fn merge_branch(
         .await?
         .ok_or_else(|| DbError::NotFound("source conversation".into()))?;
 
-    let selected = if deliverable_ids.is_empty() {
-        Vec::new()
-    } else {
-        conversation_deliverable::Entity::find()
-            .filter(conversation_deliverable::Column::ConversationId.eq(branch_conversation_id))
-            .filter(conversation_deliverable::Column::Id.is_in(deliverable_ids.clone()))
-            .filter(conversation_deliverable::Column::IsValid.eq(true))
-            .filter(conversation_deliverable::Column::IsHidden.eq(false))
-            .all(conn)
-            .await?
-    };
+    let mut deliverable_query = conversation_deliverable::Entity::find()
+        .filter(conversation_deliverable::Column::ConversationId.eq(branch_conversation_id))
+        .filter(conversation_deliverable::Column::IsValid.eq(true))
+        .filter(conversation_deliverable::Column::IsHidden.eq(false));
+    if !deliverable_ids.is_empty() {
+        deliverable_query = deliverable_query
+            .filter(conversation_deliverable::Column::Id.is_in(deliverable_ids.clone()));
+    }
+    let selected = deliverable_query
+        .order_by_asc(conversation_deliverable::Column::CreatedAt)
+        .all(conn)
+        .await?;
     let copied_count = selected.len();
     let copied_source_ids: Vec<String> = selected.iter().map(|d| d.id.clone()).collect();
     let now = Utc::now();
@@ -909,7 +1151,29 @@ pub async fn merge_branch(
                 active.last_merged_at = Set(Some(now));
                 active.last_merge_key = Set(Some(request_for_tx));
                 active.merge_target_conversation_id = Set(Some(target_id));
+                active.lifecycle_state = Set("merged".into());
+                active.lifecycle_error = Set(None);
+                active.lifecycle_updated_at = Set(Some(now));
                 active.update(txn).await?;
+
+                if let Some(branch_conversation) =
+                    conversation::Entity::find_by_id(branch_conversation_id)
+                        .one(txn)
+                        .await?
+                {
+                    let mut branch_active = branch_conversation.into_active_model();
+                    branch_active.status = Set(conversation::ConversationStatus::Completed);
+                    branch_active.pinned_at = Set(None);
+                    branch_active.updated_at = Set(now);
+                    branch_active.update(txn).await?;
+                }
+                if let Some(target) = conversation::Entity::find_by_id(target_id).one(txn).await? {
+                    let next_count = target.message_count.saturating_add(2);
+                    let mut target_active = target.into_active_model();
+                    target_active.message_count = Set(next_count);
+                    target_active.updated_at = Set(now);
+                    target_active.update(txn).await?;
+                }
                 Ok(())
             })
         })
@@ -1049,6 +1313,7 @@ mod tests {
     use super::*;
     use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
     use crate::models::AgentType;
+    use sea_orm::PaginatorTrait;
 
     #[tokio::test]
     async fn legacy_fork_send_relation_repairs_from_native_parent_identity() {
@@ -1077,6 +1342,28 @@ mod tests {
         assert_eq!(repaired.source_conversation_id, source_id);
         assert_eq!(repaired.inheritance_mode, "native_fork");
         assert!(!repaired.inheritance_compressed);
+        let branch_created_at = conversation::Entity::find_by_id(branch_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap()
+            .created_at;
+        assert_eq!(
+            repaired.forked_through_at,
+            Some(branch_created_at),
+            "legacy native branches freeze visible history at their own creation time"
+        );
+        normalize_legacy_branch_metadata(&db.conn, branch_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            conversation_service::get_by_id(&db.conn, branch_id)
+                .await
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("未命名会话 · 分支")
+        );
         assert_eq!(
             repair_native_fork_relation(&db.conn, branch_id, "session-parent")
                 .await
@@ -1085,6 +1372,13 @@ mod tests {
                 .source_conversation_id,
             source_id,
             "repair is idempotent"
+        );
+        assert_eq!(
+            native_branch_sessions_for_source(&db.conn, "session-parent")
+                .await
+                .unwrap(),
+            vec![(branch_id, "session-child".into())],
+            "only legacy native branches are candidates for writer handoff"
         );
     }
 
@@ -1165,7 +1459,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .lifecycle_state,
-            "prompt_ready",
+            "first_prompt_queued",
             "a delayed SessionStarted event must not regress prompt readiness"
         );
         finalize_first_prompt(
@@ -1221,6 +1515,146 @@ mod tests {
         assert!(conversation_service::get_by_id(&db.conn, branch.id)
             .await
             .is_ok());
+    }
+
+    #[tokio::test]
+    async fn branch_creation_is_idempotent_and_numbers_titles() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/codeg-branch-title-test").await;
+        let source_id = seed_conversation(&db, folder_id, AgentType::Codex).await;
+        conversation_service::update_title(&db.conn, source_id, "Agent 调试".into())
+            .await
+            .unwrap();
+        let source = conversation_service::get_by_id(&db.conn, source_id)
+            .await
+            .unwrap();
+        let inheritance = || BranchInheritanceRecord {
+            source_session_id: None,
+            branch_session_id: None,
+            inheritance_mode: "structured_snapshot".into(),
+            inherited_message_count: 0,
+            inherited_context_chars: 7,
+            inherited_estimated_tokens: 2,
+            inheritance_compressed: false,
+            inheritance_truncated: false,
+            inheritance_note: None,
+            forked_through_at: None,
+            snapshot_version: 2,
+            snapshot_context: Some("context".into()),
+            snapshot_images: Vec::new(),
+        };
+
+        let (first, first_info) = create_branch_row_with_request(
+            &db.conn,
+            &source,
+            Some("create-once".into()),
+            None,
+            None,
+            "snapshot",
+            inheritance(),
+        )
+        .await
+        .unwrap();
+        let (retry, retry_info) = create_branch_row_with_request(
+            &db.conn,
+            &source,
+            Some("create-once".into()),
+            None,
+            None,
+            "snapshot",
+            inheritance(),
+        )
+        .await
+        .unwrap();
+        let (second, _) = create_branch_row_with_request(
+            &db.conn,
+            &source,
+            Some("create-twice".into()),
+            None,
+            None,
+            "snapshot",
+            inheritance(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(first.id, retry.id);
+        assert_eq!(
+            first_info.branch_conversation_id,
+            retry_info.branch_conversation_id
+        );
+        assert_eq!(first.title.as_deref(), Some("Agent 调试 · 分支"));
+        assert_eq!(second.title.as_deref(), Some("Agent 调试 · 分支 2"));
+        assert_eq!(
+            conversation_branch::Entity::find()
+                .count(&db.conn)
+                .await
+                .unwrap(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn native_branch_persistence_keeps_source_session_and_title_immutable() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/codeg-native-branch-map").await;
+        let source_id = seed_conversation(&db, folder_id, AgentType::Codex).await;
+        conversation_service::bind_external_id(&db.conn, source_id, "source-session", &[])
+            .await
+            .unwrap();
+        conversation_service::update_title(&db.conn, source_id, "Agent 调试".into())
+            .await
+            .unwrap();
+        let source_before = conversation_service::get_by_id(&db.conn, source_id)
+            .await
+            .unwrap();
+
+        let (branch, relation) = create_branch_row_with_request(
+            &db.conn,
+            &source_before,
+            Some("native-create-once".into()),
+            Some("branch-session".into()),
+            None,
+            "native",
+            BranchInheritanceRecord {
+                source_session_id: Some("source-session".into()),
+                branch_session_id: Some("branch-session".into()),
+                inheritance_mode: "native_fork".into(),
+                inherited_message_count: 12,
+                inherited_context_chars: 0,
+                inherited_estimated_tokens: 0,
+                inheritance_compressed: false,
+                inheritance_truncated: false,
+                inheritance_note: None,
+                forked_through_at: Some(Utc::now()),
+                snapshot_version: 2,
+                snapshot_context: None,
+                snapshot_images: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let source_after = conversation_service::get_by_id(&db.conn, source_id)
+            .await
+            .unwrap();
+        assert_ne!(branch.id, source_id);
+        assert_eq!(source_after.title, source_before.title);
+        assert_eq!(source_after.external_id.as_deref(), Some("source-session"));
+        assert_eq!(branch.title.as_deref(), Some("Agent 调试 · 分支"));
+        assert_eq!(branch.external_id.as_deref(), Some("branch-session"));
+        assert_eq!(relation.source_conversation_id, source_id);
+        assert_eq!(
+            relation.branch_session_id.as_deref(),
+            Some("branch-session")
+        );
+        assert!(
+            native_branch_sessions_for_source(&db.conn, "source-session")
+                .await
+                .unwrap()
+                .is_empty(),
+            "detached-writer branches must never be treated as legacy owners"
+        );
     }
 
     #[tokio::test]
@@ -1367,7 +1801,7 @@ mod tests {
             branch.id,
             "merge-once".into(),
             "Branch conclusion".into(),
-            vec!["selected".into(), "invalid".into(), "hidden".into()],
+            Vec::new(),
         )
         .await
         .unwrap();
@@ -1380,23 +1814,34 @@ mod tests {
         )
         .await
         .unwrap();
+        let second_tab_retry = merge_branch(
+            &db.conn,
+            branch.id,
+            "merge-from-another-tab".into(),
+            "must not be appended twice".into(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
         assert!(!first.deduplicated);
         assert!(retry.deduplicated);
-        assert_eq!(first.copied_deliverable_count, 1);
-        assert_eq!(retry.copied_deliverable_count, 1);
+        assert!(second_tab_retry.deduplicated);
+        assert_eq!(second_tab_retry.merge_id, first.merge_id);
+        assert_eq!(first.copied_deliverable_count, 2);
+        assert_eq!(retry.copied_deliverable_count, 2);
         let copied = conversation_deliverable::Entity::find()
             .filter(conversation_deliverable::Column::ConversationId.eq(source_id))
             .all(&db.conn)
             .await
             .unwrap();
-        assert_eq!(copied.len(), 1);
+        assert_eq!(copied.len(), 2);
         assert_eq!(copied[0].path, "final.pdf");
         assert_eq!(copied[0].source, "branch_merge");
         let pending = pending_merge_context(&db.conn, source_id).await.unwrap();
         assert_eq!(pending.len(), 1);
         assert!(pending[0].1.contains("Branch conclusion"));
         assert!(pending[0].1.contains("final.pdf"));
-        assert!(!pending[0].1.contains("notes.txt"));
+        assert!(pending[0].1.contains("notes.txt"));
         mark_merge_context_consumed(&db.conn, source_id, &[pending[0].0.clone()])
             .await
             .unwrap();
@@ -1412,6 +1857,36 @@ mod tests {
             panic!("expected merge summary text")
         };
         assert_eq!(text, "Branch conclusion");
+
+        let merged_info = get_info(&db.conn, branch.id).await.unwrap().unwrap();
+        assert_eq!(merged_info.lifecycle_state, "merged");
+        assert_eq!(
+            conversation_service::get_by_id(&db.conn, branch.id)
+                .await
+                .unwrap()
+                .status,
+            "completed"
+        );
+        let active = conversation_service::list_all(
+            &db.conn,
+            Some(vec![folder_id]),
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(active
+            .iter()
+            .any(|conversation| conversation.id == source_id));
+        assert!(
+            active
+                .iter()
+                .all(|conversation| conversation.id != branch.id),
+            "merged branches stay auditable but disappear from active lists"
+        );
 
         // Both conversations remain independent live rows.
         assert!(conversation_service::get_by_id(&db.conn, source_id)

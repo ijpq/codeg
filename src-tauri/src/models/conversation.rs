@@ -139,6 +139,11 @@ pub struct DbConversationDetail {
     /// file; the index-based window metadata below remains for compatibility.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub history_page: Option<ConversationHistoryPage>,
+    /// Present for a user-created branch. The inherited prefix is resolved
+    /// from the source transcript at this fixed boundary and is read-only;
+    /// branch-local turns follow it without copying source rows into SQLite.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch_history: Option<ConversationBranchHistory>,
     /// Turn-window metadata, present only when the request asked for a window
     /// (`tailTurns` / `fromIndex`). All four fields are set together; their
     /// absence tells the frontend this is a legacy full response and windowed
@@ -164,6 +169,15 @@ pub struct DbConversationDetail {
     /// bound (i.e. its persisted twin is provably inside the window).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uncovered_prefix_max_ts: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationBranchHistory {
+    pub source_conversation_id: i32,
+    pub fork_message_id: Option<String>,
+    pub inherited_turn_count: usize,
+    pub branch_turn_count: usize,
+    pub inheritance_mode: String,
 }
 
 /// One page of older history for the reverse-infinite-scroll path:

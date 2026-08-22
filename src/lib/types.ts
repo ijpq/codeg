@@ -617,6 +617,8 @@ export interface DbConversationDetail {
   deliverable_runs?: ConversationTurnDeliverableSet[]
   /** Opaque cursor metadata returned by bounded history reads. */
   history_page?: ConversationHistoryPage | null
+  /** Fixed read-only source prefix composed ahead of branch-local turns. */
+  branch_history?: ConversationBranchHistory | null
   /**
    * Turn-window metadata, present only when the request asked for a window
    * (`tailTurns`/`fromIndex`); their absence marks a legacy full response
@@ -642,6 +644,14 @@ export interface DbConversationDetail {
    * than this bound (its persisted twin is then provably inside the window).
    */
   uncovered_prefix_max_ts?: string | null
+}
+
+export interface ConversationBranchHistory {
+  source_conversation_id: number
+  fork_message_id?: string | null
+  inherited_turn_count: number
+  branch_turn_count: number
+  inheritance_mode: string
 }
 
 /** One page of older history for reverse infinite scroll:

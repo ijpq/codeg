@@ -1793,6 +1793,12 @@ export function MessageInput({
                 <Zap className="h-4 w-4" />
                 {t("steerIntoTurn")}
               </DropdownMenuItem>
+              {onForkSend && (
+                <DropdownMenuItem onSelect={handleForkSendClick}>
+                  <GitFork className="h-4 w-4" />
+                  {t("forkAndSend")}
+                </DropdownMenuItem>
+              )}
             </DropdownMenuContent>
           </DropdownMenu>
         </div>

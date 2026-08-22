@@ -1351,6 +1351,7 @@ mod tests {
             deliverables: Vec::new(),
             deliverable_runs: Vec::new(),
             history_page: None,
+            branch_history: None,
         }
     }
 

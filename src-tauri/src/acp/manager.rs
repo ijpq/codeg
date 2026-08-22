@@ -443,13 +443,7 @@ impl ConnectionManager {
         emitter: &EventEmitter,
     ) -> Result<usize, crate::db::error::DbError> {
         self.artifact_tracker
-            .ingest_agent_file_change_report(
-                db,
-                connection_id,
-                request_id,
-                paths,
-                emitter,
-            )
+            .ingest_agent_file_change_report(db, connection_id, request_id, paths, emitter)
             .await
     }
 
@@ -805,19 +799,28 @@ impl ConnectionManager {
         Ok(connection_id)
     }
 
-    /// Run only the native ACP `session/fork` round trip. Unlike
-    /// `fork_session`, this intentionally performs no conversation-row
-    /// mutation; its caller persists a new user branch row and relation.
-    pub(crate) async fn fork_protocol_only(
+    /// Execute a native fork and retire the adapter process before returning.
+    ///
+    /// Codex's persistent `thread/fork` creates S2, while the codex-acp process
+    /// that performed the request continues to own an active writer for S1.
+    /// Attaching S2 on that same process therefore strands the original thread
+    /// behind `already has an active writer`.  A user-created conversation
+    /// branch must instead verify S2 from an independent process after this
+    /// method has observed the original process exit.
+    pub(crate) async fn fork_protocol_detached(
         &self,
         conn_id: &str,
     ) -> Result<ForkProtocolResult, AcpError> {
-        let (state, cmd_tx) = {
+        let (state, cmd_tx, child_pid) = {
             let connections = self.connections.lock().await;
             let conn = connections
                 .get(conn_id)
                 .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?;
-            (conn.state.clone(), conn.cmd_tx.clone())
+            (
+                conn.state.clone(),
+                conn.cmd_tx.clone(),
+                conn.child_pid.clone(),
+            )
         };
         let prompt_lock = self.clone_prompt_lock(conn_id).await?;
         let _guard = prompt_lock.lock_owned().await;
@@ -826,32 +829,33 @@ impl ConnectionManager {
         }
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         cmd_tx
-            .send(ConnectionCommand::Fork { reply: reply_tx })
+            .send(ConnectionCommand::ForkDetached { reply: reply_tx })
             .await
             .map_err(|_| AcpError::ProcessExited)?;
         let result = reply_rx
             .await
             .map_err(|_| AcpError::protocol("Fork reply channel closed".to_string()))??;
-        // The protocol reply is emitted just before the connection loop
-        // publishes SessionStarted for S2. Do not expose the connection to the
-        // new tab during that narrow gap: restore dedup keys on external_id,
-        // and an early tab open could otherwise spawn a second process for the
-        // same forked session.
+
         let deadline = tokio::time::Instant::now() + self.spawn_handshake_timeout;
         loop {
-            if state.read().await.external_id.as_deref() == Some(result.forked_session_id.as_str())
-            {
-                self.wait_for_prompt_ready(conn_id, Some(&result.forked_session_id))
-                    .await?;
+            let removed = !self.connections.lock().await.contains_key(conn_id);
+            let reaped = child_pid.load(std::sync::atomic::Ordering::SeqCst) == 0;
+            if removed && reaped {
+                tracing::info!(
+                    connection_id = conn_id,
+                    source_session_id = result.original_session_id,
+                    branch_session_id = result.forked_session_id,
+                    "[ACP][branch] detached fork writer handoff completed"
+                );
                 return Ok(result);
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err(AcpError::protocol(format!(
-                    "forked session {} did not become active before timeout",
+                    "forked session {} was created, but the source writer did not retire before timeout",
                     result.forked_session_id
                 )));
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 
@@ -1549,8 +1553,13 @@ impl ConnectionManager {
     ) -> Result<(), AcpError> {
         let prompt_lock = self.clone_prompt_lock(conn_id).await?;
         let _guard = prompt_lock.lock_owned().await;
-        self.send_prompt_inner(conn_id, blocks, None, Some(uuid::Uuid::new_v4().to_string()))
-            .await
+        self.send_prompt_inner(
+            conn_id,
+            blocks,
+            None,
+            Some(uuid::Uuid::new_v4().to_string()),
+        )
+        .await
     }
 
     /// Inject additional user input into the current native Codex app-server
@@ -1732,6 +1741,17 @@ impl ConnectionManager {
             return Err(AcpError::protocol(
                 "delegation link is incompatible with caller-supplied conversation_id".to_string(),
             ));
+        }
+        if let Some(conversation_id) = conversation_id {
+            if conversation_branch_service::is_merged_branch(&db.conn, conversation_id)
+                .await
+                .map_err(|error| AcpError::protocol(error.to_string()))?
+            {
+                return Err(AcpError::protocol(
+                    "This branch has already been returned to its source conversation and is read-only"
+                        .to_string(),
+                ));
+            }
         }
 
         // Acquire the per-connection prompt lock for the entire link-check
@@ -2266,7 +2286,7 @@ impl ConnectionManager {
                     branch_conversation_id = cid,
                     connection_id = conn_id,
                     client_message_id = ?client_message_id,
-                    lifecycle_state = "prompt_ready",
+                    lifecycle_state = "first_prompt_queued",
                     stage = "first_prompt_queued",
                     "[ACP][branch] first prompt entered durable client-id admission"
                 );
@@ -3353,9 +3373,8 @@ impl ConnectionManager {
         if state_turn_in_flight {
             return Err(AcpError::TurnInProgress);
         }
-        let linkable_conversation_id = state_conversation_id.or_else(|| {
-            link_conversation_id.filter(|_| link_folder_id.is_some())
-        });
+        let linkable_conversation_id = state_conversation_id
+            .or_else(|| link_conversation_id.filter(|_| link_folder_id.is_some()));
         let Some(linkable_conversation_id) = linkable_conversation_id else {
             return Err(AcpError::protocol(
                 "fork_session requires a linked conversation row".to_string(),
@@ -3378,11 +3397,7 @@ impl ConnectionManager {
                 })?
         };
         let session_operation_guard = self
-            .lock_session_operation(
-                session_agent,
-                session_cwd.as_deref(),
-                &source_session_id,
-            )
+            .lock_session_operation(session_agent, session_cwd.as_deref(), &source_session_id)
             .await?;
 
         // Serialize the fork against concurrent prompts on this connection via
@@ -3801,6 +3816,7 @@ impl ConnectionManager {
 
                     conversation_branch::ActiveModel {
                         branch_conversation_id: Set(conversation_id),
+                        creation_request_id: Set(None),
                         source_conversation_id: Set(sibling.id),
                         source_title: Set(clean_title),
                         fork_message_id: Set(None),
@@ -3859,6 +3875,32 @@ impl ConnectionManager {
         } else {
             Err(AcpError::ConnectionNotFound(conn_id.into()))
         }
+    }
+
+    /// Disconnect one ACP process and wait until its child has actually been
+    /// reaped. Ordinary UI teardown need not block on this, but an external
+    /// session writer handoff must not start its replacement while the old
+    /// adapter still owns the thread inside Codex.
+    pub(crate) async fn disconnect_and_wait(&self, conn_id: &str) -> Result<(), AcpError> {
+        let (cmd_tx, child_pid) = {
+            let mut connections = self.connections.lock().await;
+            let connection = connections
+                .remove(conn_id)
+                .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?;
+            (connection.cmd_tx, connection.child_pid)
+        };
+        tracing::info!("[ACP] disconnect-and-wait connection={}", conn_id);
+        let _ = cmd_tx.send(ConnectionCommand::Disconnect).await;
+        let deadline = tokio::time::Instant::now() + self.spawn_handshake_timeout;
+        while child_pid.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(AcpError::protocol(format!(
+                    "ACP connection {conn_id} did not release its process before writer handoff timeout"
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Ok(())
     }
 
     /// User/API initiated disconnect with a durable lifecycle boundary. The
@@ -8894,11 +8936,8 @@ mod tests {
             .await
             .expect("first session writer lock");
         let other_cwd = PathBuf::from("/tmp/same-session-different-folder");
-        let session_wait = cloned.lock_session_operation(
-            AgentType::Codex,
-            Some(&other_cwd),
-            "session-1",
-        );
+        let session_wait =
+            cloned.lock_session_operation(AgentType::Codex, Some(&other_cwd), "session-1");
         assert!(
             tokio::time::timeout(Duration::from_millis(20), session_wait)
                 .await
@@ -9395,10 +9434,11 @@ mod tests {
             .await
             .unwrap();
         // Lifecycle got there first: S2 landed on the row and S1 was preserved.
-        let preserved_id = conversation_service::bind_external_id(&db.conn, pre.id, "session-S2", &[])
-            .await
-            .unwrap()
-            .expect("the lifecycle bind preserves S1");
+        let preserved_id =
+            conversation_service::bind_external_id(&db.conn, pre.id, "session-S2", &[])
+                .await
+                .unwrap()
+                .expect("the lifecycle bind preserves S1");
 
         let (mgr, join) =
             manager_with_fake_fork("c-raced", pre.id, "session-S2", "session-S1").await;
