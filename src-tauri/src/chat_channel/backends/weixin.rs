@@ -1456,7 +1456,7 @@ mod tests {
         let mut ciphertext = plaintext.to_vec();
         ciphertext.extend(std::iter::repeat_n(padding as u8, padding));
         let cipher = Aes128::new_from_slice(&key).unwrap();
-        for block in ciphertext.chunks_exact_mut(16) {
+        for block in ciphertext.as_chunks_mut::<16>().0 {
             cipher.encrypt_block(block.into());
         }
 
