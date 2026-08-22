@@ -683,76 +683,18 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             // continuation. Either way it is an extra model round-trip per
             // prompt, and it is gated on a client advertisement codeg does not
             // make — see `build_client_capabilities` in connection.rs.
-            // 1.6.0/1.6.2 (no 1.5.0 or 1.6.1 was published) add NO new modules
-            // and nothing wire-visible: `@openai/codex` moves to ^0.148.0,
-            // `thread/reverted` + `thread/queue/changed` join the adapter's
-            // IGNORED-notification list (so they never reach a client), and
-            // `misalignmentPolicyViolation` becomes a second codex error name
-            // mapping onto the EXISTING `policy_denied` bucket —
-            // `SESSION_FAILURE_POLICY` (the codex→AIR category/actions table)
-            // is byte-identical to 1.3.0's, so the six-category vocabulary in
-            // `AcpEvent::SessionFailure` is unchanged. The rest is logging.
-            // 1.7.0 rebuilds the permission layer (`src/permissions/*`) and
-            // redefines the three approval presets. Both are wire-visible:
-            //
-            // (a) Option-level `_meta.permission.changes[]` is GONE. Codex's
-            // reason moves from `toolCall.title` (1.4.0's
-            // `params.reason ?? "Permissions Request"`) to REQUEST-level
-            // `_meta.permission = {version: 1, title, description?}`, with
-            // `{version: 1, description}` on individual options (MCP
-            // elicitation approvals only). Titles are now four fixed strings
-            // ("Run command?" / "Allow network access?" / "Make edits?" /
-            // "Grant permissions?") and the action itself is described through
-            // standard ACP fields `parse_permission_tool_call` already reads
-            // (`rawInput.command/cwd/url/additionalPermissions`, `locations`,
-            // `content`). `handle_permission_request` hoists the request meta
-            // onto the card so the reason survives; claude-agent-acp 0.69.0
-            // still emits `changes[]`, so that parser stays. Codex's option
-            // IDs were also renamed (`allow_for_session`,
-            // `accept_execpolicy_amendment`, `apply_network_policy_amendment:N`
-            // …) — inert here, codeg only echoes back the selected id — and
-            // network deny amendments introduce codex's first `reject_always`
-            // option kind, which `handle_permission_request` already maps.
-            // `_meta.codex = {kind: "plan_review", planItemId}` is unchanged,
-            // so `is_codex_plan_review` still fires.
-            //
-            // (b) `AgentMode`: the `read-only` preset's sandbox became
-            // `workspaceWrite` (it was `readOnly`) and the presets are now
-            // separated by a new `approvalsReviewer` axis — `read-only` =
-            // "Ask for approval" (reviewer `user`), `agent` = "Approve for me"
-            // (reviewer `auto_review`, i.e. a model decides which escalations
-            // to show), `agent-full-access` unchanged. Each preset also gains
-            // `_meta.kind` (`standard` / `auto_review` / `full_access`) on both
-            // `SessionMode` and the `mode` config option. There is NO read-only
-            // sandbox preset any more, which is why
-            // `codex_initial_agent_mode` (commands/acp.rs) can no longer
-            // promise to preserve one — see its doc comment.
-            //
-            // NOT adopted: native ACP subagent sessions (the draft subagent
-            // RFD). The gate is bilateral — `clientCapabilities.subagents: {}`
-            // or AIR `nativeSubagentSessions` — and codeg advertises neither,
-            // so the lifecycle stays the legacy `subAgentActivity` tool call
-            // whose shape (`_meta.codex.subagent = {threadId, path, activity}`)
-            // is byte-identical to 1.4.0's. Opting in is not merely unhelpful,
-            // it is undeliverable: `agent-client-protocol-schema` 0.11.7 has no
-            // `subagents` field on `ClientCapabilities`, and its `SessionUpdate`
-            // is an internally-tagged enum with no catch-all arm, so the
-            // `subagent_spawned` / `subagent_state_update` notifications would
-            // fail to deserialize — child output would then stream to a child
-            // session id codeg never learned about and vanish from the
-            // timeline. Revisit only after the schema crate ships both.
-            // Likewise still not adopted: `agentFileChangeReport` (unchanged
-            // since 1.4.0). `compaction_update` / `compaction_summary_chunk`
-            // appear in the bundle but come from the vendored
-            // `@agentclientprotocol/sdk` 1.4.0 SCHEMA only — codex-acp keeps
-            // emitting the `contextCompaction` synthetic tool call, so the
-            // compaction card is untouched. Steering still ships no
-            // `promptRequired` opt-in (tarball grep: zero hits ⇒ the arm below
-            // stays None), and there is still no `engines.node`, so the 20.0.0
-            // floor is retained.
+            // 1.5.0 preserves and switches providers for loaded sessions;
+            // 1.5.1 upgrades the nested official CLI to `@openai/codex`
+            // ^0.148.0. 1.6.x only hardens the adapter release/test pipeline.
+            // The published 1.6.2 bundle has a typed app-server
+            // `thread/fork` client but still omits ACP `session/fork` from its
+            // capabilities and request router. `codex_steer_adapter` applies
+            // an exact-version, anchor-verified derived-bundle bridge so Codeg
+            // user branches use the official persistent fork. The installed
+            // npm package and user Codex files are never modified.
             distribution: AgentDistribution::Npx {
-                version: "1.7.0",
-                package: "@agentclientprotocol/codex-acp@1.7.0",
+                version: "1.6.2",
+                package: "@agentclientprotocol/codex-acp@1.6.2",
                 cmd: "codex-acp",
                 args: &[],
                 env: &[],
@@ -1225,6 +1167,7 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
         },
         AgentType::Qoder => AcpAgentMeta {
             agent_type,
+            supports_steer: false,
             supports_mcp: true,
             name: "Qoder",
             description: "Alibaba's Qoder coding agent CLI (native ACP via --acp)",
@@ -1634,8 +1577,8 @@ mod tests {
         );
         assert_npx_version(
             AgentType::Codex,
-            "1.7.0",
-            "@agentclientprotocol/codex-acp@1.7.0",
+            "1.6.2",
+            "@agentclientprotocol/codex-acp@1.6.2",
             Some("20.0.0"),
         );
         assert_npx_version(AgentType::Pi, "0.0.33", "pi-acp@0.0.33", Some("22.0.0"));
