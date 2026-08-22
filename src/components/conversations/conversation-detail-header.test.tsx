@@ -200,6 +200,37 @@ describe("ConversationDetailHeader dialog target snapshot", () => {
     })
   })
 
+  it("accepts the fork-send two-row mapping when the live source becomes the branch", async () => {
+    h.createConversationBranch.mockResolvedValueOnce({
+      branchConversationId: 1,
+      sourceConversationId: 9,
+      folderId: 1,
+      connectionId: "branch-connection",
+      branchSessionId: "branch-session",
+      sessionReady: true,
+      promptReady: true,
+      lifecycleState: "ready",
+      forkMode: "native",
+      inheritanceMode: "native_fork",
+      inheritedMessageCount: 12,
+      inheritanceTruncated: false,
+    })
+    const user = userEvent.setup({ pointerEventsCheck: 0 })
+    const { getByLabelText, getByRole } = render(
+      withIntl(<ConversationDetailHeader {...A} />)
+    )
+
+    await user.click(getByLabelText("More actions"))
+    await user.click(getByRole("menuitem", { name: "Create branch" }))
+
+    await waitFor(() => {
+      expect(h.openTab.mock.calls).toEqual([
+        [1, 9, "codex", true, "conv-a"],
+        [1, 1, "codex", true, "conv-a · 分支"],
+      ])
+    })
+  })
+
   it("opens a provisional snapshot branch before its first ACP prompt is ready", async () => {
     h.createConversationBranch.mockResolvedValueOnce({
       branchConversationId: 9,

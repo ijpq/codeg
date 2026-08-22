@@ -1752,6 +1752,35 @@ describe("AcpConnectionsProvider persisted Codex restore lifecycle", () => {
     )
   })
 
+  it("converges on a later successful restore after an active-writer race", async () => {
+    h.acpRestoreConversation
+      .mockRejectedValueOnce(
+        new Error("thread sess-1 already has an active writer")
+      )
+      .mockResolvedValueOnce({
+        connectionId: "restored-after-writer",
+        externalSessionId: "sess-1",
+        reusedExisting: true,
+        codegMcpAvailable: true,
+        mcpServerCount: 1,
+        replacedConnectionIds: [],
+        lifecycleState: "ready",
+        durableSession: true,
+      })
+    await mountProvider()
+
+    await act(async () => {
+      await h.actions!.connect(CODEX_TAB, "codex", "/tmp/x", "sess-1", 42)
+    })
+
+    expect(h.acpRestoreConversation).toHaveBeenCalledTimes(2)
+    expect(h.store!.getConnection(CODEX_TAB)).toMatchObject({
+      connectionId: "restored-after-writer",
+      conversationId: 42,
+      status: "connecting",
+    })
+  })
+
   it("does not overwrite the legacy binding when restore fails", async () => {
     await mountLegacyCodexConnection()
     h.acpRestoreConversation.mockRejectedValueOnce(new Error("resume failed"))

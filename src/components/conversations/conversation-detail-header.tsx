@@ -247,6 +247,20 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
         preferredConfigValues,
       })
       await refreshConversations()
+      // Native ACP fork mutates the live S1 writer into S2. The backend keeps
+      // S1 by atomically creating a sibling source row, matching Fork & Send's
+      // mapping. Keep that source visible in its own tab before focusing the
+      // already-open S2 row, so the menu action still feels like "open a new
+      // branch" even though the live connection itself had to move forward.
+      if (result.sourceConversationId !== conversationId) {
+        openTab(
+          result.folderId,
+          result.sourceConversationId,
+          persistedConversation.agent_type,
+          true,
+          displayTitle
+        )
+      }
       openTab(
         result.folderId,
         result.branchConversationId,
