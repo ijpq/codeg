@@ -1323,6 +1323,7 @@ impl SessionState {
                 }
             }
             AcpEvent::ClaudeSdkMessage { .. }
+            | AcpEvent::AgentFileChangeReport { .. }
             | AcpEvent::ConfigOptionRejected { .. }
             | AcpEvent::SessionLoadFailed { .. }
             | AcpEvent::TurnRetrying { .. }
