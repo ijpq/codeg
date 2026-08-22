@@ -578,3 +578,17 @@ describe("ConversationDetailPanel session-load failure surface", () => {
     )
   })
 })
+
+describe("ConversationDetailPanel branch queue admission", () => {
+  it("waits for a stable turn but lets Create Branch use snapshot fallback offline", () => {
+    expect(source).toContain(
+      'const needsLiveSourceSession = item.intent === "fork"'
+    )
+    expect(source).toContain(
+      'runtimeSyncState !== "idle" || connStatus === "prompting"'
+    )
+    expect(source).toContain(
+      'needsLiveSourceSession &&\n        (!connectionReady || connStatus !== "connected")'
+    )
+  })
+})

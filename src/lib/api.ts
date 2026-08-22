@@ -2934,6 +2934,7 @@ export async function createConversation(
 }
 
 export interface CreateConversationBranchRequest {
+  requestId?: string | null
   sourceConversationId: number
   forkMessageId?: string | null
   preferredModeId?: string | null
@@ -2958,6 +2959,7 @@ export interface CreateConversationBranchResult {
 
 export interface ConversationBranchInfo {
   branchConversationId: number
+  creationRequestId?: string | null
   sourceConversationId: number
   sourceTitle?: string | null
   sourceAvailable: boolean
@@ -3021,15 +3023,15 @@ export async function getConversationBranchInfo(
 export async function mergeConversationBranch(params: {
   branchConversationId: number
   requestId: string
-  summary: string
-  deliverableIds?: string[]
 }): Promise<MergeConversationBranchResult> {
-  return getTransport().call("merge_conversation_branch", {
-    branchConversationId: params.branchConversationId,
-    requestId: params.requestId,
-    summary: params.summary,
-    deliverableIds: params.deliverableIds ?? [],
-  })
+  return getTransport().call(
+    "merge_conversation_branch",
+    {
+      branchConversationId: params.branchConversationId,
+      requestId: params.requestId,
+    },
+    { timeoutMs: 60_000 }
+  )
 }
 
 /**

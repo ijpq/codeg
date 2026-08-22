@@ -877,6 +877,16 @@ pub enum ConnectionCommand {
         reply:
             tokio::sync::oneshot::Sender<Result<crate::acp::types::ForkProtocolResult, AcpError>>,
     },
+    /// Fork the durable session, return the new session id, then retire this
+    /// ACP process instead of attaching it to the child.  Codex keeps a writer
+    /// for every session known to an adapter process; continuing on the same
+    /// process after `thread/fork` therefore leaves the source writer held and
+    /// makes the original conversation impossible to resume.  Branch creation
+    /// uses this variant and verifies the child from a fresh process.
+    ForkDetached {
+        reply:
+            tokio::sync::oneshot::Sender<Result<crate::acp::types::ForkProtocolResult, AcpError>>,
+    },
     /// Inject a live-feedback note into the RUNNING turn over the ACP
     /// `_session/steering` extension (native push channel — see
     /// `manager::submit_feedback`). The loop does the protocol round-trip
@@ -7578,6 +7588,7 @@ struct ForkExitInfo {
     original_session_id: String,
     reply: tokio::sync::oneshot::Sender<Result<crate::acp::types::ForkProtocolResult, AcpError>>,
     connection: ConnectionTo<Agent>,
+    detach_after_fork: bool,
 }
 
 /// After `run_conversation_loop` returns, handle normal exit or fork transition.
@@ -7622,6 +7633,23 @@ async fn handle_fork_or_exit(
     let fork_resp = fork_info.fork_response;
     let fork_models_raw = fork_info.fork_models_raw;
     let new_sid = fork_resp.session_id.0.to_string();
+
+    if fork_info.detach_after_fork {
+        tracing::info!(
+            connection_id = conn_id,
+            source_session_id = fork_info.original_session_id,
+            branch_session_id = new_sid,
+            "[ACP][branch] native fork completed; retiring adapter to release both writers"
+        );
+        let _ = fork_info
+            .reply
+            .send(Ok(crate::acp::types::ForkProtocolResult {
+                forked_session_id: new_sid,
+                original_session_id: fork_info.original_session_id,
+            }));
+        drop(cx);
+        return Ok(());
+    }
 
     tracing::info!(
         "[ACP] Fork transition: attaching to forked session {} (original: {})",
@@ -9364,7 +9392,14 @@ async fn run_conversation_loop<'a>(
                     inj.broker.cancel_by_parent_turn(conn_id).await;
                 }
             }
-            Some(ConnectionCommand::Fork { reply }) => {
+            Some(command @ ConnectionCommand::Fork { .. })
+            | Some(command @ ConnectionCommand::ForkDetached { .. }) => {
+                let detach_after_fork = matches!(&command, ConnectionCommand::ForkDetached { .. });
+                let reply = match command {
+                    ConnectionCommand::Fork { reply }
+                    | ConnectionCommand::ForkDetached { reply } => reply,
+                    _ => unreachable!(),
+                };
                 if !supports_fork {
                     let _ = reply.send(Err(AcpError::protocol(
                         "This agent does not support session/fork".to_string(),
@@ -9391,6 +9426,7 @@ async fn run_conversation_loop<'a>(
                             original_session_id: sid.0.to_string(),
                             reply,
                             connection: cx,
+                            detach_after_fork,
                         }));
                     }
                     Err(e) => {
@@ -12145,12 +12181,11 @@ async fn emit_conversation_update(
             } else {
                 None
             };
-            let content =
-                serialize_tool_call_content(content_blocks, synthesized_edit.is_none())
-                    .map(|c| unwrap_codebuddy_deferred_output(agent_type, &c).unwrap_or(c))
-                    // pi announces a command with an empty result, which pi-acp
-                    // renders as JSON source (see fn doc).
-                    .filter(|_| !pi_result_content_is_stringify_noise(agent_type, &tc.raw_output));
+            let content = serialize_tool_call_content(content_blocks, synthesized_edit.is_none())
+                .map(|c| unwrap_codebuddy_deferred_output(agent_type, &c).unwrap_or(c))
+                // pi announces a command with an empty result, which pi-acp
+                // renders as JSON source (see fn doc).
+                .filter(|_| !pi_result_content_is_stringify_noise(agent_type, &tc.raw_output));
             let images = extract_tool_call_images(content_blocks);
             let codex_subagent_launch = codex_subagent.is_some();
             let raw_input = codex_subagent
@@ -13784,9 +13819,9 @@ mod tests {
                 .iter()
                 .any(|v| v.as_str() == Some("sessionFailure")));
             assert_eq!(
-                capabilities.iter().any(|value| {
-                    value.as_str() == Some("agentFileChangeReport")
-                }),
+                capabilities
+                    .iter()
+                    .any(|value| { value.as_str() == Some("agentFileChangeReport") }),
                 agent == AgentType::Codex,
                 "only Codex enables the AIR audit backfill"
             );
@@ -13825,10 +13860,11 @@ mod tests {
             meta["jetbrains"]["air"]["agentFileChangeReportRequest"]["requestId"],
             "turn-run:42"
         );
-        assert!(agent_file_change_report_prompt_meta(AgentType::ClaudeCode, Some("turn-run:42"))
-            .is_none());
-        assert!(agent_file_change_report_prompt_meta(AgentType::Codex, Some("bad id"))
-            .is_none());
+        assert!(
+            agent_file_change_report_prompt_meta(AgentType::ClaudeCode, Some("turn-run:42"))
+                .is_none()
+        );
+        assert!(agent_file_change_report_prompt_meta(AgentType::Codex, Some("bad id")).is_none());
     }
 
     #[test]
@@ -13858,8 +13894,7 @@ mod tests {
                 "reason": "timeout"
             }
         }}}));
-        let parsed =
-            air_agent_file_change_report(Some(&unavailable)).expect("unavailable audit");
+        let parsed = air_agent_file_change_report(Some(&unavailable)).expect("unavailable audit");
         assert_eq!(parsed.status, "unavailable");
         assert_eq!(parsed.reason.as_deref(), Some("timeout"));
         assert!(parsed.paths.is_empty());
@@ -17510,12 +17545,7 @@ mod tests {
         cache: &mut ToolCallOutputCache,
         cb: &mut CodeBuddyLiveState,
         wire: serde_json::Value,
-    ) -> (
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<bool>,
-    ) {
+    ) -> (Option<String>, Option<String>, Option<String>, Option<bool>) {
         let st = SessionState::new(
             "conn-pi".to_string(),
             agent_type,
@@ -17540,12 +17570,7 @@ mod tests {
                     raw_input,
                     raw_output,
                     ..
-                } => Some((
-                    content.clone(),
-                    raw_input.clone(),
-                    raw_output.clone(),
-                    None,
-                )),
+                } => Some((content.clone(), raw_input.clone(), raw_output.clone(), None)),
                 AcpEvent::ToolCallUpdate {
                     content,
                     raw_input,
@@ -18056,8 +18081,7 @@ mod tests {
             ] {
                 let mut cache = ToolCallOutputCache::default();
                 let mut cb = CodeBuddyLiveState::default();
-                let (content, _, _, _) =
-                    pi_emit(AgentType::Pi, &mut cache, &mut cb, wire).await;
+                let (content, _, _, _) = pi_emit(AgentType::Pi, &mut cache, &mut cb, wire).await;
                 assert_eq!(
                     content.as_deref(),
                     Some(flattened),

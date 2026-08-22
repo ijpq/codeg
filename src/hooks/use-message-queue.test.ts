@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest"
 import { act, renderHook } from "@testing-library/react"
 import {
+  enqueuePersistedMessageForConversation,
   isQueuedGuideTargetCurrent,
   useMessageQueue,
 } from "./use-message-queue"
@@ -151,6 +152,32 @@ describe("useMessageQueue persistence (offline survival across reload)", () => {
     )
   })
 
+  it("persists one idempotent create-branch request across reload", () => {
+    const first = renderHook(() => useMessageQueue(42))
+    act(() => {
+      first.result.current.enqueue(
+        { blocks: [], displayText: "Create branch" },
+        "modeA",
+        "branch-create-stable",
+        { intent: "branch" }
+      )
+      first.result.current.enqueue(
+        { blocks: [], displayText: "Create branch" },
+        "modeA",
+        "branch-create-stable",
+        { intent: "branch" }
+      )
+    })
+    expect(first.result.current.queue).toHaveLength(1)
+
+    const reloaded = renderHook(() => useMessageQueue(42))
+    expect(reloaded.result.current.peekNext("branch")).toMatchObject({
+      clientMessageId: "branch-create-stable",
+      intent: "branch",
+      modeId: "modeA",
+    })
+  })
+
   it("preserves restore-waiting text, image, attachment, and stable id", () => {
     const pendingDraft: PromptDraft = {
       displayText: "inspect these files",
@@ -280,6 +307,31 @@ describe("useMessageQueue persistence (offline survival across reload)", () => {
       intent: "prompt",
       guideTarget: null,
       clientMessageId: "optimistic-guide",
+    })
+  })
+
+  it("moves fork-and-send into the branch queue exactly once across retries", () => {
+    const forkItem = {
+      id: "fork-queue-item",
+      clientMessageId: "fork-request-and-prompt-id",
+      draft: draft("continue independently"),
+      modeId: "code",
+      intent: "prompt" as const,
+      state: "queued" as const,
+      error: null,
+      guideTarget: null,
+    }
+    enqueuePersistedMessageForConversation(99, forkItem)
+    enqueuePersistedMessageForConversation(99, {
+      ...forkItem,
+      id: "network-retry-copy",
+    })
+
+    const branch = renderHook(() => useMessageQueue(99))
+    expect(branch.result.current.queue).toHaveLength(1)
+    expect(branch.result.current.peekNext("prompt")).toMatchObject({
+      clientMessageId: "fork-request-and-prompt-id",
+      draft: draft("continue independently"),
     })
   })
 

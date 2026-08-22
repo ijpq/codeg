@@ -52,6 +52,7 @@ mod m20260817_000002_turn_cancellation;
 mod m20260818_000001_chat_channel_inbound_queue;
 mod m20260818_000001_work_task_source;
 mod m20260819_000001_work_task_completion_kind;
+mod m20260822_000001_conversation_branch_creation_request;
 mod m20260825_000001_remote_workspace_connection_headers;
 pub struct Migrator;
 
@@ -111,6 +112,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260818_000001_chat_channel_inbound_queue::Migration),
             Box::new(m20260818_000001_work_task_source::Migration),
             Box::new(m20260819_000001_work_task_completion_kind::Migration),
+            Box::new(m20260822_000001_conversation_branch_creation_request::Migration),
             Box::new(m20260825_000001_remote_workspace_connection_headers::Migration),
         ]
     }

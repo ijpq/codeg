@@ -99,14 +99,16 @@ function QueueItem({
           <ArrowRight className="h-2.5 w-2.5" />
         </button>
       ) : null}
-      <button
-        type="button"
-        onClick={() => onEdit(item.id)}
-        className="shrink-0 rounded-sm p-0.5 hover:bg-muted-foreground/15 text-muted-foreground"
-        title={t("editItem")}
-      >
-        <Pencil className="h-2.5 w-2.5" />
-      </button>
+      {item.intent !== "branch" ? (
+        <button
+          type="button"
+          onClick={() => onEdit(item.id)}
+          className="shrink-0 rounded-sm p-0.5 hover:bg-muted-foreground/15 text-muted-foreground"
+          title={t("editItem")}
+        >
+          <Pencil className="h-2.5 w-2.5" />
+        </button>
+      ) : null}
       <button
         type="button"
         onClick={() => onDelete(item.id)}

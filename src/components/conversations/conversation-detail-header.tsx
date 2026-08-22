@@ -1,6 +1,6 @@
 "use client"
 
-import { memo, useCallback, useEffect, useState } from "react"
+import { memo, useCallback, useEffect, useRef, useState } from "react"
 import {
   ArrowLeft,
   ChevronRight,
@@ -22,17 +22,12 @@ import {
   createConversationBranch,
   deleteConversation,
   getConversationBranchInfo,
-  listConversationDeliverables,
   mergeConversationBranch,
   updateConversationPinned,
   updateConversationStatus,
   updateConversationTitle,
 } from "@/lib/api"
 import type { ConversationBranchInfo } from "@/lib/api"
-import {
-  latestAssistantConclusion,
-  visibleTurnText,
-} from "@/lib/conversation-branch"
 import { formatConversationTitle } from "@/lib/conversation-title"
 import { ConversationHeaderFolderPicker } from "@/components/chat/conversation-context-bar"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
@@ -40,7 +35,7 @@ import { useTabActions } from "@/contexts/tab-context"
 import { getRuntimeSession } from "@/stores/conversation-runtime-store"
 import { getCachedSelectors } from "@/contexts/acp-connections-context"
 import type { ConversationStatus } from "@/lib/types"
-import type { ConversationDeliverable } from "@/lib/types"
+import { queueConversationBranchCreation } from "@/hooks/use-message-queue"
 import { STATUS_ORDER } from "@/lib/types"
 import { ConversationStatusDot } from "@/components/conversations/conversation-status-dot"
 import {
@@ -72,8 +67,6 @@ import {
 } from "@/components/ui/alert-dialog"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
-import { Textarea } from "@/components/ui/textarea"
-import { Checkbox } from "@/components/ui/checkbox"
 import {
   resolveActiveSessionDetails,
   type ActiveSessionDetails,
@@ -165,21 +158,8 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
     null
   )
   const [branchBusy, setBranchBusy] = useState(false)
-  const [mergeOpen, setMergeOpen] = useState(false)
-  const [mergeSummary, setMergeSummary] = useState("")
-  const [mergeRequestId, setMergeRequestId] = useState("")
-  const [selectedDeliverables, setSelectedDeliverables] = useState<Set<string>>(
-    new Set()
-  )
-  const [mergeDeliverables, setMergeDeliverables] = useState<
-    ConversationDeliverable[]
-  >([])
-  const [mergeMessages, setMergeMessages] = useState<
-    Array<{ id: string; text: string }>
-  >([])
-  const [selectedMergeMessages, setSelectedMergeMessages] = useState<
-    Set<string>
-  >(new Set())
+  const createRequestIdRef = useRef<string | null>(null)
+  const mergeRequestIdRef = useRef<string | null>(null)
 
   const persisted = conversationId != null
   const displayTitle =
@@ -196,6 +176,8 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
     let cancelled = false
     let timer: ReturnType<typeof setTimeout> | null = null
     setBranchInfo(null)
+    createRequestIdRef.current = null
+    mergeRequestIdRef.current = null
     if (conversationId == null) return
     const load = () => {
       getConversationBranchInfo(conversationId)
@@ -210,6 +192,8 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
               "session_creating",
               "connection_ready",
               "prompt_ready",
+              "pending_first_prompt",
+              "first_prompt_queued",
               "retryable_failed",
             ].includes(info.lifecycleState)
           ) {
@@ -241,33 +225,36 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
           String(option.kind.current_value),
         ])
       )
+      const requestId = (createRequestIdRef.current ??= crypto.randomUUID())
+      if (
+        queueConversationBranchCreation({
+          conversationId,
+          requestId,
+          modeId: selectors?.modes?.current_mode_id ?? null,
+        })
+      ) {
+        return
+      }
       const result = await createConversationBranch({
+        requestId,
         sourceConversationId: conversationId,
         preferredModeId: selectors?.modes?.current_mode_id ?? null,
         preferredConfigValues,
       })
       await refreshConversations()
-      // Native ACP fork mutates the live S1 writer into S2. The backend keeps
-      // S1 by atomically creating a sibling source row, matching Fork & Send's
-      // mapping. Keep that source visible in its own tab before focusing the
-      // already-open S2 row, so the menu action still feels like "open a new
-      // branch" even though the live connection itself had to move forward.
-      if (result.sourceConversationId !== conversationId) {
-        openTab(
-          result.folderId,
-          result.sourceConversationId,
-          persistedConversation.agent_type,
-          true,
-          displayTitle
-        )
-      }
+      const branchTitle = useAppWorkspaceStore
+        .getState()
+        .conversations.find(
+          (conversation) => conversation.id === result.branchConversationId
+        )?.title
       openTab(
         result.folderId,
         result.branchConversationId,
         persistedConversation.agent_type,
         true,
-        `${displayTitle} · 分支`
+        branchTitle ?? `${displayTitle} · 分支`
       )
+      createRequestIdRef.current = null
       toast.success(
         result.inheritanceMode === "native_fork"
           ? tBranch("nativeCreated")
@@ -299,98 +286,37 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
     )
   }, [branchInfo, folderId, openTab, persistedConversation])
 
-  const handleMergeOpen = useCallback(() => {
-    const session = runtimeId == null ? null : getRuntimeSession(runtimeId)
-    const turns = [
-      ...(session?.detail?.turns ?? []),
-      ...(session?.localTurns ?? []),
-    ]
-    const messages = turns
-      .filter((turn) => turn.role === "assistant")
-      .map((turn) => ({ id: turn.id, text: visibleTurnText(turn.blocks) }))
-      .filter((message) => message.text)
-      .slice(-20)
-    const latest = messages[messages.length - 1]
-    setMergeMessages(messages)
-    setSelectedMergeMessages(new Set(latest ? [latest.id] : []))
-    setMergeSummary(latestAssistantConclusion(turns))
-    setSelectedDeliverables(new Set())
-    const loadedById = new Map<string, ConversationDeliverable>()
-    for (const run of session?.detail?.deliverable_runs ?? []) {
-      for (const deliverable of run.deliverables) {
-        loadedById.set(deliverable.id, deliverable)
-      }
-    }
-    setMergeDeliverables([...loadedById.values()])
-    if (conversationId != null) {
-      void listConversationDeliverables(conversationId)
-        .then(setMergeDeliverables)
-        .catch((error) => {
-          console.error(
-            "[ConversationDetailHeader] list branch deliverables:",
-            error
-          )
+  const handleMerge = useCallback(async () => {
+    if (!branchInfo || branchBusy) return
+    setBranchBusy(true)
+    try {
+      const result = await mergeConversationBranch({
+        branchConversationId: branchInfo.branchConversationId,
+        requestId: (mergeRequestIdRef.current ??= crypto.randomUUID()),
+      })
+      mergeRequestIdRef.current = null
+      toast.success(
+        tBranch("mergeSuccess", {
+          count: result.copiedDeliverableCount,
         })
+      )
+      await refreshConversations()
+      handleOpenSource()
+      closeTab(tabId)
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : String(error))
+    } finally {
+      setBranchBusy(false)
     }
-    setMergeRequestId(crypto.randomUUID())
-    setMergeOpen(true)
-  }, [conversationId, runtimeId])
-
-  const handleMergeConfirm = useCallback(
-    async (archiveBranch = false) => {
-      if (!branchInfo || !mergeRequestId || !mergeSummary.trim() || branchBusy)
-        return
-      setBranchBusy(true)
-      try {
-        const result = await mergeConversationBranch({
-          branchConversationId: branchInfo.branchConversationId,
-          requestId: mergeRequestId,
-          summary: mergeSummary.trim(),
-          deliverableIds: [...selectedDeliverables],
-        })
-        setMergeOpen(false)
-        setBranchInfo((current) =>
-          current
-            ? {
-                ...current,
-                lastMergedAt: new Date().toISOString(),
-                mergeTargetConversationId: result.targetConversationId,
-              }
-            : current
-        )
-        toast.success(
-          tBranch("mergeSuccess", {
-            count: result.copiedDeliverableCount,
-          })
-        )
-        if (archiveBranch && conversationId != null) {
-          await updateConversationStatus(conversationId, "completed")
-          updateConversationLocal(conversationId, { status: "completed" })
-          await refreshConversations()
-          handleOpenSource()
-          closeTab(tabId)
-        }
-      } catch (error) {
-        toast.error(error instanceof Error ? error.message : String(error))
-      } finally {
-        setBranchBusy(false)
-      }
-    },
-    [
-      branchBusy,
-      branchInfo,
-      closeTab,
-      conversationId,
-      handleOpenSource,
-      mergeRequestId,
-      mergeSummary,
-      selectedDeliverables,
-      tBranch,
-      refreshConversations,
-      tabId,
-      updateConversationLocal,
-    ]
-  )
+  }, [
+    branchBusy,
+    branchInfo,
+    closeTab,
+    handleOpenSource,
+    tBranch,
+    refreshConversations,
+    tabId,
+  ])
 
   const handleTogglePin = useCallback(() => {
     if (conversationId == null) return
@@ -529,9 +455,9 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
             <span className="hidden xl:inline">
               {` · ${branchInfo.inheritanceMode === "native_fork" ? tBranch("nativeMode") : tBranch("snapshotMode")}`}
             </span>
-            {branchInfo.lifecycleState !== "ready" && (
+            {!["ready", "merged"].includes(branchInfo.lifecycleState) && (
               <span className="hidden 2xl:inline">
-                {` · ${branchInfo.lifecycleState === "retryable_failed" ? tBranch("retryableFailed") : tBranch("pendingFirstPrompt")}`}
+                {` · ${branchInfo.lifecycleState.includes("failed") ? tBranch("retryableFailed") : tBranch("pendingFirstPrompt")}`}
               </span>
             )}
           </button>
@@ -572,7 +498,7 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
             {branchInfo && (
               <DropdownMenuItem
                 disabled={branchBusy || !branchInfo.sourceAvailable}
-                onSelect={handleMergeOpen}
+                onSelect={handleMerge}
               >
                 <GitMerge className="h-4 w-4" />
                 {tBranch("merge")}
@@ -676,96 +602,6 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
-
-      <Dialog open={mergeOpen} onOpenChange={setMergeOpen}>
-        <DialogContent className="max-w-xl">
-          <DialogHeader>
-            <DialogTitle>{tBranch("merge")}</DialogTitle>
-          </DialogHeader>
-          <p className="text-sm text-muted-foreground">
-            {tBranch("mergeDescription")}
-          </p>
-          <Textarea
-            value={mergeSummary}
-            onChange={(event) => setMergeSummary(event.target.value)}
-            rows={8}
-            placeholder={tBranch("summaryPlaceholder")}
-          />
-          {mergeMessages.length > 1 && (
-            <div className="max-h-40 space-y-2 overflow-auto rounded border p-3">
-              <p className="text-xs text-muted-foreground">
-                {tBranch("selectMessages")}
-              </p>
-              {mergeMessages.map((message) => (
-                <label
-                  key={message.id}
-                  className="flex items-start gap-2 text-sm"
-                >
-                  <Checkbox
-                    checked={selectedMergeMessages.has(message.id)}
-                    onCheckedChange={(checked) => {
-                      setSelectedMergeMessages((current) => {
-                        const next = new Set(current)
-                        if (checked === true) next.add(message.id)
-                        else next.delete(message.id)
-                        setMergeSummary(
-                          mergeMessages
-                            .filter((candidate) => next.has(candidate.id))
-                            .map((candidate) => candidate.text)
-                            .join("\n\n")
-                        )
-                        return next
-                      })
-                    }}
-                  />
-                  <span className="line-clamp-2">{message.text}</span>
-                </label>
-              ))}
-            </div>
-          )}
-          {mergeDeliverables.length > 0 && (
-            <div className="max-h-48 space-y-2 overflow-auto rounded border p-3">
-              {mergeDeliverables.map((deliverable) => (
-                <label
-                  key={deliverable.id}
-                  className="flex items-center gap-2 text-sm"
-                >
-                  <Checkbox
-                    checked={selectedDeliverables.has(deliverable.id)}
-                    onCheckedChange={(checked) => {
-                      setSelectedDeliverables((current) => {
-                        const next = new Set(current)
-                        if (checked === true) next.add(deliverable.id)
-                        else next.delete(deliverable.id)
-                        return next
-                      })
-                    }}
-                  />
-                  <span className="truncate">{deliverable.title}</span>
-                </label>
-              ))}
-            </div>
-          )}
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setMergeOpen(false)}>
-              {t("cancel")}
-            </Button>
-            <Button
-              variant="outline"
-              disabled={!mergeSummary.trim() || branchBusy}
-              onClick={() => handleMergeConfirm(true)}
-            >
-              {tBranch("mergeArchive")}
-            </Button>
-            <Button
-              disabled={!mergeSummary.trim() || branchBusy}
-              onClick={() => handleMergeConfirm(false)}
-            >
-              {tBranch("mergeKeep")}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
 
       {details?.summary && (
         <SessionDetailsDialog
