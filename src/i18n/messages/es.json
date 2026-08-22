@@ -1749,6 +1749,7 @@
         "nativeCreated": "Rama nativa independiente creada",
         "snapshotCreated": "Rama creada desde una instantánea de contexto",
         "provisionalCreated": "La instantánea de la rama está lista; envía el primer mensaje cuando quieras",
+        "runningForkHint": "Fork & Send espera a que termine el turno actual. Para crear una rama ahora, usa «Crear rama»: heredará hasta el último turno completado. Ambas conversaciones comparten el directorio de trabajo; evita editar los mismos archivos a la vez.",
         "source": "Rama de: {title}",
         "sourceDeleted": "Origen eliminado: {title}",
         "sourceDeletedHint": "La conversación de origen fue eliminada; esta rama sigue siendo independiente.",

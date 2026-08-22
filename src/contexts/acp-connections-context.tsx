@@ -45,7 +45,10 @@ import {
   isConnectionBusy,
   isConnectionGoneError,
 } from "@/lib/connection-teardown"
-import { SessionRestorePendingError } from "@/lib/session-restore"
+import {
+  isRetryableSessionRestoreConflict,
+  SessionRestorePendingError,
+} from "@/lib/session-restore"
 import { ConversationRestoreSingleFlight } from "@/lib/conversation-restore-single-flight"
 import {
   getConversationIdByExternalIdFromStore,
@@ -5497,14 +5500,33 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           let restored: Awaited<
             ReturnType<typeof acpRestoreConversation>
           > | null = null
-          try {
-            restored = await restoreFlightsRef.current.run(conversationId, () =>
+          const restoreOnce = () =>
+            restoreFlightsRef.current.run(conversationId, () =>
               acpRestoreConversation(
                 conversationId,
                 savedPrefs.modeId,
                 savedPrefs.configValues
               )
             )
+          try {
+            try {
+              restored = await restoreOnce()
+            } catch (initialError) {
+              // A second window/provider can own the backend single-flight.
+              // Older builds also surfaced Codex's active-writer/session-new
+              // race here. Give that owner one bounded chance to publish, then
+              // join the now-ready connection. Permanent missing/auth/load
+              // errors are never retried and immediately end initialization.
+              if (!isRetryableSessionRestoreConflict(initialError)) {
+                throw initialError
+              }
+              console.info(
+                "[acp-context] waiting for competing session restore",
+                { conversationId }
+              )
+              await new Promise((resolve) => window.setTimeout(resolve, 350))
+              restored = await restoreOnce()
+            }
           } catch (error) {
             // A persisted but never-used ordinary conversation has no session
             // to restore. Preserve its historical session/new path; provisional

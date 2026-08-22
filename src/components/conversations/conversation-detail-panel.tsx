@@ -2570,7 +2570,16 @@ const ConversationTabView = memo(function ConversationTabView({
       hideInput={isWelcomeMode || Boolean(acpLoadError)}
       injectContent={composerInject}
       onInjectConsumed={handleComposerInjectConsumed}
-      composerBanner={acpLoadErrorBanner}
+      composerBanner={
+        acpLoadErrorBanner ??
+        (connStatus === "prompting" &&
+        conn.supportsFork &&
+        hasPersistedConversation ? (
+          <div className="rounded-lg border border-border/60 bg-muted/35 px-3 py-2 text-xs text-muted-foreground">
+            {t("branch.runningForkHint")}
+          </div>
+        ) : null)
+      }
       feedbackList={
         feedback.showList ? (
           <FeedbackNotesDisplay notes={feedback.notes} />

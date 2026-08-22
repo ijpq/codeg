@@ -1749,6 +1749,7 @@
         "nativeCreated": "已创建独立原生分支",
         "snapshotCreated": "已通过上下文快照创建分支",
         "provisionalCreated": "分支快照已就绪，可直接发送首条消息",
+        "runningForkHint": "“分叉发送”需等待当前任务结束。如需立即分支，请使用“创建分支”：它会继承到上一完整轮次。两个会话共享工作目录，请避免同时修改同一文件。",
         "source": "分支自：{title}",
         "sourceDeleted": "来源已删除：{title}",
         "sourceDeletedHint": "来源会话已删除；本分支仍可独立使用。",

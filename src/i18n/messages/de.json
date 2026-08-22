@@ -1749,6 +1749,7 @@
         "nativeCreated": "Unabhängiger nativer Zweig erstellt",
         "snapshotCreated": "Zweig aus Kontext-Snapshot erstellt",
         "provisionalCreated": "Branch-Snapshot ist bereit; die erste Nachricht kann gesendet werden",
+        "runningForkHint": "Fork & Send wartet auf das Ende des aktuellen Durchlaufs. Mit „Zweig erstellen“ können Sie sofort vom letzten abgeschlossenen Durchlauf abzweigen. Beide Konversationen teilen das Arbeitsverzeichnis; vermeiden Sie gleichzeitige Änderungen derselben Dateien.",
         "source": "Abgezweigt von: {title}",
         "sourceDeleted": "Quelle gelöscht: {title}",
         "sourceDeletedHint": "Die Quellkonversation wurde gelöscht; dieser Zweig bleibt unabhängig nutzbar.",

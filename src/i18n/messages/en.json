@@ -1749,6 +1749,7 @@
         "nativeCreated": "Independent native branch created",
         "snapshotCreated": "Branch created from a context snapshot",
         "provisionalCreated": "Branch snapshot is ready; send the first message when ready",
+        "runningForkHint": "Fork & Send waits for the current turn. To branch now, use Create branch: it inherits through the last completed turn. Both conversations share the same working directory, so avoid concurrent edits to the same files.",
         "source": "Branched from: {title}",
         "sourceDeleted": "Source deleted: {title}",
         "sourceDeletedHint": "The source conversation was deleted; this branch remains independent.",
