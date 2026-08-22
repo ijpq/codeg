@@ -79,6 +79,26 @@ pub async fn resolve_forge_auth(
     server_host: &str,
     account_id: Option<&str>,
 ) -> Result<ResolvedAuth, ForgeError> {
+    resolve_forge_auth_with_token(conn, provider, server_host, account_id, |id| {
+        crate::keyring_store::get_token(id)
+    })
+    .await
+}
+
+/// Testable half of [`resolve_forge_auth`]. Keeping credential lookup behind a
+/// callback avoids process-global `CODEG_DATA_DIR` mutations in unit tests;
+/// those mutations can race with unrelated parallel tests and make a token
+/// written in one temporary directory get read from another.
+async fn resolve_forge_auth_with_token<F>(
+    conn: &DatabaseConnection,
+    provider: ForgeProvider,
+    server_host: &str,
+    account_id: Option<&str>,
+    token_for: F,
+) -> Result<ResolvedAuth, ForgeError>
+where
+    F: Fn(&str) -> Option<String>,
+{
     let host = server_host.trim().to_ascii_lowercase();
     if host.is_empty() {
         return Err(ForgeError::Invalid("server host is empty".into()));
@@ -112,7 +132,7 @@ pub async fn resolve_forge_auth(
             })?,
     };
 
-    let token = crate::keyring_store::get_token(&account.id)
+    let token = token_for(&account.id)
         .ok_or_else(|| ForgeError::Auth(format!("no stored token for account {}", account.id)))?;
 
     Ok(ResolvedAuth {
@@ -511,23 +531,12 @@ mod tests {
         ));
     }
 
-    /// Server mode only: the file-backed token store can be pointed at a temp
-    /// dir. Desktop would hit the real OS keyring — never in a unit test.
-    #[cfg(not(feature = "tauri-runtime"))]
     #[tokio::test]
     async fn resolution_prefers_pinned_id_then_default_and_redacts_debug() {
-        let tmp = tempfile::tempdir().expect("tempdir");
         let db = crate::db::test_helpers::fresh_in_memory_db().await;
-        let db_conn = db.conn.clone();
-        let dir = tmp.path().to_string_lossy().to_string();
-        temp_env::async_with_vars([("CODEG_DATA_DIR", Some(dir.as_str()))], async move {
-            let db = db_conn;
-            resolution_happy_path(&db).await;
-        })
-        .await;
+        resolution_happy_path(&db.conn).await;
     }
 
-    #[cfg(not(feature = "tauri-runtime"))]
     async fn resolution_happy_path(conn: &sea_orm::DatabaseConnection) {
         let mut default = account("acc-default", "https://github.com", None);
         default.is_default = true;
@@ -548,15 +557,19 @@ mod tests {
         )
         .await
         .unwrap();
-        crate::keyring_store::set_token("acc-alt", "tok-alt").unwrap();
-        crate::keyring_store::set_token("acc-default", "tok-default").unwrap();
-        crate::keyring_store::set_token("acc-gitlab", "tok-gitlab").unwrap();
+        let tokens = std::collections::HashMap::from([
+            ("acc-alt", "tok-alt"),
+            ("acc-default", "tok-default"),
+            ("acc-gitlab", "tok-gitlab"),
+        ]);
+        let token_for = |id: &str| tokens.get(id).map(|token| (*token).to_string());
         let gh = ForgeProvider::GitHub;
 
         // Pinned id wins over the default account.
-        let pinned = resolve_forge_auth(conn, gh, "github.com", Some("acc-alt"))
-            .await
-            .unwrap();
+        let pinned =
+            resolve_forge_auth_with_token(conn, gh, "github.com", Some("acc-alt"), token_for)
+                .await
+                .unwrap();
         assert_eq!(pinned.account_id, "acc-alt");
         // The pinned account's own login rides along — the push identity.
         assert_eq!(pinned.username, "bob");
@@ -565,12 +578,22 @@ mod tests {
         assert!(shown.contains("<redacted>") && !shown.contains("tok-alt"));
 
         // No pin → the host's default.
-        let by_default = resolve_forge_auth(conn, gh, "github.com", None).await.unwrap();
+        let by_default =
+            resolve_forge_auth_with_token(conn, gh, "github.com", None, token_for)
+                .await
+                .unwrap();
         assert_eq!(by_default.account_id, "acc-default");
 
         // A pinned id on the WRONG host is an error, not a silent substitute.
         assert!(matches!(
-            resolve_forge_auth(conn, gh, "ghe.corp.com", Some("acc-alt")).await,
+            resolve_forge_auth_with_token(
+                conn,
+                gh,
+                "ghe.corp.com",
+                Some("acc-alt"),
+                token_for
+            )
+            .await,
             Err(ForgeError::Auth(_))
         ));
         // GHE host derives the /api/v3 base — but without a stored token the
@@ -578,24 +601,37 @@ mod tests {
         // Still plain `Auth`: an account IS configured here, so "add an
         // account" would be the wrong advice.
         assert!(matches!(
-            resolve_forge_auth(conn, gh, "ghe.corp.com", None).await,
+            resolve_forge_auth_with_token(conn, gh, "ghe.corp.com", None, token_for).await,
             Err(ForgeError::Auth(_))
         ));
         // Unknown host: no account at all — the actionable variant.
         assert!(matches!(
-            resolve_forge_auth(conn, gh, "nowhere.example", None).await,
+            resolve_forge_auth_with_token(conn, gh, "nowhere.example", None, token_for).await,
             Err(ForgeError::NoAccount { .. })
         ));
 
         // The GitLab account resolves for GitLab, with GitLab's API base…
-        let gl = resolve_forge_auth(conn, ForgeProvider::GitLab, "gitlab.com", None)
-            .await
-            .unwrap();
+        let gl = resolve_forge_auth_with_token(
+            conn,
+            ForgeProvider::GitLab,
+            "gitlab.com",
+            None,
+            token_for,
+        )
+        .await
+        .unwrap();
         assert_eq!((gl.account_id.as_str(), gl.api_base.as_str()), ("acc-gitlab", "https://gitlab.com/api/v4"));
         // …and is invisible to the GitHub client, which would only spend it on
         // a 401 that reads like an expired token.
         assert!(matches!(
-            resolve_forge_auth(conn, gh, "gitlab.com", Some("acc-gitlab")).await,
+            resolve_forge_auth_with_token(
+                conn,
+                gh,
+                "gitlab.com",
+                Some("acc-gitlab"),
+                token_for
+            )
+            .await,
             Err(ForgeError::Auth(_))
         ));
     }
