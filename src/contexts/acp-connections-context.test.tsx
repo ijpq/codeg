@@ -1743,7 +1743,8 @@ describe("AcpConnectionsProvider persisted Codex restore lifecycle", () => {
     )
   })
 
-  it("converges on a later successful restore after an active-writer race", async () => {
+  it("requires an explicit retry after a terminal restore failure", async () => {
+    const isolatedConversationId = 4201
     h.acpRestoreConversation
       .mockRejectedValueOnce(
         new Error("thread sess-1 already has an active writer")
@@ -1760,14 +1761,32 @@ describe("AcpConnectionsProvider persisted Codex restore lifecycle", () => {
       })
     await mountProvider()
 
+    await expect(
+      h.actions!.connect(
+        CODEX_TAB,
+        "codex",
+        "/tmp/x",
+        "sess-1",
+        isolatedConversationId
+      )
+    ).rejects.toThrow("already has an active writer")
+
+    expect(h.acpRestoreConversation).toHaveBeenCalledTimes(1)
+
     await act(async () => {
-      await h.actions!.connect(CODEX_TAB, "codex", "/tmp/x", "sess-1", 42)
+      await h.actions!.connect(
+        CODEX_TAB,
+        "codex",
+        "/tmp/x",
+        "sess-1",
+        isolatedConversationId
+      )
     })
 
     expect(h.acpRestoreConversation).toHaveBeenCalledTimes(2)
     expect(h.store!.getConnection(CODEX_TAB)).toMatchObject({
       connectionId: "restored-after-writer",
-      conversationId: 42,
+      conversationId: isolatedConversationId,
       status: "connecting",
     })
   })

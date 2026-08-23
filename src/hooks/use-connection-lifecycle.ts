@@ -41,6 +41,8 @@ export interface UseConnectionLifecycleReturn {
   modeLoading: boolean
   configOptionsLoading: boolean
   selectorsLoading: boolean
+  /** True while the backend-owned persisted-session restore flight is pending. */
+  restorePending: boolean
   autoConnectError: string | null
   handleFocus: () => void
   handleSend: (
@@ -198,6 +200,8 @@ export function useConnectionLifecycle({
     agentType: AgentType
     message: string
   } | null>(null)
+  const [restorePending, setRestorePending] = useState(false)
+  const restoreGenerationRef = useRef(0)
 
   // Refs for auto-connect effect, which intentionally avoids volatile
   // dependencies to prevent reconnect loops. Synced via useEffect —
@@ -261,6 +265,18 @@ export function useConnectionLifecycle({
     if (!isActive) return
     if (!workingDir) return
     let cancelled = false
+    const generation = ++restoreGenerationRef.current
+    const restoringPersistedCodex =
+      agentType === "codex" &&
+      conversationIdRef.current != null &&
+      conversationIdRef.current > 0
+    if (restoringPersistedCodex) {
+      queueMicrotask(() => {
+        if (!cancelled && restoreGenerationRef.current === generation) {
+          setRestorePending(true)
+        }
+      })
+    }
     connConnectRef
       .current(
         agentType,
@@ -269,12 +285,12 @@ export function useConnectionLifecycle({
         conversationIdRef.current
       )
       .then(() => {
-        if (!cancelled) {
+        if (!cancelled && restoreGenerationRef.current === generation) {
           setLastAutoConnectError(null)
         }
       })
       .catch((e: unknown) => {
-        if (!cancelled) {
+        if (!cancelled && restoreGenerationRef.current === generation) {
           setLastAutoConnectError({
             contextKey: contextKeyRef.current,
             agentType,
@@ -285,6 +301,11 @@ export function useConnectionLifecycle({
           console.error("[ConnLifecycle] auto-connect:", e)
         }
       })
+      .finally(() => {
+        if (!cancelled && restoreGenerationRef.current === generation) {
+          setRestorePending(false)
+        }
+      })
     return () => {
       cancelled = true
     }
@@ -293,7 +314,7 @@ export function useConnectionLifecycle({
   // Manage task status for connection progress
   const taskIdRef = useRef<string | null>(null)
   useEffect(() => {
-    if (status === "connecting") {
+    if (status === "connecting" || restorePending) {
       if (!taskIdRef.current) {
         const id = `acp-connect-${Date.now()}`
         taskIdRef.current = id
@@ -324,7 +345,7 @@ export function useConnectionLifecycle({
         taskIdRef.current = null
       }
     }
-  }, [status, addTask, updateTask, removeTask, agentType, t])
+  }, [status, restorePending, addTask, updateTask, removeTask, agentType, t])
 
   const clearSelectorTask = useCallback(() => {
     if (selectorTaskIdRef.current) {
@@ -604,6 +625,7 @@ export function useConnectionLifecycle({
     modeLoading,
     configOptionsLoading,
     selectorsLoading,
+    restorePending,
     autoConnectError,
     handleFocus,
     handleSend,
