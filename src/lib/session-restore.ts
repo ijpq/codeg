@@ -68,7 +68,15 @@ export function shouldAwaitHistoricalSessionDetail(args: {
   detailLoading: boolean
   detailError: string | null
 }): boolean {
-  if (!args.usesPersistedDetailIdentity || args.agentType === "cline") {
+  // Codex restore is keyed by durable conversation id and the backend reads
+  // the authoritative external session itself. It no longer needs the large
+  // transcript/detail response to finish first, so history rendering and ACP
+  // resume can run in parallel. Cline retains its existing immediate path.
+  if (
+    !args.usesPersistedDetailIdentity ||
+    args.agentType === "cline" ||
+    args.agentType === "codex"
+  ) {
     return false
   }
   if (args.detailError) return false

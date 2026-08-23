@@ -5116,27 +5116,34 @@ async fn run_connection(
             )
             .await;
 
-            // Emit connected status early so the frontend can show cached
-            // selectors and enable sending while the session initialises.
-            // Prompts sent before run_conversation_loop are buffered in
-            // the cmd_rx channel and processed as soon as the loop starts.
-            emit_with_state(
-                &state,
-                &emitter_clone,
-                AcpEvent::StatusChanged {
-                    status: ConnectionStatus::Connected,
-                },
-            )
-            .await;
+            // A fresh session may expose its initialized ACP transport while
+            // session/new is being prepared. A persisted session must not:
+            // `Connected` was previously emitted here before a potentially
+            // multi-minute session/resume, which made the UI claim readiness
+            // and let the idle sweep reap the process mid-restore. Historical
+            // connections remain `Connecting` until SessionStarted confirms
+            // that the requested session is actually attached; SelectorsReady
+            // remains the final prompt-readiness latch.
+            if session_id.is_none() {
+                emit_with_state(
+                    &state,
+                    &emitter_clone,
+                    AcpEvent::StatusChanged {
+                        status: ConnectionStatus::Connected,
+                    },
+                )
+                .await;
+            }
 
             if let Some(sid) = session_id {
                 // Prefer session/resume when the agent advertises the
                 // capability: it restores session context WITHOUT replaying
                 // history (which session/load does only for us to drain and
                 // discard — the transcript the user sees comes from the disk
-                // parser, not the ACP wire). On any non-terminal resume failure
-                // we fall through to the session/load block below, so the
-                // effective chain is resume → load → new.
+                // parser, not the ACP wire). Most resume-specific failures may
+                // still recover through load. An active-writer response is
+                // different: the same durable thread is live elsewhere, so a
+                // second load on this process only repeats the ownership race.
                 if supports_resume {
                     let resume_req = build_resume_session_request(
                         agent_type,
@@ -5248,6 +5255,7 @@ async fn run_connection(
                             .await;
                         }
                         Err(e) => {
+                            let resume_error = e.to_string();
                             tracing::warn!(
                                 conversation_id = ?restore_conversation_id,
                                 connection_id = %conn_id,
@@ -5256,13 +5264,55 @@ async fn run_connection(
                                 error = %e,
                                 "[ACP][restore] stage failed"
                             );
+                            if !should_attempt_session_load_after_resume_failure(
+                                agent_type,
+                                &resume_error,
+                            ) {
+                                tracing::info!(
+                                    conversation_id = ?restore_conversation_id,
+                                    connection_id = %conn_id,
+                                    external_session_id = %sid,
+                                    stage = "session_load_skipped_active_writer",
+                                    "[ACP][restore] active writer retained by another owner; skipping duplicate load"
+                                );
+                                emit_with_state(
+                                    &state,
+                                    &emitter_clone,
+                                    AcpEvent::SessionLoadFailed {
+                                        session_id: sid.clone(),
+                                        message: resume_error.clone(),
+                                        code: "active_writer".to_string(),
+                                    },
+                                )
+                                .await;
+                                emit_with_state(
+                                    &state,
+                                    &emitter_clone,
+                                    AcpEvent::Error {
+                                        message: resume_error,
+                                        agent_type: agent_type.to_string(),
+                                        code: Some("active_writer".to_string()),
+                                        details: None,
+                                        terminal: true,
+                                    },
+                                )
+                                .await;
+                                emit_with_state(
+                                    &state,
+                                    &emitter_clone,
+                                    AcpEvent::StatusChanged {
+                                        status: ConnectionStatus::Error,
+                                    },
+                                )
+                                .await;
+                                return Ok(());
+                            }
                             // resume is unstable and NOT guaranteed equivalent to
-                            // session/load, so a resume-specific failure must
-                            // never deny a load that might still succeed. EVERY
-                            // resume error — ResourceNotFound, "Authentication
-                            // required", "Method not found", or anything else —
-                            // falls through to the session/load block below,
-                            // which already owns all terminal decisions
+                            // session/load, so ordinary resume-specific failures
+                            // still fall through to load. The active-writer case
+                            // returned above is the sole exception because load
+                            // cannot legally acquire that same writer either.
+                            // The load block below owns the remaining terminal decisions
                             // (SessionLoadFailed for not-found, silent stop for
                             // auth, fallback to session/new otherwise). No
                             // user-facing event is emitted here: load re-derives
@@ -7844,6 +7894,14 @@ fn is_active_writer_failure(message: &str) -> bool {
 
 fn preserves_agent_owned_session_on_restore_failure(agent_type: AgentType) -> bool {
     agent_type == AgentType::Codex
+}
+
+fn should_attempt_session_load_after_resume_failure(
+    agent_type: AgentType,
+    error: &str,
+) -> bool {
+    !(preserves_agent_owned_session_on_restore_failure(agent_type)
+        && is_active_writer_failure(error))
 }
 
 /// Whether codeg can absorb a "the agent forgot this session" load failure by
@@ -14410,6 +14468,18 @@ mod tests {
         ));
         assert!(!preserves_agent_owned_session_on_restore_failure(
             AgentType::ClaudeCode
+        ));
+        assert!(!should_attempt_session_load_after_resume_failure(
+            AgentType::Codex,
+            "thread 019e already has an active writer"
+        ));
+        assert!(should_attempt_session_load_after_resume_failure(
+            AgentType::Codex,
+            "resume method temporarily unavailable"
+        ));
+        assert!(should_attempt_session_load_after_resume_failure(
+            AgentType::ClaudeCode,
+            "thread 019e already has an active writer"
         ));
     }
 

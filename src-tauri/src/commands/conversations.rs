@@ -1634,9 +1634,15 @@ async fn get_folder_conversation_raw_impl(
             turns.insert(index, merge_turn);
         }
     }
-    let artifact_runs = artifact_service::list_for_conversation(conn, conversation_id)
-        .await
-        .map_err(AppCommandError::from)?;
+    let artifact_runs = if history_page.is_some() {
+        artifact_service::list_for_turn_window(conn, conversation_id, &turns)
+            .await
+            .map_err(AppCommandError::from)?
+    } else {
+        artifact_service::list_for_conversation(conn, conversation_id)
+            .await
+            .map_err(AppCommandError::from)?
+    };
     let deliverable_runs = deliverable_service::list_sets_for_turns(conn, conversation_id, &turns)
         .await
         .map_err(AppCommandError::from)?;

@@ -5,18 +5,25 @@
  * restores during the same React effect window.
  */
 export class ConversationRestoreSingleFlight<T> {
-  private readonly flights = new Map<number, Promise<T>>()
+  /** Module-global so multiple provider instances in the same renderer share
+   * one request. The backend remains the cross-window/process authority. */
+  private static readonly sharedFlights = new Map<number, Promise<unknown>>()
 
   run(conversationId: number, start: () => Promise<T>): Promise<T> {
-    const existing = this.flights.get(conversationId)
+    const existing = ConversationRestoreSingleFlight.sharedFlights.get(
+      conversationId
+    ) as Promise<T> | undefined
     if (existing) return existing
 
     const flight = start().finally(() => {
-      if (this.flights.get(conversationId) === flight) {
-        this.flights.delete(conversationId)
+      if (
+        ConversationRestoreSingleFlight.sharedFlights.get(conversationId) ===
+        flight
+      ) {
+        ConversationRestoreSingleFlight.sharedFlights.delete(conversationId)
       }
     })
-    this.flights.set(conversationId, flight)
+    ConversationRestoreSingleFlight.sharedFlights.set(conversationId, flight)
     return flight
   }
 }
