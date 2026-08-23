@@ -45,10 +45,7 @@ import {
   isConnectionBusy,
   isConnectionGoneError,
 } from "@/lib/connection-teardown"
-import {
-  isRetryableSessionRestoreConflict,
-  SessionRestorePendingError,
-} from "@/lib/session-restore"
+import { SessionRestorePendingError } from "@/lib/session-restore"
 import { ConversationRestoreSingleFlight } from "@/lib/conversation-restore-single-flight"
 import {
   getConversationIdByExternalIdFromStore,
@@ -5542,24 +5539,11 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
               )
             )
           try {
-            try {
-              restored = await restoreOnce()
-            } catch (initialError) {
-              // A second window/provider can own the backend single-flight.
-              // Older builds also surfaced Codex's active-writer/session-new
-              // race here. Give that owner one bounded chance to publish, then
-              // join the now-ready connection. Permanent missing/auth/load
-              // errors are never retried and immediately end initialization.
-              if (!isRetryableSessionRestoreConflict(initialError)) {
-                throw initialError
-              }
-              console.info(
-                "[acp-context] waiting for competing session restore",
-                { conversationId }
-              )
-              await new Promise((resolve) => window.setTimeout(resolve, 350))
-              restored = await restoreOnce()
-            }
+            // The server owns a cancellation-shielded restore flight and every
+            // caller awaits that exact result. Client-side timed retries used
+            // to turn an abandoned slow restore into a second ACP process and
+            // an active-writer conflict; one request is now the whole policy.
+            restored = await restoreOnce()
           } catch (error) {
             // A persisted but never-used ordinary conversation has no session
             // to restore. Preserve its historical session/new path; provisional

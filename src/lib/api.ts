@@ -281,11 +281,20 @@ export async function acpRestoreConversation(
   preferredModeId?: string | null,
   preferredConfigValues?: Record<string, string> | null
 ): Promise<RestoredConversationConnectionInfo> {
-  return getTransport().call("acp_restore_conversation", {
-    conversationId,
-    preferredModeId: preferredModeId ?? null,
-    preferredConfigValues: preferredConfigValues ?? null,
-  })
+  return getTransport().call(
+    "acp_restore_conversation",
+    {
+      conversationId,
+      preferredModeId: preferredModeId ?? null,
+      preferredConfigValues: preferredConfigValues ?? null,
+    },
+    // Large Codex rollouts routinely need >60s for session/resume. The web
+    // transport's old default aborted the caller while the ACP writer kept
+    // running, then the UI retry created the active-writer conflict. Let the
+    // backend's bounded restore supervisor (default 300s, configurable up to
+    // 1800s) own the deadline and return its structured terminal result.
+    { timeoutMs: 1_830_000 }
+  )
 }
 
 export async function acpPrompt(

@@ -5,7 +5,7 @@ import {
 } from "./session-restore"
 
 describe("shouldAwaitHistoricalSessionDetail", () => {
-  it("blocks the empty non-loading commit before persisted detail resolves", () => {
+  it("lets Codex restore run in parallel with persisted detail loading", () => {
     expect(
       shouldAwaitHistoricalSessionDetail({
         usesPersistedDetailIdentity: true,
@@ -14,7 +14,7 @@ describe("shouldAwaitHistoricalSessionDetail", () => {
         detailLoading: false,
         detailError: null,
       })
-    ).toBe(true)
+    ).toBe(false)
   })
 
   it("unblocks only after authoritative detail resolves", () => {
@@ -29,7 +29,19 @@ describe("shouldAwaitHistoricalSessionDetail", () => {
     ).toBe(false)
   })
 
-  it("does not gate drafts, cline, or the existing detail-error path", () => {
+  it("still gates agents that require detail-provided session identity", () => {
+    expect(
+      shouldAwaitHistoricalSessionDetail({
+        usesPersistedDetailIdentity: true,
+        agentType: "claude_code",
+        detailLoaded: false,
+        detailLoading: false,
+        detailError: null,
+      })
+    ).toBe(true)
+  })
+
+  it("does not gate drafts, Codex, cline, or the existing detail-error path", () => {
     const base = {
       usesPersistedDetailIdentity: true,
       agentType: "codex",

@@ -17,6 +17,7 @@ use sea_orm_migration::MigratorTrait;
 use error::DbError;
 use migration::Migrator;
 
+#[derive(Clone)]
 pub struct AppDatabase {
     pub conn: DatabaseConnection,
 }

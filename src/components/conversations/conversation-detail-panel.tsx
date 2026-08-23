@@ -620,12 +620,10 @@ const ConversationTabView = memo(function ConversationTabView({
   //      next prompt → original sid orphaned, agent loses prior context.
   const externalId =
     detail?.summary.external_id ?? runtimeExternalId ?? undefined
-  // For persisted conversations opened from the sidebar, wait until the
-  // session's external_id has been resolved before auto-connecting.
-  // Otherwise the auto-connect effect fires with sessionId=undefined and
-  // the backend falls back to session/new, orphaning the historical
-  // context. cline doesn't support session resume, so it connects
-  // immediately regardless.
+  // Agents whose connect path needs a client-provided external id wait for
+  // detail. Codex restore is conversation-id based and resolves the durable id
+  // server-side, so it starts in parallel with paged history loading instead
+  // of adding the detail response time ahead of a long session/resume.
   const awaitingHistoricalSessionId = shouldAwaitHistoricalSessionDetail({
     usesPersistedDetailIdentity,
     agentType: selectedAgent,
@@ -690,6 +688,7 @@ const ConversationTabView = memo(function ConversationTabView({
     modeLoading,
     configOptionsLoading,
     selectorsLoading,
+    restorePending,
     autoConnectError,
     handleFocus,
     handleSend: lifecycleSend,
@@ -756,7 +755,7 @@ const ConversationTabView = memo(function ConversationTabView({
   useEffect(() => {
     isViewerRef.current = conn.isViewer
   }, [conn.isViewer])
-  const isConnecting = connStatus === "connecting"
+  const isConnecting = connStatus === "connecting" || restorePending
   // The tab's connection is keyed by a stable tabId, but agent switching is
   // async — and for a not-installed target, connect()'s preflight throws BEFORE
   // it tears down the old connection. So `conn` can still describe the PREVIOUS
@@ -815,7 +814,7 @@ const ConversationTabView = memo(function ConversationTabView({
     ? selectedAgentNotInstalled
       ? "disconnected"
       : "connecting"
-    : connStatus === "connected" && !connectionReady
+    : restorePending || (connStatus === "connected" && !connectionReady)
       ? "connecting"
       : connStatus
   const connectionModes = useMemo(
