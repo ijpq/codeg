@@ -30,4 +30,26 @@ describe("ConversationRestoreSingleFlight", () => {
       flights.run(2, async () => 2),
     ])
   })
+
+  it("coalesces across provider-local coordinator instances", async () => {
+    let resolve!: (value: string) => void
+    const start = vi.fn(
+      () =>
+        new Promise<string>((done) => {
+          resolve = done
+        })
+    )
+    const firstProvider = new ConversationRestoreSingleFlight<string>()
+    const secondProvider = new ConversationRestoreSingleFlight<string>()
+
+    const first = firstProvider.run(26001, start)
+    const second = secondProvider.run(26001, start)
+    expect(second).toBe(first)
+    expect(start).toHaveBeenCalledTimes(1)
+    resolve("shared")
+    await expect(Promise.all([first, second])).resolves.toEqual([
+      "shared",
+      "shared",
+    ])
+  })
 })

@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use sea_orm::{
     sea_query::Expr, ActiveModelTrait, ActiveValue::NotSet, ColumnTrait, DatabaseConnection,
-    EntityTrait, IntoActiveModel, QueryFilter, QueryOrder, Set, TransactionTrait,
+    Condition, EntityTrait, IntoActiveModel, QueryFilter, QueryOrder, Set, TransactionTrait,
 };
 
 use crate::db::entities::conversation::{self, ConversationStatus};
@@ -819,6 +819,45 @@ pub async fn list_for_conversation(
         .order_by_asc(conversation_turn_run::Column::StartedAt)
         .all(conn)
         .await?;
+    list_runs_with_changes(conn, runs).await
+}
+
+/// Artifact runs relevant to one visible history page. The conversation-wide
+/// file-change ledger can be many megabytes and has its own lazy history UI;
+/// shipping all of it beside six user turns defeated transcript pagination.
+/// Active runs remain included so the newest page can render in-flight capture.
+pub async fn list_for_turn_window(
+    conn: &DatabaseConnection,
+    conversation_id: i32,
+    turns: &[crate::models::message::MessageTurn],
+) -> Result<Vec<ConversationTurnArtifactRun>, DbError> {
+    let ids = turns.iter().map(|turn| turn.id.clone()).collect::<Vec<_>>();
+    let mut window = Condition::any()
+        .add(conversation_turn_run::Column::Status.eq(ConversationTurnRunStatus::Running))
+        .add(conversation_turn_run::Column::Status.eq(ConversationTurnRunStatus::Cancelling));
+    if !ids.is_empty() {
+        window = window.add(conversation_turn_run::Column::ClientMessageId.is_in(ids));
+    }
+    if let (Some(first), Some(last)) = (turns.first(), turns.last()) {
+        window = window.add(
+            Condition::all()
+                .add(conversation_turn_run::Column::StartedAt.gte(first.timestamp))
+                .add(conversation_turn_run::Column::StartedAt.lte(last.timestamp)),
+        );
+    }
+    let runs = conversation_turn_run::Entity::find()
+        .filter(conversation_turn_run::Column::ConversationId.eq(conversation_id))
+        .filter(window)
+        .order_by_asc(conversation_turn_run::Column::StartedAt)
+        .all(conn)
+        .await?;
+    list_runs_with_changes(conn, runs).await
+}
+
+async fn list_runs_with_changes(
+    conn: &DatabaseConnection,
+    runs: Vec<conversation_turn_run::Model>,
+) -> Result<Vec<ConversationTurnArtifactRun>, DbError> {
     if runs.is_empty() {
         return Ok(Vec::new());
     }
@@ -872,7 +911,65 @@ pub async fn list_for_conversation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::AgentType;
+    use crate::models::{message::MessageTurn, AgentType, TurnRole};
+
+    #[tokio::test]
+    async fn paged_artifact_query_excludes_old_conversation_wide_runs() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let folder_id = crate::db::test_helpers::seed_folder(&db, "/tmp/windowed-artifacts").await;
+        let conversation_id =
+            crate::db::test_helpers::seed_conversation(&db, folder_id, AgentType::Codex).await;
+        for (run_id, message_id) in [("old-run", "old-user"), ("page-run", "page-user")] {
+            create_run(
+                &db.conn,
+                NewTurnRun {
+                    id: run_id.into(),
+                    conversation_id,
+                    connection_id: format!("conn-{run_id}"),
+                    client_message_id: Some(message_id.into()),
+                    prompt_fingerprint: None,
+                    folder_id: Some(folder_id),
+                    root_path: "/tmp/windowed-artifacts".into(),
+                    capture_incomplete: false,
+                    input_paths_json: "[]".into(),
+                    expectation_json: "{}".into(),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        for (run_id, started_at) in [
+            ("old-run", Utc::now() - chrono::Duration::days(2)),
+            ("page-run", Utc::now()),
+        ] {
+            let model = conversation_turn_run::Entity::find_by_id(run_id)
+                .one(&db.conn)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut active = model.into_active_model();
+            active.started_at = Set(started_at);
+            active.status = Set(ConversationTurnRunStatus::Completed);
+            active.update(&db.conn).await.unwrap();
+        }
+        let page_turns = vec![MessageTurn {
+            id: "page-user".into(),
+            role: TurnRole::User,
+            blocks: Vec::new(),
+            timestamp: Utc::now(),
+            usage: None,
+            duration_ms: None,
+            model: None,
+            completed_at: None,
+        }];
+
+        let page = list_for_turn_window(&db.conn, conversation_id, &page_turns)
+            .await
+            .unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].id, "page-run");
+        assert_eq!(list_for_conversation(&db.conn, conversation_id).await.unwrap().len(), 2);
+    }
 
     #[tokio::test]
     async fn aggregates_repeated_path_events_and_recovers_running_rows() {

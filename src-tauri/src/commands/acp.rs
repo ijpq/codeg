@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -35,6 +36,51 @@ const ACP_AGENTS_UPDATED_EVENT: &str = "app://acp-agents-updated";
 const NPM_PREFIX_TIMEOUT: Duration = Duration::from_millis(1500);
 
 static NPM_GLOBAL_PREFIX_CACHE: tokio::sync::OnceCell<PathBuf> = tokio::sync::OnceCell::const_new();
+
+/// One cancellation-shielded restore task per durable conversation. The
+/// previous mutex lived inside the HTTP/Tauri request future: navigating away
+/// dropped that future (and its guard) while the separately spawned ACP process
+/// continued to own Codex's writer. A retry could then start a second process.
+/// This registry owns the task independently and gives every caller the exact
+/// same terminal result. The external-session writer lock inside the task is
+/// the second tier, serializing different conversation rows that reference the
+/// same `(agent_type, external_session_id)`.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct ManagedRestoreFlightKey {
+    manager_identity: usize,
+    conversation_id: i32,
+}
+
+struct ManagedRestoreFlight {
+    generation: String,
+    result: tokio::sync::watch::Sender<
+        Option<Result<RestoredConversationConnectionInfo, AcpError>>,
+    >,
+}
+
+fn managed_restore_flights(
+) -> &'static tokio::sync::Mutex<HashMap<ManagedRestoreFlightKey, Arc<ManagedRestoreFlight>>> {
+    static FLIGHTS: OnceLock<
+        tokio::sync::Mutex<HashMap<ManagedRestoreFlightKey, Arc<ManagedRestoreFlight>>>,
+    > = OnceLock::new();
+    FLIGHTS.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
+}
+
+async fn acquire_managed_restore_flight(
+    key: ManagedRestoreFlightKey,
+) -> (Arc<ManagedRestoreFlight>, bool) {
+    let mut flights = managed_restore_flights().lock().await;
+    if let Some(existing) = flights.get(&key) {
+        return (existing.clone(), false);
+    }
+    let (result, _) = tokio::sync::watch::channel(None);
+    let flight = Arc::new(ManagedRestoreFlight {
+        generation: uuid::Uuid::new_v4().to_string(),
+        result,
+    });
+    flights.insert(key, flight.clone());
+    (flight, true)
+}
 
 fn is_active_writer_restore_error(error: &AcpError) -> bool {
     let normalized = error.to_string().to_ascii_lowercase();
@@ -10278,7 +10324,7 @@ async fn prepare_provisional_snapshot_branch(
 /// authoritative for agent, folder and external session identity; callers only
 /// supply the conversation id and selector preferences.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn acp_restore_conversation_core(
+async fn acp_restore_conversation_inner(
     conversation_id: i32,
     preferred_mode_id: Option<String>,
     preferred_config_values: BTreeMap<String, String>,
@@ -10562,7 +10608,7 @@ pub(crate) async fn acp_restore_conversation_core(
                 stage = "restore_phantom_turn_cleanup",
                 "[ACP][restore] discarding warm connection with no active turn run"
             );
-            let _ = manager.disconnect(&old_id).await;
+            let _ = manager.disconnect_and_wait(&old_id).await;
         }
         old_status = None;
         old_turn_in_flight = false;
@@ -10680,7 +10726,7 @@ pub(crate) async fn acp_restore_conversation_core(
     {
         let mut retry_succeeded = false;
         if !spawned.reused_existing {
-            let _ = manager.disconnect(&spawned.connection_id).await;
+            let _ = manager.disconnect_and_wait(&spawned.connection_id).await;
         }
         let released_legacy_writer = !spawned.reused_existing
             && is_active_writer_restore_error(&error)
@@ -10731,7 +10777,7 @@ pub(crate) async fn acp_restore_conversation_core(
                 }
                 Err(retry_error) => {
                     if !retry.reused_existing {
-                        let _ = manager.disconnect(&retry.connection_id).await;
+                        let _ = manager.disconnect_and_wait(&retry.connection_id).await;
                     }
                     error = retry_error;
                     spawned = retry;
@@ -10793,7 +10839,7 @@ pub(crate) async fn acp_restore_conversation_core(
             // A reused connection belongs to an existing client and remains
             // untouched because no binding mutation passed validation.
             if !spawned.reused_existing {
-                let _ = manager.disconnect(&spawned.connection_id).await;
+                let _ = manager.disconnect_and_wait(&spawned.connection_id).await;
             }
             tracing::warn!(
                 conversation_id,
@@ -10830,7 +10876,7 @@ pub(crate) async fn acp_restore_conversation_core(
     };
     if !publication_valid {
         if !spawned.reused_existing {
-            let _ = manager.disconnect(&spawned.connection_id).await;
+            let _ = manager.disconnect_and_wait(&spawned.connection_id).await;
         }
         tracing::error!(
             conversation_id,
@@ -10874,6 +10920,126 @@ pub(crate) async fn acp_restore_conversation_core(
         lifecycle_state: "ready".into(),
         durable_session: true,
     })
+}
+
+/// Cancellation-shielded entry point for persisted conversation restore.
+///
+/// The expensive lifecycle runs in a backend-owned task. Closing a tab,
+/// aborting an HTTP request, or replacing a React component only drops that
+/// caller's watch receiver; it cannot release the writer locks or orphan the
+/// spawned ACP process. Concurrent callers join the same generation and receive
+/// the same success/error value.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn acp_restore_conversation_core(
+    conversation_id: i32,
+    preferred_mode_id: Option<String>,
+    preferred_config_values: BTreeMap<String, String>,
+    manager: &ConnectionManager,
+    db: &AppDatabase,
+    data_dir: &Path,
+    owner_window_label: String,
+    emitter: EventEmitter,
+) -> Result<RestoredConversationConnectionInfo, AcpError> {
+    let key = ManagedRestoreFlightKey {
+        manager_identity: manager.instance_identity(),
+        conversation_id,
+    };
+    let (flight, leader) = acquire_managed_restore_flight(key).await;
+
+    if leader {
+        let manager = manager.clone_ref();
+        let db = db.clone();
+        let data_dir = data_dir.to_path_buf();
+        let flight_for_task = flight.clone();
+        tokio::spawn(async move {
+            let generation = flight_for_task.generation.clone();
+            tracing::info!(
+                conversation_id,
+                restore_generation = generation,
+                stage = "restore_flight_started",
+                "[ACP][restore] backend-owned restore flight started"
+            );
+            let inner_manager = manager.clone_ref();
+            let mut inner = tokio::spawn(async move {
+                acp_restore_conversation_inner(
+                    conversation_id,
+                    preferred_mode_id,
+                    preferred_config_values,
+                    &inner_manager,
+                    &db,
+                    &data_dir,
+                    owner_window_label,
+                    emitter,
+                )
+                .await
+            });
+            let result = match tokio::time::timeout(manager.restore_timeout(), &mut inner).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(join_error)) => Err(AcpError::protocol(format!(
+                    "conversation {conversation_id} restore task stopped unexpectedly: {join_error}"
+                ))),
+                Err(_) => {
+                    inner.abort();
+                    let _ = inner.await;
+                    let cleaned = manager
+                        .terminate_incomplete_restore_connections(conversation_id)
+                        .await;
+                    tracing::warn!(
+                        conversation_id,
+                        restore_generation = generation,
+                        timeout_secs = manager.restore_timeout().as_secs(),
+                        cleaned_connections = cleaned,
+                        stage = "restore_flight_timed_out",
+                        "[ACP][restore] restore timed out and was reclaimed"
+                    );
+                    Err(AcpError::protocol(format!(
+                        "conversation {conversation_id} restore timed out after {} seconds; retry",
+                        manager.restore_timeout().as_secs()
+                    )))
+                }
+            };
+            // `send_replace` retains the terminal result even if every HTTP
+            // caller navigated away. A caller joining during the small
+            // publication/removal window still observes the completed flight;
+            // plain `send` discards the value when no receiver exists.
+            flight_for_task.result.send_replace(Some(result.clone()));
+            {
+                let mut flights = managed_restore_flights().lock().await;
+                if flights
+                    .get(&key)
+                    .is_some_and(|current| Arc::ptr_eq(current, &flight_for_task))
+                {
+                    flights.remove(&key);
+                }
+            }
+            tracing::info!(
+                conversation_id,
+                restore_generation = generation,
+                succeeded = result.is_ok(),
+                stage = "restore_flight_finished",
+                "[ACP][restore] backend-owned restore flight finished"
+            );
+        });
+    } else {
+        tracing::info!(
+            conversation_id,
+            restore_generation = flight.generation,
+            stage = "restore_flight_joined",
+            "[ACP][restore] duplicate caller joined existing restore flight"
+        );
+    }
+
+    let mut receiver = flight.result.subscribe();
+    loop {
+        if let Some(result) = receiver.borrow().clone() {
+            return result;
+        }
+        receiver.changed().await.map_err(|_| {
+            AcpError::protocol(format!(
+                "conversation {conversation_id} restore supervisor ended without a result"
+            ))
+        })?;
+    }
 }
 
 /// A durable `running` row is not sufficient proof that a refreshed client can
@@ -13822,6 +13988,38 @@ pub(crate) async fn codex_poll_device_code_core(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn managed_restore_flight_has_one_leader_and_shared_terminal_result() {
+        static TEST_MANAGER: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(10_000);
+        let key = ManagedRestoreFlightKey {
+            manager_identity: TEST_MANAGER.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+            conversation_id: 26,
+        };
+        let (leader, is_leader) = acquire_managed_restore_flight(key).await;
+        let (waiter, waiter_is_leader) = acquire_managed_restore_flight(key).await;
+        assert!(is_leader);
+        assert!(!waiter_is_leader);
+        assert!(Arc::ptr_eq(&leader, &waiter));
+
+        let mut receiver = waiter.result.subscribe();
+        let expected = RestoredConversationConnectionInfo {
+            connection_id: "connection-26".into(),
+            external_session_id: "session-26".into(),
+            reused_existing: false,
+            codeg_mcp_available: true,
+            mcp_server_count: 1,
+            replaced_connection_ids: Vec::new(),
+            lifecycle_state: "ready".into(),
+            durable_session: true,
+        };
+        leader.result.send_replace(Some(Ok(expected.clone())));
+        receiver.changed().await.unwrap();
+        assert_eq!(receiver.borrow().clone().unwrap().unwrap(), expected);
+
+        managed_restore_flights().lock().await.remove(&key);
+    }
 
     #[test]
     fn external_session_writer_conflict_blocks_only_a_live_different_owner() {

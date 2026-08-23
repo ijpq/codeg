@@ -174,6 +174,13 @@ struct SessionOperationKey {
 /// genuinely broken.
 pub(crate) const SPAWN_HANDSHAKE_TIMEOUT_SECS: u64 = 60;
 
+/// Restoring an existing session is materially different from starting an ACP
+/// process. Codex has to index and resume the complete rollout and large real
+/// sessions routinely take longer than the 60 second process-handshake bound.
+/// Keep a separate, deliberately generous end-to-end deadline so a healthy
+/// two-minute resume is not mistaken for a dead adapter.
+pub(crate) const RESTORE_TIMEOUT_SECS: u64 = 300;
+
 /// Read the spawn-handshake timeout from `CODEG_ACP_SPAWN_HANDSHAKE_TIMEOUT_SECS`,
 /// falling back to `SPAWN_HANDSHAKE_TIMEOUT_SECS`. Returns the configured
 /// `Duration`. Tests can construct the manager with a custom value via
@@ -183,6 +190,15 @@ fn spawn_handshake_timeout_from_env() -> Duration {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(SPAWN_HANDSHAKE_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
+
+fn restore_timeout_from_env() -> Duration {
+    let secs = std::env::var("CODEG_ACP_RESTORE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(RESTORE_TIMEOUT_SECS)
+        .clamp(120, 1_800);
     Duration::from_secs(secs)
 }
 
@@ -247,6 +263,40 @@ async fn wait_for_session_started(
     (outcome, start.elapsed())
 }
 
+async fn hard_kill_process_cell(
+    child_pid: Arc<std::sync::atomic::AtomicU32>,
+    reason: &'static str,
+    connection_id: Option<String>,
+) {
+    let pid = child_pid.load(std::sync::atomic::Ordering::SeqCst);
+    if pid == 0 {
+        return;
+    }
+    let outcome = tokio::task::spawn_blocking(move || kill_tree::blocking::kill_tree(pid)).await;
+    match outcome {
+        Ok(Ok(_)) => tracing::info!(
+            connection_id,
+            pid,
+            reason,
+            "[ACP] per-connection teardown killed process tree"
+        ),
+        Ok(Err(error)) => tracing::debug!(
+            connection_id,
+            pid,
+            reason,
+            error = %error,
+            "[ACP] process tree was already gone during teardown"
+        ),
+        Err(error) => tracing::warn!(
+            connection_id,
+            pid,
+            reason,
+            error = %error,
+            "[ACP] process-tree cleanup task failed"
+        ),
+    }
+}
+
 pub struct ConnectionManager {
     pub(crate) connections: Arc<Mutex<HashMap<String, AgentConnection>>>,
     /// Per-(agent, working_dir, session_id) async mutex. Held across the
@@ -282,6 +332,9 @@ pub struct ConnectionManager {
     /// tests; in production initialized from env via
     /// `spawn_handshake_timeout_from_env`.
     spawn_handshake_timeout: Duration,
+    /// End-to-end deadline for persisted session resume/load and prompt
+    /// readiness. This is also the lease duration used by restore waiters.
+    restore_timeout: Duration,
     /// Shared General Settings shell used by ACP terminal fallbacks. Cloned
     /// into each connection runtime so a setting update applies to existing
     /// model sessions as well as newly spawned ones.
@@ -359,6 +412,7 @@ impl ConnectionManager {
             restore_locks: Arc::new(Mutex::new(HashMap::new())),
             branch_recovery_locks: Arc::new(Mutex::new(HashMap::new())),
             spawn_handshake_timeout: spawn_handshake_timeout_from_env(),
+            restore_timeout: restore_timeout_from_env(),
             terminal_shell_config: TerminalShellRuntimeConfig::new(),
             delegation_injection: Arc::new(std::sync::OnceLock::new()),
             chat_channel: Arc::new(std::sync::OnceLock::new()),
@@ -379,6 +433,7 @@ impl ConnectionManager {
             restore_locks: self.restore_locks.clone(),
             branch_recovery_locks: self.branch_recovery_locks.clone(),
             spawn_handshake_timeout: self.spawn_handshake_timeout,
+            restore_timeout: self.restore_timeout,
             terminal_shell_config: self.terminal_shell_config.clone(),
             delegation_injection: self.delegation_injection.clone(),
             chat_channel: self.chat_channel.clone(),
@@ -423,6 +478,20 @@ impl ConnectionManager {
         self.terminal_shell_config.clone()
     }
 
+    /// Maximum wall time owned by one persisted-conversation restore flight.
+    /// Exposed to the command layer so the cancellation-shielded supervisor
+    /// and the manager's internal waits share one policy.
+    pub(crate) fn restore_timeout(&self) -> Duration {
+        self.restore_timeout
+    }
+
+    /// Stable identity shared by every `clone_ref` of this manager. Used only
+    /// to scope the command-layer restore-flight registry in tests/processes
+    /// that may host more than one independent manager.
+    pub(crate) fn instance_identity(&self) -> usize {
+        Arc::as_ptr(&self.connections) as usize
+    }
+
     /// Test-only constructor that overrides the spawn-handshake timeout.
     /// Production code should use `new()`.
     #[cfg(test)]
@@ -435,6 +504,7 @@ impl ConnectionManager {
             restore_locks: Arc::new(Mutex::new(HashMap::new())),
             branch_recovery_locks: Arc::new(Mutex::new(HashMap::new())),
             spawn_handshake_timeout: timeout,
+            restore_timeout: timeout,
             terminal_shell_config: TerminalShellRuntimeConfig::new(),
             delegation_injection: Arc::new(std::sync::OnceLock::new()),
             chat_channel: Arc::new(std::sync::OnceLock::new()),
@@ -639,7 +709,12 @@ impl ConnectionManager {
         connection_id: &str,
         expected_session_id: Option<&str>,
     ) -> Result<String, AcpError> {
-        let deadline = tokio::time::Instant::now() + self.spawn_handshake_timeout;
+        let timeout = if expected_session_id.is_some() {
+            self.restore_timeout
+        } else {
+            self.spawn_handshake_timeout
+        };
+        let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let state = self
                 .get_state(connection_id)
@@ -684,7 +759,7 @@ impl ConnectionManager {
             if tokio::time::Instant::now() >= deadline {
                 return Err(AcpError::protocol(format!(
                     "ACP session did not become prompt-ready within {} seconds",
-                    self.spawn_handshake_timeout.as_secs()
+                    timeout.as_secs()
                 )));
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -719,9 +794,7 @@ impl ConnectionManager {
                 .or_insert_with(|| Arc::new(Mutex::new(())))
                 .clone()
         };
-        let timeout = self
-            .spawn_handshake_timeout
-            .saturating_add(Duration::from_secs(15));
+        let timeout = self.restore_timeout;
         tokio::time::timeout(timeout, lock.lock_owned())
             .await
             .map_err(|_| {
@@ -751,9 +824,7 @@ impl ConnectionManager {
                 .or_insert_with(|| Arc::new(Mutex::new(())))
                 .clone()
         };
-        let timeout = self
-            .spawn_handshake_timeout
-            .saturating_add(Duration::from_secs(15));
+        let timeout = self.restore_timeout;
         tokio::time::timeout(timeout, lock.lock_owned())
             .await
             .map_err(|_| {
@@ -1048,7 +1119,11 @@ impl ConnectionManager {
         // Logged on every wait so production can audit real-world handshake
         // latencies and tune `CODEG_ACP_SPAWN_HANDSHAKE_TIMEOUT_SECS`.
         if dedup_lock.is_some() {
-            let timeout = self.spawn_handshake_timeout;
+            let timeout = if target_conversation_id.is_some() {
+                self.restore_timeout
+            } else {
+                self.spawn_handshake_timeout
+            };
             let (outcome, elapsed) = wait_for_session_started(session_started_rx, timeout).await;
             tracing::info!(
                 "[ACP] dedup_wait connection_id={} session_id={} outcome={} \
@@ -1059,6 +1134,16 @@ impl ConnectionManager {
                 elapsed.as_millis(),
                 timeout.as_millis(),
             );
+            if target_conversation_id.is_some()
+                && !matches!(outcome, HandshakeWaitOutcome::Ready)
+            {
+                let _ = self.disconnect_and_wait(&connection_id).await;
+                return Err(AcpError::protocol(format!(
+                    "persisted ACP session did not finish resume/load within {} seconds ({})",
+                    timeout.as_secs(),
+                    outcome.as_str()
+                )));
+            }
         }
         // session_started_rx (in the no-dedup branch) is dropped here. tx
         // staying inside SessionState gets dropped naturally when the
@@ -1122,6 +1207,22 @@ impl ConnectionManager {
                     continue;
                 };
                 if state.status != ConnectionStatus::Connected {
+                    continue;
+                }
+                // Initialize used to publish Connected before a historical
+                // session had finished resume/load. A large Codex rollout can
+                // legitimately remain in that phase for minutes; the durable
+                // restore marker plus the selectors latch is an explicit lease
+                // and must beat ordinary idle age.
+                if state.restore_conversation_id.is_some() && !state.selectors_ready {
+                    tracing::debug!(
+                        connection_id = id,
+                        conversation_id = ?state.restore_conversation_id,
+                        restore_elapsed_ms = state
+                            .restore_started_at
+                            .map(|started| started.elapsed().as_millis() as u64),
+                        "[ACP][restore] idle sweep preserved active restore lease"
+                    );
                     continue;
                 }
                 if state.pending_permission.is_some() {
@@ -1425,7 +1526,7 @@ impl ConnectionManager {
             let mut removed = Vec::with_capacity(old_ids.len());
             for old_id in old_ids {
                 if let Some(old) = connections.remove(&old_id) {
-                    removed.push((old_id, old.cmd_tx));
+                    removed.push((old_id, old.cmd_tx, old.child_pid));
                 }
             }
             (
@@ -1452,9 +1553,9 @@ impl ConnectionManager {
         .await;
 
         let mut replaced_connection_ids = Vec::with_capacity(replaced.len());
-        for (old_id, cmd_tx) in replaced {
+        for (old_id, cmd_tx, child_pid) in replaced {
             replaced_connection_ids.push(old_id.clone());
-            if cmd_tx.send(ConnectionCommand::Disconnect).await.is_err() {
+            if cmd_tx.try_send(ConnectionCommand::Disconnect).is_err() {
                 tracing::warn!(
                     conversation_id,
                     old_connection_id = %old_id,
@@ -1462,6 +1563,16 @@ impl ConnectionManager {
                     "[ACP] superseded connection command channel already closed"
                 );
             }
+            let connection_id = old_id.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(DISCONNECT_ALL_GRACE).await;
+                hard_kill_process_cell(
+                    child_pid,
+                    "restore_binding_replaced",
+                    Some(connection_id),
+                )
+                .await;
+            });
         }
         drop(prompt_guards);
 
@@ -3925,13 +4036,24 @@ impl ConnectionManager {
     }
 
     pub async fn disconnect(&self, conn_id: &str) -> Result<(), AcpError> {
-        let cmd_tx = {
+        let handle = {
             let mut connections = self.connections.lock().await;
-            connections.remove(conn_id).map(|conn| conn.cmd_tx)
+            connections
+                .remove(conn_id)
+                .map(|conn| (conn.cmd_tx, conn.child_pid))
         };
-        if let Some(cmd_tx) = cmd_tx {
+        if let Some((cmd_tx, child_pid)) = handle {
             tracing::info!("[ACP] disconnect connection={}", conn_id);
-            let _ = cmd_tx.send(ConnectionCommand::Disconnect).await;
+            // Never await a full command queue on teardown. A connection stuck
+            // inside session/resume is not polling this queue; the per-process
+            // backstop below is what guarantees its Codex/codeg-mcp tree does
+            // not retain the external-session writer after CodeG forgets it.
+            let _ = cmd_tx.try_send(ConnectionCommand::Disconnect);
+            let connection_id = conn_id.to_string();
+            tokio::spawn(async move {
+                tokio::time::sleep(DISCONNECT_ALL_GRACE).await;
+                hard_kill_process_cell(child_pid, "disconnect", Some(connection_id)).await;
+            });
             Ok(())
         } else {
             Err(AcpError::ConnectionNotFound(conn_id.into()))
@@ -3951,8 +4073,16 @@ impl ConnectionManager {
             (connection.cmd_tx, connection.child_pid)
         };
         tracing::info!("[ACP] disconnect-and-wait connection={}", conn_id);
-        let _ = cmd_tx.send(ConnectionCommand::Disconnect).await;
-        let deadline = tokio::time::Instant::now() + self.spawn_handshake_timeout;
+        let _ = cmd_tx.try_send(ConnectionCommand::Disconnect);
+        tokio::time::sleep(DISCONNECT_ALL_GRACE).await;
+        hard_kill_process_cell(
+            child_pid.clone(),
+            "disconnect_and_wait",
+            Some(conn_id.to_string()),
+        )
+        .await;
+        let cleanup_timeout = self.spawn_handshake_timeout.min(Duration::from_secs(30));
+        let deadline = tokio::time::Instant::now() + cleanup_timeout;
         while child_pid.load(std::sync::atomic::Ordering::SeqCst) != 0 {
             if tokio::time::Instant::now() >= deadline {
                 return Err(AcpError::protocol(format!(
@@ -3962,6 +4092,33 @@ impl ConnectionManager {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         Ok(())
+    }
+
+    /// Reclaim only the processes provisionally owned by one restore. Used by
+    /// the end-to-end restore supervisor on timeout/panic; it never touches a
+    /// prompt-ready connection or any other conversation.
+    pub(crate) async fn terminate_incomplete_restore_connections(
+        &self,
+        conversation_id: i32,
+    ) -> usize {
+        let candidates: Vec<_> = {
+            let connections = self.connections.lock().await;
+            connections
+                .iter()
+                .map(|(id, connection)| (id.clone(), connection.state.clone()))
+                .collect()
+        };
+        let mut victims = Vec::new();
+        for (connection_id, state) in candidates {
+            let state = state.read().await;
+            if state.restore_conversation_id == Some(conversation_id) && !state.selectors_ready {
+                victims.push(connection_id);
+            }
+        }
+        for connection_id in &victims {
+            let _ = self.disconnect_and_wait(connection_id).await;
+        }
+        victims.len()
     }
 
     /// User/API initiated disconnect with a durable lifecycle boundary. The
@@ -5602,6 +5759,38 @@ mod tests {
             wait_until_dead(gpid).await,
             "grandchild {gpid} survived — the quit backstop did not kill the tree"
         );
+        let _ = child.wait();
+    }
+
+    /// A failed restore uses the single-connection teardown path rather than
+    /// application-wide shutdown. It must reclaim the same complete process
+    /// tree without touching any other manager entry.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn disconnect_backstop_kills_only_its_agent_process_tree() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut child, grandchild_pid) = spawn_process_tree(&dir.path().join("g.pid")).await;
+
+        let mgr = ConnectionManager::new();
+        let victim = fake_connection("restore-victim", None);
+        victim
+            .child_pid
+            .store(child.id(), std::sync::atomic::Ordering::SeqCst);
+        mgr.connections
+            .lock()
+            .await
+            .insert("restore-victim".to_string(), victim);
+        mgr.connections.lock().await.insert(
+            "unrelated".to_string(),
+            fake_connection("unrelated", None),
+        );
+
+        mgr.disconnect("restore-victim").await.unwrap();
+        assert!(
+            wait_until_dead(grandchild_pid).await,
+            "grandchild {grandchild_pid} survived per-connection teardown"
+        );
+        assert!(mgr.connections.lock().await.contains_key("unrelated"));
         let _ = child.wait();
     }
 
@@ -8848,6 +9037,68 @@ mod tests {
         let n = mgr.sweep_idle(Duration::from_secs(300)).await;
         assert_eq!(n, 0);
         assert!(mgr.connections.lock().await.contains_key("fresh"));
+    }
+
+    #[tokio::test]
+    async fn sweep_idle_never_reaps_a_long_historical_restore() {
+        let mgr = ConnectionManager::new();
+        insert_fake_connection(
+            &mgr,
+            "large-restore",
+            AgentType::Codex,
+            None,
+            EventEmitter::Noop,
+        )
+        .await;
+        backdate_last_activity(&mgr, "large-restore", 900).await;
+        {
+            let state = mgr.get_state("large-restore").await.unwrap();
+            let mut state = state.write().await;
+            state.restore_conversation_id = Some(26);
+            state.restore_started_at = Some(std::time::Instant::now());
+            state.selectors_ready = false;
+        }
+
+        let n = mgr.sweep_idle(Duration::from_secs(300)).await;
+        assert_eq!(n, 0);
+        assert!(mgr.connections.lock().await.contains_key("large-restore"));
+
+        // Once prompt readiness has been verified, the restore lease ends and
+        // ordinary idle policy applies again.
+        mgr.get_state("large-restore")
+            .await
+            .unwrap()
+            .write()
+            .await
+            .selectors_ready = true;
+        let n = mgr.sweep_idle(Duration::from_secs(300)).await;
+        assert_eq!(n, 1);
+    }
+
+    #[tokio::test]
+    async fn persisted_prompt_readiness_uses_restore_not_spawn_timeout() {
+        let mut mgr =
+            ConnectionManager::with_spawn_handshake_timeout(Duration::from_millis(20));
+        mgr.restore_timeout = Duration::from_millis(200);
+        let _rx = insert_live_connection(&mgr, "slow-resume", AgentType::Codex, None).await;
+        {
+            let state = mgr.get_state("slow-resume").await.unwrap();
+            state.write().await.external_id = Some("large-session".into());
+        }
+        let state = mgr.get_state("slow-resume").await.unwrap();
+        tokio::spawn(async move {
+            // Three times the ordinary process-handshake deadline, standing in
+            // for a >120s large rollout under the production 60s/300s policy.
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            state.write().await.selectors_ready = true;
+        });
+
+        assert_eq!(
+            mgr.wait_for_prompt_ready("slow-resume", Some("large-session"))
+                .await
+                .unwrap(),
+            "large-session"
+        );
     }
 
     #[tokio::test]
