@@ -70,6 +70,13 @@ import type {
   McpMarketplaceServerDetail,
 } from "./types"
 
+let acpLifecycleGeneration = 0
+
+function nextAcpLifecycleGeneration(): number {
+  acpLifecycleGeneration += 1
+  return acpLifecycleGeneration
+}
+
 export async function listConversations(params?: {
   agent_type?: AgentType | null
   search?: string | null
@@ -155,7 +162,11 @@ export interface AcpCancelResult {
 export async function acpCancel(
   connectionId: string
 ): Promise<AcpCancelResult> {
-  return invoke("acp_cancel", { connectionId })
+  return invoke("acp_cancel", {
+    connectionId,
+    requestSource: "user_stop",
+    frontendGeneration: nextAcpLifecycleGeneration(),
+  })
 }
 
 export interface ForkResult {
@@ -181,7 +192,11 @@ export async function acpRespondPermission(
 }
 
 export async function acpDisconnect(connectionId: string): Promise<void> {
-  return invoke("acp_disconnect", { connectionId })
+  return invoke("acp_disconnect", {
+    connectionId,
+    requestSource: "frontend_disconnect",
+    frontendGeneration: nextAcpLifecycleGeneration(),
+  })
 }
 
 export async function acpListConnections(): Promise<ConnectionInfo[]> {

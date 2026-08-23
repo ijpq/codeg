@@ -168,6 +168,13 @@ import type {
   TokenUsageSyncStatus,
 } from "./types"
 
+let acpLifecycleGeneration = 0
+
+function nextAcpLifecycleGeneration(): number {
+  acpLifecycleGeneration += 1
+  return acpLifecycleGeneration
+}
+
 export async function listConversations(params?: {
   agent_type?: AgentType | null
   search?: string | null
@@ -389,7 +396,11 @@ export interface AcpCancelResult {
 export async function acpCancel(
   connectionId: string
 ): Promise<AcpCancelResult> {
-  return getTransport().call("acp_cancel", { connectionId })
+  return getTransport().call("acp_cancel", {
+    connectionId,
+    requestSource: "user_stop",
+    frontendGeneration: nextAcpLifecycleGeneration(),
+  })
 }
 
 export interface ForkResult {
@@ -474,7 +485,11 @@ export async function acpAnswerPlanApproval(
 }
 
 export async function acpDisconnect(connectionId: string): Promise<void> {
-  return getTransport().call("acp_disconnect", { connectionId })
+  return getTransport().call("acp_disconnect", {
+    connectionId,
+    requestSource: "frontend_disconnect",
+    frontendGeneration: nextAcpLifecycleGeneration(),
+  })
 }
 
 export async function acpTouchConnection(

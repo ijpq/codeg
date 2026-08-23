@@ -11041,10 +11041,19 @@ pub async fn acp_describe_agent_options(
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn acp_cancel(
     connection_id: String,
+    request_source: Option<String>,
+    frontend_generation: Option<u64>,
     db: State<'_, AppDatabase>,
     manager: State<'_, ConnectionManager>,
 ) -> Result<crate::acp::types::AcpCancelResult, AcpError> {
-    manager.cancel(&db.conn, &connection_id).await
+    manager
+        .cancel_with_origin(
+            &db.conn,
+            &connection_id,
+            request_source.as_deref().unwrap_or("tauri_unspecified"),
+            frontend_generation,
+        )
+        .await
 }
 
 #[cfg(feature = "tauri-runtime")]
@@ -11104,11 +11113,18 @@ pub async fn acp_answer_plan_approval(
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn acp_disconnect(
     connection_id: String,
+    request_source: Option<String>,
+    frontend_generation: Option<u64>,
     manager: State<'_, ConnectionManager>,
     db: State<'_, AppDatabase>,
 ) -> Result<(), AcpError> {
     manager
-        .disconnect_reconciled(&db.conn, &connection_id)
+        .disconnect_reconciled_with_origin(
+            &db.conn,
+            &connection_id,
+            request_source.as_deref().unwrap_or("tauri_unspecified"),
+            frontend_generation,
+        )
         .await
 }
 

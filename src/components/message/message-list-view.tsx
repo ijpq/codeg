@@ -85,6 +85,7 @@ import type {
   PromptDeliveryPhase,
   PromptDeliveryState,
 } from "@/lib/prompt-delivery-state"
+import { MessageBottomFollowGuard } from "./message-bottom-follow-guard"
 
 type DeliveryLabelKey =
   | "delivery.submitting"
@@ -1384,6 +1385,15 @@ export function MessageListView({
   // never overlaps the composer or the tab strip.
   const selectionBoxRef = useRef<HTMLDivElement | null>(null)
 
+  // Converges the exact bottom after a live row becomes persisted or a
+  // deliverable card mounts. Content/viewport ResizeObservers handle all
+  // intermediate geometry changes; this signal covers same-height swaps that
+  // do not necessarily produce an observer entry.
+  const bottomLayoutSignal = `${conversationId}:${connStatus ?? "none"}:${threadItems.length}:${deliverableRuns.reduce(
+    (count, run) => count + run.deliverables.length,
+    0
+  )}`
+
   // Cheap user-message tally for the collapsed chip — counts user turns without
   // parsing any file diffs.
   const userMessageCount = useMemo(() => {
@@ -1524,6 +1534,7 @@ export function MessageListView({
     >
       <MessageThread className="flex-1 min-h-0" resize={messageThreadResize}>
         <AutoScrollOnSend signal={sendSignal} />
+        <MessageBottomFollowGuard layoutSignal={bottomLayoutSignal} />
         {(hasEarlierHistory || earlierHistoryError) && onLoadEarlierHistory ? (
           <LoadEarlierHistoryControl
             loading={earlierHistoryLoading}

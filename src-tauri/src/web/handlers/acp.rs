@@ -155,6 +155,10 @@ pub async fn acp_restore_conversation(
 #[serde(rename_all = "camelCase")]
 pub struct AcpDisconnectParams {
     pub connection_id: String,
+    #[serde(default)]
+    pub request_source: Option<String>,
+    #[serde(default)]
+    pub frontend_generation: Option<u64>,
 }
 
 pub async fn acp_disconnect(
@@ -163,7 +167,15 @@ pub async fn acp_disconnect(
 ) -> Result<Json<()>, AppCommandError> {
     let manager = &state.connection_manager;
     manager
-        .disconnect_reconciled(&state.db.conn, &params.connection_id)
+        .disconnect_reconciled_with_origin(
+            &state.db.conn,
+            &params.connection_id,
+            params
+                .request_source
+                .as_deref()
+                .unwrap_or("web_unspecified"),
+            params.frontend_generation,
+        )
         .await
         .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
     Ok(Json(()))
@@ -387,6 +399,10 @@ pub async fn acp_delete_agent_skill(
 #[serde(rename_all = "camelCase")]
 pub struct AcpConnectionIdParams {
     pub connection_id: String,
+    #[serde(default)]
+    pub request_source: Option<String>,
+    #[serde(default)]
+    pub frontend_generation: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -491,7 +507,15 @@ pub async fn acp_cancel(
 ) -> Result<Json<AcpCancelResult>, AppCommandError> {
     let manager = &state.connection_manager;
     let result = manager
-        .cancel(&state.db.conn, &params.connection_id)
+        .cancel_with_origin(
+            &state.db.conn,
+            &params.connection_id,
+            params
+                .request_source
+                .as_deref()
+                .unwrap_or("web_unspecified"),
+            params.frontend_generation,
+        )
         .await
         .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
     Ok(Json(result))
