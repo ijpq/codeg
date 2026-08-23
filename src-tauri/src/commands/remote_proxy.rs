@@ -1260,6 +1260,11 @@ async fn remote_ticket_download_stream(
         let response = proxy
             .workspace_http
             .get(download_url)
+            // Download endpoints return exact file bytes. Explicitly reject
+            // content coding so older CodeG servers and intermediate proxies
+            // cannot turn text/CSV attachments into an encoded stream whose
+            // length no longer describes the destination file.
+            .header(reqwest::header::ACCEPT_ENCODING, "identity")
             .send()
             .await
             .map_err(|e| {
@@ -1271,7 +1276,12 @@ async fn remote_ticket_download_stream(
         if !status.is_success() {
             return remote_error_from_response(status, response).await;
         }
-        let total = response.content_length();
+        let total = response
+            .headers()
+            .get("x-codeg-file-size")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .or_else(|| response.content_length());
         emit_workspace_transfer_progress(
             &app,
             WorkspaceTransferProgress {
@@ -1294,6 +1304,7 @@ async fn remote_ticket_download_stream(
             stream,
             &save_path,
             &transfer_id,
+            total,
             cancel_token.clone(),
             |loaded| {
                 emit_workspace_transfer_progress(
@@ -1391,6 +1402,7 @@ async fn write_response_stream_to_partial<S, F>(
     mut stream: S,
     save_path: &str,
     transfer_id: &str,
+    expected_bytes: Option<u64>,
     cancel: CancellationToken,
     mut on_progress: F,
 ) -> Result<u64, AppCommandError>
@@ -1423,11 +1435,25 @@ where
             };
             let chunk = chunk?;
             total = total.saturating_add(chunk.len() as u64);
+            if let Some(expected) = expected_bytes {
+                if total > expected {
+                    return Err(AppCommandError::network("Remote download size mismatch")
+                        .with_detail(format!(
+                            "expected {expected} bytes, received more than {total} bytes"
+                        )));
+                }
+            }
             file.write_all(&chunk).await.map_err(|e| {
                 AppCommandError::io_error("Failed to write download to disk")
                     .with_detail(e.to_string())
             })?;
             on_progress(total);
+        }
+        if let Some(expected) = expected_bytes {
+            if total != expected {
+                return Err(AppCommandError::network("Remote download size mismatch")
+                    .with_detail(format!("expected {expected} bytes, received {total} bytes")));
+            }
         }
         file.flush().await.map_err(|e| {
             AppCommandError::io_error("Failed to flush downloaded file").with_detail(e.to_string())
@@ -2012,6 +2038,7 @@ mod tests {
             stream,
             &save_path.to_string_lossy(),
             "test-transfer",
+            None,
             CancellationToken::new(),
             |_| {},
         )
@@ -2022,6 +2049,67 @@ mod tests {
         let partial = partial_download_path(&save_path.to_string_lossy(), "test-transfer");
         assert!(!Path::new(&partial).exists());
         assert!(!save_path.exists());
+    }
+
+    #[tokio::test]
+    async fn write_response_stream_to_partial_rejects_truncation_and_preserves_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let save_path = dir.path().join("out.csv");
+        std::fs::write(&save_path, b"previous complete file").unwrap();
+        let stream = futures::stream::iter([Ok(Bytes::from_static(b"a,b\n"))]);
+
+        let err = write_response_stream_to_partial(
+            stream,
+            &save_path.to_string_lossy(),
+            "truncated-transfer",
+            Some(10),
+            CancellationToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.message, "Remote download size mismatch");
+        assert_eq!(std::fs::read(&save_path).unwrap(), b"previous complete file");
+        let partial = partial_download_path(&save_path.to_string_lossy(), "truncated-transfer");
+        assert!(!Path::new(&partial).exists());
+    }
+
+    #[tokio::test]
+    async fn write_response_stream_to_partial_accepts_exact_and_legitimate_empty_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let text_path = dir.path().join("out.txt");
+        let stream = futures::stream::iter([
+            Ok(Bytes::from_static(b"remote ")),
+            Ok(Bytes::from_static(b"content")),
+        ]);
+        let bytes = write_response_stream_to_partial(
+            stream,
+            &text_path.to_string_lossy(),
+            "exact-transfer",
+            Some(14),
+            CancellationToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(bytes, 14);
+        assert_eq!(std::fs::read(&text_path).unwrap(), b"remote content");
+
+        let empty_path = dir.path().join("empty.txt");
+        let empty_stream = futures::stream::empty::<Result<Bytes, AppCommandError>>();
+        let bytes = write_response_stream_to_partial(
+            empty_stream,
+            &empty_path.to_string_lossy(),
+            "empty-transfer",
+            Some(0),
+            CancellationToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(bytes, 0);
+        assert_eq!(std::fs::metadata(empty_path).unwrap().len(), 0);
     }
 
     #[tokio::test]
