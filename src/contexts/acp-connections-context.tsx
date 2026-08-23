@@ -2673,6 +2673,12 @@ export interface AcpActionsValue {
    */
   disconnect(contextKey: string): Promise<boolean>
   /**
+   * Detach one frontend surface without stopping its backend agent. Used for
+   * component/tab lifecycle cleanup, where unmount is not user intent to
+   * cancel a task. The server's idle sweep owns eventual process reclamation.
+   */
+  releaseSurface(contextKey: string): Promise<void>
+  /**
    * Release a connection whose SURFACE went away on its own (a preview tab
    * replaced by the next single-click in the sidebar) — never a user-intent
    * teardown. Disconnects viewers and idle owners; a busy owner (prompting
@@ -4974,39 +4980,17 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     teardownAttachSubscription,
   ])
 
-  // Disconnect all on unmount
+  // Provider unmount is a CLIENT lifecycle event, not user intent to stop an
+  // agent. A browser reload, a React error-boundary remount, transport reset,
+  // or workspace-shell reconstruction can all unmount this provider while a
+  // turn is still running. The old cleanup called `acpDisconnect` for every
+  // owned connection and therefore converted those harmless UI events into
+  // `connection_disconnected` interruptions. Detach local subscriptions only;
+  // the backend owns process lifetime and its activity/idle sweep reclaims an
+  // actually idle orphan after the turn settles.
   useEffect(() => {
-    const reverseMap = reverseMapRef.current
     const attachSubs = attachSubscriptionsRef.current
-    // Capture the store ref at effect-setup time so the cleanup
-    // function doesn't read a moving target (`storeRef.current` is the
-    // same object across renders by design, but the lint rule
-    // `react-hooks/exhaustive-deps` flags reading it inside cleanup
-    // because in the general case a ref's `.current` can be replaced).
-    const store = storeRef.current
     return () => {
-      // A connection can be routed by several surfaces (see `reverseMapRef`);
-      // tear it down at most once, and only if at least one of them OWNS it.
-      const alreadyTornDown = new Set<string>()
-      for (const [connectionId, contextKeys] of reverseMap) {
-        for (const contextKey of contextKeys) {
-          // Delegation-child entries are not real user-facing
-          // connections — the broker owns their backend lifecycle and
-          // will tear them down when the parent's delegation resolves.
-          // Calling acpDisconnect on them here would race the broker's
-          // own one-shot teardown and emit a benign-but-noisy "unknown
-          // connection" error from the backend.
-          const conn = store.connections.get(contextKey)
-          if (conn?.isDelegationChild) continue
-          // Viewers attach to a connection another client owns — never
-          // acpDisconnect it on our unmount. The attach-sub detach loop below
-          // releases our read-only subscription cleanly.
-          if (conn?.isViewer) continue
-          if (alreadyTornDown.has(connectionId)) continue
-          alreadyTornDown.add(connectionId)
-          acpDisconnect(connectionId).catch(() => {})
-        }
-      }
       for (const [, sub] of attachSubs) {
         try {
           sub.detach()
@@ -5977,14 +5961,37 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     ]
   )
 
-  // Lifecycle release for a surface that vanished on its own — currently the
-  // preview tab replaced by the next single-click in the sidebar. `disconnect`
-  // stays unconditional because its other callers express user INTENT (agent
-  // switch, restart-to-apply, an explicit close); this one must not destroy
-  // work nobody asked to stop. Same policy as the unmount cleanup
-  // (`shouldDisconnectOnUnmount`): a busy owner keeps running and the idle
-  // sweep reclaims it once its turn / background work settles — it is no
-  // longer in `openTabKeys`, so nothing else keeps it alive.
+  const releaseSurface = useCallback(
+    async (contextKey: string) => {
+      deferredRestoreKeysRef.current.delete(contextKey)
+      if (connectingKeysRef.current.has(contextKey)) {
+        abandonedKeysRef.current.add(contextKey)
+      }
+      const conn = storeRef.current.connections.get(contextKey)
+      if (!conn) return
+
+      // Keep enough identity to discover/re-attach the server-owned connection
+      // if this conversation is opened again before the backend idle sweep.
+      captureIdentityBeforeRemoval(contextKey)
+      teardownAttachSubscription(contextKey)
+      releaseConnectionRoute(conn.connectionId, contextKey)
+      pendingUnmappedEventsRef.current.delete(conn.connectionId)
+      lastActivityRef.current.delete(contextKey)
+      dispatch({ type: "CONNECTION_REMOVED", contextKey })
+    },
+    [
+      captureIdentityBeforeRemoval,
+      dispatch,
+      releaseConnectionRoute,
+      teardownAttachSubscription,
+    ]
+  )
+
+  // Lifecycle release for a preview surface replaced by the next single-click
+  // in the sidebar. Idle owners can be reclaimed immediately; busy owners stay
+  // alive. Ordinary component unmount uses `releaseSurface` above, which is
+  // intentionally even more conservative because its local status may be
+  // stale when a WebSocket/React lifecycle transition caused the unmount.
   const disconnectIfIdle = useCallback(
     async (contextKey: string) => {
       const conn = storeRef.current.connections.get(contextKey)
@@ -6711,6 +6718,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     () => ({
       connect,
       disconnect,
+      releaseSurface,
       disconnectIfIdle,
       disconnectAll,
       sendPrompt,
@@ -6739,6 +6747,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
     [
       connect,
       disconnect,
+      releaseSurface,
       disconnectIfIdle,
       disconnectAll,
       sendPrompt,
