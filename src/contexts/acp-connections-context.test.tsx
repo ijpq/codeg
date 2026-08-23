@@ -138,12 +138,13 @@ function Probe() {
 }
 
 async function mountProvider() {
-  render(
+  const view = render(
     <AcpConnectionsProvider>
       <Probe />
     </AcpConnectionsProvider>
   )
   await act(async () => {})
+  return view
 }
 
 const TAB = "conv-1-claude_code-42"
@@ -357,6 +358,45 @@ describe("AcpConnectionsProvider cross-client viewer lifecycle", () => {
     })
 
     expect(h.acpDisconnect).toHaveBeenCalledWith("spawned-conn")
+  })
+
+  it("surface release drops local routing without stopping the backend owner", async () => {
+    h.acpFindConnectionForConversation.mockResolvedValue(null)
+    await mountProvider()
+
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 42)
+    })
+    const subscription = h.attach.mock.results.at(-1)?.value as
+      | { detach: ReturnType<typeof vi.fn> }
+      | undefined
+    h.acpDisconnect.mockClear()
+
+    await act(async () => {
+      await h.actions!.releaseSurface(TAB)
+    })
+
+    expect(subscription?.detach).toHaveBeenCalledTimes(1)
+    expect(h.acpDisconnect).not.toHaveBeenCalled()
+    expect(h.store!.getConnection(TAB)).toBeUndefined()
+  })
+
+  it("provider unmount detaches the client without interrupting an owned turn", async () => {
+    h.acpFindConnectionForConversation.mockResolvedValue(null)
+    const view = await mountProvider()
+
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 42)
+    })
+    const subscription = h.attach.mock.results.at(-1)?.value as
+      | { detach: ReturnType<typeof vi.fn> }
+      | undefined
+    h.acpDisconnect.mockClear()
+
+    view.unmount()
+
+    expect(subscription?.detach).toHaveBeenCalledTimes(1)
+    expect(h.acpDisconnect).not.toHaveBeenCalled()
   })
 
   it("does not submit a historical prompt until its attach replay completes", async () => {

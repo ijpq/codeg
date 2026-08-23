@@ -2884,6 +2884,20 @@ impl ConnectionManager {
         db: &DatabaseConnection,
         conn_id: &str,
     ) -> Result<AcpCancelResult, AcpError> {
+        self.cancel_with_origin(db, conn_id, "internal", None).await
+    }
+
+    /// Cancel with an audited caller origin. Public UI/API entry points use
+    /// this form so a field report can distinguish an explicit Stop click from
+    /// automation, shutdown, or another lifecycle path without logging user
+    /// content or credentials.
+    pub async fn cancel_with_origin(
+        &self,
+        db: &DatabaseConnection,
+        conn_id: &str,
+        request_source: &str,
+        frontend_generation: Option<u64>,
+    ) -> Result<AcpCancelResult, AcpError> {
         let prompt_lock = self.clone_prompt_lock(conn_id).await?;
         let _cancel_guard = prompt_lock.lock_owned().await;
         let (cmd_tx, state_arc) = {
@@ -3009,6 +3023,8 @@ impl ConnectionManager {
             cancel_requested_at = %requested_at,
             cancel_deadline = %deadline_at,
             cancel_acknowledgment = disposition,
+            request_source,
+            frontend_generation,
             "[ACP][cancel] cancellation transition evaluated"
         );
 
@@ -4130,6 +4146,20 @@ impl ConnectionManager {
         db: &DatabaseConnection,
         conn_id: &str,
     ) -> Result<(), AcpError> {
+        self.disconnect_reconciled_with_origin(db, conn_id, "internal", None)
+            .await
+    }
+
+    /// Disconnect with an audited frontend/lifecycle origin. The durable
+    /// settlement remains identical; metadata exists solely to make an
+    /// unexpected interruption attributable in production logs.
+    pub async fn disconnect_reconciled_with_origin(
+        &self,
+        db: &DatabaseConnection,
+        conn_id: &str,
+        request_source: &str,
+        frontend_generation: Option<u64>,
+    ) -> Result<(), AcpError> {
         if let Some(run) = artifact_service::latest_run_for_connection(db, conn_id)
             .await
             .map_err(|error| AcpError::protocol(error.to_string()))?
@@ -4201,10 +4231,18 @@ impl ConnectionManager {
                     old_state = ?run.status,
                     new_state = "interrupted",
                     transition_reason = "explicit_disconnect",
+                    request_source,
+                    frontend_generation,
                     "[ACP][disconnect] active turn settled before connection removal"
                 );
             }
         }
+        tracing::info!(
+            connection_id = conn_id,
+            request_source,
+            frontend_generation,
+            "[ACP][disconnect] connection teardown requested"
+        );
         self.disconnect(conn_id).await
     }
 
