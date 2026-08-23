@@ -811,6 +811,11 @@ mod tests {
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         );
         assert_eq!(response.headers()[axum::http::header::CONTENT_LENGTH], "16");
+        assert_eq!(
+            response.headers()[axum::http::header::CACHE_CONTROL],
+            "private, no-store, no-transform"
+        );
+        assert_eq!(response.headers()["x-codeg-file-size"], "16");
         let disposition = response.headers()[axum::http::header::CONTENT_DISPOSITION]
             .to_str()
             .unwrap();
@@ -820,6 +825,36 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(body.as_ref(), b"document payload");
+    }
+
+    #[tokio::test]
+    async fn text_download_response_preserves_exact_length_and_disables_transforms() {
+        let source = tempfile::tempdir().unwrap();
+        let name = "report.csv";
+        let path = source.path().join(name);
+        let payload = b"name,value\nalpha,1\nbeta,2\n";
+        std::fs::write(&path, payload).unwrap();
+
+        let response = crate::web::handlers::workspace_files::stream_file_response(&path, name)
+            .await
+            .unwrap();
+        assert_eq!(response.headers()[axum::http::header::CONTENT_TYPE], "text/csv");
+        assert_eq!(
+            response.headers()[axum::http::header::CONTENT_LENGTH],
+            payload.len().to_string()
+        );
+        assert_eq!(
+            response.headers()[axum::http::header::CACHE_CONTROL],
+            "private, no-store, no-transform"
+        );
+        assert_eq!(
+            response.headers()["x-codeg-file-size"],
+            payload.len().to_string()
+        );
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), payload);
     }
 
     #[test]
