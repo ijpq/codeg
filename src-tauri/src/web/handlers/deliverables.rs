@@ -251,6 +251,7 @@ fn stream_deliverables_zip(
     if let Some(value) = super::workspace_files::attachment_header(&filename) {
         headers.insert(header::CONTENT_DISPOSITION, value);
     }
+    super::workspace_files::apply_download_response_policy(&mut headers);
     (
         StatusCode::OK,
         headers,

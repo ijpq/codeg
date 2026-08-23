@@ -39,6 +39,9 @@ use crate::app_error::AppCommandError;
 use crate::app_state::AppState;
 use crate::workspace_transfer::{DownloadKind, DownloadTicketIssued, DownloadTicketSpec};
 
+const DOWNLOAD_CACHE_CONTROL: &str = "private, no-store, no-transform";
+const CODEG_FILE_SIZE_HEADER: &str = "x-codeg-file-size";
+
 // ---------------------------------------------------------------------------
 // Wire types
 // ---------------------------------------------------------------------------
@@ -739,9 +742,13 @@ pub(crate) async fn stream_file_response(
     if let Ok(v) = HeaderValue::from_str(&size.to_string()) {
         headers.insert(header::CONTENT_LENGTH, v);
     }
+    if let Ok(v) = HeaderValue::from_str(&size.to_string()) {
+        headers.insert(CODEG_FILE_SIZE_HEADER, v);
+    }
     if let Some(v) = attachment_header(name) {
         headers.insert(header::CONTENT_DISPOSITION, v);
     }
+    apply_download_response_policy(&mut headers);
 
     Ok((StatusCode::OK, headers, body).into_response())
 }
@@ -778,7 +785,15 @@ async fn stream_zip_response(
     if let Some(v) = attachment_header(&zip_name) {
         headers.insert(header::CONTENT_DISPOSITION, v);
     }
+    apply_download_response_policy(&mut headers);
     Ok((StatusCode::OK, headers, body).into_response())
+}
+
+pub(crate) fn apply_download_response_policy(headers: &mut HeaderMap) {
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(DOWNLOAD_CACHE_CONTROL),
+    );
 }
 
 fn zip_body_stream(
