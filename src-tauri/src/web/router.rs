@@ -1889,8 +1889,10 @@ async fn api_not_found(uri: axum::http::Uri) -> impl IntoResponse {
 #[cfg(test)]
 mod tests {
     use axum::http::header::{
-        ACCEPT_ENCODING, CACHE_CONTROL, CONTENT_ENCODING, IF_MODIFIED_SINCE, LAST_MODIFIED, RANGE,
+        ACCEPT_ENCODING, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LENGTH,
+        IF_MODIFIED_SINCE, LAST_MODIFIED, RANGE,
     };
+    use axum::http::{header, HeaderMap, HeaderValue};
     use axum_test::TestServer;
 
     use super::*;
@@ -1916,6 +1918,47 @@ mod tests {
 
         response.assert_status_ok();
         response.assert_header(CONTENT_ENCODING, "gzip");
+    }
+
+    #[tokio::test]
+    async fn global_compression_keeps_text_attachment_bytes_and_length_untouched() {
+        let payload = "name,value\nalpha,1\nbeta,2\n".repeat(128);
+        let expected_len = payload.len();
+        let app = Router::new()
+            .route(
+                "/download",
+                get(move || {
+                    let payload = payload.clone();
+                    async move {
+                        let mut headers = HeaderMap::new();
+                        headers.insert(
+                            header::CONTENT_TYPE,
+                            HeaderValue::from_static("text/csv"),
+                        );
+                        headers.insert(
+                            CONTENT_DISPOSITION,
+                            HeaderValue::from_static("attachment; filename=report.csv"),
+                        );
+                        headers.insert(
+                            CONTENT_LENGTH,
+                            HeaderValue::from_str(&payload.len().to_string()).unwrap(),
+                        );
+                        (headers, payload)
+                    }
+                }),
+            )
+            .layer(crate::web::compression::compression_layer());
+        let server = TestServer::new(app).expect("test server should start");
+
+        let response = server
+            .get("/download")
+            .add_header(ACCEPT_ENCODING, "br, gzip")
+            .await;
+
+        response.assert_status_ok();
+        assert!(response.headers().get(CONTENT_ENCODING).is_none());
+        response.assert_header(CONTENT_LENGTH, expected_len.to_string());
+        assert_eq!(response.as_bytes().len(), expected_len);
     }
 
     #[tokio::test]
