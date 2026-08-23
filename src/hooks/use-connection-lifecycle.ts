@@ -7,7 +7,6 @@ import { useAcpActions } from "@/contexts/acp-connections-context"
 import { useTaskContext } from "@/contexts/task-context"
 import { useConnection, type UseConnectionReturn } from "@/hooks/use-connection"
 import { extractAppCommandError } from "@/lib/app-error"
-import { isConnectionBusy } from "@/lib/connection-teardown"
 import { isNetworkOrOfflineError } from "@/lib/network-error"
 import { isSessionRestorePendingError } from "@/lib/session-restore"
 import { TurnBusyError } from "@/lib/turn-busy"
@@ -97,15 +96,10 @@ export interface UseConnectionLifecycleReturn {
  * (`disconnectIfIdle`) so the two teardown paths can't drift apart.
  * Exported for tests.
  */
-export function shouldDisconnectOnUnmount(args: {
-  status: string | null
-  isViewer: boolean
-  backgroundOutstanding: number
+export function shouldReleaseSurfaceOnUnmount(args: {
   transientUnmount?: boolean
 }): boolean {
-  if (args.transientUnmount) return false
-  if (args.isViewer) return true
-  return !isConnectionBusy(args)
+  return !args.transientUnmount
 }
 
 function normalizeErrorMessage(error: unknown): string {
@@ -128,7 +122,7 @@ export function useConnectionLifecycle({
   isTransientUnmount,
 }: UseConnectionLifecycleOptions): UseConnectionLifecycleReturn {
   const t = useTranslations("Folder.chat.connectionLifecycle")
-  const { setActiveKey, touchActivity } = useAcpActions()
+  const { setActiveKey, touchActivity, releaseSurface } = useAcpActions()
   const { addTask, updateTask, removeTask } = useTaskContext()
   const conn = useConnection(contextKey)
 
@@ -138,7 +132,6 @@ export function useConnectionLifecycle({
     status,
     selectorsReady,
     connect: connConnect,
-    disconnect: connDisconnect,
     sendPrompt,
     setMode: connSetMode,
     setConfigOption: connSetConfigOption,
@@ -207,18 +200,6 @@ export function useConnectionLifecycle({
   // dependencies to prevent reconnect loops. Synced via useEffect —
   // effects run in declaration order, so these are current before
   // the auto-connect effect reads them.
-  const statusRef = useRef(status)
-  useEffect(() => {
-    statusRef.current = status
-  }, [status])
-  const isViewerRef = useRef(conn.isViewer)
-  useEffect(() => {
-    isViewerRef.current = conn.isViewer
-  }, [conn.isViewer])
-  const backgroundOutstandingRef = useRef(conn.backgroundOutstanding)
-  useEffect(() => {
-    backgroundOutstandingRef.current = conn.backgroundOutstanding
-  }, [conn.backgroundOutstanding])
   const contextKeyRef = useRef(contextKey)
   useEffect(() => {
     contextKeyRef.current = contextKey
@@ -387,45 +368,35 @@ export function useConnectionLifecycle({
     t,
   ])
 
-  // Keep a ref to disconnect so the unmount cleanup always calls the
-  // latest version without adding it as a dependency.
-  const connDisconnectRef = useRef(connDisconnect)
+  // Keep a ref to the non-destructive surface release so unmount never turns a
+  // React/browser lifecycle event into a backend task interruption.
+  const releaseSurfaceRef = useRef(releaseSurface)
   useEffect(() => {
-    connDisconnectRef.current = connDisconnect
-  }, [connDisconnect])
+    releaseSurfaceRef.current = releaseSurface
+  }, [releaseSurface])
   const isTransientUnmountRef = useRef(isTransientUnmount)
   useEffect(() => {
     isTransientUnmountRef.current = isTransientUnmount
   }, [isTransientUnmount])
 
-  // Clean up on unmount (e.g. tab closed): disconnect the ACP connection
-  // so it doesn't leak, and remove lingering tasks.
-  // However, if the agent is actively prompting (generating a response),
-  // keep it alive so it can finish in the background — the idle sweep
-  // will clean it up once it transitions back to "connected".
+  // Clean up on unmount (e.g. tab closed) by detaching this frontend surface.
+  // The backend connection is deliberately not stopped: React remounts,
+  // WebSocket churn, and stale client status are not cancellation intent.
+  // Backend activity/idle reconciliation owns eventual process cleanup.
   useEffect(() => {
     return () => {
-      // Owners keep a prompting agent alive in the background to finish the
-      // turn (the idle sweep reclaims it once it returns to "connected"), and
-      // likewise while background work is still outstanding (async sub-agents
-      // / background shells) — disconnecting kills the agent CLI and the
-      // background work with it. Both sweeps already exempt such connections;
-      // once the work settles (or the max-age valve expires it) outstanding
-      // drops to 0 and the normal idle sweep reclaims the connection.
-      // Viewers are different: disconnect() only DETACHES them (it never
-      // acpDisconnects — that belongs to the owner), so tearing a viewer down
-      // mid-turn is safe and leaves the owner's agent untouched. And it's
-      // necessary: the idle sweep skips viewers, so a viewer left attached
-      // here would leak its WS subscription until the whole provider unmounts.
       if (
-        shouldDisconnectOnUnmount({
-          status: statusRef.current,
-          isViewer: isViewerRef.current,
-          backgroundOutstanding: backgroundOutstandingRef.current,
+        shouldReleaseSurfaceOnUnmount({
           transientUnmount: isTransientUnmountRef.current?.() === true,
         })
       ) {
-        connDisconnectRef.current().catch(() => {})
+        // A few isolated hook harnesses provide a deliberately minimal mocked
+        // action object. Production providers always expose releaseSurface;
+        // tolerate the old mock shape so unmount cannot mask the assertion the
+        // test actually owns.
+        if (typeof releaseSurfaceRef.current === "function") {
+          releaseSurfaceRef.current(contextKeyRef.current).catch(() => {})
+        }
       }
       // Task cleanup stays unconditional even on transient unmounts — the
       // remounted instance mints fresh task ids, so stale ones would orphan.
