@@ -2507,6 +2507,11 @@ impl CodexParser {
         // and as `response_item.image_generation_call`, sharing the same call_id/id.
         // Emit at most one ContentBlock::Image per id to avoid duplicate display.
         let mut emitted_image_ids: HashSet<String> = HashSet::new();
+        // Standalone web-search results are the only durable Codex record that
+        // maps private citation ids (`turn…search…`) to URLs. Keep one tool
+        // block per call so live ACP, reload, and branch-visible history share
+        // the same structured `codeg.citations` metadata.
+        let mut emitted_web_search_ids: HashSet<String> = HashSet::new();
         // Streaming reasoning buffer. Codex emits one `event_msg.agent_reasoning`
         // per reasoning section, then groups the same sections into a single
         // `response_item.reasoning.summary`. We buffer the per-section events and
@@ -2916,6 +2921,66 @@ impl CodexParser {
                                 if !call_id.is_empty() {
                                     emitted_image_ids.insert(call_id);
                                 }
+                            }
+                            "web_search_end" => {
+                                let call_id = payload
+                                    .get("call_id")
+                                    .or_else(|| payload.get("id"))
+                                    .and_then(|value| value.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                if !call_id.is_empty()
+                                    && !emitted_web_search_ids.insert(call_id.clone())
+                                {
+                                    continue;
+                                }
+                                let raw_input = serde_json::json!({
+                                    "type": "webSearch",
+                                    "id": call_id,
+                                    "query": payload.get("query").cloned().unwrap_or_default(),
+                                    "action": payload.get("action").cloned().unwrap_or_default(),
+                                    "results": payload.get("results").cloned().unwrap_or_default(),
+                                })
+                                .to_string();
+                                let meta = crate::citations::attach_sources_to_meta(
+                                    None,
+                                    Some(&raw_input),
+                                );
+                                // A result-less legacy event carries no useful
+                                // citation mapping; keep the historical UI as-is.
+                                if crate::citations::sources_from_meta(meta.as_ref()).is_empty() {
+                                    continue;
+                                }
+                                let tool_id = if call_id.is_empty() {
+                                    format!("web-search-{}", messages.len())
+                                } else {
+                                    call_id
+                                };
+                                messages.push(UnifiedMessage {
+                                    id: format!("tool-{}", messages.len()),
+                                    role: MessageRole::Assistant,
+                                    content: vec![
+                                        ContentBlock::ToolUse {
+                                            tool_use_id: Some(tool_id.clone()),
+                                            tool_name: "web_search".to_string(),
+                                            input_preview: Some(raw_input),
+                                            status: Some("completed".to_string()),
+                                            meta,
+                                        },
+                                        ContentBlock::ToolResult {
+                                            tool_use_id: Some(tool_id),
+                                            output_preview: None,
+                                            is_error: false,
+                                            agent_stats: None,
+                                            images: Vec::new(),
+                                        },
+                                    ],
+                                    timestamp,
+                                    usage: None,
+                                    duration_ms: None,
+                                    model: None,
+                                    completed_at: Some(timestamp),
+                                });
                             }
                             "token_count" => {
                                 if let Some(info) = payload.get("info") {
@@ -6871,6 +6936,70 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn reload_preserves_structured_web_search_citations() {
+        let path = write_temp_rollout(
+            "citations",
+            &[
+                serde_json::json!({
+                    "timestamp":"2026-08-24T10:00:00Z",
+                    "type":"session_meta",
+                    "payload":{"id":"citation-session","cwd":"/tmp/project"}
+                })
+                .to_string(),
+                serde_json::json!({
+                    "timestamp":"2026-08-24T10:00:01Z",
+                    "type":"event_msg",
+                    "payload":{"type":"user_message","message":"search"}
+                })
+                .to_string(),
+                serde_json::json!({
+                    "timestamp":"2026-08-24T10:00:02Z",
+                    "type":"event_msg",
+                    "payload":{
+                        "type":"web_search_end",
+                        "call_id":"ws-1",
+                        "query":"source",
+                        "action":{"type":"search","query":"source"},
+                        "results":[{
+                            "type":"text_result",
+                            "ref_id":"turn0search0",
+                            "url":"https://example.com/source?q=1",
+                            "title":"Example source"
+                        }]
+                    }
+                })
+                .to_string(),
+                serde_json::json!({
+                    "timestamp":"2026-08-24T10:00:03Z",
+                    "type":"event_msg",
+                    "payload":{
+                        "type":"agent_message",
+                        "message":"answer \u{e200}cite\u{e202}turn0search0\u{e201}"
+                    }
+                })
+                .to_string(),
+            ],
+        );
+        let detail = CodexParser::new()
+            .parse_conversation_detail(&path, "citation-session")
+            .expect("parse citation rollout");
+        let meta = detail
+            .turns
+            .iter()
+            .flat_map(|turn| turn.blocks.iter())
+            .find_map(|block| match block {
+                ContentBlock::ToolUse { meta, .. } => meta.as_ref(),
+                _ => None,
+            })
+            .expect("web search citation metadata");
+        let sources = crate::citations::sources_from_meta(Some(meta));
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].reference_id, "turn0search0");
+        assert_eq!(sources[0].url, "https://example.com/source?q=1");
+        let _ = fs::remove_file(path);
     }
 
     #[test]

@@ -12290,7 +12290,10 @@ async fn emit_conversation_update(
             let meta_marks_background =
                 codebuddy_meta_marks_background(agent_type, tc.meta.as_ref());
             let grok_spawn = grok_meta_marks_spawn_subagent(agent_type, tc.meta.as_ref());
-            let meta = tc.meta.map(serde_json::Value::Object);
+            let meta = crate::citations::attach_sources_to_meta(
+                tc.meta.map(serde_json::Value::Object),
+                raw_input.as_deref(),
+            );
             let status = format!("{:?}", tc.status).to_lowercase();
             raw_output_cache.remove_if_final(&tool_call_id, Some(status.as_str()));
             // Track Grok's spawn_subagent lifecycle for the subagent-notification
@@ -12510,7 +12513,10 @@ async fn emit_conversation_update(
             let meta_marks_background =
                 codebuddy_meta_marks_background(agent_type, tcu.meta.as_ref());
             let grok_spawn = grok_meta_marks_spawn_subagent(agent_type, tcu.meta.as_ref());
-            let meta = tcu.meta.clone().map(serde_json::Value::Object);
+            let meta = crate::citations::attach_sources_to_meta(
+                tcu.meta.clone().map(serde_json::Value::Object),
+                raw_input.as_deref(),
+            );
             let status = tcu.fields.status.map(|s| format!("{:?}", s).to_lowercase());
             raw_output_cache.remove_if_final(&tool_call_id, status.as_deref());
             // Same lifetime as the output cache — and deliberately NOT mirrored in
