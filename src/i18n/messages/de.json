@@ -2840,6 +2840,8 @@
         "editItem": "Bearbeiten",
         "deleteItem": "Entfernen",
         "queued": "Eingereiht",
+        "waiting_source_turn": "Warten auf Abschluss der Quellaufgabe",
+        "creating_branch": "Branch wird erstellt",
         "waiting_session_restore": "Warten auf Sitzungswiederherstellung",
         "waiting_connection": "Warten auf Verbindungswiederholung",
         "failed": "Senden fehlgeschlagen",

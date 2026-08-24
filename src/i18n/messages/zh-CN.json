@@ -2840,6 +2840,8 @@
         "editItem": "编辑",
         "deleteItem": "删除",
         "queued": "已排队",
+        "waiting_source_turn": "等待源任务结束",
+        "creating_branch": "正在创建分支",
         "waiting_session_restore": "等待会话恢复",
         "waiting_connection": "等待连接重试",
         "failed": "发送失败",

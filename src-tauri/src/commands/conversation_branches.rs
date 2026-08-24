@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::acp::error::AcpError;
 use crate::acp::manager::ConnectionManager;
 use crate::acp::types::ConnectionStatus;
-use crate::app_error::AppCommandError;
+use crate::app_error::{AppCommandError, AppErrorCode};
 use crate::commands::acp::build_session_runtime_env;
 use crate::commands::conversation_branch_context::{
     build_branch_inheritance_snapshot, BranchInheritanceSnapshot,
@@ -49,9 +49,20 @@ pub struct CreateConversationBranchRequest {
     /// HTTP response or a reloaded persisted queue must resolve to the same
     /// branch instead of forking twice.
     pub request_id: Option<String>,
+    /// Stable identity of the user's branch action. Unlike an individual HTTP
+    /// request id, this survives component remounts and transport retries.
+    /// The server validates its source/fork point before deduplicating it.
+    pub operation_id: Option<String>,
     pub source_conversation_id: i32,
     pub fork_message_id: Option<String>,
     pub snapshot_context: Option<String>,
+    /// Queue-backed UI entry points set this so the server, rather than stale
+    /// browser runtime state, is authoritative about whether the source turn
+    /// has reached a durable terminal state. A busy source returns the normal
+    /// recoverable `turn_in_progress` conflict without creating a partial
+    /// branch; the stable request id can be retried after the turn settles.
+    #[serde(default)]
+    pub defer_if_source_busy: bool,
     pub preferred_mode_id: Option<String>,
     #[serde(default)]
     pub preferred_config_values: BTreeMap<String, String>,
@@ -116,6 +127,13 @@ fn branch_session_start_error(context: &str, error: &AcpError) -> AppCommandErro
     AppCommandError::task_execution_failed(format!("{context}: {error}"))
 }
 
+fn source_busy_branch_error() -> AppCommandError {
+    AppCommandError::new(
+        AppErrorCode::TurnInProgress,
+        "turn already in progress for source conversation; branch request remains queued",
+    )
+}
+
 fn should_attempt_native_fork(
     fork_message_id: Option<&str>,
     source_session_id: Option<&str>,
@@ -150,59 +168,96 @@ pub async fn create_conversation_branch_core(
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
         .or_else(|| Some(uuid::Uuid::new_v4().to_string()));
+    let operation_id = request
+        .operation_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .or_else(|| creation_request_id.clone());
     // The idempotency row does not exist until a potentially long native fork
     // has created and verified S2. Single-flight the whole protocol operation,
     // then re-read the durable result below; otherwise two retries with one
     // client id could create two child sessions before the unique index becomes
     // able to arbitrate.
-    let _creation_guard = match creation_request_id.as_deref() {
+    let _creation_guard = match operation_id.as_deref().or(creation_request_id.as_deref()) {
         Some(request_id) => Some(lock_branch_creation_request(request_id).await),
         None => None,
     };
-    if let Some(request_id) = creation_request_id.as_deref() {
-        if let Some(existing) =
-            conversation_branch_service::get_by_creation_request_id(&db.conn, request_id)
+    let existing_by_operation = match operation_id.as_deref() {
+        Some(operation_id) => {
+            conversation_branch_service::get_by_operation_id(&db.conn, operation_id)
                 .await
                 .map_err(AppCommandError::from)?
-        {
-            let branch = conversation_service::get_by_id(&db.conn, existing.branch_conversation_id)
-                .await
-                .map_err(AppCommandError::from)?;
-            let connection_id = manager
-                .find_connection_by_conversation_id(existing.branch_conversation_id)
-                .await;
-            let prompt_ready = if let Some(connection_id) = connection_id.as_deref() {
-                manager.get_state(connection_id).await.is_some_and(|state| {
-                    state
-                        .try_read()
-                        .is_ok_and(|state| state.status == ConnectionStatus::Connected)
-                })
-            } else {
-                false
-            };
-            tracing::info!(
-                creation_request_id = request_id,
-                source_conversation_id = existing.source_conversation_id,
-                branch_conversation_id = existing.branch_conversation_id,
-                lifecycle_state = existing.lifecycle_state,
-                "[ACP][branch] deduplicated branch creation request"
-            );
-            return Ok(CreateConversationBranchResult {
-                branch_conversation_id: existing.branch_conversation_id,
-                source_conversation_id: existing.source_conversation_id,
-                folder_id: branch.folder_id,
-                connection_id,
-                branch_session_id: existing.branch_session_id,
-                session_ready: existing.session_verified_at.is_some(),
-                prompt_ready,
-                lifecycle_state: existing.lifecycle_state,
-                fork_mode: existing.fork_mode,
-                inheritance_mode: existing.inheritance_mode,
-                inherited_message_count: existing.inherited_message_count,
-                inheritance_truncated: existing.inheritance_truncated,
-                fallback_reason: existing.lifecycle_error,
-            });
         }
+        None => None,
+    };
+    let existing = if existing_by_operation.is_some() {
+        existing_by_operation
+    } else if let Some(request_id) = creation_request_id.as_deref() {
+        conversation_branch_service::get_by_creation_request_id(&db.conn, request_id)
+            .await
+            .map_err(AppCommandError::from)?
+    } else {
+        None
+    };
+    if let Some(existing) = existing {
+        if existing.source_conversation_id != request.source_conversation_id
+            || existing.fork_message_id != request.fork_message_id
+        {
+            return Err(AppCommandError::invalid_input(
+                "Branch operation id was already used for another source or fork point",
+            ));
+        }
+        if conversation_branch_service::branch_conversation_is_deleted(
+            &db.conn,
+            existing.branch_conversation_id,
+        )
+        .await
+        .map_err(AppCommandError::from)?
+        {
+            return Err(AppCommandError::not_found(
+                "Branch operation was cancelled or its provisional conversation was deleted",
+            ));
+        }
+        let branch = conversation_service::get_by_id(&db.conn, existing.branch_conversation_id)
+            .await
+            .map_err(AppCommandError::from)?;
+        let connection_id = manager
+            .find_connection_by_conversation_id(existing.branch_conversation_id)
+            .await;
+        let prompt_ready = if let Some(connection_id) = connection_id.as_deref() {
+            manager.get_state(connection_id).await.is_some_and(|state| {
+                state
+                    .try_read()
+                    .is_ok_and(|state| state.status == ConnectionStatus::Connected)
+            })
+        } else {
+            false
+        };
+        tracing::info!(
+            creation_request_id = ?creation_request_id,
+            operation_id = ?operation_id,
+            source_conversation_id = existing.source_conversation_id,
+            branch_conversation_id = existing.branch_conversation_id,
+            lifecycle_state = existing.lifecycle_state,
+            "[ACP][branch] deduplicated branch creation request"
+        );
+        return Ok(CreateConversationBranchResult {
+            branch_conversation_id: existing.branch_conversation_id,
+            source_conversation_id: existing.source_conversation_id,
+            folder_id: branch.folder_id,
+            connection_id,
+            branch_session_id: existing.branch_session_id,
+            session_ready: existing.session_verified_at.is_some(),
+            prompt_ready,
+            lifecycle_state: existing.lifecycle_state,
+            fork_mode: existing.fork_mode,
+            inheritance_mode: existing.inheritance_mode,
+            inherited_message_count: existing.inherited_message_count,
+            inheritance_truncated: existing.inheritance_truncated,
+            fallback_reason: existing.lifecycle_error,
+        });
     }
     // A stale `conversation.status = in_progress` must not force a latest-tail
     // branch down the lossy snapshot path. Reconcile durable runs first, then
@@ -250,11 +305,33 @@ pub async fn create_conversation_branch_core(
     // stale browser binding can temporarily hide it. Consult the durable turn
     // state as well so an in-flight round is never copied merely because its
     // connection could not be found in this process at this instant.
-    let source_has_active_run =
-        !artifact_service::active_runs_for_conversation(&db.conn, source.id)
-            .await?
-            .is_empty();
-    let source_live_busy = source_connection_busy || source_has_active_run;
+    let source_active_runs =
+        artifact_service::active_runs_for_conversation(&db.conn, source.id).await?;
+    let source_has_active_run = !source_active_runs.is_empty();
+    // Prompt admission creates the durable run before exposing the live ACP
+    // generation. Therefore the run row is the authoritative queue blocker.
+    // A lone stale Prompting/turn_in_flight bit (common after a missed terminal
+    // event) must not strand Create Branch forever; it still prevents reusing
+    // that particular connection below, so native fork will either take a safe
+    // isolated writer handoff or fall back honestly to the persisted snapshot.
+    let source_live_busy = source_has_active_run;
+    if request.defer_if_source_busy && source_live_busy {
+        tracing::info!(
+            creation_request_id = ?creation_request_id,
+            operation_id = ?operation_id,
+            source_conversation_id = source.id,
+            source_turn_run_id = ?source_active_runs.first().map(|run| run.id.as_str()),
+            source_turn_state = ?source_active_runs.first().map(|run| &run.status),
+            source_connection_busy,
+            source_has_active_run,
+            queue_state_before = "creating",
+            queue_state_after = "queued",
+            blocking_reason = "source_turn_active",
+            trigger = "authoritative_branch_admission",
+            "[ACP][branch-queue] source is active; durable-idempotent request deferred"
+        );
+        return Err(source_busy_branch_error());
+    }
     let native_candidate = should_attempt_native_fork(
         request.fork_message_id.as_deref(),
         source.external_id.as_deref(),
@@ -350,10 +427,11 @@ pub async fn create_conversation_branch_core(
             Ok((connection_id, forked_session_id)) => {
                 let inherited_message_count =
                     i32::try_from(source.message_count).unwrap_or(i32::MAX);
-                let persisted = conversation_branch_service::create_branch_row_with_request(
+                let persisted = conversation_branch_service::create_branch_row_with_operation(
                     &db.conn,
                     &source,
                     creation_request_id.clone(),
+                    operation_id.clone(),
                     Some(forked_session_id.clone()),
                     None,
                     "native",
@@ -421,12 +499,18 @@ pub async fn create_conversation_branch_core(
                 emit_conversation_upsert(emitter, &db.conn, source.id).await;
                 emit_conversation_upsert(emitter, &db.conn, branch.id).await;
                 tracing::info!(
+                    creation_request_id = ?creation_request_id,
+                    operation_id = ?operation_id,
                     source_conversation_id = source.id,
                     branch_conversation_id = branch.id,
                     source_session_id = source.external_id,
                     branch_session_id = forked_session_id,
                     connection_id,
                     mapping_strategy = "immutable_source_detached_writer_handoff",
+                    queue_state_before = "creating",
+                    queue_state_after = "completed",
+                    branch_lifecycle_state = "ready",
+                    trigger = "native_fork_verified",
                     "[ACP][branch] verified native branch persisted"
                 );
                 return Ok(CreateConversationBranchResult {
@@ -446,6 +530,25 @@ pub async fn create_conversation_branch_core(
                 });
             }
             Err(error) => {
+                if request.defer_if_source_busy
+                    && (matches!(&error, AcpError::TurnInProgress)
+                        || !artifact_service::active_runs_for_conversation(&db.conn, source.id)
+                            .await?
+                            .is_empty())
+                {
+                    tracing::info!(
+                        creation_request_id = ?creation_request_id,
+                        operation_id = ?operation_id,
+                        source_conversation_id = source.id,
+                        queue_state_before = "creating",
+                        queue_state_after = "queued",
+                        blocking_reason = "source_became_active_during_fork",
+                        trigger = "native_fork_race_recheck",
+                        error = %error,
+                        "[ACP][branch-queue] source became active during fork; request deferred"
+                    );
+                    return Err(source_busy_branch_error());
+                }
                 use_stable_boundary |= matches!(&error, AcpError::TurnInProgress);
                 fallback_reason = Some(error.to_string());
             }
@@ -494,7 +597,8 @@ pub async fn create_conversation_branch_core(
             if request
                 .snapshot_context
                 .as_deref()
-                .is_some_and(|v| !v.trim().is_empty()) =>
+                .is_some_and(|v| !v.trim().is_empty())
+                && request.fork_message_id.is_none() =>
         {
             // Compatibility for one release of older clients. New clients do
             // not send this field. Mark it explicitly so it cannot be mistaken
@@ -525,6 +629,8 @@ pub async fn create_conversation_branch_core(
         Err(error) => return Err(error),
     };
     tracing::info!(
+        creation_request_id = ?creation_request_id,
+        operation_id = ?operation_id,
         source_conversation_id = source.id,
         fork_message_id = ?inheritance.fork_message_id,
         inheritance_mode = inheritance.inheritance_mode,
@@ -547,6 +653,8 @@ pub async fn create_conversation_branch_core(
     // Opening the branch may prewarm a connection, but the first real user
     // prompt atomically injects this snapshot and promotes the session id.
     tracing::info!(
+        creation_request_id = ?creation_request_id,
+        operation_id = ?operation_id,
         source_conversation_id = source.id,
         source_generating = source.status == "in_progress",
         lifecycle_state = "snapshot_ready",
@@ -555,10 +663,11 @@ pub async fn create_conversation_branch_core(
         "[ACP][branch] persisting provisional snapshot branch"
     );
     let snapshot = inheritance.context.clone();
-    let (branch, relation) = conversation_branch_service::create_branch_row_with_request(
+    let (branch, relation) = conversation_branch_service::create_branch_row_with_operation(
         &db.conn,
         &source,
-        creation_request_id,
+        creation_request_id.clone(),
+        operation_id.clone(),
         None,
         inheritance.fork_message_id.clone(),
         "snapshot",
@@ -573,6 +682,8 @@ pub async fn create_conversation_branch_core(
     .map_err(AppCommandError::from)?;
     emit_conversation_upsert(emitter, &db.conn, branch.id).await;
     tracing::info!(
+        creation_request_id = ?creation_request_id,
+        operation_id = ?operation_id,
         source_conversation_id = source.id,
         branch_conversation_id = branch.id,
         connection_id = ?Option::<String>::None,
@@ -586,6 +697,10 @@ pub async fn create_conversation_branch_core(
         truncated = inheritance.truncated,
         fallback_reason = ?fallback_reason,
         stage = "branch_ready",
+        queue_state_before = "creating",
+        queue_state_after = "completed",
+        branch_lifecycle_state = relation.lifecycle_state,
+        trigger = "snapshot_persisted",
         "[ACP][branch] provisional snapshot branch persisted"
     );
     Ok(CreateConversationBranchResult {
@@ -1001,10 +1116,12 @@ mod tests {
             Path::new("/tmp/codeg-message-branch-data"),
             "test".into(),
             CreateConversationBranchRequest {
-                request_id: None,
+                request_id: Some("snapshot-first-request".into()),
+                operation_id: Some("snapshot-stable-operation".into()),
                 source_conversation_id: source_id,
-                fork_message_id: Some("message-4".into()),
+                fork_message_id: None,
                 snapshot_context: Some("User: context through message four".into()),
+                defer_if_source_busy: false,
                 preferred_mode_id: Some("code".into()),
                 preferred_config_values: BTreeMap::new(),
             },
@@ -1035,6 +1152,143 @@ mod tests {
             .unwrap();
         assert_eq!(info.lifecycle_state, "provisional");
         assert!(info.snapshot_consumed_at.is_none());
+
+        let retry = create_conversation_branch_core(
+            &db,
+            &ConnectionManager::new(),
+            &EventEmitter::Noop,
+            Path::new("/tmp/codeg-message-branch-data"),
+            "test".into(),
+            CreateConversationBranchRequest {
+                request_id: Some("snapshot-reconnected-request".into()),
+                operation_id: Some("snapshot-stable-operation".into()),
+                source_conversation_id: source_id,
+                fork_message_id: None,
+                snapshot_context: None,
+                defer_if_source_busy: false,
+                preferred_mode_id: Some("code".into()),
+                preferred_config_values: BTreeMap::new(),
+            },
+        )
+        .await
+        .expect("a transport retry with the same operation must reuse the branch");
+        assert_eq!(retry.branch_conversation_id, result.branch_conversation_id);
+        assert_eq!(
+            conversation_branch::Entity::find()
+                .count(&db.conn)
+                .await
+                .unwrap(),
+            1,
+            "a successful operation terminates every later fallback/retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_fork_message_never_creates_a_half_ready_snapshot() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/codeg-missing-fork-message").await;
+        let source_id = seed_conversation(&db, folder_id, AgentType::Codex).await;
+        let error = create_conversation_branch_core(
+            &db,
+            &ConnectionManager::new(),
+            &EventEmitter::Noop,
+            Path::new("/tmp/codeg-missing-fork-message-data"),
+            "test".into(),
+            CreateConversationBranchRequest {
+                request_id: Some("missing-message-request".into()),
+                operation_id: Some("missing-message-operation".into()),
+                source_conversation_id: source_id,
+                fork_message_id: Some("turn-does-not-exist".into()),
+                snapshot_context: Some("legacy browser context must not mask the error".into()),
+                defer_if_source_busy: false,
+                preferred_mode_id: None,
+                preferred_config_values: BTreeMap::new(),
+            },
+        )
+        .await
+        .expect_err("an unknown durable fork point must be rejected");
+        assert!(matches!(
+            error.code,
+            AppErrorCode::InvalidInput | AppErrorCode::NotFound | AppErrorCode::TaskExecutionFailed
+        ));
+        assert_eq!(
+            conversation_branch::Entity::find()
+                .count(&db.conn)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_review_with_a_completed_settled_run_is_branch_idle() {
+        let db = fresh_in_memory_db().await;
+        let folder_path = "/tmp/codeg-terminal-source-branch";
+        let folder_id = seed_folder(&db, folder_path).await;
+        let source_id = seed_conversation(&db, folder_id, AgentType::Codex).await;
+        artifact_service::create_run(
+            &db.conn,
+            artifact_service::NewTurnRun {
+                id: "completed-source-turn".into(),
+                conversation_id: source_id,
+                connection_id: "old-terminal-connection".into(),
+                client_message_id: Some("completed-source-message".into()),
+                prompt_fingerprint: None,
+                folder_id: Some(folder_id),
+                root_path: folder_path.into(),
+                capture_incomplete: false,
+                input_paths_json: "[]".into(),
+                expectation_json: "{}".into(),
+            },
+        )
+        .await
+        .unwrap();
+        artifact_service::finish_run(
+            &db.conn,
+            "completed-source-turn",
+            crate::db::entities::conversation_turn_run::ConversationTurnRunStatus::Completed,
+            Some("end_turn".into()),
+        )
+        .await
+        .unwrap();
+        artifact_service::mark_settled(&db.conn, "completed-source-turn", "settled", &[])
+            .await
+            .unwrap();
+        conversation_service::update_status(
+            &db.conn,
+            source_id,
+            conversation::ConversationStatus::PendingReview,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            conversation_service::get_by_id(&db.conn, source_id)
+                .await
+                .unwrap()
+                .status,
+            "pending_review"
+        );
+
+        let result = create_conversation_branch_core(
+            &db,
+            &ConnectionManager::new(),
+            &EventEmitter::Noop,
+            Path::new("/tmp/codeg-terminal-source-branch-data"),
+            "test".into(),
+            CreateConversationBranchRequest {
+                request_id: Some("terminal-source-request".into()),
+                operation_id: Some("terminal-source-operation".into()),
+                source_conversation_id: source_id,
+                fork_message_id: None,
+                snapshot_context: Some("completed context".into()),
+                defer_if_source_busy: true,
+                preferred_mode_id: None,
+                preferred_config_values: BTreeMap::new(),
+            },
+        )
+        .await
+        .expect("pending_review is a stable idle state, not a branch blocker");
+        assert_eq!(result.lifecycle_state, "provisional");
     }
 
     #[tokio::test]
@@ -1072,6 +1326,35 @@ mod tests {
             "the durable running turn must participate in branch busy detection"
         );
 
+        let deferred = create_conversation_branch_core(
+            &db,
+            &ConnectionManager::new(),
+            &EventEmitter::Noop,
+            Path::new("/tmp/codeg-running-source-branch-data"),
+            "test".into(),
+            CreateConversationBranchRequest {
+                request_id: Some("queued-running-source".into()),
+                operation_id: Some("queued-running-source-operation".into()),
+                source_conversation_id: source_id,
+                fork_message_id: None,
+                snapshot_context: Some("last committed context".into()),
+                defer_if_source_busy: true,
+                preferred_mode_id: None,
+                preferred_config_values: BTreeMap::new(),
+            },
+        )
+        .await
+        .expect_err("queue-backed branch creation must wait for the active source turn");
+        assert!(matches!(deferred.code, AppErrorCode::TurnInProgress));
+        assert_eq!(
+            conversation_branch::Entity::find()
+                .count(&db.conn)
+                .await
+                .unwrap(),
+            0,
+            "a deferred request must not expose a half-created branch"
+        );
+
         let result = create_conversation_branch_core(
             &db,
             &ConnectionManager::new(),
@@ -1080,9 +1363,11 @@ mod tests {
             "test".into(),
             CreateConversationBranchRequest {
                 request_id: None,
+                operation_id: None,
                 source_conversation_id: source_id,
                 fork_message_id: None,
                 snapshot_context: Some("last committed context".into()),
+                defer_if_source_busy: false,
                 preferred_mode_id: None,
                 preferred_config_values: BTreeMap::new(),
             },

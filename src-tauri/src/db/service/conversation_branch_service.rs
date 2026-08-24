@@ -37,6 +37,7 @@ fn source_title_base(title: Option<&str>) -> String {
 pub struct ConversationBranchInfo {
     pub branch_conversation_id: i32,
     pub creation_request_id: Option<String>,
+    pub operation_id: Option<String>,
     pub source_conversation_id: i32,
     pub source_title: Option<String>,
     pub source_available: bool,
@@ -74,6 +75,7 @@ impl From<conversation_branch::Model> for ConversationBranchInfo {
         Self {
             branch_conversation_id: value.branch_conversation_id,
             creation_request_id: value.creation_request_id,
+            operation_id: value.operation_id,
             source_conversation_id: value.source_conversation_id,
             source_title: value.source_title,
             source_available: true,
@@ -154,7 +156,45 @@ pub async fn create_branch_row_with_request(
     fork_mode: &str,
     inheritance: BranchInheritanceRecord,
 ) -> Result<(conversation::Model, ConversationBranchInfo), DbError> {
+    let operation_id = creation_request_id.clone();
+    create_branch_row_with_operation(
+        conn,
+        source,
+        creation_request_id,
+        operation_id,
+        external_id,
+        fork_message_id,
+        fork_mode,
+        inheritance,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn create_branch_row_with_operation(
+    conn: &DatabaseConnection,
+    source: &DbConversationSummary,
+    creation_request_id: Option<String>,
+    operation_id: Option<String>,
+    external_id: Option<String>,
+    fork_message_id: Option<String>,
+    fork_mode: &str,
+    inheritance: BranchInheritanceRecord,
+) -> Result<(conversation::Model, ConversationBranchInfo), DbError> {
     let _create_guard = BRANCH_CREATE_LOCK.lock().await;
+    if let Some(operation_id) = operation_id.as_deref() {
+        if let Some(existing) = conversation_branch::Entity::find()
+            .filter(conversation_branch::Column::OperationId.eq(operation_id))
+            .one(conn)
+            .await?
+        {
+            let branch = conversation::Entity::find_by_id(existing.branch_conversation_id)
+                .one(conn)
+                .await?
+                .ok_or_else(|| DbError::NotFound("idempotent branch conversation".into()))?;
+            return Ok((branch, existing.into()));
+        }
+    }
     if let Some(request_id) = creation_request_id.as_deref() {
         if let Some(existing) = conversation_branch::Entity::find()
             .filter(conversation_branch::Column::CreationRequestId.eq(request_id))
@@ -238,6 +278,7 @@ pub async fn create_branch_row_with_request(
                     let relation = conversation_branch::ActiveModel {
                         branch_conversation_id: Set(created.id),
                         creation_request_id: Set(creation_request_id),
+                        operation_id: Set(operation_id),
                         source_conversation_id: Set(source_id),
                         source_title: Set(source_title),
                         fork_message_id: Set(fork_message_id),
@@ -293,6 +334,31 @@ pub async fn create_branch_row_with_request(
             Err(DbError::Database(error))
         }
     }
+}
+
+pub async fn get_by_operation_id(
+    conn: &DatabaseConnection,
+    operation_id: &str,
+) -> Result<Option<ConversationBranchInfo>, DbError> {
+    let operation_id = operation_id.trim();
+    if operation_id.is_empty() {
+        return Ok(None);
+    }
+    Ok(conversation_branch::Entity::find()
+        .filter(conversation_branch::Column::OperationId.eq(operation_id))
+        .one(conn)
+        .await?
+        .map(Into::into))
+}
+
+pub async fn branch_conversation_is_deleted(
+    conn: &DatabaseConnection,
+    conversation_id: i32,
+) -> Result<bool, DbError> {
+    Ok(conversation::Entity::find_by_id(conversation_id)
+        .one(conn)
+        .await?
+        .is_none_or(|conversation| conversation.deleted_at.is_some()))
 }
 
 pub async fn get_by_creation_request_id(
@@ -477,6 +543,16 @@ pub async fn mark_initialization_state(
     if row.snapshot_consumed_at.is_some() {
         return Ok(());
     }
+    // `prompt_ready` is reserved for a branch with a verified durable session.
+    // A provisional session/new connection can accept its first prompt, but it
+    // has no resumable rollout yet and must remain pending-first-prompt.
+    let lifecycle_state = if lifecycle_state == "prompt_ready"
+        && (row.branch_session_id.is_none() || row.session_verified_at.is_none())
+    {
+        "pending_first_prompt"
+    } else {
+        lifecycle_state
+    };
     // SessionStarted is handled by a DB subscriber and can arrive after the
     // synchronous restore path already reached prompt_ready (or failed). Do
     // not let that delayed lower-level event move the durable state backward.
@@ -818,6 +894,7 @@ pub async fn repair_native_fork_relation(
     let relation = conversation_branch::ActiveModel {
         branch_conversation_id: Set(conversation_id),
         creation_request_id: Set(None),
+        operation_id: Set(None),
         source_conversation_id: Set(source.id),
         source_title: Set(source.title.clone()),
         fork_message_id: Set(None),
@@ -1440,6 +1517,25 @@ mod tests {
         assert!(can_reinitialize_empty_snapshot_session(&db.conn, branch.id)
             .await
             .unwrap());
+        mark_initialization_state(
+            &db.conn,
+            branch.id,
+            "prompt_ready",
+            Some("ephemeral-connection".into()),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            get_info(&db.conn, branch.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .lifecycle_state,
+            "pending_first_prompt",
+            "an ephemeral session cannot advertise durable prompt_ready"
+        );
         mark_first_prompt_queued(&db.conn, branch.id, Some("optimistic-first"), "conn-first")
             .await
             .unwrap();
@@ -1566,6 +1662,18 @@ mod tests {
         )
         .await
         .unwrap();
+        let (transport_retry, transport_retry_info) = create_branch_row_with_operation(
+            &db.conn,
+            &source,
+            Some("different-http-request".into()),
+            Some("create-once".into()),
+            None,
+            None,
+            "snapshot",
+            inheritance(),
+        )
+        .await
+        .unwrap();
         let (second, _) = create_branch_row_with_request(
             &db.conn,
             &source,
@@ -1579,9 +1687,14 @@ mod tests {
         .unwrap();
 
         assert_eq!(first.id, retry.id);
+        assert_eq!(first.id, transport_retry.id);
         assert_eq!(
             first_info.branch_conversation_id,
             retry_info.branch_conversation_id
+        );
+        assert_eq!(
+            first_info.branch_conversation_id,
+            transport_retry_info.branch_conversation_id
         );
         assert_eq!(first.title.as_deref(), Some("Agent 调试 · 分支"));
         assert_eq!(second.title.as_deref(), Some("Agent 调试 · 分支 2"));
