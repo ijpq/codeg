@@ -379,6 +379,11 @@ pub struct SessionState {
     // 事件锚点
     pub event_seq: u64,
     pub last_activity_at: DateTime<Utc>,
+    /// Last event emitted by the ACP/agent connection itself. Unlike
+    /// `last_activity_at`, browser attach keepalives never update this clock.
+    /// Reconciliation therefore treats it as the run heartbeat while idle
+    /// sweeping can continue to use the broader client-or-agent activity.
+    pub last_agent_activity_at: DateTime<Utc>,
     /// Last event proving an in-flight turn is making real progress. Status,
     /// usage and selector heartbeats deliberately do not update this clock:
     /// they can continue forever after an adapter has lost its terminal event.
@@ -542,6 +547,19 @@ pub struct SessionState {
     /// not part of the client-visible snapshot.
     pub turn_in_flight: bool,
 
+    /// Durable turn-run identity owned by the current in-memory prompt. This is
+    /// installed as soon as the artifact/run row is created, before any branch
+    /// snapshot or merge context is prepared, and cleared with TurnComplete.
+    /// Reconciliation uses it to ensure an old run (or an old connection
+    /// generation) can never settle the prompt that currently owns this
+    /// connection. Backend-internal; the public snapshot already exposes the
+    /// client message and connection event sequence needed by the UI.
+    pub active_turn_run_id: Option<String>,
+    /// Event-sequence boundary captured with `active_turn_run_id`. Unlike a
+    /// wall-clock timestamp this is monotonic for one connection and changes
+    /// when a new prompt generation is armed.
+    pub active_turn_generation: Option<u64>,
+
     /// Whether the most recently completed turn ended via a stop reason other
     /// than `"end_turn"` (cancelled, refusal, max_tokens, max_turn_requests,
     /// empty, unknown — the same "abnormal ending" bucket `connection.rs`
@@ -621,6 +639,7 @@ impl SessionState {
             session_started_tx: None,
             event_seq: 0,
             last_activity_at: Utc::now(),
+            last_agent_activity_at: Utc::now(),
             last_turn_progress_at: Utc::now(),
             event_stream: Arc::new(ConnectionEventStream::new()),
             recent_events: RecentEventsBuffer::new(),
@@ -640,6 +659,8 @@ impl SessionState {
             steer_messages: Vec::new(),
             pending_user_message_started_at: None,
             turn_in_flight: false,
+            active_turn_run_id: None,
+            active_turn_generation: None,
             last_turn_ended_abnormally: false,
             config_stale: false,
             config_stale_kind: None,
@@ -1100,6 +1121,8 @@ impl SessionState {
                 // cancel, stop-reason — emit TurnComplete; disconnect/error
                 // discard the state entirely, so no stale flag can outlive them.)
                 self.turn_in_flight = false;
+                self.active_turn_run_id = None;
+                self.active_turn_generation = None;
                 // NOTE: `active_delegations` is intentionally NOT cleared here.
                 // A running delegation's child runs in the background long after
                 // the parent's `delegate_to_agent` tool call returns and this
@@ -1358,7 +1381,9 @@ impl SessionState {
                 // 权威值已由紧随其后的 SessionConfigOptions 落进快照。
             }
         }
-        self.last_activity_at = Utc::now();
+        let now = Utc::now();
+        self.last_activity_at = now;
+        self.last_agent_activity_at = now;
     }
 
     /// Whether this connection has launched background work (async sub-agent /

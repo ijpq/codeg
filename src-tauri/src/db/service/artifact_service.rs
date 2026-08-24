@@ -3,7 +3,8 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use sea_orm::{
     sea_query::Expr, ActiveModelTrait, ActiveValue::NotSet, ColumnTrait, DatabaseConnection,
-    Condition, EntityTrait, IntoActiveModel, QueryFilter, QueryOrder, Set, TransactionTrait,
+    Condition, EntityTrait, IntoActiveModel, PaginatorTrait, QueryFilter, QueryOrder, Set,
+    TransactionTrait,
 };
 
 use crate::db::entities::conversation::{self, ConversationStatus};
@@ -54,6 +55,115 @@ pub enum CancelRequestDisposition {
 pub struct CancelRequestTransition {
     pub disposition: CancelRequestDisposition,
     pub run: Option<conversation_turn_run::Model>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaleFinalizeOutcome {
+    pub run_changed: bool,
+    pub conversation_changed: bool,
+}
+
+/// Finalize one specifically observed stale run without allowing it to demote a
+/// conversation that already acquired a newer active run. The run CAS and the
+/// "no replacement exists" conversation update share one SQLite transaction,
+/// which is the durable counterpart to the manager's connection-generation
+/// check.
+pub async fn finalize_stale_turn_state(
+    conn: &DatabaseConnection,
+    run_id: &str,
+    expected_connection_id: &str,
+    stop_reason: &str,
+) -> Result<StaleFinalizeOutcome, DbError> {
+    let txn = conn.begin().await?;
+    let now = Utc::now();
+    let Some(current) = conversation_turn_run::Entity::find_by_id(run_id.to_string())
+        .one(&txn)
+        .await?
+    else {
+        txn.rollback().await?;
+        return Ok(StaleFinalizeOutcome {
+            run_changed: false,
+            conversation_changed: false,
+        });
+    };
+    if current.status != ConversationTurnRunStatus::Running
+        || current.connection_id != expected_connection_id
+    {
+        txn.rollback().await?;
+        return Ok(StaleFinalizeOutcome {
+            run_changed: false,
+            conversation_changed: false,
+        });
+    }
+
+    let run_changed = conversation_turn_run::Entity::update_many()
+        .col_expr(
+            conversation_turn_run::Column::Status,
+            Expr::value(ConversationTurnRunStatus::Interrupted),
+        )
+        .col_expr(
+            conversation_turn_run::Column::CaptureIncomplete,
+            Expr::value(true),
+        )
+        .col_expr(
+            conversation_turn_run::Column::StopReason,
+            Expr::value(Some(stop_reason.to_string())),
+        )
+        .col_expr(
+            conversation_turn_run::Column::CompletedAt,
+            Expr::value(Some(now)),
+        )
+        .col_expr(
+            conversation_turn_run::Column::SettlementStatus,
+            Expr::value("settled_incomplete"),
+        )
+        .col_expr(
+            conversation_turn_run::Column::SettledAt,
+            Expr::value(Some(now)),
+        )
+        .filter(conversation_turn_run::Column::Id.eq(run_id.to_string()))
+        .filter(
+            conversation_turn_run::Column::ConnectionId.eq(expected_connection_id.to_string()),
+        )
+        .filter(
+            conversation_turn_run::Column::Status.eq(ConversationTurnRunStatus::Running),
+        )
+        .exec(&txn)
+        .await?
+        .rows_affected
+        == 1;
+
+    let mut conversation_changed = false;
+    if run_changed {
+        let replacement_count = conversation_turn_run::Entity::find()
+            .filter(
+                conversation_turn_run::Column::ConversationId.eq(current.conversation_id),
+            )
+            .filter(conversation_turn_run::Column::Status.is_in([
+                ConversationTurnRunStatus::Running,
+                ConversationTurnRunStatus::Cancelling,
+            ]))
+            .count(&txn)
+            .await?;
+        if replacement_count == 0 {
+            conversation_changed = conversation::Entity::update_many()
+                .col_expr(
+                    conversation::Column::Status,
+                    Expr::value(ConversationStatus::PendingReview),
+                )
+                .col_expr(conversation::Column::UpdatedAt, Expr::value(now))
+                .filter(conversation::Column::Id.eq(current.conversation_id))
+                .exec(&txn)
+                .await?
+                .rows_affected
+                > 0;
+        }
+    }
+    txn.commit().await?;
+    Ok(StaleFinalizeOutcome {
+        run_changed,
+        conversation_changed,
+    })
 }
 
 /// Atomically close the user-visible turn lifecycle. File inspection and

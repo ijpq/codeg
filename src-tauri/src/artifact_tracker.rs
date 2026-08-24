@@ -402,6 +402,12 @@ struct ActiveCapture {
     task: tokio::task::JoinHandle<()>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ActiveCaptureInfo {
+    pub run_id: String,
+    pub generation: u64,
+}
+
 #[derive(Clone, Default)]
 pub struct ArtifactTracker {
     active: Arc<Mutex<HashMap<String, ActiveCapture>>>,
@@ -435,6 +441,20 @@ pub(crate) fn emit_artifacts_changed(
 impl ArtifactTracker {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) async fn active_capture_info(
+        &self,
+        connection_id: &str,
+    ) -> Option<ActiveCaptureInfo> {
+        self.active
+            .lock()
+            .await
+            .get(connection_id)
+            .map(|capture| ActiveCaptureInfo {
+                run_id: capture.run_id.clone(),
+                generation: capture.minimum_completion_seq,
+            })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -812,10 +832,26 @@ impl ArtifactTracker {
     pub async fn force_finish_turn(
         &self,
         connection_id: &str,
+        expected_run_id: &str,
         status: ArtifactTurnFinishStatus,
         stop_reason: String,
     ) -> bool {
-        let capture = self.active.lock().await.remove(connection_id);
+        let capture = {
+            let mut active = self.active.lock().await;
+            let Some(capture) = active.get(connection_id) else {
+                return false;
+            };
+            if capture.run_id != expected_run_id {
+                tracing::warn!(
+                    connection_id,
+                    expected_turn_run_id = expected_run_id,
+                    active_turn_run_id = capture.run_id,
+                    "[artifact-tracker] refused to settle a different turn generation"
+                );
+                return false;
+            }
+            active.remove(connection_id)
+        };
         let Some(capture) = capture else {
             return false;
         };
@@ -1316,6 +1352,54 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn forced_settlement_refuses_a_different_turn_generation() {
+        let tracker = ArtifactTracker::new();
+        let (finish_tx, finish_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _ = finish_rx.await;
+        });
+        tracker.active.lock().await.insert(
+            "shared-connection".into(),
+            ActiveCapture {
+                run_id: "new-run".into(),
+                root_key: "/tmp/generation-test".into(),
+                minimum_completion_seq: 42,
+                ambiguous: Arc::new(AtomicBool::new(false)),
+                finish_tx,
+                task,
+            },
+        );
+
+        assert!(
+            !tracker
+                .force_finish_turn(
+                    "shared-connection",
+                    "old-run",
+                    ArtifactTurnFinishStatus::Interrupted,
+                    "stale_run_reconciled".into(),
+                )
+                .await
+        );
+        assert_eq!(
+            tracker.active_capture_info("shared-connection").await,
+            Some(ActiveCaptureInfo {
+                run_id: "new-run".into(),
+                generation: 42,
+            })
+        );
+        assert!(
+            tracker
+                .force_finish_turn(
+                    "shared-connection",
+                    "new-run",
+                    ArtifactTurnFinishStatus::Interrupted,
+                    "test_cleanup".into(),
+                )
+                .await
+        );
     }
 
     #[test]
