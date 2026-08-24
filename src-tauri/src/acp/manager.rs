@@ -52,7 +52,8 @@ const STEER_RESPONSE_TIMEOUT_SECS: u64 = 30;
 const ACCEPTED_PROMPT_ID_CACHE_LIMIT: usize = 128;
 const DEFAULT_CANCEL_TIMEOUT_SECS: u64 = 25;
 const DEFAULT_ZOMBIE_PROMPT_TIMEOUT_SECS: u64 = 600;
-const RUN_TERMINAL_SETTLEMENT_GRACE_SECS: i64 = 5;
+const DEFAULT_STALE_RUN_TIMEOUT_SECS: u64 = 120;
+const DEFAULT_STALE_CONFIRMATION_SECS: u64 = 15;
 
 fn cancel_timeout_from_env() -> Duration {
     let seconds = std::env::var("CODEG_ACP_CANCEL_TIMEOUT_SECS")
@@ -70,6 +71,24 @@ fn zombie_prompt_timeout_from_env() -> chrono::Duration {
         .unwrap_or(DEFAULT_ZOMBIE_PROMPT_TIMEOUT_SECS as i64)
         .clamp(30, 3_600);
     chrono::Duration::seconds(seconds)
+}
+
+fn stale_run_timeout_from_env() -> Duration {
+    let seconds = std::env::var("CODEG_ACP_STALE_RUN_TIMEOUT_SECS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_STALE_RUN_TIMEOUT_SECS)
+        .clamp(30, 3_600);
+    Duration::from_secs(seconds)
+}
+
+fn stale_confirmation_from_env() -> Duration {
+    let seconds = std::env::var("CODEG_ACP_STALE_CONFIRMATION_SECS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_STALE_CONFIRMATION_SECS)
+        .clamp(5, 300);
+    Duration::from_secs(seconds)
 }
 
 /// Grace window `disconnect_all` waits after firing every `Disconnect` before
@@ -327,6 +346,16 @@ pub struct ConnectionManager {
     /// conversation-keyed lock prevents concurrent restores from creating two
     /// replacement sessions.
     branch_recovery_locks: Arc<Mutex<HashMap<i32, Arc<Mutex<()>>>>>,
+    /// Reconciliation can be started by the periodic monitor, restore, branch
+    /// handoff, and page attach. Serialize the complete check/confirm/finalize
+    /// lifecycle for one conversation so two callers cannot both settle it.
+    reconciliation_locks: Arc<Mutex<HashMap<i32, Arc<Mutex<()>>>>>,
+    /// First-pass stale observations. A run is never finalized from a single
+    /// sample; the second pass must see the same connection/run generation and
+    /// unchanged activity after the confirmation window.
+    stale_run_suspicions: Arc<Mutex<HashMap<String, StaleRunSuspicion>>>,
+    stale_run_timeout: Duration,
+    stale_confirmation: Duration,
     /// Bound on how long `spawn_agent` waits for the agent's handshake
     /// before releasing the dedup lock. Configurable per-instance for
     /// tests; in production initialized from env via
@@ -396,6 +425,36 @@ struct PendingPlanApprovalEntry {
     sender: tokio::sync::oneshot::Sender<PlanApprovalAnswer>,
 }
 
+#[derive(Clone, Debug)]
+struct StaleRunSuspicion {
+    conversation_id: i32,
+    first_seen_at: chrono::DateTime<chrono::Utc>,
+    connection_id: String,
+    connection_generation: Option<u64>,
+    heartbeat_at: Option<chrono::DateTime<chrono::Utc>>,
+    output_at: Option<chrono::DateTime<chrono::Utc>>,
+    reason: String,
+}
+
+#[derive(Clone, Debug)]
+struct RunLiveObservation {
+    status: ConnectionStatus,
+    turn_in_flight: bool,
+    heartbeat_at: chrono::DateTime<chrono::Utc>,
+    output_at: chrono::DateTime<chrono::Utc>,
+    has_live_text: bool,
+    has_interaction: bool,
+    all_tools_terminal: bool,
+    pending_tool_count: usize,
+    child_pid: u32,
+    process_alive: Option<bool>,
+    event_seq: u64,
+    active_turn_run_id: Option<String>,
+    active_turn_generation: Option<u64>,
+    restore_in_progress: bool,
+    conversation_id: Option<i32>,
+}
+
 impl Default for ConnectionManager {
     fn default() -> Self {
         Self::new()
@@ -411,6 +470,10 @@ impl ConnectionManager {
             session_operation_locks: Arc::new(Mutex::new(HashMap::new())),
             restore_locks: Arc::new(Mutex::new(HashMap::new())),
             branch_recovery_locks: Arc::new(Mutex::new(HashMap::new())),
+            reconciliation_locks: Arc::new(Mutex::new(HashMap::new())),
+            stale_run_suspicions: Arc::new(Mutex::new(HashMap::new())),
+            stale_run_timeout: stale_run_timeout_from_env(),
+            stale_confirmation: stale_confirmation_from_env(),
             spawn_handshake_timeout: spawn_handshake_timeout_from_env(),
             restore_timeout: restore_timeout_from_env(),
             terminal_shell_config: TerminalShellRuntimeConfig::new(),
@@ -432,6 +495,10 @@ impl ConnectionManager {
             session_operation_locks: self.session_operation_locks.clone(),
             restore_locks: self.restore_locks.clone(),
             branch_recovery_locks: self.branch_recovery_locks.clone(),
+            reconciliation_locks: self.reconciliation_locks.clone(),
+            stale_run_suspicions: self.stale_run_suspicions.clone(),
+            stale_run_timeout: self.stale_run_timeout,
+            stale_confirmation: self.stale_confirmation,
             spawn_handshake_timeout: self.spawn_handshake_timeout,
             restore_timeout: self.restore_timeout,
             terminal_shell_config: self.terminal_shell_config.clone(),
@@ -503,6 +570,10 @@ impl ConnectionManager {
             session_operation_locks: Arc::new(Mutex::new(HashMap::new())),
             restore_locks: Arc::new(Mutex::new(HashMap::new())),
             branch_recovery_locks: Arc::new(Mutex::new(HashMap::new())),
+            reconciliation_locks: Arc::new(Mutex::new(HashMap::new())),
+            stale_run_suspicions: Arc::new(Mutex::new(HashMap::new())),
+            stale_run_timeout: stale_run_timeout_from_env(),
+            stale_confirmation: stale_confirmation_from_env(),
             spawn_handshake_timeout: timeout,
             restore_timeout: timeout,
             terminal_shell_config: TerminalShellRuntimeConfig::new(),
@@ -2404,6 +2475,11 @@ impl ConnectionManager {
         } else {
             None
         };
+        if let Some(run_id) = artifact_run_id.as_ref() {
+            let mut state = state_arc.write().await;
+            state.active_turn_run_id = Some(run_id.clone());
+            state.active_turn_generation = Some(event_seq_before_prompt.saturating_add(1));
+        }
 
         // Snapshot branches bootstrap their fresh ACP session exactly once.
         // Projection of the user-visible message and artifact expectation has
@@ -2671,6 +2747,11 @@ impl ConnectionManager {
             Err(send_err) => {
                 if artifact_run_id.is_some() {
                     self.artifact_tracker.cancel_unsent_turn(conn_id).await;
+                    let mut state = state_arc.write().await;
+                    if state.active_turn_run_id.as_ref() == artifact_run_id.as_ref() {
+                        state.active_turn_run_id = None;
+                        state.active_turn_generation = None;
+                    }
                 }
                 if let Some(cid) = conversation_id_for_status {
                     let pending_branch = branch_snapshot.is_some();
@@ -3178,6 +3259,7 @@ impl ConnectionManager {
             .artifact_tracker
             .force_finish_turn(
                 connection_id,
+                run_id,
                 ArtifactTurnFinishStatus::Cancelled,
                 stop_reason.to_string(),
             )
@@ -3214,11 +3296,106 @@ impl ConnectionManager {
         Ok(finalized)
     }
 
+    async fn reconciliation_lock(&self, conversation_id: i32) -> Arc<Mutex<()>> {
+        let mut locks = self.reconciliation_locks.lock().await;
+        locks
+            .entry(conversation_id)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    async fn observe_run_connection(&self, connection_id: &str) -> Option<RunLiveObservation> {
+        let handle = {
+            let connections = self.connections.lock().await;
+            connections.get(connection_id).map(|connection| {
+                (
+                    Arc::clone(&connection.state),
+                    connection
+                        .child_pid
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                )
+            })
+        }?;
+        let (state, child_pid) = handle;
+        let state = state.read().await;
+        let pending_tool_count = state
+            .active_tool_calls
+            .values()
+            .filter(|tool| {
+                matches!(
+                    tool.status,
+                    crate::acp::session_state::ToolCallStatus::Pending
+                        | crate::acp::session_state::ToolCallStatus::InProgress
+                )
+            })
+            .count();
+        let all_tools_terminal = !state.active_tool_calls.is_empty()
+            && state.active_tool_calls.values().all(|tool| {
+                matches!(
+                    tool.status,
+                    crate::acp::session_state::ToolCallStatus::Completed
+                        | crate::acp::session_state::ToolCallStatus::Failed
+                )
+            });
+        Some(RunLiveObservation {
+            status: state.status.clone(),
+            turn_in_flight: state.turn_in_flight,
+            heartbeat_at: state.last_agent_activity_at,
+            output_at: state.last_turn_progress_at,
+            has_live_text: state.has_effective_live_text(),
+            has_interaction: state.has_active_turn_interaction(),
+            all_tools_terminal,
+            pending_tool_count,
+            child_pid,
+            process_alive: (child_pid != 0)
+                .then(|| crate::acp::delegation::parent_watcher::parent_alive(child_pid)),
+            event_seq: state.event_seq,
+            active_turn_run_id: state.active_turn_run_id.clone(),
+            active_turn_generation: state.active_turn_generation,
+            restore_in_progress: state.restore_conversation_id.is_some() && !state.selectors_ready,
+            conversation_id: state.conversation_id,
+        })
+    }
+
+    async fn clear_stale_suspicion(&self, run_id: &str) {
+        self.stale_run_suspicions.lock().await.remove(run_id);
+    }
+
+    async fn confirm_stale_observation(
+        &self,
+        run_id: &str,
+        observation: StaleRunSuspicion,
+    ) -> (bool, u8) {
+        let mut suspicions = self.stale_run_suspicions.lock().await;
+        if let Some(previous) = suspicions.get(run_id) {
+            let unchanged = previous.connection_id == observation.connection_id
+                && previous.connection_generation == observation.connection_generation
+                && previous.heartbeat_at == observation.heartbeat_at
+                && previous.output_at == observation.output_at
+                && previous.reason == observation.reason;
+            if unchanged {
+                let elapsed = observation
+                    .first_seen_at
+                    .signed_duration_since(previous.first_seen_at)
+                    .to_std()
+                    .unwrap_or_default();
+                if elapsed >= self.stale_confirmation {
+                    suspicions.remove(run_id);
+                    return (true, 2);
+                }
+                return (false, 2);
+            }
+        }
+        suspicions.insert(run_id.to_string(), observation);
+        (false, 1)
+    }
+
     /// Reconcile durable active runs against the process-local connection map.
-    /// A live Prompting connection with an in-flight turn is preserved no
-    /// matter how old it is. Cleanup requires contradictory evidence: missing
-    /// connection, terminal connection state, a cancel deadline, or a
-    /// conversation already cancelled while its run remained active.
+    /// A first stale observation is diagnostic only. Finalization requires the
+    /// same run/connection generation, heartbeat, output clock, and stale basis
+    /// to survive a confirmation window and a final prompt-lock recheck. Fresh
+    /// agent activity, tools/interactions, restore/handoff work, or a newer run
+    /// veto the candidate immediately.
     pub async fn reconcile_conversation_runs(
         &self,
         db: &DatabaseConnection,
@@ -3226,10 +3403,16 @@ impl ConnectionManager {
     ) -> Result<usize, AcpError> {
         use crate::db::entities::conversation_turn_run::ConversationTurnRunStatus;
 
+        let reconciliation_lock = self.reconciliation_lock(conversation_id).await;
+        let _reconciliation_guard = reconciliation_lock.lock().await;
         let runs = artifact_service::active_runs_for_conversation(db, conversation_id)
             .await
             .map_err(|error| AcpError::protocol(error.to_string()))?;
         if runs.is_empty() {
+            self.stale_run_suspicions
+                .lock()
+                .await
+                .retain(|_, suspicion| suspicion.conversation_id != conversation_id);
             return Ok(0);
         }
         let conversation_status = conversation_service::get_by_id(db, conversation_id)
@@ -3237,95 +3420,162 @@ impl ConnectionManager {
             .map_err(|error| AcpError::protocol(error.to_string()))?
             .status;
         let now = chrono::Utc::now();
+        let stale_threshold = chrono::Duration::from_std(self.stale_run_timeout)
+            .unwrap_or_else(|_| chrono::Duration::seconds(DEFAULT_STALE_RUN_TIMEOUT_SECS as i64));
+        let newest_run_id = runs.first().map(|run| run.id.clone());
         let mut reconciled = 0;
 
         for run in runs {
-            let live_handle = {
-                let connections = self.connections.lock().await;
-                connections.get(&run.connection_id).map(|connection| {
-                    (
-                        Arc::clone(&connection.state),
-                        connection
-                            .child_pid
-                            .load(std::sync::atomic::Ordering::SeqCst),
-                    )
-                })
-            };
-            // Never await a state lock while holding the global connection-map
-            // mutex. Restore/disconnect paths acquire these in the opposite
-            // order, and reconciliation must not introduce a lock inversion.
-            let live = match live_handle {
-                Some((state, child_pid)) => {
-                    let state = state.read().await;
-                    Some((
-                        state.status.clone(),
-                        state.turn_in_flight,
-                        state.last_activity_at,
-                        state.last_turn_progress_at,
-                        state.has_effective_live_text(),
-                        state.has_active_turn_interaction(),
-                        !state.active_tool_calls.is_empty()
-                            && state.active_tool_calls.values().all(|tool| {
-                                matches!(
-                                    tool.status,
-                                    crate::acp::session_state::ToolCallStatus::Completed
-                                        | crate::acp::session_state::ToolCallStatus::Failed
-                                )
-                            }),
-                        child_pid,
-                    ))
+            let live = self.observe_run_connection(&run.connection_id).await;
+            let capture = self
+                .artifact_tracker
+                .active_capture_info(&run.connection_id)
+                .await;
+            let connection_generation = live
+                .as_ref()
+                .and_then(|observation| observation.active_turn_generation)
+                .or_else(|| {
+                    capture
+                        .as_ref()
+                        .filter(|capture| capture.run_id == run.id)
+                        .map(|capture| capture.generation)
+                });
+            let heartbeat_age_ms = live.as_ref().map(|observation| {
+                now.signed_duration_since(observation.heartbeat_at)
+                    .num_milliseconds()
+                    .max(0)
+            });
+            let output_age_ms = live.as_ref().map(|observation| {
+                now.signed_duration_since(observation.output_at)
+                    .num_milliseconds()
+                    .max(0)
+            });
+            let run_age = now.signed_duration_since(run.started_at);
+            let owns_current_generation = live.as_ref().is_some_and(|observation| {
+                observation.conversation_id == Some(conversation_id)
+                    && observation.active_turn_run_id.as_deref() == Some(run.id.as_str())
+            }) || capture
+                .as_ref()
+                .is_some_and(|capture| capture.run_id == run.id);
+            let newer_run_detected = newest_run_id.as_deref() != Some(run.id.as_str());
+
+            // Old duplicate rows can exist after crashes, but they are never
+            // allowed to act on the current capture, connection state, or
+            // conversation status. They get their own two-pass, run-only CAS.
+            if newer_run_detected {
+                if run_age < stale_threshold {
+                    self.clear_stale_suspicion(&run.id).await;
+                    tracing::debug!(
+                        conversation_id,
+                        turn_run_id = run.id,
+                        connection_id = run.connection_id,
+                        connection_generation,
+                        veto_reason = "newer_run_detected",
+                        "[ACP][reconcile] stale finalization vetoed"
+                    );
+                    continue;
                 }
-                None => None,
-            };
+                let (confirmed, attempt) = self
+                    .confirm_stale_observation(
+                        &run.id,
+                        StaleRunSuspicion {
+                            conversation_id,
+                            first_seen_at: now,
+                            connection_id: run.connection_id.clone(),
+                            connection_generation,
+                            heartbeat_at: live
+                                .as_ref()
+                                .map(|observation| observation.heartbeat_at),
+                            output_at: live.as_ref().map(|observation| observation.output_at),
+                            reason: "superseded_active_row".to_string(),
+                        },
+                    )
+                    .await;
+                if !confirmed {
+                    tracing::warn!(
+                        conversation_id,
+                        turn_id = ?run.client_message_id,
+                        turn_run_id = run.id,
+                        client_message_id = ?run.client_message_id,
+                        connection_id = run.connection_id,
+                        connection_generation,
+                        confirmation_attempt = attempt,
+                        final_basis = "superseded_active_row",
+                        state_changed = false,
+                        "[ACP][reconcile] suspected stale run retained for confirmation"
+                    );
+                    continue;
+                }
+                let changed = artifact_service::force_finish_incomplete(
+                    db,
+                    &run.id,
+                    ConversationTurnRunStatus::Interrupted,
+                    "superseded_run_reconciled",
+                )
+                .await
+                .map_err(|error| AcpError::protocol(error.to_string()))?;
+                tracing::warn!(
+                    conversation_id,
+                    turn_run_id = run.id,
+                    connection_id = run.connection_id,
+                    connection_generation,
+                    confirmation_attempt = 2,
+                    final_basis = "superseded_active_row",
+                    state_changed = changed,
+                    artifact_tracker_state = "preserved_newer_generation",
+                    "[ACP][reconcile] superseded durable run finalized in isolation"
+                );
+                reconciled += usize::from(changed);
+                continue;
+            }
+
             let deadline_expired = run
                 .cancel_deadline_at
                 .is_some_and(|deadline| deadline <= now);
             let contradiction = conversation_status == "cancelled";
-            let live_invalid = live.as_ref().is_some_and(|(status, turn_in_flight, ..)| {
-                !(*status == ConnectionStatus::Prompting && *turn_in_flight)
-            });
-            // TurnComplete clears the in-memory flag before the artifact
-            // subscriber's 450ms filesystem grace and durable finish. Avoid
-            // misclassifying that normal handoff as an orphaned run.
-            let live_invalid_after_grace = live_invalid
-                && live.as_ref().is_some_and(|(_, _, last_activity, ..)| {
-                    now.signed_duration_since(*last_activity).num_seconds()
-                        >= RUN_TERMINAL_SETTLEMENT_GRACE_SECS
+            let fresh_heartbeat = owns_current_generation
+                && live.as_ref().is_some_and(|observation| {
+                    now.signed_duration_since(observation.heartbeat_at) < stale_threshold
                 });
-            let stalled_terminal_tools = live.as_ref().is_some_and(
-                |(
-                    status,
-                    turn_in_flight,
-                    _,
-                    last_progress,
-                    has_live_text,
-                    has_interaction,
-                    all_tools_terminal,
-                    _,
-                )| {
-                    *status == ConnectionStatus::Prompting
-                        && *turn_in_flight
-                        && *all_tools_terminal
-                        && !*has_live_text
-                        && !*has_interaction
-                        && now.signed_duration_since(*last_progress)
-                            >= zombie_prompt_timeout_from_env()
-                },
-            );
+            let fresh_output = owns_current_generation
+                && live.as_ref().is_some_and(|observation| {
+                    now.signed_duration_since(observation.output_at) < stale_threshold
+                });
+            let restore_in_progress = live
+                .as_ref()
+                .is_some_and(|observation| observation.restore_in_progress);
+            let active_interaction = owns_current_generation
+                && live
+                .as_ref()
+                .is_some_and(|observation| observation.has_interaction);
+            let prompting = owns_current_generation
+                && live.as_ref().is_some_and(|observation| {
+                    observation.status == ConnectionStatus::Prompting
+                        && observation.turn_in_flight
+                });
+            let stalled_terminal_tools = live.as_ref().is_some_and(|observation| {
+                prompting
+                    && observation.all_tools_terminal
+                    && !observation.has_live_text
+                    && !observation.has_interaction
+                    && now.signed_duration_since(observation.output_at)
+                        >= zombie_prompt_timeout_from_env()
+            });
 
             match run.status {
-                ConversationTurnRunStatus::Cancelling
-                    if deadline_expired || live.is_none() || live_invalid || contradiction =>
-                {
+                ConversationTurnRunStatus::Cancelling if deadline_expired => {
+                    self.clear_stale_suspicion(&run.id).await;
                     tracing::warn!(
                         conversation_id,
+                        turn_id = ?run.client_message_id,
                         turn_run_id = run.id,
+                        client_message_id = ?run.client_message_id,
                         connection_id = run.connection_id,
                         current_state = "cancelling",
                         cancel_deadline = ?run.cancel_deadline_at,
-                        recent_heartbeat = ?live.as_ref().map(|(_, _, last, ..)| last),
-                        recent_output = ?live.as_ref().map(|(_, _, _, progress, ..)| progress),
-                        process_id = ?live.as_ref().map(|tuple| tuple.7),
+                        heartbeat_age_ms,
+                        output_age_ms,
+                        process_id = ?live.as_ref().map(|observation| observation.child_pid),
                         connection_exists = live.is_some(),
                         contradiction,
                         failure_classification = "stale_cancelling_run",
@@ -3336,11 +3586,7 @@ impl ConnectionManager {
                             db,
                             &run.connection_id,
                             &run.id,
-                            if deadline_expired {
-                                "cancel_timeout"
-                            } else {
-                                "cancel_connection_missing"
-                            },
+                            "cancel_timeout",
                             live.is_some(),
                         )
                         .await
@@ -3356,100 +3602,286 @@ impl ConnectionManager {
                     }
                     reconciled += 1;
                 }
-                ConversationTurnRunStatus::Running
-                    if live.is_none()
-                        || live_invalid_after_grace
-                        || contradiction
-                        || stalled_terminal_tools =>
-                {
-                    let state_and_emitter = self.get_state_and_emitter(&run.connection_id).await;
-                    // Persist the terminal state before broadcasting it. A
-                    // client observing TurnComplete can therefore immediately
-                    // re-query without ever seeing the old running row.
-                    let finalized = artifact_service::finalize_turn_state(
-                        db,
-                        &run.id,
-                        ConversationTurnRunStatus::Interrupted,
-                        if stalled_terminal_tools {
-                            "zombie_prompting_reconciled"
+                ConversationTurnRunStatus::Running => {
+                    let veto_reason = if fresh_heartbeat {
+                        Some("fresh_heartbeat")
+                    } else if fresh_output {
+                        Some("fresh_output")
+                    } else if active_interaction {
+                        Some("active_tool_or_interaction")
+                    } else if restore_in_progress {
+                        Some("restore_in_progress")
+                    } else {
+                        None
+                    };
+                    if let Some(veto_reason) = veto_reason {
+                        self.clear_stale_suspicion(&run.id).await;
+                        tracing::debug!(
+                            conversation_id,
+                            turn_run_id = run.id,
+                            connection_id = run.connection_id,
+                            connection_generation,
+                            connection_event_seq = live.as_ref().map(|observation| observation.event_seq),
+                            current_state = "running",
+                            heartbeat_age_ms,
+                            output_age_ms,
+                            tool_activity_age_ms = output_age_ms,
+                            connection_exists = live.is_some(),
+                            process_alive = ?live.as_ref().and_then(|observation| observation.process_alive),
+                            pending_tool_count = live.as_ref().map_or(0, |observation| observation.pending_tool_count),
+                            artifact_tracker_state = if capture.as_ref().is_some_and(|capture| capture.run_id == run.id) { "current" } else { "missing_or_other_generation" },
+                            stale_threshold_ms = self.stale_run_timeout.as_millis() as u64,
+                            veto_reason,
+                            state_changed = false,
+                            "[ACP][reconcile] stale finalization vetoed"
+                        );
+                        continue;
+                    }
+
+                    let candidate_reason = if live.is_none() && run_age >= stale_threshold {
+                        Some("connection_missing")
+                    } else if stalled_terminal_tools {
+                        Some("terminal_tools_without_terminal_event")
+                    } else if let Some(observation) = live.as_ref() {
+                        if matches!(
+                            observation.status,
+                            ConnectionStatus::Error | ConnectionStatus::Disconnected
+                        ) {
+                            Some("connection_terminal")
+                        } else if !prompting && run_age >= stale_threshold {
+                            Some("run_not_owned_by_prompting_state")
+                        } else if prompting
+                            && now.signed_duration_since(observation.output_at)
+                                >= zombie_prompt_timeout_from_env()
+                        {
+                            Some("prompt_activity_stalled")
+                        } else if contradiction && run_age >= stale_threshold {
+                            Some("durable_state_contradiction")
                         } else {
-                            "stale_run_reconciled"
-                        },
-                        ConversationStatus::PendingReview,
-                        true,
-                        true,
-                    )
-                    .await
-                    .map_err(|error| AcpError::protocol(error.to_string()))?;
-                    if let Some((state, emitter)) = state_and_emitter.as_ref() {
-                        let (session_id, agent_type) = {
-                            let snapshot = state.read().await;
-                            (
-                                snapshot.external_id.clone().unwrap_or_default(),
-                                snapshot.agent_type.to_string(),
-                            )
-                        };
-                        emit_with_state(
-                            state,
-                            emitter,
-                            AcpEvent::TurnComplete {
-                                session_id,
-                                stop_reason: if stalled_terminal_tools {
-                                    "zombie_prompting_reconciled".to_string()
-                                } else {
-                                    "stale_run_reconciled".to_string()
-                                },
-                                agent_type,
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    let Some(candidate_reason) = candidate_reason else {
+                        self.clear_stale_suspicion(&run.id).await;
+                        continue;
+                    };
+
+                    let observed_heartbeat = live
+                        .as_ref()
+                        .map(|observation| observation.heartbeat_at);
+                    let observed_output = live.as_ref().map(|observation| observation.output_at);
+                    let (confirmed, attempt) = self
+                        .confirm_stale_observation(
+                            &run.id,
+                            StaleRunSuspicion {
+                                conversation_id,
+                                first_seen_at: now,
+                                connection_id: run.connection_id.clone(),
+                                connection_generation,
+                                heartbeat_at: observed_heartbeat,
+                                output_at: observed_output,
+                                reason: candidate_reason.to_string(),
                             },
                         )
                         .await;
+                    if !confirmed {
+                        tracing::warn!(
+                            conversation_id,
+                            turn_run_id = run.id,
+                            connection_id = run.connection_id,
+                            connection_generation,
+                            current_state = "running",
+                            heartbeat_age_ms,
+                            output_age_ms,
+                            tool_activity_age_ms = output_age_ms,
+                            connection_exists = live.is_some(),
+                            process_alive = ?live.as_ref().and_then(|observation| observation.process_alive),
+                            pending_tool_count = live.as_ref().map_or(0, |observation| observation.pending_tool_count),
+                            artifact_tracker_state = if capture.as_ref().is_some_and(|capture| capture.run_id == run.id) { "current" } else { "missing_or_other_generation" },
+                            stale_threshold_ms = self.stale_run_timeout.as_millis() as u64,
+                            confirmation_attempt = attempt,
+                            final_basis = candidate_reason,
+                            state_changed = false,
+                            "[ACP][reconcile] suspected stale run retained for confirmation"
+                        );
+                        continue;
+                    }
+
+                    // Block a prompt admission on this connection while the
+                    // second observation is revalidated and committed.
+                    let prompt_lock = {
+                        let connections = self.connections.lock().await;
+                        connections
+                            .get(&run.connection_id)
+                            .map(|connection| Arc::clone(&connection.prompt_lock))
+                    };
+                    let _prompt_guard = match prompt_lock.as_ref() {
+                        Some(lock) => Some(lock.lock().await),
+                        None => None,
+                    };
+                    let latest = artifact_service::active_runs_for_conversation(db, conversation_id)
+                        .await
+                        .map_err(|error| AcpError::protocol(error.to_string()))?;
+                    if latest.first().map(|active| active.id.as_str()) != Some(run.id.as_str()) {
+                        self.clear_stale_suspicion(&run.id).await;
+                        tracing::info!(
+                            conversation_id,
+                            turn_run_id = run.id,
+                            connection_id = run.connection_id,
+                            veto_reason = "newer_run_detected",
+                            state_changed = false,
+                            "[ACP][reconcile] confirmed stale observation invalidated"
+                        );
+                        continue;
+                    }
+                    let live_after = self.observe_run_connection(&run.connection_id).await;
+                    let capture_after = self
+                        .artifact_tracker
+                        .active_capture_info(&run.connection_id)
+                        .await;
+                    let generation_after = live_after
+                        .as_ref()
+                        .and_then(|observation| observation.active_turn_generation)
+                        .or_else(|| {
+                            capture_after
+                                .as_ref()
+                                .filter(|capture| capture.run_id == run.id)
+                                .map(|capture| capture.generation)
+                        });
+                    let changed_activity = generation_after != connection_generation
+                        || live_after.as_ref().map(|observation| observation.heartbeat_at)
+                            != observed_heartbeat
+                        || live_after.as_ref().map(|observation| observation.output_at)
+                            != observed_output;
+                    let newer_owner = live_after.as_ref().is_some_and(|observation| {
+                        observation.conversation_id != Some(conversation_id)
+                            || observation.active_turn_run_id.as_deref().is_some_and(|active| active != run.id)
+                    }) || capture_after.as_ref().is_some_and(|capture| capture.run_id != run.id);
+                    if changed_activity || newer_owner {
+                        self.clear_stale_suspicion(&run.id).await;
+                        tracing::info!(
+                            conversation_id,
+                            turn_run_id = run.id,
+                            connection_id = run.connection_id,
+                            connection_generation = generation_after,
+                            veto_reason = if newer_owner { "newer_run_detected" } else { "fresh_activity_during_confirmation" },
+                            state_changed = false,
+                            "[ACP][reconcile] confirmed stale observation invalidated"
+                        );
+                        continue;
+                    }
+
+                    let stop_reason = if stalled_terminal_tools {
+                        "zombie_prompting_reconciled"
+                    } else {
+                        "stale_run_reconciled"
+                    };
+                    let finalized = artifact_service::finalize_stale_turn_state(
+                        db,
+                        &run.id,
+                        &run.connection_id,
+                        stop_reason,
+                    )
+                    .await
+                    .map_err(|error| AcpError::protocol(error.to_string()))?;
+                    let state_and_emitter = self.get_state_and_emitter(&run.connection_id).await;
+                    let exact_live_owner = live_after.as_ref().is_some_and(|observation| {
+                        observation.conversation_id == Some(conversation_id)
+                            && observation.active_turn_run_id.as_deref() == Some(run.id.as_str())
+                    }) || capture_after
+                        .as_ref()
+                        .is_some_and(|capture| capture.run_id == run.id);
+                    if finalized.run_changed && exact_live_owner {
+                        if let Some((state, emitter)) = state_and_emitter.as_ref() {
+                            let (session_id, agent_type) = {
+                                let snapshot = state.read().await;
+                                (
+                                    snapshot.external_id.clone().unwrap_or_default(),
+                                    snapshot.agent_type.to_string(),
+                                )
+                            };
+                            emit_with_state(
+                                state,
+                                emitter,
+                                AcpEvent::TurnComplete {
+                                    session_id,
+                                    stop_reason: stop_reason.to_string(),
+                                    agent_type,
+                                },
+                            )
+                            .await;
+                        }
                     }
                     let capture_finished = self
                         .artifact_tracker
                         .force_finish_turn(
                             &run.connection_id,
+                            &run.id,
                             ArtifactTurnFinishStatus::Interrupted,
-                            "stale_run_reconciled".to_string(),
+                            stop_reason.to_string(),
                         )
                         .await;
-                    if let Some((state, emitter)) = state_and_emitter {
-                        emit_with_state(
-                            &state,
-                            &emitter,
-                            AcpEvent::ConversationStatusChanged {
-                                conversation_id,
-                                status: ConversationStatus::PendingReview,
-                            },
-                        )
-                        .await;
+                    if finalized.conversation_changed {
+                        if let Some((state, emitter)) = state_and_emitter.as_ref() {
+                            emit_with_state(
+                                state,
+                                emitter,
+                                AcpEvent::ConversationStatusChanged {
+                                    conversation_id,
+                                    status: ConversationStatus::PendingReview,
+                                },
+                            )
+                            .await;
+                        }
                     }
+                    let connection_unhealthy = live_after.as_ref().is_some_and(|observation| {
+                        matches!(
+                            observation.status,
+                            ConnectionStatus::Error | ConnectionStatus::Disconnected
+                        ) || observation.process_alive == Some(false)
+                    }) || matches!(
+                        candidate_reason,
+                        "prompt_activity_stalled" | "terminal_tools_without_terminal_event"
+                    );
                     tracing::warn!(
                         conversation_id,
                         turn_run_id = run.id,
                         connection_id = run.connection_id,
+                        connection_generation,
                         current_state = "running",
                         target_state = "interrupted",
-                        recent_heartbeat = ?live.as_ref().map(|(_, _, last, ..)| last),
-                        recent_output = ?live.as_ref().map(|(_, _, _, progress, ..)| progress),
-                        connection_exists = live.is_some(),
-                        contradiction,
-                        stalled_terminal_tools,
-                        durable_state_changed = finalized,
-                        artifact_tracker_settled = capture_finished,
+                        turn_id = ?run.client_message_id,
+                        client_message_id = ?run.client_message_id,
+                        heartbeat_age_ms,
+                        output_age_ms,
+                        tool_activity_age_ms = output_age_ms,
+                        connection_exists = live_after.is_some(),
+                        process_alive = ?live_after.as_ref().and_then(|observation| observation.process_alive),
+                        pending_tool_count = live_after.as_ref().map_or(0, |observation| observation.pending_tool_count),
+                        artifact_tracker_state = if capture_finished { "settled_exact_generation" } else { "not_owned_or_already_settled" },
+                        stale_threshold_ms = self.stale_run_timeout.as_millis() as u64,
+                        confirmation_attempt = 2,
+                        final_basis = candidate_reason,
+                        durable_state_changed = finalized.run_changed,
+                        conversation_state_changed = finalized.conversation_changed,
+                        connection_cleanup_requested = connection_unhealthy,
                         "[ACP][reconcile] stale running turn finalized"
                     );
-                    if live.is_some() {
+                    if connection_unhealthy {
                         let _ = self.disconnect(&run.connection_id).await;
                     }
-                    reconciled += 1;
+                    reconciled += usize::from(finalized.run_changed);
                 }
                 _ => {
+                    self.clear_stale_suspicion(&run.id).await;
                     tracing::debug!(
                         conversation_id,
                         turn_run_id = run.id,
                         connection_id = run.connection_id,
                         current_state = ?run.status,
-                        recent_heartbeat = ?live.as_ref().map(|(_, _, last, ..)| last),
+                        heartbeat_age_ms,
                         connection_exists = live.is_some(),
                         "[ACP][reconcile] active run retained"
                     );
@@ -4220,6 +4652,7 @@ impl ConnectionManager {
                 self.artifact_tracker
                     .force_finish_turn(
                         conn_id,
+                        &run.id,
                         ArtifactTurnFinishStatus::Interrupted,
                         "connection_disconnected".to_string(),
                     )
@@ -5665,6 +6098,7 @@ mod tests {
     use crate::acp::session_state::SessionState;
     use crate::acp::types::ConnectionStatus;
     use crate::web::event_bridge::{EventEmitter, WebEvent, WebEventBroadcaster};
+    use sea_orm::{ColumnTrait, QueryFilter};
     use std::path::PathBuf;
     use std::sync::Arc;
     use tokio::sync::{broadcast, mpsc, RwLock};
@@ -6128,6 +6562,8 @@ mod tests {
         state.external_id = Some(format!("session-{conn_id}"));
         state.status = ConnectionStatus::Prompting;
         state.turn_in_flight = true;
+        state.active_turn_run_id = Some(run_id.clone());
+        state.active_turn_generation = Some(1);
         (conversation_id, run_id)
     }
 
@@ -6216,6 +6652,22 @@ mod tests {
         let mgr = ConnectionManager::new();
         let _rx = insert_live_connection(&mgr, "healthy-long", AgentType::Codex, None).await;
         let (conversation_id, run_id) = seed_live_turn_run(&db, &mgr, "healthy-long").await;
+        conversation_turn_run::Entity::update_many()
+            .col_expr(
+                conversation_turn_run::Column::StartedAt,
+                sea_orm::sea_query::Expr::value(chrono::Utc::now() - chrono::Duration::hours(1)),
+            )
+            .filter(conversation_turn_run::Column::Id.eq(run_id.clone()))
+            .exec(&db.conn)
+            .await
+            .unwrap();
+        {
+            let state = mgr.get_state("healthy-long").await.unwrap();
+            let mut state = state.write().await;
+            state.live_message = None;
+            state.last_turn_progress_at = chrono::Utc::now() - chrono::Duration::hours(1);
+            state.last_agent_activity_at = chrono::Utc::now();
+        }
 
         assert_eq!(
             mgr.reconcile_conversation_runs(&db.conn, conversation_id)
@@ -6236,7 +6688,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconciliation_allows_terminal_event_settlement_grace_then_repairs() {
+    async fn reconciliation_never_interrupts_a_six_second_prompt_admission_window() {
         let db = crate::db::test_helpers::fresh_in_memory_db().await;
         let mgr = ConnectionManager::new();
         let _rx = insert_live_connection(&mgr, "settlement-grace", AgentType::Codex, None).await;
@@ -6247,6 +6699,8 @@ mod tests {
             state.status = ConnectionStatus::Connected;
             state.turn_in_flight = false;
             state.last_activity_at = chrono::Utc::now();
+            state.last_agent_activity_at = chrono::Utc::now();
+            state.last_turn_progress_at = chrono::Utc::now() - chrono::Duration::hours(1);
         }
 
         assert_eq!(
@@ -6256,13 +6710,17 @@ mod tests {
             0,
             "the normal TurnComplete -> artifact settlement handoff gets a grace window"
         );
-        state.write().await.last_activity_at =
-            chrono::Utc::now() - chrono::Duration::seconds(RUN_TERMINAL_SETTLEMENT_GRACE_SECS + 1);
+        {
+            let mut state = state.write().await;
+            state.last_activity_at = chrono::Utc::now() - chrono::Duration::seconds(6);
+            state.last_agent_activity_at = chrono::Utc::now() - chrono::Duration::seconds(6);
+        }
         assert_eq!(
             mgr.reconcile_conversation_runs(&db.conn, conversation_id)
                 .await
                 .unwrap(),
-            1
+            0,
+            "a newly-created durable run can precede Prompting while prompt context is prepared"
         );
         let run = crate::db::entities::conversation_turn_run::Entity::find_by_id(run_id)
             .one(&db.conn)
@@ -6271,18 +6729,247 @@ mod tests {
             .unwrap();
         assert_eq!(
             run.status,
-            crate::db::entities::conversation_turn_run::ConversationTurnRunStatus::Interrupted
+            crate::db::entities::conversation_turn_run::ConversationTurnRunStatus::Running
         );
+    }
+
+    #[tokio::test]
+    async fn reconciliation_vetoes_an_active_tool_even_without_text_or_heartbeat() {
+        use crate::acp::session_state::{ToolCallState, ToolCallStatus, ToolKind};
+
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let mut mgr = ConnectionManager::new();
+        mgr.stale_run_timeout = Duration::ZERO;
+        mgr.stale_confirmation = Duration::ZERO;
+        let _rx = insert_live_connection(&mgr, "active-tool", AgentType::Codex, None).await;
+        let (conversation_id, run_id) = seed_live_turn_run(&db, &mgr, "active-tool").await;
+        let state = mgr.get_state("active-tool").await.unwrap();
+        {
+            let mut state = state.write().await;
+            state.last_activity_at = chrono::Utc::now() - chrono::Duration::hours(1);
+            state.last_agent_activity_at = chrono::Utc::now() - chrono::Duration::hours(1);
+            state.last_turn_progress_at = chrono::Utc::now() - chrono::Duration::hours(1);
+            state.active_tool_calls.insert(
+                "long-tool".into(),
+                ToolCallState {
+                    id: "long-tool".into(),
+                    kind: ToolKind::Execute,
+                    label: "long build".into(),
+                    status: ToolCallStatus::InProgress,
+                    input: None,
+                    output: None,
+                    content: None,
+                    locations: None,
+                    meta: None,
+                    images: Vec::new(),
+                    raw_input_chunks: Vec::new(),
+                },
+            );
+        }
+
+        assert_eq!(
+            mgr.reconcile_conversation_runs(&db.conn, conversation_id)
+                .await
+                .unwrap(),
+            0
+        );
+        let run = conversation_turn_run::Entity::find_by_id(run_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.status, ConversationTurnRunStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn activity_between_stale_passes_cancels_the_suspicion() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let mut mgr = ConnectionManager::new();
+        mgr.stale_run_timeout = Duration::from_secs(30);
+        mgr.stale_confirmation = Duration::ZERO;
+        let _rx = insert_live_connection(&mgr, "activity-veto", AgentType::Codex, None).await;
+        let (conversation_id, run_id) = seed_live_turn_run(&db, &mgr, "activity-veto").await;
+        conversation_turn_run::Entity::update_many()
+            .col_expr(
+                conversation_turn_run::Column::StartedAt,
+                sea_orm::sea_query::Expr::value(chrono::Utc::now() - chrono::Duration::hours(1)),
+            )
+            .filter(conversation_turn_run::Column::Id.eq(run_id.clone()))
+            .exec(&db.conn)
+            .await
+            .unwrap();
+        let state = mgr.get_state("activity-veto").await.unwrap();
+        {
+            let mut state = state.write().await;
+            state.status = ConnectionStatus::Connected;
+            state.turn_in_flight = false;
+            state.last_activity_at = chrono::Utc::now() - chrono::Duration::hours(1);
+            state.last_agent_activity_at = chrono::Utc::now() - chrono::Duration::hours(1);
+            state.last_turn_progress_at = chrono::Utc::now() - chrono::Duration::hours(1);
+        }
+        assert_eq!(
+            mgr.reconcile_conversation_runs(&db.conn, conversation_id)
+                .await
+                .unwrap(),
+            0
+        );
+        state.write().await.last_agent_activity_at = chrono::Utc::now();
+        assert_eq!(
+            mgr.reconcile_conversation_runs(&db.conn, conversation_id)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(mgr.stale_run_suspicions.lock().await.get(&run_id).is_none());
+        let run = conversation_turn_run::Entity::find_by_id(run_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.status, ConversationTurnRunStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn old_reconciler_cannot_settle_or_demote_a_newer_run() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let mut mgr = ConnectionManager::new();
+        mgr.stale_run_timeout = Duration::ZERO;
+        mgr.stale_confirmation = Duration::ZERO;
+        let _rx = insert_live_connection(&mgr, "generation-race", AgentType::Codex, None).await;
+        let (conversation_id, old_run_id) =
+            seed_live_turn_run(&db, &mgr, "generation-race").await;
+        let state = mgr.get_state("generation-race").await.unwrap();
+        {
+            let mut state = state.write().await;
+            state.status = ConnectionStatus::Connected;
+            state.turn_in_flight = false;
+            state.last_activity_at = chrono::Utc::now() - chrono::Duration::hours(1);
+            state.last_agent_activity_at = chrono::Utc::now() - chrono::Duration::hours(1);
+            state.last_turn_progress_at = chrono::Utc::now() - chrono::Duration::hours(1);
+        }
+        assert_eq!(
+            mgr.reconcile_conversation_runs(&db.conn, conversation_id)
+                .await
+                .unwrap(),
+            0
+        );
+
+        let new_run_id = "run-generation-race-new".to_string();
+        artifact_service::create_run(
+            &db.conn,
+            artifact_service::NewTurnRun {
+                id: new_run_id.clone(),
+                conversation_id,
+                connection_id: "generation-race".into(),
+                client_message_id: Some("message-new".into()),
+                prompt_fingerprint: None,
+                folder_id: None,
+                root_path: "/tmp/cancel-manager".into(),
+                capture_incomplete: false,
+                input_paths_json: "[]".into(),
+                expectation_json: "{}".into(),
+            },
+        )
+        .await
+        .unwrap();
+        conversation_service::update_status(
+            &db.conn,
+            conversation_id,
+            ConversationStatus::InProgress,
+        )
+        .await
+        .unwrap();
+        {
+            let mut state = state.write().await;
+            state.status = ConnectionStatus::Prompting;
+            state.turn_in_flight = true;
+            state.active_turn_run_id = Some(new_run_id.clone());
+            state.active_turn_generation = Some(2);
+            state.last_activity_at = chrono::Utc::now();
+            state.last_agent_activity_at = chrono::Utc::now();
+            state.last_turn_progress_at = chrono::Utc::now();
+        }
+
+        assert_eq!(
+            mgr.reconcile_conversation_runs(&db.conn, conversation_id)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            mgr.reconcile_conversation_runs(&db.conn, conversation_id)
+                .await
+                .unwrap(),
+            1,
+            "only the superseded row is repaired after its own confirmation"
+        );
+        let old_run = conversation_turn_run::Entity::find_by_id(old_run_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let new_run = conversation_turn_run::Entity::find_by_id(new_run_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let conversation = conversation::Entity::find_by_id(conversation_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(old_run.status, ConversationTurnRunStatus::Interrupted);
+        assert_eq!(new_run.status, ConversationTurnRunStatus::Running);
+        assert_eq!(conversation.status, ConversationStatus::InProgress);
+        assert_eq!(
+            state.read().await.active_turn_run_id.as_deref(),
+            Some("run-generation-race-new")
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_reconciliation_finalizes_a_stale_run_once() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let mut mgr = ConnectionManager::new();
+        mgr.stale_run_timeout = Duration::ZERO;
+        mgr.stale_confirmation = Duration::ZERO;
+        let _rx = insert_live_connection(&mgr, "concurrent-stale", AgentType::Codex, None).await;
+        let (conversation_id, run_id) = seed_live_turn_run(&db, &mgr, "concurrent-stale").await;
+        mgr.connections.lock().await.remove("concurrent-stale");
+        let left = mgr.clone_ref();
+        let right = mgr.clone_ref();
+        let left_db = db.conn.clone();
+        let right_db = db.conn.clone();
+        let (left_count, right_count) = tokio::join!(
+            left.reconcile_conversation_runs(&left_db, conversation_id),
+            right.reconcile_conversation_runs(&right_db, conversation_id)
+        );
+        assert_eq!(left_count.unwrap() + right_count.unwrap(), 1);
+        let run = conversation_turn_run::Entity::find_by_id(run_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.status, ConversationTurnRunStatus::Interrupted);
     }
 
     #[tokio::test]
     async fn reconciliation_interrupts_orphaned_running_row() {
         let db = crate::db::test_helpers::fresh_in_memory_db().await;
-        let mgr = ConnectionManager::new();
+        let mut mgr = ConnectionManager::new();
+        mgr.stale_run_timeout = Duration::ZERO;
+        mgr.stale_confirmation = Duration::ZERO;
         let _rx = insert_live_connection(&mgr, "orphaned", AgentType::Codex, None).await;
         let (conversation_id, run_id) = seed_live_turn_run(&db, &mgr, "orphaned").await;
         mgr.connections.lock().await.remove("orphaned");
 
+        assert_eq!(
+            mgr.reconcile_conversation_runs(&db.conn, conversation_id)
+                .await
+                .unwrap(),
+            0,
+            "the first stale observation is diagnostic only"
+        );
         assert_eq!(
             mgr.reconcile_conversation_runs(&db.conn, conversation_id)
                 .await
@@ -6342,12 +7029,16 @@ mod tests {
         use crate::models::message::MessageRole;
 
         let db = crate::db::test_helpers::fresh_in_memory_db().await;
-        let mgr = ConnectionManager::new();
+        let mut mgr = ConnectionManager::new();
+        mgr.stale_run_timeout = Duration::ZERO;
+        mgr.stale_confirmation = Duration::ZERO;
         let _rx = insert_live_connection(&mgr, "blank-zombie", AgentType::Codex, None).await;
         let (conversation_id, run_id) = seed_live_turn_run(&db, &mgr, "blank-zombie").await;
         let state = mgr.get_state("blank-zombie").await.unwrap();
         {
             let mut state = state.write().await;
+            state.last_activity_at = chrono::Utc::now() - chrono::Duration::hours(1);
+            state.last_agent_activity_at = chrono::Utc::now() - chrono::Duration::hours(1);
             state.last_turn_progress_at = chrono::Utc::now() - chrono::Duration::hours(1);
             state.live_message = Some(LiveMessage {
                 id: "blank-live".into(),
@@ -6380,6 +7071,12 @@ mod tests {
             mgr.reconcile_conversation_runs(&db.conn, conversation_id)
                 .await
                 .unwrap(),
+            0
+        );
+        assert_eq!(
+            mgr.reconcile_conversation_runs(&db.conn, conversation_id)
+                .await
+                .unwrap(),
             1
         );
         let run = crate::db::entities::conversation_turn_run::Entity::find_by_id(run_id)
@@ -6396,6 +7093,47 @@ mod tests {
             Some("zombie_prompting_reconciled")
         );
         assert!(mgr.get_state("blank-zombie").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn reconciliation_eventually_closes_a_truly_silent_dead_prompt() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let mut mgr = ConnectionManager::new();
+        mgr.stale_run_timeout = Duration::ZERO;
+        mgr.stale_confirmation = Duration::ZERO;
+        let _rx = insert_live_connection(&mgr, "silent-zombie", AgentType::Codex, None).await;
+        let (conversation_id, run_id) = seed_live_turn_run(&db, &mgr, "silent-zombie").await;
+        let state = mgr.get_state("silent-zombie").await.unwrap();
+        {
+            let mut state = state.write().await;
+            state.last_activity_at = chrono::Utc::now() - chrono::Duration::hours(1);
+            state.last_agent_activity_at = chrono::Utc::now() - chrono::Duration::hours(1);
+            state.last_turn_progress_at = chrono::Utc::now() - chrono::Duration::hours(1);
+            state.live_message = None;
+        }
+
+        assert_eq!(
+            mgr.reconcile_conversation_runs(&db.conn, conversation_id)
+                .await
+                .unwrap(),
+            0,
+            "the first silent observation must never finalize a run"
+        );
+        assert_eq!(
+            mgr.reconcile_conversation_runs(&db.conn, conversation_id)
+                .await
+                .unwrap(),
+            1,
+            "an unchanged silent prompt is repairable after confirmation"
+        );
+        let run = conversation_turn_run::Entity::find_by_id(run_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.status, ConversationTurnRunStatus::Interrupted);
+        assert_eq!(run.stop_reason.as_deref(), Some("stale_run_reconciled"));
+        assert!(mgr.get_state("silent-zombie").await.is_none());
     }
 
     #[tokio::test]
