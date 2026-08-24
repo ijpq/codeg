@@ -1764,7 +1764,10 @@ export function MessageListView({
       >
         <MessageThread className="flex-1 min-h-0" resize={messageThreadResize}>
           <AutoScrollOnSend signal={sendSignal} />
-          <MessageBottomFollowGuard layoutSignal={bottomLayoutSignal} />
+          <MessageBottomFollowGuard
+            layoutSignal={bottomLayoutSignal}
+            scopeKey={conversationId}
+          />
           {(hasEarlierHistory || earlierHistoryError) &&
           onLoadEarlierHistory ? (
             <LoadEarlierHistoryControl
