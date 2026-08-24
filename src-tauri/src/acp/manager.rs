@@ -9859,7 +9859,11 @@ mod tests {
     async fn persisted_prompt_readiness_uses_restore_not_spawn_timeout() {
         let mut mgr =
             ConnectionManager::with_spawn_handshake_timeout(Duration::from_millis(20));
-        mgr.restore_timeout = Duration::from_millis(200);
+        // Keep the semantic gap large while leaving enough wall-clock margin
+        // for saturated macOS CI runners. The assertion is that readiness may
+        // arrive after the 20 ms spawn deadline but before the restore lease,
+        // not that Tokio timers fire within a sub-second benchmark budget.
+        mgr.restore_timeout = Duration::from_secs(3);
         let _rx = insert_live_connection(&mgr, "slow-resume", AgentType::Codex, None).await;
         {
             let state = mgr.get_state("slow-resume").await.unwrap();
@@ -9867,9 +9871,9 @@ mod tests {
         }
         let state = mgr.get_state("slow-resume").await.unwrap();
         tokio::spawn(async move {
-            // Three times the ordinary process-handshake deadline, standing in
+            // Five times the ordinary process-handshake deadline, standing in
             // for a >120s large rollout under the production 60s/300s policy.
-            tokio::time::sleep(Duration::from_millis(60)).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
             state.write().await.selectors_ready = true;
         });
 
