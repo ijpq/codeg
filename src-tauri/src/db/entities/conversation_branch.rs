@@ -21,6 +21,13 @@ pub struct Model {
     pub inheritance_truncated: bool,
     pub inheritance_note: Option<String>,
     pub forked_through_at: Option<DateTimeUtc>,
+    /// Durable EOF of the source rollout when native fork was accepted.
+    pub source_rollout_offset: Option<i64>,
+    /// Durable EOF of the child rollout after it was verified and before any
+    /// branch-authored prompt. Merge reads forward from this offset only.
+    pub branch_rollout_offset: Option<i64>,
+    /// exact_rollout_offset | inferred_bounded_tail
+    pub fork_boundary_kind: Option<String>,
     pub snapshot_version: i32,
     pub snapshot_images_json: Option<String>,
     pub snapshot_context: Option<String>,

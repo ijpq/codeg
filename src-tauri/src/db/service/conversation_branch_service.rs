@@ -53,6 +53,9 @@ pub struct ConversationBranchInfo {
     pub inheritance_truncated: bool,
     pub inheritance_note: Option<String>,
     pub forked_through_at: Option<chrono::DateTime<Utc>>,
+    pub source_rollout_offset: Option<i64>,
+    pub branch_rollout_offset: Option<i64>,
+    pub fork_boundary_kind: Option<String>,
     pub snapshot_version: i32,
     pub snapshot_consumed_at: Option<chrono::DateTime<Utc>>,
     pub lifecycle_state: String,
@@ -91,6 +94,9 @@ impl From<conversation_branch::Model> for ConversationBranchInfo {
             inheritance_truncated: value.inheritance_truncated,
             inheritance_note: value.inheritance_note,
             forked_through_at: value.forked_through_at,
+            source_rollout_offset: value.source_rollout_offset,
+            branch_rollout_offset: value.branch_rollout_offset,
+            fork_boundary_kind: value.fork_boundary_kind,
             snapshot_version: value.snapshot_version,
             snapshot_consumed_at: value.snapshot_consumed_at,
             lifecycle_state: value.lifecycle_state,
@@ -122,6 +128,9 @@ pub struct BranchInheritanceRecord {
     pub inheritance_truncated: bool,
     pub inheritance_note: Option<String>,
     pub forked_through_at: Option<chrono::DateTime<Utc>>,
+    pub source_rollout_offset: Option<i64>,
+    pub branch_rollout_offset: Option<i64>,
+    pub fork_boundary_kind: Option<String>,
     pub snapshot_version: i32,
     pub snapshot_context: Option<String>,
     pub snapshot_images: Vec<ImageData>,
@@ -293,6 +302,9 @@ pub async fn create_branch_row_with_operation(
                         inheritance_truncated: Set(inheritance.inheritance_truncated),
                         inheritance_note: Set(inheritance.inheritance_note),
                         forked_through_at: Set(inheritance.forked_through_at),
+                        source_rollout_offset: Set(inheritance.source_rollout_offset),
+                        branch_rollout_offset: Set(inheritance.branch_rollout_offset),
+                        fork_boundary_kind: Set(inheritance.fork_boundary_kind),
                         snapshot_version: Set(inheritance.snapshot_version),
                         snapshot_images_json: Set((!inheritance.snapshot_images.is_empty()).then(
                             || {
@@ -917,6 +929,9 @@ pub async fn repair_native_fork_relation(
         // virtually the entire inherited history, while using its current
         // message count could leak source turns written after the fork.
         forked_through_at: Set(Some(branch.created_at)),
+        source_rollout_offset: Set(None),
+        branch_rollout_offset: Set(None),
+        fork_boundary_kind: Set(None),
         snapshot_version: Set(2),
         snapshot_images_json: Set(None),
         snapshot_context: Set(None),
@@ -1034,6 +1049,78 @@ pub struct MergeBranchResult {
     pub target_conversation_id: i32,
     pub copied_deliverable_count: usize,
     pub deduplicated: bool,
+}
+
+/// Fast idempotency probe used before transcript extraction. Without this, a
+/// retried click on a successfully merged multi-gigabyte native branch would
+/// repeat the expensive read before `merge_branch` could discover the audit
+/// row inside its transaction lock.
+pub async fn existing_merge_result(
+    conn: &DatabaseConnection,
+    branch_conversation_id: i32,
+    request_id: &str,
+) -> Result<Option<MergeBranchResult>, DbError> {
+    if let Some(existing) = conversation_branch_merge::Entity::find_by_id(request_id.trim())
+        .one(conn)
+        .await?
+    {
+        let copied = serde_json::from_str::<Vec<String>>(&existing.deliverable_ids_json)
+            .unwrap_or_default()
+            .len();
+        return Ok(Some(MergeBranchResult {
+            merge_id: existing.id,
+            target_conversation_id: existing.target_conversation_id,
+            copied_deliverable_count: copied,
+            deduplicated: true,
+        }));
+    }
+    let Some(relation) = conversation_branch::Entity::find_by_id(branch_conversation_id)
+        .one(conn)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let Some(last_merge_key) = relation
+        .last_merge_key
+        .as_deref()
+        .filter(|_| relation.lifecycle_state == "merged")
+    else {
+        return Ok(None);
+    };
+    let Some(existing) = conversation_branch_merge::Entity::find_by_id(last_merge_key)
+        .one(conn)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let copied = serde_json::from_str::<Vec<String>>(&existing.deliverable_ids_json)
+        .unwrap_or_default()
+        .len();
+    Ok(Some(MergeBranchResult {
+        merge_id: existing.id,
+        target_conversation_id: existing.target_conversation_id,
+        copied_deliverable_count: copied,
+        deduplicated: true,
+    }))
+}
+
+pub async fn record_inferred_branch_boundary(
+    conn: &DatabaseConnection,
+    branch_conversation_id: i32,
+    branch_rollout_offset: i64,
+) -> Result<ConversationBranchInfo, DbError> {
+    let row = conversation_branch::Entity::find_by_id(branch_conversation_id)
+        .one(conn)
+        .await?
+        .ok_or_else(|| DbError::NotFound("conversation branch".into()))?;
+    if row.branch_rollout_offset.is_some() {
+        return Ok(row.into());
+    }
+    let mut active = row.into_active_model();
+    active.branch_rollout_offset = Set(Some(branch_rollout_offset));
+    active.fork_boundary_kind = Set(Some("inferred_bounded_tail".into()));
+    active.lifecycle_updated_at = Set(Some(Utc::now()));
+    Ok(active.update(conn).await?.into())
 }
 
 pub async fn merge_branch(
@@ -1485,6 +1572,9 @@ mod tests {
                 inheritance_truncated: false,
                 inheritance_note: None,
                 forked_through_at: None,
+                source_rollout_offset: None,
+                branch_rollout_offset: None,
+                fork_boundary_kind: None,
                 snapshot_version: 2,
                 snapshot_context: Some("User: hello".into()),
                 snapshot_images: Vec::new(),
@@ -1635,6 +1725,9 @@ mod tests {
             inheritance_truncated: false,
             inheritance_note: None,
             forked_through_at: None,
+            source_rollout_offset: None,
+            branch_rollout_offset: None,
+            fork_boundary_kind: None,
             snapshot_version: 2,
             snapshot_context: Some("context".into()),
             snapshot_images: Vec::new(),
@@ -1740,6 +1833,9 @@ mod tests {
                 inheritance_truncated: false,
                 inheritance_note: None,
                 forked_through_at: Some(Utc::now()),
+                source_rollout_offset: Some(123),
+                branch_rollout_offset: Some(456),
+                fork_boundary_kind: Some("exact_rollout_offset".into()),
                 snapshot_version: 2,
                 snapshot_context: None,
                 snapshot_images: Vec::new(),
@@ -1760,6 +1856,12 @@ mod tests {
         assert_eq!(
             relation.branch_session_id.as_deref(),
             Some("branch-session")
+        );
+        assert_eq!(relation.source_rollout_offset, Some(123));
+        assert_eq!(relation.branch_rollout_offset, Some(456));
+        assert_eq!(
+            relation.fork_boundary_kind.as_deref(),
+            Some("exact_rollout_offset")
         );
         assert!(
             native_branch_sessions_for_source(&db.conn, "source-session")
@@ -1795,6 +1897,9 @@ mod tests {
                 inheritance_truncated: false,
                 inheritance_note: None,
                 forked_through_at: None,
+                source_rollout_offset: None,
+                branch_rollout_offset: None,
+                fork_boundary_kind: None,
                 snapshot_version: 2,
                 snapshot_context: Some("important context".into()),
                 snapshot_images: Vec::new(),
@@ -1839,6 +1944,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_native_boundary_is_persisted_once_without_overwriting_exact_data() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/codeg-native-boundary-repair").await;
+        let source_id = seed_conversation(&db, folder_id, AgentType::Codex).await;
+        let source = conversation_service::get_by_id(&db.conn, source_id)
+            .await
+            .unwrap();
+        let (branch, _) = create_branch_row(
+            &db.conn,
+            &source,
+            Some("child-session".into()),
+            None,
+            "native",
+            BranchInheritanceRecord {
+                source_session_id: Some("source-session".into()),
+                branch_session_id: Some("child-session".into()),
+                inheritance_mode: "native_fork".into(),
+                inherited_message_count: 10,
+                inherited_context_chars: 0,
+                inherited_estimated_tokens: 0,
+                inheritance_compressed: false,
+                inheritance_truncated: false,
+                inheritance_note: None,
+                forked_through_at: Some(Utc::now()),
+                source_rollout_offset: None,
+                branch_rollout_offset: None,
+                fork_boundary_kind: None,
+                snapshot_version: 2,
+                snapshot_context: None,
+                snapshot_images: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let inferred = record_inferred_branch_boundary(&db.conn, branch.id, 900)
+            .await
+            .unwrap();
+        assert_eq!(inferred.branch_rollout_offset, Some(900));
+        assert_eq!(
+            inferred.fork_boundary_kind.as_deref(),
+            Some("inferred_bounded_tail")
+        );
+        let retry = record_inferred_branch_boundary(&db.conn, branch.id, 1000)
+            .await
+            .unwrap();
+        assert_eq!(retry.branch_rollout_offset, Some(900));
+    }
+
+    #[tokio::test]
     async fn merge_is_append_only_and_idempotent() {
         let db = fresh_in_memory_db().await;
         let folder_id = seed_folder(&db, "/tmp/codeg-branch-merge-test").await;
@@ -1863,6 +2018,9 @@ mod tests {
                 inheritance_truncated: false,
                 inheritance_note: None,
                 forked_through_at: None,
+                source_rollout_offset: None,
+                branch_rollout_offset: None,
+                fork_boundary_kind: None,
                 snapshot_version: 2,
                 snapshot_context: None,
                 snapshot_images: Vec::new(),
