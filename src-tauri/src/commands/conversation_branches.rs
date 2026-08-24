@@ -13,15 +13,22 @@ use crate::commands::conversation_branch_context::{
     build_branch_inheritance_snapshot, BranchInheritanceSnapshot,
 };
 use crate::commands::conversations::emit_conversation_upsert;
-use crate::commands::conversations::get_folder_conversation_core;
+use crate::commands::conversations::{
+    get_folder_conversation_core, get_folder_conversation_raw_core, strip_branch_merge_context,
+    strip_branch_snapshot_context,
+};
 use crate::db::service::{
     artifact_service, conversation_branch_service, conversation_service, folder_service,
 };
 use crate::db::AppDatabase;
+use crate::web::event_bridge::emit_event;
 use crate::web::event_bridge::EventEmitter;
 
 static BRANCH_CREATION_FLIGHTS: LazyLock<
     tokio::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+> = LazyLock::new(|| tokio::sync::Mutex::new(std::collections::HashMap::new()));
+static BRANCH_MERGE_FLIGHTS: LazyLock<
+    tokio::sync::Mutex<std::collections::HashMap<i32, Arc<tokio::sync::Mutex<()>>>>,
 > = LazyLock::new(|| tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
 async fn lock_branch_creation_request(request_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
@@ -34,6 +41,18 @@ async fn lock_branch_creation_request(request_id: &str) -> tokio::sync::OwnedMut
         flights.retain(|_, flight| Arc::strong_count(flight) > 1);
         flights
             .entry(request_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    };
+    lock.lock_owned().await
+}
+
+async fn lock_branch_merge(conversation_id: i32) -> tokio::sync::OwnedMutexGuard<()> {
+    let lock = {
+        let mut flights = BRANCH_MERGE_FLIGHTS.lock().await;
+        flights.retain(|_, flight| Arc::strong_count(flight) > 1);
+        flights
+            .entry(conversation_id)
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
     };
@@ -93,6 +112,9 @@ fn inheritance_record(
     source_session_id: Option<String>,
     branch_session_id: Option<String>,
     snapshot_context: Option<String>,
+    source_rollout_offset: Option<i64>,
+    branch_rollout_offset: Option<i64>,
+    fork_boundary_kind: Option<String>,
 ) -> conversation_branch_service::BranchInheritanceRecord {
     conversation_branch_service::BranchInheritanceRecord {
         source_session_id,
@@ -105,10 +127,74 @@ fn inheritance_record(
         inheritance_truncated: snapshot.truncated,
         inheritance_note: snapshot.note.clone(),
         forked_through_at: snapshot.forked_through_at,
+        source_rollout_offset,
+        branch_rollout_offset,
+        fork_boundary_kind,
         snapshot_version: snapshot.snapshot_version,
         snapshot_context,
         snapshot_images: snapshot.images.clone(),
     }
+}
+
+#[derive(Debug)]
+struct NativeForkBoundary {
+    fork_message_id: Option<String>,
+    forked_through_at: chrono::DateTime<chrono::Utc>,
+    source_rollout_offset: Option<i64>,
+    branch_rollout_offset: Option<i64>,
+    kind: String,
+}
+
+fn checked_rollout_offset(offset: u64) -> Result<i64, AcpError> {
+    i64::try_from(offset)
+        .map_err(|_| AcpError::protocol("Codex rollout offset exceeds SQLite INTEGER range"))
+}
+
+async fn capture_codex_source_boundary(
+    session_id: String,
+    cwd: String,
+) -> Result<(Option<String>, chrono::DateTime<chrono::Utc>, i64), AcpError> {
+    tokio::task::spawn_blocking(move || {
+        let parser = crate::parsers::codex::CodexParser::new();
+        let offset = checked_rollout_offset(
+            parser
+                .rollout_len(&session_id)
+                .map_err(|error| AcpError::protocol(error.to_string()))?,
+        )?;
+        // The byte offset is the authoritative boundary. Resolving a friendly
+        // visible turn id is deliberately bounded as well: a final tool record
+        // can be huge, and branch creation must never parse an unbounded tail
+        // merely to decorate the offset.
+        let page = parser
+            .get_conversation_page_bounded(&session_id, None, 1, Some(cwd), 16 * 1024 * 1024)
+            .ok();
+        let boundary = page.as_ref().and_then(|page| page.detail.turns.last());
+        Ok((
+            Some(
+                boundary
+                    .map(|turn| turn.id.clone())
+                    .unwrap_or_else(|| format!("codex-rollout-offset-{offset}")),
+            ),
+            boundary
+                .map(|turn| turn.timestamp)
+                .unwrap_or_else(chrono::Utc::now),
+            offset,
+        ))
+    })
+    .await
+    .map_err(|error| AcpError::protocol(format!("Codex boundary task failed: {error}")))?
+}
+
+async fn capture_codex_rollout_offset(session_id: String) -> Result<i64, AcpError> {
+    tokio::task::spawn_blocking(move || {
+        checked_rollout_offset(
+            crate::parsers::codex::CodexParser::new()
+                .rollout_len(&session_id)
+                .map_err(|error| AcpError::protocol(error.to_string()))?,
+        )
+    })
+    .await
+    .map_err(|error| AcpError::protocol(format!("Codex boundary task failed: {error}")))?
 }
 
 fn ensure_independent_fork_session(
@@ -341,7 +427,7 @@ pub async fn create_conversation_branch_core(
     let fallback_reason;
     if native_candidate {
         let session_id = source.external_id.clone().unwrap_or_default();
-        let native_attempt: Result<(String, String), AcpError> = async {
+        let native_attempt: Result<(String, String, NativeForkBoundary), AcpError> = async {
             // One durable Codex thread may have only one writer.  Serialize the
             // whole handoff by external session id, fork on the current writer
             // when it exists, and retire that adapter before loading S2 in a
@@ -354,6 +440,13 @@ pub async fn create_conversation_branch_core(
                     &session_id,
                 )
                 .await?;
+            let source_boundary = if source.agent_type == crate::models::AgentType::Codex {
+                let (fork_message_id, forked_through_at, source_rollout_offset) =
+                    capture_codex_source_boundary(session_id.clone(), folder.path.clone()).await?;
+                Some((fork_message_id, forked_through_at, source_rollout_offset))
+            } else {
+                None
+            };
             let source_connection_id =
                 if let Some(connection_id) = idle_source_connection_id.clone() {
                     connection_id
@@ -420,11 +513,32 @@ pub async fn create_conversation_branch_core(
                     request.preferred_config_values.clone(),
                 )
                 .await?;
-            Ok((branch_connection_id, branch_session_id))
+            let boundary = if let Some((fork_message_id, forked_through_at, source_offset)) =
+                source_boundary
+            {
+                NativeForkBoundary {
+                    fork_message_id,
+                    forked_through_at,
+                    source_rollout_offset: Some(source_offset),
+                    branch_rollout_offset: Some(
+                        capture_codex_rollout_offset(branch_session_id.clone()).await?,
+                    ),
+                    kind: "exact_rollout_offset".into(),
+                }
+            } else {
+                NativeForkBoundary {
+                    fork_message_id: None,
+                    forked_through_at: chrono::Utc::now(),
+                    source_rollout_offset: None,
+                    branch_rollout_offset: None,
+                    kind: "agent_timestamp_boundary".into(),
+                }
+            };
+            Ok((branch_connection_id, branch_session_id, boundary))
         }
         .await;
         match native_attempt {
-            Ok((connection_id, forked_session_id)) => {
+            Ok((connection_id, forked_session_id, boundary)) => {
                 let inherited_message_count =
                     i32::try_from(source.message_count).unwrap_or(i32::MAX);
                 let persisted = conversation_branch_service::create_branch_row_with_operation(
@@ -433,7 +547,7 @@ pub async fn create_conversation_branch_core(
                     creation_request_id.clone(),
                     operation_id.clone(),
                     Some(forked_session_id.clone()),
-                    None,
+                    boundary.fork_message_id.clone(),
                     "native",
                     inheritance_record(
                         &BranchInheritanceSnapshot {
@@ -450,14 +564,17 @@ pub async fn create_conversation_branch_core(
                                 "ACP session/fork created an independent session with the complete native context."
                                     .into(),
                             ),
-                            fork_message_id: None,
-                            forked_through_at: Some(chrono::Utc::now()),
+                            fork_message_id: boundary.fork_message_id.clone(),
+                            forked_through_at: Some(boundary.forked_through_at),
                             snapshot_version: 2,
                             images: Vec::new(),
                         },
                         source.external_id.clone(),
                         Some(forked_session_id.clone()),
                         None,
+                        boundary.source_rollout_offset,
+                        boundary.branch_rollout_offset,
+                        Some(boundary.kind.clone()),
                     ),
                 )
                 .await;
@@ -505,6 +622,10 @@ pub async fn create_conversation_branch_core(
                     branch_conversation_id = branch.id,
                     source_session_id = source.external_id,
                     branch_session_id = forked_session_id,
+                    fork_message_id = ?boundary.fork_message_id,
+                    source_rollout_offset = ?boundary.source_rollout_offset,
+                    branch_rollout_offset = ?boundary.branch_rollout_offset,
+                    fork_boundary_kind = boundary.kind,
                     connection_id,
                     mapping_strategy = "immutable_source_detached_writer_handoff",
                     queue_state_before = "creating",
@@ -676,6 +797,9 @@ pub async fn create_conversation_branch_core(
             source.external_id.clone(),
             None,
             Some(snapshot),
+            None,
+            None,
+            Some("snapshot_message_boundary".into()),
         ),
     )
     .await
@@ -720,7 +844,262 @@ pub async fn create_conversation_branch_core(
     })
 }
 
-pub async fn merge_conversation_branch_core(
+const BRANCH_MERGE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const BRANCH_MERGE_MAX_TURNS: usize = 2_000;
+const BRANCH_MERGE_PAGE_USER_TURNS: usize = 16;
+const BRANCH_MERGE_PARSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
+pub const BRANCH_MERGE_PROGRESS_EVENT: &str = "conversation-branch://merge-progress";
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BranchMergeProgress<'a> {
+    branch_conversation_id: i32,
+    request_id: &'a str,
+    stage: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<&'a str>,
+}
+
+fn emit_branch_merge_progress(
+    emitter: &EventEmitter,
+    branch_conversation_id: i32,
+    request_id: &str,
+    stage: &str,
+    error: Option<&str>,
+) {
+    emit_event(
+        emitter,
+        BRANCH_MERGE_PROGRESS_EVENT,
+        BranchMergeProgress {
+            branch_conversation_id,
+            request_id,
+            stage,
+            error,
+        },
+    );
+}
+
+#[derive(Debug)]
+struct BranchMergeIncrement {
+    turns: Vec<crate::models::MessageTurn>,
+    start_offset: Option<u64>,
+    end_offset: Option<u64>,
+    bytes_read: u64,
+    boundary_kind: String,
+}
+
+fn merge_boundary_error(message: impl Into<String>) -> AppCommandError {
+    AppCommandError::task_execution_failed(format!(
+        "Branch merge could not determine a reliable fork boundary: {}. The branch was preserved; retry after repairing its boundary.",
+        message.into()
+    ))
+}
+
+async fn load_codex_merge_increment(
+    relation: &conversation_branch_service::ConversationBranchInfo,
+    branch_session_id: String,
+    cwd: String,
+) -> Result<BranchMergeIncrement, AppCommandError> {
+    let relation = relation.clone();
+    let task = tokio::task::spawn_blocking(move || {
+        let parser = crate::parsers::codex::CodexParser::new();
+        if let Some(saved_offset) = relation.branch_rollout_offset {
+            let saved_offset = u64::try_from(saved_offset)
+                .map_err(|_| merge_boundary_error("the saved branch rollout offset is negative"))?;
+            let range = parser
+                .get_conversation_range(
+                    &branch_session_id,
+                    saved_offset,
+                    BRANCH_MERGE_MAX_BYTES,
+                    Some(cwd),
+                )
+                .map_err(|error| merge_boundary_error(error.to_string()))?;
+            let mut turns = range.detail.turns;
+            if relation.fork_boundary_kind.as_deref() == Some("inferred_bounded_tail") {
+                let boundary = relation.forked_through_at.ok_or_else(|| {
+                    merge_boundary_error("the inferred boundary has no timestamp guard")
+                })?;
+                turns.retain(|turn| turn.timestamp > boundary);
+            }
+            if turns.len() > BRANCH_MERGE_MAX_TURNS {
+                return Err(merge_boundary_error(format!(
+                    "the branch delta contains {} visible turns, exceeding the safe limit of {BRANCH_MERGE_MAX_TURNS}",
+                    turns.len()
+                )));
+            }
+            return Ok(BranchMergeIncrement {
+                bytes_read: range.end_offset.saturating_sub(range.start_offset),
+                start_offset: Some(range.start_offset),
+                end_offset: Some(range.end_offset),
+                turns,
+                boundary_kind: relation
+                    .fork_boundary_kind
+                    .unwrap_or_else(|| "saved_rollout_offset".into()),
+            });
+        }
+
+        if relation.fork_mode != "native" {
+            let file_len = parser
+                .rollout_len(&branch_session_id)
+                .map_err(|error| merge_boundary_error(error.to_string()))?;
+            let range = parser
+                .get_conversation_range(&branch_session_id, 0, BRANCH_MERGE_MAX_BYTES, Some(cwd))
+                .map_err(|error| merge_boundary_error(error.to_string()))?;
+            if range.detail.turns.len() > BRANCH_MERGE_MAX_TURNS {
+                return Err(merge_boundary_error(format!(
+                    "the snapshot branch contains {} visible turns, exceeding the safe limit of {BRANCH_MERGE_MAX_TURNS}",
+                    range.detail.turns.len()
+                )));
+            }
+            return Ok(BranchMergeIncrement {
+                turns: range.detail.turns,
+                start_offset: Some(0),
+                end_offset: Some(file_len),
+                bytes_read: file_len,
+                boundary_kind: "snapshot_rollout_start".into(),
+            });
+        }
+
+        let boundary = relation.forked_through_at.ok_or_else(|| {
+            merge_boundary_error("legacy native fork has neither an offset nor forked_through_at")
+        })?;
+        let parent = crate::parsers::codex::native_fork_parent_session_id(&branch_session_id)
+            .ok_or_else(|| {
+                merge_boundary_error(
+                    "the child rollout does not declare a native-fork parent session",
+                )
+            })?;
+        if relation.source_session_id.as_deref() != Some(parent.as_str()) {
+            return Err(merge_boundary_error(
+                "the child rollout parent does not match the persisted source session",
+            ));
+        }
+
+        // Legacy rows have no exact child EOF. Walk backwards in directly
+        // seekable 16-user-turn pages until one crosses the creation boundary.
+        // The scan stops at both a byte and visible-turn ceiling; it can recover
+        // a two-round delta from a multi-gigabyte inherited rollout without
+        // touching the inherited prefix.
+        let mut before_offset = None;
+        let mut scanned_bytes = 0u64;
+        let mut scanned_turns = 0usize;
+        let mut pages = Vec::new();
+        let inferred_start = loop {
+            let remaining = BRANCH_MERGE_MAX_BYTES.saturating_sub(scanned_bytes);
+            if remaining == 0 || scanned_turns >= BRANCH_MERGE_MAX_TURNS {
+                return Err(merge_boundary_error(format!(
+                    "no timestamp seam was found within {scanned_bytes} bytes and {scanned_turns} visible turns"
+                )));
+            }
+            let page = parser
+                .get_conversation_page_bounded(
+                    &branch_session_id,
+                    before_offset,
+                    BRANCH_MERGE_PAGE_USER_TURNS,
+                    Some(cwd.clone()),
+                    remaining,
+                )
+                .map_err(|error| merge_boundary_error(error.to_string()))?;
+            let page_bytes = page.end_offset.saturating_sub(page.start_offset);
+            scanned_bytes = scanned_bytes.saturating_add(page_bytes);
+            scanned_turns = scanned_turns.saturating_add(page.detail.turns.len());
+            let crosses_boundary = page
+                .detail
+                .turns
+                .iter()
+                .any(|turn| turn.timestamp <= boundary);
+            let start_offset = page.start_offset;
+            let has_more = page.has_more;
+            pages.push(page.detail.turns);
+            if crosses_boundary || !has_more {
+                break start_offset;
+            }
+            before_offset = Some(start_offset);
+        };
+        pages.reverse();
+        let mut turns = pages.into_iter().flatten().collect::<Vec<_>>();
+        turns.retain(|turn| turn.timestamp > boundary);
+        if turns.len() > BRANCH_MERGE_MAX_TURNS {
+            return Err(merge_boundary_error(format!(
+                "the inferred branch delta contains {} visible turns, exceeding the safe limit",
+                turns.len()
+            )));
+        }
+        let end_offset = parser
+            .rollout_len(&branch_session_id)
+            .map_err(|error| merge_boundary_error(error.to_string()))?;
+        Ok(BranchMergeIncrement {
+            turns,
+            start_offset: Some(inferred_start),
+            end_offset: Some(end_offset),
+            bytes_read: scanned_bytes,
+            boundary_kind: "inferred_bounded_tail".into(),
+        })
+    });
+    tokio::time::timeout(BRANCH_MERGE_PARSE_TIMEOUT, task)
+        .await
+        .map_err(|_| {
+            merge_boundary_error(format!(
+                "bounded transcript extraction exceeded {} seconds",
+                BRANCH_MERGE_PARSE_TIMEOUT.as_secs()
+            ))
+        })?
+        .map_err(|error| {
+            merge_boundary_error(format!("bounded transcript task stopped: {error}"))
+        })?
+}
+
+async fn load_branch_merge_increment(
+    db: &AppDatabase,
+    relation: &conversation_branch_service::ConversationBranchInfo,
+) -> Result<BranchMergeIncrement, AppCommandError> {
+    let branch = conversation_service::get_by_id(&db.conn, relation.branch_conversation_id)
+        .await
+        .map_err(AppCommandError::from)?;
+    let folder = folder_service::get_folder_by_id(&db.conn, branch.folder_id)
+        .await
+        .map_err(AppCommandError::from)?
+        .ok_or_else(|| AppCommandError::not_found("Branch folder was not found"))?;
+    let session_id = relation
+        .branch_session_id
+        .as_deref()
+        .or(branch.external_id.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    let mut increment = if branch.agent_type == crate::models::AgentType::Codex {
+        let session_id = session_id
+            .ok_or_else(|| merge_boundary_error("the branch has no verified Codex session ID"))?;
+        load_codex_merge_increment(relation, session_id, folder.path).await?
+    } else {
+        let (detail, _) = tokio::time::timeout(
+            BRANCH_MERGE_PARSE_TIMEOUT,
+            get_folder_conversation_raw_core(&db.conn, branch.id),
+        )
+        .await
+        .map_err(|_| merge_boundary_error("branch transcript extraction timed out"))??;
+        if detail.turns.len() > BRANCH_MERGE_MAX_TURNS {
+            return Err(merge_boundary_error(format!(
+                "the branch contains {} visible turns, exceeding the safe limit",
+                detail.turns.len()
+            )));
+        }
+        BranchMergeIncrement {
+            turns: detail.turns,
+            start_offset: None,
+            end_offset: None,
+            bytes_read: 0,
+            boundary_kind: "agent_local_transcript".into(),
+        }
+    };
+    if relation.fork_mode == "snapshot" {
+        strip_branch_snapshot_context(&mut increment.turns);
+    }
+    strip_branch_merge_context(&mut increment.turns);
+    Ok(increment)
+}
+
+async fn merge_conversation_branch_impl(
     db: &AppDatabase,
     manager: &ConnectionManager,
     emitter: &EventEmitter,
@@ -732,6 +1111,34 @@ pub async fn merge_conversation_branch_core(
         merge_request_id = request_id,
         stage = "branch_merge_started",
         "[ACP][branch] one-click return to source started"
+    );
+    let _merge_guard = lock_branch_merge(branch_conversation_id).await;
+    if let Some(existing) = conversation_branch_service::existing_merge_result(
+        &db.conn,
+        branch_conversation_id,
+        &request_id,
+    )
+    .await
+    .map_err(AppCommandError::from)?
+    {
+        return Ok(existing);
+    }
+    let relation = conversation_branch_service::get_info(&db.conn, branch_conversation_id)
+        .await
+        .map_err(AppCommandError::from)?
+        .ok_or_else(|| AppCommandError::not_found("Conversation branch was not found"))?;
+    if relation.lifecycle_state != "ready" {
+        return Err(AppCommandError::task_execution_failed(format!(
+            "The branch is not ready to merge (state: {})",
+            relation.lifecycle_state
+        )));
+    }
+    emit_branch_merge_progress(
+        emitter,
+        branch_conversation_id,
+        &request_id,
+        "stopping_branch",
+        None,
     );
     manager
         .reconcile_conversation_runs(&db.conn, branch_conversation_id)
@@ -785,15 +1192,59 @@ pub async fn merge_conversation_branch_core(
         ));
     }
 
-    let (detail, _) = get_folder_conversation_core(&db.conn, branch_conversation_id).await?;
-    let inherited = detail
-        .branch_history
-        .as_ref()
-        .map_or(0, |history| history.inherited_turn_count)
-        .min(detail.turns.len());
-    let branch_title = detail.summary.title.as_deref().unwrap_or("未命名分支");
+    emit_branch_merge_progress(
+        emitter,
+        branch_conversation_id,
+        &request_id,
+        "determining_boundary",
+        None,
+    );
+    emit_branch_merge_progress(
+        emitter,
+        branch_conversation_id,
+        &request_id,
+        "extracting_increment",
+        None,
+    );
+    let extraction_started = std::time::Instant::now();
+    let increment = load_branch_merge_increment(db, &relation).await?;
+    if relation.branch_rollout_offset.is_none()
+        && increment.boundary_kind == "inferred_bounded_tail"
+    {
+        let inferred_offset = increment
+            .start_offset
+            .and_then(|offset| i64::try_from(offset).ok())
+            .ok_or_else(|| merge_boundary_error("the inferred offset cannot be persisted"))?;
+        conversation_branch_service::record_inferred_branch_boundary(
+            &db.conn,
+            branch_conversation_id,
+            inferred_offset,
+        )
+        .await
+        .map_err(AppCommandError::from)?;
+    }
+    tracing::info!(
+        branch_conversation_id,
+        source_conversation_id = relation.source_conversation_id,
+        merge_request_id = request_id,
+        fork_message_id = ?relation.fork_message_id,
+        forked_through_at = ?relation.forked_through_at,
+        start_offset = ?increment.start_offset,
+        end_offset = ?increment.end_offset,
+        bytes_read = increment.bytes_read,
+        loaded_turns = increment.turns.len(),
+        bounded_history = true,
+        boundary_kind = increment.boundary_kind,
+        elapsed_ms = extraction_started.elapsed().as_millis() as u64,
+        stage = "branch_delta_extracted",
+        "[ACP][branch] bounded merge increment extracted"
+    );
+    let branch = conversation_service::get_by_id(&db.conn, branch_conversation_id)
+        .await
+        .map_err(AppCommandError::from)?;
+    let branch_title = branch.title.as_deref().unwrap_or("未命名分支");
     let mut sections = Vec::new();
-    for turn in detail.turns.iter().skip(inherited) {
+    for turn in &increment.turns {
         let text = turn
             .blocks
             .iter()
@@ -817,11 +1268,10 @@ pub async fn merge_conversation_branch_core(
     }
     let mut seen_changes = std::collections::HashSet::new();
     let mut file_changes = Vec::new();
-    for run in detail
-        .artifact_runs
-        .iter()
-        .filter(|run| run.conversation_id == branch_conversation_id)
-    {
+    let artifact_runs = artifact_service::list_for_conversation(&db.conn, branch_conversation_id)
+        .await
+        .map_err(AppCommandError::from)?;
+    for run in &artifact_runs {
         for change in &run.changes {
             let path = change.path.trim();
             if path.is_empty() {
@@ -855,6 +1305,13 @@ pub async fn merge_conversation_branch_core(
         } else {
             sections.join("\n\n")
         }
+    );
+    emit_branch_merge_progress(
+        emitter,
+        branch_conversation_id,
+        &request_id,
+        "writing_source",
+        None,
     );
     let result = conversation_branch_service::merge_branch(
         &db.conn,
@@ -899,6 +1356,57 @@ pub async fn merge_conversation_branch_core(
         "[ACP][branch] one-click return to source committed"
     );
     Ok(result)
+}
+
+pub async fn merge_conversation_branch_core(
+    db: &AppDatabase,
+    manager: &ConnectionManager,
+    emitter: &EventEmitter,
+    branch_conversation_id: i32,
+    request_id: String,
+) -> Result<conversation_branch_service::MergeBranchResult, AppCommandError> {
+    emit_branch_merge_progress(
+        emitter,
+        branch_conversation_id,
+        &request_id,
+        "started",
+        None,
+    );
+    let result = merge_conversation_branch_impl(
+        db,
+        manager,
+        emitter,
+        branch_conversation_id,
+        request_id.clone(),
+    )
+    .await;
+    match &result {
+        Ok(_) => emit_branch_merge_progress(
+            emitter,
+            branch_conversation_id,
+            &request_id,
+            "completed",
+            None,
+        ),
+        Err(error) => {
+            let message = error.to_string();
+            emit_branch_merge_progress(
+                emitter,
+                branch_conversation_id,
+                &request_id,
+                "failed",
+                Some(&message),
+            );
+            tracing::warn!(
+                branch_conversation_id,
+                merge_request_id = request_id,
+                error = %message,
+                stage = "branch_merge_failed",
+                "[ACP][branch] one-click return to source failed without committing"
+            );
+        }
+    }
+    result
 }
 
 pub async fn get_conversation_branch_info_core(

@@ -2998,6 +2998,9 @@ export interface ConversationBranchInfo {
   inheritanceTruncated: boolean
   inheritanceNote?: string | null
   forkedThroughAt?: string | null
+  sourceRolloutOffset?: number | null
+  branchRolloutOffset?: number | null
+  forkBoundaryKind?: string | null
   snapshotVersion: number
   snapshotConsumedAt?: string | null
   lifecycleState: string
@@ -3053,7 +3056,7 @@ export async function mergeConversationBranch(params: {
       branchConversationId: params.branchConversationId,
       requestId: params.requestId,
     },
-    { timeoutMs: 60_000 }
+    { timeoutMs: 90_000 }
   )
 }
 

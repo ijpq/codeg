@@ -1681,7 +1681,14 @@ async fn get_folder_conversation_raw_impl(
     ))
 }
 
-fn strip_branch_snapshot_context(turns: &mut [MessageTurn]) {
+pub(crate) async fn get_folder_conversation_raw_core(
+    conn: &sea_orm::DatabaseConnection,
+    conversation_id: i32,
+) -> Result<(DbConversationDetail, Option<String>), AppCommandError> {
+    get_folder_conversation_raw_impl(conn, conversation_id, None).await
+}
+
+pub(crate) fn strip_branch_snapshot_context(turns: &mut [MessageTurn]) {
     let Some(first_user) = turns
         .iter_mut()
         .find(|turn| matches!(turn.role, TurnRole::User))
@@ -1702,7 +1709,7 @@ fn strip_branch_snapshot_context(turns: &mut [MessageTurn]) {
     });
 }
 
-fn strip_branch_merge_context(turns: &mut [MessageTurn]) {
+pub(crate) fn strip_branch_merge_context(turns: &mut [MessageTurn]) {
     for turn in turns
         .iter_mut()
         .filter(|turn| matches!(turn.role, TurnRole::User))
