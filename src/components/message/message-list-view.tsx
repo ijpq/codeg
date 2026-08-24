@@ -48,7 +48,6 @@ import {
   AlertCircle,
   CheckIcon,
   CopyIcon,
-  Info,
   GitBranch,
   Loader2,
   Plus,
@@ -1508,10 +1507,7 @@ export function MessageListView({
         ref={selectionBoxRef}
         className="relative flex h-full min-h-0 flex-col"
       >
-        <MessageThread
-          className="flex-1 min-h-0"
-          resize={messageThreadResize}
-        >
+        <MessageThread className="flex-1 min-h-0" resize={messageThreadResize}>
           <AutoScrollOnSend signal={sendSignal} />
           <MessageBottomFollowGuard layoutSignal={bottomLayoutSignal} />
           {(hasEarlierHistory || earlierHistoryError) &&
