@@ -1,4 +1,10 @@
-import { useMemo, type ReactNode } from "react"
+import {
+  useCallback,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  type ReactNode,
+} from "react"
 import { useTranslations } from "next-intl"
 import type {
   AgentType,
@@ -135,6 +141,22 @@ interface ConversationShellProps {
   onInjectConsumed?: () => void
 }
 
+export function publishConversationDockHeight(
+  shell: HTMLElement,
+  dock: HTMLElement
+): number {
+  const height = Math.max(0, dock.getBoundingClientRect().height)
+  const next = `${height}px`
+  if (
+    shell.style.getPropertyValue("--codeg-conversation-bottom-dock-height") !==
+    next
+  ) {
+    shell.style.setProperty("--codeg-conversation-bottom-dock-height", next)
+  }
+  shell.dataset.bottomDockHeight = String(height)
+  return height
+}
+
 export function ConversationShell({
   status,
   promptCapabilities,
@@ -198,6 +220,34 @@ export function ConversationShell({
   injectContent,
   onInjectConsumed,
 }: ConversationShellProps) {
+  const shellRef = useRef<HTMLDivElement>(null)
+  const bottomDockRef = useRef<HTMLDivElement>(null)
+
+  const publishBottomDockGeometry = useCallback(() => {
+    const shell = shellRef.current
+    const dock = bottomDockRef.current
+    if (!shell || !dock) return
+    publishConversationDockHeight(shell, dock)
+  }, [])
+
+  useLayoutEffect(() => {
+    const dock = bottomDockRef.current
+    if (!dock) return
+
+    const observer = new ResizeObserver(publishBottomDockGeometry)
+    observer.observe(dock)
+    publishBottomDockGeometry()
+
+    const onViewportResize = () => publishBottomDockGeometry()
+    window.addEventListener("resize", onViewportResize)
+    window.visualViewport?.addEventListener("resize", onViewportResize)
+    return () => {
+      observer.disconnect()
+      window.removeEventListener("resize", onViewportResize)
+      window.visualViewport?.removeEventListener("resize", onViewportResize)
+    }
+  }, [publishBottomDockGeometry])
+
   const tAcp = useTranslations("Folder.chat.acpConnections")
   const retryLineText = useMemo(() => {
     const retry = claudeApiRetry
@@ -271,7 +321,11 @@ export function ConversationShell({
   }, [claudeApiRetry, tAcp])
 
   return (
-    <div className="relative flex h-full min-h-0 flex-col">
+    <div
+      ref={shellRef}
+      data-conversation-shell
+      className="relative flex h-full min-h-0 flex-col"
+    >
       {topBanner}
       <div className="flex-1 min-h-0">{children}</div>
 
@@ -282,116 +336,125 @@ export function ConversationShell({
 
       <QuestionDialog question={pendingQuestion} onAnswer={onAnswerQuestion} />
 
-      {/* Composer dock. The ask-question card sits in normal flow just above the
-          feedback list and input — like the permission/question dialogs — so it
-          shrinks the message list instead of covering it, while staying aligned
-          to the input width. */}
-      <div>
-        {pendingAskQuestion && pendingAskQuestion.questions.length > 0 && (
-          <div className="mx-auto w-full max-w-3xl px-4">
-            <AskQuestionCard
-              question={pendingAskQuestion}
-              onAnswer={onAnswerAskQuestion}
-            />
-          </div>
+      {/* One measured bottom surface. The transcript consumes this live geometry
+          instead of assuming a textarea height: queue rows, approval cards,
+          status/failure strips and the editor can all resize independently. */}
+      <div
+        ref={bottomDockRef}
+        data-conversation-bottom-dock
+        className="shrink-0"
+      >
+        {/* Composer dock. The ask-question card sits in normal flow just above
+            the feedback list and input, so the message viewport normally
+            shrinks rather than being covered. The geometry guard also handles
+            embedded/future layouts where the dock overlaps the viewport. */}
+        <div>
+          {pendingAskQuestion && pendingAskQuestion.questions.length > 0 && (
+            <div className="mx-auto w-full max-w-3xl px-4">
+              <AskQuestionCard
+                question={pendingAskQuestion}
+                onAnswer={onAnswerAskQuestion}
+              />
+            </div>
+          )}
+          {pendingPlanApproval && (
+            <div className="mx-auto w-full max-w-3xl px-4">
+              {/* key on approval_id so the card always remounts (fresh in-flight /
+                  feedback state) if the slot is ever reused for a new approval. */}
+              <PlanApprovalCard
+                key={pendingPlanApproval.approval_id}
+                approval={pendingPlanApproval}
+                onAnswer={onAnswerPlanApproval}
+              />
+            </div>
+          )}
+
+          {composerBanner && (
+            <div className="mx-auto w-full max-w-3xl px-4 pb-2">
+              {composerBanner}
+            </div>
+          )}
+
+          {!hideInput && feedbackList && (
+            <div className="mx-auto w-full max-w-3xl px-4">{feedbackList}</div>
+          )}
+
+          {!hideInput && (
+            <div className="mx-auto w-full max-w-3xl">
+              <ChatInput
+                status={status}
+                promptCapabilities={promptCapabilities}
+                defaultPath={defaultPath}
+                agentName={agentName}
+                onFocus={onFocus}
+                onSend={onSend}
+                supportsSteer={supportsSteer}
+                onGuide={onGuide}
+                onCancel={onCancel}
+                modes={modes}
+                configOptions={configOptions}
+                modeLoading={modeLoading}
+                configOptionsLoading={configOptionsLoading}
+                selectorsLoading={selectorsLoading}
+                selectedModeId={selectedModeId}
+                onModeChange={onModeChange}
+                onConfigOptionChange={onConfigOptionChange}
+                agentType={agentType}
+                availableCommands={availableCommands}
+                attachmentTabId={attachmentTabId}
+                draftStorageKey={draftStorageKey}
+                isActive={isActive}
+                showActiveFlow={showActiveFlow}
+                queue={queue}
+                onEnqueue={onEnqueue}
+                onQueueReorder={onQueueReorder}
+                onQueueEdit={onQueueEdit}
+                onQueueDelete={onQueueDelete}
+                onQueueRetry={onQueueRetry}
+                onConvertGuideToPrompt={onConvertGuideToPrompt}
+                editingItemId={editingItemId}
+                editingDraftText={editingDraftText}
+                editingDraftBlocks={editingDraftBlocks}
+                isEditingQueueItem={isEditingQueueItem}
+                onSaveQueueEdit={onSaveQueueEdit}
+                onCancelQueueEdit={onCancelQueueEdit}
+                onForkSend={onForkSend}
+                onSteer={onSteer}
+                allowOfflineCompose={allowOfflineCompose}
+                onAddFeedback={onAddFeedback}
+                feedbackAddDisabled={feedbackAddDisabled}
+                injectContent={injectContent}
+                onInjectConsumed={onInjectConsumed}
+              />
+            </div>
+          )}
+        </div>
+
+        {sessionFailures && sessionFailures.length > 0 && (
+          <SessionFailureBanner
+            failures={sessionFailures}
+            onAction={onSessionFailureAction}
+            onDismiss={onSessionFailureDismiss}
+          />
         )}
-        {pendingPlanApproval && (
-          <div className="mx-auto w-full max-w-3xl px-4">
-            {/* key on approval_id so the card always remounts (fresh in-flight /
-                feedback state) if the slot is ever reused for a new approval. */}
-            <PlanApprovalCard
-              key={pendingPlanApproval.approval_id}
-              approval={pendingPlanApproval}
-              onAnswer={onAnswerPlanApproval}
-            />
+
+        {retryLineText && (
+          <div className="border-t border-destructive/20 bg-destructive/5 px-4 py-2 text-xs text-destructive">
+            <div className="flex items-center gap-2 font-medium">
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              <span className="min-w-0 overflow-hidden text-ellipsis whitespace-nowrap">
+                {retryLineText}
+              </span>
+            </div>
           </div>
         )}
 
-        {composerBanner && (
-          <div className="mx-auto w-full max-w-3xl px-4 pb-2">
-            {composerBanner}
-          </div>
-        )}
-
-        {!hideInput && feedbackList && (
-          <div className="mx-auto w-full max-w-3xl px-4">{feedbackList}</div>
-        )}
-
-        {!hideInput && (
-          <div className="mx-auto w-full max-w-3xl">
-            <ChatInput
-              status={status}
-              promptCapabilities={promptCapabilities}
-              defaultPath={defaultPath}
-              agentName={agentName}
-              onFocus={onFocus}
-              onSend={onSend}
-              supportsSteer={supportsSteer}
-              onGuide={onGuide}
-              onCancel={onCancel}
-              modes={modes}
-              configOptions={configOptions}
-              modeLoading={modeLoading}
-              configOptionsLoading={configOptionsLoading}
-              selectorsLoading={selectorsLoading}
-              selectedModeId={selectedModeId}
-              onModeChange={onModeChange}
-              onConfigOptionChange={onConfigOptionChange}
-              agentType={agentType}
-              availableCommands={availableCommands}
-              attachmentTabId={attachmentTabId}
-              draftStorageKey={draftStorageKey}
-              isActive={isActive}
-              showActiveFlow={showActiveFlow}
-              queue={queue}
-              onEnqueue={onEnqueue}
-              onQueueReorder={onQueueReorder}
-              onQueueEdit={onQueueEdit}
-              onQueueDelete={onQueueDelete}
-              onQueueRetry={onQueueRetry}
-              onConvertGuideToPrompt={onConvertGuideToPrompt}
-              editingItemId={editingItemId}
-              editingDraftText={editingDraftText}
-              editingDraftBlocks={editingDraftBlocks}
-              isEditingQueueItem={isEditingQueueItem}
-              onSaveQueueEdit={onSaveQueueEdit}
-              onCancelQueueEdit={onCancelQueueEdit}
-              onForkSend={onForkSend}
-              onSteer={onSteer}
-              allowOfflineCompose={allowOfflineCompose}
-              onAddFeedback={onAddFeedback}
-              feedbackAddDisabled={feedbackAddDisabled}
-              injectContent={injectContent}
-              onInjectConsumed={onInjectConsumed}
-            />
+        {error && (
+          <div className="px-4 py-2 text-xs text-destructive bg-destructive/5 border-t border-destructive/20">
+            {error}
           </div>
         )}
       </div>
-
-      {sessionFailures && sessionFailures.length > 0 && (
-        <SessionFailureBanner
-          failures={sessionFailures}
-          onAction={onSessionFailureAction}
-          onDismiss={onSessionFailureDismiss}
-        />
-      )}
-
-      {retryLineText && (
-        <div className="border-t border-destructive/20 bg-destructive/5 px-4 py-2 text-xs text-destructive">
-          <div className="flex items-center gap-2 font-medium">
-            <Loader2 className="h-3.5 w-3.5 animate-spin" />
-            <span className="min-w-0 overflow-hidden text-ellipsis whitespace-nowrap">
-              {retryLineText}
-            </span>
-          </div>
-        </div>
-      )}
-
-      {error && (
-        <div className="px-4 py-2 text-xs text-destructive bg-destructive/5 border-t border-destructive/20">
-          {error}
-        </div>
-      )}
     </div>
   )
 }
