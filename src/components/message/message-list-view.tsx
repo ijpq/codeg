@@ -49,7 +49,6 @@ import {
   AlertCircle,
   CheckIcon,
   CopyIcon,
-  Info,
   GitBranch,
   Loader2,
   Plus,

@@ -1202,6 +1202,7 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
         },
         AgentType::Antigravity => AcpAgentMeta {
             agent_type,
+            supports_steer: false,
             supports_mcp: true,
             name: "Google Antigravity",
             description: "Google's AI coding agent (first-party ACP server)",
