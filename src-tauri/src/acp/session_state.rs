@@ -504,6 +504,11 @@ pub struct SessionState {
     /// `delegation_call_id`-bound child outcome. Cleared on the next prompt.
     pub last_assistant_text: Option<String>,
 
+    /// Structured WebSearch sources captured for the just-completed assistant
+    /// answer. Kept beside `last_assistant_text` so plain-text channels can
+    /// resolve Codex citation markers after the live tool map is cleared.
+    pub last_assistant_citations: Vec<crate::citations::CitationSource>,
+
     /// The in-flight user prompt for the current turn, captured from
     /// `AcpEvent::UserMessage` and cleared on `TurnComplete` (alongside
     /// `live_message`). Carried on `to_snapshot()` so a client attaching
@@ -630,6 +635,7 @@ impl SessionState {
             goal_active: false,
             session_failures: BTreeMap::new(),
             last_assistant_text: None,
+            last_assistant_citations: Vec::new(),
             pending_user_message: None,
             steer_messages: Vec::new(),
             pending_user_message_started_at: None,
@@ -1063,6 +1069,35 @@ impl SessionState {
                         .join("");
                     if !assembled.trim().is_empty() {
                         self.last_assistant_text = Some(assembled);
+                    }
+                }
+                let mut citation_sources = Vec::new();
+                for tool_call in self.active_tool_calls.values() {
+                    citation_sources.extend(crate::citations::sources_from_meta(
+                        tool_call.meta.as_ref(),
+                    ));
+                }
+                self.last_assistant_citations =
+                    crate::citations::merge_sources(citation_sources.iter());
+                if let Some(answer) = self.last_assistant_text.as_deref() {
+                    let references = crate::citations::reference_ids(answer);
+                    let resolved = self
+                        .last_assistant_citations
+                        .iter()
+                        .map(|source| source.reference_id.as_str())
+                        .collect::<std::collections::HashSet<_>>();
+                    let unresolved = references
+                        .iter()
+                        .filter(|reference| !resolved.contains(reference.as_str()))
+                        .count();
+                    if unresolved > 0 {
+                        tracing::warn!(
+                            connection_id = %self.connection_id,
+                            conversation_id = ?self.conversation_id,
+                            citation_reference_count = references.len(),
+                            citation_unresolved_count = unresolved,
+                            "[ACP][citations] assistant answer contains citation ids without URL metadata"
+                        );
                     }
                 }
                 self.live_message = None;

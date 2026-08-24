@@ -316,42 +316,56 @@ fn inherited_images(turns: &[MessageTurn]) -> (Vec<ImageData>, bool) {
 }
 
 fn visible_entries(turns: &[MessageTurn]) -> Vec<VisibleEntry> {
-    turns
+    let mut entries = Vec::new();
+    let mut citation_sources = Vec::new();
+    for turn in turns
         .iter()
         .filter(|turn| matches!(turn.role, TurnRole::User | TurnRole::Assistant))
-        .filter_map(|turn| {
-            let mut parts = Vec::new();
-            for block in &turn.blocks {
-                match block {
-                    ContentBlock::Text { text } if !text.trim().is_empty() => {
-                        parts.push(text.trim().to_string());
-                    }
-                    ContentBlock::Image { mime_type, uri, .. } => parts.push(format!(
-                        "[Attached image: {}]",
-                        uri.as_deref().unwrap_or(mime_type)
-                    )),
-                    ContentBlock::ImageGeneration {
-                        image: Some(image), ..
-                    } => parts.push(format!(
-                        "[Generated image: {}]",
-                        image.uri.as_deref().unwrap_or(&image.mime_type)
-                    )),
-                    // Deliberately exclude hidden reasoning and raw tool traffic.
-                    ContentBlock::Thinking { .. }
-                    | ContentBlock::ToolUse { .. }
-                    | ContentBlock::ToolResult { .. }
-                    | ContentBlock::ImageGeneration { image: None, .. } => {}
-                    ContentBlock::Text { .. } => {}
+    {
+        if matches!(turn.role, TurnRole::User) {
+            citation_sources.clear();
+        }
+        let mut parts = Vec::new();
+        for block in &turn.blocks {
+            match block {
+                ContentBlock::Text { text } if !text.trim().is_empty() => {
+                    parts.push(crate::citations::render_plain_text_citations(
+                        text.trim(),
+                        &citation_sources,
+                    ));
                 }
+                ContentBlock::ToolUse { meta, .. } => {
+                    citation_sources.extend(crate::citations::sources_from_meta(meta.as_ref()));
+                    citation_sources =
+                        crate::citations::merge_sources(citation_sources.iter());
+                }
+                ContentBlock::Image { mime_type, uri, .. } => parts.push(format!(
+                    "[Attached image: {}]",
+                    uri.as_deref().unwrap_or(mime_type)
+                )),
+                ContentBlock::ImageGeneration {
+                    image: Some(image), ..
+                } => parts.push(format!(
+                    "[Generated image: {}]",
+                    image.uri.as_deref().unwrap_or(&image.mime_type)
+                )),
+                // Deliberately exclude hidden reasoning and raw tool traffic.
+                ContentBlock::Thinking { .. }
+                | ContentBlock::ToolResult { .. }
+                | ContentBlock::ImageGeneration { image: None, .. } => {}
+                ContentBlock::Text { .. } => {}
             }
-            (!parts.is_empty()).then(|| VisibleEntry {
+        }
+        if !parts.is_empty() {
+            entries.push(VisibleEntry {
                 id: turn.id.clone(),
                 role: turn.role.clone(),
                 timestamp: turn.timestamp,
                 text: parts.join("\n"),
-            })
-        })
-        .collect()
+            });
+        }
+    }
+    entries
 }
 
 fn visible_deliverable_paths(
@@ -646,5 +660,41 @@ mod tests {
         assert_eq!(snapshot.images.len(), 1);
         assert_eq!(snapshot.images[0].data, "aW1hZ2U=");
         assert!(snapshot.context.contains("reference.png"));
+    }
+
+    #[test]
+    fn branch_snapshot_keeps_resolved_citation_urls_without_tool_noise() {
+        let source = crate::citations::CitationSource {
+            reference_id: "turn0search0".into(),
+            url: "https://example.com/source".into(),
+            title: "Example source".into(),
+            site_name: "example.com".into(),
+        };
+        let mut search = turn("search", TurnRole::Assistant, "", 2);
+        search.blocks = vec![ContentBlock::ToolUse {
+            tool_use_id: Some("ws-1".into()),
+            tool_name: "web_search".into(),
+            input_preview: None,
+            status: Some("completed".into()),
+            meta: Some(serde_json::json!({ "codeg.citations": [source] })),
+        }];
+        let answer = turn(
+            "answer",
+            TurnRole::Assistant,
+            "Result \u{e200}cite\u{e202}turn0search0\u{e201}",
+            3,
+        );
+        let snapshot = build_branch_inheritance_snapshot(
+            &detail(vec![
+                turn("user", TurnRole::User, "research", 1),
+                search,
+                answer,
+            ]),
+            None,
+            Some(100_000),
+        )
+        .unwrap();
+        assert!(snapshot.context.contains("https://example.com/source"));
+        assert!(!snapshot.context.contains("turn0search0"));
     }
 }
