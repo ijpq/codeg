@@ -6,6 +6,7 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub branch_conversation_id: i32,
     pub creation_request_id: Option<String>,
+    pub operation_id: Option<String>,
     pub source_conversation_id: i32,
     pub source_title: Option<String>,
     pub fork_message_id: Option<String>,

@@ -212,9 +212,9 @@ describe("ConversationDetailHeader dialog target snapshot", () => {
   })
 
   it("hands Create Branch to the durable tab queue when the runtime accepts it", async () => {
-    let queued: CustomEvent | null = null
+    const queued: CustomEvent[] = []
     const listener = (event: Event) => {
-      queued = event as CustomEvent
+      queued.push(event as CustomEvent)
       event.preventDefault()
     }
     window.addEventListener(
@@ -229,12 +229,21 @@ describe("ConversationDetailHeader dialog target snapshot", () => {
     await user.click(getByLabelText("More actions"))
     await user.click(getByRole("menuitem", { name: "Create branch" }))
 
-    expect(queued).not.toBeNull()
-    expect(queued!.detail).toMatchObject({
+    expect(queued).toHaveLength(1)
+    expect(queued[0]!.detail).toMatchObject({
       conversationId: 1,
       requestId: expect.any(String),
+      operationId: expect.any(String),
     })
+    expect(queued[0]!.detail.operationId).toBe(queued[0]!.detail.requestId)
     expect(h.createConversationBranch).not.toHaveBeenCalled()
+
+    await user.click(getByLabelText("More actions"))
+    await user.click(getByRole("menuitem", { name: "Create branch" }))
+    expect(queued).toHaveLength(2)
+    expect(queued[1]!.detail.operationId).not.toBe(
+      queued[0]!.detail.operationId
+    )
     window.removeEventListener(
       "codeg:queue-conversation-branch-creation",
       listener

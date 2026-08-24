@@ -10244,7 +10244,7 @@ async fn prepare_provisional_snapshot_branch(
             conversation_branch_service::mark_initialization_state(
                 &db.conn,
                 conversation_id,
-                "prompt_ready",
+                "pending_first_prompt",
                 Some(connection_id.clone()),
                 None,
                 false,
@@ -10253,7 +10253,7 @@ async fn prepare_provisional_snapshot_branch(
             .map_err(|error| AcpError::protocol(error.to_string()))?;
             tracing::info!(
                 branch_conversation_id = conversation_id,
-                lifecycle_state = "prompt_ready",
+                lifecycle_state = "pending_first_prompt",
                 external_session_id = %session_id,
                 connection_id = %connection_id,
                 session_verification_result = "ephemeral_prompt_ready",
@@ -10267,7 +10267,7 @@ async fn prepare_provisional_snapshot_branch(
                 codeg_mcp_available: state.codeg_mcp_available,
                 mcp_server_count: state.mcp_server_count,
                 replaced_connection_ids: Vec::new(),
-                lifecycle_state: "prompt_ready".into(),
+                lifecycle_state: "pending_first_prompt".into(),
                 durable_session: false,
             }));
         }
@@ -10340,7 +10340,7 @@ async fn prepare_provisional_snapshot_branch(
         conversation_branch_service::mark_initialization_state(
             &db.conn,
             conversation_id,
-            "prompt_ready",
+            "pending_first_prompt",
             Some(connection_id.clone()),
             None,
             false,
@@ -10349,7 +10349,7 @@ async fn prepare_provisional_snapshot_branch(
         .map_err(|error| AcpError::protocol(error.to_string()))?;
         tracing::info!(
             branch_conversation_id = conversation_id,
-            lifecycle_state = "prompt_ready",
+            lifecycle_state = "pending_first_prompt",
             external_session_id = %session_id,
             connection_id = %connection_id,
             session_verification_result = "ephemeral_prompt_ready",
@@ -10363,7 +10363,7 @@ async fn prepare_provisional_snapshot_branch(
             codeg_mcp_available: activation.codeg_mcp_available,
             mcp_server_count: activation.mcp_server_count,
             replaced_connection_ids: activation.replaced_connection_ids,
-            lifecycle_state: "prompt_ready".into(),
+            lifecycle_state: "pending_first_prompt".into(),
             durable_session: false,
         })
     }

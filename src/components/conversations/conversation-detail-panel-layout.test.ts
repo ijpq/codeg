@@ -580,15 +580,21 @@ describe("ConversationDetailPanel session-load failure surface", () => {
 })
 
 describe("ConversationDetailPanel branch queue admission", () => {
-  it("waits for a stable turn but lets Create Branch use snapshot fallback offline", () => {
+  it("uses the server's durable source-turn state and retries lost wake-ups", () => {
     expect(source).toContain(
-      'const needsLiveSourceSession = item.intent === "fork"'
+      "The browser's runtime status can lag a durable turn completion"
     )
+    expect(source).toContain("deferIfSourceBusy: true")
+    expect(source).toContain('mqMarkState(item.id, "creating_branch")')
+    expect(source).toContain('mqMarkState(item.id, "waiting_source_turn")')
+    expect(source).toContain("isTurnInProgressRejection(error)")
     expect(source).toContain(
+      'extractAppCommandError(error)?.code === "not_found"'
+    )
+    expect(source).toContain("mqRemove(item.id)")
+    expect(source).toContain("}, 2_000)")
+    expect(source).not.toContain(
       'runtimeSyncState !== "idle" || connStatus === "prompting"'
-    )
-    expect(source).toContain(
-      'needsLiveSourceSession &&\n        (!connectionReady || connStatus !== "connected")'
     )
   })
 })

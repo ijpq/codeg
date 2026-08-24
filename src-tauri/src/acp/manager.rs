@@ -4437,6 +4437,7 @@ impl ConnectionManager {
                     conversation_branch::ActiveModel {
                         branch_conversation_id: Set(conversation_id),
                         creation_request_id: Set(None),
+                        operation_id: Set(None),
                         source_conversation_id: Set(sibling.id),
                         source_title: Set(clean_title),
                         fork_message_id: Set(None),

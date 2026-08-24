@@ -2857,6 +2857,8 @@
         "editItem": "編輯",
         "deleteItem": "刪除",
         "queued": "已排隊",
+        "waiting_source_turn": "等待來源任務結束",
+        "creating_branch": "正在建立分支",
         "waiting_session_restore": "等待會話恢復",
         "waiting_connection": "等待連線重試",
         "failed": "傳送失敗",

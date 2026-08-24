@@ -2857,6 +2857,8 @@
         "editItem": "Editar",
         "deleteItem": "Remover",
         "queued": "Na fila",
+        "waiting_source_turn": "Aguardando a tarefa de origem terminar",
+        "creating_branch": "Criando ramificação",
         "waiting_session_restore": "Aguardando recuperação da sessão",
         "waiting_connection": "Aguardando nova tentativa de conexão",
         "failed": "Falha no envio",

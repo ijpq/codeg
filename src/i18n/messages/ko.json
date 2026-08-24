@@ -2857,6 +2857,8 @@
         "editItem": "편집",
         "deleteItem": "삭제",
         "queued": "대기열에 추가됨",
+        "waiting_source_turn": "원본 작업 완료 대기 중",
+        "creating_branch": "분기 생성 중",
         "waiting_session_restore": "세션 복구 대기 중",
         "waiting_connection": "연결 재시도 대기 중",
         "failed": "전송 실패",
