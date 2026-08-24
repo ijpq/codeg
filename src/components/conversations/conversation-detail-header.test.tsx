@@ -1,5 +1,5 @@
 import { type ComponentProps, type ReactElement } from "react"
-import { render, waitFor } from "@testing-library/react"
+import { act, render, waitFor } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import { NextIntlClientProvider } from "next-intl"
 import { describe, expect, it, vi, beforeEach } from "vitest"
@@ -60,6 +60,13 @@ const h = vi.hoisted(() => ({
   openNewConversationTab: vi.fn(),
   updateConversationLocal: vi.fn(),
   refreshConversations: vi.fn(),
+  mergeProgressHandler: null as null | ((payload: unknown) => void),
+  subscribe: vi.fn(
+    async (_event: string, handler: (payload: unknown) => void) => {
+      h.mergeProgressHandler = handler
+      return () => {}
+    }
+  ),
 }))
 
 vi.mock("@/lib/api", () => ({
@@ -78,6 +85,7 @@ vi.mock("@/contexts/tab-context", () => ({
     openNewConversationTab: h.openNewConversationTab,
   }),
 }))
+vi.mock("@/lib/platform", () => ({ subscribe: h.subscribe }))
 vi.mock("@/stores/app-workspace-store", () => {
   const state = {
     updateConversationLocal: h.updateConversationLocal,
@@ -137,6 +145,7 @@ function withIntl(ui: ReactElement) {
 describe("ConversationDetailHeader dialog target snapshot", () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    h.mergeProgressHandler = null
   })
 
   it("deletes the conversation the dialog was opened for, even after the active tab switches", async () => {
@@ -315,6 +324,13 @@ describe("ConversationDetailHeader dialog target snapshot", () => {
   })
 
   it("returns to the source in one click without a content-selection dialog", async () => {
+    let finishMerge!: (value: MergeConversationBranchResult) => void
+    h.mergeConversationBranch.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishMerge = resolve
+        })
+    )
     h.getConversationBranchInfo.mockResolvedValueOnce({
       branchConversationId: 2,
       sourceConversationId: 1,
@@ -363,6 +379,26 @@ describe("ConversationDetailHeader dialog target snapshot", () => {
         branchConversationId: 2,
         requestId: expect.any(String),
       })
+    })
+    const requestId = h.mergeConversationBranch.mock.calls[0]![0].requestId
+    act(() => {
+      h.mergeProgressHandler?.({
+        branchConversationId: 2,
+        requestId,
+        stage: "extracting_increment",
+      })
+    })
+    expect(await findByRole("status")).toHaveTextContent(
+      "Extracting branch changes…"
+    )
+
+    finishMerge({
+      mergeId: "merge-progress",
+      targetConversationId: 1,
+      copiedDeliverableCount: 0,
+      deduplicated: false,
+    })
+    await waitFor(() => {
       expect(h.openTab).toHaveBeenCalledWith(1, 1, "codex", true, "conv-a")
       expect(h.closeTab).toHaveBeenCalledWith("tab-b")
     })

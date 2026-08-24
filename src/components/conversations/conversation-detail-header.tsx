@@ -36,6 +36,7 @@ import { getRuntimeSession } from "@/stores/conversation-runtime-store"
 import { getCachedSelectors } from "@/contexts/acp-connections-context"
 import type { ConversationStatus } from "@/lib/types"
 import { queueConversationBranchCreation } from "@/hooks/use-message-queue"
+import { subscribe } from "@/lib/platform"
 import { STATUS_ORDER } from "@/lib/types"
 import { ConversationStatusDot } from "@/components/conversations/conversation-status-dot"
 import {
@@ -158,6 +159,8 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
     null
   )
   const [branchBusy, setBranchBusy] = useState(false)
+  const [mergeStage, setMergeStage] = useState<string | null>(null)
+  const [mergeError, setMergeError] = useState<string | null>(null)
   const createRequestIdRef = useRef<string | null>(null)
   const mergeRequestIdRef = useRef<string | null>(null)
 
@@ -211,6 +214,34 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
       if (timer) clearTimeout(timer)
     }
   }, [conversationId, persistedConversation?.external_id, title])
+
+  useEffect(() => {
+    if (conversationId == null) return
+    let cancelled = false
+    let unlisten: (() => void) | null = null
+    subscribe<{
+      branchConversationId: number
+      requestId: string
+      stage: string
+      error?: string | null
+    }>("conversation-branch://merge-progress", (progress) => {
+      if (
+        progress.branchConversationId !== conversationId ||
+        progress.requestId !== mergeRequestIdRef.current
+      ) {
+        return
+      }
+      setMergeStage(progress.stage)
+      setMergeError(progress.error ?? null)
+    }).then((dispose) => {
+      if (cancelled) dispose()
+      else unlisten = dispose
+    })
+    return () => {
+      cancelled = true
+      unlisten?.()
+    }
+  }, [conversationId])
 
   const handleCreateBranch = useCallback(async () => {
     if (conversationId == null || !persistedConversation || branchBusy) {
@@ -296,12 +327,15 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
   const handleMerge = useCallback(async () => {
     if (!branchInfo || branchBusy) return
     setBranchBusy(true)
+    setMergeStage("started")
+    setMergeError(null)
     try {
       const result = await mergeConversationBranch({
         branchConversationId: branchInfo.branchConversationId,
         requestId: (mergeRequestIdRef.current ??= crypto.randomUUID()),
       })
       mergeRequestIdRef.current = null
+      setMergeStage("completed")
       toast.success(
         tBranch("mergeSuccess", {
           count: result.copiedDeliverableCount,
@@ -311,7 +345,10 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
       handleOpenSource()
       closeTab(tabId)
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : String(error))
+      setMergeStage("failed")
+      const message = error instanceof Error ? error.message : String(error)
+      setMergeError(message)
+      toast.error(message)
     } finally {
       setBranchBusy(false)
     }
@@ -324,6 +361,21 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
     refreshConversations,
     tabId,
   ])
+
+  const mergeStageLabel =
+    mergeStage == null
+      ? null
+      : mergeStage === "determining_boundary"
+        ? tBranch("mergeDeterminingBoundary")
+        : mergeStage === "extracting_increment"
+          ? tBranch("mergeExtractingIncrement")
+          : mergeStage === "writing_source"
+            ? tBranch("mergeWritingSource")
+            : mergeStage === "failed"
+              ? tBranch("mergeFailed")
+              : mergeStage === "completed"
+                ? tBranch("mergeCompleted")
+                : tBranch("mergePreparing")
 
   const handleTogglePin = useCallback(() => {
     if (conversationId == null) return
@@ -469,6 +521,16 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
               </span>
             )}
           </button>
+        )}
+        {(branchBusy || mergeStage === "failed") && mergeStageLabel && (
+          <span
+            className="max-w-72 shrink-0 truncate text-xs text-muted-foreground"
+            role="status"
+            title={mergeError ?? undefined}
+          >
+            {mergeStageLabel}
+            {mergeError ? ` · ${mergeError}` : ""}
+          </span>
         )}
       </div>
       <div className="flex shrink-0 items-center">

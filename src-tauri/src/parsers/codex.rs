@@ -495,7 +495,17 @@ fn native_fork_parent_session_id_in(sessions_dir: &Path, session_id: &str) -> Op
 pub(crate) struct CodexConversationPage {
     pub detail: ConversationDetail,
     pub start_offset: u64,
+    pub end_offset: u64,
     pub has_more: bool,
+}
+
+/// A byte-bounded slice of an append-only Codex rollout. Branch merge uses
+/// this instead of reparsing the native fork's inherited prefix (which can be
+/// gigabytes) once the exact child offset captured at fork time is known.
+pub(crate) struct CodexConversationRange {
+    pub detail: ConversationDetail,
+    pub start_offset: u64,
+    pub end_offset: u64,
 }
 
 const CODEX_HISTORY_SCAN_CHUNK_BYTES: usize = 1024 * 1024;
@@ -548,6 +558,7 @@ fn find_codex_page_start(
     file: &mut fs::File,
     end_offset: u64,
     user_turn_limit: usize,
+    max_scan_bytes: Option<u64>,
 ) -> Result<u64, ParseError> {
     if end_offset == 0 || user_turn_limit == 0 {
         return Ok(end_offset);
@@ -560,6 +571,13 @@ fn find_codex_page_start(
 
     while position > 0 {
         let read_start = position.saturating_sub(CODEX_HISTORY_SCAN_CHUNK_BYTES as u64);
+        if let Some(limit) = max_scan_bytes {
+            if end_offset.saturating_sub(read_start) > limit {
+                return Err(ParseError::InvalidData(format!(
+                    "Codex reverse scan exceeded the safe limit of {limit} bytes without finding a user boundary"
+                )));
+            }
+        }
         let read_len =
             usize::try_from(position - read_start).unwrap_or(CODEX_HISTORY_SCAN_CHUNK_BYTES);
         let mut chunk = vec![0u8; read_len];
@@ -2369,19 +2387,13 @@ fn parse_codex_subagent_stats(
 }
 
 impl CodexParser {
-    pub(crate) fn get_conversation_page(
-        &self,
-        conversation_id: &str,
-        before_offset: Option<u64>,
-        user_turn_limit: usize,
-        cwd_hint: Option<String>,
-    ) -> Result<CodexConversationPage, ParseError> {
+    fn rollout_path(&self, conversation_id: &str) -> Result<PathBuf, ParseError> {
         if !self.base_dir.exists() {
             return Err(ParseError::ConversationNotFound(
                 conversation_id.to_string(),
             ));
         }
-        let path = WalkDir::new(&self.base_dir)
+        WalkDir::new(&self.base_dir)
             .into_iter()
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.path().to_path_buf())
@@ -2393,13 +2405,73 @@ impl CodexParser {
                         .to_string_lossy()
                         .contains(conversation_id)
             })
-            .ok_or_else(|| ParseError::ConversationNotFound(conversation_id.to_string()))?;
+            .ok_or_else(|| ParseError::ConversationNotFound(conversation_id.to_string()))
+    }
+
+    /// Current durable end offset of a Codex rollout. The returned value is a
+    /// stable boundary in the append-only file and contains no transcript data.
+    pub(crate) fn rollout_len(&self, conversation_id: &str) -> Result<u64, ParseError> {
+        Ok(fs::metadata(self.rollout_path(conversation_id)?)?.len())
+    }
+
+    pub(crate) fn get_conversation_page(
+        &self,
+        conversation_id: &str,
+        before_offset: Option<u64>,
+        user_turn_limit: usize,
+        cwd_hint: Option<String>,
+    ) -> Result<CodexConversationPage, ParseError> {
+        self.get_conversation_page_impl(
+            conversation_id,
+            before_offset,
+            user_turn_limit,
+            cwd_hint,
+            None,
+        )
+    }
+
+    pub(crate) fn get_conversation_page_bounded(
+        &self,
+        conversation_id: &str,
+        before_offset: Option<u64>,
+        user_turn_limit: usize,
+        cwd_hint: Option<String>,
+        max_bytes: u64,
+    ) -> Result<CodexConversationPage, ParseError> {
+        self.get_conversation_page_impl(
+            conversation_id,
+            before_offset,
+            user_turn_limit,
+            cwd_hint,
+            Some(max_bytes),
+        )
+    }
+
+    fn get_conversation_page_impl(
+        &self,
+        conversation_id: &str,
+        before_offset: Option<u64>,
+        user_turn_limit: usize,
+        cwd_hint: Option<String>,
+        max_bytes: Option<u64>,
+    ) -> Result<CodexConversationPage, ParseError> {
+        let path = self.rollout_path(conversation_id)?;
 
         let mut file = fs::File::open(&path)?;
         let file_len = file.metadata()?.len();
         let end_offset = before_offset.unwrap_or(file_len).min(file_len);
-        let start_offset =
-            find_codex_page_start(&mut file, end_offset, user_turn_limit.clamp(1, 100))?;
+        let start_offset = find_codex_page_start(
+            &mut file,
+            end_offset,
+            user_turn_limit.clamp(1, 100),
+            max_bytes,
+        )?;
+        let page_bytes = end_offset.saturating_sub(start_offset);
+        if max_bytes.is_some_and(|limit| page_bytes > limit) {
+            return Err(ParseError::InvalidData(format!(
+                "Codex history page is {page_bytes} bytes, exceeding the safe merge limit"
+            )));
+        }
         file.seek(SeekFrom::Start(start_offset))?;
         let reader = BufReader::new(file.take(end_offset.saturating_sub(start_offset)));
         let detail = self.parse_conversation_detail_reader(
@@ -2412,7 +2484,49 @@ impl CodexParser {
         Ok(CodexConversationPage {
             detail,
             start_offset,
+            end_offset,
             has_more: start_offset > 0,
+        })
+    }
+
+    /// Parse only `[start_offset, EOF)` and reject the request before reading
+    /// when the delta exceeds `max_bytes`. Offsets are captured at a complete
+    /// rollout boundary; legacy inferred offsets may conservatively include a
+    /// few older records, which callers additionally filter by timestamp.
+    pub(crate) fn get_conversation_range(
+        &self,
+        conversation_id: &str,
+        start_offset: u64,
+        max_bytes: u64,
+        cwd_hint: Option<String>,
+    ) -> Result<CodexConversationRange, ParseError> {
+        let path = self.rollout_path(conversation_id)?;
+        let mut file = fs::File::open(&path)?;
+        let end_offset = file.metadata()?.len();
+        if start_offset > end_offset {
+            return Err(ParseError::InvalidData(format!(
+                "saved branch rollout offset {start_offset} is beyond the current rollout length {end_offset}"
+            )));
+        }
+        let bytes = end_offset.saturating_sub(start_offset);
+        if bytes > max_bytes {
+            return Err(ParseError::InvalidData(format!(
+                "branch delta is {bytes} bytes, exceeding the safe merge limit of {max_bytes} bytes"
+            )));
+        }
+        file.seek(SeekFrom::Start(start_offset))?;
+        let reader = BufReader::new(file.take(bytes));
+        let detail = self.parse_conversation_detail_reader(
+            &path,
+            conversation_id,
+            reader,
+            cwd_hint,
+            Some(start_offset),
+        )?;
+        Ok(CodexConversationRange {
+            detail,
+            start_offset,
+            end_offset,
         })
     }
 
@@ -5213,7 +5327,7 @@ mod tests {
     use chrono::{DateTime, Duration, Utc};
     use std::env;
     use std::fs;
-    use std::io::{BufWriter, Write};
+    use std::io::{BufWriter, Seek, SeekFrom, Write};
     use std::path::PathBuf;
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -7307,6 +7421,67 @@ mod tests {
         assert_eq!(user_texts(&oldest.detail), vec!["prompt-0"]);
         assert!(!oldest.has_more);
         assert_eq!(oldest.start_offset, 0);
+    }
+
+    #[test]
+    fn exact_range_reads_tiny_branch_delta_from_sparse_gigabyte_rollout() {
+        let dir = tempfile::tempdir().expect("temp sessions dir");
+        let conversation_id = "gigabyte-native-fork";
+        let path = dir
+            .path()
+            .join(format!("rollout-2026-08-24-{conversation_id}.jsonl"));
+        let mut file = fs::File::create(&path).expect("create rollout");
+        writeln!(
+            file,
+            "{}",
+            rollout_line(
+                "2026-08-24T00:00:00Z",
+                "session_meta",
+                serde_json::json!({
+                    "id": conversation_id,
+                    "parent_thread_id": "source-session",
+                    "cwd": "/tmp/large"
+                }),
+            )
+        )
+        .unwrap();
+        // Sparse expansion models a 1+ GiB inherited prefix without consuming
+        // disk or making the test slow. The exact fork offset begins after it.
+        file.set_len(1_100_000_000)
+            .expect("make sparse inherited prefix");
+        file.seek(SeekFrom::End(0)).unwrap();
+        let delta_start = file.stream_position().unwrap();
+        for line in [
+            rollout_line(
+                "2026-08-24T00:10:00Z",
+                "event_msg",
+                serde_json::json!({"type":"user_message","message":"branch-only"}),
+            ),
+            rollout_line(
+                "2026-08-24T00:10:01Z",
+                "event_msg",
+                serde_json::json!({"type":"agent_message","message":"branch-result"}),
+            ),
+        ] {
+            writeln!(file, "{line}").unwrap();
+        }
+        file.flush().unwrap();
+
+        let parser = CodexParser::with_base_dir(dir.path().to_path_buf());
+        let range = parser
+            .get_conversation_range(
+                conversation_id,
+                delta_start,
+                1024 * 1024,
+                Some("/tmp/large".into()),
+            )
+            .expect("only the post-fork range is parsed");
+        assert_eq!(range.start_offset, delta_start);
+        assert!(range.end_offset > 1_100_000_000);
+        assert_eq!(user_texts(&range.detail), vec!["branch-only"]);
+        assert!(range.detail.turns.iter().flat_map(|turn| &turn.blocks).any(
+            |block| matches!(block, ContentBlock::Text { text } if text == "branch-result")
+        ));
     }
 
     /// Manual acceptance benchmark for the reported 300+ MB rollout shape.
