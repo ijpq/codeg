@@ -335,6 +335,40 @@ describe("useMessageQueue persistence (offline survival across reload)", () => {
     })
   })
 
+  it("persists authoritative branch admission states across reload", () => {
+    const first = renderHook(() => useMessageQueue(42))
+    act(() =>
+      first.result.current.enqueue(draft("Create branch"), null, "branch-1", {
+        intent: "branch",
+        state: "waiting_source_turn",
+      })
+    )
+    const id = first.result.current.queue[0].id
+    act(() => first.result.current.markState(id, "creating_branch"))
+
+    const reloaded = renderHook(() => useMessageQueue(42))
+    expect(reloaded.result.current.queue).toHaveLength(1)
+    expect(reloaded.result.current.queue[0]).toMatchObject({
+      clientMessageId: "branch-1",
+      intent: "branch",
+      state: "creating_branch",
+    })
+  })
+
+  it("coalesces duplicate Create Branch operations while one is pending", () => {
+    const { result } = renderHook(() => useMessageQueue(42))
+    act(() => {
+      result.current.enqueue(draft("Create branch"), null, "operation-a", {
+        intent: "branch",
+      })
+      result.current.enqueue(draft("Create branch"), null, "operation-b", {
+        intent: "branch",
+      })
+    })
+    expect(result.current.queue).toHaveLength(1)
+    expect(result.current.queue[0].clientMessageId).toBe("operation-a")
+  })
+
   it("preserves client_message_id across dequeue and Busy requeue", () => {
     const { result } = renderHook(() => useMessageQueue())
     act(() =>

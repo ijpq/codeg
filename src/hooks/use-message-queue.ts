@@ -7,6 +7,8 @@ import { randomUUID } from "@/lib/utils"
 export type QueuedMessageIntent = "prompt" | "guide" | "fork" | "branch"
 export type QueuedMessageState =
   | "queued"
+  | "waiting_source_turn"
+  | "creating_branch"
   | "waiting_session_restore"
   | "waiting_connection"
   | "failed"
@@ -103,6 +105,7 @@ export const QUEUE_BRANCH_CREATION_EVENT =
 export interface QueueBranchCreationRequest {
   conversationId: number
   requestId: string
+  operationId: string
   modeId: string | null
 }
 
@@ -169,6 +172,8 @@ function loadPersistedQueue(storageKey: string | null): QueuedMessage[] {
 function isQueuedMessageState(value: unknown): value is QueuedMessageState {
   return (
     value === "queued" ||
+    value === "waiting_source_turn" ||
+    value === "creating_branch" ||
     value === "waiting_session_restore" ||
     value === "waiting_connection" ||
     value === "failed" ||
@@ -352,6 +357,17 @@ export function useMessageQueue(
         queueRef.current.some(
           (item) => item.clientMessageId === clientMessageId
         )
+      ) {
+        return
+      }
+      // One menu action may be replayed by a header remount or transport
+      // reconnect before React receives the first completion. Coalesce the
+      // duplicate while a Create Branch operation is still represented in the
+      // authoritative queue; once it completes and is removed, the user can
+      // deliberately create another branch.
+      if (
+        options?.intent === "branch" &&
+        queueRef.current.some((item) => item.intent === "branch")
       ) {
         return
       }

@@ -230,14 +230,21 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
         queueConversationBranchCreation({
           conversationId,
           requestId,
+          operationId: requestId,
           modeId: selectors?.modes?.current_mode_id ?? null,
         })
       ) {
+        // The mounted tab has durably adopted this operation id in its queue.
+        // Retries for that queued item keep using it, while the next deliberate
+        // menu action must receive a fresh id after this item completes.
+        createRequestIdRef.current = null
         return
       }
       const result = await createConversationBranch({
         requestId,
+        operationId: requestId,
         sourceConversationId: conversationId,
+        deferIfSourceBusy: false,
         preferredModeId: selectors?.modes?.current_mode_id ?? null,
         preferredConfigValues,
       })

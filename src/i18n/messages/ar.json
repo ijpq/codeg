@@ -2921,6 +2921,8 @@
         "editItem": "تعديل",
         "deleteItem": "حذف",
         "queued": "في قائمة الانتظار",
+        "waiting_source_turn": "بانتظار انتهاء المهمة المصدر",
+        "creating_branch": "جارٍ إنشاء الفرع",
         "waiting_session_restore": "بانتظار استعادة الجلسة",
         "waiting_connection": "بانتظار إعادة الاتصال",
         "failed": "فشل الإرسال",

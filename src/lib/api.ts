@@ -3072,8 +3072,10 @@ export async function createConversation(
 
 export interface CreateConversationBranchRequest {
   requestId?: string | null
+  operationId?: string | null
   sourceConversationId: number
   forkMessageId?: string | null
+  deferIfSourceBusy?: boolean
   preferredModeId?: string | null
   preferredConfigValues?: Record<string, string>
 }
@@ -3097,6 +3099,7 @@ export interface CreateConversationBranchResult {
 export interface ConversationBranchInfo {
   branchConversationId: number
   creationRequestId?: string | null
+  operationId?: string | null
   sourceConversationId: number
   sourceTitle?: string | null
   sourceAvailable: boolean

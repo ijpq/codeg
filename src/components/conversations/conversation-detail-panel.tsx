@@ -102,7 +102,8 @@ import {
   openSettingsWindow,
   submitSessionFeedback,
 } from "@/lib/api"
-import { toErrorMessage } from "@/lib/app-error"
+import { extractAppCommandError, toErrorMessage } from "@/lib/app-error"
+import { isTurnInProgressRejection } from "@/lib/turn-busy"
 import { classifySteerFailure } from "@/lib/steer-errors"
 import { isNetworkOrOfflineError } from "@/lib/network-error"
 import {
@@ -1644,7 +1645,7 @@ const ConversationTabView = memo(function ConversationTabView({
       mqEnqueue(
         { blocks: [], displayText: t("branch.create") },
         event.detail.modeId,
-        event.detail.requestId,
+        event.detail.operationId,
         { intent: "branch" }
       )
     }
@@ -1654,27 +1655,41 @@ const ConversationTabView = memo(function ConversationTabView({
   }, [dbConversationId, mqEnqueue, t])
 
   const forkSendInFlightRef = useRef<string | null>(null)
+  const branchQueueRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null
+  )
+  useEffect(
+    () => () => {
+      if (branchQueueRetryTimerRef.current) {
+        clearTimeout(branchQueueRetryTimerRef.current)
+      }
+    },
+    []
+  )
   useEffect(() => {
     const item = msgQueue[0]
     if (!item || (item.intent !== "fork" && item.intent !== "branch")) return
-    const needsLiveSourceSession = item.intent === "fork"
-    const sourceTurnIsActive =
-      runtimeSyncState !== "idle" || connStatus === "prompting"
+    if (item.state === "failed" || item.state === "expired_guide") return
     if (
       forkSendInFlightRef.current ||
-      sourceTurnIsActive ||
-      (needsLiveSourceSession &&
-        (!connectionReady || connStatus !== "connected")) ||
       webConnState !== "connected" ||
       dbConversationId == null
     ) {
       return
     }
     forkSendInFlightRef.current = item.id
+    mqMarkState(item.id, "creating_branch")
+    let retryWhenSourceSettles = false
     const selectors = getCachedSelectors(selectedAgent)
     void createConversationBranch({
       requestId: item.clientMessageId,
+      operationId: item.clientMessageId,
       sourceConversationId: dbConversationId,
+      // The browser's runtime status can lag a durable turn completion after a
+      // lost WebSocket event. Always ask the server: it either starts now or
+      // returns the recoverable turn-in-progress conflict. The same request id
+      // is retried, so a lost response cannot create a second branch.
+      deferIfSourceBusy: true,
       preferredModeId: item.modeId ?? selectors?.modes?.current_mode_id ?? null,
       preferredConfigValues: Object.fromEntries(
         (selectors?.configOptions ?? []).map((option) => [
@@ -1707,14 +1722,37 @@ const ConversationTabView = memo(function ConversationTabView({
         )
       })
       .catch((error: unknown) => {
+        if (isTurnInProgressRejection(error)) {
+          retryWhenSourceSettles = true
+          mqMarkState(item.id, "waiting_source_turn")
+          if (branchQueueRetryTimerRef.current) {
+            clearTimeout(branchQueueRetryTimerRef.current)
+          }
+          branchQueueRetryTimerRef.current = setTimeout(() => {
+            branchQueueRetryTimerRef.current = null
+            forkSendInFlightRef.current = null
+            // Re-enter the effect even when no WebSocket turn-complete event
+            // arrived. The backend re-checks the durable active run on every
+            // attempt, so this polling is a lightweight lost-wakeup safety net.
+            mqMarkState(item.id, "queued")
+          }, 2_000)
+          return
+        }
+        if (extractAppCommandError(error)?.code === "not_found") {
+          // A provisional branch may have been explicitly removed while the
+          // original HTTP response was lost. Its persisted source-tab queue
+          // item must not survive forever or recreate the deleted operation.
+          mqRemove(item.id)
+          return
+        }
         mqMarkState(item.id, "failed", toErrorMessage(error))
       })
       .finally(() => {
-        forkSendInFlightRef.current = null
+        if (!retryWhenSourceSettles) {
+          forkSendInFlightRef.current = null
+        }
       })
   }, [
-    connectionReady,
-    connStatus,
     dbConversationId,
     mqMarkState,
     mqRemove,
@@ -1722,7 +1760,6 @@ const ConversationTabView = memo(function ConversationTabView({
     openTab,
     ownTab?.title,
     refreshConversations,
-    runtimeSyncState,
     selectedAgent,
     webConnState,
   ])
@@ -2346,8 +2383,10 @@ const ConversationTabView = memo(function ConversationTabView({
         }
         const result = await createConversationBranch({
           requestId,
+          operationId: requestId,
           sourceConversationId: dbConversationId,
           forkMessageId: messageId,
+          deferIfSourceBusy: false,
           preferredModeId: selectedModeId,
           preferredConfigValues: Object.fromEntries(
             connectionConfigOptions.map((option) => [

@@ -2921,6 +2921,8 @@
         "editItem": "編集",
         "deleteItem": "削除",
         "queued": "キュー済み",
+        "waiting_source_turn": "元のタスクの完了を待機中",
+        "creating_branch": "ブランチを作成中",
         "waiting_session_restore": "セッションの復旧待ち",
         "waiting_connection": "接続の再試行待ち",
         "failed": "送信失敗",
