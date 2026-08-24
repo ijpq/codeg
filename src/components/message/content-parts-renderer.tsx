@@ -41,6 +41,11 @@ import { UnifiedDiffPreview } from "@/components/diff/unified-diff-preview"
 import { generateUnifiedDiff } from "@/lib/unified-diff-generator"
 import { FilePathLink } from "@/components/ai-elements/link-safety"
 import {
+  extractCitationSources,
+  renderCitationMarkdown,
+  type CitationSource,
+} from "@/lib/citations"
+import {
   Reasoning,
   ReasoningTrigger,
   ReasoningContent,
@@ -2222,11 +2227,13 @@ function parseCliExecutionEnvelope(text: string): {
 const TextPart = memo(function TextPart({
   text,
   isUser = false,
+  citationSources = [],
 }: {
   text: string
   // User messages render as plain text + inline reference badges (no Markdown),
   // matching the plain-text composer. Assistant / system text keeps full Markdown.
   isUser?: boolean
+  citationSources?: readonly CitationSource[]
 }) {
   if (isUser) {
     return (
@@ -2235,9 +2242,10 @@ const TextPart = memo(function TextPart({
       </div>
     )
   }
+  const renderedText = renderCitationMarkdown(text, citationSources)
   return (
     <div className='break-words text-sm prose prose-sm dark:prose-invert max-w-none [&_ul]:list-inside [&_ol]:list-inside [&_[data-streamdown="code-block-body"]]:max-h-96 [&_[data-streamdown="code-block-body"]]:overflow-auto'>
-      <MessageResponse>{text}</MessageResponse>
+      <MessageResponse>{renderedText}</MessageResponse>
     </div>
   )
 })
@@ -3025,6 +3033,7 @@ export const ContentPartsRenderer = memo(function ContentPartsRenderer({
   parts,
   role,
 }: ContentPartsRendererProps) {
+  const citationSources = useMemo(() => extractCitationSources(parts), [parts])
   const renderPart = (part: AdaptedContentPart, keyId: string): ReactNode => {
     if (part.type === "text") {
       return (
@@ -3032,6 +3041,7 @@ export const ContentPartsRenderer = memo(function ContentPartsRenderer({
           key={`text-${keyId}`}
           text={part.text}
           isUser={role === "user"}
+          citationSources={citationSources}
         />
       )
     }

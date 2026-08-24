@@ -24,7 +24,7 @@ const SUPPORTED_ADAPTER_VERSION: &str = "1.1.2";
 const NATIVE_FORK_ADAPTER_VERSION: &str = "1.6.2";
 const NATIVE_STEERING_MIN_VERSION: (u64, u64, u64) = (1, 1, 6);
 const PATCH_REVISION: &str = "codeg-steer-v1";
-const NATIVE_FORK_PATCH_REVISION: &str = "codeg-native-thread-fork-v1";
+const NATIVE_FORK_PATCH_REVISION: &str = "codeg-native-thread-fork-citations-v2";
 
 #[derive(Debug, Clone)]
 pub struct PreparedCodexSteerAdapter {
@@ -140,6 +140,40 @@ if (process.argv.includes("--version")) {"#,
 /// register an independent adapter-side session state for the returned id.
 /// Every anchor is taken from the published npm bundle, not the source tree.
 const NATIVE_FORK_REPLACEMENTS: &[Replacement] = &[
+    // codex-acp 1.6.2 receives WebSearchItem.results from Codex app-server but
+    // drops it while mapping both live and session/load history into ACP. Keep
+    // the forward-compatible JSON values in rawInput so CodeG can resolve the
+    // private-use citation ids in the assistant text without inventing URLs.
+    Replacement {
+        before: r#"    query: item.query,
+    action: item.action
+  };
+}
+function createCollabAgentToolCallUpdate"#,
+        after: r#"    query: item.query,
+    action: item.action,
+    results: item.results
+  };
+}
+function createCollabAgentToolCallUpdate"#,
+    },
+    Replacement {
+        before: r#"      rawInput: {
+        query: item.query,
+        action: item.action
+      }
+    };
+  }
+  createReviewModeUpdate"#,
+        after: r#"      rawInput: {
+        query: item.query,
+        action: item.action,
+        results: item.results
+      }
+    };
+  }
+  createReviewModeUpdate"#,
+    },
     Replacement {
         before: r#"          delete: {},
           additionalDirectories: {}"#,
@@ -537,6 +571,7 @@ mod tests {
             .expect("published codex-acp 1.6.2 bundle must match every verified anchor");
         assert!(patched.contains("methods.agent.session.fork"));
         assert!(patched.contains("this.codexClient.threadFork"));
+        assert!(patched.matches("results: item.results").count() >= 2);
 
         let fixture = tempfile::Builder::new()
             .suffix(".mjs")

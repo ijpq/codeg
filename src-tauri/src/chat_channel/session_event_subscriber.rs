@@ -893,16 +893,27 @@ pub(super) async fn handle_acp_envelope(
                                 None,
                             )
                             .await;
-                            let final_text =
+                            let (final_text, citation_sources) =
                                 if let Some(state) = conn_mgr.get_state(connection_id).await {
-                                    state.read().await.last_assistant_text.clone()
+                                    let state = state.read().await;
+                                    (
+                                        state.last_assistant_text.clone(),
+                                        state.last_assistant_citations.clone(),
+                                    )
                                 } else {
-                                    None
+                                    (None, Vec::new())
                                 };
                             let (kind, body) = if stop_reason == "end_turn" {
                                 (
                                     "final",
-                                    final_text.unwrap_or_else(|| match lang {
+                                    final_text
+                                        .map(|text| {
+                                            crate::citations::render_plain_text_citations(
+                                                &text,
+                                                &citation_sources,
+                                            )
+                                        })
+                                        .unwrap_or_else(|| match lang {
                                         Lang::ZhCn | Lang::ZhTw => {
                                             "任务已结束，但没有生成可发送的最终回答。".to_string()
                                         }
@@ -938,6 +949,16 @@ pub(super) async fn handle_acp_envelope(
                             .await;
                         }
                     } else {
+                        let citation_sources =
+                            if let Some(state) = conn_mgr.get_state(connection_id).await {
+                                state.read().await.last_assistant_citations.clone()
+                            } else {
+                                Vec::new()
+                            };
+                        let content = crate::citations::render_plain_text_citations(
+                            &content,
+                            &citation_sources,
+                        );
                         let body = format_completion(&content, tool_count, lang);
                         let msg = RichMessage::info(body)
                             .with_title(match lang {

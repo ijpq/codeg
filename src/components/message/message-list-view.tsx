@@ -86,6 +86,10 @@ import type {
   PromptDeliveryState,
 } from "@/lib/prompt-delivery-state"
 import { MessageBottomFollowGuard } from "./message-bottom-follow-guard"
+import {
+  extractCitationSources,
+  renderCitationPlainText,
+} from "@/lib/citations"
 
 type DeliveryLabelKey =
   | "delivery.submitting"
@@ -433,7 +437,7 @@ function extractDelegationSources(
 }
 
 function extractTextFromParts(parts: AdaptedContentPart[]): string {
-  return parts
+  const text = parts
     .flatMap((p): string[] => {
       if (p.type === "text") return [p.text]
       if (p.type === "goal-run") return [extractTextFromParts(p.items)]
@@ -441,6 +445,7 @@ function extractTextFromParts(parts: AdaptedContentPart[]): string {
     })
     .filter((text) => text.length > 0)
     .join("\n")
+  return renderCitationPlainText(text, extractCitationSources(parts))
 }
 
 type AssistantTurnItem = Extract<ThreadRenderItem, { kind: "turn" }>

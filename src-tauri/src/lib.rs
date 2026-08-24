@@ -20,6 +20,7 @@ pub mod artifact_tracker;
 pub mod automation;
 pub mod backgrounds;
 pub mod chat_channel;
+pub mod citations;
 pub mod commands;
 pub mod db;
 pub mod folder_links;
