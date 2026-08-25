@@ -1049,6 +1049,10 @@ impl SessionState {
                 // call (no concluding text) → empty, which CLEARS the field so a
                 // prior turn's text can't leak as this turn's result; the LLM
                 // reads the full result by opening the child session instead.
+                let completed_message_id = self
+                    .live_message
+                    .as_ref()
+                    .map(|message| message.id.clone());
                 if let Some(live) = self.live_message.as_ref() {
                     let after_last_tool_call = live
                         .content
@@ -1086,6 +1090,11 @@ impl SessionState {
                 }
                 self.last_assistant_citations =
                     crate::citations::merge_sources(citation_sources.iter());
+                for source in &mut self.last_assistant_citations {
+                    if source.message_id.is_none() {
+                        source.message_id.clone_from(&completed_message_id);
+                    }
+                }
                 if let Some(answer) = self.last_assistant_text.as_deref() {
                     let references = crate::citations::reference_ids(answer);
                     let resolved = self
@@ -1097,13 +1106,37 @@ impl SessionState {
                         .iter()
                         .filter(|reference| !resolved.contains(reference.as_str()))
                         .count();
+                    let resolved_count = references.len().saturating_sub(unresolved);
+                    let mut source_event_types = self
+                        .last_assistant_citations
+                        .iter()
+                        .map(|source| source.source_type.as_str())
+                        .collect::<Vec<_>>();
+                    source_event_types.sort_unstable();
+                    source_event_types.dedup();
+                    let source_event_types = source_event_types.join(",");
                     if unresolved > 0 {
                         tracing::warn!(
                             connection_id = %self.connection_id,
                             conversation_id = ?self.conversation_id,
+                            message_id = completed_message_id.as_deref().unwrap_or_default(),
                             citation_reference_count = references.len(),
-                            citation_unresolved_count = unresolved,
+                            resolved_citation_count = resolved_count,
+                            unresolved_citation_count = unresolved,
+                            metadata_first_missing_stage = "acp_session_update",
+                            citation_source_event_types = source_event_types,
                             "[ACP][citations] assistant answer contains citation ids without URL metadata"
+                        );
+                    } else if !references.is_empty() {
+                        tracing::debug!(
+                            connection_id = %self.connection_id,
+                            conversation_id = ?self.conversation_id,
+                            message_id = completed_message_id.as_deref().unwrap_or_default(),
+                            citation_reference_count = references.len(),
+                            resolved_citation_count = resolved_count,
+                            unresolved_citation_count = 0,
+                            citation_source_event_types = source_event_types,
+                            "[ACP][citations] assistant citation metadata resolved"
                         );
                     }
                 }
@@ -1759,7 +1792,10 @@ impl SessionState {
             entry.locations = Some(loc.clone());
         }
         if let Some(m) = meta {
-            entry.meta = Some(m.clone());
+            entry.meta = Some(crate::citations::merge_citations_in_meta(
+                entry.meta.as_ref(),
+                m,
+            ));
         }
         if let Some(imgs) = images {
             // Replace-on-update: the agent re-sends the full image list on
@@ -3535,6 +3571,47 @@ mod tests {
     }
 
     #[test]
+    fn turn_complete_keeps_live_citations_for_plain_text_channels() {
+        let mut s = fresh_state();
+        s.apply_event(&AcpEvent::ToolCall {
+            tool_call_id: "ws-1".into(),
+            title: "Search".into(),
+            kind: "search".into(),
+            status: "completed".into(),
+            content: None,
+            raw_input: None,
+            raw_output: None,
+            locations: None,
+            meta: Some(serde_json::json!({
+                "codeg.citations": [{
+                    "citation_id": "turn0search0",
+                    "url": "https://example.com/source",
+                    "title": "Source",
+                    "domain": "example.com"
+                }]
+            })),
+            images: None,
+        });
+        s.apply_event(&AcpEvent::ContentDelta {
+            text: "answer \u{e200}cite\u{e202}turn0search0\u{e201}".into(),
+            parent_tool_use_id: None,
+        });
+        s.apply_event(&AcpEvent::TurnComplete {
+            session_id: "ext".into(),
+            stop_reason: "end_turn".into(),
+            agent_type: "codex".into(),
+        });
+        assert_eq!(s.last_assistant_citations.len(), 1);
+        assert_eq!(
+            crate::citations::render_plain_text_citations(
+                s.last_assistant_text.as_deref().expect("final text"),
+                &s.last_assistant_citations,
+            ),
+            "answer [1]\n\n来源：\n[1] Source：https://example.com/source"
+        );
+    }
+
+    #[test]
     fn turn_complete_trailing_tool_call_captures_no_text() {
         // A turn ending on a tool call has no concluding text block; the result
         // text stays unset (the LLM opens the child session for detail).
@@ -4161,6 +4238,61 @@ mod tests {
             Some(&meta),
             "ToolCallUpdate without meta must NOT clobber previously-set value"
         );
+    }
+
+    #[test]
+    fn partial_web_search_updates_merge_citation_metadata() {
+        let mut s = fresh_state();
+        s.apply_event(&AcpEvent::ToolCall {
+            tool_call_id: "ws-1".into(),
+            title: "Search".into(),
+            kind: "search".into(),
+            status: "in_progress".into(),
+            content: None,
+            raw_input: None,
+            raw_output: None,
+            locations: None,
+            meta: Some(serde_json::json!({
+                "codeg.citations": [{
+                    "citation_id": "turn0search0",
+                    "url": "https://example.com/a",
+                    "title": "A",
+                    "domain": "example.com"
+                }]
+            })),
+            images: None,
+        });
+        s.apply_event(&AcpEvent::ToolCallUpdate {
+            tool_call_id: "ws-1".into(),
+            title: None,
+            status: Some("completed".into()),
+            content: None,
+            raw_input: None,
+            raw_output: None,
+            raw_output_append: None,
+            locations: None,
+            meta: Some(serde_json::json!({
+                "codeg.citations": [{
+                    "citation_id": "turn0view0",
+                    "url": "https://docs.example.org/open",
+                    "title": "Open",
+                    "domain": "docs.example.org"
+                }]
+            })),
+            images: None,
+        });
+        let entry = s.active_tool_calls.get("ws-1").expect("search call");
+        let sources = crate::citations::sources_from_meta(entry.meta.as_ref());
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0].reference_id, "turn0search0");
+        assert_eq!(sources[1].reference_id, "turn0view0");
+        let snapshot_sources = s
+            .to_snapshot()
+            .active_tool_calls
+            .into_iter()
+            .flat_map(|call| crate::citations::sources_from_meta(call.meta.as_ref()))
+            .collect::<Vec<_>>();
+        assert_eq!(snapshot_sources, sources);
     }
 
     #[test]
