@@ -12,6 +12,7 @@ const h = vi.hoisted(() => ({
   refreshSnapshot: vi.fn(),
   reconnect: vi.fn(),
   status: null as "prompting" | "connected" | null,
+  promptReady: true,
 }))
 
 vi.mock("next-intl", () => ({
@@ -40,6 +41,7 @@ vi.mock("@/hooks/use-connection", () => ({
     agentType: null,
     isViewer: false,
     status: h.status,
+    promptReady: h.promptReady,
     promptCapabilities: {
       image: false,
       audio: false,
@@ -89,12 +91,14 @@ interface HarnessProps {
   sessionId?: string
   conversationId?: number
   agentType?: AgentType
+  showFocusInput?: boolean
 }
 
 function Harness({
   sessionId,
   conversationId,
   agentType = "codex",
+  showFocusInput = false,
 }: HarnessProps) {
   const lifecycle = useConnectionLifecycle({
     contextKey: "codex-tab",
@@ -105,9 +109,14 @@ function Harness({
     conversationId,
   })
   return (
-    <button onClick={lifecycle.handleCancel}>
-      {lifecycle.isCancelling ? "stopping" : "stop"}
-    </button>
+    <>
+      <button onClick={lifecycle.handleCancel}>
+        {lifecycle.isCancelling ? "stopping" : "stop"}
+      </button>
+      {showFocusInput ? (
+        <input aria-label="prompt" onFocus={lifecycle.handleFocus} />
+      ) : null}
+    </>
   )
 }
 
@@ -124,6 +133,7 @@ describe("useConnectionLifecycle persisted identity changes", () => {
     h.reconnect.mockReset()
     h.reconnect.mockResolvedValue(true)
     h.status = null
+    h.promptReady = true
   })
 
   it("connects again when an asynchronously loaded external session id becomes available", async () => {
@@ -159,6 +169,30 @@ describe("useConnectionLifecycle persisted identity changes", () => {
     view.rerender(<Harness {...props} />)
     await Promise.resolve()
     expect(h.connect).toHaveBeenCalledTimes(1)
+  })
+
+  it("revalidates an idle connection whose local prompt-ready latch is stale", async () => {
+    h.status = "connected"
+    h.promptReady = false
+    render(
+      <Harness
+        conversationId={42}
+        sessionId="codex-session-42"
+        showFocusInput
+      />
+    )
+    await waitFor(() => expect(h.connect).toHaveBeenCalledTimes(1))
+    h.connect.mockClear()
+
+    fireEvent.focus(screen.getByLabelText("prompt"))
+    await waitFor(() => {
+      expect(h.connect).toHaveBeenCalledWith(
+        "codex",
+        "/workspace",
+        "codex-session-42",
+        42
+      )
+    })
   })
 
   it("sends only one cancel while a fast double-click is in flight", async () => {

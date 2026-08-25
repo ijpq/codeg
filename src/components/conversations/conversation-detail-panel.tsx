@@ -1253,6 +1253,12 @@ const ConversationTabView = memo(function ConversationTabView({
               state: "waiting_session_restore",
             })
           }
+          // Do not wait for another mount/WS event to wake a stale restore.
+          // `handleFocus` re-runs the idempotent atomic restore when the local
+          // connection is idle-but-not-prompt-ready; the retained queue item
+          // flushes with this same client id once the authoritative ready
+          // receipt lands.
+          handleFocus()
         }
         if (queueItemId) queueSendInFlightRef.current = null
         return
@@ -1390,6 +1396,7 @@ const ConversationTabView = memo(function ConversationTabView({
         }
         queueSendInFlightRef.current = null
         setSyncState(effectiveConversationId, "idle")
+        handleFocus()
       }
       const onSendFailed = (error: unknown, ambiguous: boolean) => {
         promptSubmitPendingRef.current = false
@@ -1602,6 +1609,7 @@ const ConversationTabView = memo(function ConversationTabView({
       conn.pendingUserMessage,
       effectiveConversationId,
       folderId,
+      handleFocus,
       hasPersistedConversation,
       lifecycleSend,
       pinTab,
