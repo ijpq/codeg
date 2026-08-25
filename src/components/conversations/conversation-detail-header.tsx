@@ -19,7 +19,6 @@ import { toast } from "sonner"
 import { useTranslations } from "next-intl"
 import { useImeGuard } from "@/hooks/use-ime-guard"
 import {
-  createConversationBranch,
   deleteConversation,
   getConversationBranchInfo,
   mergeConversationBranch,
@@ -33,9 +32,7 @@ import { ConversationHeaderFolderPicker } from "@/components/chat/conversation-c
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
 import { useTabActions } from "@/contexts/tab-context"
 import { getRuntimeSession } from "@/stores/conversation-runtime-store"
-import { getCachedSelectors } from "@/contexts/acp-connections-context"
 import type { ConversationStatus } from "@/lib/types"
-import { queueConversationBranchCreation } from "@/hooks/use-message-queue"
 import { subscribe } from "@/lib/platform"
 import { STATUS_ORDER } from "@/lib/types"
 import { ConversationStatusDot } from "@/components/conversations/conversation-status-dot"
@@ -73,6 +70,10 @@ import {
   type ActiveSessionDetails,
 } from "./active-session-details"
 import { SessionDetailsDialog } from "./session-details-dialog"
+import {
+  getDatedBranchTitle,
+  requestConversationBranchCreation,
+} from "./conversation-branch-creation-action"
 
 interface ConversationDetailHeaderProps {
   tabId: string
@@ -249,36 +250,20 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
     }
     setBranchBusy(true)
     try {
-      const selectors = getCachedSelectors(persistedConversation.agent_type)
-      const preferredConfigValues = Object.fromEntries(
-        (selectors?.configOptions ?? []).map((option) => [
-          option.id,
-          String(option.kind.current_value),
-        ])
-      )
       const requestId = (createRequestIdRef.current ??= crypto.randomUUID())
-      if (
-        queueConversationBranchCreation({
-          conversationId,
-          requestId,
-          operationId: requestId,
-          modeId: selectors?.modes?.current_mode_id ?? null,
-        })
-      ) {
+      const action = await requestConversationBranchCreation({
+        conversationId,
+        agentType: persistedConversation.agent_type,
+        requestId,
+      })
+      if (action.kind === "queued") {
         // The mounted tab has durably adopted this operation id in its queue.
         // Retries for that queued item keep using it, while the next deliberate
         // menu action must receive a fresh id after this item completes.
         createRequestIdRef.current = null
         return
       }
-      const result = await createConversationBranch({
-        requestId,
-        operationId: requestId,
-        sourceConversationId: conversationId,
-        deferIfSourceBusy: false,
-        preferredModeId: selectors?.modes?.current_mode_id ?? null,
-        preferredConfigValues,
-      })
+      const result = action.result
       await refreshConversations()
       const branchTitle = useAppWorkspaceStore
         .getState()
@@ -290,7 +275,7 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
         result.branchConversationId,
         persistedConversation.agent_type,
         true,
-        branchTitle ?? `${displayTitle} · 分支`
+        branchTitle ?? getDatedBranchTitle(displayTitle)
       )
       createRequestIdRef.current = null
       toast.success(
