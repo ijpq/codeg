@@ -1097,15 +1097,16 @@ async fn capture_loop(args: CaptureLoopArgs) {
     }
 
     tracing::info!(
-        "[artifact-tracker] finish run={} conversation={} status={:?} reason={} observed={} available={} removed={} stat_errors={}",
-        run_id,
+        turn_run_id = %run_id,
         conversation_id,
-        finish.status,
-        finish.stop_reason.as_deref().unwrap_or(""),
-        final_stats.observed,
-        final_stats.available,
-        final_stats.removed,
-        final_stats.stat_errors,
+        stage = "artifact_settlement_completed",
+        settlement_status = ?finish.status,
+        stop_reason = finish.stop_reason.as_deref().unwrap_or(""),
+        observed = final_stats.observed,
+        available = final_stats.available,
+        removed = final_stats.removed,
+        stat_errors = final_stats.stat_errors,
+        "[artifact-tracker] auxiliary artifact settlement completed"
     );
     emit_artifacts_changed(&emitter, conversation_id, run_id);
 }

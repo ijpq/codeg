@@ -24,7 +24,7 @@ const SUPPORTED_ADAPTER_VERSION: &str = "1.1.2";
 const NATIVE_FORK_ADAPTER_VERSION: &str = "1.6.2";
 const NATIVE_STEERING_MIN_VERSION: (u64, u64, u64) = (1, 1, 6);
 const PATCH_REVISION: &str = "codeg-steer-v1";
-const NATIVE_FORK_PATCH_REVISION: &str = "codeg-native-thread-fork-citations-v2";
+const NATIVE_FORK_PATCH_REVISION: &str = "codeg-native-thread-fork-citations-terminal-v3";
 
 #[derive(Debug, Clone)]
 pub struct PreparedCodexSteerAdapter {
@@ -259,6 +259,68 @@ function createCollabAgentToolCallUpdate"#,
     Replacement {
         before: r#").onRequest(methods.agent.session.load, (ctx) => getAgent().loadSession(ctx.params)).onRequest(methods.agent.session.list"#,
         after: r#").onRequest(methods.agent.session.load, (ctx) => getAgent().loadSession(ctx.params)).onRequest(methods.agent.session.fork, (ctx) => getAgent().forkSession(ctx.params)).onRequest(methods.agent.session.list"#,
+    },
+    // Record the app-server terminal at the point where codex-acp first sees
+    // it. Together with CodeG's prompt-response and durable-terminal logs this
+    // separates provider latency from adapter queue/report latency without
+    // logging any user content.
+    Replacement {
+        before: r#"  recordTurnCompleted(event) {
+    const threadResolvers = this.pendingTurnCompletionResolvers.get(event.threadId);"#,
+        after: r#"  recordTurnCompleted(event) {
+    logger.log("Codex turn/completed received", {
+      sessionId: event.threadId,
+      turnId: event.turn.id,
+      status: event.turn.status,
+      receivedAtMs: Date.now()
+    });
+    const threadResolvers = this.pendingTurnCompletionResolvers.get(event.threadId);"#,
+    },
+    // AIR's file-change report is an auxiliary, model-backed audit performed
+    // *after* Codex has already emitted `turn/completed`. Upstream 1.6.2 awaits
+    // that audit from `prompt()`'s `finally` block, so the ACP prompt response
+    // (and therefore CodeG's durable TurnComplete) is held open for the audit's
+    // entire 30-second budget. A backed-up app-server notification queue can
+    // add another budget-sized interval, matching the roughly one-minute
+    // "final answer is visible but still generating" field reports.
+    //
+    // CodeG already correlates late reports by the durable turn-run request id
+    // and its idle connection loop continues consuming session updates after
+    // the prompt response. Detaching only this auxiliary report therefore
+    // preserves exactly-once attribution while allowing the authoritative ACP
+    // terminal response to settle the user-visible turn immediately.
+    Replacement {
+        before: r#"      if (agentFileChangeReportRequest !== null) {
+        await this.publishAgentFileChangeReport(
+          sessionState,
+          agentFileChangeReportTurnId,
+          agentFileChangeReportRequest,
+          agentFileChangeReportUnavailableReason,
+          activePrompt.signal
+        );
+      }
+      logger.log("Prompt completed", { sessionId: params.sessionId });"#,
+        after: r#"      if (agentFileChangeReportRequest !== null) {
+        const reportStartedAt = Date.now();
+        void this.publishAgentFileChangeReport(
+          sessionState,
+          agentFileChangeReportTurnId,
+          agentFileChangeReportRequest,
+          agentFileChangeReportUnavailableReason,
+          activePrompt.signal
+        ).then(
+          () => logger.log("Agent file-change report completed after prompt terminal", {
+            sessionId: params.sessionId,
+            requestId: agentFileChangeReportRequest.requestId,
+            elapsedMs: Date.now() - reportStartedAt
+          }),
+          (error) => logger.error("Detached agent file-change report failed", error)
+        );
+      }
+      logger.log("Prompt terminal ready", {
+        sessionId: params.sessionId,
+        reportDetached: agentFileChangeReportRequest !== null
+      });"#,
     },
 ];
 
@@ -551,6 +613,10 @@ mod tests {
         assert!(patched.contains("this.sessions.set(sessionId, sessionState)"));
         assert!(patched.contains("methods.agent.session.fork"));
         assert!(patched.contains("thread/fork did not return an independent session"));
+        assert!(patched.contains("Codex turn/completed received"));
+        assert!(patched.contains("Prompt terminal ready"));
+        assert!(patched.contains("Agent file-change report completed after prompt terminal"));
+        assert!(!patched.contains("await this.publishAgentFileChangeReport("));
     }
 
     #[test]
