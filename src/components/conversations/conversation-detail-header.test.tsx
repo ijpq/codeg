@@ -215,7 +215,7 @@ describe("ConversationDetailHeader dialog target snapshot", () => {
         9,
         "codex",
         true,
-        "conv-a · 分支"
+        expect.stringMatching(/^conv-a · 分支 \d{1,2}\.\d{1,2}$/)
       )
     })
   })
@@ -284,7 +284,13 @@ describe("ConversationDetailHeader dialog target snapshot", () => {
 
     await waitFor(() => {
       expect(h.openTab.mock.calls).toEqual([
-        [1, 9, "codex", true, "conv-a · 分支"],
+        [
+          1,
+          9,
+          "codex",
+          true,
+          expect.stringMatching(/^conv-a · 分支 \d{1,2}\.\d{1,2}$/),
+        ],
       ])
     })
   })
@@ -316,7 +322,13 @@ describe("ConversationDetailHeader dialog target snapshot", () => {
       expect(h.createConversationBranch).toHaveBeenCalledTimes(1)
     })
     expect(h.refreshConversations).toHaveBeenCalled()
-    expect(h.openTab).toHaveBeenCalledWith(1, 9, "codex", true, "conv-a · 分支")
+    expect(h.openTab).toHaveBeenCalledWith(
+      1,
+      9,
+      "codex",
+      true,
+      expect.stringMatching(/^conv-a · 分支 \d{1,2}\.\d{1,2}$/)
+    )
   })
 
   it("returns to the source in one click without a content-selection dialog", async () => {

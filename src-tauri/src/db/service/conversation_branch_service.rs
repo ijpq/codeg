@@ -1,4 +1,4 @@
-use chrono::Utc;
+use chrono::{Datelike, Local, NaiveDate, Utc};
 use sea_orm::{
     ActiveModelTrait, ActiveValue::NotSet, ColumnTrait, DatabaseConnection, EntityTrait,
     IntoActiveModel, QueryFilter, QueryOrder, Set, TransactionError, TransactionTrait,
@@ -30,6 +30,27 @@ fn source_title_base(title: Option<&str>) -> String {
     } else {
         title.into()
     }
+}
+
+fn next_dated_branch_title(
+    source_title: Option<&str>,
+    date: NaiveDate,
+    sibling_titles: &std::collections::HashSet<String>,
+) -> String {
+    let base = format!(
+        "{} · 分支 {}.{}",
+        source_title_base(source_title),
+        date.month(),
+        date.day()
+    );
+    if !sibling_titles.contains(&base) {
+        return base;
+    }
+
+    (2..)
+        .map(|number| format!("{base}.{number}"))
+        .find(|candidate| !sibling_titles.contains(candidate))
+        .expect("the dated branch title number space is unbounded")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -217,7 +238,6 @@ pub async fn create_branch_row_with_operation(
             return Ok((branch, existing.into()));
         }
     }
-    let base_title = format!("{} · 分支", source_title_base(source.title.as_deref()));
     let sibling_titles = conversation::Entity::find()
         .filter(conversation::Column::FolderId.eq(source.folder_id))
         .filter(conversation::Column::DeletedAt.is_null())
@@ -226,14 +246,11 @@ pub async fn create_branch_row_with_operation(
         .into_iter()
         .filter_map(|row| row.title)
         .collect::<std::collections::HashSet<_>>();
-    let title = if !sibling_titles.contains(&base_title) {
-        base_title
-    } else {
-        (2..)
-            .map(|number| format!("{base_title} {number}"))
-            .find(|candidate| !sibling_titles.contains(candidate))
-            .expect("the branch title number space is unbounded")
-    };
+    let title = next_dated_branch_title(
+        source.title.as_deref(),
+        Local::now().date_naive(),
+        &sibling_titles,
+    );
     let title = Some(title);
     let now = Utc::now();
     let provisional = fork_mode == "snapshot" && inheritance.snapshot_context.is_some();
@@ -1479,6 +1496,25 @@ mod tests {
     use crate::models::AgentType;
     use sea_orm::PaginatorTrait;
 
+    #[test]
+    fn dated_branch_titles_use_dot_suffixes_for_same_day_siblings() {
+        let date = NaiveDate::from_ymd_opt(2026, 8, 25).unwrap();
+        let mut used = std::collections::HashSet::new();
+
+        let first = next_dated_branch_title(Some("Agent 调试"), date, &used);
+        assert_eq!(first, "Agent 调试 · 分支 8.25");
+        used.insert(first);
+
+        let second = next_dated_branch_title(Some("Agent 调试"), date, &used);
+        assert_eq!(second, "Agent 调试 · 分支 8.25.2");
+        used.insert(second);
+
+        assert_eq!(
+            next_dated_branch_title(Some("Agent 调试"), date, &used),
+            "Agent 调试 · 分支 8.25.3"
+        );
+    }
+
     #[tokio::test]
     async fn legacy_fork_send_relation_repairs_from_native_parent_identity() {
         let db = fresh_in_memory_db().await;
@@ -1704,7 +1740,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn branch_creation_is_idempotent_and_numbers_titles() {
+    async fn branch_creation_is_idempotent_and_numbers_dated_titles() {
         let db = fresh_in_memory_db().await;
         let folder_id = seed_folder(&db, "/tmp/codeg-branch-title-test").await;
         let source_id = seed_conversation(&db, folder_id, AgentType::Codex).await;
@@ -1789,8 +1825,13 @@ mod tests {
             first_info.branch_conversation_id,
             transport_retry_info.branch_conversation_id
         );
-        assert_eq!(first.title.as_deref(), Some("Agent 调试 · 分支"));
-        assert_eq!(second.title.as_deref(), Some("Agent 调试 · 分支 2"));
+        let first_title = first.title.as_deref().unwrap();
+        assert!(first_title.starts_with("Agent 调试 · 分支 "));
+        let expected_second_title = format!("{first_title}.2");
+        assert_eq!(
+            second.title.as_deref(),
+            Some(expected_second_title.as_str())
+        );
         assert_eq!(
             conversation_branch::Entity::find()
                 .count(&db.conn)
@@ -1850,7 +1891,10 @@ mod tests {
         assert_ne!(branch.id, source_id);
         assert_eq!(source_after.title, source_before.title);
         assert_eq!(source_after.external_id.as_deref(), Some("source-session"));
-        assert_eq!(branch.title.as_deref(), Some("Agent 调试 · 分支"));
+        assert!(branch
+            .title
+            .as_deref()
+            .is_some_and(|title| title.starts_with("Agent 调试 · 分支 ")));
         assert_eq!(branch.external_id.as_deref(), Some("branch-session"));
         assert_eq!(relation.source_conversation_id, source_id);
         assert_eq!(
