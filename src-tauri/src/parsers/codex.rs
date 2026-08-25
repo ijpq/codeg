@@ -18,8 +18,127 @@ use crate::parsers::{
     folder_name_from_path, title_from_user_text, truncate_str, AgentParser, ParseError,
 };
 
+const CITATION_RECOVERY_TAIL_BYTES: u64 = 64 * 1024 * 1024;
+
 pub struct CodexParser {
     base_dir: PathBuf,
+}
+
+fn merge_web_search_citation_meta(
+    messages: &mut [UnifiedMessage],
+    tool_id: &str,
+    incoming_meta: Option<&serde_json::Value>,
+) -> bool {
+    let Some(incoming_meta) = incoming_meta else {
+        return false;
+    };
+    for message in messages.iter_mut().rev() {
+        for block in message.content.iter_mut().rev() {
+            let ContentBlock::ToolUse {
+                tool_use_id, meta, ..
+            } = block
+            else {
+                continue;
+            };
+            if tool_use_id.as_deref() != Some(tool_id) {
+                continue;
+            }
+            *meta = Some(crate::citations::merge_citations_in_meta(
+                meta.as_ref(),
+                incoming_meta,
+            ));
+            return true;
+        }
+    }
+    false
+}
+
+/// Recover sources for the current Codex turn from its append-only rollout.
+/// This is a terminal-path fallback for providers whose live `WebSearchItem`
+/// reports `results: null` even though `web_search_end` persists the exact
+/// ref-id/URL pairs. The read is bounded and must observe a current-turn
+/// `task_started` boundary; otherwise it fails closed instead of mixing an old
+/// turn's same-shaped citation id into the new answer.
+pub(crate) fn recover_current_turn_citation_sources(
+    session_id: &str,
+    wanted_ids: &HashSet<String>,
+) -> Result<Vec<crate::citations::CitationSource>, String> {
+    if wanted_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let parser = CodexParser::new();
+    let path = parser
+        .rollout_path(session_id)
+        .map_err(|_| "rollout_not_found".to_string())?;
+    recover_current_turn_citation_sources_from_path(&path, wanted_ids)
+}
+
+fn recover_current_turn_citation_sources_from_path(
+    path: &Path,
+    wanted_ids: &HashSet<String>,
+) -> Result<Vec<crate::citations::CitationSource>, String> {
+    if wanted_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut file = fs::File::open(path).map_err(|_| "rollout_open_failed".to_string())?;
+    let file_len = file
+        .metadata()
+        .map_err(|_| "rollout_metadata_failed".to_string())?
+        .len();
+    let start = file_len.saturating_sub(CITATION_RECOVERY_TAIL_BYTES);
+    file.seek(SeekFrom::Start(start))
+        .map_err(|_| "rollout_seek_failed".to_string())?;
+    let mut reader = BufReader::new(file);
+    if start > 0 {
+        let mut partial = String::new();
+        reader
+            .read_line(&mut partial)
+            .map_err(|_| "rollout_partial_line_failed".to_string())?;
+    }
+
+    let mut saw_stable_boundary = false;
+    let mut sources = Vec::new();
+    for line in reader.lines() {
+        let line = line.map_err(|_| "rollout_read_failed".to_string())?;
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let record_type = value
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let Some(payload) = value.get("payload") else {
+            continue;
+        };
+        let payload_type = payload
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if record_type == "event_msg" && payload_type == "task_started" {
+            saw_stable_boundary = true;
+            sources.clear();
+            continue;
+        }
+        if !saw_stable_boundary {
+            continue;
+        }
+        let citation_payload = (record_type == "event_msg" && payload_type == "web_search_end")
+            || (record_type == "response_item" && payload_type == "web_search_call");
+        if !citation_payload {
+            continue;
+        }
+        sources.extend(crate::citations::extract_sources_from_web_search_input(
+            &payload.to_string(),
+        ));
+    }
+    if !saw_stable_boundary {
+        return Err("stable_turn_boundary_outside_bounded_tail".to_string());
+    }
+    let merged = crate::citations::merge_sources(sources.iter())
+        .into_iter()
+        .filter(|source| wanted_ids.contains(&source.reference_id))
+        .collect::<Vec<_>>();
+    Ok(merged)
 }
 
 impl Default for CodexParser {
@@ -3043,11 +3162,6 @@ impl CodexParser {
                                     .and_then(|value| value.as_str())
                                     .unwrap_or("")
                                     .to_string();
-                                if !call_id.is_empty()
-                                    && !emitted_web_search_ids.insert(call_id.clone())
-                                {
-                                    continue;
-                                }
                                 let raw_input = serde_json::json!({
                                     "type": "webSearch",
                                     "id": call_id,
@@ -3070,6 +3184,14 @@ impl CodexParser {
                                 } else {
                                     call_id
                                 };
+                                if merge_web_search_citation_meta(
+                                    &mut messages,
+                                    &tool_id,
+                                    meta.as_ref(),
+                                ) {
+                                    continue;
+                                }
+                                emitted_web_search_ids.insert(tool_id.clone());
                                 messages.push(UnifiedMessage {
                                     id: format!("tool-{}", messages.len()),
                                     role: MessageRole::Assistant,
@@ -3248,6 +3370,66 @@ impl CodexParser {
                         }
 
                         match payload_type {
+                            "web_search_call" => {
+                                // Some Codex/app-server builds retain an exact
+                                // citation id + open-page URL only on the raw
+                                // Responses item. codex-acp 1.6.2 ignored this
+                                // event entirely. Recover it on history load,
+                                // but only when the structured object itself
+                                // proves the id↔URL association.
+                                let raw_input = payload.to_string();
+                                let meta = crate::citations::attach_sources_to_meta(
+                                    None,
+                                    Some(&raw_input),
+                                );
+                                if !crate::citations::sources_from_meta(meta.as_ref()).is_empty() {
+                                    let call_id = payload
+                                        .get("call_id")
+                                        .or_else(|| payload.get("id"))
+                                        .and_then(serde_json::Value::as_str)
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let dedup_id = if call_id.is_empty() {
+                                        format!("web-search-response-{}", messages.len())
+                                    } else {
+                                        call_id.clone()
+                                    };
+                                    if merge_web_search_citation_meta(
+                                        &mut messages,
+                                        &dedup_id,
+                                        meta.as_ref(),
+                                    ) {
+                                        continue;
+                                    }
+                                    if emitted_web_search_ids.insert(dedup_id.clone()) {
+                                        messages.push(UnifiedMessage {
+                                            id: format!("tool-{}", messages.len()),
+                                            role: MessageRole::Assistant,
+                                            content: vec![
+                                                ContentBlock::ToolUse {
+                                                    tool_use_id: Some(dedup_id.clone()),
+                                                    tool_name: "web_search".to_string(),
+                                                    input_preview: Some(raw_input),
+                                                    status: Some("completed".to_string()),
+                                                    meta,
+                                                },
+                                                ContentBlock::ToolResult {
+                                                    tool_use_id: Some(dedup_id),
+                                                    output_preview: None,
+                                                    is_error: false,
+                                                    agent_stats: None,
+                                                    images: Vec::new(),
+                                                },
+                                            ],
+                                            timestamp,
+                                            usage: None,
+                                            duration_ms: None,
+                                            model: None,
+                                            completed_at: Some(timestamp),
+                                        });
+                                    }
+                                }
+                            }
                             "reasoning" => {
                                 // Codex records a reasoning turn as a `summary` array
                                 // of `{type:"summary_text", text}` parts — one part per
@@ -5232,7 +5414,7 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
 #[cfg(test)]
 mod tests {
 
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     use super::extract_codex_title_candidate;
     use super::extract_context_window_used_tokens_from_token_count_info;
@@ -5245,6 +5427,7 @@ mod tests {
     use super::merge_codex_total_usage_stats;
     use super::parse_codex_subagent_stats;
     use super::redact_encrypted_args;
+    use super::recover_current_turn_citation_sources_from_path;
     use super::resolve_codex_home_dir_from;
     use super::CODEX_SUBAGENT_LAUNCH_KEY;
     use super::COLLAB_OP_KEY;
@@ -7113,6 +7296,170 @@ mod tests {
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].reference_id, "turn0search0");
         assert_eq!(sources[0].url, "https://example.com/source?q=1");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn reload_merges_raw_open_page_and_search_result_citations() {
+        let path = write_temp_rollout(
+            "raw-citations",
+            &[
+                serde_json::json!({
+                    "timestamp":"2026-08-24T10:00:00Z",
+                    "type":"session_meta",
+                    "payload":{"id":"raw-citation-session","cwd":"/tmp/project"}
+                })
+                .to_string(),
+                serde_json::json!({
+                    "timestamp":"2026-08-24T10:00:01Z",
+                    "type":"event_msg",
+                    "payload":{"type":"user_message","message":"search"}
+                })
+                .to_string(),
+                serde_json::json!({
+                    "timestamp":"2026-08-24T10:00:02Z",
+                    "type":"response_item",
+                    "payload":{
+                        "type":"web_search_call",
+                        "id":"turn4view0",
+                        "action":{"type":"openPage","url":"https://docs.example.org/open?q=%E4%B8%AD%E6%96%87"}
+                    }
+                })
+                .to_string(),
+                serde_json::json!({
+                    "timestamp":"2026-08-24T10:00:03Z",
+                    "type":"event_msg",
+                    "payload":{
+                        "type":"web_search_end",
+                        "call_id":"turn4view0",
+                        "query":"source",
+                        "results":[{
+                            "ref_id":"turn4search0",
+                            "url":"https://example.com/result",
+                            "title":"Result"
+                        }]
+                    }
+                })
+                .to_string(),
+                serde_json::json!({
+                    "timestamp":"2026-08-24T10:00:04Z",
+                    "type":"event_msg",
+                    "payload":{
+                        "type":"agent_message",
+                        "message":"answer \u{e200}cite\u{e202}turn4view0\u{e202}turn4search0\u{e201}"
+                    }
+                })
+                .to_string(),
+            ],
+        );
+        let detail = CodexParser::new()
+            .parse_conversation_detail(&path, "raw-citation-session")
+            .expect("parse raw citation rollout");
+        let sources = detail
+            .turns
+            .iter()
+            .flat_map(|turn| turn.blocks.iter())
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse { meta, .. } => meta.as_ref(),
+                _ => None,
+            })
+            .flat_map(|meta| crate::citations::sources_from_meta(Some(meta)))
+            .collect::<Vec<_>>();
+        assert_eq!(sources.len(), 2);
+        assert!(sources.iter().any(|source| {
+            source.reference_id == "turn4view0"
+                && source.url.starts_with("https://docs.example.org/open")
+        }));
+        assert!(sources.iter().any(|source| {
+            source.reference_id == "turn4search0"
+                && source.url == "https://example.com/result"
+        }));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn terminal_citation_recovery_is_scoped_to_latest_stable_turn() {
+        let path = write_temp_rollout(
+            "terminal-citation-recovery",
+            &[
+                serde_json::json!({
+                    "timestamp":"2026-08-24T10:00:00Z",
+                    "type":"event_msg",
+                    "payload":{"type":"task_started"}
+                })
+                .to_string(),
+                serde_json::json!({
+                    "timestamp":"2026-08-24T10:00:01Z",
+                    "type":"event_msg",
+                    "payload":{
+                        "type":"web_search_end",
+                        "call_id":"old-call",
+                        "results":[{
+                            "ref_id":"turn8view0",
+                            "url":"https://old.example/wrong",
+                            "title":"Old"
+                        }]
+                    }
+                })
+                .to_string(),
+                serde_json::json!({
+                    "timestamp":"2026-08-24T10:01:00Z",
+                    "type":"event_msg",
+                    "payload":{"type":"task_started"}
+                })
+                .to_string(),
+                serde_json::json!({
+                    "timestamp":"2026-08-24T10:01:01Z",
+                    "type":"event_msg",
+                    "payload":{
+                        "type":"web_search_end",
+                        "call_id":"current-call",
+                        "results":[{
+                            "ref_id":"turn8view0",
+                            "url":"https://current.example/right",
+                            "title":"Current"
+                        },{
+                            "ref_id":"turn8search1",
+                            "url":"https://current.example/unused",
+                            "title":"Unused"
+                        }]
+                    }
+                })
+                .to_string(),
+            ],
+        );
+        let wanted = HashSet::from(["turn8view0".to_string()]);
+        let sources = recover_current_turn_citation_sources_from_path(&path, &wanted)
+            .expect("recover current turn");
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].url, "https://current.example/right");
+        assert_eq!(sources[0].call_id.as_deref(), Some("current-call"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn terminal_citation_recovery_fails_closed_without_turn_boundary() {
+        let path = write_temp_rollout(
+            "terminal-citation-no-boundary",
+            &[serde_json::json!({
+                "timestamp":"2026-08-24T10:00:01Z",
+                "type":"event_msg",
+                "payload":{
+                    "type":"web_search_end",
+                    "call_id":"call",
+                    "results":[{
+                        "ref_id":"turn8view0",
+                        "url":"https://example.com/wrong-turn"
+                    }]
+                }
+            })
+            .to_string()],
+        );
+        let wanted = HashSet::from(["turn8view0".to_string()]);
+        assert_eq!(
+            recover_current_turn_citation_sources_from_path(&path, &wanted).unwrap_err(),
+            "stable_turn_boundary_outside_bounded_tail"
+        );
         let _ = fs::remove_file(path);
     }
 
