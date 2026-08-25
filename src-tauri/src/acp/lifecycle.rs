@@ -432,6 +432,8 @@ pub(crate) async fn handle_event(
                     conversation_id = cid,
                     turn_run_id = ?latest_run.as_ref().map(|run| &run.id),
                     connection_id = %envelope.connection_id,
+                    event_seq = envelope.seq,
+                    stage = "durable_terminal_persisted",
                     old_state = ?latest_run.as_ref().map(|run| &run.status),
                     new_state = ?run_status,
                     transition_reason = %stop_reason,

@@ -8571,6 +8571,15 @@ async fn run_conversation_loop<'a>(
                         .send_request_to(Agent, prompt_request)
                         .block_task(),
                 );
+                let prompt_rpc_started = std::time::Instant::now();
+                tracing::info!(
+                    conversation_id = ?state.read().await.conversation_id,
+                    connection_id = %conn_id,
+                    external_session_id = %sid.0,
+                    turn_run_id = ?agent_file_change_report_request_id,
+                    stage = "prompt_rpc_started",
+                    "[ACP][terminal] prompt request entered the active turn loop"
+                );
                 let mut tracked_terminal_tool_calls: HashMap<String, TrackedTerminalToolCall> =
                     HashMap::new();
                 let mut terminal_poll_interval = tokio::time::interval(
@@ -8747,6 +8756,19 @@ async fn run_conversation_loop<'a>(
                                         .await;
                                     }
                                     let raw_reason_str = stop_reason_to_str(reason);
+                                    tracing::info!(
+                                        conversation_id = ?state.read().await.conversation_id,
+                                        connection_id = %conn_id,
+                                        external_session_id = %sid.0,
+                                        turn_run_id = ?agent_file_change_report_request_id,
+                                        stage = "acp_terminal_received",
+                                        terminal_source = "session_stop_reason",
+                                        terminal_elapsed_ms = prompt_rpc_started.elapsed().as_millis() as u64,
+                                        pending_terminal_tools = tracked_terminal_tool_calls.len(),
+                                        background_outstanding = state.read().await.background_outstanding,
+                                        stop_reason = raw_reason_str,
+                                        "[ACP][terminal] authoritative terminal signal received"
+                                    );
                                     // Pure: resolves the reason and (for an
                                     // empty turn) its diagnosis. Side effects
                                     // below stay exactly where they were — note
@@ -8857,6 +8879,19 @@ async fn run_conversation_loop<'a>(
                                 .await;
                             }
                             let raw_reason_str = stop_reason_to_str(reason);
+                            tracing::info!(
+                                conversation_id = ?state.read().await.conversation_id,
+                                connection_id = %conn_id,
+                                external_session_id = %sid.0,
+                                turn_run_id = ?agent_file_change_report_request_id,
+                                stage = "acp_terminal_received",
+                                terminal_source = "prompt_response",
+                                terminal_elapsed_ms = prompt_rpc_started.elapsed().as_millis() as u64,
+                                pending_terminal_tools = tracked_terminal_tool_calls.len(),
+                                background_outstanding = state.read().await.background_outstanding,
+                                stop_reason = raw_reason_str,
+                                "[ACP][terminal] authoritative terminal signal received"
+                            );
                             // Same pure helper as the StopReason-message exit,
                             // so the two can't drift. This exit keeps its own
                             // extra side effect (`record_turn_end` below).
