@@ -669,6 +669,12 @@ mod tests {
             url: "https://example.com/source".into(),
             title: "Example source".into(),
             site_name: "example.com".into(),
+            source_type: "web_search".into(),
+            call_id: Some("ws-1".into()),
+            message_id: None,
+            start_index: None,
+            end_index: None,
+            snippet: None,
         };
         let mut search = turn("search", TurnRole::Assistant, "", 2);
         search.blocks = vec![ContentBlock::ToolUse {

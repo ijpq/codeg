@@ -24,7 +24,7 @@ const SUPPORTED_ADAPTER_VERSION: &str = "1.1.2";
 const NATIVE_FORK_ADAPTER_VERSION: &str = "1.6.2";
 const NATIVE_STEERING_MIN_VERSION: (u64, u64, u64) = (1, 1, 6);
 const PATCH_REVISION: &str = "codeg-steer-v1";
-const NATIVE_FORK_PATCH_REVISION: &str = "codeg-native-thread-fork-citations-terminal-v3";
+const NATIVE_FORK_PATCH_REVISION: &str = "codeg-native-thread-fork-citations-terminal-v4";
 
 #[derive(Debug, Clone)]
 pub struct PreparedCodexSteerAdapter {
@@ -173,6 +173,35 @@ function createCollabAgentToolCallUpdate"#,
     };
   }
   createReviewModeUpdate"#,
+    },
+    // Codex app-server also publishes the underlying Responses item. Upstream
+    // codex-acp 1.6.2 deliberately ignores every `rawResponseItem/completed`,
+    // including `web_search_call`; that is the only event some providers use
+    // to retain an exact open-page citation id + URL. Preserve that structured
+    // item as a partial update on the existing web-search call. CodeG will only
+    // accept http(s) URLs paired with an explicit citation id, never infer one
+    // from event order.
+    Replacement {
+        before: r#"      case "externalAgentConfig/import/completed":
+      case "rawResponseItem/completed":
+      case "rawResponse/completed":"#,
+        after: r#"      case "externalAgentConfig/import/completed":
+      case "rawResponseItem/completed": {
+        const item = notification.params.item;
+        if (item?.type !== "web_search_call" || typeof item.id !== "string" || !/^turn\d+(?:search|view|open|fetch)\d+$/.test(item.id)) {
+          return null;
+        }
+        return {
+          sessionUpdate: "tool_call_update",
+          toolCallId: item.id,
+          rawInput: {
+            type: item.type,
+            id: item.id,
+            action: item.action
+          }
+        };
+      }
+      case "rawResponse/completed":"#,
     },
     Replacement {
         before: r#"          delete: {},
@@ -455,6 +484,8 @@ pub async fn prepare(
         .find(|(candidate, _)| candidate.is_file());
     let Some((bundle, package_prefix)) = selected else {
         tracing::warn!(
+            citation_bridge_active = false,
+            metadata_first_missing_stage = "codex_acp_bundle_discovery",
             "[ACP][Codex] adapter compatibility disabled: agentclientprotocol codex-acp bundle not found"
         );
         return Ok(None);
@@ -469,6 +500,8 @@ pub async fn prepare(
                 tracing::warn!(
                     version = version.as_deref().unwrap_or_default(),
                     patchable_fork_version = NATIVE_FORK_ADAPTER_VERSION,
+                    citation_bridge_active = false,
+                    metadata_first_missing_stage = "codex_acp_version_gate",
                     "[ACP][Codex] adapter has upstream steering but no verified ACP session/fork bridge; launching unchanged"
                 );
             } else {
@@ -476,6 +509,8 @@ pub async fn prepare(
                     version = ?version,
                     patchable_legacy_steer_version = SUPPORTED_ADAPTER_VERSION,
                     patchable_fork_version = NATIVE_FORK_ADAPTER_VERSION,
+                    citation_bridge_active = false,
+                    metadata_first_missing_stage = "codex_acp_version_gate",
                     "[ACP][Codex] adapter compatibility patch unavailable; launching unchanged"
                 );
             }
@@ -495,6 +530,8 @@ pub async fn prepare(
         Err(error) => {
             tracing::warn!(
                 patch_kind,
+                citation_bridge_active = false,
+                metadata_first_missing_stage = "codex_acp_patch_prepare",
                 "[ACP][Codex] compatibility patch disabled: {error}"
             );
             return Ok(None);
@@ -552,6 +589,7 @@ pub async fn prepare(
     tracing::info!(
         version = version.as_deref().unwrap_or_default(),
         patch_kind,
+        citation_bridge_active = patch_kind == "native_fork",
         derived_script = %script.display(),
         "[ACP][Codex] launching verified derived adapter"
     );
@@ -616,6 +654,9 @@ mod tests {
         assert!(patched.contains("Codex turn/completed received"));
         assert!(patched.contains("Prompt terminal ready"));
         assert!(patched.contains("Agent file-change report completed after prompt terminal"));
+        assert!(patched.contains("item?.type !== \"web_search_call\""));
+        assert!(patched.contains("/^turn\\d+(?:search|view|open|fetch)\\d+$/"));
+        assert!(patched.contains("rawInput: {\n            type: item.type"));
         assert!(!patched.contains("await this.publishAgentFileChangeReport("));
     }
 

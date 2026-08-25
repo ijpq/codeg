@@ -2588,6 +2588,177 @@ async fn drain_permissions_then_emit(
     emit_with_state(state, emitter, follow_up).await;
 }
 
+/// Best-effort terminal fallback for Codex providers that persist exact web
+/// source metadata to the rollout but report `results: null` on the live ACP
+/// WebSearch item. It is deliberately gated on unresolved ids already present
+/// in this turn's assistant text, reads only the latest stable turn, and only
+/// updates a web-search call that is already owned by this connection.
+async fn recover_codex_citations_before_terminal(
+    agent_type: AgentType,
+    session_id: &str,
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
+) {
+    if !matches!(agent_type, AgentType::Codex) {
+        return;
+    }
+    let (conversation_id, message_id, unresolved, active_tool_ids) = {
+        let state = state.read().await;
+        let message_id = state
+            .live_message
+            .as_ref()
+            .map(|message| message.id.clone())
+            .unwrap_or_default();
+        let answer = state
+            .live_message
+            .as_ref()
+            .map(|message| {
+                message
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        crate::acp::session_state::LiveContentBlock::Text {
+                            text,
+                            parent_tool_use_id: None,
+                        } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .unwrap_or_default();
+        let references = crate::citations::reference_ids(&answer);
+        let resolved = state
+            .active_tool_calls
+            .values()
+            .flat_map(|call| crate::citations::sources_from_meta(call.meta.as_ref()))
+            .map(|source| source.reference_id)
+            .collect::<HashSet<_>>();
+        let unresolved = references
+            .into_iter()
+            .filter(|reference| !resolved.contains(reference))
+            .collect::<HashSet<_>>();
+        let active_tool_ids = state
+            .active_tool_calls
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
+        (
+            state.conversation_id,
+            message_id,
+            unresolved,
+            active_tool_ids,
+        )
+    };
+    if unresolved.is_empty() {
+        return;
+    }
+
+    let session_id_owned = session_id.to_string();
+    let unresolved_for_read = unresolved.clone();
+    let recovery = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        tokio::task::spawn_blocking(move || {
+            let first = crate::parsers::codex::recover_current_turn_citation_sources(
+                &session_id_owned,
+                &unresolved_for_read,
+            );
+            if first.as_ref().is_ok_and(|sources| !sources.is_empty()) {
+                return first;
+            }
+            // The app-server terminal and rollout writer are separate tasks.
+            // Give a just-flushed `web_search_end` one bounded chance to land.
+            std::thread::sleep(std::time::Duration::from_millis(125));
+            crate::parsers::codex::recover_current_turn_citation_sources(
+                &session_id_owned,
+                &unresolved_for_read,
+            )
+        }),
+    )
+    .await;
+    let recovered = match recovery {
+        Ok(Ok(Ok(sources))) => sources,
+        Ok(Ok(Err(error))) => {
+            tracing::warn!(
+                conversation_id = ?conversation_id,
+                message_id,
+                citation_reference_count = unresolved.len(),
+                metadata_first_missing_stage = "rollout_terminal_recovery",
+                failure_classification = error,
+                "[ACP][citations] bounded rollout recovery did not resolve citation metadata"
+            );
+            return;
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(
+                conversation_id = ?conversation_id,
+                message_id,
+                citation_reference_count = unresolved.len(),
+                metadata_first_missing_stage = "rollout_terminal_recovery_task",
+                failure_classification = %error,
+                "[ACP][citations] rollout recovery task failed"
+            );
+            return;
+        }
+        Err(_) => {
+            tracing::warn!(
+                conversation_id = ?conversation_id,
+                message_id,
+                citation_reference_count = unresolved.len(),
+                metadata_first_missing_stage = "rollout_terminal_recovery_timeout",
+                "[ACP][citations] bounded rollout recovery timed out"
+            );
+            return;
+        }
+    };
+
+    let mut grouped = BTreeMap::<String, Vec<crate::citations::CitationSource>>::new();
+    for source in recovered {
+        let tool_call_id = source
+            .call_id
+            .as_ref()
+            .filter(|call_id| active_tool_ids.contains(*call_id))
+            .cloned()
+            .or_else(|| {
+                active_tool_ids
+                    .contains(&source.reference_id)
+                    .then(|| source.reference_id.clone())
+            });
+        if let Some(tool_call_id) = tool_call_id {
+            grouped.entry(tool_call_id).or_default().push(source);
+        }
+    }
+    let recovered_count = grouped.values().map(Vec::len).sum::<usize>();
+    for (tool_call_id, sources) in grouped {
+        emit_with_state(
+            state,
+            emitter,
+            AcpEvent::ToolCallUpdate {
+                tool_call_id,
+                title: None,
+                status: None,
+                content: None,
+                raw_input: None,
+                raw_output: None,
+                raw_output_append: None,
+                locations: None,
+                meta: crate::citations::attach_sources_to_meta_value(None, &sources),
+                images: None,
+            },
+        )
+        .await;
+    }
+    tracing::info!(
+        conversation_id = ?conversation_id,
+        message_id,
+        citation_reference_count = unresolved.len(),
+        resolved_citation_count = recovered_count,
+        unresolved_citation_count = unresolved.len().saturating_sub(recovered_count),
+        citation_source_event_types = "rollout_web_search_end",
+        "[ACP][citations] terminal citation metadata recovery completed"
+    );
+}
+
 /// Shared body of the two drains above. Emits the compensating
 /// `PermissionResolved` for whatever was on screen; queued cards were never
 /// published, so they need none.
@@ -8788,6 +8959,13 @@ async fn run_conversation_loop<'a>(
                                     // turn may be unpersisted (see journal_turn_span).
                                     if reason_str == "end_turn" {
                                         journal_turn_span(&mut turn_timing_probe, conn_id, &sid.0).await;
+                                        recover_codex_citations_before_terminal(
+                                            agent_type,
+                                            &sid.0,
+                                            state,
+                                            emitter,
+                                        )
+                                        .await;
                                     }
                                     // The turn is over, so any card still parked
                                     // here is moot — `TurnComplete` clears
@@ -8919,6 +9097,13 @@ async fn run_conversation_loop<'a>(
                             // may be unpersisted (see journal_turn_span).
                             if reason_str == "end_turn" {
                                 journal_turn_span(&mut turn_timing_probe, conn_id, &sid.0).await;
+                                recover_codex_citations_before_terminal(
+                                    agent_type,
+                                    &sid.0,
+                                    state,
+                                    emitter,
+                                )
+                                .await;
                             }
                             // ACP has no turn-end notification — the stop
                             // reason arrives here, in the prompt RESPONSE — so

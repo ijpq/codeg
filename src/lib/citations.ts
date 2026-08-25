@@ -1,10 +1,16 @@
 import type { AdaptedContentPart } from "@/lib/adapters/ai-elements-adapter"
 
 export interface CitationSource {
-  reference_id: string
+  citation_id: string
   url: string
   title: string
-  site_name: string
+  domain: string
+  source_type: string
+  call_id?: string | null
+  message_id?: string | null
+  start_index?: number | null
+  end_index?: number | null
+  snippet?: string | null
 }
 
 const MARKER_RE = /\uE200cite\uE202([^\uE201]+)\uE201/g
@@ -28,24 +34,41 @@ function sourcesFromMeta(meta: Record<string, unknown> | null | undefined) {
   for (const item of raw) {
     if (!item || typeof item !== "object" || Array.isArray(item)) continue
     const value = item as Record<string, unknown>
-    const referenceId = value.reference_id
+    const citationId = value.citation_id ?? value.reference_id
     const url = safeHttpUrl(value.url)
-    if (typeof referenceId !== "string" || !referenceId.trim() || !url) {
+    if (typeof citationId !== "string" || !citationId.trim() || !url) {
       continue
     }
     const parsed = new URL(url)
-    sources.push({
-      reference_id: referenceId,
+    const source: CitationSource = {
+      citation_id: citationId,
       url,
       title:
         typeof value.title === "string" && value.title.trim()
           ? value.title.trim()
           : parsed.hostname,
-      site_name:
-        typeof value.site_name === "string" && value.site_name.trim()
-          ? value.site_name.trim()
+      domain:
+        typeof (value.domain ?? value.site_name) === "string" &&
+        String(value.domain ?? value.site_name).trim()
+          ? String(value.domain ?? value.site_name).trim()
           : parsed.hostname,
-    })
+      source_type:
+        typeof value.source_type === "string" && value.source_type.trim()
+          ? value.source_type.trim()
+          : "web_search",
+    }
+    if (typeof value.call_id === "string") source.call_id = value.call_id
+    if (typeof value.message_id === "string") {
+      source.message_id = value.message_id
+    }
+    if (typeof value.start_index === "number") {
+      source.start_index = value.start_index
+    }
+    if (typeof value.end_index === "number") {
+      source.end_index = value.end_index
+    }
+    if (typeof value.snippet === "string") source.snippet = value.snippet
+    sources.push(source)
   }
   return sources
 }
@@ -73,8 +96,8 @@ export function extractCitationSources(
   collectPartSources(parts, collected)
   const byReference = new Map<string, CitationSource>()
   for (const source of collected) {
-    if (!byReference.has(source.reference_id)) {
-      byReference.set(source.reference_id, source)
+    if (!byReference.has(source.citation_id)) {
+      byReference.set(source.citation_id, source)
     }
   }
   return [...byReference.values()]
@@ -85,7 +108,7 @@ function citationIndex(sources: readonly CitationSource[]) {
   const numberByUrl = new Map<string, number>()
   const numbered: CitationSource[] = []
   for (const source of sources) {
-    byReference.set(source.reference_id, source)
+    byReference.set(source.citation_id, source)
     if (!numberByUrl.has(source.url)) {
       numbered.push(source)
       numberByUrl.set(source.url, numbered.length)
@@ -112,7 +135,7 @@ function markerSources(
 }
 
 function markdownTitle(source: CitationSource): string {
-  return `${source.title}${source.site_name ? ` — ${source.site_name}` : ""}`
+  return `${source.title}${source.domain ? ` — ${source.domain}` : ""}`
     .replace(/\\/g, "\\\\")
     .replace(/"/g, '\\"')
     .replace(/[\r\n]+/g, " ")
@@ -133,8 +156,7 @@ export function renderCitationMarkdown(
           `[${numberByUrl.get(source.url)}](<${source.url}> "${markdownTitle(source)}")`
       )
       .join("")
-    const fallback =
-      unresolved || resolved.length === 0 ? "［引用来源暂不可解析］" : ""
+    const fallback = unresolved || resolved.length === 0 ? "*来源缺失*" : ""
     return `${fallback}${links}`
   })
 }
@@ -153,7 +175,7 @@ export function renderCitationPlainText(
       const number = numberByUrl.get(source.url)
       if (number) labels.add(number)
     }
-    return `${unresolved || resolved.length === 0 ? "［引用来源暂不可解析］" : ""}${[
+    return `${unresolved || resolved.length === 0 ? "〔来源缺失〕" : ""}${[
       ...labels,
     ]
       .map((number) => `[${number}]`)
