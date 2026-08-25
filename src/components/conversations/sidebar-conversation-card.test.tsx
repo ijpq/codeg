@@ -1,5 +1,6 @@
 import { type ReactElement } from "react"
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
+import { waitFor } from "@testing-library/react"
 import { NextIntlClientProvider } from "next-intl"
 import { afterEach, describe, expect, it, vi, beforeEach } from "vitest"
 
@@ -39,6 +40,7 @@ const onDoubleClick = vi.fn()
 const onRename = vi.fn(async () => {})
 const onDelete = vi.fn(async () => {})
 const onStatusChange = vi.fn(async () => {})
+const onCreateBranch = vi.fn(async () => {})
 const onTogglePin = vi.fn()
 
 function conv(id: number): DbConversationSummary {
@@ -207,6 +209,55 @@ describe("SidebarConversationCard pin action", () => {
     fireEvent.contextMenu(getByText("conv-2"))
     fireEvent.click(getByText("Unpin"))
     expect(onTogglePin).toHaveBeenCalledWith(2, false)
+  })
+})
+
+describe("SidebarConversationCard branch action", () => {
+  beforeEach(() => {
+    onCreateBranch.mockClear()
+    onSelect.mockClear()
+  })
+
+  it("creates a branch for the right-clicked conversation", async () => {
+    const target = conv(12)
+    const { getByText } = renderWithIntl(
+      <SidebarConversationCard
+        conversation={target}
+        isSelected={false}
+        timeLabel="5m"
+        onSelect={onSelect}
+        onDoubleClick={onDoubleClick}
+        onRename={onRename}
+        onDelete={onDelete}
+        onStatusChange={onStatusChange}
+        onCreateBranch={onCreateBranch}
+      />
+    )
+
+    fireEvent.contextMenu(getByText("conv-12"))
+    fireEvent.click(getByText("Create branch"))
+
+    await waitFor(() => expect(onCreateBranch).toHaveBeenCalledWith(target))
+    expect(onCreateBranch).toHaveBeenCalledTimes(1)
+    expect(onSelect).not.toHaveBeenCalled()
+  })
+
+  it("does not expose the action when the owning list did not provide it", () => {
+    const { getByText, queryByText } = renderWithIntl(
+      <SidebarConversationCard
+        conversation={conv(13)}
+        isSelected={false}
+        timeLabel="5m"
+        onSelect={onSelect}
+        onDoubleClick={onDoubleClick}
+        onRename={onRename}
+        onDelete={onDelete}
+        onStatusChange={onStatusChange}
+      />
+    )
+
+    fireEvent.contextMenu(getByText("conv-13"))
+    expect(queryByText("Create branch")).toBeNull()
   })
 })
 

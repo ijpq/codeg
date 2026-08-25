@@ -183,6 +183,7 @@ import {
 } from "@/lib/export-conversation"
 import { useExportLabels } from "@/lib/use-export-labels"
 import { resolveActiveSessionDetails } from "./active-session-details"
+import { getDatedBranchTitle } from "./conversation-branch-creation-action"
 import { ConversationDetailHeader } from "./conversation-detail-header"
 import { SessionDetailsDialog } from "./session-details-dialog"
 
@@ -1718,7 +1719,7 @@ const ConversationTabView = memo(function ConversationTabView({
           result.branchConversationId,
           selectedAgent,
           true,
-          branchTitle ?? `${ownTab?.title ?? "未命名会话"} · 分支`
+          branchTitle ?? getDatedBranchTitle(ownTab?.title ?? "未命名会话")
         )
       })
       .catch((error: unknown) => {
@@ -2406,7 +2407,7 @@ const ConversationTabView = memo(function ConversationTabView({
           result.branchConversationId,
           selectedAgent,
           true,
-          branchTitle ?? `${ownTab?.title ?? "未命名会话"} · 分支`
+          branchTitle ?? getDatedBranchTitle(ownTab?.title ?? "未命名会话")
         )
         forkMessageRequestIdsRef.current.delete(messageId)
         toast.success(t("branch.snapshotCreated"))
