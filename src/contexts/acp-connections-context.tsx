@@ -401,6 +401,24 @@ type Action =
       conversationId: number
     }
   | {
+      /**
+       * Authoritative result of `acp_restore_conversation` for the concrete
+       * connection already stored under this key. Unlike a replay/snapshot,
+       * this response is returned only after the backend verified the durable
+       * external session and its prompt-ready latch. It therefore repairs a
+       * client that missed the one-shot attach-ready event without replacing
+       * (and wiping) the existing connection state.
+       */
+      type: "RESTORE_CONFIRMED"
+      contextKey: string
+      connectionId: string
+      conversationId: number
+      externalSessionId: string
+      lifecycleState: string | null
+      codegMcpAvailable: boolean
+      mcpServerCount: number
+    }
+  | {
       type: "HYDRATE_FROM_SNAPSHOT"
       contextKey: string
       patch: import("@/lib/snapshot-denormalize").SnapshotPatch
@@ -1383,6 +1401,52 @@ function connectionsReducer(
       next.set(action.contextKey, {
         ...current,
         conversationId: action.conversationId,
+      })
+      return next
+    }
+
+    case "RESTORE_CONFIRMED": {
+      const current = state.get(action.contextKey)
+      // Restore responses are asynchronous. A response for a connection that
+      // has already been replaced must never make the replacement ready.
+      if (!current || current.connectionId !== action.connectionId) {
+        return state
+      }
+      const durableReady = action.lifecycleState === "ready"
+      const activeTurnAttached =
+        action.lifecycleState === "active_turn_attached"
+      const nextStatus = durableReady
+        ? "connected"
+        : activeTurnAttached
+          ? "prompting"
+          : current.status
+      const nextSelectorsReady = current.selectorsReady || durableReady
+      const nextPromptReady = current.promptReady || durableReady
+      if (
+        current.conversationId === action.conversationId &&
+        current.sessionId === action.externalSessionId &&
+        current.status === nextStatus &&
+        current.selectorsReady === nextSelectorsReady &&
+        current.promptReady === nextPromptReady &&
+        current.codegMcpAvailable === action.codegMcpAvailable &&
+        current.mcpServerCount === action.mcpServerCount &&
+        current.error === null &&
+        current.loadError === null
+      ) {
+        return state
+      }
+      const next = new Map(state)
+      next.set(action.contextKey, {
+        ...current,
+        conversationId: action.conversationId,
+        sessionId: action.externalSessionId,
+        status: nextStatus,
+        selectorsReady: nextSelectorsReady,
+        promptReady: nextPromptReady,
+        codegMcpAvailable: action.codegMcpAvailable,
+        mcpServerCount: action.mcpServerCount,
+        error: null,
+        loadError: null,
       })
       return next
     }
@@ -5310,6 +5374,11 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             sameConnectRequest(boundRequest, request) &&
             existing.status !== "disconnected" &&
             existing.status !== "error" &&
+            // `connected` is not sufficient for a persisted restore: an
+            // attach/reconnect resets promptReady until its exact session is
+            // verified. Trusting the stale entry here made every later
+            // connect a no-op, even while the backend was already ready.
+            (existing.status === "prompting" || existing.promptReady) &&
             (!requiresHistoricalCodegMcp || existing.codegMcpAvailable)
           ) {
             return
@@ -5508,6 +5577,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         let restoredCodegMcpAvailable = false
         let restoredMcpServerCount = 0
         let restoredLifecycleState: string | null = null
+        let restoredExternalSessionId: string | null = null
         let backendReplacedConnectionIds: string[] = []
 
         if (shouldRestorePersisted && conversationId != null) {
@@ -5565,6 +5635,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             restoredCodegMcpAvailable = restored.codegMcpAvailable
             restoredMcpServerCount = restored.mcpServerCount
             restoredLifecycleState = restored.lifecycleState ?? null
+            restoredExternalSessionId = restored.externalSessionId
             backendReplacedConnectionIds = restored.replacedConnectionIds
             isViewer =
               restored.reusedExisting && !isConnectionOwnedLocally(connectionId)
@@ -5639,8 +5710,35 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         } else if (currentExisting?.connectionId === connectionId) {
           // A concurrent restore reused the connection this context already
           // owns/views. Do not dispatch CONNECTION_CREATED — that would wipe its
-          // in-flight snapshot state and ownership bit.
+          // in-flight snapshot state and ownership bit. The restore response is
+          // nevertheless authoritative: `ready` means the backend verified the
+          // exact durable session and prompt latch. Fold that result into the
+          // existing entry so a missed attach-ready frame cannot strand the UI.
           boundConnectRequestsRef.current.set(contextKey, request)
+          if (!attachSubscriptionsRef.current.has(contextKey)) {
+            const attach = setupAttachSubscription(
+              contextKey,
+              connectionId,
+              currentExisting.lastAppliedSeq || undefined
+            )
+            if (!attach) bindConnectionRoute(connectionId, contextKey)
+          }
+          if (
+            restoredConversationId != null &&
+            restoredExternalSessionId != null &&
+            restoredLifecycleState === "ready"
+          ) {
+            dispatch({
+              type: "RESTORE_CONFIRMED",
+              contextKey,
+              connectionId,
+              conversationId: restoredConversationId,
+              externalSessionId: restoredExternalSessionId,
+              lifecycleState: restoredLifecycleState,
+              codegMcpAvailable: restoredCodegMcpAvailable,
+              mcpServerCount: restoredMcpServerCount,
+            })
+          }
           return
         }
 
@@ -5659,12 +5757,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         })
 
         // A refreshed client attaching to an already-running durable turn must
-        // be controllable immediately, even before its WebSocket snapshot
-        // arrives.  In particular the Stop button must not depend on
-        // `promptReady`: that latch protects NEW prompts, whereas cancel only
-        // needs the verified connection id returned by the backend.  The cold
-        // snapshot will shortly hydrate the full live transcript, native-steer
-        // capability and pending interaction state.
+        // expose Stop immediately, before its snapshot arrives. It must not,
+        // however, advertise prompt readiness for a second ordinary turn.
         if (restoredLifecycleState === "active_turn_attached") {
           dispatch({
             type: "STATUS_CHANGED",
@@ -5750,6 +5844,28 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             type: "PROMPT_READINESS_CHANGED",
             contextKey,
             ready: true,
+          })
+        }
+        // The atomic restore response is itself a durable readiness receipt.
+        // Apply it AFTER starting the attach subscription because onAttaching
+        // pessimistically clears promptReady. This lets an idle `ready`
+        // connection accept prompts immediately even if the one-shot snapshot
+        // or replay frame is delayed/lost. Transport health remains a separate
+        // gate in the composer, so a disconnected WebSocket still queues.
+        if (
+          restoredConversationId != null &&
+          restoredExternalSessionId != null &&
+          restoredLifecycleState === "ready"
+        ) {
+          dispatch({
+            type: "RESTORE_CONFIRMED",
+            contextKey,
+            connectionId,
+            conversationId: restoredConversationId,
+            externalSessionId: restoredExternalSessionId,
+            lifecycleState: restoredLifecycleState,
+            codegMcpAvailable: restoredCodegMcpAvailable,
+            mcpServerCount: restoredMcpServerCount,
           })
         }
         // A legacy active session without Codeg MCP is still safe to view and

@@ -1495,6 +1495,123 @@ describe("AcpConnectionsProvider persisted Codex restore lifecycle", () => {
     expect(h.acpCancel).toHaveBeenCalledWith("running-codex-conn")
   })
 
+  it("treats an atomic durable-ready restore as prompt-ready without a WebSocket ready frame", async () => {
+    h.acpRestoreConversation.mockResolvedValueOnce({
+      connectionId: "durable-ready-without-replay",
+      externalSessionId: "sess-1",
+      reusedExisting: true,
+      codegMcpAvailable: true,
+      mcpServerCount: 3,
+      replacedConnectionIds: [],
+      lifecycleState: "ready",
+      durableSession: true,
+    })
+    await mountProvider()
+
+    await act(async () => {
+      await h.actions!.connect(CODEX_TAB, "codex", "/tmp/x", "sess-1", 42)
+    })
+
+    // No onSnapshot/onReplay callback is delivered. The restore RPC only
+    // returns `ready` after backend session verification, so that durable
+    // receipt must be sufficient to unblock the next prompt.
+    expect(h.store!.getConnection(CODEX_TAB)).toMatchObject({
+      connectionId: "durable-ready-without-replay",
+      conversationId: 42,
+      sessionId: "sess-1",
+      status: "connected",
+      selectorsReady: true,
+      promptReady: true,
+      codegMcpAvailable: true,
+      mcpServerCount: 3,
+    })
+
+    await act(async () => {
+      await h.actions!.sendPrompt(
+        CODEX_TAB,
+        [{ type: "text", text: "continue after ready" }],
+        { folderId: 1, conversationId: 42, clientMessageId: "stable-ready-id" }
+      )
+    })
+    expect(h.acpPrompt).toHaveBeenCalledWith(
+      "durable-ready-without-replay",
+      [{ type: "text", text: "continue after ready" }],
+      1,
+      42,
+      "stable-ready-id"
+    )
+  })
+
+  it("repairs stale prompt readiness when restore reuses the same connection id", async () => {
+    h.acpRestoreConversation
+      .mockResolvedValueOnce({
+        connectionId: "same-ready-connection",
+        externalSessionId: "sess-1",
+        reusedExisting: true,
+        codegMcpAvailable: true,
+        mcpServerCount: 3,
+        replacedConnectionIds: [],
+        lifecycleState: "active_turn_attached",
+        durableSession: true,
+      })
+      .mockResolvedValueOnce({
+        connectionId: "same-ready-connection",
+        externalSessionId: "sess-1",
+        reusedExisting: true,
+        codegMcpAvailable: true,
+        mcpServerCount: 3,
+        replacedConnectionIds: [],
+        lifecycleState: "ready",
+        durableSession: true,
+      })
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(CODEX_TAB, "codex", "/tmp/x", "sess-1", 42)
+    })
+    const handlers = latestAttachHandlers()
+    emitAcpEvent(handlers, {
+      seq: 1,
+      connection_id: "same-ready-connection",
+      type: "status_changed",
+      status: "connected",
+    })
+    expect(h.store!.getConnection(CODEX_TAB)).toMatchObject({
+      status: "connected",
+      promptReady: false,
+    })
+
+    // The second restore returns the SAME id. This used to take an early
+    // return that left promptReady=false forever.
+    await act(async () => {
+      await h.actions!.connect(CODEX_TAB, "codex", "/tmp/x", "sess-1", 42)
+    })
+    expect(h.acpRestoreConversation).toHaveBeenCalledTimes(2)
+    expect(h.store!.getConnection(CODEX_TAB)).toMatchObject({
+      connectionId: "same-ready-connection",
+      conversationId: 42,
+      sessionId: "sess-1",
+      status: "connected",
+      selectorsReady: true,
+      promptReady: true,
+    })
+
+    await act(async () => {
+      await h.actions!.sendPrompt(
+        CODEX_TAB,
+        [{ type: "text", text: "send once after repair" }],
+        { folderId: 1, conversationId: 42, clientMessageId: "repair-once" }
+      )
+    })
+    expect(h.acpPrompt).toHaveBeenCalledTimes(1)
+    expect(h.acpPrompt).toHaveBeenCalledWith(
+      "same-ready-connection",
+      [{ type: "text", text: "send once after repair" }],
+      1,
+      42,
+      "repair-once"
+    )
+  })
+
   it("upgrades an attached legacy active turn after that turn completes", async () => {
     h.acpRestoreConversation.mockResolvedValueOnce({
       connectionId: "legacy-running-conn",
@@ -1827,7 +1944,8 @@ describe("AcpConnectionsProvider persisted Codex restore lifecycle", () => {
     expect(h.store!.getConnection(CODEX_TAB)).toMatchObject({
       connectionId: "restored-after-writer",
       conversationId: isolatedConversationId,
-      status: "connecting",
+      status: "connected",
+      promptReady: true,
     })
   })
 
