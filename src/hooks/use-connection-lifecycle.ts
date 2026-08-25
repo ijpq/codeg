@@ -131,6 +131,7 @@ export function useConnectionLifecycle({
   const {
     status,
     selectorsReady,
+    promptReady,
     connect: connConnect,
     sendPrompt,
     setMode: connSetMode,
@@ -413,7 +414,16 @@ export function useConnectionLifecycle({
     // avoid connecting with sessionId=undefined and orphaning context.
     if (!isActive) return
     touchActivity(contextKey)
-    if (!status || status === "disconnected" || status === "error") {
+    if (
+      !status ||
+      status === "disconnected" ||
+      status === "error" ||
+      // A durable idle connection with a stale frontend prompt latch should
+      // re-run the idempotent atomic restore. The backend normally reuses the
+      // same ready connection in a few milliseconds; the authoritative result
+      // then repairs promptReady even if no WebSocket ready event is replayed.
+      (status === "connected" && !promptReady)
+    ) {
       setLastAutoConnectError(null)
       connConnect(agentType, workingDir, sessionId, conversationId).catch(
         (e: unknown) => {
@@ -430,6 +440,7 @@ export function useConnectionLifecycle({
     sessionId,
     conversationId,
     status,
+    promptReady,
     connConnect,
     contextKey,
     touchActivity,
