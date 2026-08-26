@@ -629,13 +629,9 @@ export interface DbConversationDetail {
   history_page?: ConversationHistoryPage | null
   /** Fixed read-only source prefix composed ahead of branch-local turns. */
   branch_history?: ConversationBranchHistory | null
-  /**
-   * Turn-window metadata, present only when the request asked for a window
-   * (`tailTurns`/`fromIndex`); their absence marks a legacy full response
-   * (old server) and disables windowed merging. `turns` then holds
-   * `full[turns_offset..]` while every other field still describes the full
-   * transcript. See `src/lib/turn-window.ts` for the derivation helpers.
-   */
+  /** Legacy index-window metadata used only by explicit `tailTurns` or
+   * `fromIndex` compatibility requests. Current conversation pages use the
+   * opaque `history_page` cursor instead. */
   turns_offset?: number | null
   turns_total?: number | null
   /** Assistant turns in `full[0..turns_offset)` (baseline globalization). */

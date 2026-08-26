@@ -8,6 +8,7 @@ import type { UserImageDisplay } from "@/lib/adapters/ai-elements-adapter"
 import type { ToolCallStatus } from "@/lib/types"
 import { ImagePreviewDialog } from "@/components/ui/image-preview-dialog"
 import { ImageActions, useImageActions } from "./image-actions"
+import { useResolvedHistoryImage } from "./use-resolved-history-image"
 import { cn } from "@/lib/utils"
 
 interface GeneratedImagesBlockProps {
@@ -73,11 +74,14 @@ export const GeneratedImagesBlock = memo(function GeneratedImagesBlock({
 }: GeneratedImagesBlockProps) {
   const t = useTranslations("Folder.chat.messageList")
   const [previewOpen, setPreviewOpen] = useState(false)
+  const resolvedImage = useResolvedHistoryImage(image)
+  const displayImage = resolvedImage.image
   // Treat `failed` (and the unusual `completed`-without-image case) as
   // failure so the user gets a clear error indicator instead of a
   // perpetual skeleton when codex reports the call ended without an image.
   const isFailed =
-    image === null && (status === "failed" || status === "completed")
+    resolvedImage.failed ||
+    (image === null && (status === "failed" || status === "completed"))
 
   const { canCopy, copy, download } = useImageActions()
 
@@ -110,9 +114,9 @@ export const GeneratedImagesBlock = memo(function GeneratedImagesBlock({
           </div>
         ) : null}
 
-        {image ? (
+        {displayImage ? (
           <ImageActions
-            image={image}
+            image={displayImage}
             className="group relative inline-block shrink-0 overflow-hidden rounded-md border border-border/70 bg-muted/30"
           >
             <button
@@ -121,8 +125,8 @@ export const GeneratedImagesBlock = memo(function GeneratedImagesBlock({
               className="block cursor-pointer transition-opacity hover:opacity-80"
             >
               <Image
-                src={`data:${image.mime_type};base64,${image.data}`}
-                alt={image.name}
+                src={`data:${displayImage.mime_type};base64,${displayImage.data}`}
+                alt={displayImage.name}
                 width={256}
                 height={256}
                 unoptimized
@@ -133,7 +137,7 @@ export const GeneratedImagesBlock = memo(function GeneratedImagesBlock({
               type="button"
               onClick={(e) => {
                 e.stopPropagation()
-                void download(image)
+                void download(displayImage)
               }}
               className="absolute right-1 top-1 rounded-full bg-background/80 p-1 text-foreground/80 opacity-0 shadow-sm transition-opacity hover:bg-background hover:text-foreground group-hover:opacity-100 focus-visible:opacity-100"
               aria-label={t("downloadImage")}
@@ -168,17 +172,27 @@ export const GeneratedImagesBlock = memo(function GeneratedImagesBlock({
       </div>
 
       <ImagePreviewDialog
-        src={image ? `data:${image.mime_type};base64,${image.data}` : ""}
-        alt={image?.name ?? ""}
-        open={previewOpen && image !== null}
+        src={
+          displayImage
+            ? `data:${displayImage.mime_type};base64,${displayImage.data}`
+            : ""
+        }
+        alt={displayImage?.name ?? ""}
+        open={previewOpen && displayImage !== null}
         onOpenChange={(open) => setPreviewOpen(open)}
-        onDownload={image ? () => void download(image) : undefined}
+        onDownload={
+          displayImage ? () => void download(displayImage) : undefined
+        }
         downloadLabel={t("downloadImage")}
-        onCopy={image && canCopy ? () => void copy(image) : undefined}
+        onCopy={
+          displayImage && canCopy ? () => void copy(displayImage) : undefined
+        }
         copyLabel={t("copyImage")}
         renderImage={
-          image
-            ? (preview) => <ImageActions image={image}>{preview}</ImageActions>
+          displayImage
+            ? (preview) => (
+                <ImageActions image={displayImage}>{preview}</ImageActions>
+              )
             : undefined
         }
       />

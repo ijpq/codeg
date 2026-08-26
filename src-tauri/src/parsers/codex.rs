@@ -2,10 +2,14 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::time::{Instant, SystemTime};
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, Utc};
 use regex::Regex;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 use crate::models::*;
@@ -611,11 +615,19 @@ fn native_fork_parent_session_id_in(sessions_dir: &Path, session_id: &str) -> Op
 /// A directly-seekable page from a Codex rollout. `start_offset` is also the
 /// cursor for the next (older) page; callers never need to know how the JSONL
 /// was split into render turns.
+#[derive(Clone)]
 pub(crate) struct CodexConversationPage {
     pub detail: ConversationDetail,
     pub start_offset: u64,
     pub end_offset: u64,
     pub has_more: bool,
+    /// Bytes inspected while locating the page boundary. Zero means the
+    /// persistent offset index answered the lookup without scanning JSONL.
+    pub scan_bytes: u64,
+    /// Whether the parsed page itself came from the bounded in-process cache.
+    pub cache_hit: bool,
+    /// Whether the page boundary came from the persistent offset index.
+    pub index_hit: bool,
 }
 
 /// A byte-bounded slice of an append-only Codex rollout. Branch merge uses
@@ -627,7 +639,178 @@ pub(crate) struct CodexConversationRange {
     pub end_offset: u64,
 }
 
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct CodexRolloutSizeDiagnostics {
+    pub file_bytes: u64,
+    pub record_count: u64,
+    pub ordinary_text_bytes: u64,
+    pub reasoning_bytes: u64,
+    pub tool_call_bytes: u64,
+    pub tool_result_bytes: u64,
+    pub image_or_data_url_bytes: u64,
+    pub snapshot_or_compaction_bytes: u64,
+    pub duplicate_record_bytes: u64,
+    pub duplicate_record_count: u64,
+    pub other_bytes: u64,
+}
+
 const CODEX_HISTORY_SCAN_CHUNK_BYTES: usize = 1024 * 1024;
+const CODEX_HISTORY_INDEX_VERSION: u8 = 1;
+const CODEX_HISTORY_PAGE_CACHE_ENTRIES: usize = 16;
+const CODEX_HISTORY_PAGE_CACHE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const CODEX_HISTORY_PAGE_CACHE_MAX_ENTRY_BYTES: u64 = 32 * 1024 * 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct CodexHistoryIndex {
+    version: u8,
+    observed_len: u64,
+    observed_mtime_ns: u128,
+    /// Exact `(end offset, requested user rounds) -> start offset` pages.
+    /// Offsets remain valid while the append-only rollout grows, so reopening
+    /// an old page never rescans the multi-gigabyte prefix.
+    pages: HashMap<String, u64>,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct CodexPageCacheKey {
+    path: PathBuf,
+    file_len: u64,
+    modified_ns: u128,
+    end_offset: u64,
+    user_turn_limit: usize,
+    cwd_hint: Option<String>,
+}
+
+#[derive(Clone)]
+struct CachedCodexPage {
+    page: Arc<CodexConversationPage>,
+    used_at: Instant,
+    source_bytes: u64,
+}
+
+static ROLLOUT_PATH_CACHE: LazyLock<Mutex<HashMap<(PathBuf, String), PathBuf>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static HISTORY_INDEX_CACHE: LazyLock<Mutex<HashMap<PathBuf, CodexHistoryIndex>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static HISTORY_PAGE_CACHE: LazyLock<Mutex<HashMap<CodexPageCacheKey, CachedCodexPage>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static HISTORY_PAGE_FLIGHTS: LazyLock<
+    Mutex<HashMap<CodexPageCacheKey, Arc<Mutex<()>>>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn system_time_ns(value: SystemTime) -> u128 {
+    value
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+}
+
+fn history_page_index_key(end_offset: u64, user_turn_limit: usize) -> String {
+    format!("{end_offset}:{user_turn_limit}")
+}
+
+fn history_index_path(rollout_path: &Path) -> Option<PathBuf> {
+    let cache_root = dirs::cache_dir()?.join("codeg").join("codex-history-index-v1");
+    let canonical = rollout_path
+        .canonicalize()
+        .unwrap_or_else(|_| rollout_path.to_path_buf());
+    let digest = Sha256::digest(canonical.to_string_lossy().as_bytes());
+    Some(cache_root.join(format!("{}.json", URL_SAFE_NO_PAD.encode(digest))))
+}
+
+fn load_history_index(rollout_path: &Path) -> CodexHistoryIndex {
+    let Some(index_path) = history_index_path(rollout_path) else {
+        return CodexHistoryIndex::default();
+    };
+    fs::read(index_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<CodexHistoryIndex>(&bytes).ok())
+        .filter(|index| index.version == CODEX_HISTORY_INDEX_VERSION)
+        .unwrap_or_default()
+}
+
+fn save_history_index(rollout_path: &Path, index: &CodexHistoryIndex) {
+    let Some(index_path) = history_index_path(rollout_path) else {
+        return;
+    };
+    let Some(parent) = index_path.parent() else {
+        return;
+    };
+    if fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let Ok(bytes) = serde_json::to_vec(index) else {
+        return;
+    };
+    let temporary = index_path.with_extension(format!("json.tmp-{}", std::process::id()));
+    if fs::write(&temporary, bytes).is_ok() {
+        let _ = fs::rename(&temporary, &index_path);
+    }
+    let _ = fs::remove_file(temporary);
+}
+
+fn indexed_page_start(
+    rollout_path: &Path,
+    file_len: u64,
+    modified_ns: u128,
+    end_offset: u64,
+    user_turn_limit: usize,
+) -> Option<u64> {
+    let mut indexes = HISTORY_INDEX_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let index = indexes
+        .entry(rollout_path.to_path_buf())
+        .or_insert_with(|| load_history_index(rollout_path));
+    // Rollouts are append-only. Preserve offsets across growth; a shrink or a
+    // same-length rewrite invalidates them and is safely rebuilt on demand.
+    if file_len < index.observed_len
+        || (file_len == index.observed_len
+            && index.observed_mtime_ns != 0
+            && modified_ns != index.observed_mtime_ns)
+    {
+        index.pages.clear();
+    }
+    index.observed_len = file_len;
+    index.observed_mtime_ns = modified_ns;
+    index
+        .pages
+        .get(&history_page_index_key(end_offset, user_turn_limit))
+        .copied()
+        .filter(|start| *start <= end_offset)
+}
+
+fn remember_page_start(
+    rollout_path: &Path,
+    file_len: u64,
+    modified_ns: u128,
+    end_offset: u64,
+    user_turn_limit: usize,
+    start_offset: u64,
+) {
+    let snapshot = {
+        let mut indexes = HISTORY_INDEX_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        let index = indexes
+            .entry(rollout_path.to_path_buf())
+            .or_insert_with(|| load_history_index(rollout_path));
+        index.version = CODEX_HISTORY_INDEX_VERSION;
+        index.observed_len = file_len;
+        index.observed_mtime_ns = modified_ns;
+        index.pages.insert(
+            history_page_index_key(end_offset, user_turn_limit),
+            start_offset,
+        );
+        // A corrupt client cannot grow this sidecar without bound by asking
+        // thousands of different page sizes/cursors.
+        if index.pages.len() > 4096 {
+            let mut keys = index.pages.keys().cloned().collect::<Vec<_>>();
+            keys.sort();
+            for key in keys.into_iter().take(index.pages.len() - 4096) {
+                index.pages.remove(&key);
+            }
+        }
+        index.clone()
+    };
+    save_history_index(rollout_path, &snapshot);
+}
 
 fn is_codex_user_boundary(line: &[u8]) -> bool {
     // Most JSONL records are tool/output traffic. Avoid feeding their often
@@ -669,6 +852,10 @@ fn is_codex_user_boundary(line: &[u8]) -> bool {
     }
 }
 
+fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && haystack.windows(needle.len()).any(|window| window == needle)
+}
+
 /// Walk JSONL records backwards until `user_turn_limit` user-round boundaries
 /// have been found. Memory is bounded by the selected page (plus one JSONL
 /// record), not by the complete rollout; this is the critical difference for
@@ -678,9 +865,9 @@ fn find_codex_page_start(
     end_offset: u64,
     user_turn_limit: usize,
     max_scan_bytes: Option<u64>,
-) -> Result<u64, ParseError> {
+) -> Result<(u64, u64), ParseError> {
     if end_offset == 0 || user_turn_limit == 0 {
-        return Ok(end_offset);
+        return Ok((end_offset, 0));
     }
 
     let mut position = end_offset;
@@ -717,7 +904,10 @@ fn find_codex_page_start(
                 // event. Include that one record so the page keeps the turn's
                 // model and cumulative context/token metadata, while the next
                 // cursor still ends cleanly before this round.
-                return Ok(read_start + line_start as u64);
+                return Ok((
+                    read_start + line_start as u64,
+                    end_offset.saturating_sub(read_start),
+                ));
             }
             if line_start < line_end && is_codex_user_boundary(&chunk[line_start..line_end]) {
                 boundaries += 1;
@@ -734,7 +924,7 @@ fn find_codex_page_start(
         position = read_start;
     }
 
-    Ok(0)
+    Ok((0, end_offset))
 }
 
 impl AgentParser for CodexParser {
@@ -2512,7 +2702,17 @@ impl CodexParser {
                 conversation_id.to_string(),
             ));
         }
-        WalkDir::new(&self.base_dir)
+        let cache_key = (self.base_dir.clone(), conversation_id.to_string());
+        if let Some(path) = ROLLOUT_PATH_CACHE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&cache_key)
+            .filter(|path| path.is_file())
+            .cloned()
+        {
+            return Ok(path);
+        }
+        let path = WalkDir::new(&self.base_dir)
             .into_iter()
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.path().to_path_buf())
@@ -2524,13 +2724,90 @@ impl CodexParser {
                         .to_string_lossy()
                         .contains(conversation_id)
             })
-            .ok_or_else(|| ParseError::ConversationNotFound(conversation_id.to_string()))
+            .ok_or_else(|| ParseError::ConversationNotFound(conversation_id.to_string()))?;
+        ROLLOUT_PATH_CACHE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(cache_key, path.clone());
+        Ok(path)
     }
 
     /// Current durable end offset of a Codex rollout. The returned value is a
     /// stable boundary in the append-only file and contains no transcript data.
     pub(crate) fn rollout_len(&self, conversation_id: &str) -> Result<u64, ParseError> {
         Ok(fs::metadata(self.rollout_path(conversation_id)?)?.len())
+    }
+
+    /// Explicit, read-only rollout composition scan. This is never invoked by
+    /// normal conversation loading; it exists to decide whether a separate
+    /// migration/compaction tool would be worthwhile without rewriting the
+    /// user's append-only Codex session.
+    pub fn diagnose_rollout_size(
+        &self,
+        conversation_id: &str,
+    ) -> Result<CodexRolloutSizeDiagnostics, ParseError> {
+        let path = self.rollout_path(conversation_id)?;
+        let file = fs::File::open(path)?;
+        let mut reader = BufReader::new(file);
+        let mut line = Vec::new();
+        let mut diagnostics = CodexRolloutSizeDiagnostics::default();
+        let mut seen = HashSet::<[u8; 32]>::new();
+        loop {
+            line.clear();
+            let bytes = reader.read_until(b'\n', &mut line)?;
+            if bytes == 0 {
+                break;
+            }
+            let bytes = bytes as u64;
+            diagnostics.file_bytes = diagnostics.file_bytes.saturating_add(bytes);
+            diagnostics.record_count = diagnostics.record_count.saturating_add(1);
+            let digest: [u8; 32] = Sha256::digest(&line).into();
+            if !seen.insert(digest) {
+                diagnostics.duplicate_record_count =
+                    diagnostics.duplicate_record_count.saturating_add(1);
+                diagnostics.duplicate_record_bytes =
+                    diagnostics.duplicate_record_bytes.saturating_add(bytes);
+            }
+
+            if bytes_contain(&line, b"data:image")
+                || bytes_contain(&line, b"\"input_image\"")
+                || bytes_contain(&line, b"\"image_url\"")
+                || bytes_contain(&line, b"\"image_generation")
+            {
+                diagnostics.image_or_data_url_bytes =
+                    diagnostics.image_or_data_url_bytes.saturating_add(bytes);
+            } else if bytes_contain(&line, b"compaction")
+                || bytes_contain(&line, b"compact")
+                || bytes_contain(&line, b"snapshot")
+            {
+                diagnostics.snapshot_or_compaction_bytes = diagnostics
+                    .snapshot_or_compaction_bytes
+                    .saturating_add(bytes);
+            } else if bytes_contain(&line, b"reasoning") {
+                diagnostics.reasoning_bytes = diagnostics.reasoning_bytes.saturating_add(bytes);
+            } else if bytes_contain(&line, b"function_call_output")
+                || bytes_contain(&line, b"tool_result")
+                || bytes_contain(&line, b"custom_tool_call_output")
+            {
+                diagnostics.tool_result_bytes =
+                    diagnostics.tool_result_bytes.saturating_add(bytes);
+            } else if bytes_contain(&line, b"function_call")
+                || bytes_contain(&line, b"tool_call")
+                || bytes_contain(&line, b"web_search_call")
+            {
+                diagnostics.tool_call_bytes = diagnostics.tool_call_bytes.saturating_add(bytes);
+            } else if bytes_contain(&line, b"user_message")
+                || bytes_contain(&line, b"agent_message")
+                || bytes_contain(&line, b"output_text")
+                || bytes_contain(&line, b"\"type\":\"message\"")
+            {
+                diagnostics.ordinary_text_bytes =
+                    diagnostics.ordinary_text_bytes.saturating_add(bytes);
+            } else {
+                diagnostics.other_bytes = diagnostics.other_bytes.saturating_add(bytes);
+            }
+        }
+        Ok(diagnostics)
     }
 
     pub(crate) fn get_conversation_page(
@@ -2575,16 +2852,91 @@ impl CodexParser {
         max_bytes: Option<u64>,
     ) -> Result<CodexConversationPage, ParseError> {
         let path = self.rollout_path(conversation_id)?;
+        let metadata = fs::metadata(&path)?;
+        let file_len = metadata.len();
+        let modified_ns = metadata.modified().map(system_time_ns).unwrap_or_default();
+        let end_offset = before_offset.unwrap_or(file_len).min(file_len);
+        let user_turn_limit = user_turn_limit.clamp(1, 100);
+        let cache_key = CodexPageCacheKey {
+            path: path.clone(),
+            file_len,
+            modified_ns,
+            end_offset,
+            user_turn_limit,
+            cwd_hint: cwd_hint.clone(),
+        };
+        if max_bytes.is_none() {
+            if let Some(cached) = HISTORY_PAGE_CACHE
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .get_mut(&cache_key)
+            {
+                cached.used_at = Instant::now();
+                let mut page = (*cached.page).clone();
+                page.cache_hit = true;
+                return Ok(page);
+            }
+        }
+
+        // Full parse single-flight for an identical immutable page. Seven
+        // browser effects requesting the same tail now share one JSONL parse
+        // instead of starting seven blocking workers.
+        let flight = {
+            let mut flights = HISTORY_PAGE_FLIGHTS
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            flights
+                .entry(cache_key.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let flight_guard = flight.lock().unwrap_or_else(|error| error.into_inner());
+        if max_bytes.is_none() {
+            if let Some(cached) = HISTORY_PAGE_CACHE
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .get_mut(&cache_key)
+            {
+                cached.used_at = Instant::now();
+                let mut page = (*cached.page).clone();
+                page.cache_hit = true;
+                drop(flight_guard);
+                HISTORY_PAGE_FLIGHTS
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .remove(&cache_key);
+                return Ok(page);
+            }
+        }
 
         let mut file = fs::File::open(&path)?;
-        let file_len = file.metadata()?.len();
-        let end_offset = before_offset.unwrap_or(file_len).min(file_len);
-        let start_offset = find_codex_page_start(
-            &mut file,
-            end_offset,
-            user_turn_limit.clamp(1, 100),
-            max_bytes,
-        )?;
+        let (start_offset, scan_bytes, index_hit) = if max_bytes.is_none() {
+            if let Some(start) = indexed_page_start(
+                &path,
+                file_len,
+                modified_ns,
+                end_offset,
+                user_turn_limit,
+            ) {
+                (start, 0, true)
+            } else {
+                let (start, scanned) =
+                    find_codex_page_start(&mut file, end_offset, user_turn_limit, None)?;
+                remember_page_start(
+                    &path,
+                    file_len,
+                    modified_ns,
+                    end_offset,
+                    user_turn_limit,
+                    start,
+                );
+                (start, scanned, false)
+            }
+        } else {
+            let (start, scanned) =
+                find_codex_page_start(&mut file, end_offset, user_turn_limit, max_bytes)?;
+            (start, scanned, false)
+        };
         let page_bytes = end_offset.saturating_sub(start_offset);
         if max_bytes.is_some_and(|limit| page_bytes > limit) {
             return Err(ParseError::InvalidData(format!(
@@ -2600,12 +2952,51 @@ impl CodexParser {
             cwd_hint,
             Some(start_offset),
         )?;
-        Ok(CodexConversationPage {
+        let page = CodexConversationPage {
             detail,
             start_offset,
             end_offset,
             has_more: start_offset > 0,
-        })
+            scan_bytes,
+            cache_hit: false,
+            index_hit,
+        };
+        if max_bytes.is_none() && page_bytes <= CODEX_HISTORY_PAGE_CACHE_MAX_ENTRY_BYTES {
+            let mut cache = HISTORY_PAGE_CACHE
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            cache.insert(
+                cache_key.clone(),
+                CachedCodexPage {
+                    page: Arc::new(page.clone()),
+                    used_at: Instant::now(),
+                    source_bytes: page_bytes,
+                },
+            );
+            while cache.len() > CODEX_HISTORY_PAGE_CACHE_ENTRIES
+                || cache
+                    .values()
+                    .map(|entry| entry.source_bytes)
+                    .sum::<u64>()
+                    > CODEX_HISTORY_PAGE_CACHE_MAX_BYTES
+            {
+                if let Some(oldest) = cache
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.used_at)
+                    .map(|(key, _)| key.clone())
+                {
+                    cache.remove(&oldest);
+                } else {
+                    break;
+                }
+            }
+        }
+        drop(flight_guard);
+        HISTORY_PAGE_FLIGHTS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&cache_key);
+        Ok(page)
     }
 
     /// Parse only `[start_offset, EOF)` and reject the request before reading
@@ -2620,8 +3011,31 @@ impl CodexParser {
         cwd_hint: Option<String>,
     ) -> Result<CodexConversationRange, ParseError> {
         let path = self.rollout_path(conversation_id)?;
+        let end_offset = fs::metadata(&path)?.len();
+        self.get_conversation_range_between(
+            conversation_id,
+            start_offset,
+            end_offset,
+            max_bytes,
+            cwd_hint,
+        )
+    }
+
+    /// Parse an exact previously-issued history window. Used only when the
+    /// user expands a deferred heavy block; it never scans outside the opaque
+    /// page offsets carried by that block's reference.
+    pub(crate) fn get_conversation_range_between(
+        &self,
+        conversation_id: &str,
+        start_offset: u64,
+        end_offset: u64,
+        max_bytes: u64,
+        cwd_hint: Option<String>,
+    ) -> Result<CodexConversationRange, ParseError> {
+        let path = self.rollout_path(conversation_id)?;
         let mut file = fs::File::open(&path)?;
-        let end_offset = file.metadata()?.len();
+        let file_len = file.metadata()?.len();
+        let end_offset = end_offset.min(file_len);
         if start_offset > end_offset {
             return Err(ParseError::InvalidData(format!(
                 "saved branch rollout offset {start_offset} is beyond the current rollout length {end_offset}"
@@ -5501,6 +5915,7 @@ mod tests {
     use super::COLLAB_OP_KEY;
     use super::should_skip_duplicate_user_message;
     use super::strip_blocked_resource_mentions;
+    use super::{history_index_path, HISTORY_INDEX_CACHE, HISTORY_PAGE_CACHE};
     use super::AgentParser;
     use super::CodexParser;
     use super::CODEX_SCRIPT_TOOL_NAME;
@@ -7831,24 +8246,23 @@ mod tests {
         ));
     }
 
-    /// Manual acceptance benchmark for the reported 300+ MB rollout shape.
-    /// Kept ignored in the default suite because it deliberately writes a
-    /// 305+ MiB temporary JSONL; release verification runs it explicitly.
+    /// Regression for the reported multi-gigabyte rollout shape. A sparse
+    /// prefix models the old history without consuming 2 GB of test disk; the
+    /// valid tail is real JSONL and must be reached without touching the sparse
+    /// prefix.
     #[test]
-    #[ignore = "writes a 300+ MiB temporary Codex rollout"]
     fn large_rollout_first_page_reads_only_the_tail() {
-        const ROUNDS: usize = 200;
-        const TOOL_OUTPUT_BYTES: usize = 1_600_000;
+        const ROUNDS: usize = 12;
+        const TOOL_OUTPUT_BYTES: usize = 512_000;
 
         let dir = tempfile::tempdir().expect("temp sessions dir");
         let conversation_id = "large-paged-history";
         let path = dir
             .path()
             .join(format!("rollout-2026-08-06-{conversation_id}.jsonl"));
-        let file = fs::File::create(&path).expect("create rollout");
-        let mut writer = BufWriter::new(file);
+        let mut file = fs::File::create(&path).expect("create rollout");
         writeln!(
-            writer,
+            file,
             "{}",
             rollout_line(
                 "2026-08-06T00:00:00Z",
@@ -7857,6 +8271,10 @@ mod tests {
             )
         )
         .expect("write metadata");
+        file.set_len(2_232_143_172)
+            .expect("create sparse 2.08 GiB prefix");
+        file.seek(SeekFrom::End(0)).expect("seek sparse tail");
+        let mut writer = BufWriter::new(file);
         let output = "x".repeat(TOOL_OUTPUT_BYTES);
         for index in 0..ROUNDS {
             writeln!(
@@ -7913,7 +8331,7 @@ mod tests {
         writer.flush().expect("flush rollout");
 
         let source_bytes = fs::metadata(&path).expect("rollout metadata").len();
-        assert!(source_bytes > 300 * 1024 * 1024);
+        assert!(source_bytes > 2_000_000_000);
         let parser = CodexParser::with_base_dir(dir.path().to_path_buf());
         let started = Instant::now();
         let page = parser
@@ -7931,27 +8349,30 @@ mod tests {
         );
         assert_eq!(user_texts(&page.detail).len(), 6);
         assert!(page.has_more);
-        assert!(response_bytes < source_bytes as usize / 10);
+        assert!(page.scan_bytes < 8 * 1024 * 1024);
         assert!(elapsed.as_secs() < 10, "tail page parse took {elapsed:?}");
+        let cached = parser
+            .get_conversation_page(conversation_id, None, 6, Some("/tmp/large".into()))
+            .expect("reuse first page");
+        assert!(cached.cache_hit);
+        assert_eq!(cached.scan_bytes, page.scan_bytes);
 
-        let complete_started = Instant::now();
-        let mut cursor = page.start_offset;
-        let mut loaded_user_turns = user_texts(&page.detail).len();
-        let mut page_count = 1usize;
-        while cursor > 0 {
-            let earlier = parser
-                .get_conversation_page(conversation_id, Some(cursor), 6, Some("/tmp/large".into()))
-                .expect("load earlier page");
-            assert!(earlier.start_offset < cursor, "cursor must advance");
-            cursor = earlier.start_offset;
-            loaded_user_turns += user_texts(&earlier.detail).len();
-            page_count += 1;
+        HISTORY_PAGE_CACHE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+        HISTORY_INDEX_CACHE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+        let indexed = parser
+            .get_conversation_page(conversation_id, None, 6, Some("/tmp/large".into()))
+            .expect("reuse persisted page index after memory-cache reset");
+        assert!(indexed.index_hit);
+        assert_eq!(indexed.scan_bytes, 0);
+        if let Some(index_path) = history_index_path(&path) {
+            let _ = fs::remove_file(index_path);
         }
-        eprintln!(
-            "large_history_complete pages={page_count} user_turns={loaded_user_turns} elapsed_ms={}",
-            complete_started.elapsed().as_millis()
-        );
-        assert_eq!(loaded_user_turns, ROUNDS);
     }
 
     fn rollout_line(ts: &str, msg_type: &str, payload: serde_json::Value) -> String {

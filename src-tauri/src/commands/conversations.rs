@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use sha2::{Digest, Sha256};
 #[cfg(feature = "tauri-runtime")]
 use tauri::Manager;
 
@@ -1196,6 +1198,167 @@ fn inherited_run_belongs_to_boundary(
     }
 }
 
+fn turn_has_renderable_content(turn: &MessageTurn) -> bool {
+    turn.blocks.iter().any(|block| match block {
+        ContentBlock::Text { text } | ContentBlock::Thinking { text } => {
+            !text.trim().is_empty()
+        }
+        _ => true,
+    })
+}
+
+fn rewrite_inherited_page_ids(
+    turns: &mut [MessageTurn],
+    branch_conversation_id: i32,
+    source_conversation_id: i32,
+) -> HashMap<String, String> {
+    let mut rewritten = HashMap::new();
+    for turn in turns {
+        let original = turn.id.clone();
+        let inherited = format!(
+            "branch-inherited:{branch_conversation_id}:{source_conversation_id}:{original}"
+        );
+        rewritten.insert(original, inherited.clone());
+        turn.id = inherited;
+    }
+    rewritten
+}
+
+async fn get_snapshot_branch_page(
+    conn: &sea_orm::DatabaseConnection,
+    conversation_id: i32,
+    relation: conversation_branch_service::ConversationBranchInfo,
+    request: ConversationHistoryRequest,
+    branch_path: HashSet<i32>,
+) -> Result<(DbConversationDetail, Option<String>), AppCommandError> {
+    const SOURCE_CURSOR_PREFIX: &str = "branch-source:";
+    if let Some(source_cursor) = request
+        .before_cursor
+        .as_deref()
+        .and_then(|cursor| cursor.strip_prefix(SOURCE_CURSOR_PREFIX))
+    {
+        // Keep branch-owned summary/session metadata cheap by reading one tail
+        // round, then replace only the transcript page with the frozen source
+        // page. The source cursor is an exact JSONL byte offset when available.
+        let (mut branch_detail, title) = get_folder_conversation_raw_impl(
+            conn,
+            conversation_id,
+            Some(ConversationHistoryRequest {
+                before_cursor: None,
+                user_turn_limit: 1,
+            }),
+        )
+        .await?;
+        let source_before = if source_cursor == "latest" {
+            None
+        } else {
+            Some(format!("codex:{source_cursor}"))
+        };
+        let (mut source_detail, _) = Box::pin(get_folder_conversation_core_impl(
+            conn,
+            relation.source_conversation_id,
+            Some(ConversationHistoryRequest {
+                before_cursor: source_before,
+                user_turn_limit: request.user_turn_limit,
+            }),
+            branch_path,
+        ))
+        .await?;
+        if let Some(boundary) = relation.forked_through_at {
+            source_detail
+                .turns
+                .retain(|turn| turn.timestamp <= boundary);
+        }
+        source_detail.turns.retain(turn_has_renderable_content);
+        let rewritten = rewrite_inherited_page_ids(
+            &mut source_detail.turns,
+            conversation_id,
+            relation.source_conversation_id,
+        );
+        for run in &mut source_detail.deliverable_runs {
+            if let Some(turn_id) = run.user_turn_id.as_mut() {
+                if let Some(inherited) = rewritten.get(turn_id) {
+                    *turn_id = inherited.clone();
+                }
+            }
+        }
+        let source_page = source_detail.history_page.take();
+        branch_detail.turns = source_detail.turns;
+        branch_detail.artifact_runs = source_detail.artifact_runs;
+        branch_detail.deliverable_runs = source_detail.deliverable_runs;
+        branch_detail.history_page = Some(ConversationHistoryPage {
+            next_cursor: source_page
+                .as_ref()
+                .and_then(|page| page.next_cursor.as_deref())
+                .and_then(|cursor| cursor.strip_prefix("codex:"))
+                .map(|cursor| format!("{SOURCE_CURSOR_PREFIX}{cursor}")),
+            has_more: source_page.as_ref().is_some_and(|page| page.has_more),
+            loaded_turns: branch_detail.turns.len() as u32,
+        });
+        branch_detail.branch_history = Some(
+            crate::models::conversation::ConversationBranchHistory {
+                source_conversation_id: relation.source_conversation_id,
+                fork_message_id: relation.fork_message_id,
+                inherited_turn_count: relation.inherited_message_count.max(0) as usize,
+                branch_turn_count: 0,
+                inheritance_mode: relation.inheritance_mode,
+            },
+        );
+        return Ok((branch_detail, title));
+    }
+
+    let (mut detail, title) =
+        get_folder_conversation_raw_impl(conn, conversation_id, Some(request.clone())).await?;
+    // A snapshot is transport-only initialization context. Once stripped, an
+    // otherwise-empty synthetic user row must not create a blank card/page.
+    detail.turns.retain(turn_has_renderable_content);
+    if detail.turns.is_empty() {
+        // A newly-created snapshot branch has no local user turn yet. Return a
+        // real inherited source page on its first open rather than an empty
+        // placeholder that needs a second observer/request to become useful.
+        let source_cursor = relation
+            .source_rollout_offset
+            .and_then(|value| u64::try_from(value).ok())
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "latest".into());
+        return Box::pin(get_snapshot_branch_page(
+            conn,
+            conversation_id,
+            relation,
+            ConversationHistoryRequest {
+                before_cursor: Some(format!("{SOURCE_CURSOR_PREFIX}{source_cursor}")),
+                user_turn_limit: request.user_turn_limit,
+            },
+            branch_path,
+        ))
+        .await;
+    }
+    if let Some(page) = detail.history_page.as_mut() {
+        if !page.has_more {
+            page.has_more = true;
+            page.next_cursor = Some(format!(
+                "{SOURCE_CURSOR_PREFIX}{}",
+                relation
+                    .source_rollout_offset
+                    .and_then(|value| u64::try_from(value).ok())
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "latest".into())
+            ));
+        }
+        page.loaded_turns = detail.turns.len() as u32;
+    }
+    detail.branch_history = Some(
+        crate::models::conversation::ConversationBranchHistory {
+            source_conversation_id: relation.source_conversation_id,
+            fork_message_id: relation.fork_message_id,
+            inherited_turn_count: relation.inherited_message_count.max(0) as usize,
+            branch_turn_count: detail.turns.len(),
+            inheritance_mode: relation.inheritance_mode,
+        },
+    );
+    Ok((detail, title))
+}
+
 pub async fn get_folder_conversation_core(
     conn: &sea_orm::DatabaseConnection,
     conversation_id: i32,
@@ -1213,6 +1376,412 @@ pub async fn get_folder_conversation_core(
 pub struct ConversationHistoryRequest {
     pub before_cursor: Option<String>,
     pub user_turn_limit: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct HistoryReadMetrics {
+    start_offset: u64,
+    end_offset: u64,
+    scan_bytes: u64,
+    cache_hit: bool,
+    index_hit: bool,
+}
+
+const HISTORY_TOOL_PREVIEW_HEAD_BYTES: usize = 4 * 1024;
+const HISTORY_TOOL_PREVIEW_TAIL_BYTES: usize = 1024;
+const HISTORY_DEFER_THRESHOLD_BYTES: usize = 8 * 1024;
+const HISTORY_REASONING_DEFER_THRESHOLD_BYTES: usize = 32 * 1024;
+const HISTORY_IMAGE_DEFER_THRESHOLD_BYTES: usize = 64 * 1024;
+const HISTORY_DEFERRED_RANGE_LIMIT_BYTES: u64 = 128 * 1024 * 1024;
+const HISTORY_DEFERRED_IMAGE_URI_PREFIX: &str = "codeg-history-content:";
+const HISTORY_DEFERRED_REASONING_MARKER_PREFIX: &str =
+    "<!--codeg-history-reasoning:";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct DeferredHistoryContentRef {
+    version: u8,
+    conversation_id: i32,
+    start_offset: u64,
+    end_offset: u64,
+    kind: String,
+    tool_use_id: Option<String>,
+    content_sha256: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DeferredHistoryContent {
+    pub content: String,
+    pub byte_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+}
+
+fn sha256_hex(value: &str) -> String {
+    Sha256::digest(value.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn encode_deferred_history_ref(reference: &DeferredHistoryContentRef) -> Option<String> {
+    serde_json::to_vec(reference)
+        .ok()
+        .map(|bytes| URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn truncate_history_preview(value: &str) -> String {
+    fn boundary_at_or_before(value: &str, offset: usize) -> usize {
+        let mut at = offset.min(value.len());
+        while at > 0 && !value.is_char_boundary(at) {
+            at -= 1;
+        }
+        at
+    }
+    let head_end = boundary_at_or_before(value, HISTORY_TOOL_PREVIEW_HEAD_BYTES);
+    let tail_start = boundary_at_or_before(
+        value,
+        value.len().saturating_sub(HISTORY_TOOL_PREVIEW_TAIL_BYTES),
+    );
+    format!(
+        "{}\n\n… {} bytes deferred; expand to load the complete output …\n\n{}",
+        &value[..head_end],
+        value.len(),
+        &value[tail_start..]
+    )
+}
+
+fn insert_tool_history_meta(
+    meta: &mut Option<serde_json::Value>,
+    key: &str,
+    value: serde_json::Value,
+) {
+    if !meta.as_ref().is_some_and(serde_json::Value::is_object) {
+        *meta = Some(serde_json::json!({}));
+    }
+    if let Some(object) = meta.as_mut().and_then(serde_json::Value::as_object_mut) {
+        object.insert(key.to_string(), value);
+    }
+}
+
+fn defer_heavy_tool_outputs(
+    turns: &mut [MessageTurn],
+    conversation_id: i32,
+    window: HistoryReadMetrics,
+) {
+    for turn in turns {
+        for result_index in 0..turn.blocks.len() {
+            let (tool_use_id, content_sha256, original_bytes) =
+                match &turn.blocks[result_index] {
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        output_preview: Some(output),
+                        ..
+                    } if output.len() > HISTORY_DEFER_THRESHOLD_BYTES => {
+                        (tool_use_id.clone(), sha256_hex(output), output.len())
+                    }
+                    _ => continue,
+                };
+            // Do not truncate an orphan result: without an owning ToolUse
+            // there is nowhere in the current wire model to carry the opaque
+            // load reference, and losing access would be worse than a larger
+            // page. Normal Codex transcripts pair these blocks.
+            let matching_index = tool_use_id
+                .as_deref()
+                .and_then(|wanted| {
+                    turn.blocks[..result_index].iter().rposition(|block| {
+                        matches!(block, ContentBlock::ToolUse { tool_use_id: Some(id), .. } if id == wanted)
+                    })
+                })
+                .or_else(|| {
+                    turn.blocks[..result_index]
+                        .iter()
+                        .rposition(|block| matches!(block, ContentBlock::ToolUse { .. }))
+                });
+            let Some(matching_index) = matching_index else {
+                continue;
+            };
+            let reference = DeferredHistoryContentRef {
+                version: 1,
+                conversation_id,
+                start_offset: window.start_offset,
+                end_offset: window.end_offset,
+                kind: "tool_output".into(),
+                tool_use_id: tool_use_id.clone(),
+                content_sha256,
+            };
+            let Some(encoded) = encode_deferred_history_ref(&reference) else {
+                continue;
+            };
+            let preview_bytes = if let ContentBlock::ToolResult {
+                output_preview: Some(output),
+                ..
+            } = &mut turn.blocks[result_index]
+            {
+                *output = truncate_history_preview(output);
+                output.len()
+            } else {
+                continue;
+            };
+            if let ContentBlock::ToolUse { meta, .. } = &mut turn.blocks[matching_index] {
+                insert_tool_history_meta(
+                    meta,
+                    "codeg.historyOutput",
+                    serde_json::json!({
+                        "ref": encoded,
+                        "byteCount": original_bytes,
+                        "previewBytes": preview_bytes,
+                    }),
+                );
+            }
+        }
+
+        for block in &mut turn.blocks {
+            match block {
+                ContentBlock::Thinking { text }
+                    if text.len() > HISTORY_REASONING_DEFER_THRESHOLD_BYTES =>
+                {
+                    let reference = DeferredHistoryContentRef {
+                        version: 1,
+                        conversation_id,
+                        start_offset: window.start_offset,
+                        end_offset: window.end_offset,
+                        kind: "reasoning".into(),
+                        tool_use_id: None,
+                        content_sha256: sha256_hex(text),
+                    };
+                    if let Some(encoded) = encode_deferred_history_ref(&reference) {
+                        *text = format!(
+                            "{}\n\n{HISTORY_DEFERRED_REASONING_MARKER_PREFIX}{encoded}-->",
+                            truncate_history_preview(text)
+                        );
+                    }
+                }
+                ContentBlock::Image {
+                    data,
+                    uri,
+                    ..
+                } => {
+                    defer_history_image(data, uri, conversation_id, window);
+                }
+                ContentBlock::ImageGeneration {
+                    image: Some(image),
+                    ..
+                } => {
+                    defer_history_image(
+                        &mut image.data,
+                        &mut image.uri,
+                        conversation_id,
+                        window,
+                    );
+                }
+                ContentBlock::ToolResult { images, .. } => {
+                    for image in images {
+                        defer_history_image(
+                            &mut image.data,
+                            &mut image.uri,
+                            conversation_id,
+                            window,
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn defer_history_image(
+    data: &mut String,
+    uri: &mut Option<String>,
+    conversation_id: i32,
+    window: HistoryReadMetrics,
+) {
+    if data.len() <= HISTORY_IMAGE_DEFER_THRESHOLD_BYTES {
+        return;
+    }
+    let reference = DeferredHistoryContentRef {
+        version: 1,
+        conversation_id,
+        start_offset: window.start_offset,
+        end_offset: window.end_offset,
+        kind: "image".into(),
+        tool_use_id: None,
+        content_sha256: sha256_hex(data),
+    };
+    let Some(encoded) = encode_deferred_history_ref(&reference) else {
+        return;
+    };
+    data.clear();
+    // `uri` is already part of every historical image wire shape, unlike a
+    // new schema field that older clients would discard. The prefix is never
+    // interpreted as a local path; the web client exchanges the opaque token
+    // for bytes through the authenticated history-content endpoint.
+    *uri = Some(format!("{HISTORY_DEFERRED_IMAGE_URI_PREFIX}{encoded}"));
+}
+
+pub async fn get_deferred_history_content_core(
+    conn: &sea_orm::DatabaseConnection,
+    encoded_reference: String,
+) -> Result<DeferredHistoryContent, AppCommandError> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(encoded_reference)
+        .map_err(|_| AppCommandError::invalid_input("Invalid history content reference"))?;
+    let reference: DeferredHistoryContentRef = serde_json::from_slice(&bytes)
+        .map_err(|_| AppCommandError::invalid_input("Invalid history content reference"))?;
+    if reference.version != 1
+        || (reference.kind != "tool_output"
+            && reference.kind != "image"
+            && reference.kind != "reasoning")
+    {
+        return Err(AppCommandError::invalid_input(
+            "Unsupported history content reference",
+        ));
+    }
+    let summary = conversation_service::get_by_id(conn, reference.conversation_id)
+        .await
+        .map_err(AppCommandError::from)?;
+    if summary.agent_type != AgentType::Codex {
+        return Err(AppCommandError::invalid_input(
+            "History content reference does not target a Codex conversation",
+        ));
+    }
+    let session_id = summary
+        .external_id
+        .ok_or_else(|| AppCommandError::invalid_input("Conversation has no durable session"))?;
+    let cwd = match summary.origin_cwd {
+        Some(cwd) => Some(cwd),
+        None => folder_service::get_folder_by_id(conn, summary.folder_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|folder| folder.path),
+    };
+    let range = tokio::task::spawn_blocking(move || {
+        CodexParser::new().get_conversation_range_between(
+            &session_id,
+            reference.start_offset,
+            reference.end_offset,
+            HISTORY_DEFERRED_RANGE_LIMIT_BYTES,
+            cwd,
+        )
+    })
+    .await
+    .map_err(|error| {
+        AppCommandError::task_execution_failed("Deferred history reader stopped")
+            .with_detail(error.to_string())
+    })?
+    .map_err(parse_error_to_app_error)?;
+    for turn in range.detail.turns {
+        for block in turn.blocks {
+            let image = match block {
+                ContentBlock::Thinking { text } => {
+                    if reference.kind == "reasoning"
+                        && sha256_hex(&text) == reference.content_sha256
+                    {
+                        return Ok(DeferredHistoryContent {
+                            byte_count: text.len() as u64,
+                            content: text,
+                            mime_type: None,
+                        });
+                    }
+                    None
+                }
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    output_preview,
+                    images,
+                    ..
+                } => {
+                    if reference.kind == "tool_output" {
+                        if reference.tool_use_id.is_some()
+                            && tool_use_id.as_deref() != reference.tool_use_id.as_deref()
+                        {
+                            continue;
+                        }
+                        if let Some(output) = output_preview {
+                            if sha256_hex(&output) == reference.content_sha256 {
+                                return Ok(DeferredHistoryContent {
+                                    byte_count: output.len() as u64,
+                                    content: output,
+                                    mime_type: None,
+                                });
+                            }
+                        }
+                    }
+                    if reference.kind == "image" {
+                        for image in images {
+                            if sha256_hex(&image.data) == reference.content_sha256 {
+                                return Ok(DeferredHistoryContent {
+                                    byte_count: image.data.len() as u64,
+                                    content: image.data,
+                                    mime_type: Some(image.mime_type),
+                                });
+                            }
+                        }
+                    }
+                    None
+                }
+                ContentBlock::Image {
+                    data, mime_type, ..
+                } => Some((data, mime_type)),
+                ContentBlock::ImageGeneration {
+                    image: Some(image),
+                    ..
+                } => Some((image.data, image.mime_type)),
+                _ => None,
+            };
+            if reference.kind == "image" {
+                if let Some((data, mime_type)) = image {
+                    if sha256_hex(&data) == reference.content_sha256 {
+                        return Ok(DeferredHistoryContent {
+                            byte_count: data.len() as u64,
+                            content: data,
+                            mime_type: Some(mime_type),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    Err(AppCommandError::task_execution_failed(
+        "Deferred history content no longer matches the transcript",
+    ))
+}
+
+pub async fn diagnose_codex_rollout_size_core(
+    conn: &sea_orm::DatabaseConnection,
+    conversation_id: i32,
+) -> Result<crate::parsers::codex::CodexRolloutSizeDiagnostics, AppCommandError> {
+    let summary = conversation_service::get_by_id(conn, conversation_id)
+        .await
+        .map_err(AppCommandError::from)?;
+    if summary.agent_type != AgentType::Codex {
+        return Err(AppCommandError::invalid_input(
+            "Rollout size diagnostics are available only for Codex conversations",
+        ));
+    }
+    let session_id = summary
+        .external_id
+        .ok_or_else(|| AppCommandError::invalid_input("Conversation has no durable session"))?;
+    let started = std::time::Instant::now();
+    let diagnostics = tokio::task::spawn_blocking(move || {
+        CodexParser::new().diagnose_rollout_size(&session_id)
+    })
+    .await
+    .map_err(|error| {
+        AppCommandError::task_execution_failed("Rollout diagnostic worker stopped")
+            .with_detail(error.to_string())
+    })?
+    .map_err(parse_error_to_app_error)?;
+    tracing::info!(
+        route = "diagnose_codex_rollout_size",
+        conversation_id,
+        file_bytes = diagnostics.file_bytes,
+        record_count = diagnostics.record_count,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "[conversation][perf] read-only rollout size diagnostic completed"
+    );
+    Ok(diagnostics)
 }
 
 /// Default size for the public conversation-detail command. Keeping this next
@@ -1255,6 +1824,75 @@ async fn get_folder_conversation_core_impl(
         return Err(AppCommandError::task_execution_failed(
             "Invalid conversation branch cycle",
         ));
+    }
+
+    // Cursor reads must remain cursor reads. The legacy implementation below
+    // composed a branch by fully parsing both rollouts and only then slicing
+    // the Vec, so opening a native fork of a 2 GB source read roughly 4 GB.
+    // A native Codex child already owns an immutable replay of the source
+    // prefix and can be paged directly. Snapshot branches page their local
+    // rollout first, then cross an explicit cursor into the frozen source.
+    if let Some(request) = history_request.as_ref() {
+        if relation.inheritance_mode == "native_fork" {
+            let (mut detail, title) =
+                get_folder_conversation_raw_impl(conn, conversation_id, Some(request.clone()))
+                    .await?;
+            let source_artifacts = artifact_service::list_for_turn_window(
+                conn,
+                relation.source_conversation_id,
+                &detail.turns,
+            )
+            .await
+            .unwrap_or_default();
+            let source_deliverables = deliverable_service::list_sets_for_turns(
+                conn,
+                relation.source_conversation_id,
+                &detail.turns,
+            )
+            .await
+            .unwrap_or_default();
+            detail.artifact_runs.extend(source_artifacts);
+            detail.deliverable_runs.extend(source_deliverables);
+            detail.artifact_runs.sort_by_key(|run| run.started_at);
+            detail.artifact_runs.dedup_by(|left, right| left.id == right.id);
+            detail
+                .deliverable_runs
+                .sort_by_key(|run| run.started_at);
+            detail
+                .deliverable_runs
+                .dedup_by(|left, right| left.turn_run_id == right.turn_run_id);
+            let inherited_turn_count = usize::try_from(relation.inherited_message_count.max(0))
+                .unwrap_or_default();
+            let branch_turn_count = detail
+                .summary
+                .message_count
+                .saturating_sub(inherited_turn_count as u32) as usize;
+            detail.summary.message_count = detail
+                .summary
+                .message_count
+                .max(relation.inherited_message_count.max(0) as u32);
+            detail.branch_history = Some(
+                crate::models::conversation::ConversationBranchHistory {
+                    source_conversation_id: relation.source_conversation_id,
+                    fork_message_id: relation.fork_message_id,
+                    inherited_turn_count,
+                    branch_turn_count,
+                    inheritance_mode: relation.inheritance_mode,
+                },
+            );
+            return Ok((detail, title));
+        }
+
+        if relation.fork_mode == "snapshot" {
+            return get_snapshot_branch_page(
+                conn,
+                conversation_id,
+                relation,
+                request.clone(),
+                branch_path,
+            )
+            .await;
+        }
     }
 
     // Branch history is a read-only reference to the source prefix, not copied
@@ -1380,6 +2018,7 @@ async fn get_folder_conversation_raw_impl(
         parsed_model,
         transcript_watermark,
         history_page,
+        history_read_metrics,
     ) = if let Some(ref ext_id) = summary.external_id {
         let at = summary.agent_type;
         let eid = ext_id.clone();
@@ -1438,6 +2077,13 @@ async fn get_folder_conversation_raw_impl(
                             has_more: page.has_more,
                             loaded_turns,
                         }),
+                        Some(HistoryReadMetrics {
+                            start_offset: page.start_offset,
+                            end_offset: page.end_offset,
+                            scan_bytes: page.scan_bytes,
+                            cache_hit: page.cache_hit,
+                            index_hit: page.index_hit,
+                        }),
                     ));
                 }
             }
@@ -1473,6 +2119,7 @@ async fn get_folder_conversation_raw_impl(
                         d.summary.model,
                         d.transcript_watermark,
                         page,
+                        None,
                     ))
                 }
                 Err(crate::parsers::ParseError::ConversationNotFound(_)) => {
@@ -1519,12 +2166,13 @@ async fn get_folder_conversation_raw_impl(
                                         d.summary.model,
                                         d.transcript_watermark,
                                         page,
+                                        None,
                                     ));
                                 }
                             }
                         }
                     }
-                    Ok((vec![], None, None, None, None, None, None))
+                    Ok((vec![], None, None, None, None, None, None, None))
                 }
                 Err(e) => Err(parse_error_to_app_error(e)),
             }
@@ -1549,6 +2197,7 @@ async fn get_folder_conversation_raw_impl(
                 has_more: false,
                 loaded_turns: 0,
             }),
+            None,
         )
     };
     let session_parse_elapsed_ms = parse_started.elapsed().as_millis() as u64;
@@ -1634,6 +2283,9 @@ async fn get_folder_conversation_raw_impl(
             turns.insert(index, merge_turn);
         }
     }
+    if let Some(window) = history_read_metrics {
+        defer_heavy_tool_outputs(&mut turns, conversation_id, window);
+    }
     let artifact_runs = if history_page.is_some() {
         artifact_service::list_for_turn_window(conn, conversation_id, &turns)
             .await
@@ -1660,6 +2312,11 @@ async fn get_folder_conversation_raw_impl(
         loaded_turns = turns.len(),
         summary_db_elapsed_ms,
         session_parse_elapsed_ms,
+        jsonl_read_bytes = history_read_metrics
+            .map(|metrics| metrics.end_offset.saturating_sub(metrics.start_offset)),
+        jsonl_scan_bytes = history_read_metrics.map(|metrics| metrics.scan_bytes),
+        parser_cache_hit = history_read_metrics.is_some_and(|metrics| metrics.cache_hit),
+        offset_index_hit = history_read_metrics.is_some_and(|metrics| metrics.index_hit),
         related_db_elapsed_ms,
         total_elapsed_ms = total_started.elapsed().as_millis() as u64,
         "[conversation][perf] detail data loaded"
@@ -1943,9 +2600,9 @@ fn apply_turn_window(
 /// reply persisted after it mid-stream. A no-op (one cheap lock pass) when no turn
 /// is in flight. Shared by the Tauri command and the web handler.
 ///
-/// `window`: when set, the response's `turns` are sliced to the requested
-/// window AFTER all full-list post-processing (the summary counts, stats and
-/// watermark keep describing the full transcript).
+/// `window` is the legacy index-window compatibility path. New callers pass a
+/// `ConversationHistoryRequest`, which seeks and parses only the requested
+/// JSONL byte page before applying the same live-state overlays.
 pub async fn get_folder_conversation_with_live_core(
     conn: &sea_orm::DatabaseConnection,
     manager: &crate::acp::manager::ConnectionManager,
@@ -2111,7 +2768,8 @@ pub async fn get_folder_conversation(
     user_turn_limit: Option<u32>,
 ) -> Result<DbConversationDetail, AppCommandError> {
     let emitter = EventEmitter::Tauri(app);
-    if before_cursor.is_some() || user_turn_limit.is_some() {
+    let legacy_window_requested = tail_turns.is_some() || from_index.is_some();
+    if !legacy_window_requested {
         get_folder_conversation_page_with_live_core(
             &db.conn,
             &manager,
@@ -2136,6 +2794,24 @@ pub async fn get_folder_conversation(
         )
         .await
     }
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn get_deferred_history_content(
+    db: tauri::State<'_, AppDatabase>,
+    reference: String,
+) -> Result<DeferredHistoryContent, AppCommandError> {
+    get_deferred_history_content_core(&db.conn, reference).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn diagnose_codex_rollout_size(
+    db: tauri::State<'_, AppDatabase>,
+    conversation_id: i32,
+) -> Result<crate::parsers::codex::CodexRolloutSizeDiagnostics, AppCommandError> {
+    diagnose_codex_rollout_size_core(&db.conn, conversation_id).await
 }
 
 #[cfg(feature = "tauri-runtime")]
@@ -6426,6 +7102,195 @@ mod tests {
         assert_eq!(
             seam.prefix_hash,
             crate::commands::turn_window::prefix_fingerprint(&turns[..2])
+        );
+    }
+
+    #[test]
+    fn bounded_history_defers_large_tool_output_but_keeps_a_load_reference() {
+        let full = "工具输出".repeat(20_000);
+        let mut turns = vec![MessageTurn {
+            id: "assistant-1".into(),
+            role: TurnRole::Assistant,
+            blocks: vec![
+                ContentBlock::ToolUse {
+                    tool_use_id: Some("call-1".into()),
+                    tool_name: "exec_command".into(),
+                    input_preview: Some("echo test".into()),
+                    status: Some("completed".into()),
+                    meta: None,
+                },
+                ContentBlock::ToolResult {
+                    tool_use_id: Some("call-1".into()),
+                    output_preview: Some(full.clone()),
+                    is_error: false,
+                    agent_stats: None,
+                    images: Vec::new(),
+                },
+            ],
+            timestamp: at(0),
+            usage: None,
+            duration_ms: None,
+            model: None,
+            completed_at: Some(at(1)),
+        }];
+        defer_heavy_tool_outputs(
+            &mut turns,
+            26,
+            HistoryReadMetrics {
+                start_offset: 100,
+                end_offset: 200,
+                ..HistoryReadMetrics::default()
+            },
+        );
+        let ContentBlock::ToolUse { meta, .. } = &turns[0].blocks[0] else {
+            panic!("tool use")
+        };
+        let reference = meta
+            .as_ref()
+            .and_then(|meta| meta.pointer("/codeg.historyOutput/ref"))
+            .and_then(serde_json::Value::as_str)
+            .expect("deferred reference");
+        let decoded = URL_SAFE_NO_PAD.decode(reference).expect("decode ref");
+        let parsed: DeferredHistoryContentRef =
+            serde_json::from_slice(&decoded).expect("parse ref");
+        assert_eq!(parsed.conversation_id, 26);
+        assert_eq!(parsed.start_offset, 100);
+        assert_eq!(parsed.end_offset, 200);
+        assert_eq!(parsed.content_sha256, sha256_hex(&full));
+        let ContentBlock::ToolResult {
+            output_preview: Some(preview),
+            ..
+        } = &turns[0].blocks[1]
+        else {
+            panic!("tool result")
+        };
+        assert!(preview.len() < full.len() / 2);
+        assert!(preview.contains("deferred"));
+    }
+
+    #[test]
+    fn bounded_history_defers_large_images_without_losing_a_load_reference() {
+        let full = "a".repeat(HISTORY_IMAGE_DEFER_THRESHOLD_BYTES + 1);
+        let mut turns = vec![MessageTurn {
+            id: "user-1".into(),
+            role: TurnRole::User,
+            blocks: vec![ContentBlock::Image {
+                data: full.clone(),
+                mime_type: "image/png".into(),
+                uri: Some("clipboard://original.png".into()),
+            }],
+            timestamp: at(0),
+            usage: None,
+            duration_ms: None,
+            model: None,
+            completed_at: Some(at(1)),
+        }];
+        defer_heavy_tool_outputs(
+            &mut turns,
+            26,
+            HistoryReadMetrics {
+                start_offset: 100,
+                end_offset: 200,
+                ..HistoryReadMetrics::default()
+            },
+        );
+        let ContentBlock::Image { data, uri, .. } = &turns[0].blocks[0] else {
+            panic!("image")
+        };
+        assert!(data.is_empty());
+        let reference = uri
+            .as_deref()
+            .and_then(|uri| uri.strip_prefix(HISTORY_DEFERRED_IMAGE_URI_PREFIX))
+            .expect("deferred reference");
+        let decoded = URL_SAFE_NO_PAD.decode(reference).expect("decode ref");
+        let parsed: DeferredHistoryContentRef =
+            serde_json::from_slice(&decoded).expect("parse ref");
+        assert_eq!(parsed.kind, "image");
+        assert_eq!(parsed.conversation_id, 26);
+        assert_eq!(parsed.content_sha256, sha256_hex(&full));
+    }
+
+    #[test]
+    fn bounded_history_defers_large_reasoning_without_exposing_the_reference() {
+        let full = "分析过程".repeat(20_000);
+        let mut turns = vec![MessageTurn {
+            id: "assistant-reasoning".into(),
+            role: TurnRole::Assistant,
+            blocks: vec![ContentBlock::Thinking { text: full.clone() }],
+            timestamp: at(0),
+            usage: None,
+            duration_ms: None,
+            model: None,
+            completed_at: Some(at(1)),
+        }];
+        defer_heavy_tool_outputs(
+            &mut turns,
+            26,
+            HistoryReadMetrics {
+                start_offset: 100,
+                end_offset: 200,
+                ..HistoryReadMetrics::default()
+            },
+        );
+        let ContentBlock::Thinking { text } = &turns[0].blocks[0] else {
+            panic!("reasoning")
+        };
+        let encoded = text
+            .split_once(HISTORY_DEFERRED_REASONING_MARKER_PREFIX)
+            .and_then(|(_, marker)| marker.strip_suffix("-->"))
+            .expect("deferred reasoning reference");
+        let decoded = URL_SAFE_NO_PAD.decode(encoded).expect("decode ref");
+        let parsed: DeferredHistoryContentRef =
+            serde_json::from_slice(&decoded).expect("parse ref");
+        assert_eq!(parsed.kind, "reasoning");
+        assert_eq!(parsed.conversation_id, 26);
+        assert_eq!(parsed.content_sha256, sha256_hex(&full));
+        assert!(text.len() < full.len() / 2);
+    }
+
+    #[test]
+    fn bounded_history_payload_stays_small_with_tool_heavy_recent_rounds() {
+        let mut turns = (0..6)
+            .map(|index| MessageTurn {
+                id: format!("assistant-{index}"),
+                role: TurnRole::Assistant,
+                blocks: vec![
+                    ContentBlock::ToolUse {
+                        tool_use_id: Some(format!("call-{index}")),
+                        tool_name: "exec_command".into(),
+                        input_preview: Some("large command".into()),
+                        status: Some("completed".into()),
+                        meta: None,
+                    },
+                    ContentBlock::ToolResult {
+                        tool_use_id: Some(format!("call-{index}")),
+                        output_preview: Some("x".repeat(512_000)),
+                        is_error: false,
+                        agent_stats: None,
+                        images: Vec::new(),
+                    },
+                ],
+                timestamp: at(index),
+                usage: None,
+                duration_ms: None,
+                model: None,
+                completed_at: Some(at(index + 1)),
+            })
+            .collect::<Vec<_>>();
+        defer_heavy_tool_outputs(
+            &mut turns,
+            26,
+            HistoryReadMetrics {
+                start_offset: 100,
+                end_offset: 4_000_000,
+                ..HistoryReadMetrics::default()
+            },
+        );
+        let bytes = serde_json::to_vec(&turns).expect("serialize bounded turns");
+        assert!(
+            bytes.len() < 128 * 1024,
+            "deferred page stayed unexpectedly large: {} bytes",
+            bytes.len()
         );
     }
 }
