@@ -141,7 +141,12 @@ export type AdaptedContentPart =
       errorText?: string
       state: "output-available" | "output-error"
     }
-  | { type: "reasoning"; content: string; isStreaming: boolean }
+  | {
+      type: "reasoning"
+      content: string
+      isStreaming: boolean
+      deferredRef?: string | null
+    }
   | {
       type: "tool-group"
       items: AdaptedToolCallPart[]
@@ -186,6 +191,49 @@ export interface UserImageDisplay {
   data: string
   mime_type: string
   uri?: string | null
+  /** Opaque authenticated reference for large historical image bytes. */
+  deferredRef?: string | null
+}
+
+const DEFERRED_HISTORY_IMAGE_URI_PREFIX = "codeg-history-content:"
+const DEFERRED_HISTORY_REASONING_RE =
+  /\s*<!--codeg-history-reasoning:([A-Za-z0-9_-]+)-->\s*$/
+
+function parseDeferredHistoryReasoning(text: string): {
+  content: string
+  deferredRef: string | null
+} {
+  const match = DEFERRED_HISTORY_REASONING_RE.exec(text)
+  if (!match) return { content: text, deferredRef: null }
+  return {
+    content: text.slice(0, match.index).trimEnd(),
+    deferredRef: match[1] ?? null,
+  }
+}
+
+function deferredHistoryImageRef(uri?: string | null): string | null {
+  if (!uri?.startsWith(DEFERRED_HISTORY_IMAGE_URI_PREFIX)) return null
+  const reference = uri.slice(DEFERRED_HISTORY_IMAGE_URI_PREFIX.length)
+  return reference.length > 0 ? reference : null
+}
+
+function imageDataToDisplay(img: {
+  data: string
+  mime_type: string
+  uri?: string | null
+}): UserImageDisplay | null {
+  if (!img.mime_type) return null
+  const deferredRef = deferredHistoryImageRef(img.uri)
+  if (!img.data && !deferredRef) return null
+  return {
+    name: deferredRef
+      ? `image.${img.mime_type.split("/")[1]?.split("+")[0] ?? "png"}`
+      : deriveImageNameFromImageData(img),
+    data: img.data,
+    mime_type: img.mime_type,
+    uri: deferredRef ? null : (img.uri ?? null),
+    deferredRef,
+  }
 }
 
 const BLOCKED_RESOURCE_MENTION_RE = /@([^\s@]+)\s*\[blocked[^\]]*\]/gi
@@ -971,29 +1019,14 @@ function splitUserTextAndResources(
   return { parts: nextParts, resources }
 }
 
-function deriveImageNameFromBlock(
-  block: Extract<ContentBlock, { type: "image" }>
-): string {
-  if (block.uri && block.uri.trim().length > 0) {
-    return fileNameFromUri(block.uri)
-  }
-  const ext = block.mime_type.split("/")[1]?.split("+")[0] ?? "image"
-  return `image.${ext}`
-}
-
 function extractUserImagesFromBlocks(
   blocks: ContentBlock[]
 ): UserImageDisplay[] {
   const images: UserImageDisplay[] = []
   for (const block of blocks) {
     if (block.type !== "image") continue
-    if (!block.data || !block.mime_type) continue
-    addImage(images, {
-      name: deriveImageNameFromBlock(block),
-      data: block.data,
-      mime_type: block.mime_type,
-      uri: block.uri ?? null,
-    })
+    const display = imageDataToDisplay(block)
+    if (display) addImage(images, display)
   }
   return images
 }
@@ -1050,24 +1083,19 @@ function adaptContentBlock(
       }
     }
 
-    case "thinking":
+    case "thinking": {
+      const deferred = parseDeferredHistoryReasoning(block.text)
       return {
         type: "reasoning",
-        content: block.text,
+        content: deferred.content,
         isStreaming,
+        deferredRef: deferred.deferredRef,
       }
+    }
 
     case "image_generation": {
       const img = block.image ?? null
-      const display: UserImageDisplay | null =
-        img && img.data && img.mime_type
-          ? {
-              name: deriveImageNameFromImageData(img),
-              data: img.data,
-              mime_type: img.mime_type,
-              uri: img.uri ?? null,
-            }
-          : null
+      const display = img ? imageDataToDisplay(img) : null
       return {
         type: "generated-image",
         revisedPrompt: block.revised_prompt ?? null,
@@ -1123,17 +1151,13 @@ function adaptImageToolResultParts(result: {
   if (!images || images.length === 0) return null
   const parts: AdaptedGeneratedImagePart[] = []
   for (const img of images) {
-    if (!img.data || !img.mime_type) continue
+    const display = imageDataToDisplay(img)
+    if (!display) continue
     parts.push({
       type: "generated-image",
       // A Read has no model-revised prompt — only codex image generation does.
       revisedPrompt: null,
-      image: {
-        name: deriveImageNameFromImageData(img),
-        data: img.data,
-        mime_type: img.mime_type,
-        uri: img.uri ?? null,
-      },
+      image: display,
       // Historical replay always carries a present image, so status is
       // irrelevant to the renderer; `null` is treated as success.
       status: null,

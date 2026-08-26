@@ -2053,12 +2053,19 @@ export async function importSelectedSessions(
 }
 
 /**
- * Fetch a conversation's detail, optionally windowed:
- * - `{ tailTurns }` — last N turns, start aligned to a user-round boundary
- * - `{ fromIndex }` — exact slice `turns[fromIndex..]` (window refresh)
- * No window → legacy full response (also what an old server returns for any
- * request; the windowed fields are then absent).
+ * Fetch a conversation's bounded detail page:
+ * - `{ tailTurns }` — legacy last-N window compatibility
+ * - `{ fromIndex }` — legacy exact-index window compatibility
+ * No selector means the server's bounded newest page. Full history is never an
+ * implicit side effect of opening a conversation; export/search explicitly
+ * walk opaque cursor pages.
  */
+const folderConversationFlights = new Map<
+  string,
+  Promise<DbConversationDetail>
+>()
+let folderConversationRequestSequence = 0
+
 export async function getFolderConversation(
   conversationId: number,
   options?: {
@@ -2068,7 +2075,7 @@ export async function getFolderConversation(
     userTurnLimit?: number | null
   }
 ): Promise<DbConversationDetail> {
-  return getTransport().call("get_folder_conversation", {
+  const requestKey = {
     conversationId,
     ...(options?.tailTurns != null ? { tailTurns: options.tailTurns } : {}),
     ...(options?.fromIndex != null ? { fromIndex: options.fromIndex } : {}),
@@ -2078,7 +2085,50 @@ export async function getFolderConversation(
     ...(options?.userTurnLimit !== undefined
       ? { userTurnLimit: options.userTurnLimit }
       : {}),
-  })
+  }
+  const key = JSON.stringify(requestKey)
+  const existing = folderConversationFlights.get(key)
+  if (existing) {
+    if (process.env.NODE_ENV !== "test") {
+      console.debug("[conversation][perf] duplicate detail request reused", {
+        conversationId,
+        cursor: options?.beforeCursor ?? null,
+        userTurnLimit: options?.userTurnLimit ?? null,
+      })
+    }
+    return existing
+  }
+  const requestId = `${Date.now().toString(36)}-${(folderConversationRequestSequence += 1).toString(
+    36
+  )}`
+  const args =
+    isDesktop() && !isRemoteDesktopMode()
+      ? requestKey
+      : { ...requestKey, requestId }
+  const started = Date.now()
+  const flight = getTransport()
+    .call<DbConversationDetail>("get_folder_conversation", args)
+    .then((detail) => {
+      if (process.env.NODE_ENV !== "test") {
+        console.debug("[conversation][perf] detail received", {
+          conversationId,
+          requestId,
+          cursor: options?.beforeCursor ?? null,
+          userTurnLimit: options?.userTurnLimit ?? null,
+          loadedTurns: detail.turns.length,
+          elapsedMs: Date.now() - started,
+          requestReused: false,
+        })
+      }
+      return detail
+    })
+    .finally(() => {
+      if (folderConversationFlights.get(key) === flight) {
+        folderConversationFlights.delete(key)
+      }
+    })
+  folderConversationFlights.set(key, flight)
+  return flight
 }
 
 /** Fetch one page of older history ending just before `beforeIndex`. */
@@ -2092,6 +2142,39 @@ export async function getFolderConversationTurns(
     beforeIndex,
     limit,
   })
+}
+
+/** Load a single heavy historical tool output that the bounded detail response
+ * represented as a preview. The opaque reference is scoped to one immutable
+ * JSONL byte window and is revalidated against the original content hash. */
+export async function getDeferredHistoryContent(reference: string): Promise<{
+  content: string
+  byte_count: number
+  mime_type?: string | null
+}> {
+  return getTransport().call("get_deferred_history_content", { reference })
+}
+
+export interface CodexRolloutSizeDiagnostics {
+  file_bytes: number
+  record_count: number
+  ordinary_text_bytes: number
+  reasoning_bytes: number
+  tool_call_bytes: number
+  tool_result_bytes: number
+  image_or_data_url_bytes: number
+  snapshot_or_compaction_bytes: number
+  duplicate_record_bytes: number
+  duplicate_record_count: number
+  other_bytes: number
+}
+
+/** Explicit read-only full-rollout diagnostic. Never called by normal page
+ * opening; operators opt into the O(file size) scan when investigating growth. */
+export async function diagnoseCodexRolloutSize(
+  conversationId: number
+): Promise<CodexRolloutSizeDiagnostics> {
+  return getTransport().call("diagnose_codex_rollout_size", { conversationId })
 }
 
 export async function removeFolderFromHistory(path: string): Promise<void> {

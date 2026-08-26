@@ -1,8 +1,7 @@
 /**
  * Coverage for the windowed conversation-loading protocol:
- * - cold loads request a tail window; refreshes re-request the loaded window
- *   (`fromIndex = turns_offset`) and fall back to a fresh tail when the
- *   prefix fingerprint no longer matches (compaction rewrote history);
+ * - cold loads and refreshes use the bounded opaque-cursor endpoint; no
+ *   persisted window can make a refresh fall back to a full-file parse;
  * - `loadOlderTurns` prepends an older page only when its seam proof matches
  *   the current window fingerprint, participates in the fetch-generation
  *   total order, and is single-flight;
@@ -24,7 +23,6 @@ import {
   resetConversationRuntimeStore,
   useConversationRuntimeStore,
   HISTORY_PAGE_USER_TURNS,
-  TAIL_TURNS_DEFAULT,
   OLDER_TURNS_PAGE_SIZE,
   type ConversationRuntimeSession,
 } from "@/stores/conversation-runtime-store"
@@ -209,7 +207,9 @@ describe("windowed fetch/refetch", () => {
     actions().refetchDetail(CID)
     await flush()
     expect(mockGet).toHaveBeenCalledTimes(1)
-    expect(mockGet).toHaveBeenCalledWith(CID, { fromIndex: 2 })
+    expect(mockGet).toHaveBeenCalledWith(CID, {
+      userTurnLimit: HISTORY_PAGE_USER_TURNS,
+    })
     expect(session()?.detail?.turns.map((t) => t.id)).toEqual([
       "turn-2",
       "turn-3",
@@ -218,7 +218,7 @@ describe("windowed fetch/refetch", () => {
     ])
   })
 
-  it("refetch falls back to a fresh tail when the prefix fingerprint changed", async () => {
+  it("does not issue a legacy full-window retry when an old prefix fingerprint changed", async () => {
     seed({ detail: windowedDetail(2) })
     // The window-refresh read reports a REWRITTEN prefix (different hash);
     // the loaded window's coordinates are garbage → a second request must
@@ -230,11 +230,11 @@ describe("windowed fetch/refetch", () => {
       .mockResolvedValueOnce(windowedDetail(4))
     actions().refetchDetail(CID)
     await flush()
-    expect(mockGet).toHaveBeenNthCalledWith(1, CID, { fromIndex: 2 })
-    expect(mockGet).toHaveBeenNthCalledWith(2, CID, {
-      tailTurns: TAIL_TURNS_DEFAULT,
+    expect(mockGet).toHaveBeenCalledTimes(1)
+    expect(mockGet).toHaveBeenCalledWith(CID, {
+      userTurnLimit: HISTORY_PAGE_USER_TURNS,
     })
-    expect(session()?.detail?.turns_offset).toBe(4)
+    expect(session()?.detail?.prefix_hash).toBe("00000000000000ff")
   })
 
   it("refetch falls back to a fresh tail when the total collapsed below the window start", async () => {
@@ -250,10 +250,11 @@ describe("windowed fetch/refetch", () => {
       .mockResolvedValueOnce(windowedDetail(0))
     actions().refetchDetail(CID)
     await flush()
-    expect(mockGet).toHaveBeenNthCalledWith(2, CID, {
-      tailTurns: TAIL_TURNS_DEFAULT,
+    expect(mockGet).toHaveBeenCalledTimes(1)
+    expect(mockGet).toHaveBeenCalledWith(CID, {
+      userTurnLimit: HISTORY_PAGE_USER_TURNS,
     })
-    expect(session()?.detail?.turns_offset).toBe(0)
+    expect(session()?.detail?.turns).toEqual([])
   })
 
   it("passes a legacy full response through untouched (old server)", async () => {
@@ -327,7 +328,9 @@ describe("loadOlderTurns", () => {
     // No merge happened; the standard refetch path was invoked instead.
     expect(session()?.detail?.turns_offset).toBe(4)
     expect(session()?.loadingOlderTurns).toBe(false)
-    expect(mockGet).toHaveBeenCalledWith(CID, { fromIndex: 4 })
+    expect(mockGet).toHaveBeenCalledWith(CID, {
+      userTurnLimit: HISTORY_PAGE_USER_TURNS,
+    })
   })
 
   it("drops a page that lost the fetch-generation race to a newer fetch", async () => {
@@ -455,11 +458,13 @@ describe("syncTurnMetadata windowed gate", () => {
     )
     actions().syncTurnMetadata(CID)
     await vi.advanceTimersByTimeAsync(1600)
-    expect(mockGet).toHaveBeenCalledWith(CID, { fromIndex: 6 })
+    expect(mockGet).toHaveBeenCalledWith(CID, {
+      userTurnLimit: HISTORY_PAGE_USER_TURNS,
+    })
     expect(session()?.localTurns[0]?.usage?.input_tokens).toBe(10)
   })
 
-  it("skips turn patches entirely when the boundary fingerprint mismatches", async () => {
+  it("uses the authoritative bounded tail instead of an obsolete prefix fingerprint", async () => {
     vi.useFakeTimers()
     seed({
       localTurns: local,
@@ -486,10 +491,7 @@ describe("syncTurnMetadata windowed gate", () => {
     )
     actions().syncTurnMetadata(CID)
     await vi.advanceTimersByTimeAsync(1600)
-    // Retry fires once (metadata still missing), then gives up — usage must
-    // never be pinned from an unverified window.
-    await vi.advanceTimersByTimeAsync(3100)
-    expect(session()?.localTurns[0]?.usage).toBeUndefined()
+    expect(session()?.localTurns[0]?.usage?.input_tokens).toBe(10)
   })
 
   it("legacy full response uses the global baseline math", async () => {
@@ -521,7 +523,9 @@ describe("syncTurnMetadata windowed gate", () => {
     )
     actions().syncTurnMetadata(CID)
     await vi.advanceTimersByTimeAsync(1600)
-    expect(mockGet).toHaveBeenCalledWith(CID, undefined)
+    expect(mockGet).toHaveBeenCalledWith(CID, {
+      userTurnLimit: HISTORY_PAGE_USER_TURNS,
+    })
     expect(session()?.localTurns[0]?.usage?.input_tokens).toBe(42)
   })
 })
