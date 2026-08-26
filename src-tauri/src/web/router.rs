@@ -115,6 +115,15 @@ pub fn build_router(
             post(handlers::conversations::get_folder_conversation)
                 .layer(history_response_compression()),
         )
+        .route(
+            "/get_deferred_history_content",
+            post(handlers::conversations::get_deferred_history_content)
+                .layer(history_response_compression()),
+        )
+        .route(
+            "/diagnose_codex_rollout_size",
+            post(handlers::conversations::diagnose_codex_rollout_size),
+        )
         // ─── Confirmed deliverables ───
         // JSON operations are authenticated and accept database ids only. A
         // short-lived one-use ticket is the sole unauthenticated download

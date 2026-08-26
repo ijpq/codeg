@@ -1043,6 +1043,8 @@ mod tauri_app {
                 conversations::scan_importable_sessions,
                 conversations::import_selected_sessions,
                 conversations::get_folder_conversation,
+                conversations::get_deferred_history_content,
+                conversations::diagnose_codex_rollout_size,
                 conversations::get_folder_conversation_turns,
                 conversations::list_folders,
                 conversations::get_stats,

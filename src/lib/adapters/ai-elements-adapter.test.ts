@@ -1317,6 +1317,67 @@ describe("adaptMessageTurn — image tool results", () => {
     ])
   })
 
+  it("keeps an opaque load reference for a deferred historical image", () => {
+    const adapted = adaptMessageTurn(
+      {
+        id: "read-deferred-image",
+        role: "assistant",
+        timestamp: "2026-06-02T00:00:00.000Z",
+        blocks: [
+          {
+            type: "tool_result",
+            tool_use_id: null,
+            output_preview: null,
+            is_error: false,
+            images: [
+              {
+                data: "",
+                mime_type: "image/png",
+                uri: "codeg-history-content:opaque-ref",
+              },
+            ],
+          },
+        ],
+      },
+      msgText,
+      false
+    )
+
+    const part = adapted.content[0]
+    if (part.type !== "generated-image") {
+      throw new Error("expected a generated-image part")
+    }
+    expect(part.image?.data).toBe("")
+    expect(part.image?.deferredRef).toBe("opaque-ref")
+    expect(part.image?.uri).toBeNull()
+  })
+
+  it("keeps a deferred reasoning reference out of rendered markdown", () => {
+    const adapted = adaptMessageTurn(
+      {
+        id: "deferred-reasoning",
+        role: "assistant",
+        timestamp: "2026-06-02T00:00:00.000Z",
+        blocks: [
+          {
+            type: "thinking",
+            text: "reasoning preview\n\n<!--codeg-history-reasoning:opaque_ref-->",
+          },
+        ],
+      },
+      msgText,
+      false
+    )
+
+    const part = adapted.content[0]
+    if (part.type !== "reasoning") {
+      throw new Error("expected a reasoning part")
+    }
+    expect(part.content).toBe("reasoning preview")
+    expect(part.content).not.toContain("codeg-history-reasoning")
+    expect(part.deferredRef).toBe("opaque_ref")
+  })
+
   it("leaves a normal text Read result as a tool card (no regression)", () => {
     const adapted = adaptMessageTurn(
       {

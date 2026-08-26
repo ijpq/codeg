@@ -130,8 +130,12 @@ pub async fn get_conversation(
 #[serde(rename_all = "camelCase")]
 pub struct GetFolderConversationParams {
     pub conversation_id: i32,
-    /// Optional turn-window selectors (mutually exclusive). Absent = legacy
-    /// full response.
+    #[serde(default)]
+    pub request_id: Option<String>,
+    /// Optional legacy turn-window selectors (mutually exclusive). New callers
+    /// use the opaque history cursor. If every selector is absent we still
+    /// return the bounded newest page; ordinary UI opens must never mean
+    /// "parse the complete transcript".
     #[serde(default)]
     pub tail_turns: Option<usize>,
     #[serde(default)]
@@ -142,14 +146,18 @@ pub struct GetFolderConversationParams {
     pub user_turn_limit: Option<u32>,
 }
 
+fn legacy_turn_window_requested(params: &GetFolderConversationParams) -> bool {
+    params.tail_turns.is_some() || params.from_index.is_some()
+}
+
 pub async fn get_folder_conversation(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<GetFolderConversationParams>,
 ) -> Result<axum::response::Response, AppCommandError> {
     let started = std::time::Instant::now();
     let db = &state.db;
-    let cursor_requested = params.before_cursor.is_some() || params.user_turn_limit.is_some();
-    let result = if cursor_requested {
+    let legacy_window_requested = legacy_turn_window_requested(&params);
+    let result = if !legacy_window_requested {
         conv_commands::get_folder_conversation_page_with_live_core(
             &db.conn,
             &state.connection_manager,
@@ -157,7 +165,7 @@ pub async fn get_folder_conversation(
             &state.emitter,
             params.conversation_id,
             conv_commands::ConversationHistoryRequest {
-                before_cursor: params.before_cursor,
+                before_cursor: params.before_cursor.clone(),
                 user_turn_limit: params
                     .user_turn_limit
                     .unwrap_or(conv_commands::DEFAULT_HISTORY_PAGE_USER_TURNS),
@@ -186,7 +194,14 @@ pub async fn get_folder_conversation(
     let serialization_elapsed_ms = serialization_started.elapsed().as_millis() as u64;
     tracing::info!(
         route = "/api/get_folder_conversation",
+        request_id = params.request_id.as_deref(),
         conversation_id = params.conversation_id,
+        source_conversation_id = result
+            .branch_history
+            .as_ref()
+            .map(|history| history.source_conversation_id),
+        cursor = params.before_cursor.as_deref(),
+        page_size = params.user_turn_limit,
         bounded_history = result.history_page.is_some() || result.turns_offset.is_some(),
         loaded_turns = result.turns.len(),
         has_more = result
@@ -199,6 +214,39 @@ pub async fn get_folder_conversation(
         "[HTTP][perf] conversation detail prepared"
     );
     Ok(([("content-type", "application/json")], response_bytes).into_response())
+}
+
+#[derive(Deserialize)]
+pub struct GetDeferredHistoryContentParams {
+    pub reference: String,
+}
+
+pub async fn get_deferred_history_content(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<GetDeferredHistoryContentParams>,
+) -> Result<Json<conv_commands::DeferredHistoryContent>, AppCommandError> {
+    Ok(Json(
+        conv_commands::get_deferred_history_content_core(&state.db.conn, params.reference).await?,
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnoseCodexRolloutSizeParams {
+    pub conversation_id: i32,
+}
+
+pub async fn diagnose_codex_rollout_size(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<DiagnoseCodexRolloutSizeParams>,
+) -> Result<Json<crate::parsers::codex::CodexRolloutSizeDiagnostics>, AppCommandError> {
+    Ok(Json(
+        conv_commands::diagnose_codex_rollout_size_core(
+            &state.db.conn,
+            params.conversation_id,
+        )
+        .await?,
+    ))
 }
 
 #[derive(Deserialize)]
@@ -523,4 +571,35 @@ pub async fn delete_conversation(
     )
     .await?;
     Ok(Json(()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conversation_detail_without_selectors_uses_bounded_cursor_path() {
+        let params = GetFolderConversationParams {
+            conversation_id: 26,
+            request_id: Some("request-1".into()),
+            tail_turns: None,
+            from_index: None,
+            before_cursor: None,
+            user_turn_limit: None,
+        };
+        assert!(!legacy_turn_window_requested(&params));
+    }
+
+    #[test]
+    fn only_explicit_legacy_window_selectors_enable_full_parse_compatibility() {
+        let params = GetFolderConversationParams {
+            conversation_id: 26,
+            request_id: None,
+            tail_turns: Some(10),
+            from_index: None,
+            before_cursor: None,
+            user_turn_limit: None,
+        };
+        assert!(legacy_turn_window_requested(&params));
+    }
 }

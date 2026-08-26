@@ -210,31 +210,16 @@ export interface ConversationRuntimeSession {
   // Session-level stats (token usage, context window, etc.)
   sessionStats: SessionStats | null
 
-  // Number of persisted assistant turns that predate this session's `localTurns`
-  // — captured at send time (first optimistic turn of a batch), when `detail`
-  // is settled history. A GLOBAL count over the full transcript
-  // (`assistant_turns_before_offset` + the loaded window's share), so it stays
-  // valid however the loaded window moves. Consumed only on the LEGACY sync
-  // path (old server, full reparse): the reparse slices this many turns off
-  // the front before aligning the rest to `localTurns`. The windowed sync
-  // path replaces it with the fingerprint gate below. `null` when no
-  // user-initiated batch is in flight (e.g. the sub-agent adopt path); the
-  // reparse then treats the whole parse as this session's, matching the
-  // pre-capture behavior. See `computeTurnMetadataPatches`.
+  // Number of persisted assistant turns that predate this session's
+  // `localTurns`, captured at send time. Retained for compatibility with
+  // already-mounted sessions and for local alignment helpers; detail refreshes
+  // themselves now use the bounded newest cursor page and never request a
+  // complete transcript merely to patch metadata.
   historyAssistantBaseline: number | null
 
-  // Windowed-sync anchor, captured together with the baseline at batch start:
-  // the batch's first turn will persist at global index `batchBoundaryIndex`,
-  // and `batchBoundaryPrefixHash` fingerprints full[0..batchBoundaryIndex) at
-  // capture time (client-side chain extension of the window fingerprint).
-  // `syncTurnMetadata` refetches `{ fromIndex: batchBoundaryIndex }` and
-  // applies turn patches ONLY when the response's prefix_hash equals the
-  // captured hash — a mismatch means the history the baseline counted was
-  // rewritten (compaction) between capture and sync, where aligning by counts
-  // would pin wrong metadata onto local turns (first-write-wins makes that
-  // permanent). `batchBoundaryPrefixHash` null = captured under a legacy
-  // (non-windowed) detail: the windowed gate cannot run, only the legacy
-  // full-reparse math may patch.
+  // Legacy index-window anchor retained in persisted runtime state. Current
+  // servers synchronize from the bounded newest cursor page, while these
+  // fields still protect compatibility with old in-memory sessions.
   batchBoundaryIndex: number | null
   batchBoundaryPrefixHash: string | null
 
@@ -3312,40 +3297,22 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     set((state) => reducer(state, action))
   }
 
-  /**
-   * Fetch the detail as a WINDOW scoped to what this session has loaded:
-   * - no windowed detail yet → the default tail window;
-   * - a windowed detail → `{ fromIndex: turns_offset }`, i.e. refresh the
-   *   whole loaded region (older, unloaded prefix untouched). Anchoring at
-   *   the window start — not the active round — is deliberate: turns INSIDE
-   *   the loaded region can be rewritten later (a background task completing
-   *   rewrites its multi-rounds-old ack preview; delegation meta advances),
-   *   and today's full refetch repainted them. The unloaded prefix picks up
-   *   such rewrites whenever the user pages it in.
-   *
-   * The response is verified against the current window fingerprint: a
-   * mismatch (or a total that collapsed below the window start) means the
-   * prefix was rewritten — compaction — so the loaded window's coordinates
-   * are garbage; retry once as a fresh tail window (dropping paged-in
-   * history) instead of stitching incompatible parses together. A legacy
-   * full response (old server: no window fields) passes through untouched.
-   */
+  /** Refresh only the newest bounded cursor page. Older pages already shown
+   * remain local UI history until the next explicit pagination request; an ACP
+   * or deliverable event must not turn a metadata refresh into a full JSONL
+   * parse. */
   const fetchDetailWindowed = async (
     fetchId: number,
-    currentDetail: DbConversationDetail | null
+    _currentDetail: DbConversationDetail | null
   ): Promise<DbConversationDetail> => {
-    if (!isWindowedDetail(currentDetail)) {
-      return getFolderConversation(fetchId, { tailTurns: TAIL_TURNS_DEFAULT })
-    }
-    const offset = currentDetail.turns_offset
-    const detail = await getFolderConversation(fetchId, { fromIndex: offset })
-    if (!isWindowedDetail(detail)) return detail
-    const consistent =
-      detail.turns_offset === offset &&
-      detail.prefix_hash === currentDetail.prefix_hash &&
-      detail.turns_total >= offset
-    if (consistent) return detail
-    return getFolderConversation(fetchId, { tailTurns: TAIL_TURNS_DEFAULT })
+    void _currentDetail
+    // The legacy index window requires the backend to parse the complete
+    // transcript before slicing. Always converge old loaded state onto the
+    // byte-cursor endpoint instead; this is the difference between a tail seek
+    // and a 2 GB scan when a pre-cursor client session remains mounted.
+    return getFolderConversation(fetchId, {
+      userTurnLimit: HISTORY_PAGE_USER_TURNS,
+    })
   }
 
   const fetchDetail = (conversationId: number): void => {
@@ -3856,16 +3823,9 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
         // never the history the baseline counted — so no per-fetch transfer
         // of the whole transcript just to patch usage metadata. An old
         // server ignores the selector and returns the legacy full parse.
-        const boundaryIndex = session.batchBoundaryIndex
-        const metadataRequest = session.detail?.history_page
-          ? getFolderConversation(dbConversationId, {
-              userTurnLimit: HISTORY_PAGE_USER_TURNS,
-            })
-          : boundaryIndex != null
-            ? getFolderConversation(dbConversationId, {
-                fromIndex: boundaryIndex,
-              })
-            : getFolderConversation(dbConversationId, undefined)
+        const metadataRequest = getFolderConversation(dbConversationId, {
+          userTurnLimit: HISTORY_PAGE_USER_TURNS,
+        })
         metadataRequest
           .then((parsed) => {
             if (cancelled) return
@@ -3883,43 +3843,20 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
             const parsedAssistantTurns = parsed.turns.filter(
               (t) => t.role === "assistant"
             )
-            // Persisted history precedes this batch in the parse; the count
-            // of leading parsed assistant turns that are history tells the
-            // alignment where the batch starts so it never folds a historical
-            // turn's stats into the first reply.
-            //
-            // WINDOWED response: the fingerprint gate decides. The window was
-            // requested at the batch boundary, so on a verified prefix the
-            // count is simply 0 (the whole window is this session's — the
-            // same semantics as the adopt path). A mismatch — boundary hash
-            // absent (captured under a legacy detail), offset not honored,
-            // or the prefix rewritten by compaction between capture and sync
-            // — means count-based alignment could pin WRONG metadata onto
-            // local turns, and first-write-wins would make that permanent.
-            // Metadata absence is recoverable; a mis-patch is not. So skip
-            // the turn patches entirely (session stats are still safe: they
-            // describe the full transcript regardless of the window).
-            //
-            // LEGACY response (old server): today's math, verbatim — the
-            // global baseline over the full parse.
-            const responseWindowed = isWindowedDetail(parsed)
-            const boundaryHash = cur.batchBoundaryPrefixHash
-            const windowVerified =
-              responseWindowed &&
-              boundaryHash != null &&
-              parsed.turns_offset === boundaryIndex &&
-              parsed.prefix_hash === boundaryHash
-            const persistedAssistantCount = responseWindowed
-              ? 0
-              : (cur.historyAssistantBaseline ?? 0)
-            const patches =
-              responseWindowed && !windowVerified
-                ? []
-                : computeTurnMetadataPatches({
-                    localAssistantIndices,
-                    parsedAssistantTurns,
-                    persistedAssistantCount,
-                  })
+            // Cursor pages contain the newest bounded tail. Align the local
+            // batch against the tail's final assistant turns; older assistants
+            // in this page are the persisted prefix. This preserves metadata
+            // patching without falling back to the legacy full-file
+            // `fromIndex` parse.
+            const persistedAssistantCount = Math.max(
+              0,
+              parsedAssistantTurns.length - localAssistantIndices.length
+            )
+            const patches = computeTurnMetadataPatches({
+              localAssistantIndices,
+              parsedAssistantTurns,
+              persistedAssistantCount,
+            })
 
             if (patches.length > 0 || parsed.session_stats) {
               dispatch({
