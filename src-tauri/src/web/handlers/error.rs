@@ -23,6 +23,7 @@ fn status_for_app_error_code(code: AppErrorCode) -> StatusCode {
         | AppErrorCode::AuthenticationFailed => StatusCode::UNPROCESSABLE_ENTITY,
         AppErrorCode::NetworkError
         | AppErrorCode::DatabaseError
+        | AppErrorCode::BranchMergeFailed
         | AppErrorCode::IoError
         | AppErrorCode::ExternalCommandFailed
         | AppErrorCode::WindowOperationFailed
@@ -46,6 +47,14 @@ mod tests {
         assert_eq!(
             status_for_app_error_code(AppErrorCode::AuthenticationFailed),
             StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+
+    #[test]
+    fn branch_merge_transaction_failure_has_stable_server_error_status() {
+        assert_eq!(
+            status_for_app_error_code(AppErrorCode::BranchMergeFailed),
+            StatusCode::INTERNAL_SERVER_ERROR
         );
     }
 }

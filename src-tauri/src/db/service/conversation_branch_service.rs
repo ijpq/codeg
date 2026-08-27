@@ -5,7 +5,8 @@ use sea_orm::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::sync::LazyLock;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use crate::db::entities::{
     conversation, conversation_branch, conversation_branch_merge, conversation_deliverable,
@@ -14,6 +15,8 @@ use crate::db::entities::{
 use crate::db::error::DbError;
 #[cfg(test)]
 use crate::db::service::conversation_service;
+use crate::db::service::deliverable_path::deliverable_path_identity;
+use crate::db::service::deliverable_service;
 use crate::models::conversation::DbConversationSummary;
 use crate::models::message::{ContentBlock, ImageData, MessageTurn, TurnRole};
 
@@ -1140,6 +1143,84 @@ pub async fn record_inferred_branch_boundary(
     Ok(active.update(conn).await?.into())
 }
 
+fn merge_source_priority(source: &str) -> u8 {
+    match source {
+        deliverable_service::SOURCE_DECLARED => 3,
+        "branch_merge" => 2,
+        deliverable_service::SOURCE_INFERRED => 1,
+        _ => 0,
+    }
+}
+
+fn branch_deliverable_is_mergeable(item: &conversation_deliverable::Model) -> bool {
+    if !item.is_valid || item.is_hidden || item.change_kind == "deleted" {
+        return false;
+    }
+    item.source != deliverable_service::SOURCE_INFERRED
+        || (item.category == "standalone_output"
+            && deliverable_service::inference_path_allowed(&item.path))
+}
+
+fn select_merge_deliverables(
+    rows: Vec<conversation_deliverable::Model>,
+) -> Vec<conversation_deliverable::Model> {
+    let mut selected: HashMap<String, conversation_deliverable::Model> = HashMap::new();
+    for row in rows.into_iter().filter(branch_deliverable_is_mergeable) {
+        let identity = deliverable_path_identity(&row.root_path, &row.path).identity;
+        let should_replace = selected.get(&identity).is_none_or(|current| {
+            merge_source_priority(&row.source)
+                .cmp(&merge_source_priority(&current.source))
+                .then_with(|| row.updated_at.cmp(&current.updated_at))
+                .then_with(|| row.created_at.cmp(&current.created_at))
+                .is_gt()
+        });
+        if should_replace {
+            selected.insert(identity, row);
+        }
+    }
+    let mut selected = selected.into_values().collect::<Vec<_>>();
+    selected.sort_by(|left, right| {
+        left.position
+            .cmp(&right.position)
+            .then_with(|| left.created_at.cmp(&right.created_at))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    selected
+}
+
+fn set_merge_transaction_stage(stage: &Arc<Mutex<&'static str>>, next: &'static str) {
+    if let Ok(mut current) = stage.lock() {
+        *current = next;
+    }
+}
+
+fn sqlite_failure_kind(error: &sea_orm::DbErr) -> &'static str {
+    let text = error.to_string().to_ascii_lowercase();
+    if text.contains("unique constraint") {
+        "unique_constraint"
+    } else if text.contains("foreign key constraint") {
+        "foreign_key_constraint"
+    } else if text.contains("database is locked") || text.contains("database is busy") {
+        "database_busy"
+    } else {
+        "database_error"
+    }
+}
+
+fn sqlite_constraint_name(error: &sea_orm::DbErr) -> &'static str {
+    let text = error.to_string();
+    if text.contains("conversation_deliverable.conversation_id")
+        && text.contains("conversation_deliverable.root_path")
+        && text.contains("conversation_deliverable.path")
+    {
+        "idx_conversation_deliverable_conversation_path"
+    } else if text.contains("conversation_branch_merge.id") {
+        "conversation_branch_merge_primary_key"
+    } else {
+        "unknown"
+    }
+}
+
 pub async fn merge_branch(
     conn: &DatabaseConnection,
     branch_conversation_id: i32,
@@ -1214,12 +1295,13 @@ pub async fn merge_branch(
         deliverable_query = deliverable_query
             .filter(conversation_deliverable::Column::Id.is_in(deliverable_ids.clone()));
     }
-    let selected = deliverable_query
-        .order_by_asc(conversation_deliverable::Column::CreatedAt)
-        .all(conn)
-        .await?;
+    let selected = select_merge_deliverables(
+        deliverable_query
+            .order_by_desc(conversation_deliverable::Column::UpdatedAt)
+            .all(conn)
+            .await?,
+    );
     let copied_count = selected.len();
-    let copied_source_ids: Vec<String> = selected.iter().map(|d| d.id.clone()).collect();
     let now = Utc::now();
     let target_id = relation.source_conversation_id;
     let run_id = format!("branch-merge-{request_id}");
@@ -1230,23 +1312,12 @@ pub async fn merge_branch(
         .unwrap_or_default();
     let summary_for_tx = summary.trim().to_string();
     let request_for_tx = request_id.clone();
+    let transaction_stage = Arc::new(Mutex::new("begin"));
+    let transaction_stage_for_tx = transaction_stage.clone();
     let transaction_result = conn
         .transaction::<_, (), sea_orm::DbErr>(|txn| {
             Box::pin(async move {
-                conversation_branch_merge::ActiveModel {
-                    id: Set(request_for_tx.clone()),
-                    branch_conversation_id: Set(branch_conversation_id),
-                    source_conversation_id: Set(target_id),
-                    target_conversation_id: Set(target_id),
-                    summary: Set(summary_for_tx),
-                    deliverable_ids_json: Set(
-                        serde_json::to_string(&copied_source_ids).unwrap_or_else(|_| "[]".into())
-                    ),
-                    created_at: Set(now),
-                    context_consumed_at: Set(None),
-                }
-                .insert(txn)
-                .await?;
+                set_merge_transaction_stage(&transaction_stage_for_tx, "insert_turn_run");
                 conversation_turn_run::ActiveModel {
                     id: Set(run_id.clone()),
                     conversation_id: Set(target_id),
@@ -1280,44 +1351,119 @@ pub async fn merge_branch(
                 }
                 .insert(txn)
                 .await?;
-                for (position, source) in selected.into_iter().enumerate() {
-                    let copied_id = uuid::Uuid::new_v4().to_string();
-                    conversation_deliverable::ActiveModel {
-                        id: Set(copied_id.clone()),
-                        conversation_id: Set(target_id),
-                        turn_run_id: Set(Some(run_id.clone())),
-                        root_path: Set(source.root_path),
-                        path: Set(source.path),
-                        kind: Set(source.kind),
-                        title: Set(source.title.clone()),
-                        description: Set(source.description),
-                        role: Set(source.role.clone()),
-                        category: Set(source.category.clone()),
-                        change_kind: Set(source.change_kind.clone()),
-                        position: Set(position as i32),
-                        source: Set("branch_merge".into()),
-                        file_name: Set(source.file_name),
-                        extension: Set(source.extension),
-                        size_bytes: Set(source.size_bytes),
-                        modified_at: Set(source.modified_at),
-                        is_valid: Set(source.is_valid),
-                        invalid_reason: Set(source.invalid_reason),
-                        is_hidden: Set(false),
-                        verified_at: Set(source.verified_at),
-                        last_checked_at: Set(source.last_checked_at),
-                        created_at: Set(now),
-                        updated_at: Set(now),
-                    }
-                    .insert(txn)
+
+                set_merge_transaction_stage(
+                    &transaction_stage_for_tx,
+                    "load_target_deliverables",
+                );
+                let target_rows = conversation_deliverable::Entity::find()
+                    .filter(conversation_deliverable::Column::ConversationId.eq(target_id))
+                    .order_by_desc(conversation_deliverable::Column::UpdatedAt)
+                    .all(txn)
                     .await?;
+                let mut target_by_identity = HashMap::new();
+                let mut legacy_duplicate_count = 0usize;
+                for target in target_rows {
+                    let identity =
+                        deliverable_path_identity(&target.root_path, &target.path).identity;
+                    if target_by_identity.contains_key(&identity) {
+                        legacy_duplicate_count += 1;
+                    } else {
+                        target_by_identity.insert(identity, target);
+                    }
+                }
+                if legacy_duplicate_count > 0 {
+                    tracing::warn!(
+                        branch_conversation_id,
+                        target_conversation_id = target_id,
+                        merge_request_id = %request_for_tx,
+                        legacy_duplicate_count,
+                        stage = "deliverable_identity_lookup",
+                        "[ACP][branch] legacy deliverable path aliases retained; newest identity reused"
+                    );
+                }
+
+                let mut target_deliverable_ids = Vec::with_capacity(selected.len());
+                for (position, source) in selected.into_iter().enumerate() {
+                    set_merge_transaction_stage(
+                        &transaction_stage_for_tx,
+                        "upsert_target_deliverable",
+                    );
+                    let normalized = deliverable_path_identity(&source.root_path, &source.path);
+                    let target = if let Some(existing) =
+                        target_by_identity.get(&normalized.identity).cloned()
+                    {
+                        // `conversation_deliverable` is the durable file
+                        // identity. Updating it records the newest aggregate
+                        // metadata; the association inserted below preserves a
+                        // separate, auditable version for this merge turn.
+                        let mut active = existing.into_active_model();
+                        active.turn_run_id = Set(Some(run_id.clone()));
+                        active.kind = Set(source.kind.clone());
+                        active.title = Set(source.title.clone());
+                        active.description = Set(source.description.clone());
+                        active.role = Set(source.role.clone());
+                        active.category = Set(source.category.clone());
+                        active.change_kind = Set(source.change_kind.clone());
+                        active.position = Set(position as i32);
+                        active.source = Set("branch_merge".into());
+                        active.file_name = Set(source.file_name.clone());
+                        active.extension = Set(source.extension.clone());
+                        active.size_bytes = Set(source.size_bytes);
+                        active.modified_at = Set(source.modified_at);
+                        active.is_valid = Set(true);
+                        active.invalid_reason = Set(None);
+                        active.is_hidden = Set(false);
+                        active.verified_at = Set(source.verified_at);
+                        active.last_checked_at = Set(source.last_checked_at);
+                        active.updated_at = Set(now);
+                        active.update(txn).await?
+                    } else {
+                        conversation_deliverable::ActiveModel {
+                            id: Set(uuid::Uuid::new_v4().to_string()),
+                            conversation_id: Set(target_id),
+                            turn_run_id: Set(Some(run_id.clone())),
+                            root_path: Set(normalized.storage_root),
+                            path: Set(normalized.storage_path),
+                            kind: Set(source.kind.clone()),
+                            title: Set(source.title.clone()),
+                            description: Set(source.description.clone()),
+                            role: Set(source.role.clone()),
+                            category: Set(source.category.clone()),
+                            change_kind: Set(source.change_kind.clone()),
+                            position: Set(position as i32),
+                            source: Set("branch_merge".into()),
+                            file_name: Set(source.file_name.clone()),
+                            extension: Set(source.extension.clone()),
+                            size_bytes: Set(source.size_bytes),
+                            modified_at: Set(source.modified_at),
+                            is_valid: Set(true),
+                            invalid_reason: Set(None),
+                            is_hidden: Set(false),
+                            verified_at: Set(source.verified_at),
+                            last_checked_at: Set(source.last_checked_at),
+                            created_at: Set(now),
+                            updated_at: Set(now),
+                        }
+                        .insert(txn)
+                        .await?
+                    };
+                    let target_id_for_file = target.id.clone();
+                    target_by_identity.insert(normalized.identity, target);
+                    target_deliverable_ids.push(target_id_for_file.clone());
+
+                    set_merge_transaction_stage(
+                        &transaction_stage_for_tx,
+                        "insert_turn_deliverable",
+                    );
                     conversation_turn_deliverable::ActiveModel {
                         id: Set(uuid::Uuid::new_v4().to_string()),
                         conversation_id: Set(target_id),
                         turn_run_id: Set(run_id.clone()),
-                        deliverable_id: Set(copied_id),
+                        deliverable_id: Set(target_id_for_file),
                         source: Set("branch_merge".into()),
                         title: Set(source.title),
-                        description: Set(None),
+                        description: Set(source.description),
                         role: Set(source.role),
                         category: Set(source.category),
                         change_kind: Set(source.change_kind),
@@ -1328,6 +1474,28 @@ pub async fn merge_branch(
                     .insert(txn)
                     .await?;
                 }
+
+                // New rows store target-conversation deliverable identities.
+                // Older audit rows may contain branch ids; readers continue to
+                // tolerate that historical representation.
+                set_merge_transaction_stage(&transaction_stage_for_tx, "insert_merge_audit");
+                conversation_branch_merge::ActiveModel {
+                    id: Set(request_for_tx.clone()),
+                    branch_conversation_id: Set(branch_conversation_id),
+                    source_conversation_id: Set(target_id),
+                    target_conversation_id: Set(target_id),
+                    summary: Set(summary_for_tx),
+                    deliverable_ids_json: Set(
+                        serde_json::to_string(&target_deliverable_ids)
+                            .unwrap_or_else(|_| "[]".into()),
+                    ),
+                    created_at: Set(now),
+                    context_consumed_at: Set(None),
+                }
+                .insert(txn)
+                .await?;
+
+                set_merge_transaction_stage(&transaction_stage_for_tx, "update_branch_state");
                 let mut active = relation.into_active_model();
                 active.last_merged_at = Set(Some(now));
                 active.last_merge_key = Set(Some(request_for_tx));
@@ -1337,6 +1505,10 @@ pub async fn merge_branch(
                 active.lifecycle_updated_at = Set(Some(now));
                 active.update(txn).await?;
 
+                set_merge_transaction_stage(
+                    &transaction_stage_for_tx,
+                    "update_branch_conversation",
+                );
                 if let Some(branch_conversation) =
                     conversation::Entity::find_by_id(branch_conversation_id)
                         .one(txn)
@@ -1348,6 +1520,10 @@ pub async fn merge_branch(
                     branch_active.updated_at = Set(now);
                     branch_active.update(txn).await?;
                 }
+                set_merge_transaction_stage(
+                    &transaction_stage_for_tx,
+                    "update_target_conversation",
+                );
                 if let Some(target) = conversation::Entity::find_by_id(target_id).one(txn).await? {
                     let next_count = target.message_count.saturating_add(2);
                     let mut target_active = target.into_active_model();
@@ -1377,11 +1553,26 @@ pub async fn merge_branch(
                 deduplicated: true,
             });
         }
-        return Err(match error {
-            TransactionError::Connection(error) | TransactionError::Transaction(error) => {
-                DbError::Database(error)
-            }
-        });
+        let database_error = match error {
+            TransactionError::Connection(error) | TransactionError::Transaction(error) => error,
+        };
+        let failure_stage = transaction_stage
+            .lock()
+            .map(|stage| *stage)
+            .unwrap_or("unknown");
+        tracing::error!(
+            branch_conversation_id,
+            target_conversation_id = target_id,
+            merge_request_id = %request_id,
+            failure_stage,
+            sqlite_error_kind = sqlite_failure_kind(&database_error),
+            sqlite_constraint_name = sqlite_constraint_name(&database_error),
+            database_error = %database_error,
+            database_error_debug = ?database_error,
+            transaction_committed = false,
+            "[ACP][branch] merge database transaction rolled back"
+        );
+        return Err(DbError::Database(database_error));
     }
 
     Ok(MergeBranchResult {
@@ -1494,7 +1685,88 @@ mod tests {
     use super::*;
     use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
     use crate::models::AgentType;
-    use sea_orm::PaginatorTrait;
+    use sea_orm::{ConnectionTrait, DatabaseBackend, PaginatorTrait, Statement};
+
+    async fn seed_test_deliverable(
+        conn: &DatabaseConnection,
+        id: &str,
+        conversation_id: i32,
+        root_path: &str,
+        path: &str,
+        source: &str,
+        valid: bool,
+        hidden: bool,
+        change_kind: &str,
+        category: &str,
+    ) {
+        let now = Utc::now();
+        conversation_deliverable::ActiveModel {
+            id: Set(id.into()),
+            conversation_id: Set(conversation_id),
+            turn_run_id: Set(None),
+            root_path: Set(root_path.into()),
+            path: Set(path.into()),
+            kind: Set("file".into()),
+            title: Set(format!("title-{id}")),
+            description: Set(Some(format!("description-{id}"))),
+            role: Set("supporting".into()),
+            category: Set(category.into()),
+            change_kind: Set(change_kind.into()),
+            position: Set(0),
+            source: Set(source.into()),
+            file_name: Set(path.rsplit(['/', '\\']).next().unwrap_or(path).into()),
+            extension: Set(path.rsplit_once('.').map(|(_, extension)| extension.into())),
+            size_bytes: Set(Some(42)),
+            modified_at: Set(Some(now)),
+            is_valid: Set(valid),
+            invalid_reason: Set((!valid).then(|| "missing".into())),
+            is_hidden: Set(hidden),
+            verified_at: Set(now),
+            last_checked_at: Set(Some(now)),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(conn)
+        .await
+        .unwrap();
+    }
+
+    async fn seed_native_test_branch(
+        db: &crate::db::AppDatabase,
+        source_id: i32,
+    ) -> conversation::Model {
+        let source = conversation_service::get_by_id(&db.conn, source_id)
+            .await
+            .unwrap();
+        create_branch_row(
+            &db.conn,
+            &source,
+            Some(format!("fork-session-{source_id}")),
+            None,
+            "native",
+            BranchInheritanceRecord {
+                source_session_id: source.external_id.clone(),
+                branch_session_id: Some(format!("fork-session-{source_id}")),
+                inheritance_mode: "native_fork".into(),
+                inherited_message_count: 0,
+                inherited_context_chars: 0,
+                inherited_estimated_tokens: 0,
+                inheritance_compressed: false,
+                inheritance_truncated: false,
+                inheritance_note: None,
+                forked_through_at: None,
+                source_rollout_offset: None,
+                branch_rollout_offset: None,
+                fork_boundary_kind: None,
+                snapshot_version: 2,
+                snapshot_context: None,
+                snapshot_images: Vec::new(),
+            },
+        )
+        .await
+        .unwrap()
+        .0
+    }
 
     #[test]
     fn dated_branch_titles_use_dot_suffixes_for_same_day_siblings() {
@@ -2217,5 +2489,382 @@ mod tests {
         assert!(conversation_service::get_by_id(&db.conn, source_id)
             .await
             .is_ok());
+    }
+
+    #[tokio::test]
+    async fn merge_reuses_existing_target_deliverable_instead_of_violating_unique_key() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "D:/codeg/merge-conflict").await;
+        let source_id = seed_conversation(&db, folder_id, AgentType::Codex).await;
+        conversation_service::bind_external_id(&db.conn, source_id, "source-session-stable", &[])
+            .await
+            .unwrap();
+        let source = conversation_service::get_by_id(&db.conn, source_id)
+            .await
+            .unwrap();
+        let (branch, _) = create_branch_row(
+            &db.conn,
+            &source,
+            Some("fork-session".into()),
+            None,
+            "native",
+            BranchInheritanceRecord {
+                source_session_id: source.external_id.clone(),
+                branch_session_id: Some("fork-session".into()),
+                inheritance_mode: "native_fork".into(),
+                inherited_message_count: 0,
+                inherited_context_chars: 0,
+                inherited_estimated_tokens: 0,
+                inheritance_compressed: false,
+                inheritance_truncated: false,
+                inheritance_note: None,
+                forked_through_at: None,
+                source_rollout_offset: None,
+                branch_rollout_offset: None,
+                fork_boundary_kind: None,
+                snapshot_version: 2,
+                snapshot_context: None,
+                snapshot_images: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        let now = Utc::now();
+        for (id, conversation_id) in [("source-existing", source_id), ("branch-new", branch.id)] {
+            conversation_deliverable::ActiveModel {
+                id: Set(id.into()),
+                conversation_id: Set(conversation_id),
+                turn_run_id: Set(None),
+                root_path: Set("D:/codeg/merge-conflict".into()),
+                path: Set("STATUS.md".into()),
+                kind: Set("file".into()),
+                title: Set("STATUS.md".into()),
+                description: Set(None),
+                role: Set("supporting".into()),
+                category: Set("document".into()),
+                change_kind: Set("modified".into()),
+                position: Set(0),
+                source: Set("declared".into()),
+                file_name: Set("STATUS.md".into()),
+                extension: Set(Some("md".into())),
+                size_bytes: Set(Some(42)),
+                modified_at: Set(Some(now)),
+                is_valid: Set(true),
+                invalid_reason: Set(None),
+                is_hidden: Set(false),
+                verified_at: Set(now),
+                last_checked_at: Set(Some(now)),
+                created_at: Set(now),
+                updated_at: Set(now),
+            }
+            .insert(&db.conn)
+            .await
+            .unwrap();
+        }
+
+        let merged = merge_branch(
+            &db.conn,
+            branch.id,
+            "merge-constraint".into(),
+            "Branch conclusion".into(),
+            Vec::new(),
+        )
+        .await
+        .expect("the existing durable file identity should be reused");
+        assert_eq!(merged.copied_deliverable_count, 1);
+        let target_rows = conversation_deliverable::Entity::find()
+            .filter(conversation_deliverable::Column::ConversationId.eq(source_id))
+            .all(&db.conn)
+            .await
+            .unwrap();
+        assert_eq!(target_rows.len(), 1);
+        assert_eq!(target_rows[0].id, "source-existing");
+        assert_eq!(target_rows[0].source, "branch_merge");
+        let audit = conversation_branch_merge::Entity::find_by_id("merge-constraint")
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .expect("merge audit");
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(&audit.deliverable_ids_json).unwrap(),
+            vec!["source-existing"]
+        );
+        let association = conversation_turn_deliverable::Entity::find()
+            .filter(
+                conversation_turn_deliverable::Column::TurnRunId
+                    .eq("branch-merge-merge-constraint"),
+            )
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .expect("merge version association");
+        assert_eq!(association.deliverable_id, "source-existing");
+        assert_eq!(
+            conversation_service::get_by_id(&db.conn, source_id)
+                .await
+                .unwrap()
+                .external_id
+                .as_deref(),
+            Some("source-session-stable")
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_reuses_windows_path_aliases_and_keeps_one_durable_identity() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "D:/codeg/merge-alias").await;
+        let source_id = seed_conversation(&db, folder_id, AgentType::Codex).await;
+        let branch = seed_native_test_branch(&db, source_id).await;
+        seed_test_deliverable(
+            &db.conn,
+            "legacy-target",
+            source_id,
+            "D:\\codeg\\merge-alias",
+            "Exports\\Final.CSV",
+            "declared",
+            true,
+            false,
+            "created",
+            "standalone_output",
+        )
+        .await;
+        seed_test_deliverable(
+            &db.conn,
+            "branch-version",
+            branch.id,
+            "d:/codeg/./merge-alias/",
+            "exports/draft/../final.csv",
+            "declared",
+            true,
+            false,
+            "modified",
+            "standalone_output",
+        )
+        .await;
+
+        let result = merge_branch(
+            &db.conn,
+            branch.id,
+            "merge-windows-alias".into(),
+            "Updated report".into(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.copied_deliverable_count, 1);
+        let target_rows = conversation_deliverable::Entity::find()
+            .filter(conversation_deliverable::Column::ConversationId.eq(source_id))
+            .all(&db.conn)
+            .await
+            .unwrap();
+        assert_eq!(target_rows.len(), 1);
+        assert_eq!(target_rows[0].id, "legacy-target");
+        assert_eq!(target_rows[0].title, "title-branch-version");
+        assert_eq!(target_rows[0].change_kind, "modified");
+    }
+
+    #[tokio::test]
+    async fn merge_filters_invalid_hidden_deleted_and_transient_inferred_outputs() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "D:/codeg/merge-filter").await;
+        let source_id = seed_conversation(&db, folder_id, AgentType::Codex).await;
+        let branch = seed_native_test_branch(&db, source_id).await;
+        for (id, path, source, valid, hidden, change_kind, category) in [
+            (
+                "declared-final",
+                "deliverables/final.txt",
+                "declared",
+                true,
+                false,
+                "created",
+                "standalone_output",
+            ),
+            (
+                "invalid",
+                "deliverables/missing.txt",
+                "declared",
+                false,
+                false,
+                "created",
+                "standalone_output",
+            ),
+            (
+                "hidden",
+                "deliverables/hidden.txt",
+                "declared",
+                true,
+                true,
+                "created",
+                "standalone_output",
+            ),
+            (
+                "deleted",
+                "deliverables/old.txt",
+                "declared",
+                true,
+                false,
+                "deleted",
+                "standalone_output",
+            ),
+            (
+                "qa-preview",
+                "_qa/page-01.png",
+                "inferred",
+                true,
+                false,
+                "created",
+                "standalone_output",
+            ),
+            (
+                "inferred-duplicate",
+                "deliverables\\final.txt",
+                "inferred",
+                true,
+                false,
+                "created",
+                "standalone_output",
+            ),
+        ] {
+            seed_test_deliverable(
+                &db.conn,
+                id,
+                branch.id,
+                "D:/codeg/merge-filter",
+                path,
+                source,
+                valid,
+                hidden,
+                change_kind,
+                category,
+            )
+            .await;
+        }
+
+        let result = merge_branch(
+            &db.conn,
+            branch.id,
+            "merge-filtered".into(),
+            "Only current user output".into(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.copied_deliverable_count, 1);
+        let targets = conversation_deliverable::Entity::find()
+            .filter(conversation_deliverable::Column::ConversationId.eq(source_id))
+            .all(&db.conn)
+            .await
+            .unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].path, "deliverables/final.txt");
+        assert_eq!(targets[0].title, "title-declared-final");
+    }
+
+    #[tokio::test]
+    async fn merge_database_failure_rolls_back_every_write_and_preserves_branch() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "D:/codeg/merge-rollback").await;
+        let source_id = seed_conversation(&db, folder_id, AgentType::Codex).await;
+        let source_before = conversation_service::get_by_id(&db.conn, source_id)
+            .await
+            .unwrap();
+        let branch = seed_native_test_branch(&db, source_id).await;
+        seed_test_deliverable(
+            &db.conn,
+            "branch-output",
+            branch.id,
+            "D:/codeg/merge-rollback",
+            "result.txt",
+            "declared",
+            true,
+            false,
+            "created",
+            "standalone_output",
+        )
+        .await;
+        db.conn
+            .execute(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                "CREATE TRIGGER inject_merge_failure BEFORE INSERT ON conversation_branch_merge BEGIN SELECT RAISE(ABORT, 'injected merge failure'); END".to_string(),
+            ))
+            .await
+            .unwrap();
+
+        let error = merge_branch(
+            &db.conn,
+            branch.id,
+            "merge-rollback".into(),
+            "Must roll back".into(),
+            Vec::new(),
+        )
+        .await
+        .expect_err("injected SQLite failure");
+        assert!(error.to_string().contains("injected merge failure"));
+        assert!(
+            conversation_branch_merge::Entity::find_by_id("merge-rollback")
+                .one(&db.conn)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            conversation_turn_run::Entity::find_by_id("branch-merge-merge-rollback")
+                .one(&db.conn)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(conversation_deliverable::Entity::find()
+            .filter(conversation_deliverable::Column::ConversationId.eq(source_id))
+            .all(&db.conn)
+            .await
+            .unwrap()
+            .is_empty());
+        let relation = get_info(&db.conn, branch.id).await.unwrap().unwrap();
+        assert_ne!(relation.lifecycle_state, "merged");
+        assert_eq!(
+            conversation_service::get_by_id(&db.conn, source_id)
+                .await
+                .unwrap()
+                .message_count,
+            source_before.message_count
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_merge_requests_commit_exactly_one_audit_event() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "D:/codeg/merge-concurrent").await;
+        let source_id = seed_conversation(&db, folder_id, AgentType::Codex).await;
+        let branch = seed_native_test_branch(&db, source_id).await;
+
+        let (first, second) = tokio::join!(
+            merge_branch(
+                &db.conn,
+                branch.id,
+                "merge-concurrent-a".into(),
+                "Concurrent result".into(),
+                Vec::new(),
+            ),
+            merge_branch(
+                &db.conn,
+                branch.id,
+                "merge-concurrent-b".into(),
+                "Concurrent duplicate".into(),
+                Vec::new(),
+            )
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert_eq!(first.merge_id, second.merge_id);
+        assert_ne!(first.deduplicated, second.deduplicated);
+        assert_eq!(
+            conversation_branch_merge::Entity::find()
+                .filter(conversation_branch_merge::Column::BranchConversationId.eq(branch.id),)
+                .count(&db.conn)
+                .await
+                .unwrap(),
+            1
+        );
     }
 }

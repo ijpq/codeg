@@ -134,6 +134,40 @@ const B: Props = {
   title: "conv-b",
 }
 
+const READY_BRANCH_INFO: ConversationBranchInfo = {
+  branchConversationId: 2,
+  sourceConversationId: 1,
+  sourceTitle: "conv-a",
+  sourceAvailable: true,
+  forkMessageId: null,
+  forkMode: "native",
+  sourceSessionId: "session-source",
+  branchSessionId: "session-fork",
+  inheritanceMode: "native_fork",
+  inheritedMessageCount: 12,
+  inheritedContextChars: 0,
+  inheritedEstimatedTokens: 0,
+  inheritanceCompressed: false,
+  inheritanceTruncated: false,
+  inheritanceNote: null,
+  forkedThroughAt: "2026-08-22T00:00:00Z",
+  snapshotVersion: 2,
+  snapshotConsumedAt: null,
+  lifecycleState: "ready",
+  lifecycleError: null,
+  lifecycleUpdatedAt: "2026-08-22T00:00:00Z",
+  sessionVerifiedAt: "2026-08-22T00:00:00Z",
+  firstPromptClientMessageId: null,
+  firstPromptQueuedAt: null,
+  firstPromptAcceptedAt: null,
+  initializationRetryCount: 0,
+  lastConnectionId: "connection-branch",
+  snapshotDigest: null,
+  createdAt: "2026-08-22T00:00:00Z",
+  lastMergedAt: null,
+  mergeTargetConversationId: null,
+}
+
 function withIntl(ui: ReactElement) {
   return (
     <NextIntlClientProvider locale="en" messages={enMessages}>
@@ -339,39 +373,7 @@ describe("ConversationDetailHeader dialog target snapshot", () => {
           finishMerge = resolve
         })
     )
-    h.getConversationBranchInfo.mockResolvedValueOnce({
-      branchConversationId: 2,
-      sourceConversationId: 1,
-      sourceTitle: "conv-a",
-      sourceAvailable: true,
-      forkMessageId: null,
-      forkMode: "native",
-      sourceSessionId: "session-source",
-      branchSessionId: "session-fork",
-      inheritanceMode: "native_fork",
-      inheritedMessageCount: 12,
-      inheritedContextChars: 0,
-      inheritedEstimatedTokens: 0,
-      inheritanceCompressed: false,
-      inheritanceTruncated: false,
-      inheritanceNote: null,
-      forkedThroughAt: "2026-08-22T00:00:00Z",
-      snapshotVersion: 2,
-      snapshotConsumedAt: null,
-      lifecycleState: "ready",
-      lifecycleError: null,
-      lifecycleUpdatedAt: "2026-08-22T00:00:00Z",
-      sessionVerifiedAt: "2026-08-22T00:00:00Z",
-      firstPromptClientMessageId: null,
-      firstPromptQueuedAt: null,
-      firstPromptAcceptedAt: null,
-      initializationRetryCount: 0,
-      lastConnectionId: "connection-branch",
-      snapshotDigest: null,
-      createdAt: "2026-08-22T00:00:00Z",
-      lastMergedAt: null,
-      mergeTargetConversationId: null,
-    })
+    h.getConversationBranchInfo.mockResolvedValueOnce(READY_BRANCH_INFO)
     const user = userEvent.setup({ pointerEventsCheck: 0 })
     const { findByRole, queryByRole } = render(
       withIntl(<ConversationDetailHeader {...B} />)
@@ -411,5 +413,27 @@ describe("ConversationDetailHeader dialog target snapshot", () => {
       expect(h.closeTab).toHaveBeenCalledWith("tab-b")
     })
     expect(queryByRole("dialog")).not.toBeInTheDocument()
+  })
+
+  it("renders structured merge errors with a stable code instead of [object Object]", async () => {
+    h.getConversationBranchInfo.mockResolvedValueOnce(READY_BRANCH_INFO)
+    h.mergeConversationBranch.mockRejectedValueOnce({
+      code: "branch_merge_failed",
+      message: "Branch merge could not be committed",
+      detail: "The database transaction was rolled back; retrying is safe.",
+    })
+    const user = userEvent.setup({ pointerEventsCheck: 0 })
+    const { findByRole } = render(withIntl(<ConversationDetailHeader {...B} />))
+
+    await user.click(await findByRole("button", { name: "More actions" }))
+    await user.click(
+      await findByRole("menuitem", { name: "Merge into main conversation" })
+    )
+
+    const status = await findByRole("status")
+    expect(status).toHaveTextContent("branch_merge_failed")
+    expect(status).toHaveTextContent("transaction was rolled back")
+    expect(status).not.toHaveTextContent("[object Object]")
+    expect(h.mergeConversationBranch).toHaveBeenCalledTimes(1)
   })
 })
