@@ -56,6 +56,7 @@ export type AppErrorCode =
   | "network_error"
   | "authentication_failed"
   | "database_error"
+  | "branch_merge_failed"
   | "io_error"
   | "external_command_failed"
   | "window_operation_failed"

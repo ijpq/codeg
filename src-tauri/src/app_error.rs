@@ -82,6 +82,9 @@ pub enum AppErrorCode {
     NetworkError,
     AuthenticationFailed,
     DatabaseError,
+    /// A branch return transaction failed. The database rollback is complete,
+    /// so retrying the same merge request id is safe.
+    BranchMergeFailed,
     IoError,
     ExternalCommandFailed,
     WindowOperationFailed,
@@ -195,6 +198,14 @@ impl AppCommandError {
 
     pub fn database_error(message: impl Into<String>) -> Self {
         Self::new(AppErrorCode::DatabaseError, message)
+    }
+
+    pub fn branch_merge_failed(detail: impl Into<String>) -> Self {
+        Self::new(
+            AppErrorCode::BranchMergeFailed,
+            "Branch merge could not be committed",
+        )
+        .with_detail(detail)
     }
 
     pub fn io_error(message: impl Into<String>) -> Self {

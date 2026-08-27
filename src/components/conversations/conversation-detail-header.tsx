@@ -28,6 +28,7 @@ import {
 } from "@/lib/api"
 import type { ConversationBranchInfo } from "@/lib/api"
 import { formatConversationTitle } from "@/lib/conversation-title"
+import { extractAppCommandError, toErrorMessage } from "@/lib/app-error"
 import { ConversationHeaderFolderPicker } from "@/components/chat/conversation-context-bar"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
 import { useTabActions } from "@/contexts/tab-context"
@@ -164,6 +165,7 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
   const [mergeError, setMergeError] = useState<string | null>(null)
   const createRequestIdRef = useRef<string | null>(null)
   const mergeRequestIdRef = useRef<string | null>(null)
+  const mergeInFlightRef = useRef(false)
 
   const persisted = conversationId != null
   const displayTitle =
@@ -182,6 +184,7 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
     setBranchInfo(null)
     createRequestIdRef.current = null
     mergeRequestIdRef.current = null
+    mergeInFlightRef.current = false
     if (conversationId == null) return
     const load = () => {
       getConversationBranchInfo(conversationId)
@@ -310,7 +313,8 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
   }, [branchInfo, folderId, openTab, persistedConversation])
 
   const handleMerge = useCallback(async () => {
-    if (!branchInfo || branchBusy) return
+    if (!branchInfo || branchBusy || mergeInFlightRef.current) return
+    mergeInFlightRef.current = true
     setBranchBusy(true)
     setMergeStage("started")
     setMergeError(null)
@@ -331,10 +335,13 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
       closeTab(tabId)
     } catch (error) {
       setMergeStage("failed")
-      const message = error instanceof Error ? error.message : String(error)
+      const appError = extractAppCommandError(error)
+      const detail = toErrorMessage(error)
+      const message = appError ? `${appError.code}: ${detail}` : detail
       setMergeError(message)
       toast.error(message)
     } finally {
+      mergeInFlightRef.current = false
       setBranchBusy(false)
     }
   }, [

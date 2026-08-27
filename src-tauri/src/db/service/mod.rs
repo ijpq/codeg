@@ -8,6 +8,7 @@ pub mod chat_channel_service;
 pub mod conversation_branch_service;
 pub mod conversation_service;
 pub mod custom_agent_service;
+pub(crate) mod deliverable_path;
 pub mod deliverable_service;
 pub mod folder_command_service;
 pub mod folder_link_service;

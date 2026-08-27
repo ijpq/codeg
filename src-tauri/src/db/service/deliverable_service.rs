@@ -14,6 +14,7 @@ use crate::db::entities::{
     conversation_turn_file_change, deliverable_declaration, folder,
 };
 use crate::db::error::DbError;
+use crate::db::service::deliverable_path::deliverable_path_identity;
 use crate::models::{
     ConversationDeliverable, ConversationDeliverableHistoryGroup,
     ConversationDeliverableHistoryPage, ConversationTurnDeliverableSet, MessageTurn,
@@ -398,16 +399,31 @@ async fn save_turn_set(
         i32::try_from(previous.len()).unwrap_or(i32::MAX)
     };
 
+    // The legacy unique index compares raw strings, which is not a valid file
+    // identity on Windows (`D:/x` and `d:\\x` are the same place). Build the
+    // lookup once from all existing rows so new declarations reuse a durable
+    // identity even when an old row uses another slash or drive-letter style.
+    // New rows use the canonical forward-slash storage form; existing rows are
+    // not rewritten in place because an old database may already contain two
+    // logical twins whose raw keys differ.
+    let mut known_by_path = HashMap::new();
+    for model in conversation_deliverable::Entity::find()
+        .filter(conversation_deliverable::Column::ConversationId.eq(conversation_id))
+        .order_by_desc(conversation_deliverable::Column::UpdatedAt)
+        .all(&txn)
+        .await?
+    {
+        known_by_path
+            .entry(deliverable_path_identity(&model.root_path, &model.path).identity)
+            .or_insert(model);
+    }
+
     let mut saved_pairs = Vec::with_capacity(items.len());
     let mut retained_ids = HashSet::new();
     for (position, item) in items.into_iter().enumerate() {
         let position = position_offset.saturating_add(i32::try_from(position).unwrap_or(i32::MAX));
-        let existing = conversation_deliverable::Entity::find()
-            .filter(conversation_deliverable::Column::ConversationId.eq(conversation_id))
-            .filter(conversation_deliverable::Column::RootPath.eq(item.root_path.clone()))
-            .filter(conversation_deliverable::Column::Path.eq(item.path.clone()))
-            .one(&txn)
-            .await?;
+        let normalized_path = deliverable_path_identity(&item.root_path, &item.path);
+        let existing = known_by_path.get(&normalized_path.identity).cloned();
 
         let model = if let Some(existing) = existing {
             let mut active = existing.into_active_model();
@@ -436,8 +452,8 @@ async fn save_turn_set(
                 id: Set(uuid::Uuid::new_v4().to_string()),
                 conversation_id: Set(conversation_id),
                 turn_run_id: Set(Some(turn_run_id.to_string())),
-                root_path: Set(item.root_path),
-                path: Set(item.path),
+                root_path: Set(normalized_path.storage_root),
+                path: Set(normalized_path.storage_path),
                 kind: Set(item.kind),
                 title: Set(item.title.clone()),
                 description: Set(item.description.clone()),
@@ -461,6 +477,7 @@ async fn save_turn_set(
             .insert(&txn)
             .await?
         };
+        known_by_path.insert(normalized_path.identity, model.clone());
         retained_ids.insert(model.id.clone());
         let existing_association = if replace_existing {
             None
@@ -722,7 +739,7 @@ fn inference_path_hard_allowed(path: &str) -> bool {
     true
 }
 
-fn inference_path_allowed(path: &str) -> bool {
+pub(crate) fn inference_path_allowed(path: &str) -> bool {
     if !inference_path_hard_allowed(path) {
         return false;
     }
@@ -936,10 +953,9 @@ pub async fn infer_for_turn(
         if !matches!(
             change.source.as_str(),
             "watcher" | "agent_file_change_report"
-        )
-            || (change.attribution != "exclusive"
-                && !explicitly_expected
-                && !ambiguous_standalone_candidate)
+        ) || (change.attribution != "exclusive"
+            && !explicitly_expected
+            && !ambiguous_standalone_candidate)
             || existing_paths.contains(&change.path)
             || (inputs.contains(&change.path)
                 && change.kind == ConversationTurnFileChangeKind::Created)
@@ -1157,25 +1173,7 @@ async fn refreshed_models(
 }
 
 fn normalized_deliverable_path_key(root_path: &str, path: &str) -> String {
-    let normalized_root = root_path
-        .replace('\\', "/")
-        .trim_end_matches('/')
-        .to_string();
-    let normalized_path = path
-        .replace('\\', "/")
-        .split('/')
-        .filter(|component| !component.is_empty() && *component != ".")
-        .collect::<Vec<_>>()
-        .join("/");
-    let (normalized_root, normalized_path) = if cfg!(windows) {
-        (
-            normalized_root.to_lowercase(),
-            normalized_path.to_lowercase(),
-        )
-    } else {
-        (normalized_root, normalized_path)
-    };
-    format!("{normalized_root}::{normalized_path}")
+    deliverable_path_identity(root_path, path).identity
 }
 
 fn is_user_visible_deliverable(item: &ConversationDeliverable) -> bool {

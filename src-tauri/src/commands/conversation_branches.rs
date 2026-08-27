@@ -895,6 +895,15 @@ fn merge_boundary_error(message: impl Into<String>) -> AppCommandError {
     ))
 }
 
+fn map_branch_merge_commit_error(error: crate::db::error::DbError) -> AppCommandError {
+    match error {
+        crate::db::error::DbError::Database(_) => AppCommandError::branch_merge_failed(
+            "The database transaction was rolled back; retrying this merge is safe.",
+        ),
+        other => AppCommandError::from(other),
+    }
+}
+
 async fn load_codex_merge_increment(
     relation: &conversation_branch_service::ConversationBranchInfo,
     branch_session_id: String,
@@ -1321,7 +1330,7 @@ async fn merge_conversation_branch_impl(
         Vec::new(),
     )
     .await
-    .map_err(AppCommandError::from)?;
+    .map_err(map_branch_merge_commit_error)?;
     if let Some(connection_id) = branch_connection_id.as_deref() {
         if let Err(error) = manager.disconnect(connection_id).await {
             tracing::warn!(
@@ -1562,6 +1571,20 @@ mod tests {
     fn native_fork_must_return_a_distinct_session() {
         assert!(ensure_independent_fork_session("source", "branch").is_ok());
         assert!(ensure_independent_fork_session("same", "same").is_err());
+    }
+
+    #[test]
+    fn merge_database_error_is_structured_and_does_not_expose_raw_sqlite_text() {
+        let error = map_branch_merge_commit_error(crate::db::error::DbError::Database(
+            sea_orm::DbErr::Custom("UNIQUE constraint failed: private_table.path".into()),
+        ));
+        assert!(matches!(error.code, AppErrorCode::BranchMergeFailed));
+        assert_eq!(error.message, "Branch merge could not be committed");
+        assert!(!error
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("private_table"));
     }
 
     #[test]
