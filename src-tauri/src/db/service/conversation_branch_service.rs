@@ -1689,18 +1689,30 @@ mod tests {
     use crate::models::AgentType;
     use sea_orm::{ConnectionTrait, DatabaseBackend, PaginatorTrait, Statement};
 
-    async fn seed_test_deliverable(
-        conn: &DatabaseConnection,
-        id: &str,
+    struct TestDeliverable<'a> {
+        id: &'a str,
         conversation_id: i32,
-        root_path: &str,
-        path: &str,
-        source: &str,
+        root_path: &'a str,
+        path: &'a str,
+        source: &'a str,
         valid: bool,
         hidden: bool,
-        change_kind: &str,
-        category: &str,
-    ) {
+        change_kind: &'a str,
+        category: &'a str,
+    }
+
+    async fn seed_test_deliverable(conn: &DatabaseConnection, input: TestDeliverable<'_>) {
+        let TestDeliverable {
+            id,
+            conversation_id,
+            root_path,
+            path,
+            source,
+            valid,
+            hidden,
+            change_kind,
+            category,
+        } = input;
         let now = Utc::now();
         conversation_deliverable::ActiveModel {
             id: Set(id.into()),
@@ -2619,28 +2631,32 @@ mod tests {
         let branch = seed_native_test_branch(&db, source_id).await;
         seed_test_deliverable(
             &db.conn,
-            "legacy-target",
-            source_id,
-            "D:\\codeg\\merge-alias",
-            "Exports\\Final.CSV",
-            "declared",
-            true,
-            false,
-            "created",
-            "standalone_output",
+            TestDeliverable {
+                id: "legacy-target",
+                conversation_id: source_id,
+                root_path: "D:\\codeg\\merge-alias",
+                path: "Exports\\Final.CSV",
+                source: "declared",
+                valid: true,
+                hidden: false,
+                change_kind: "created",
+                category: "standalone_output",
+            },
         )
         .await;
         seed_test_deliverable(
             &db.conn,
-            "branch-version",
-            branch.id,
-            "d:/codeg/./merge-alias/",
-            "exports/draft/../final.csv",
-            "declared",
-            true,
-            false,
-            "modified",
-            "standalone_output",
+            TestDeliverable {
+                id: "branch-version",
+                conversation_id: branch.id,
+                root_path: "d:/codeg/./merge-alias/",
+                path: "exports/draft/../final.csv",
+                source: "declared",
+                valid: true,
+                hidden: false,
+                change_kind: "modified",
+                category: "standalone_output",
+            },
         )
         .await;
 
@@ -2729,15 +2745,17 @@ mod tests {
         ] {
             seed_test_deliverable(
                 &db.conn,
-                id,
-                branch.id,
-                "D:/codeg/merge-filter",
-                path,
-                source,
-                valid,
-                hidden,
-                change_kind,
-                category,
+                TestDeliverable {
+                    id,
+                    conversation_id: branch.id,
+                    root_path: "D:/codeg/merge-filter",
+                    path,
+                    source,
+                    valid,
+                    hidden,
+                    change_kind,
+                    category,
+                },
             )
             .await;
         }
@@ -2773,15 +2791,17 @@ mod tests {
         let branch = seed_native_test_branch(&db, source_id).await;
         seed_test_deliverable(
             &db.conn,
-            "branch-output",
-            branch.id,
-            "D:/codeg/merge-rollback",
-            "result.txt",
-            "declared",
-            true,
-            false,
-            "created",
-            "standalone_output",
+            TestDeliverable {
+                id: "branch-output",
+                conversation_id: branch.id,
+                root_path: "D:/codeg/merge-rollback",
+                path: "result.txt",
+                source: "declared",
+                valid: true,
+                hidden: false,
+                change_kind: "created",
+                category: "standalone_output",
+            },
         )
         .await;
         db.conn
