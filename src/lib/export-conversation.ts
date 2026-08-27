@@ -10,6 +10,8 @@ import { downloadImage } from "@/lib/image-download"
 import { saveTextFile, type SaveFileResult } from "@/lib/save-file"
 import { toPng } from "html-to-image"
 
+export { saveTextFile } from "@/lib/save-file"
+
 /** Outcome of an export operation — see {@link SaveFileResult}. */
 export type ExportResult = SaveFileResult
 
@@ -45,51 +47,6 @@ export interface ExportConversationData {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/**
- * Save a UTF-8 text payload to disk.
- *
- * Desktop (Tauri): pops the system "Save As" dialog and writes via the
- * `save_text_file` Rust command — write failures (e.g. macOS TCC denial
- * after the dialog cached an earlier "Don't Allow") propagate as
- * exceptions, so the caller can show a real error toast instead of a
- * misleading success.
- *
- * Web (browser): falls back to the legacy `<a download>` Blob link;
- * the browser owns the download manager and we have no per-call status
- * channel, so this path is always reported as `"saved"`.
- */
-export async function saveTextFile(opts: {
-  content: string
-  suggestedName: string
-  mimeType: string
-  filterName: string
-  ext: string
-}): Promise<ExportResult> {
-  const { content, suggestedName, mimeType, filterName, ext } = opts
-
-  if (isDesktop()) {
-    const { save } = await import("@tauri-apps/plugin-dialog")
-    const path = await save({
-      defaultPath: suggestedName,
-      filters: [{ name: filterName, extensions: [ext] }],
-    })
-    if (!path) return "cancelled"
-    const { invoke } = await import("@tauri-apps/api/core")
-    await invoke("save_text_file", { path, contents: content })
-    return "saved"
-  }
-
-  const blob = new Blob([content], { type: mimeType })
-  const url = URL.createObjectURL(blob)
-  const link = document.createElement("a")
-  link.href = url
-  link.download = suggestedName
-  document.body.append(link)
-  link.click()
-  link.remove()
-  URL.revokeObjectURL(url)
-  return "saved"
-}
 function makeExportFilename(title: string | null, ext: string): string {
   const date = new Date().toISOString().slice(0, 10)
   const base = (title ?? "conversation")

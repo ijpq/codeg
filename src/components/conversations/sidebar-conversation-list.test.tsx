@@ -20,6 +20,7 @@ import {
   useAppWorkspaceStore,
 } from "@/stores/app-workspace-store"
 import enMessages from "@/i18n/messages/en.json"
+import { RECENT_PAGE_SIZE } from "./sidebar-conversation-grouping"
 
 // ── Probes ────────────────────────────────────────────────────────────────
 // AgentIcon renders once per card body → counts card re-renders. The Folder /
@@ -1134,7 +1135,7 @@ describe("SidebarConversationList — Recent section", () => {
     // `recentLimit` starts at RECENT_PAGE_SIZE and only ever grew, so a list
     // expanded a few pages deep stayed that way for the rest of the session.
     // These cover the way back out.
-    const PAGE = 15
+    const PAGE = RECENT_PAGE_SIZE
     const TOTAL = PAGE + 4
 
     // Recent duplicates every canonical row, so total cards = canonical + recent

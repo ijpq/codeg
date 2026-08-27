@@ -1366,10 +1366,12 @@ pub async fn merge_branch(
                 for target in target_rows {
                     let identity =
                         deliverable_path_identity(&target.root_path, &target.path).identity;
-                    if target_by_identity.contains_key(&identity) {
-                        legacy_duplicate_count += 1;
+                    if let std::collections::hash_map::Entry::Vacant(entry) =
+                        target_by_identity.entry(identity)
+                    {
+                        entry.insert(target);
                     } else {
-                        target_by_identity.insert(identity, target);
+                        legacy_duplicate_count += 1;
                     }
                 }
                 if legacy_duplicate_count > 0 {
