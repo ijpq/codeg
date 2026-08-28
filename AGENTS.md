@@ -56,6 +56,48 @@ cargo insta review
 INSTA_UPDATE=auto cargo test --features test-utils     # 自动写新 .snap
 ```
 
+## Git 分支与 worktree 强制生命周期
+
+本项目允许使用 Git worktree 隔离并行开发，但 worktree 只是可重建的临时检出目录，
+`origin` 上的分支、已合并的默认分支或已发布的远端 tag 才是持久化来源。不得把已结束的
+worktree 及其构建缓存长期留在本机。
+
+### 创建与使用
+
+- 只有确实需要并行开发时才创建 worktree；串行工作继续使用现有工作区。
+- 创建前先执行 `git fetch origin`。继续已有工作时，必须从对应的 `origin/<branch>`
+  重建 worktree；新任务从明确的远端基线创建独立分支。
+- worktree 应集中放在统一的 worktree 根目录（例如 `../codeg-worktrees/` 或项目配置的
+  `worktree_root`），不得在 home 下随意散落新的 `codeg-*` 目录。
+- 一个 worktree 只服务一个分支和一项并行任务，不得让多个代理共享同一检出目录。
+
+### 结束与清理（严格按顺序执行）
+
+1. 检查 worktree 的 tracked、staged、unstaged、untracked 和 ignored/build 产物，确认需要
+   保留的修改均已提交；存在未处理文件时禁止删除目录。
+2. 对仍需继续开发或尚未合并的分支，必须推送同名分支到 `origin` 并建立 upstream；远端
+   tag 不能替代可继续开发的远端分支。
+3. 对已经合并或发布的分支，可以不保留同名远端分支，但必须在 `git fetch origin` 后验证
+   worktree 的 tip 已被 `origin` 默认分支包含，或验证对应 tag 确实存在于 `origin` 且指向
+   正确提交。仅存在本地 tag、过期的 remote-tracking ref 或同名 GitHub Release 都不算验证。
+4. 记录并核对本地 tip 与远端分支/tag 的 commit；push、fetch 或 commit 一致性检查失败时，
+   必须停止清理并报告阻塞，不得假定内容已经备份。
+5. 远端持久化验证通过后，使用 `git worktree remove <path>` 删除 worktree；不得直接用
+   `rm -rf` 绕过 Git 的 worktree 安全检查。若 Git 因工作区不干净而拒绝删除，先处理原因，
+   不得直接 `--force`。
+6. 删除完成后执行 `git worktree prune` 清理失效登记，并确认对应目录以及其中的
+   `target`、`.next`、`out`、`coverage` 等独立构建产物已经消失。
+7. 本地分支 ref 可在远端验证后按需删除；以后需要继续开发时，重新 fetch 远端分支并创建
+   新 worktree，不得依赖保留的历史工作目录。
+
+### 完成判定
+
+- 本地 tip 未被任何有效的 `origin` 分支或远端 tag 包含时，禁止删除其 worktree 或本地
+  分支；临时 `backup/*` 也必须选择推送到远端归档分支或由用户明确授权放弃。
+- 任务交付前必须审计 `git worktree list`。已完成任务的 worktree、失效登记和独立构建缓存
+  仍然存在时，不得报告清理完成。
+- 除当前主工作区和仍在进行的并行任务外，本地不应长期保留其他 Codeg worktree。
+
 ## 发版约定
 
 当用户只说“发版”“release”或“完成 release 发版”时，直接执行
