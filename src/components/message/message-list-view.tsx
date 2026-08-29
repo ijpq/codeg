@@ -215,6 +215,15 @@ export type ThreadRenderItem =
       kind: "typing"
     }
   | {
+      // Durable outputs returned for the loaded transcript window whose
+      // producing user turn could not be mapped onto the adapted frontend
+      // groups. Keep them visible at the conversation tail without guessing
+      // that they belong to a specific assistant reply.
+      key: string
+      kind: "deliverables"
+      deliverables: ConversationDeliverable[]
+    }
+  | {
       // A context-compaction event hoisted OUT of an assistant turn into its own
       // standalone timeline element. In history the compaction lands as its own
       // (assistant-role) turn between the reply that preceded `/compact` and the
@@ -290,9 +299,8 @@ export interface DeliverableAssociationResult {
   byUserId: Map<string, ConversationDeliverable[]>
   /**
    * Durable output sets that could not be correlated to a user turn in the
-   * currently loaded history page. These remain available from the separate
-   * conversation history endpoint and must never be guessed onto the final
-   * assistant reply.
+   * currently loaded history page. They must never be guessed onto a specific
+   * assistant reply, but remain visible in a conversation-tail fallback.
    */
   unassociated: ConversationDeliverable[]
 }
@@ -401,6 +409,21 @@ export function resolveDeliverableAssociations(
       unresolved.flatMap((run) => run.deliverables)
     ),
   }
+}
+
+export function appendUnassociatedDeliverablesTail(
+  items: ThreadRenderItem[],
+  deliverables: ConversationDeliverable[]
+): ThreadRenderItem[] {
+  if (deliverables.length === 0) return items
+  return [
+    ...items,
+    {
+      key: "unassociated-deliverables-tail",
+      kind: "deliverables",
+      deliverables,
+    },
+  ]
 }
 
 // Collect the `delegate_to_agent` tool calls within a turn's adapted parts,
@@ -1239,6 +1262,14 @@ export function MessageListView({
       ),
     [deliverableRuns, threadItems]
   )
+  const renderableThreadItems = useMemo(
+    () =>
+      appendUnassociatedDeliverablesTail(
+        threadItems,
+        deliverableAssociations.unassociated
+      ),
+    [deliverableAssociations.unassociated, threadItems]
+  )
   const renderThreadItem = useCallback(
     (item: ThreadRenderItem) => {
       switch (item.kind) {
@@ -1279,6 +1310,13 @@ export function MessageListView({
         }
         case "typing":
           return <PendingTypingIndicator />
+        case "deliverables":
+          return (
+            <ReplyDeliverables
+              conversationId={conversationId}
+              deliverables={item.deliverables}
+            />
+          )
         case "compaction":
           // Chrome-less centered divider between turns (no avatar / stats footer).
           return (
@@ -1366,7 +1404,7 @@ export function MessageListView({
   // deliverable card mounts. Content/viewport ResizeObservers handle all
   // intermediate geometry changes; this signal covers same-height swaps that
   // do not necessarily produce an observer entry.
-  const bottomLayoutSignal = `${conversationId}:${connStatus ?? "none"}:${threadItems.length}:${deliverableRuns.reduce(
+  const bottomLayoutSignal = `${conversationId}:${connStatus ?? "none"}:${renderableThreadItems.length}:${deliverableRuns.reduce(
     (count, run) => count + run.deliverables.length,
     0
   )}`
@@ -1432,7 +1470,8 @@ export function MessageListView({
   // --- Explicit final-deliverables panel -------------------------------------
   const [deliverablesExpanded, setDeliverablesExpanded] = useState(false)
 
-  const hasRenderableContent = threadItems.length > 0 || Boolean(liveMessage)
+  const hasRenderableContent =
+    renderableThreadItems.length > 0 || Boolean(liveMessage)
 
   if (detailLoading && !hasRenderableContent) {
     return (
@@ -1530,7 +1569,7 @@ export function MessageListView({
             />
           ) : null}
           <VirtualizedMessageThread
-            items={threadItems}
+            items={renderableThreadItems}
             getItemKey={getThreadItemKey}
             renderItem={renderThreadItem}
             emptyState={emptyState}

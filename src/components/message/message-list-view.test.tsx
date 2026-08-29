@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest"
 
 import {
+  appendUnassociatedDeliverablesTail,
   associateDeliverablesWithUserTurns,
   mergeConsecutiveAssistantTurns,
   replyDeliverablesForRun,
@@ -350,6 +351,19 @@ describe("resolveDeliverableAssociations", () => {
 
     expect(result.byUserId.size).toBe(0)
     expect(result.unassociated).toEqual([])
+  })
+
+  it("keeps unmatched durable outputs visible in a conversation-tail card", () => {
+    const items: ThreadRenderItem[] = []
+    const withTail = appendUnassociatedDeliverablesTail(items, [declared])
+
+    expect(withTail).toHaveLength(1)
+    expect(withTail[0]).toMatchObject({
+      key: "unassociated-deliverables-tail",
+      kind: "deliverables",
+      deliverables: [declared],
+    })
+    expect(appendUnassociatedDeliverablesTail(items, [])).toBe(items)
   })
 })
 
