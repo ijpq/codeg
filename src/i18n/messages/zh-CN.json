@@ -3711,8 +3711,6 @@
         "revealed": "已在 Codeg 主机定位文件",
         "selectFile": "选择 {name}",
         "missing": "文件不存在",
-        "updatedAt": "更新于",
-        "producedAt": "产生于",
         "empty": "当前对话还没有确认的产物",
         "noFilterResults": "没有符合筛选条件的产物",
         "hostActionNotice": "“打开文件”“复制文件”和“打开文件夹”作用于运行 Codeg Server 的主机；下载始终发送到当前访问设备。"
