@@ -3642,8 +3642,6 @@
         "revealed": "File revealed on the Codeg host",
         "selectFile": "Select {name}",
         "missing": "File missing",
-        "updatedAt": "Updated",
-        "producedAt": "Produced",
         "empty": "This conversation has no confirmed deliverables yet",
         "noFilterResults": "No deliverables match these filters",
         "hostActionNotice": "Open, copy file, and reveal actions affect the host running Codeg Server; downloads always go to the current device."

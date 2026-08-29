@@ -57,12 +57,18 @@ const HISTORY_PAGE_SIZE = 25
 
 function formatBytes(value?: number | null): string {
   if (value == null) return "—"
-  if (value < 1024) return `${value} B`
-  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`
+  if (value < 1024) return `${value}B`
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)}KB`
   if (value < 1024 * 1024 * 1024) {
-    return `${(value / (1024 * 1024)).toFixed(1)} MB`
+    return `${(value / (1024 * 1024)).toFixed(1)}MB`
   }
-  return `${(value / (1024 * 1024 * 1024)).toFixed(1)} GB`
+  return `${(value / (1024 * 1024 * 1024)).toFixed(1)}GB`
+}
+
+function formatCompactTimestamp(value: string): string {
+  const date = new Date(value)
+  const minute = String(date.getMinutes()).padStart(2, "0")
+  return `${date.getMonth() + 1}.${date.getDate()} ${date.getHours()}:${minute}`
 }
 
 export const ConversationDeliverablesPanel = memo(
@@ -182,11 +188,6 @@ export const ConversationDeliverablesPanel = memo(
       )
       return [...ids]
     }, [groups])
-    const turnLabels = useMemo(() => {
-      const labels = new Map<string, number>()
-      turnIds.forEach((turnRunId, index) => labels.set(turnRunId, index + 1))
-      return labels
-    }, [turnIds])
     const filtered = useMemo(() => {
       const rows = visible.filter((item) => {
         const type = item.extension ?? item.kind
@@ -526,30 +527,25 @@ export const ConversationDeliverablesPanel = memo(
                         </div>
                         <div
                           data-testid={`deliverable-metadata-${item.id}`}
-                          className="flex min-w-0 items-center gap-1 text-[10px] text-muted-foreground"
+                          className="flex min-w-0 items-center gap-1 whitespace-nowrap text-[10px] text-muted-foreground"
                         >
+                          <span className="shrink-0">
+                            {(item.extension ?? item.kind).toUpperCase()}
+                          </span>
+                          <span aria-hidden="true" className="shrink-0">
+                            |
+                          </span>
                           <time
                             dateTime={item.produced_at}
-                            className="shrink-0 font-medium"
+                            className="shrink-0"
                           >
-                            {t("producedAt")}{" "}
-                            {new Date(item.produced_at).toLocaleString()}
+                            {formatCompactTimestamp(item.produced_at)}
                           </time>
                           <span aria-hidden="true" className="shrink-0">
-                            ·
+                            |
                           </span>
-                          <span className="truncate">
-                            {item.title && item.title !== item.file_name
-                              ? `${item.title} · `
-                              : ""}
-                            {formatBytes(item.size_bytes)} · {t("updatedAt")}{" "}
-                            {new Date(item.updated_at).toLocaleString()}
-                            {item.turn_run_id &&
-                            turnLabels.has(item.turn_run_id)
-                              ? ` · ${t("turnNumber", {
-                                  number: turnLabels.get(item.turn_run_id) ?? 1,
-                                })}`
-                              : ""}
+                          <span className="shrink-0">
+                            {formatBytes(item.size_bytes)}
                           </span>
                         </div>
                       </div>
