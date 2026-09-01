@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 const mocks = vi.hoisted(() => ({ call: vi.fn() }))
 
@@ -11,7 +11,10 @@ vi.mock("@/lib/transport", () => ({
   notifyRemoteDesktopUnauthorized: vi.fn(),
 }))
 
-import { getFolderConversation } from "@/lib/api"
+import {
+  getFolderConversation,
+  invalidateFolderConversationCache,
+} from "@/lib/api"
 
 const detail = {
   summary: { id: 26 },
@@ -25,6 +28,11 @@ const detail = {
 describe("conversation detail request single-flight", () => {
   beforeEach(() => {
     mocks.call.mockReset()
+    invalidateFolderConversationCache()
+  })
+
+  afterEach(() => {
+    vi.unstubAllEnvs()
   })
 
   it("reuses concurrent requests for the same conversation and cursor", async () => {
@@ -61,6 +69,93 @@ describe("conversation detail request single-flight", () => {
         userTurnLimit: 6,
       }),
     ])
+    expect(mocks.call).toHaveBeenCalledTimes(2)
+  })
+
+  it("reuses a recently completed first screen from the bounded LRU", async () => {
+    vi.stubEnv("NODE_ENV", "production")
+    mocks.call.mockResolvedValue(detail)
+    await getFolderConversation(226, {
+      beforeCursor: null,
+      userTurnLimit: 25,
+    })
+    await getFolderConversation(226, {
+      beforeCursor: null,
+      userTurnLimit: 25,
+    })
+    expect(mocks.call).toHaveBeenCalledTimes(1)
+  })
+
+  it("cancels shared backend work only after every consumer detaches", async () => {
+    mocks.call.mockImplementation(
+      (_command: string, _args: unknown, options?: { signal?: AbortSignal }) =>
+        new Promise((_resolve, reject) => {
+          options?.signal?.addEventListener(
+            "abort",
+            () => {
+              const error = new Error("cancelled")
+              error.name = "AbortError"
+              reject(error)
+            },
+            { once: true }
+          )
+        })
+    )
+    const firstController = new AbortController()
+    const secondController = new AbortController()
+    const first = getFolderConversation(126, {
+      beforeCursor: null,
+      userTurnLimit: 25,
+      signal: firstController.signal,
+    })
+    const second = getFolderConversation(126, {
+      beforeCursor: null,
+      userTurnLimit: 25,
+      signal: secondController.signal,
+    })
+
+    firstController.abort()
+    await expect(first).rejects.toMatchObject({ name: "AbortError" })
+    const transportSignal = mocks.call.mock.calls[0]![2]?.signal as AbortSignal
+    expect(transportSignal.aborted).toBe(false)
+    secondController.abort()
+    await expect(second).rejects.toMatchObject({ name: "AbortError" })
+    expect(transportSignal.aborted).toBe(true)
+    expect(mocks.call).toHaveBeenCalledTimes(1)
+  })
+
+  it("starts fresh instead of reusing a transport flight already cancelled by its last consumer", async () => {
+    mocks.call
+      .mockImplementationOnce(
+        (
+          _command: string,
+          _args: unknown,
+          options?: { signal?: AbortSignal }
+        ) =>
+          new Promise((_resolve, reject) => {
+            options?.signal?.addEventListener(
+              "abort",
+              () => {
+                const error = new Error("cancelled")
+                error.name = "AbortError"
+                reject(error)
+              },
+              { once: true }
+            )
+          })
+      )
+      .mockResolvedValueOnce(detail)
+
+    const abandoned = new AbortController()
+    const first = getFolderConversation(326, {
+      userTurnLimit: 25,
+      signal: abandoned.signal,
+    })
+    abandoned.abort()
+    const replacement = getFolderConversation(326, { userTurnLimit: 25 })
+
+    await expect(first).rejects.toMatchObject({ name: "AbortError" })
+    await expect(replacement).resolves.toEqual(detail)
     expect(mocks.call).toHaveBeenCalledTimes(2)
   })
 })

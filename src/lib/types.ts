@@ -661,6 +661,45 @@ export interface ConversationBranchHistory {
   inheritance_mode: string
 }
 
+export interface ConversationBranchMergePreview {
+  id: string
+  branch_conversation_id: number
+  created_at: string
+  summary_preview: string
+  summary_bytes: number
+}
+
+export interface ConversationBranchMergePreviewPage {
+  items: ConversationBranchMergePreview[]
+  next_offset?: number | null
+  has_more: boolean
+}
+
+export interface ConversationSourceBranchPreview {
+  branch_conversation_id: number
+  branch_session_id?: string | null
+  fork_mode: string
+  inheritance_mode: string
+  inherited_message_count: number
+  inherited_context_chars: number
+  inherited_estimated_tokens: number
+  lifecycle_state: string
+  created_at: string
+  last_merged_at?: string | null
+  merge_target_conversation_id?: number | null
+}
+
+export interface ConversationSourceBranchPreviewPage {
+  items: ConversationSourceBranchPreview[]
+  next_offset?: number | null
+  has_more: boolean
+}
+
+export interface ConversationOutputWindow {
+  artifact_runs: ConversationTurnArtifactRun[]
+  deliverable_runs: ConversationTurnDeliverableSet[]
+}
+
 /** One page of older history for reverse infinite scroll:
  *  `full[turns_offset .. turns_offset + turns.length)`. */
 export interface ConversationTurnsPage {
@@ -680,6 +719,22 @@ export interface ConversationHistoryPage {
   next_cursor?: string | null
   has_more: boolean
   loaded_turns: number
+  source_version?: string | null
+  read_start_offset?: number | null
+  read_end_offset?: number | null
+  read_bytes?: number | null
+  scan_bytes?: number | null
+  cache_hit?: boolean | null
+  index_hit?: boolean | null
+  index_status?:
+    | "missing"
+    | "building"
+    | "ready"
+    | "stale"
+    | "corrupt"
+    | "limited"
+    | null
+  indexed_through_offset?: number | null
 }
 
 export interface ConversationDeliverable {

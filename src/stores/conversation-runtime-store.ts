@@ -4,12 +4,19 @@ import type {
   LiveMessage,
   ToolCallInfo,
 } from "@/contexts/acp-connections-context"
-import { getFolderConversation, getFolderConversationTurns } from "@/lib/api"
+import {
+  getFolderConversation,
+  getFolderConversationTurns,
+  invalidateFolderConversationCache,
+  listConversationOutputWindow,
+} from "@/lib/api"
 import { registerBackendScopedStoreReset } from "@/stores/backend-scoped-store-reset"
 import type {
   AgentExecutionStats,
   AgentTranscriptEntry,
   ConversationTurnsPage,
+  ConversationTurnArtifactRun,
+  ConversationTurnDeliverableSet,
   DbConversationDetail,
   MessageTurn,
   PlanEntryInfo,
@@ -132,7 +139,7 @@ export interface PendingBackgroundSettlement {
  * `background_activity` handler).
  */
 export const BACKGROUND_OVERLAY_HARD_CAP = 300
-export const HISTORY_PAGE_USER_TURNS = 6
+export const HISTORY_PAGE_USER_TURNS = 25
 
 /**
  * Default tail window for a cold detail load, and the page size for
@@ -332,6 +339,7 @@ type Action =
       conversationId: number
       error: string
     }
+  | { type: "FETCH_DETAIL_CANCEL"; conversationId: number }
   | { type: "FETCH_HISTORY_PAGE_START"; conversationId: number }
   | {
       type: "FETCH_HISTORY_PAGE_SUCCESS"
@@ -342,6 +350,13 @@ type Action =
       type: "FETCH_HISTORY_PAGE_ERROR"
       conversationId: number
       error: string
+    }
+  | { type: "FETCH_HISTORY_PAGE_CANCEL"; conversationId: number }
+  | {
+      type: "REFRESH_VISIBLE_OUTPUTS_SUCCESS"
+      conversationId: number
+      artifactRuns: ConversationTurnArtifactRun[]
+      deliverableRuns: ConversationTurnDeliverableSet[]
     }
   | {
       type: "COMPLETE_TURN"
@@ -1916,6 +1931,12 @@ function reducer(
         detailError: action.error,
       }))
 
+    case "FETCH_DETAIL_CANCEL":
+      return updateSessionInState(state, action.conversationId, (current) => ({
+        ...current,
+        detailLoading: false,
+      }))
+
     // The three LOAD_OLDER/PREPEND cases guard on session existence instead
     // of using the create-if-missing update helper: a page response landing
     // after the tab closed must not resurrect a ghost session.
@@ -2045,6 +2066,24 @@ function reducer(
         ...current,
         historyPageLoading: false,
         historyPageError: action.error,
+      }))
+
+    case "FETCH_HISTORY_PAGE_CANCEL":
+      return updateSessionInState(state, action.conversationId, (current) => ({
+        ...current,
+        historyPageLoading: false,
+      }))
+
+    case "REFRESH_VISIBLE_OUTPUTS_SUCCESS":
+      return updateSessionInState(state, action.conversationId, (current) => ({
+        ...current,
+        detail: current.detail
+          ? {
+              ...current.detail,
+              artifact_runs: action.artifactRuns,
+              deliverable_runs: action.deliverableRuns,
+            }
+          : null,
       }))
 
     case "COMPLETE_TURN": {
@@ -2725,6 +2764,7 @@ export interface RuntimeActions {
     conversationId: number,
     options?: { preserveLive?: boolean }
   ) => void
+  refreshVisibleOutputs: (conversationId: number) => Promise<void>
   loadEarlierHistory: (conversationId: number) => Promise<void>
   loadCompleteHistory: (
     conversationId: number
@@ -2886,6 +2926,11 @@ let timelinePrefixCache = new WeakMap<
 // per conversation); a cleanup sweep isn't needed for the expected cardinality.
 const fetchGeneration = new Map<number, number>()
 const historyPageFlights = new Map<number, Promise<void>>()
+const historyPageControllers = new Map<number, AbortController>()
+const detailFetchControllers = new Map<number, AbortController>()
+const detailRefetchPending = new Map<number, boolean>()
+const outputWindowFlights = new Map<number, Promise<void>>()
+const outputWindowRefreshPending = new Set<number>()
 
 function bumpFetchGeneration(conversationId: number): number {
   const next = (fetchGeneration.get(conversationId) ?? 0) + 1
@@ -2898,6 +2943,18 @@ function isLatestGeneration(
   generation: number
 ): boolean {
   return fetchGeneration.get(conversationId) === generation
+}
+
+function markConversationDetailPhase(
+  conversationId: number,
+  phase: "request-start" | "data-ready"
+): void {
+  if (typeof performance === "undefined" || process.env.NODE_ENV === "test") {
+    return
+  }
+  const name = `codeg-conversation-${conversationId}-${phase}`
+  performance.clearMarks(name)
+  performance.mark(name)
 }
 
 // ─── Cross-client viewer detail sync ─────────────────────────────────────
@@ -3478,13 +3535,62 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     set((state) => reducer(state, action))
   }
 
+  const beginDetailFetch = (
+    conversationId: number,
+    exclusiveOpen: boolean
+  ): AbortController => {
+    if (exclusiveOpen) {
+      for (const [otherConversationId, controller] of detailFetchControllers) {
+        if (otherConversationId === conversationId) continue
+        controller.abort()
+        detailFetchControllers.delete(otherConversationId)
+        detailRefetchPending.delete(otherConversationId)
+        bumpFetchGeneration(otherConversationId)
+        dispatch({
+          type: "FETCH_DETAIL_CANCEL",
+          conversationId: otherConversationId,
+        })
+      }
+      for (const [otherConversationId, controller] of historyPageControllers) {
+        if (otherConversationId === conversationId) continue
+        controller.abort()
+        historyPageControllers.delete(otherConversationId)
+        bumpFetchGeneration(otherConversationId)
+        dispatch({
+          type: "FETCH_HISTORY_PAGE_CANCEL",
+          conversationId: otherConversationId,
+        })
+      }
+    }
+    if (historyPageControllers.get(conversationId)) {
+      historyPageControllers.get(conversationId)?.abort()
+      historyPageControllers.delete(conversationId)
+      dispatch({ type: "FETCH_HISTORY_PAGE_CANCEL", conversationId })
+    }
+    detailFetchControllers.get(conversationId)?.abort()
+    const controller = new AbortController()
+    detailFetchControllers.set(conversationId, controller)
+    return controller
+  }
+
+  const finishDetailFetch = (
+    conversationId: number,
+    controller: AbortController
+  ) => {
+    if (detailFetchControllers.get(conversationId) === controller) {
+      detailFetchControllers.delete(conversationId)
+    }
+  }
+
   /** Refresh only the newest bounded cursor page. Older pages already shown
    * remain local UI history until the next explicit pagination request; an ACP
    * or deliverable event must not turn a metadata refresh into a full JSONL
    * parse. */
   const fetchDetailWindowed = async (
     fetchId: number,
-    _currentDetail: DbConversationDetail | null
+    _currentDetail: DbConversationDetail | null,
+    generation?: number,
+    signal?: AbortSignal
   ): Promise<DbConversationDetail> => {
     void _currentDetail
     // The legacy index window requires the backend to parse the complete
@@ -3493,6 +3599,9 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     // and a 2 GB scan when a pre-cursor client session remains mounted.
     return getFolderConversation(fetchId, {
       userTurnLimit: HISTORY_PAGE_USER_TURNS,
+      requestGeneration: generation ?? null,
+      signal,
+      cacheMode: "reload",
     })
   }
 
@@ -3510,29 +3619,46 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       return
     }
 
+    const controller = beginDetailFetch(conversationId, true)
     const generation = bumpFetchGeneration(conversationId)
+    markConversationDetailPhase(conversationId, "request-start")
     dispatch({ type: "FETCH_DETAIL_START", conversationId })
     getFolderConversation(conversationId, {
       userTurnLimit: HISTORY_PAGE_USER_TURNS,
+      requestGeneration: generation,
+      signal: controller.signal,
     })
       .then((detail) => {
         if (!isLatestGeneration(conversationId, generation)) return
+        markConversationDetailPhase(conversationId, "data-ready")
         dispatch({ type: "FETCH_DETAIL_SUCCESS", conversationId, detail })
       })
       .catch((error: unknown) => {
         if (!isLatestGeneration(conversationId, generation)) return
+        if (error instanceof Error && error.name === "AbortError") {
+          dispatch({ type: "FETCH_DETAIL_CANCEL", conversationId })
+          return
+        }
         dispatch({
           type: "FETCH_DETAIL_ERROR",
           conversationId,
           error: toErrorMessage(error),
         })
       })
+      .finally(() => finishDetailFetch(conversationId, controller))
   }
 
   const refetchDetail = (
     conversationId: number,
     options?: { preserveLive?: boolean }
   ): void => {
+    if (detailFetchControllers.has(conversationId)) {
+      // State events arriving in a burst do not need parallel transcript
+      // reads. Keep one trailing refresh so an event that landed after the
+      // active request's snapshot is still observed.
+      detailRefetchPending.set(conversationId, options?.preserveLive ?? false)
+      return
+    }
     // The session key is not always a fetchable DB id: a conversation started
     // as a new-chat draft keeps its virtual (negative) key for the tab's whole
     // life. Fetch with the bound DB row id (see `dbConversationId`) and store
@@ -3543,16 +3669,28 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     // never flip to their persisted terminal state.
     const session = get().byConversationId.get(conversationId)
     const fetchId = session?.dbConversationId ?? conversationId
+    const controller = beginDetailFetch(conversationId, false)
     const generation = bumpFetchGeneration(conversationId)
+    markConversationDetailPhase(conversationId, "request-start")
+    invalidateFolderConversationCache(fetchId)
     dispatch({ type: "FETCH_DETAIL_START", conversationId })
     const detailRequest = isWindowedDetail(session?.detail ?? null)
-      ? fetchDetailWindowed(fetchId, session?.detail ?? null)
+      ? fetchDetailWindowed(
+          fetchId,
+          session?.detail ?? null,
+          generation,
+          controller.signal
+        )
       : getFolderConversation(fetchId, {
           userTurnLimit: HISTORY_PAGE_USER_TURNS,
+          requestGeneration: generation,
+          signal: controller.signal,
+          cacheMode: "reload",
         })
     detailRequest
       .then((detail) => {
         if (!isLatestGeneration(conversationId, generation)) return
+        markConversationDetailPhase(conversationId, "data-ready")
         dispatch({
           type: "FETCH_DETAIL_SUCCESS",
           conversationId,
@@ -3562,11 +3700,25 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       })
       .catch((error: unknown) => {
         if (!isLatestGeneration(conversationId, generation)) return
+        if (error instanceof Error && error.name === "AbortError") {
+          dispatch({ type: "FETCH_DETAIL_CANCEL", conversationId })
+          return
+        }
         dispatch({
           type: "FETCH_DETAIL_ERROR",
           conversationId,
           error: toErrorMessage(error),
         })
+      })
+      .finally(() => {
+        finishDetailFetch(conversationId, controller)
+        const pendingPreserveLive = detailRefetchPending.get(conversationId)
+        if (pendingPreserveLive !== undefined) {
+          detailRefetchPending.delete(conversationId)
+          refetchDetail(conversationId, {
+            preserveLive: pendingPreserveLive,
+          })
+        }
       })
   }
 
@@ -3628,12 +3780,20 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       return Promise.resolve()
     }
     const fetchId = session.dbConversationId ?? conversationId
+    detailFetchControllers.get(conversationId)?.abort()
+    detailFetchControllers.delete(conversationId)
+    const controller = new AbortController()
+    historyPageControllers.set(conversationId, controller)
+    const generation = bumpFetchGeneration(conversationId)
     dispatch({ type: "FETCH_HISTORY_PAGE_START", conversationId })
     const flight = getFolderConversation(fetchId, {
       beforeCursor: cursor,
       userTurnLimit: HISTORY_PAGE_USER_TURNS,
+      requestGeneration: generation,
+      signal: controller.signal,
     })
       .then((detail) => {
+        if (!isLatestGeneration(conversationId, generation)) return
         // A reload/refetch may have replaced the page while this request was in
         // flight. Only prepend when its cursor is still the one we consumed.
         const currentCursor =
@@ -3647,10 +3807,15 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
         })
       })
       .catch((error: unknown) => {
+        if (!isLatestGeneration(conversationId, generation)) return
         const currentCursor =
           get().byConversationId.get(conversationId)?.detail?.history_page
             ?.next_cursor ?? null
         if (currentCursor !== cursor) return
+        if (error instanceof Error && error.name === "AbortError") {
+          dispatch({ type: "FETCH_HISTORY_PAGE_CANCEL", conversationId })
+          return
+        }
         dispatch({
           type: "FETCH_HISTORY_PAGE_ERROR",
           conversationId,
@@ -3658,6 +3823,9 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
         })
       })
       .finally(() => {
+        if (historyPageControllers.get(conversationId) === controller) {
+          historyPageControllers.delete(conversationId)
+        }
         if (historyPageFlights.get(conversationId) === flight) {
           historyPageFlights.delete(conversationId)
         }
@@ -3742,9 +3910,11 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       // detail fetcher that both triggers and can re-trigger itself.
       const generation = bumpFetchGeneration(conversationId)
       const detailRequest = isWindowedDetail(cur.detail)
-        ? fetchDetailWindowed(fetchId, cur.detail)
+        ? fetchDetailWindowed(fetchId, cur.detail, generation)
         : getFolderConversation(fetchId, {
             userTurnLimit: HISTORY_PAGE_USER_TURNS,
+            requestGeneration: generation,
+            cacheMode: "reload",
           })
       detailRequest
         .then((detail) => {
@@ -3880,6 +4050,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
 
         getFolderConversation(dbConversationId, {
           userTurnLimit: HISTORY_PAGE_USER_TURNS,
+          cacheMode: "reload",
         })
           .then((detail) => {
             if (cancelled) return
@@ -4006,6 +4177,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
         // server ignores the selector and returns the legacy full parse.
         const metadataRequest = getFolderConversation(dbConversationId, {
           userTurnLimit: HISTORY_PAGE_USER_TURNS,
+          cacheMode: "reload",
         })
         metadataRequest
           .then((parsed) => {
@@ -4081,9 +4253,56 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     }
   }
 
+  const refreshVisibleOutputs = (conversationId: number): Promise<void> => {
+    const existing = outputWindowFlights.get(conversationId)
+    if (existing) {
+      outputWindowRefreshPending.add(conversationId)
+      return existing
+    }
+    const session = get().byConversationId.get(conversationId)
+    const detailAtRequest = session?.detail ?? null
+    if (!session || !detailAtRequest) return Promise.resolve()
+    const fetchId = session.dbConversationId ?? conversationId
+    invalidateFolderConversationCache(fetchId)
+    const flight = listConversationOutputWindow(fetchId, detailAtRequest.turns)
+      .then((window) => {
+        const current = get().byConversationId.get(conversationId)
+        if (!current?.detail) return
+        if (current.detail !== detailAtRequest) {
+          outputWindowRefreshPending.add(conversationId)
+          return
+        }
+        dispatch({
+          type: "REFRESH_VISIBLE_OUTPUTS_SUCCESS",
+          conversationId,
+          artifactRuns: window.artifact_runs,
+          deliverableRuns: window.deliverable_runs,
+        })
+      })
+      .catch((error: unknown) => {
+        if (process.env.NODE_ENV !== "test") {
+          console.warn("[conversation][perf] visible output refresh failed", {
+            conversationId,
+            error: toErrorMessage(error),
+          })
+        }
+      })
+      .finally(() => {
+        if (outputWindowFlights.get(conversationId) === flight) {
+          outputWindowFlights.delete(conversationId)
+        }
+        if (outputWindowRefreshPending.delete(conversationId)) {
+          void refreshVisibleOutputs(conversationId)
+        }
+      })
+    outputWindowFlights.set(conversationId, flight)
+    return flight
+  }
+
   const actions: RuntimeActions = {
     fetchDetail,
     refetchDetail,
+    refreshVisibleOutputs,
     loadOlderTurns,
     loadEarlierHistory,
     loadCompleteHistory,
@@ -4169,6 +4388,13 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       // late-arriving response can't resurrect the session with stale
       // detail. See `fetchGeneration` above.
       bumpFetchGeneration(conversationId)
+      detailFetchControllers.get(conversationId)?.abort()
+      detailFetchControllers.delete(conversationId)
+      detailRefetchPending.delete(conversationId)
+      historyPageControllers.get(conversationId)?.abort()
+      historyPageControllers.delete(conversationId)
+      outputWindowRefreshPending.delete(conversationId)
+      invalidateFolderConversationCache(conversationId)
       // Stop a viewer-sync poll whose tab just closed (its own tick guard would
       // also stop it on the next fire, but cancelling now drops the pending
       // timer immediately).
@@ -4254,6 +4480,14 @@ export function resetConversationRuntimeStore(): void {
   // backend epoch here. See `RemoteConnectionGate`.
   fetchGeneration.clear()
   historyPageFlights.clear()
+  outputWindowFlights.clear()
+  outputWindowRefreshPending.clear()
+  detailRefetchPending.clear()
+  for (const controller of historyPageControllers.values()) controller.abort()
+  historyPageControllers.clear()
+  for (const controller of detailFetchControllers.values()) controller.abort()
+  detailFetchControllers.clear()
+  invalidateFolderConversationCache()
   for (const cancel of viewerDetailSyncCancels.values()) cancel()
   for (const cancel of completedTurnReconcileCancels.values()) cancel()
   viewerDetailSyncCancels.clear()

@@ -30,6 +30,8 @@ import {
 vi.mock("@/lib/api", () => ({
   getFolderConversation: vi.fn(),
   getFolderConversationTurns: vi.fn(),
+  invalidateFolderConversationCache: vi.fn(),
+  listConversationOutputWindow: vi.fn(),
 }))
 
 const { getFolderConversation, getFolderConversationTurns } =
@@ -195,9 +197,10 @@ describe("windowed fetch/refetch", () => {
     mockGet.mockResolvedValue(windowedDetail(4))
     actions().fetchDetail(CID)
     await flush()
-    expect(mockGet).toHaveBeenCalledWith(CID, {
-      userTurnLimit: HISTORY_PAGE_USER_TURNS,
-    })
+    expect(mockGet).toHaveBeenCalledWith(
+      CID,
+      expect.objectContaining({ userTurnLimit: HISTORY_PAGE_USER_TURNS })
+    )
     expect(session()?.detail?.turns_offset).toBe(4)
   })
 
@@ -207,15 +210,40 @@ describe("windowed fetch/refetch", () => {
     actions().refetchDetail(CID)
     await flush()
     expect(mockGet).toHaveBeenCalledTimes(1)
-    expect(mockGet).toHaveBeenCalledWith(CID, {
-      userTurnLimit: HISTORY_PAGE_USER_TURNS,
-    })
+    expect(mockGet).toHaveBeenCalledWith(
+      CID,
+      expect.objectContaining({ userTurnLimit: HISTORY_PAGE_USER_TURNS })
+    )
     expect(session()?.detail?.turns.map((t) => t.id)).toEqual([
       "turn-2",
       "turn-3",
       "turn-4",
       "turn-5",
     ])
+  })
+
+  it("coalesces an event burst into one active refetch and one trailing refresh", async () => {
+    seed({ detail: windowedDetail(2) })
+    let resolveFirst: (detail: DbConversationDetail) => void = () => {}
+    mockGet
+      .mockImplementationOnce(
+        () =>
+          new Promise<DbConversationDetail>((resolve) => {
+            resolveFirst = resolve
+          })
+      )
+      .mockResolvedValueOnce(windowedDetail(4))
+
+    actions().refetchDetail(CID)
+    actions().refetchDetail(CID)
+    actions().refetchDetail(CID)
+    expect(mockGet).toHaveBeenCalledTimes(1)
+
+    resolveFirst(windowedDetail(2))
+    await flush()
+    await flush()
+    expect(mockGet).toHaveBeenCalledTimes(2)
+    expect(session()?.detail?.turns_offset).toBe(4)
   })
 
   it("does not issue a legacy full-window retry when an old prefix fingerprint changed", async () => {
@@ -231,9 +259,10 @@ describe("windowed fetch/refetch", () => {
     actions().refetchDetail(CID)
     await flush()
     expect(mockGet).toHaveBeenCalledTimes(1)
-    expect(mockGet).toHaveBeenCalledWith(CID, {
-      userTurnLimit: HISTORY_PAGE_USER_TURNS,
-    })
+    expect(mockGet).toHaveBeenCalledWith(
+      CID,
+      expect.objectContaining({ userTurnLimit: HISTORY_PAGE_USER_TURNS })
+    )
     expect(session()?.detail?.prefix_hash).toBe("00000000000000ff")
   })
 
@@ -251,9 +280,10 @@ describe("windowed fetch/refetch", () => {
     actions().refetchDetail(CID)
     await flush()
     expect(mockGet).toHaveBeenCalledTimes(1)
-    expect(mockGet).toHaveBeenCalledWith(CID, {
-      userTurnLimit: HISTORY_PAGE_USER_TURNS,
-    })
+    expect(mockGet).toHaveBeenCalledWith(
+      CID,
+      expect.objectContaining({ userTurnLimit: HISTORY_PAGE_USER_TURNS })
+    )
     expect(session()?.detail?.turns).toEqual([])
   })
 
@@ -328,9 +358,10 @@ describe("loadOlderTurns", () => {
     // No merge happened; the standard refetch path was invoked instead.
     expect(session()?.detail?.turns_offset).toBe(4)
     expect(session()?.loadingOlderTurns).toBe(false)
-    expect(mockGet).toHaveBeenCalledWith(CID, {
-      userTurnLimit: HISTORY_PAGE_USER_TURNS,
-    })
+    expect(mockGet).toHaveBeenCalledWith(
+      CID,
+      expect.objectContaining({ userTurnLimit: HISTORY_PAGE_USER_TURNS })
+    )
   })
 
   it("drops a page that lost the fetch-generation race to a newer fetch", async () => {
@@ -458,9 +489,10 @@ describe("syncTurnMetadata windowed gate", () => {
     )
     actions().syncTurnMetadata(CID)
     await vi.advanceTimersByTimeAsync(1600)
-    expect(mockGet).toHaveBeenCalledWith(CID, {
-      userTurnLimit: HISTORY_PAGE_USER_TURNS,
-    })
+    expect(mockGet).toHaveBeenCalledWith(
+      CID,
+      expect.objectContaining({ userTurnLimit: HISTORY_PAGE_USER_TURNS })
+    )
     expect(session()?.localTurns[0]?.usage?.input_tokens).toBe(10)
   })
 
@@ -523,9 +555,10 @@ describe("syncTurnMetadata windowed gate", () => {
     )
     actions().syncTurnMetadata(CID)
     await vi.advanceTimersByTimeAsync(1600)
-    expect(mockGet).toHaveBeenCalledWith(CID, {
-      userTurnLimit: HISTORY_PAGE_USER_TURNS,
-    })
+    expect(mockGet).toHaveBeenCalledWith(
+      CID,
+      expect.objectContaining({ userTurnLimit: HISTORY_PAGE_USER_TURNS })
+    )
     expect(session()?.localTurns[0]?.usage?.input_tokens).toBe(42)
   })
 })

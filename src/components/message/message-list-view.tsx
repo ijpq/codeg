@@ -67,6 +67,7 @@ import type {
   ConversationDeliverable,
   ConversationTurnDeliverableSet,
   ConnectionStatus,
+  MessageTurn,
 } from "@/lib/types"
 import { cn, copyTextToClipboard } from "@/lib/utils"
 import { VirtualizedMessageThread } from "@/components/message/virtualized-message-thread"
@@ -409,6 +410,18 @@ const EMPTY_DELEGATIONS: DelegationCardSource[] = []
 const EMPTY_NAV_ENTRIES: MessageNavEntry[] = []
 const EMPTY_DELIVERABLES: ConversationDeliverable[] = []
 const EMPTY_PROMPT_DELIVERIES: Record<string, PromptDeliveryState> = {}
+
+// A settled turn keeps object identity while unrelated live tokens arrive.
+// Reuse its one-element wrapper so memoized historical rows do not re-render.
+const sourceTurnsSingletonCache = new WeakMap<MessageTurn, MessageTurn[]>()
+export function singletonSourceTurns(turn: MessageTurn): MessageTurn[] {
+  let cached = sourceTurnsSingletonCache.get(turn)
+  if (!cached) {
+    cached = [turn]
+    sourceTurnsSingletonCache.set(turn, cached)
+  }
+  return cached
+}
 
 export function resolveMessageThreadResizeBehavior(
   isActive: boolean,
@@ -1214,6 +1227,52 @@ export function MessageListView({
   const timelineTurns = useConversationRuntimeStore((s) =>
     selectTimelineTurns(s, conversationId)
   )
+  const measuredDetailRef = useRef<object | null>(null)
+  useEffect(() => {
+    const measuredDetail = session?.detail ?? null
+    if (
+      process.env.NODE_ENV === "test" ||
+      !measuredDetail ||
+      detailLoading ||
+      measuredDetailRef.current === measuredDetail
+    ) {
+      return
+    }
+    measuredDetailRef.current = measuredDetail
+    const committedAt = performance.now()
+    const startMarks = performance.getEntriesByName(
+      `codeg-conversation-${conversationId}-request-start`,
+      "mark"
+    )
+    const readyMarks = performance.getEntriesByName(
+      `codeg-conversation-${conversationId}-data-ready`,
+      "mark"
+    )
+    const startedAt =
+      startMarks[startMarks.length - 1]?.startTime ?? committedAt
+    const dataReadyAt =
+      readyMarks[readyMarks.length - 1]?.startTime ?? committedAt
+    let secondFrame = 0
+    const firstFrame = requestAnimationFrame(() => {
+      secondFrame = requestAnimationFrame(() => {
+        const interactiveAt = performance.now()
+        console.debug("[conversation][perf] first screen committed", {
+          conversationId,
+          loadedTurns: measuredDetail.turns.length,
+          timelineTurns: timelineTurns.length,
+          reactCommitMs: Math.round((committedAt - dataReadyAt) * 100) / 100,
+          firstScreenRenderMs:
+            Math.round((interactiveAt - startedAt) * 100) / 100,
+          interactiveAfterDataMs:
+            Math.round((interactiveAt - dataReadyAt) * 100) / 100,
+        })
+      })
+    })
+    return () => {
+      cancelAnimationFrame(firstFrame)
+      if (secondFrame) cancelAnimationFrame(secondFrame)
+    }
+  }, [conversationId, detailLoading, session?.detail, timelineTurns.length])
   const pendingUserStartedAt = useMemo(() => {
     for (let index = timelineTurns.length - 1; index >= 0; index -= 1) {
       const turn = timelineTurns[index].turn

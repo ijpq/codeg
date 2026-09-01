@@ -136,6 +136,7 @@ export type AdaptedProposedPlanPart = {
 
 export type AdaptedContentPart =
   | { type: "text"; text: string }
+  | { type: "deferred-text"; text: string; deferredRef: string }
   | AdaptedToolCallPart
   | {
       type: "tool-result"
@@ -201,12 +202,26 @@ export interface UserImageDisplay {
 const DEFERRED_HISTORY_IMAGE_URI_PREFIX = "codeg-history-content:"
 const DEFERRED_HISTORY_REASONING_RE =
   /\s*<!--codeg-history-reasoning:([A-Za-z0-9_-]+)-->\s*$/
+const DEFERRED_BRANCH_MERGE_SUMMARY_RE =
+  /\s*<!--codeg-branch-merge-summary:([A-Za-z0-9_-]+)-->\s*$/
 
 function parseDeferredHistoryReasoning(text: string): {
   content: string
   deferredRef: string | null
 } {
   const match = DEFERRED_HISTORY_REASONING_RE.exec(text)
+  if (!match) return { content: text, deferredRef: null }
+  return {
+    content: text.slice(0, match.index).trimEnd(),
+    deferredRef: match[1] ?? null,
+  }
+}
+
+function parseDeferredBranchMergeSummary(text: string): {
+  content: string
+  deferredRef: string | null
+} {
+  const match = DEFERRED_BRANCH_MERGE_SUMMARY_RE.exec(text)
   if (!match) return { content: text, deferredRef: null }
   return {
     content: text.slice(0, match.index).trimEnd(),
@@ -1629,6 +1644,7 @@ function mergeGoalObjectiveHints(
 export function isTurnAnswerPart(part: AdaptedContentPart): boolean {
   switch (part.type) {
     case "text":
+    case "deferred-text":
     case "proposed-plan":
     case "generated-image":
       return true
@@ -1851,6 +1867,16 @@ export function adaptMessageTurn(
     const block = turn.blocks[index]
 
     if (turn.role === "assistant" && block.type === "text") {
+      const deferredMerge = parseDeferredBranchMergeSummary(block.text)
+      if (deferredMerge.deferredRef) {
+        adaptedContent.push({
+          type: "deferred-text",
+          text: deferredMerge.content,
+          deferredRef: deferredMerge.deferredRef,
+        })
+        continue
+      }
+
       const goalExpandedParts = expandGoalUpdateText(
         block.text,
         turn.id,

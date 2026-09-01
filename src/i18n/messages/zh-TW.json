@@ -3312,6 +3312,8 @@
         }
       },
       "contentParts": {
+        "loadBranchMergeSummary": "載入完整回歸內容",
+        "loadingBranchMergeSummary": "正在載入回歸內容…",
         "showingTailOutput": "為確保效能，串流輸出時僅顯示尾端內容。",
         "result": "結果",
         "unknown": "未知",

@@ -3312,6 +3312,8 @@
         }
       },
       "contentParts": {
+        "loadBranchMergeSummary": "Load complete merge summary",
+        "loadingBranchMergeSummary": "Loading merge summary…",
         "showingTailOutput": "Showing tail output while streaming for performance.",
         "result": "Result",
         "unknown": "unknown",

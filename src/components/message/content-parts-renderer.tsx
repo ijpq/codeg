@@ -2260,6 +2260,48 @@ const TextPart = memo(function TextPart({
   )
 })
 
+const DeferredTextPart = memo(function DeferredTextPart({
+  part,
+  citationSources,
+}: {
+  part: Extract<AdaptedContentPart, { type: "deferred-text" }>
+  citationSources: readonly CitationSource[]
+}) {
+  const t = useTranslations("Folder.chat.contentParts")
+  const [content, setContent] = useState(part.text)
+  const [loading, setLoading] = useState(false)
+  const [loaded, setLoaded] = useState(false)
+  const load = useCallback(() => {
+    if (loading || loaded) return
+    setLoading(true)
+    void getDeferredHistoryContent(part.deferredRef)
+      .then((result) => {
+        setContent(result.content)
+        setLoaded(true)
+      })
+      .catch(() => undefined)
+      .finally(() => setLoading(false))
+  }, [loaded, loading, part.deferredRef])
+
+  return (
+    <div className="space-y-2">
+      <TextPart text={content} citationSources={citationSources} />
+      {!loaded && (
+        <button
+          type="button"
+          className="text-xs text-muted-foreground underline-offset-4 hover:underline disabled:opacity-50"
+          disabled={loading}
+          onClick={load}
+        >
+          {loading
+            ? t("loadingBranchMergeSummary")
+            : t("loadBranchMergeSummary")}
+        </button>
+      )}
+    </div>
+  )
+})
+
 const ToolCallPart = memo(function ToolCallPart({
   part,
 }: {
@@ -3134,6 +3176,16 @@ export const ContentPartsRenderer = memo(function ContentPartsRenderer({
           key={`text-${keyId}`}
           text={part.text}
           isUser={role === "user"}
+          citationSources={citationSources}
+        />
+      )
+    }
+
+    if (part.type === "deferred-text") {
+      return (
+        <DeferredTextPart
+          key={`deferred-text-${keyId}`}
+          part={part}
           citationSources={citationSources}
         />
       )

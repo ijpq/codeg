@@ -10,7 +10,6 @@ use axum::{
     Json, Router,
 };
 
-use futures_util::StreamExt;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::ServeDir;
@@ -119,6 +118,18 @@ pub fn build_router(
             "/get_deferred_history_content",
             post(handlers::conversations::get_deferred_history_content)
                 .layer(history_response_compression()),
+        )
+        .route(
+            "/list_conversation_branch_merges",
+            post(handlers::conversations::list_conversation_branch_merges),
+        )
+        .route(
+            "/list_conversation_branches",
+            post(handlers::conversations::list_conversation_branches),
+        )
+        .route(
+            "/list_conversation_output_window",
+            post(handlers::conversations::list_conversation_output_window),
         )
         .route(
             "/diagnose_codex_rollout_size",
@@ -1427,10 +1438,7 @@ pub fn build_router(
             "/forge_list_issues",
             post(handlers::forge::forge_list_issues),
         )
-        .route(
-            "/forge_tab_count",
-            post(handlers::forge::forge_tab_count),
-        )
+        .route("/forge_tab_count", post(handlers::forge::forge_tab_count))
         .route(
             "/forge_list_labels",
             post(handlers::forge::forge_list_labels),
@@ -1705,7 +1713,7 @@ pub fn build_router(
                     "[HTTP][perf] request completed"
                 );
                 if path.ends_with("/get_folder_conversation") {
-                    measure_history_response_body(response, path, request_id, started)
+                    measure_history_response_body(response, path, request_id, started).await
                 } else {
                     response
                 }
@@ -1780,7 +1788,7 @@ pub fn build_router(
         .layer(crate::web::compression::compression_layer())
 }
 
-fn measure_history_response_body(
+async fn measure_history_response_body(
     response: Response,
     route: String,
     request_id: uuid::Uuid,
@@ -1792,50 +1800,41 @@ fn measure_history_response_body(
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
     let (parts, body) = response.into_parts();
-    let body_stream = body.into_data_stream();
-    let measured = futures_util::stream::unfold(
-        (body_stream, 0u64),
-        move |(mut body_stream, transmitted_bytes)| {
-            let route = route.clone();
-            let content_encoding = content_encoding.clone();
-            async move {
-                match body_stream.next().await {
-                    Some(Ok(chunk)) => {
-                        let transmitted_bytes = transmitted_bytes + chunk.len() as u64;
-                        Some((
-                            Ok::<_, axum::Error>(chunk),
-                            (body_stream, transmitted_bytes),
-                        ))
-                    }
-                    Some(Err(error)) => {
-                        tracing::warn!(
-                            route = %route,
-                            %request_id,
-                            transmitted_bytes,
-                            content_encoding = ?content_encoding,
-                            total_elapsed_ms = started.elapsed().as_millis() as u64,
-                            error = %error,
-                            "[HTTP][perf] response body interrupted"
-                        );
-                        Some((Err(error), (body_stream, transmitted_bytes)))
-                    }
-                    None => {
-                        tracing::info!(
-                            route = %route,
-                            %request_id,
-                            transmitted_bytes,
-                            compressed_bytes = content_encoding.as_ref().map(|_| transmitted_bytes),
-                            content_encoding = ?content_encoding,
-                            total_elapsed_ms = started.elapsed().as_millis() as u64,
-                            "[HTTP][perf] response body completed"
-                        );
-                        None
-                    }
-                }
-            }
-        },
-    );
-    Response::from_parts(parts, Body::from_stream(measured))
+    let compression_started = std::time::Instant::now();
+    match axum::body::to_bytes(body, 512 * 1024 * 1024).await {
+        Ok(bytes) => {
+            let transmitted_bytes = bytes.len() as u64;
+            tracing::info!(
+                route = %route,
+                %request_id,
+                transmitted_bytes,
+                compressed_bytes = content_encoding.as_ref().map(|_| transmitted_bytes),
+                content_encoding = ?content_encoding,
+                compression_elapsed_ms = compression_started.elapsed().as_millis() as u64,
+                total_elapsed_ms = started.elapsed().as_millis() as u64,
+                "[HTTP][perf] response body encoded"
+            );
+            Response::from_parts(parts, Body::from(bytes))
+        }
+        Err(error) => {
+            tracing::warn!(
+                route = %route,
+                %request_id,
+                content_encoding = ?content_encoding,
+                compression_elapsed_ms = compression_started.elapsed().as_millis() as u64,
+                total_elapsed_ms = started.elapsed().as_millis() as u64,
+                error = %error,
+                "[HTTP][perf] response encoding failed"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "Failed to encode conversation response"
+                })),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn static_response_policy(request: axum::extract::Request, next: Next) -> Response {
@@ -1940,10 +1939,7 @@ mod tests {
                     let payload = payload.clone();
                     async move {
                         let mut headers = HeaderMap::new();
-                        headers.insert(
-                            header::CONTENT_TYPE,
-                            HeaderValue::from_static("text/csv"),
-                        );
+                        headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/csv"));
                         headers.insert(
                             CONTENT_DISPOSITION,
                             HeaderValue::from_static("attachment; filename=report.csv"),

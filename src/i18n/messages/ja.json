@@ -3312,6 +3312,8 @@
         }
       },
       "contentParts": {
+        "loadBranchMergeSummary": "完全なマージ概要を読み込む",
+        "loadingBranchMergeSummary": "マージ概要を読み込み中…",
         "showingTailOutput": "パフォーマンスのため、ストリーミング中は末尾出力を表示しています。",
         "result": "結果",
         "unknown": "不明",

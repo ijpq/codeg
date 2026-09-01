@@ -25,6 +25,8 @@ import {
 
 vi.mock("@/lib/api", () => ({
   getFolderConversation: vi.fn(),
+  invalidateFolderConversationCache: vi.fn(),
+  listConversationOutputWindow: vi.fn(),
 }))
 
 const { getFolderConversation } = await import("@/lib/api")
@@ -493,9 +495,10 @@ describe("syncViewerDetail — pure viewer refetch", () => {
     await vi.advanceTimersByTimeAsync(0)
 
     expect(mockGet).toHaveBeenCalledTimes(1)
-    expect(mockGet).toHaveBeenCalledWith(CID, {
-      userTurnLimit: HISTORY_PAGE_USER_TURNS,
-    })
+    expect(mockGet).toHaveBeenCalledWith(
+      CID,
+      expect.objectContaining({ userTurnLimit: HISTORY_PAGE_USER_TURNS })
+    )
     const turns = session()?.detail?.turns ?? []
     expect(turns.map((t) => t.role)).toEqual(["user", "assistant"])
     // The persisted load replaces the synthesized optimistic prompt.
@@ -627,9 +630,10 @@ describe("syncViewerDetail — pure viewer refetch", () => {
 
     useConversationRuntimeStore.getState().actions.syncViewerDetail(-7)
     await vi.advanceTimersByTimeAsync(0)
-    expect(mockGet).toHaveBeenCalledWith(500, {
-      userTurnLimit: HISTORY_PAGE_USER_TURNS,
-    })
+    expect(mockGet).toHaveBeenCalledWith(
+      500,
+      expect.objectContaining({ userTurnLimit: HISTORY_PAGE_USER_TURNS })
+    )
   })
 
   it("routes a positive-id nudge to a draft tab keyed by a negative runtime id", async () => {
@@ -659,9 +663,10 @@ describe("syncViewerDetail — pure viewer refetch", () => {
     useConversationRuntimeStore.getState().actions.syncViewerDetail(CID)
     await vi.advanceTimersByTimeAsync(0)
 
-    expect(mockGet).toHaveBeenCalledWith(CID, {
-      userTurnLimit: HISTORY_PAGE_USER_TURNS,
-    })
+    expect(mockGet).toHaveBeenCalledWith(
+      CID,
+      expect.objectContaining({ userTurnLimit: HISTORY_PAGE_USER_TURNS })
+    )
     const turns =
       useConversationRuntimeStore.getState().byConversationId.get(-7)?.detail
         ?.turns ?? []

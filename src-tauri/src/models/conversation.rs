@@ -206,12 +206,30 @@ pub struct ConversationTurnsPage {
 /// deliberately opaque: Codex pages use transcript byte offsets so the server
 /// can seek directly into very large JSONL files, while other parsers fall back
 /// to a turn-index cursor without exposing that distinction to the frontend.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ConversationHistoryPage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
     pub has_more: bool,
     pub loaded_turns: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_start_offset: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_end_offset: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scan_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_hit: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index_hit: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub indexed_through_offset: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

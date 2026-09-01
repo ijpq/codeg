@@ -1418,6 +1418,31 @@ describe("adaptMessageTurn — image tool results", () => {
     expect(part.deferredRef).toBe("opaque_ref")
   })
 
+  it("keeps a branch merge preview light until its summary is requested", () => {
+    const adapted = adaptMessageTurn(
+      {
+        id: "branch-merge-result",
+        role: "assistant",
+        timestamp: "2026-06-02T00:00:00.000Z",
+        blocks: [
+          {
+            type: "text",
+            text: "merge preview\n\n<!--codeg-branch-merge-summary:opaque_ref-->",
+          },
+        ],
+      },
+      msgText,
+      false
+    )
+
+    const part = adapted.content[0]
+    if (part.type !== "deferred-text") {
+      throw new Error("expected a deferred-text part")
+    }
+    expect(part.text).toBe("merge preview")
+    expect(part.deferredRef).toBe("opaque_ref")
+  })
+
   it("leaves a normal text Read result as a tool card (no regression)", () => {
     const adapted = adaptMessageTurn(
       {

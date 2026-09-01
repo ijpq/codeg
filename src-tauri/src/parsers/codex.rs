@@ -1,8 +1,13 @@
 use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::fs::{self, OpenOptions};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+#[cfg(not(test))]
+use std::thread;
+#[cfg(not(test))]
+use std::time::Duration as StdDuration;
 use std::time::{Instant, SystemTime};
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -439,9 +444,7 @@ impl CodexParser {
                                         pending_promotions.push((
                                             is_user,
                                             is_user
-                                                .then(|| {
-                                                    extract_codex_title_candidate(&text, true)
-                                                })
+                                                .then(|| extract_codex_title_candidate(&text, true))
                                                 .flatten(),
                                         ));
                                     }
@@ -595,7 +598,10 @@ fn native_fork_parent_session_id_in(sessions_dir: &Path, session_id: &str) -> Op
             continue;
         };
         if value.get("type").and_then(serde_json::Value::as_str) != Some("session_meta")
-            || value.pointer("/payload/id").and_then(serde_json::Value::as_str) != Some(session_id)
+            || value
+                .pointer("/payload/id")
+                .and_then(serde_json::Value::as_str)
+                != Some(session_id)
         {
             continue;
         }
@@ -628,6 +634,12 @@ pub(crate) struct CodexConversationPage {
     pub cache_hit: bool,
     /// Whether the page boundary came from the persistent offset index.
     pub index_hit: bool,
+    /// `missing`, `building`, `ready`, `limited`, `stale`, or `corrupt` at read time.
+    pub index_status: &'static str,
+    /// Last source byte durably covered by the persistent record index.
+    pub indexed_through_offset: u64,
+    /// Opaque append-version used by the frontend's bounded LRU cache.
+    pub source_version: String,
 }
 
 /// A byte-bounded slice of an append-only Codex rollout. Branch merge uses
@@ -655,20 +667,89 @@ pub struct CodexRolloutSizeDiagnostics {
 }
 
 const CODEX_HISTORY_SCAN_CHUNK_BYTES: usize = 1024 * 1024;
-const CODEX_HISTORY_INDEX_VERSION: u8 = 1;
+pub(crate) const CODEX_HISTORY_FIRST_PAGE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const CODEX_HISTORY_INDEX_VERSION: u8 = 2;
+#[cfg(not(test))]
+const CODEX_HISTORY_INDEX_SLICE_BYTES: u64 = 16 * 1024 * 1024;
+#[cfg(not(test))]
+const CODEX_HISTORY_INDEX_PROGRESS_BYTES: u64 = 256 * 1024 * 1024;
+const CODEX_HISTORY_INDEX_ENTRY_BYTES: usize = 17;
+const CODEX_HISTORY_INDEX_MAX_ENTRIES: usize = 4_000_000;
+#[cfg(not(test))]
+const CODEX_HISTORY_INDEX_CACHE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 const CODEX_HISTORY_PAGE_CACHE_ENTRIES: usize = 16;
 const CODEX_HISTORY_PAGE_CACHE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const CODEX_HISTORY_PAGE_CACHE_MAX_ENTRY_BYTES: u64 = 32 * 1024 * 1024;
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct CodexHistoryIndex {
+const INDEX_MARK_USER: u16 = 1 << 0;
+const INDEX_MARK_MESSAGE: u16 = 1 << 1;
+const INDEX_MARK_TURN: u16 = 1 << 2;
+const INDEX_MARK_TOOL: u16 = 1 << 3;
+const INDEX_MARK_COMPACTION: u16 = 1 << 4;
+const INDEX_MARKER_TAIL_BYTES: usize = 96;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum CodexHistoryEntryKind {
+    User = 1,
+    Message = 2,
+    Turn = 3,
+    Tool = 4,
+    Compaction = 5,
+}
+
+impl CodexHistoryEntryKind {
+    fn from_byte(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::User),
+            2 => Some(Self::Message),
+            3 => Some(Self::Turn),
+            4 => Some(Self::Tool),
+            5 => Some(Self::Compaction),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CodexHistoryIndexEntry {
+    start_offset: u64,
+    end_offset: u64,
+    kind: CodexHistoryEntryKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CodexHistoryIndexMeta {
     version: u8,
+    canonical_path: String,
+    file_identity: String,
     observed_len: u64,
     observed_mtime_ns: u128,
+    indexed_through_offset: u64,
+    entry_count: usize,
+    /// The fixed-size sidecar reached its configured space cap.  Scanning can
+    /// continue to checkpoint source progress, but record-based lookup beyond
+    /// the last retained entry must fall back to the bounded tail scanner.
+    #[serde(default)]
+    entries_saturated: bool,
+    #[serde(default)]
+    pending_record_start: u64,
+    #[serde(default)]
+    pending_record_markers: u16,
+    #[serde(default)]
+    pending_record_tail: Vec<u8>,
     /// Exact `(end offset, requested user rounds) -> start offset` pages.
-    /// Offsets remain valid while the append-only rollout grows, so reopening
-    /// an old page never rescans the multi-gigabyte prefix.
+    /// This small compatibility cache makes the first reopen fast while the
+    /// richer record index is still building in the background.
+    #[serde(default)]
     pages: HashMap<String, u64>,
+}
+
+#[derive(Debug, Clone)]
+struct CodexHistoryIndex {
+    meta: CodexHistoryIndexMeta,
+    entries: Vec<CodexHistoryIndexEntry>,
+    load_status: &'static str,
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -694,9 +775,24 @@ static HISTORY_INDEX_CACHE: LazyLock<Mutex<HashMap<PathBuf, CodexHistoryIndex>>>
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static HISTORY_PAGE_CACHE: LazyLock<Mutex<HashMap<CodexPageCacheKey, CachedCodexPage>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-static HISTORY_PAGE_FLIGHTS: LazyLock<
-    Mutex<HashMap<CodexPageCacheKey, Arc<Mutex<()>>>>,
-> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static HISTORY_PAGE_FLIGHTS: LazyLock<Mutex<HashMap<CodexPageCacheKey, Arc<Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+#[cfg(not(test))]
+static HISTORY_INDEX_BUILDS: LazyLock<Mutex<HashSet<PathBuf>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+struct HistoryPageFlightRegistration {
+    key: CodexPageCacheKey,
+}
+
+impl Drop for HistoryPageFlightRegistration {
+    fn drop(&mut self) {
+        HISTORY_PAGE_FLIGHTS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.key);
+    }
+}
 
 fn system_time_ns(value: SystemTime) -> u128 {
     value
@@ -709,27 +805,252 @@ fn history_page_index_key(end_offset: u64, user_turn_limit: usize) -> String {
     format!("{end_offset}:{user_turn_limit}")
 }
 
-fn history_index_path(rollout_path: &Path) -> Option<PathBuf> {
-    let cache_root = dirs::cache_dir()?.join("codeg").join("codex-history-index-v1");
+fn history_index_base_path(rollout_path: &Path) -> Option<PathBuf> {
+    let cache_root = history_index_cache_root()?;
     let canonical = rollout_path
         .canonicalize()
         .unwrap_or_else(|_| rollout_path.to_path_buf());
     let digest = Sha256::digest(canonical.to_string_lossy().as_bytes());
-    Some(cache_root.join(format!("{}.json", URL_SAFE_NO_PAD.encode(digest))))
+    Some(cache_root.join(URL_SAFE_NO_PAD.encode(digest)))
 }
 
-fn load_history_index(rollout_path: &Path) -> CodexHistoryIndex {
-    let Some(index_path) = history_index_path(rollout_path) else {
-        return CodexHistoryIndex::default();
+fn history_index_cache_root() -> Option<PathBuf> {
+    Some(
+        dirs::cache_dir()?
+            .join("codeg")
+            .join("codex-history-index-v2"),
+    )
+}
+
+#[cfg(not(test))]
+fn enforce_history_index_cache_limit(current_rollout: &Path) {
+    #[derive(Default)]
+    struct CacheGroup {
+        bytes: u64,
+        modified: Option<SystemTime>,
+        paths: Vec<PathBuf>,
+    }
+
+    let Some(root) = history_index_cache_root() else {
+        return;
     };
-    fs::read(index_path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<CodexHistoryIndex>(&bytes).ok())
-        .filter(|index| index.version == CODEX_HISTORY_INDEX_VERSION)
-        .unwrap_or_default()
+    let Ok(entries) = fs::read_dir(&root) else {
+        return;
+    };
+    let current_rollout = current_rollout.to_path_buf();
+    let builds = HISTORY_INDEX_BUILDS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let protected = builds
+        .iter()
+        .chain(std::iter::once(&current_rollout))
+        .filter_map(|path| history_index_base_path(path))
+        .filter_map(|path| path.file_name().map(|name| name.to_owned()))
+        .collect::<HashSet<_>>();
+    drop(builds);
+    let mut groups = HashMap::<String, CacheGroup>::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let base = name
+            .strip_suffix(".meta.json")
+            .or_else(|| name.strip_suffix(".entries"));
+        let Some(base) = base else {
+            continue;
+        };
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let group = groups.entry(base.to_string()).or_default();
+        group.bytes = group.bytes.saturating_add(metadata.len());
+        let modified = metadata.modified().ok();
+        if modified > group.modified {
+            group.modified = modified;
+        }
+        group.paths.push(path);
+    }
+    let mut total = groups.values().map(|group| group.bytes).sum::<u64>();
+    if total <= CODEX_HISTORY_INDEX_CACHE_MAX_BYTES {
+        return;
+    }
+    let mut groups = groups.into_iter().collect::<Vec<_>>();
+    groups.sort_by_key(|(_, group)| group.modified);
+    let mut released = 0u64;
+    for (base, group) in groups {
+        if total <= CODEX_HISTORY_INDEX_CACHE_MAX_BYTES
+            || protected.contains(std::ffi::OsStr::new(&base))
+        {
+            continue;
+        }
+        for path in group.paths {
+            let _ = fs::remove_file(path);
+        }
+        total = total.saturating_sub(group.bytes);
+        released = released.saturating_add(group.bytes);
+    }
+    if released > 0 {
+        tracing::info!(
+            released_bytes = released,
+            remaining_bytes = total,
+            cache_limit_bytes = CODEX_HISTORY_INDEX_CACHE_MAX_BYTES,
+            "[conversation][perf] evicted old Codex history indexes"
+        );
+    }
 }
 
-fn save_history_index(rollout_path: &Path, index: &CodexHistoryIndex) {
+fn history_index_path(rollout_path: &Path) -> Option<PathBuf> {
+    history_index_base_path(rollout_path).map(|path| path.with_extension("meta.json"))
+}
+
+fn history_index_entries_path(rollout_path: &Path) -> Option<PathBuf> {
+    history_index_base_path(rollout_path).map(|path| path.with_extension("entries"))
+}
+
+fn canonical_history_path(rollout_path: &Path) -> String {
+    rollout_path
+        .canonicalize()
+        .unwrap_or_else(|_| rollout_path.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[cfg(unix)]
+fn history_file_identity(_rollout_path: &Path, metadata: &fs::Metadata) -> String {
+    use std::os::unix::fs::MetadataExt;
+    format!("unix:{}:{}", metadata.dev(), metadata.ino())
+}
+
+#[cfg(windows)]
+fn history_file_identity(rollout_path: &Path, metadata: &fs::Metadata) -> String {
+    use std::os::windows::fs::MetadataExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+
+    if let Ok(file) = fs::File::open(rollout_path) {
+        // SAFETY: the handle stays owned by `file` for the duration of the
+        // call, and `info` points to a writable structure of the exact type the
+        // Win32 API expects.
+        let mut info = unsafe { std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };
+        let succeeded = unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) };
+        if succeeded != 0 {
+            let file_index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+            return format!("windows:{}:{}", info.dwVolumeSerialNumber, file_index);
+        }
+    }
+
+    // Opening a file can fail transiently (for example while an antivirus
+    // scanner owns it). Creation time plus attributes is stable across normal
+    // appends and still gives the index a conservative fallback identity.
+    format!(
+        "windows-fallback:{}:{}",
+        metadata.creation_time(),
+        metadata.file_attributes()
+    )
+}
+
+#[cfg(not(any(unix, windows)))]
+fn history_file_identity(_rollout_path: &Path, _metadata: &fs::Metadata) -> String {
+    "path".to_string()
+}
+
+fn empty_history_index(rollout_path: &Path, metadata: &fs::Metadata) -> CodexHistoryIndex {
+    CodexHistoryIndex {
+        meta: CodexHistoryIndexMeta {
+            version: CODEX_HISTORY_INDEX_VERSION,
+            canonical_path: canonical_history_path(rollout_path),
+            file_identity: history_file_identity(rollout_path, metadata),
+            observed_len: metadata.len(),
+            observed_mtime_ns: metadata.modified().map(system_time_ns).unwrap_or_default(),
+            indexed_through_offset: 0,
+            entry_count: 0,
+            entries_saturated: false,
+            pending_record_start: 0,
+            pending_record_markers: 0,
+            pending_record_tail: Vec::new(),
+            pages: HashMap::new(),
+        },
+        entries: Vec::new(),
+        load_status: "missing",
+    }
+}
+
+fn decode_history_entries(
+    rollout_path: &Path,
+    entry_count: usize,
+) -> Option<Vec<CodexHistoryIndexEntry>> {
+    if entry_count > CODEX_HISTORY_INDEX_MAX_ENTRIES {
+        return None;
+    }
+    let entries_path = history_index_entries_path(rollout_path)?;
+    if entry_count == 0 {
+        return Some(Vec::new());
+    }
+    let bytes = fs::read(entries_path).ok()?;
+    let expected = entry_count.checked_mul(CODEX_HISTORY_INDEX_ENTRY_BYTES)?;
+    if bytes.len() < expected {
+        return None;
+    }
+    let mut entries = Vec::with_capacity(entry_count);
+    let mut previous_end = 0u64;
+    let (records, remainder) = bytes[..expected].as_chunks::<CODEX_HISTORY_INDEX_ENTRY_BYTES>();
+    if !remainder.is_empty() {
+        return None;
+    }
+    for record in records {
+        let start_offset = u64::from_le_bytes(record[..8].try_into().ok()?);
+        let end_offset = u64::from_le_bytes(record[8..16].try_into().ok()?);
+        let kind = CodexHistoryEntryKind::from_byte(record[16])?;
+        if end_offset <= start_offset || start_offset < previous_end {
+            return None;
+        }
+        previous_end = end_offset;
+        entries.push(CodexHistoryIndexEntry {
+            start_offset,
+            end_offset,
+            kind,
+        });
+    }
+    Some(entries)
+}
+
+fn load_history_index(rollout_path: &Path, metadata: &fs::Metadata) -> CodexHistoryIndex {
+    let mut empty = empty_history_index(rollout_path, metadata);
+    let Some(index_path) = history_index_path(rollout_path) else {
+        return empty;
+    };
+    let Some(meta) = fs::read(&index_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<CodexHistoryIndexMeta>(&bytes).ok())
+    else {
+        if index_path.exists() {
+            empty.load_status = "corrupt";
+        }
+        return empty;
+    };
+    if meta.version != CODEX_HISTORY_INDEX_VERSION
+        || meta.canonical_path != canonical_history_path(rollout_path)
+        || meta.file_identity != history_file_identity(rollout_path, metadata)
+        || meta.indexed_through_offset > metadata.len()
+    {
+        empty.load_status = "stale";
+        return empty;
+    }
+    let Some(entries) = decode_history_entries(rollout_path, meta.entry_count) else {
+        empty.load_status = "corrupt";
+        return empty;
+    };
+    CodexHistoryIndex {
+        meta,
+        entries,
+        load_status: "ready",
+    }
+}
+
+fn save_history_index_meta(rollout_path: &Path, meta: &CodexHistoryIndexMeta) {
     let Some(index_path) = history_index_path(rollout_path) else {
         return;
     };
@@ -739,7 +1060,7 @@ fn save_history_index(rollout_path: &Path, index: &CodexHistoryIndex) {
     if fs::create_dir_all(parent).is_err() {
         return;
     }
-    let Ok(bytes) = serde_json::to_vec(index) else {
+    let Ok(bytes) = serde_json::to_vec(meta) else {
         return;
     };
     let temporary = index_path.with_extension(format!("json.tmp-{}", std::process::id()));
@@ -749,6 +1070,49 @@ fn save_history_index(rollout_path: &Path, index: &CodexHistoryIndex) {
     let _ = fs::remove_file(temporary);
 }
 
+fn reset_history_index_files(rollout_path: &Path, index: &CodexHistoryIndex) {
+    if let Some(entries_path) = history_index_entries_path(rollout_path) {
+        if let Some(parent) = entries_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::File::create(entries_path);
+    }
+    save_history_index_meta(rollout_path, &index.meta);
+}
+
+fn validate_history_index_source(
+    rollout_path: &Path,
+    metadata: &fs::Metadata,
+    index: &CodexHistoryIndex,
+) -> bool {
+    index.meta.version == CODEX_HISTORY_INDEX_VERSION
+        && index.meta.canonical_path == canonical_history_path(rollout_path)
+        && index.meta.file_identity == history_file_identity(rollout_path, metadata)
+        && metadata.len() >= index.meta.observed_len
+        && index.meta.indexed_through_offset <= metadata.len()
+        && !(metadata.len() == index.meta.observed_len
+            && index.meta.observed_mtime_ns != 0
+            && metadata.modified().map(system_time_ns).unwrap_or_default()
+                != index.meta.observed_mtime_ns)
+}
+
+fn history_index_status(index: &CodexHistoryIndex, file_len: u64) -> (&'static str, u64) {
+    if index.load_status == "corrupt" || index.load_status == "stale" {
+        return (index.load_status, index.meta.indexed_through_offset);
+    }
+    if index.meta.entries_saturated {
+        return ("limited", index.meta.indexed_through_offset);
+    }
+    if index.meta.indexed_through_offset >= file_len && index.meta.pending_record_start >= file_len
+    {
+        ("ready", index.meta.indexed_through_offset)
+    } else if index.meta.indexed_through_offset > 0 {
+        ("building", index.meta.indexed_through_offset)
+    } else {
+        (index.load_status, 0)
+    }
+}
+
 fn indexed_page_start(
     rollout_path: &Path,
     file_len: u64,
@@ -756,26 +1120,69 @@ fn indexed_page_start(
     end_offset: u64,
     user_turn_limit: usize,
 ) -> Option<u64> {
-    let mut indexes = HISTORY_INDEX_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let metadata = fs::metadata(rollout_path).ok()?;
+    let mut indexes = HISTORY_INDEX_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let index = indexes
         .entry(rollout_path.to_path_buf())
-        .or_insert_with(|| load_history_index(rollout_path));
+        .or_insert_with(|| load_history_index(rollout_path, &metadata));
     // Rollouts are append-only. Preserve offsets across growth; a shrink or a
     // same-length rewrite invalidates them and is safely rebuilt on demand.
-    if file_len < index.observed_len
-        || (file_len == index.observed_len
-            && index.observed_mtime_ns != 0
-            && modified_ns != index.observed_mtime_ns)
-    {
-        index.pages.clear();
+    if !validate_history_index_source(rollout_path, &metadata, index) {
+        *index = empty_history_index(rollout_path, &metadata);
+        index.load_status = "stale";
+        reset_history_index_files(rollout_path, index);
     }
-    index.observed_len = file_len;
-    index.observed_mtime_ns = modified_ns;
-    index
+    index.meta.observed_len = file_len;
+    index.meta.observed_mtime_ns = modified_ns;
+    if let Some(start) = index
+        .meta
         .pages
         .get(&history_page_index_key(end_offset, user_turn_limit))
         .copied()
-        .filter(|start| *start <= end_offset)
+        .filter(|start| {
+            *start <= end_offset
+                && end_offset.saturating_sub(*start) <= CODEX_HISTORY_FIRST_PAGE_MAX_BYTES
+        })
+    {
+        return Some(start);
+    }
+    if index.meta.indexed_through_offset < end_offset {
+        return None;
+    }
+    if index.meta.entries_saturated
+        && index
+            .entries
+            .last()
+            .is_none_or(|entry| entry.end_offset < end_offset)
+    {
+        return None;
+    }
+    let mut users = index
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == CodexHistoryEntryKind::User && entry.end_offset <= end_offset)
+        .rev();
+    let user = users.nth(user_turn_limit.saturating_sub(1));
+    match user {
+        Some(user) => {
+            let preceding_turn = index.entries.iter().rev().find(|entry| {
+                entry.end_offset <= user.start_offset && entry.kind == CodexHistoryEntryKind::Turn
+            });
+            let start = preceding_turn
+                .map(|entry| entry.start_offset)
+                .unwrap_or(user.start_offset);
+            (end_offset.saturating_sub(start) <= CODEX_HISTORY_FIRST_PAGE_MAX_BYTES)
+                .then_some(start)
+        }
+        None if index.meta.indexed_through_offset >= end_offset
+            && end_offset <= CODEX_HISTORY_FIRST_PAGE_MAX_BYTES =>
+        {
+            Some(0)
+        }
+        None => None,
+    }
 }
 
 fn remember_page_start(
@@ -786,30 +1193,356 @@ fn remember_page_start(
     user_turn_limit: usize,
     start_offset: u64,
 ) {
+    let Ok(metadata) = fs::metadata(rollout_path) else {
+        return;
+    };
     let snapshot = {
-        let mut indexes = HISTORY_INDEX_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut indexes = HISTORY_INDEX_CACHE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let index = indexes
             .entry(rollout_path.to_path_buf())
-            .or_insert_with(|| load_history_index(rollout_path));
-        index.version = CODEX_HISTORY_INDEX_VERSION;
-        index.observed_len = file_len;
-        index.observed_mtime_ns = modified_ns;
-        index.pages.insert(
+            .or_insert_with(|| load_history_index(rollout_path, &metadata));
+        index.meta.version = CODEX_HISTORY_INDEX_VERSION;
+        index.meta.observed_len = file_len;
+        index.meta.observed_mtime_ns = modified_ns;
+        index.meta.pages.insert(
             history_page_index_key(end_offset, user_turn_limit),
             start_offset,
         );
         // A corrupt client cannot grow this sidecar without bound by asking
         // thousands of different page sizes/cursors.
-        if index.pages.len() > 4096 {
-            let mut keys = index.pages.keys().cloned().collect::<Vec<_>>();
+        if index.meta.pages.len() > 4096 {
+            let mut keys = index.meta.pages.keys().cloned().collect::<Vec<_>>();
             keys.sort();
-            for key in keys.into_iter().take(index.pages.len() - 4096) {
-                index.pages.remove(&key);
+            for key in keys
+                .into_iter()
+                .take(index.meta.pages.len().saturating_sub(4096))
+            {
+                index.meta.pages.remove(&key);
             }
         }
-        index.clone()
+        index.meta.clone()
     };
-    save_history_index(rollout_path, &snapshot);
+    save_history_index_meta(rollout_path, &snapshot);
+}
+
+fn contains_any(haystack: &[u8], needles: &[&[u8]]) -> bool {
+    needles.iter().any(|needle| bytes_contain(haystack, needle))
+}
+
+fn update_index_record_markers(markers: &mut u16, tail: &mut Vec<u8>, bytes: &[u8]) {
+    let mut searchable = Vec::with_capacity(tail.len() + bytes.len());
+    searchable.extend_from_slice(tail);
+    searchable.extend_from_slice(bytes);
+    if contains_any(
+        &searchable,
+        &[
+            br#""type":"user_message""#,
+            br#""type": "user_message""#,
+            br#""thread_goal_updated""#,
+        ],
+    ) {
+        *markers |= INDEX_MARK_USER;
+    }
+    if contains_any(
+        &searchable,
+        &[
+            br#""type":"agent_message""#,
+            br#""type": "agent_message""#,
+            br#""role":"assistant""#,
+            br#""role": "assistant""#,
+        ],
+    ) {
+        *markers |= INDEX_MARK_MESSAGE;
+    }
+    if contains_any(
+        &searchable,
+        &[
+            br#""type":"turn_context""#,
+            br#""type": "turn_context""#,
+            br#""type":"task_started""#,
+            br#""type": "task_started""#,
+            br#""type":"task_complete""#,
+            br#""type": "task_complete""#,
+        ],
+    ) {
+        *markers |= INDEX_MARK_TURN;
+    }
+    if contains_any(
+        &searchable,
+        &[
+            br#""function_call""#,
+            br#""function_call_output""#,
+            br#""custom_tool_call""#,
+            br#""custom_tool_call_output""#,
+            br#""tool_call""#,
+            br#""web_search""#,
+        ],
+    ) {
+        *markers |= INDEX_MARK_TOOL;
+    }
+    if contains_any(
+        &searchable,
+        &[
+            br#""context_compacted""#,
+            br#""contextCompaction""#,
+            br#""compaction_update""#,
+            br#""compaction_summary""#,
+        ],
+    ) {
+        *markers |= INDEX_MARK_COMPACTION;
+    }
+    let keep = searchable.len().min(INDEX_MARKER_TAIL_BYTES);
+    tail.clear();
+    tail.extend_from_slice(&searchable[searchable.len().saturating_sub(keep)..]);
+}
+
+fn index_entry_kind(markers: u16) -> Option<CodexHistoryEntryKind> {
+    if markers & INDEX_MARK_USER != 0 {
+        Some(CodexHistoryEntryKind::User)
+    } else if markers & INDEX_MARK_COMPACTION != 0 {
+        Some(CodexHistoryEntryKind::Compaction)
+    } else if markers & INDEX_MARK_TOOL != 0 {
+        Some(CodexHistoryEntryKind::Tool)
+    } else if markers & INDEX_MARK_MESSAGE != 0 {
+        Some(CodexHistoryEntryKind::Message)
+    } else if markers & INDEX_MARK_TURN != 0 {
+        Some(CodexHistoryEntryKind::Turn)
+    } else {
+        None
+    }
+}
+
+fn encode_history_entries(entries: &[CodexHistoryIndexEntry]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(entries.len() * CODEX_HISTORY_INDEX_ENTRY_BYTES);
+    for entry in entries {
+        bytes.extend_from_slice(&entry.start_offset.to_le_bytes());
+        bytes.extend_from_slice(&entry.end_offset.to_le_bytes());
+        bytes.push(entry.kind as u8);
+    }
+    bytes
+}
+
+fn append_history_entries(
+    rollout_path: &Path,
+    existing_count: usize,
+    entries: &[CodexHistoryIndexEntry],
+) -> std::io::Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let entries_path = history_index_entries_path(rollout_path)
+        .ok_or_else(|| std::io::Error::other("history index cache directory unavailable"))?;
+    if let Some(parent) = entries_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let expected_len = existing_count
+        .checked_mul(CODEX_HISTORY_INDEX_ENTRY_BYTES)
+        .and_then(|value| u64::try_from(value).ok())
+        .ok_or_else(|| std::io::Error::other("history index entry count overflow"))?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(entries_path)?;
+    if file.metadata()?.len() != expected_len {
+        file.set_len(expected_len)?;
+    }
+    file.seek(SeekFrom::Start(expected_len))?;
+    file.write_all(&encode_history_entries(entries))?;
+    file.flush()?;
+    Ok(())
+}
+
+fn build_history_index_slice(
+    rollout_path: &Path,
+    byte_budget: u64,
+) -> Result<(bool, u64, u64, usize), ParseError> {
+    let metadata = fs::metadata(rollout_path)?;
+    let file_len = metadata.len();
+    let mut index = {
+        let mut indexes = HISTORY_INDEX_CACHE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        indexes
+            .remove(rollout_path)
+            .unwrap_or_else(|| load_history_index(rollout_path, &metadata))
+    };
+    if !validate_history_index_source(rollout_path, &metadata, &index) {
+        index = empty_history_index(rollout_path, &metadata);
+        index.load_status = "stale";
+        reset_history_index_files(rollout_path, &index);
+    }
+
+    let start_offset = index.meta.indexed_through_offset.min(file_len);
+    if start_offset >= file_len {
+        index.meta.observed_len = file_len;
+        index.meta.observed_mtime_ns = metadata.modified().map(system_time_ns).unwrap_or_default();
+        index.load_status = "ready";
+        save_history_index_meta(rollout_path, &index.meta);
+        HISTORY_INDEX_CACHE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(rollout_path.to_path_buf(), index);
+        return Ok((true, start_offset, file_len, 0));
+    }
+
+    let read_len = file_len
+        .saturating_sub(start_offset)
+        .min(byte_budget.max(1));
+    let mut file = fs::File::open(rollout_path)?;
+    file.seek(SeekFrom::Start(start_offset))?;
+    let mut reader = file.take(read_len);
+    let mut buffer = vec![0u8; CODEX_HISTORY_SCAN_CHUNK_BYTES];
+    let mut absolute = start_offset;
+    let mut record_start = index.meta.pending_record_start.min(start_offset);
+    if index.meta.pending_record_tail.is_empty() && record_start < start_offset {
+        record_start = start_offset;
+    }
+    let mut markers = index.meta.pending_record_markers;
+    let mut marker_tail = std::mem::take(&mut index.meta.pending_record_tail);
+    let mut appended = Vec::new();
+
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let chunk = &buffer[..read];
+        let mut segment_start = 0usize;
+        for (position, byte) in chunk.iter().enumerate() {
+            if *byte != b'\n' {
+                continue;
+            }
+            update_index_record_markers(
+                &mut markers,
+                &mut marker_tail,
+                &chunk[segment_start..=position],
+            );
+            let record_end = absolute + position as u64 + 1;
+            if let Some(kind) = index_entry_kind(markers) {
+                if index.entries.len() + appended.len() < CODEX_HISTORY_INDEX_MAX_ENTRIES {
+                    appended.push(CodexHistoryIndexEntry {
+                        start_offset: record_start,
+                        end_offset: record_end,
+                        kind,
+                    });
+                } else {
+                    index.meta.entries_saturated = true;
+                }
+            }
+            record_start = record_end;
+            markers = 0;
+            marker_tail.clear();
+            segment_start = position + 1;
+        }
+        if segment_start < chunk.len() {
+            update_index_record_markers(&mut markers, &mut marker_tail, &chunk[segment_start..]);
+        }
+        absolute += read as u64;
+    }
+
+    let existing_count = index.entries.len();
+    append_history_entries(rollout_path, existing_count, &appended)?;
+    index.entries.extend_from_slice(&appended);
+    index.meta.indexed_through_offset = absolute;
+    index.meta.entry_count = index.entries.len();
+    index.meta.pending_record_start = record_start;
+    index.meta.pending_record_markers = markers;
+    index.meta.pending_record_tail = marker_tail;
+    index.meta.observed_len = file_len;
+    index.meta.observed_mtime_ns = metadata.modified().map(system_time_ns).unwrap_or_default();
+    index.load_status = "ready";
+
+    // Merge any exact-page boundaries learned while this I/O slice ran.
+    let mut indexes = HISTORY_INDEX_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(current) = indexes.get(rollout_path) {
+        index.meta.pages.extend(current.meta.pages.clone());
+    }
+    save_history_index_meta(rollout_path, &index.meta);
+    let complete = absolute >= file_len && record_start >= file_len;
+    let entry_count = index.entries.len();
+    indexes.insert(rollout_path.to_path_buf(), index);
+    Ok((complete, absolute, file_len, entry_count))
+}
+
+#[cfg(not(test))]
+fn schedule_history_index_build(rollout_path: PathBuf) {
+    {
+        let mut builds = HISTORY_INDEX_BUILDS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !builds.insert(rollout_path.clone()) {
+            return;
+        }
+    }
+    let build_path = rollout_path.clone();
+    let spawn = thread::Builder::new()
+        .name("codeg-history-index".to_string())
+        .spawn(move || {
+            let started = Instant::now();
+            let mut next_progress = CODEX_HISTORY_INDEX_PROGRESS_BYTES;
+            loop {
+                match build_history_index_slice(&build_path, CODEX_HISTORY_INDEX_SLICE_BYTES) {
+                    Ok((complete, indexed, total, entries)) => {
+                        if indexed >= next_progress || complete {
+                            tracing::info!(
+                                index_version = CODEX_HISTORY_INDEX_VERSION,
+                                indexed_through_offset = indexed,
+                                source_bytes = total,
+                                index_entries = entries,
+                                complete,
+                                elapsed_ms = started.elapsed().as_millis() as u64,
+                                "[conversation][perf] Codex history index progress"
+                            );
+                            next_progress =
+                                indexed.saturating_add(CODEX_HISTORY_INDEX_PROGRESS_BYTES);
+                        }
+                        if complete || indexed >= total {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            "[conversation][perf] Codex history index paused after an error"
+                        );
+                        break;
+                    }
+                }
+                // Cooperative throttling: indexing never runs on the request
+                // thread and yields between durable, restart-safe slices.
+                thread::sleep(StdDuration::from_millis(5));
+            }
+            enforce_history_index_cache_limit(&build_path);
+            HISTORY_INDEX_BUILDS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&build_path);
+        });
+    if spawn.is_err() {
+        HISTORY_INDEX_BUILDS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&rollout_path);
+    }
+}
+
+fn current_history_index_status(
+    rollout_path: &Path,
+    metadata: &fs::Metadata,
+) -> (&'static str, u64) {
+    let mut indexes = HISTORY_INDEX_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let index = indexes
+        .entry(rollout_path.to_path_buf())
+        .or_insert_with(|| load_history_index(rollout_path, metadata));
+    history_index_status(index, metadata.len())
 }
 
 fn is_codex_user_boundary(line: &[u8]) -> bool {
@@ -853,7 +1586,10 @@ fn is_codex_user_boundary(line: &[u8]) -> bool {
 }
 
 fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
-    !needle.is_empty() && haystack.windows(needle.len()).any(|window| window == needle)
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
 }
 
 /// Walk JSONL records backwards until `user_turn_limit` user-round boundaries
@@ -865,6 +1601,7 @@ fn find_codex_page_start(
     end_offset: u64,
     user_turn_limit: usize,
     max_scan_bytes: Option<u64>,
+    cancelled: Option<&AtomicBool>,
 ) -> Result<(u64, u64), ParseError> {
     if end_offset == 0 || user_turn_limit == 0 {
         return Ok((end_offset, 0));
@@ -874,16 +1611,19 @@ fn find_codex_page_start(
     let mut suffix = Vec::<u8>::new();
     let mut boundaries = 0usize;
     let mut include_preceding_record = false;
+    let scan_floor = max_scan_bytes
+        .map(|limit| end_offset.saturating_sub(limit))
+        .unwrap_or(0);
 
-    while position > 0 {
-        let read_start = position.saturating_sub(CODEX_HISTORY_SCAN_CHUNK_BYTES as u64);
-        if let Some(limit) = max_scan_bytes {
-            if end_offset.saturating_sub(read_start) > limit {
-                return Err(ParseError::InvalidData(format!(
-                    "Codex reverse scan exceeded the safe limit of {limit} bytes without finding a user boundary"
-                )));
-            }
+    while position > scan_floor {
+        if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err(ParseError::InvalidData(
+                "Codex history page read was cancelled".into(),
+            ));
         }
+        let read_start = position
+            .saturating_sub(CODEX_HISTORY_SCAN_CHUNK_BYTES as u64)
+            .max(scan_floor);
         let read_len =
             usize::try_from(position - read_start).unwrap_or(CODEX_HISTORY_SCAN_CHUNK_BYTES);
         let mut chunk = vec![0u8; read_len];
@@ -922,6 +1662,19 @@ fn find_codex_page_start(
         suffix.clear();
         suffix.extend_from_slice(&chunk[..prefix_end]);
         position = read_start;
+
+        if position == scan_floor && scan_floor > 0 {
+            // The bounded tail did not contain enough user rounds. Return the
+            // first complete JSONL record inside the budget instead of either
+            // failing the open or crossing the hard read ceiling. A single
+            // record larger than the ceiling yields an empty page until the
+            // background record index reaches it; the original rollout is
+            // never rewritten or partially parsed.
+            let start = first_newline
+                .map(|newline| scan_floor + newline as u64 + 1)
+                .unwrap_or(end_offset);
+            return Ok((start.min(end_offset), end_offset.saturating_sub(scan_floor)));
+        }
     }
 
     Ok((0, end_offset))
@@ -2789,8 +3542,7 @@ impl CodexParser {
                 || bytes_contain(&line, b"tool_result")
                 || bytes_contain(&line, b"custom_tool_call_output")
             {
-                diagnostics.tool_result_bytes =
-                    diagnostics.tool_result_bytes.saturating_add(bytes);
+                diagnostics.tool_result_bytes = diagnostics.tool_result_bytes.saturating_add(bytes);
             } else if bytes_contain(&line, b"function_call")
                 || bytes_contain(&line, b"tool_call")
                 || bytes_contain(&line, b"web_search_call")
@@ -2823,6 +3575,25 @@ impl CodexParser {
             user_turn_limit,
             cwd_hint,
             None,
+            None,
+        )
+    }
+
+    pub(crate) fn get_conversation_page_cancellable(
+        &self,
+        conversation_id: &str,
+        before_offset: Option<u64>,
+        user_turn_limit: usize,
+        cwd_hint: Option<String>,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<CodexConversationPage, ParseError> {
+        self.get_conversation_page_impl(
+            conversation_id,
+            before_offset,
+            user_turn_limit,
+            cwd_hint,
+            None,
+            Some(cancelled),
         )
     }
 
@@ -2840,6 +3611,7 @@ impl CodexParser {
             user_turn_limit,
             cwd_hint,
             Some(max_bytes),
+            None,
         )
     }
 
@@ -2850,7 +3622,16 @@ impl CodexParser {
         user_turn_limit: usize,
         cwd_hint: Option<String>,
         max_bytes: Option<u64>,
+        cancelled: Option<Arc<AtomicBool>>,
     ) -> Result<CodexConversationPage, ParseError> {
+        if cancelled
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+        {
+            return Err(ParseError::InvalidData(
+                "Codex history page read was cancelled".into(),
+            ));
+        }
         let path = self.rollout_path(conversation_id)?;
         let metadata = fs::metadata(&path)?;
         let file_len = metadata.len();
@@ -2874,6 +3655,8 @@ impl CodexParser {
                 cached.used_at = Instant::now();
                 let mut page = (*cached.page).clone();
                 page.cache_hit = true;
+                #[cfg(not(test))]
+                schedule_history_index_build(path.clone());
                 return Ok(page);
             }
         }
@@ -2891,6 +3674,17 @@ impl CodexParser {
                 .clone()
         };
         let flight_guard = flight.lock().unwrap_or_else(|error| error.into_inner());
+        let _flight_registration = HistoryPageFlightRegistration {
+            key: cache_key.clone(),
+        };
+        if cancelled
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+        {
+            return Err(ParseError::InvalidData(
+                "Codex history page read was cancelled".into(),
+            ));
+        }
         if max_bytes.is_none() {
             if let Some(cached) = HISTORY_PAGE_CACHE
                 .lock()
@@ -2900,6 +3694,8 @@ impl CodexParser {
                 cached.used_at = Instant::now();
                 let mut page = (*cached.page).clone();
                 page.cache_hit = true;
+                #[cfg(not(test))]
+                schedule_history_index_build(path.clone());
                 drop(flight_guard);
                 HISTORY_PAGE_FLIGHTS
                     .lock()
@@ -2911,17 +3707,18 @@ impl CodexParser {
 
         let mut file = fs::File::open(&path)?;
         let (start_offset, scan_bytes, index_hit) = if max_bytes.is_none() {
-            if let Some(start) = indexed_page_start(
-                &path,
-                file_len,
-                modified_ns,
-                end_offset,
-                user_turn_limit,
-            ) {
+            if let Some(start) =
+                indexed_page_start(&path, file_len, modified_ns, end_offset, user_turn_limit)
+            {
                 (start, 0, true)
             } else {
-                let (start, scanned) =
-                    find_codex_page_start(&mut file, end_offset, user_turn_limit, None)?;
+                let (start, scanned) = find_codex_page_start(
+                    &mut file,
+                    end_offset,
+                    user_turn_limit,
+                    Some(CODEX_HISTORY_FIRST_PAGE_MAX_BYTES),
+                    cancelled.as_deref(),
+                )?;
                 remember_page_start(
                     &path,
                     file_len,
@@ -2933,8 +3730,13 @@ impl CodexParser {
                 (start, scanned, false)
             }
         } else {
-            let (start, scanned) =
-                find_codex_page_start(&mut file, end_offset, user_turn_limit, max_bytes)?;
+            let (start, scanned) = find_codex_page_start(
+                &mut file,
+                end_offset,
+                user_turn_limit,
+                max_bytes,
+                cancelled.as_deref(),
+            )?;
             (start, scanned, false)
         };
         let page_bytes = end_offset.saturating_sub(start_offset);
@@ -2944,6 +3746,14 @@ impl CodexParser {
             )));
         }
         file.seek(SeekFrom::Start(start_offset))?;
+        if cancelled
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+        {
+            return Err(ParseError::InvalidData(
+                "Codex history page read was cancelled".into(),
+            ));
+        }
         let reader = BufReader::new(file.take(end_offset.saturating_sub(start_offset)));
         let detail = self.parse_conversation_detail_reader(
             &path,
@@ -2952,6 +3762,9 @@ impl CodexParser {
             cwd_hint,
             Some(start_offset),
         )?;
+        #[cfg(not(test))]
+        schedule_history_index_build(path.clone());
+        let (index_status, indexed_through_offset) = current_history_index_status(&path, &metadata);
         let page = CodexConversationPage {
             detail,
             start_offset,
@@ -2960,6 +3773,9 @@ impl CodexParser {
             scan_bytes,
             cache_hit: false,
             index_hit,
+            index_status,
+            indexed_through_offset,
+            source_version: format!("{file_len}:{modified_ns}"),
         };
         if max_bytes.is_none() && page_bytes <= CODEX_HISTORY_PAGE_CACHE_MAX_ENTRY_BYTES {
             let mut cache = HISTORY_PAGE_CACHE
@@ -2974,10 +3790,7 @@ impl CodexParser {
                 },
             );
             while cache.len() > CODEX_HISTORY_PAGE_CACHE_ENTRIES
-                || cache
-                    .values()
-                    .map(|entry| entry.source_bytes)
-                    .sum::<u64>()
+                || cache.values().map(|entry| entry.source_bytes).sum::<u64>()
                     > CODEX_HISTORY_PAGE_CACHE_MAX_BYTES
             {
                 if let Some(oldest) = cache
@@ -3575,10 +4388,8 @@ impl CodexParser {
                                 // instead of one card per section. If no grouped
                                 // summary arrives (interrupted/older rollouts), the
                                 // buffer is flushed on its own and nothing is lost.
-                                let text = payload
-                                    .get("text")
-                                    .and_then(|t| t.as_str())
-                                    .unwrap_or("");
+                                let text =
+                                    payload.get("text").and_then(|t| t.as_str()).unwrap_or("");
                                 if !text.trim().is_empty() {
                                     pending_reasoning.push(text.to_string());
                                     pending_reasoning_ts = Some(timestamp);
@@ -3929,9 +4740,7 @@ impl CodexParser {
                                     .map(|parts| {
                                         parts
                                             .iter()
-                                            .filter_map(|p| {
-                                                p.get("text").and_then(|t| t.as_str())
-                                            })
+                                            .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
                                             .filter(|t| !t.trim().is_empty())
                                             .collect::<Vec<_>>()
                                             .join("\n\n")
@@ -4339,30 +5148,32 @@ impl CodexParser {
                                     // routed through the same CollabAgentCard as
                                     // the live wait capsule. Two output shapes —
                                     // see `native_team_wait_input`.
-                                    let capsule = parse_codex_json_output(payload).and_then(
-                                        |output_obj| match output_obj
-                                            .get("status")
-                                            .and_then(|s| s.as_object())
-                                        {
-                                            Some(status) => {
-                                                // Mark returned agents so the spawn
-                                                // capsule won't also show their
-                                                // result, and record per-agent error
-                                                // state so the execution capsule can
-                                                // render failed (live parity).
-                                                for (agent_id, value) in status {
-                                                    agent_waited.insert(agent_id.clone());
-                                                    let (st, _) = extract_wait_agent_status(value);
-                                                    if is_error_collab_status(&st) {
-                                                        agent_errored.insert(agent_id.clone());
+                                    let capsule =
+                                        parse_codex_json_output(payload).and_then(|output_obj| {
+                                            match output_obj
+                                                .get("status")
+                                                .and_then(|s| s.as_object())
+                                            {
+                                                Some(status) => {
+                                                    // Mark returned agents so the spawn
+                                                    // capsule won't also show their
+                                                    // result, and record per-agent error
+                                                    // state so the execution capsule can
+                                                    // render failed (live parity).
+                                                    for (agent_id, value) in status {
+                                                        agent_waited.insert(agent_id.clone());
+                                                        let (st, _) =
+                                                            extract_wait_agent_status(value);
+                                                        if is_error_collab_status(&st) {
+                                                            agent_errored.insert(agent_id.clone());
+                                                        }
                                                     }
+                                                    (!status.is_empty())
+                                                        .then(|| build_collab_wait_input(status))
                                                 }
-                                                (!status.is_empty())
-                                                    .then(|| build_collab_wait_input(status))
+                                                None => native_team_wait_input(&output_obj),
                                             }
-                                            None => native_team_wait_input(&output_obj),
-                                        },
-                                    );
+                                        });
                                     if let Some((collab_input, is_error)) = capsule {
                                         messages.push(UnifiedMessage {
                                             id: format!("tool-{}", messages.len()),
@@ -4408,11 +5219,8 @@ impl CodexParser {
                                             // just `completed`): an errored/notFound
                                             // close with no wait must not lose its
                                             // message or its error state.
-                                            if let Some(prev) =
-                                                output_obj.get("previous_status")
-                                            {
-                                                let (st, msg) =
-                                                    extract_wait_agent_status(prev);
+                                            if let Some(prev) = output_obj.get("previous_status") {
+                                                let (st, msg) = extract_wait_agent_status(prev);
                                                 if let Some(text) = msg {
                                                     agent_fallback_results
                                                         .entry(agent_id.clone())
@@ -4463,21 +5271,21 @@ impl CodexParser {
                                             &mut shell_sessions,
                                         );
                                     }
-                                    let (raw_output, envelope_error) =
-                                        if envelope.status != ScriptStatus::Unknown
-                                            || output_value.is_some_and(|v| v.is_array())
-                                        {
-                                            (
-                                                with_note(
-                                                    Some(envelope.joined()),
-                                                    envelope.note.as_deref(),
-                                                )
-                                                .filter(|s| !s.is_empty()),
-                                                envelope.is_error(),
+                                    let (raw_output, envelope_error) = if envelope.status
+                                        != ScriptStatus::Unknown
+                                        || output_value.is_some_and(|v| v.is_array())
+                                    {
+                                        (
+                                            with_note(
+                                                Some(envelope.joined()),
+                                                envelope.note.as_deref(),
                                             )
-                                        } else {
-                                            (value_to_preview(output_value), false)
-                                        };
+                                            .filter(|s| !s.is_empty()),
+                                            envelope.is_error(),
+                                        )
+                                    } else {
+                                        (value_to_preview(output_value), false)
+                                    };
                                     // A poll about to be folded into the card of
                                     // the command it is collecting for: its
                                     // envelope has to go, and an envelope that
@@ -4715,7 +5523,8 @@ impl CodexParser {
                                     *is_error = true;
                                 }
                                 if let Some(dir) = session_dir {
-                                    let stats = agent_stats_cache.entry(agent_id.to_string())
+                                    let stats = agent_stats_cache
+                                        .entry(agent_id.to_string())
                                         .or_insert_with(|| {
                                             parse_codex_subagent_stats(dir, agent_id)
                                         });
@@ -5089,7 +5898,9 @@ fn reconcile_turn_usage(turns: &mut [MessageTurn], recorded: &TurnUsage) {
         .fold(TurnUsage::default(), |acc, u| codex_usage_add(&acc, u));
 
     let missing = TurnUsage {
-        input_tokens: recorded.input_tokens.saturating_sub(attributed.input_tokens),
+        input_tokens: recorded
+            .input_tokens
+            .saturating_sub(attributed.input_tokens),
         output_tokens: recorded
             .output_tokens
             .saturating_sub(attributed.output_tokens),
@@ -5107,10 +5918,11 @@ fn reconcile_turn_usage(turns: &mut [MessageTurn], recorded: &TurnUsage) {
     // Prefer a turn that already reports usage — it is one the transcript
     // itself tied to a model call, so the recovered tokens land beside spend
     // that really happened rather than on an unrelated bubble.
-    let target = turns
-        .iter()
-        .rposition(|t| t.usage.is_some())
-        .or_else(|| turns.iter().rposition(|t| matches!(t.role, TurnRole::Assistant)));
+    let target = turns.iter().rposition(|t| t.usage.is_some()).or_else(|| {
+        turns
+            .iter()
+            .rposition(|t| matches!(t.role, TurnRole::Assistant))
+    });
     if let Some(turn) = target.and_then(|i| turns.get_mut(i)) {
         turn.usage = Some(match turn.usage {
             Some(ref existing) => codex_usage_add(existing, &missing),
@@ -5743,9 +6555,9 @@ fn response_item_user_has_image(payload: &serde_json::Value) -> bool {
         .get("content")
         .and_then(|c| c.as_array())
         .is_some_and(|items| {
-            items.iter().any(|item| {
-                item.get("type").and_then(|v| v.as_str()) == Some("input_image")
-            })
+            items
+                .iter()
+                .any(|item| item.get("type").and_then(|v| v.as_str()) == Some("input_image"))
         })
 }
 
@@ -5897,37 +6709,56 @@ mod tests {
 
     use std::collections::{HashMap, HashSet};
 
+    use super::codex_parent_thread_id;
     use super::extract_codex_title_candidate;
     use super::extract_context_window_used_tokens_from_token_count_info;
     use super::extract_response_item_user_image_blocks;
     use super::extract_turn_usage_from_codex_usage;
-    use super::codex_parent_thread_id;
     use super::is_encrypted_envelope;
     use super::merge_codex_context_window_stats;
-    use super::native_team_wait_input;
-    use super::native_fork_parent_session_id_in;
     use super::merge_codex_total_usage_stats;
+    use super::native_fork_parent_session_id_in;
+    use super::native_team_wait_input;
     use super::parse_codex_subagent_stats;
-    use super::redact_encrypted_args;
     use super::recover_current_turn_citation_sources_from_path;
+    use super::redact_encrypted_args;
     use super::resolve_codex_home_dir_from;
-    use super::CODEX_SUBAGENT_LAUNCH_KEY;
-    use super::COLLAB_OP_KEY;
     use super::should_skip_duplicate_user_message;
     use super::strip_blocked_resource_mentions;
-    use super::{history_index_path, HISTORY_INDEX_CACHE, HISTORY_PAGE_CACHE};
     use super::AgentParser;
     use super::CodexParser;
     use super::CODEX_SCRIPT_TOOL_NAME;
+    use super::CODEX_SUBAGENT_LAUNCH_KEY;
+    use super::COLLAB_OP_KEY;
+    use super::{
+        build_history_index_slice, history_index_entries_path, history_index_path,
+        HISTORY_INDEX_CACHE, HISTORY_PAGE_CACHE,
+    };
     use crate::models::{
         ContentBlock, MessageRole, MessageTurn, SessionStats, TurnRole, TurnUsage, UnifiedMessage,
     };
     use chrono::{DateTime, Duration, Utc};
+    use sha2::{Digest, Sha256};
     use std::env;
-    use std::fs;
+    use std::fs::{self, OpenOptions};
     use std::io::{BufWriter, Seek, SeekFrom, Write};
     use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+    fn remove_history_index_fixture(path: &std::path::Path) {
+        HISTORY_INDEX_CACHE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(path);
+        if let Some(index_path) = history_index_path(path) {
+            let _ = fs::remove_file(index_path);
+        }
+        if let Some(entries_path) = history_index_entries_path(path) {
+            let _ = fs::remove_file(entries_path);
+        }
+    }
 
     fn write_index_title_fixture(
         conversation_id: &str,
@@ -6065,9 +6896,9 @@ mod tests {
                 ),
             ];
             fs::write(
-                temp_dir
-                    .path()
-                    .join(format!("rollout-2026-08-28T10-00-00-{conversation_id}.jsonl")),
+                temp_dir.path().join(format!(
+                    "rollout-2026-08-28T10-00-00-{conversation_id}.jsonl"
+                )),
                 format!("{}\n", lines.join("\n")),
             )
             .expect("write rollout");
@@ -6557,13 +7388,19 @@ mod tests {
             .iter()
             .filter_map(|t| t.usage.as_ref())
             .map(|u| {
-                u.input_tokens + u.output_tokens + u.cache_creation_input_tokens
+                u.input_tokens
+                    + u.output_tokens
+                    + u.cache_creation_input_tokens
                     + u.cache_read_input_tokens
             })
             .sum()
     }
 
-    fn parse_rollout(label: &str, content: &str, session_id: &str) -> crate::models::ConversationDetail {
+    fn parse_rollout(
+        label: &str,
+        content: &str,
+        session_id: &str,
+    ) -> crate::models::ConversationDetail {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system time ok")
@@ -6683,7 +7520,10 @@ mod tests {
         );
         let detail = parse_rollout("toolonly", content, "toolonly-1");
         assert!(
-            !detail.turns.iter().any(|t| matches!(t.role, TurnRole::Assistant)),
+            !detail
+                .turns
+                .iter()
+                .any(|t| matches!(t.role, TurnRole::Assistant)),
             "precondition: this rollout has no assistant turn"
         );
         let total = detail
@@ -6946,8 +7786,7 @@ mod tests {
 
         // active → create_goal, objective + status carried in the tool_result.
         let create_id = find("create_goal");
-        let create_out: serde_json::Value =
-            serde_json::from_str(&outputs[&create_id]).unwrap();
+        let create_out: serde_json::Value = serde_json::from_str(&outputs[&create_id]).unwrap();
         assert_eq!(create_out["goal"]["status"], "active");
         assert_eq!(create_out["goal"]["objective"], "Refactor the auth module");
         // Distinct goal events get distinct (occurrence-addressed) ids.
@@ -6955,8 +7794,7 @@ mod tests {
 
         // budgetLimited → update_goal with the status normalized to snake_case.
         let update_id = find("update_goal");
-        let update_out: serde_json::Value =
-            serde_json::from_str(&outputs[&update_id]).unwrap();
+        let update_out: serde_json::Value = serde_json::from_str(&outputs[&update_id]).unwrap();
         assert_eq!(update_out["goal"]["status"], "budget_limited");
         assert_eq!(update_out["goal"]["tokensUsed"], 5200);
         let update_in: serde_json::Value = serde_json::from_str(&inputs[&update_id]).unwrap();
@@ -7110,8 +7948,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time ok")
             .as_nanos();
-        let path: PathBuf =
-            env::temp_dir().join(format!("codeg-codex-goaltext-{nanos}.jsonl"));
+        let path: PathBuf = env::temp_dir().join(format!("codeg-codex-goaltext-{nanos}.jsonl"));
         let content = concat!(
             "{\"timestamp\":\"2026-03-01T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"gt-1\",\"cwd\":\"/tmp/demo\"}}\n",
             "{\"timestamp\":\"2026-03-01T10:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"/goal Analyze the README\"}}\n",
@@ -7129,7 +7966,10 @@ mod tests {
             .iter()
             .filter(|t| matches!(t.role, TurnRole::User))
             .count();
-        assert_eq!(user_turns, 1, "real user_message not duplicated by synthesis");
+        assert_eq!(
+            user_turns, 1,
+            "real user_message not duplicated by synthesis"
+        );
         let user_text = detail
             .turns
             .iter()
@@ -7158,8 +7998,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time ok")
             .as_nanos();
-        let path: PathBuf =
-            env::temp_dir().join(format!("codeg-codex-goaldup-{nanos}.jsonl"));
+        let path: PathBuf = env::temp_dir().join(format!("codeg-codex-goaldup-{nanos}.jsonl"));
         let content = concat!(
             "{\"timestamp\":\"2026-03-01T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"gd-1\",\"cwd\":\"/tmp/demo\"}}\n",
             "{\"timestamp\":\"2026-03-01T10:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_goal_updated\",\"goal\":{\"objective\":\"Investigate auth\",\"status\":\"active\"}}}\n",
@@ -7207,8 +8046,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time ok")
             .as_nanos();
-        let path: PathBuf =
-            env::temp_dir().join(format!("codeg-codex-goalconfirm-{nanos}.jsonl"));
+        let path: PathBuf = env::temp_dir().join(format!("codeg-codex-goalconfirm-{nanos}.jsonl"));
         let content = concat!(
             "{\"timestamp\":\"2026-03-01T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"gc-1\",\"cwd\":\"/tmp/demo\"}}\n",
             "{\"timestamp\":\"2026-03-01T10:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_goal_updated\",\"goal\":{\"objective\":\"Build a static page\",\"status\":\"active\"}}}\n",
@@ -7276,8 +8114,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time ok")
             .as_nanos();
-        let path: PathBuf =
-            env::temp_dir().join(format!("codeg-codex-sumconfirm-{nanos}.jsonl"));
+        let path: PathBuf = env::temp_dir().join(format!("codeg-codex-sumconfirm-{nanos}.jsonl"));
         let content = concat!(
             "{\"timestamp\":\"2026-03-01T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"sc-1\",\"cwd\":\"/tmp/demo\"}}\n",
             "{\"timestamp\":\"2026-03-01T10:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_goal_updated\",\"goal\":{\"objective\":\"Build a static page\",\"status\":\"active\"}}}\n",
@@ -7312,8 +8149,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time ok")
             .as_nanos();
-        let path: PathBuf =
-            env::temp_dir().join(format!("codeg-codex-sumgoal-{nanos}.jsonl"));
+        let path: PathBuf = env::temp_dir().join(format!("codeg-codex-sumgoal-{nanos}.jsonl"));
         let content = concat!(
             "{\"timestamp\":\"2026-03-01T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"sg-1\",\"cwd\":\"/tmp/demo\"}}\n",
             "{\"timestamp\":\"2026-03-01T10:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_goal_updated\",\"goal\":{\"objective\":\"Build a static test page\",\"status\":\"active\"}}}\n",
@@ -7329,10 +8165,7 @@ mod tests {
             .expect("summary present");
 
         // Objective wins as title; the internal-context text never leaks in.
-        assert_eq!(
-            summary.title.as_deref(),
-            Some("Build a static test page")
-        );
+        assert_eq!(summary.title.as_deref(), Some("Build a static test page"));
         // The synthesized user turn (+1) plus the agent_message (+1).
         assert_eq!(summary.message_count, 2);
 
@@ -7347,8 +8180,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time ok")
             .as_nanos();
-        let path: PathBuf =
-            env::temp_dir().join(format!("codeg-codex-sumname-{nanos}.jsonl"));
+        let path: PathBuf = env::temp_dir().join(format!("codeg-codex-sumname-{nanos}.jsonl"));
         let content = concat!(
             "{\"timestamp\":\"2026-03-01T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"sn-1\",\"cwd\":\"/tmp/demo\"}}\n",
             "{\"timestamp\":\"2026-03-01T10:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_goal_updated\",\"goal\":{\"objective\":\"Build a static test page\",\"status\":\"active\"}}}\n",
@@ -7379,8 +8211,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time ok")
             .as_nanos();
-        let path: PathBuf =
-            env::temp_dir().join(format!("codeg-codex-sumimg-{nanos}.jsonl"));
+        let path: PathBuf = env::temp_dir().join(format!("codeg-codex-sumimg-{nanos}.jsonl"));
         let content = concat!(
             "{\"timestamp\":\"2026-03-01T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"si-1\",\"cwd\":\"/tmp/demo\"}}\n",
             "{\"timestamp\":\"2026-03-01T10:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_goal_updated\",\"goal\":{\"objective\":\"Do the thing\",\"status\":\"active\"}}}\n",
@@ -7431,8 +8262,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time ok")
             .as_nanos();
-        let path: PathBuf =
-            env::temp_dir().join(format!("codeg-codex-sumnull-{nanos}.jsonl"));
+        let path: PathBuf = env::temp_dir().join(format!("codeg-codex-sumnull-{nanos}.jsonl"));
         let content = concat!(
             "{\"timestamp\":\"2026-03-01T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"snl-1\",\"cwd\":\"/tmp/demo\"}}\n",
             "{\"timestamp\":\"2026-03-01T10:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_goal_updated\",\"goal\":null}}\n",
@@ -7464,8 +8294,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time ok")
             .as_nanos();
-        let path: PathBuf =
-            env::temp_dir().join(format!("codeg-codex-gtxt-{nanos}.jsonl"));
+        let path: PathBuf = env::temp_dir().join(format!("codeg-codex-gtxt-{nanos}.jsonl"));
         let content = concat!(
             "{\"timestamp\":\"2026-03-01T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"gt2-1\",\"cwd\":\"/tmp/demo\"}}\n",
             "{\"timestamp\":\"2026-03-01T10:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_goal_updated\",\"goal\":{\"objective\":\"Do X\",\"status\":\"active\"}}}\n",
@@ -7517,8 +8346,7 @@ mod tests {
             .as_nanos();
 
         // (a) terminal-only goal → no capture, no synthetic count/title.
-        let path_a: PathBuf =
-            env::temp_dir().join(format!("codeg-codex-term-{nanos}.jsonl"));
+        let path_a: PathBuf = env::temp_dir().join(format!("codeg-codex-term-{nanos}.jsonl"));
         fs::write(
             &path_a,
             concat!(
@@ -7534,13 +8362,15 @@ mod tests {
             .expect("ok")
             .expect("present");
         assert_eq!(summary_a.title, None, "terminal goal is not a title");
-        assert_eq!(summary_a.message_count, 1, "no synthetic user for terminal goal");
+        assert_eq!(
+            summary_a.message_count, 1,
+            "no synthetic user for terminal goal"
+        );
         let _ = fs::remove_file(&path_a);
 
         // (b) terminal THEN active → the active objective is captured (not the
         // terminal one), matching the detail parser's first-create_goal capture.
-        let path_b: PathBuf =
-            env::temp_dir().join(format!("codeg-codex-termact-{nanos}.jsonl"));
+        let path_b: PathBuf = env::temp_dir().join(format!("codeg-codex-termact-{nanos}.jsonl"));
         fs::write(
             &path_b,
             concat!(
@@ -8014,8 +8844,7 @@ mod tests {
                 && source.url.starts_with("https://docs.example.org/open")
         }));
         assert!(sources.iter().any(|source| {
-            source.reference_id == "turn4search0"
-                && source.url == "https://example.com/result"
+            source.reference_id == "turn4search0" && source.url == "https://example.com/result"
         }));
         let _ = fs::remove_file(path);
     }
@@ -8241,9 +9070,12 @@ mod tests {
         assert_eq!(range.start_offset, delta_start);
         assert!(range.end_offset > 1_100_000_000);
         assert_eq!(user_texts(&range.detail), vec!["branch-only"]);
-        assert!(range.detail.turns.iter().flat_map(|turn| &turn.blocks).any(
-            |block| matches!(block, ContentBlock::Text { text } if text == "branch-result")
-        ));
+        assert!(range
+            .detail
+            .turns
+            .iter()
+            .flat_map(|turn| &turn.blocks)
+            .any(|block| matches!(block, ContentBlock::Text { text } if text == "branch-result")));
     }
 
     /// Regression for the reported multi-gigabyte rollout shape. A sparse
@@ -8271,8 +9103,8 @@ mod tests {
             )
         )
         .expect("write metadata");
-        file.set_len(2_232_143_172)
-            .expect("create sparse 2.08 GiB prefix");
+        file.set_len(3_300_000_000)
+            .expect("create sparse 3+ GB prefix");
         file.seek(SeekFrom::End(0)).expect("seek sparse tail");
         let mut writer = BufWriter::new(file);
         let output = "x".repeat(TOOL_OUTPUT_BYTES);
@@ -8331,7 +9163,7 @@ mod tests {
         writer.flush().expect("flush rollout");
 
         let source_bytes = fs::metadata(&path).expect("rollout metadata").len();
-        assert!(source_bytes > 2_000_000_000);
+        assert!(source_bytes > 3_000_000_000);
         let parser = CodexParser::with_base_dir(dir.path().to_path_buf());
         let started = Instant::now();
         let page = parser
@@ -8349,7 +9181,11 @@ mod tests {
         );
         assert_eq!(user_texts(&page.detail).len(), 6);
         assert!(page.has_more);
-        assert!(page.scan_bytes < 8 * 1024 * 1024);
+        assert!(page.scan_bytes <= super::CODEX_HISTORY_FIRST_PAGE_MAX_BYTES);
+        assert!(
+            page.end_offset.saturating_sub(page.start_offset)
+                <= super::CODEX_HISTORY_FIRST_PAGE_MAX_BYTES
+        );
         assert!(elapsed.as_secs() < 10, "tail page parse took {elapsed:?}");
         let cached = parser
             .get_conversation_page(conversation_id, None, 6, Some("/tmp/large".into()))
@@ -8370,9 +9206,159 @@ mod tests {
             .expect("reuse persisted page index after memory-cache reset");
         assert!(indexed.index_hit);
         assert_eq!(indexed.scan_bytes, 0);
-        if let Some(index_path) = history_index_path(&path) {
-            let _ = fs::remove_file(index_path);
-        }
+        remove_history_index_fixture(&path);
+    }
+
+    #[test]
+    fn history_index_resumes_at_the_append_boundary_and_survives_restart() {
+        let dir = tempfile::tempdir().expect("temp sessions dir");
+        let conversation_id = "incremental-index";
+        let path = dir
+            .path()
+            .join(format!("rollout-2026-08-06-{conversation_id}.jsonl"));
+        let first = [
+            rollout_line(
+                "2026-08-06T00:00:00Z",
+                "session_meta",
+                serde_json::json!({"id": conversation_id, "cwd": "/tmp/index"}),
+            ),
+            rollout_line(
+                "2026-08-06T00:00:01Z",
+                "event_msg",
+                serde_json::json!({"type":"user_message","message":"first"}),
+            ),
+            rollout_line(
+                "2026-08-06T00:00:02Z",
+                "event_msg",
+                serde_json::json!({"type":"agent_message","message":"answer"}),
+            ),
+        ]
+        .join("\n")
+            + "\n";
+        fs::write(&path, first).expect("write initial rollout");
+        let original_len = fs::metadata(&path).unwrap().len();
+        let (complete, indexed, total, entries) =
+            build_history_index_slice(&path, 64 * 1024).expect("build initial index");
+        assert!(complete);
+        assert_eq!(indexed, original_len);
+        assert_eq!(total, original_len);
+        assert!(entries >= 2);
+
+        // Simulate a process restart: the next builder must restore the
+        // durable checkpoint rather than scan from byte zero.
+        HISTORY_INDEX_CACHE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+        let appended = [
+            rollout_line(
+                "2026-08-06T00:00:03Z",
+                "event_msg",
+                serde_json::json!({"type":"user_message","message":"second"}),
+            ),
+            rollout_line(
+                "2026-08-06T00:00:04Z",
+                "event_msg",
+                serde_json::json!({"type":"agent_message","message":"second-answer"}),
+            ),
+        ]
+        .join("\n")
+            + "\n";
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(appended.as_bytes()).unwrap();
+        file.flush().unwrap();
+        let new_len = fs::metadata(&path).unwrap().len();
+        let (complete, indexed, total, new_entries) =
+            build_history_index_slice(&path, 64 * 1024).expect("index appended tail");
+        assert!(complete);
+        assert_eq!(indexed, new_len);
+        assert_eq!(total, new_len);
+        assert!(new_entries > entries);
+        assert_eq!(indexed - original_len, appended.len() as u64);
+
+        remove_history_index_fixture(&path);
+    }
+
+    #[test]
+    fn corrupt_history_index_rebuilds_without_touching_the_rollout() {
+        let dir = tempfile::tempdir().expect("temp sessions dir");
+        let conversation_id = "corrupt-index";
+        let path = dir
+            .path()
+            .join(format!("rollout-2026-08-06-{conversation_id}.jsonl"));
+        let source = [
+            rollout_line(
+                "2026-08-06T00:00:00Z",
+                "session_meta",
+                serde_json::json!({"id": conversation_id, "cwd": "/tmp/index"}),
+            ),
+            rollout_line(
+                "2026-08-06T00:00:01Z",
+                "event_msg",
+                serde_json::json!({"type":"user_message","message":"keep me"}),
+            ),
+            rollout_line(
+                "2026-08-06T00:00:02Z",
+                "event_msg",
+                serde_json::json!({"type":"agent_message","message":"kept"}),
+            ),
+        ]
+        .join("\n")
+            + "\n";
+        fs::write(&path, &source).expect("write rollout");
+        build_history_index_slice(&path, 64 * 1024).expect("build index");
+        let original_digest = Sha256::digest(fs::read(&path).unwrap());
+        let original_len = fs::metadata(&path).unwrap().len();
+        let meta_path = history_index_path(&path).expect("cache path");
+        fs::write(&meta_path, b"{not-json").expect("corrupt sidecar");
+        HISTORY_INDEX_CACHE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+
+        build_history_index_slice(&path, 64 * 1024).expect("rebuild corrupt index");
+        assert_eq!(fs::metadata(&path).unwrap().len(), original_len);
+        assert_eq!(Sha256::digest(fs::read(&path).unwrap()), original_digest);
+        let parser = CodexParser::with_base_dir(dir.path().to_path_buf());
+        let page = parser
+            .get_conversation_page(conversation_id, None, 1, Some("/tmp/index".into()))
+            .expect("read rebuilt page");
+        assert_eq!(user_texts(&page.detail), vec!["keep me"]);
+        assert!(page.index_hit);
+
+        remove_history_index_fixture(&path);
+    }
+
+    #[test]
+    fn cancelled_history_read_stops_before_parsing_the_page() {
+        let dir = tempfile::tempdir().expect("temp sessions dir");
+        let conversation_id = "cancelled-page";
+        let path = dir
+            .path()
+            .join(format!("rollout-2026-08-06-{conversation_id}.jsonl"));
+        fs::write(
+            &path,
+            rollout_line(
+                "2026-08-06T00:00:00Z",
+                "event_msg",
+                serde_json::json!({"type":"user_message","message":"never parsed"}),
+            ) + "\n",
+        )
+        .unwrap();
+        let parser = CodexParser::with_base_dir(dir.path().to_path_buf());
+        let cancelled = Arc::new(AtomicBool::new(true));
+        let error = parser
+            .get_conversation_page_cancellable(
+                conversation_id,
+                None,
+                25,
+                Some("/tmp/index".into()),
+                cancelled,
+            )
+            .err()
+            .expect("cancelled read must stop");
+        assert!(error.to_string().contains("cancelled"));
+        remove_history_index_fixture(&path);
     }
 
     fn rollout_line(ts: &str, msg_type: &str, payload: serde_json::Value) -> String {
@@ -8695,7 +9681,11 @@ mod tests {
                 serde_json::json!({"agent_b":{"completed":"B_RESULT_TOKEN"}}),
             ),
             narration("2026-06-27T10:00:09Z", "NARRATION_MID B back waiting A"),
-            wait("2026-06-27T10:00:10Z", "wait_2", serde_json::json!(["agent_a"])),
+            wait(
+                "2026-06-27T10:00:10Z",
+                "wait_2",
+                serde_json::json!(["agent_a"]),
+            ),
             wait_out(
                 "2026-06-27T10:00:11Z",
                 "wait_2",
@@ -9089,8 +10079,7 @@ mod tests {
                 _ => None,
             })
             .expect("spawn Agent capsule present");
-        let parsed: serde_json::Value =
-            serde_json::from_str(input).expect("spawn input is JSON");
+        let parsed: serde_json::Value = serde_json::from_str(input).expect("spawn input is JSON");
         assert_eq!(
             parsed.get("agent_id").and_then(|v| v.as_str()),
             Some("AGENT_UUID_X"),
@@ -9189,7 +10178,9 @@ mod tests {
         // 0.147 emits no wait/close capsule, so this card stands for the LAUNCH
         // only and must say so rather than read as "the sub-agent finished".
         assert_eq!(
-            parsed.get(CODEX_SUBAGENT_LAUNCH_KEY).and_then(|v| v.as_bool()),
+            parsed
+                .get(CODEX_SUBAGENT_LAUNCH_KEY)
+                .and_then(|v| v.as_bool()),
             Some(true)
         );
 
@@ -9234,7 +10225,10 @@ mod tests {
             })
             .expect("spawn Agent capsule present");
         let parsed: serde_json::Value = serde_json::from_str(input).expect("JSON");
-        assert_eq!(parsed.get("subagent_type").and_then(|v| v.as_str()), Some("worker"));
+        assert_eq!(
+            parsed.get("subagent_type").and_then(|v| v.as_str()),
+            Some("worker")
+        );
         assert_eq!(parsed.get("prompt").and_then(|v| v.as_str()), Some("do it"));
         assert!(parsed.get(CODEX_SUBAGENT_LAUNCH_KEY).is_none());
 
@@ -9297,7 +10291,10 @@ mod tests {
     fn redaction_leaves_ordinary_arguments_untouched() {
         let mut args = serde_json::json!({"cmd":"pnpm build","timeout_ms":3600000});
         assert!(!redact_encrypted_args(&mut args));
-        assert_eq!(args, serde_json::json!({"cmd":"pnpm build","timeout_ms":3600000}));
+        assert_eq!(
+            args,
+            serde_json::json!({"cmd":"pnpm build","timeout_ms":3600000})
+        );
         // Nested and array positions are reached.
         let sealed = format!("gAAAAAB{}", "0g7gOInVU3UTzqL".repeat(10));
         let mut nested = serde_json::json!({"outer":{"list":[sealed.clone(),"keep me"]}});
@@ -9380,14 +10377,17 @@ mod tests {
             })
             .expect("wait capsule present");
         let parsed: serde_json::Value = serde_json::from_str(input).expect("JSON");
-        assert_eq!(parsed.get(COLLAB_OP_KEY).and_then(|v| v.as_str()), Some("wait"));
-        assert_eq!(parsed.get("status").and_then(|v| v.as_str()), Some("completed"));
+        assert_eq!(
+            parsed.get(COLLAB_OP_KEY).and_then(|v| v.as_str()),
+            Some("wait")
+        );
+        assert_eq!(
+            parsed.get("status").and_then(|v| v.as_str()),
+            Some("completed")
+        );
         // No agents and no prompt — the card renders as a bare pill, exactly
         // what the live `collabAgentToolCall` produces for this output.
-        assert_eq!(
-            parsed.get("agentsStates"),
-            Some(&serde_json::json!({}))
-        );
+        assert_eq!(parsed.get("agentsStates"), Some(&serde_json::json!({})));
         let errored = detail
             .turns
             .iter()
@@ -9401,7 +10401,9 @@ mod tests {
     #[test]
     fn native_team_wait_shape_gate_and_timeout() {
         // `timed_out` is the shape gate: only the native-team output has it.
-        assert!(native_team_wait_input(&serde_json::json!({"message":"Wait completed."})).is_none());
+        assert!(
+            native_team_wait_input(&serde_json::json!({"message":"Wait completed."})).is_none()
+        );
         assert!(native_team_wait_input(&serde_json::json!({})).is_none());
         // A timeout is a real outcome — flag the capsule failed.
         let (input, is_error) =
@@ -9409,7 +10411,10 @@ mod tests {
                 .expect("native shape");
         assert!(is_error);
         let parsed: serde_json::Value = serde_json::from_str(&input).expect("JSON");
-        assert_eq!(parsed.get("status").and_then(|v| v.as_str()), Some("failed"));
+        assert_eq!(
+            parsed.get("status").and_then(|v| v.as_str()),
+            Some("failed")
+        );
     }
 
     #[test]
@@ -10955,20 +11960,35 @@ mod tests {
     fn a_labelled_fanout_splits_a_collapsed_blob_per_command() {
         let detail = code_mode_detail(
             &labelled_fanout(&["query-entry", "formula-service", "factor-full"]),
-            labelled_blob(6, &[
-                ("query-entry", "one"),
-                ("formula-service", "two"),
-                ("factor-full", "three"),
-            ]),
+            labelled_blob(
+                6,
+                &[
+                    ("query-entry", "one"),
+                    ("formula-service", "two"),
+                    ("factor-full", "three"),
+                ],
+            ),
             "code-mode-labelled",
         );
 
         assert_eq!(
             tool_uses(&detail),
             vec![
-                ("call_1#0".into(), "exec_command".into(), Some("echo 0".into())),
-                ("call_1#1".into(), "exec_command".into(), Some("echo 1".into())),
-                ("call_1#2".into(), "exec_command".into(), Some("echo 2".into())),
+                (
+                    "call_1#0".into(),
+                    "exec_command".into(),
+                    Some("echo 0".into())
+                ),
+                (
+                    "call_1#1".into(),
+                    "exec_command".into(),
+                    Some("echo 1".into())
+                ),
+                (
+                    "call_1#2".into(),
+                    "exec_command".into(),
+                    Some("echo 2".into())
+                ),
             ]
         );
         assert_eq!(
@@ -10992,12 +12012,21 @@ mod tests {
     #[test]
     fn a_truncated_separator_leaves_its_command_without_output() {
         let detail = code_mode_detail(
-            &labelled_fanout(&["query-entry", "formula-service", "vo", "formula-splice", "factor-full"]),
-            labelled_blob(20, &[
-                ("query-entry", "first"),
-                ("formula-service", "second\nvo-output\nsplice-output"),
-                ("factor-full", "last"),
+            &labelled_fanout(&[
+                "query-entry",
+                "formula-service",
+                "vo",
+                "formula-splice",
+                "factor-full",
             ]),
+            labelled_blob(
+                20,
+                &[
+                    ("query-entry", "first"),
+                    ("formula-service", "second\nvo-output\nsplice-output"),
+                    ("factor-full", "last"),
+                ],
+            ),
             "code-mode-labelled-partial",
         );
 
@@ -11005,7 +12034,11 @@ mod tests {
             tool_results(&detail),
             vec![
                 ("call_1#0".into(), Some("first".into()), false),
-                ("call_1#1".into(), Some("second\nvo-output\nsplice-output".into()), false),
+                (
+                    "call_1#1".into(),
+                    Some("second\nvo-output\nsplice-output".into()),
+                    false
+                ),
                 ("call_1#2".into(), None, false),
                 ("call_1#3".into(), None, false),
                 ("call_1#4".into(), Some("last".into()), false),
@@ -11013,7 +12046,10 @@ mod tests {
         );
 
         let metas = tool_metas(&detail);
-        assert_eq!(metas[1]["sharedWith"], serde_json::json!(["vo", "formula-splice"]));
+        assert_eq!(
+            metas[1]["sharedWith"],
+            serde_json::json!(["vo", "formula-splice"])
+        );
         assert_eq!(metas[2]["outputMissing"], true);
         assert_eq!(metas[3]["outputMissing"], true);
         assert!(metas[0].get("sharedWith").is_none());
@@ -11027,10 +12063,7 @@ mod tests {
     fn a_repeated_separator_line_keeps_the_script_card() {
         let detail = code_mode_detail(
             &labelled_fanout(&["alpha", "beta"]),
-            labelled_blob(8, &[
-                ("alpha", "one\n===== beta ====="),
-                ("beta", "two"),
-            ]),
+            labelled_blob(8, &[("alpha", "one\n===== beta ====="), ("beta", "two")]),
             "code-mode-labelled-dup",
         );
 
@@ -11046,11 +12079,14 @@ mod tests {
     fn a_repeated_output_line_still_splits() {
         let detail = code_mode_detail(
             &labelled_fanout(&["alpha", "beta", "gamma"]),
-            labelled_blob(8, &[
-                ("alpha", "shared line\none"),
-                ("beta", "shared line\ntwo"),
-                ("gamma", "three"),
-            ]),
+            labelled_blob(
+                8,
+                &[
+                    ("alpha", "shared line\none"),
+                    ("beta", "shared line\ntwo"),
+                    ("gamma", "three"),
+                ],
+            ),
             "code-mode-labelled-repeat",
         );
 
@@ -11135,7 +12171,9 @@ mod tests {
     /// want. Tool-only turns come back with `None`. The role is stringified
     /// because `TurnRole` is not `PartialEq` and a production model should not
     /// grow a derive to serve a test.
-    fn turn_texts(detail: &crate::models::ConversationDetail) -> Vec<(&'static str, Option<String>)> {
+    fn turn_texts(
+        detail: &crate::models::ConversationDetail,
+    ) -> Vec<(&'static str, Option<String>)> {
         detail
             .turns
             .iter()

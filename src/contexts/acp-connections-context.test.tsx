@@ -122,6 +122,8 @@ vi.mock("@/lib/api", () => ({
   getFolderConversation: vi.fn(async () => {
     throw new Error("detail not seeded in this suite")
   }),
+  invalidateFolderConversationCache: vi.fn(),
+  listConversationOutputWindow: vi.fn(),
 }))
 
 function Probe() {
@@ -367,9 +369,8 @@ describe("AcpConnectionsProvider cross-client viewer lifecycle", () => {
     await act(async () => {
       await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 42)
     })
-    const subscription = h.attach.mock.results.at(-1)?.value as
-      | { detach: ReturnType<typeof vi.fn> }
-      | undefined
+    const subscription = h.attach.mock.results[h.attach.mock.results.length - 1]
+      ?.value as { detach: ReturnType<typeof vi.fn> } | undefined
     h.acpDisconnect.mockClear()
 
     await act(async () => {
@@ -388,9 +389,8 @@ describe("AcpConnectionsProvider cross-client viewer lifecycle", () => {
     await act(async () => {
       await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 42)
     })
-    const subscription = h.attach.mock.results.at(-1)?.value as
-      | { detach: ReturnType<typeof vi.fn> }
-      | undefined
+    const subscription = h.attach.mock.results[h.attach.mock.results.length - 1]
+      ?.value as { detach: ReturnType<typeof vi.fn> } | undefined
     h.acpDisconnect.mockClear()
 
     view.unmount()
@@ -2387,8 +2387,8 @@ describe("AcpConnectionsProvider liveMessage sink (mirror out of React)", () => 
     })
 
     expect(calls).toHaveLength(2)
-    expect(calls.at(-1)!.isLive).toBe(true)
-    expect(calls.at(-1)!.content).toEqual([])
+    expect(calls[calls.length - 1]!.isLive).toBe(true)
+    expect(calls[calls.length - 1]!.content).toEqual([])
   })
 
   it("relays a subsequent liveMessage change (tool call appended) to the sink", async () => {
@@ -2527,7 +2527,7 @@ describe("AcpConnectionsProvider liveMessage sink (mirror out of React)", () => 
       status: "disconnected",
     })
 
-    expect(calls.at(-1)).toEqual({ live: false, isLive: false })
+    expect(calls[calls.length - 1]).toEqual({ live: false, isLive: false })
   })
 
   it("mirrors to the sink BEFORE notifying connection key subscribers", async () => {

@@ -40,6 +40,11 @@ const eslintConfig = defineConfig([
     "src-tauri/target/**",
     "src-tauri/experts/**",
     "public/vs/**",
+    // Local release staging and diagnostic captures are generated output.
+    // They can contain a second copy of the exported frontend and must not be
+    // traversed by `pnpm eslint .`.
+    "release/**",
+    "artifacts/**",
     // Gitignored scratch space for planning/review docs and one-off probe
     // scripts. Prettier already skips it — its `--ignore-path` defaults to
     // `.gitignore` — but flat config has no such default, so without this

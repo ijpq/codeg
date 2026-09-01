@@ -121,6 +121,7 @@ function seedSession(
     historyAssistantBaseline: null,
     batchBoundaryIndex: null,
     batchBoundaryPrefixHash: null,
+    promptDeliveries: {},
     loadingOlderTurns: false,
     olderTurnsPrependEpoch: 0,
     pendingCleanup: false,

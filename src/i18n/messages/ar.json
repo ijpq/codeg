@@ -3312,6 +3312,8 @@
         }
       },
       "contentParts": {
+        "loadBranchMergeSummary": "تحميل الملخص الكامل",
+        "loadingBranchMergeSummary": "جارٍ تحميل الملخص…",
         "showingTailOutput": "يتم عرض نهاية المخرجات أثناء البث لتحسين الأداء.",
         "result": "النتيجة",
         "unknown": "غير معروف",

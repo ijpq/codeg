@@ -3312,6 +3312,8 @@
         }
       },
       "contentParts": {
+        "loadBranchMergeSummary": "加载完整回归正文",
+        "loadingBranchMergeSummary": "正在加载回归正文…",
         "showingTailOutput": "为保证性能，流式输出时仅显示尾部内容。",
         "result": "结果",
         "unknown": "未知",

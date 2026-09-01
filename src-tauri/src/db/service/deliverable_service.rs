@@ -3,8 +3,8 @@ use std::path::{Component, Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, IntoActiveModel, QueryFilter,
-    QueryOrder, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait, IntoActiveModel,
+    QueryFilter, QueryOrder, Set, TransactionTrait,
 };
 
 use crate::db::entities::conversation_turn_file_change::ConversationTurnFileChangeKind;
@@ -1476,8 +1476,54 @@ pub async fn list_sets_for_turns(
     conversation_id: i32,
     turns: &[MessageTurn],
 ) -> Result<Vec<ConversationTurnDeliverableSet>, DbError> {
+    if turns.is_empty() {
+        return Ok(Vec::new());
+    }
+    let user_turns = turns
+        .iter()
+        .filter(|turn| matches!(turn.role, crate::models::TurnRole::User))
+        .collect::<Vec<_>>();
+    let client_message_ids = user_turns
+        .iter()
+        .map(|turn| turn.id.clone())
+        .collect::<Vec<_>>();
+    let prompt_fingerprints = user_turns
+        .iter()
+        .filter_map(|turn| crate::artifact_tracker::user_turn_fingerprint(turn))
+        .collect::<Vec<_>>();
+    let mut visible = Condition::any()
+        .add(conversation_turn_run::Column::Status.eq(ConversationTurnRunStatus::Running));
+    if !client_message_ids.is_empty() {
+        visible =
+            visible.add(conversation_turn_run::Column::ClientMessageId.is_in(client_message_ids));
+    }
+    if !prompt_fingerprints.is_empty() {
+        visible = visible
+            .add(conversation_turn_run::Column::PromptFingerprint.is_in(prompt_fingerprints));
+    }
+    if let (Some(first), Some(last)) = (
+        turns.iter().map(|turn| turn.timestamp).min(),
+        turns.iter().map(|turn| turn.timestamp).max(),
+    ) {
+        // Legacy runs without a persisted prompt fingerprint were already
+        // eligible only within 90 seconds of a visible user turn.  Push that
+        // same safe window into SQLite instead of materializing every run in a
+        // years-long conversation and discarding nearly all of them in Rust.
+        visible = visible.add(
+            Condition::all()
+                .add(
+                    conversation_turn_run::Column::StartedAt
+                        .gte(first - chrono::Duration::seconds(90)),
+                )
+                .add(
+                    conversation_turn_run::Column::StartedAt
+                        .lte(last + chrono::Duration::seconds(90)),
+                ),
+        );
+    }
     let runs = conversation_turn_run::Entity::find()
         .filter(conversation_turn_run::Column::ConversationId.eq(conversation_id))
+        .filter(visible)
         .order_by_asc(conversation_turn_run::Column::StartedAt)
         .all(conn)
         .await?;
@@ -1748,6 +1794,7 @@ mod tests {
         self, NewTurnRun, PendingFileChange, ReportedFileChange,
     };
     use crate::models::{AgentType, ContentBlock, MessageTurn, TurnRole};
+    use sea_orm::ConnectionTrait;
 
     async fn seed_run(
         db: &crate::db::AppDatabase,
@@ -1776,6 +1823,82 @@ mod tests {
         )
         .await
         .expect("run");
+    }
+
+    #[tokio::test]
+    async fn large_deliverable_ledger_is_returned_as_a_small_independent_page() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let folder_id = crate::db::test_helpers::seed_folder(&db, "/tmp/large-ledger").await;
+        let conversation_id =
+            crate::db::test_helpers::seed_conversation(&db, folder_id, AgentType::Codex).await;
+        let now = Utc::now().to_rfc3339();
+        db.conn
+            .execute_unprepared(&format!(
+                r#"
+                WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 753)
+                INSERT INTO conversation_turn_run (
+                    id, conversation_id, connection_id, client_message_id,
+                    prompt_accepted_at, prompt_fingerprint, cancel_request_id,
+                    cancel_requested_at, cancel_deadline_at, folder_id, root_path,
+                    status, capture_incomplete, stop_reason, started_at,
+                    completed_at, deliverables_declared_at, input_paths_json,
+                    declaration_status, declaration_attempted_at,
+                    declaration_error, expectation_json, settlement_status,
+                    settled_at, missing_expected_paths_json
+                )
+                SELECT printf('ledger-run-%d', x), {conversation_id},
+                    printf('ledger-conn-%d', x), printf('ledger-message-%d', x),
+                    '{now}', NULL, NULL, NULL, NULL, {folder_id}, '/tmp/large-ledger',
+                    'completed', 0, NULL, '{now}', '{now}', '{now}', '[]',
+                    'success', '{now}', NULL, '{{}}', 'settled', '{now}', '[]'
+                FROM n;
+
+                WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 758)
+                INSERT INTO conversation_deliverable (
+                    id, conversation_id, turn_run_id, root_path, path, kind,
+                    title, description, role, category, change_kind, position,
+                    source, file_name, extension, size_bytes, modified_at,
+                    is_valid, invalid_reason, is_hidden, verified_at,
+                    last_checked_at, created_at, updated_at
+                )
+                SELECT printf('ledger-file-%d', x), {conversation_id},
+                    printf('ledger-run-%d', ((x - 1) % 753) + 1),
+                    '/tmp/large-ledger', printf('output/file-%04d.pdf', x),
+                    'file', printf('File %d', x), NULL, 'primary',
+                    'standalone_output', 'created', 0, 'declared',
+                    printf('file-%04d.pdf', x), 'pdf', x * 100, '{now}',
+                    1, NULL, 0, '{now}', '{now}', '{now}', '{now}'
+                FROM n;
+
+                WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 1261)
+                INSERT INTO conversation_turn_deliverable (
+                    id, conversation_id, turn_run_id, deliverable_id, source,
+                    title, description, role, category, change_kind, position,
+                    created_at, updated_at
+                )
+                SELECT printf('ledger-map-%d', x), {conversation_id},
+                    printf('ledger-run-%d', ((x - 1) % 753) + 1),
+                    printf('ledger-file-%d', ((x - 1) % 758) + 1),
+                    'declared', printf('File %d', ((x - 1) % 758) + 1),
+                    NULL, 'primary', 'standalone_output', 'created', 0,
+                    '{now}', '{now}'
+                FROM n;
+                "#
+            ))
+            .await
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let page = list_history_page(&db.conn, conversation_id, 0, 25)
+            .await
+            .unwrap();
+        let response = serde_json::to_vec(&page).unwrap();
+        assert_eq!(page.total, 758);
+        assert_eq!(page.items.len(), 25);
+        assert!(page.has_more);
+        assert_eq!(page.next_offset, Some(25));
+        assert!(response.len() < 1024 * 1024);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
     #[tokio::test]

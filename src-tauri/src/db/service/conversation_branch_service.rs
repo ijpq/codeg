@@ -1,7 +1,9 @@
 use chrono::{Datelike, Local, NaiveDate, Utc};
+use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::NotSet, ColumnTrait, DatabaseConnection, EntityTrait,
-    IntoActiveModel, QueryFilter, QueryOrder, Set, TransactionError, TransactionTrait,
+    FromQueryResult, IntoActiveModel, QueryFilter, QueryOrder, QuerySelect, Set, TransactionError,
+    TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -406,6 +408,67 @@ pub async fn get_by_creation_request_id(
         .one(conn)
         .await?
         .map(Into::into))
+}
+
+/// Lightweight source-branch metadata.  Ordinary source-conversation opens do
+/// not call this query, and an explicit branch-list request never selects the
+/// potentially large snapshot context or any branch rollout content.
+#[derive(Debug, Clone, FromQueryResult, Serialize)]
+pub struct ConversationSourceBranchPreview {
+    pub branch_conversation_id: i32,
+    pub branch_session_id: Option<String>,
+    pub fork_mode: String,
+    pub inheritance_mode: String,
+    pub inherited_message_count: i32,
+    pub inherited_context_chars: i64,
+    pub inherited_estimated_tokens: i64,
+    pub lifecycle_state: String,
+    pub created_at: chrono::DateTime<Utc>,
+    pub last_merged_at: Option<chrono::DateTime<Utc>>,
+    pub merge_target_conversation_id: Option<i32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConversationSourceBranchPreviewPage {
+    pub items: Vec<ConversationSourceBranchPreview>,
+    pub next_offset: Option<u64>,
+    pub has_more: bool,
+}
+
+pub async fn branch_preview_page_for_source(
+    conn: &DatabaseConnection,
+    conversation_id: i32,
+    offset: u64,
+    limit: u64,
+) -> Result<ConversationSourceBranchPreviewPage, DbError> {
+    let limit = limit.clamp(1, 50);
+    let mut rows = conversation_branch::Entity::find()
+        .select_only()
+        .column(conversation_branch::Column::BranchConversationId)
+        .column(conversation_branch::Column::BranchSessionId)
+        .column(conversation_branch::Column::ForkMode)
+        .column(conversation_branch::Column::InheritanceMode)
+        .column(conversation_branch::Column::InheritedMessageCount)
+        .column(conversation_branch::Column::InheritedContextChars)
+        .column(conversation_branch::Column::InheritedEstimatedTokens)
+        .column(conversation_branch::Column::LifecycleState)
+        .column(conversation_branch::Column::CreatedAt)
+        .column(conversation_branch::Column::LastMergedAt)
+        .column(conversation_branch::Column::MergeTargetConversationId)
+        .filter(conversation_branch::Column::SourceConversationId.eq(conversation_id))
+        .order_by_desc(conversation_branch::Column::CreatedAt)
+        .offset(offset)
+        .limit(limit + 1)
+        .into_model::<ConversationSourceBranchPreview>()
+        .all(conn)
+        .await?;
+    let has_more = rows.len() as u64 > limit;
+    rows.truncate(limit as usize);
+    Ok(ConversationSourceBranchPreviewPage {
+        next_offset: has_more.then_some(offset + rows.len() as u64),
+        has_more,
+        items: rows,
+    })
 }
 
 pub async fn update_branch_session_id(
@@ -1623,6 +1686,80 @@ pub async fn merge_turns_for_target(
     Ok(turns)
 }
 
+/// Lightweight branch-return metadata for the conversation timeline.  The
+/// potentially large summary body is deliberately projected to a short SQL
+/// preview so SQLite never materializes every historical return in an ordinary
+/// conversation open.
+#[derive(Debug, Clone, FromQueryResult, Serialize)]
+pub struct ConversationBranchMergePreview {
+    pub id: String,
+    pub branch_conversation_id: i32,
+    pub created_at: chrono::DateTime<Utc>,
+    pub summary_preview: String,
+    pub summary_bytes: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ConversationBranchMergePreviewPage {
+    pub items: Vec<ConversationBranchMergePreview>,
+    pub next_offset: Option<u64>,
+    pub has_more: bool,
+}
+
+pub async fn merge_preview_page_for_target(
+    conn: &DatabaseConnection,
+    conversation_id: i32,
+    offset: u64,
+    limit: u64,
+) -> Result<ConversationBranchMergePreviewPage, DbError> {
+    let limit = limit.clamp(1, 50);
+    let mut rows = conversation_branch_merge::Entity::find()
+        .select_only()
+        .column(conversation_branch_merge::Column::Id)
+        .column(conversation_branch_merge::Column::BranchConversationId)
+        .column(conversation_branch_merge::Column::CreatedAt)
+        .column_as(Expr::cust("substr(summary, 1, 512)"), "summary_preview")
+        .column_as(Expr::cust("length(CAST(summary AS BLOB))"), "summary_bytes")
+        .filter(conversation_branch_merge::Column::TargetConversationId.eq(conversation_id))
+        .order_by_desc(conversation_branch_merge::Column::CreatedAt)
+        .offset(offset)
+        .limit(limit + 1)
+        .into_model::<ConversationBranchMergePreview>()
+        .all(conn)
+        .await?;
+    let has_more = rows.len() as u64 > limit;
+    rows.truncate(limit as usize);
+    Ok(ConversationBranchMergePreviewPage {
+        next_offset: has_more.then_some(offset + rows.len() as u64),
+        has_more,
+        items: rows,
+    })
+}
+
+pub async fn merge_previews_for_target(
+    conn: &DatabaseConnection,
+    conversation_id: i32,
+    limit: u64,
+) -> Result<Vec<ConversationBranchMergePreview>, DbError> {
+    let mut rows = merge_preview_page_for_target(conn, conversation_id, 0, limit)
+        .await?
+        .items;
+    rows.reverse();
+    Ok(rows)
+}
+
+pub async fn merge_summary_for_target(
+    conn: &DatabaseConnection,
+    conversation_id: i32,
+    merge_id: &str,
+) -> Result<Option<String>, DbError> {
+    Ok(conversation_branch_merge::Entity::find_by_id(merge_id)
+        .filter(conversation_branch_merge::Column::TargetConversationId.eq(conversation_id))
+        .one(conn)
+        .await?
+        .map(|row| row.summary))
+}
+
 pub async fn pending_merge_context(
     conn: &DatabaseConnection,
     conversation_id: i32,
@@ -2503,6 +2640,112 @@ mod tests {
         assert!(conversation_service::get_by_id(&db.conn, source_id)
             .await
             .is_ok());
+    }
+
+    #[tokio::test]
+    async fn branch_merge_history_projects_only_a_bounded_summary_preview() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/codeg-branch-preview-test").await;
+        let source_id = seed_conversation(&db, folder_id, AgentType::Codex).await;
+        let branch_id = seed_conversation(&db, folder_id, AgentType::Codex).await;
+        let summary = "回归正文".repeat(2_000);
+        conversation_branch_merge::ActiveModel {
+            id: Set("merge-large-summary".into()),
+            branch_conversation_id: Set(branch_id),
+            source_conversation_id: Set(source_id),
+            target_conversation_id: Set(source_id),
+            summary: Set(summary.clone()),
+            deliverable_ids_json: Set("[]".into()),
+            created_at: Set(Utc::now()),
+            context_consumed_at: Set(None),
+        }
+        .insert(&db.conn)
+        .await
+        .unwrap();
+
+        let page = merge_preview_page_for_target(&db.conn, source_id, 0, 20)
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert!(page.items[0].summary_preview.chars().count() <= 512);
+        assert_eq!(page.items[0].summary_bytes, summary.len() as i64);
+        assert_ne!(page.items[0].summary_preview, summary);
+        assert_eq!(
+            merge_summary_for_target(&db.conn, source_id, "merge-large-summary")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(summary.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn fourteen_branches_and_seven_returns_stay_summary_only() {
+        let db = fresh_in_memory_db().await;
+        let folder_id = seed_folder(&db, "/tmp/codeg-many-branches-test").await;
+        let source_id = seed_conversation(&db, folder_id, AgentType::Codex).await;
+        let source = conversation_service::get_by_id(&db.conn, source_id)
+            .await
+            .unwrap();
+        let mut branch_ids = Vec::new();
+        for index in 0..14 {
+            let (branch, _) = create_branch_row(
+                &db.conn,
+                &source,
+                Some(format!("branch-session-{index}")),
+                None,
+                "native",
+                BranchInheritanceRecord {
+                    source_session_id: source.external_id.clone(),
+                    branch_session_id: Some(format!("branch-session-{index}")),
+                    inheritance_mode: "native_fork".into(),
+                    inherited_message_count: 20_000,
+                    inherited_context_chars: 2_000_000_000,
+                    inherited_estimated_tokens: 500_000_000,
+                    inheritance_compressed: false,
+                    inheritance_truncated: false,
+                    inheritance_note: None,
+                    forked_through_at: None,
+                    source_rollout_offset: Some(2_000_000_000),
+                    branch_rollout_offset: Some(2_000_000_000),
+                    fork_boundary_kind: Some("exact_rollout_offset".into()),
+                    snapshot_version: 2,
+                    snapshot_context: None,
+                    snapshot_images: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+            branch_ids.push(branch.id);
+        }
+        for (index, branch_id) in branch_ids.iter().take(7).enumerate() {
+            conversation_branch_merge::ActiveModel {
+                id: Set(format!("many-merge-{index}")),
+                branch_conversation_id: Set(*branch_id),
+                source_conversation_id: Set(source_id),
+                target_conversation_id: Set(source_id),
+                summary: Set(format!("summary-{index}")),
+                deliverable_ids_json: Set("[]".into()),
+                created_at: Set(Utc::now() + chrono::Duration::seconds(index as i64)),
+                context_consumed_at: Set(Some(Utc::now())),
+            }
+            .insert(&db.conn)
+            .await
+            .unwrap();
+        }
+
+        let started = std::time::Instant::now();
+        let branches = branch_preview_page_for_source(&db.conn, source_id, 0, 20)
+            .await
+            .unwrap();
+        let merges = merge_preview_page_for_target(&db.conn, source_id, 0, 20)
+            .await
+            .unwrap();
+        assert_eq!(branches.items.len(), 14);
+        assert!(!branches.has_more);
+        assert_eq!(merges.items.len(), 7);
+        assert!(merges.items.iter().all(|item| item.summary_bytes < 64));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 
     #[tokio::test]

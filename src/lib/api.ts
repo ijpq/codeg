@@ -54,6 +54,10 @@ import type {
   ConversationSummary,
   ConversationDetail,
   ConversationTurnsPage,
+  ConversationBranchMergePreviewPage,
+  ConversationSourceBranchPreviewPage,
+  ConversationOutputWindow,
+  MessageTurn,
   DbConversationDetail,
   FolderInfo,
   AgentStats,
@@ -2168,11 +2172,85 @@ export async function importSelectedSessions(
  * implicit side effect of opening a conversation; export/search explicitly
  * walk opaque cursor pages.
  */
-const folderConversationFlights = new Map<
-  string,
-  Promise<DbConversationDetail>
->()
+interface FolderConversationFlight {
+  promise: Promise<DbConversationDetail>
+  controller: AbortController
+  consumers: number
+  settled: boolean
+}
+
+interface FolderConversationCacheEntry {
+  detail: DbConversationDetail
+  storedAt: number
+  usedAt: number
+}
+
+const FOLDER_CONVERSATION_CACHE_TTL_MS = 30_000
+const FOLDER_CONVERSATION_CACHE_MAX_ENTRIES = 8
+const folderConversationFlights = new Map<string, FolderConversationFlight>()
+const folderConversationCache = new Map<string, FolderConversationCacheEntry>()
 let folderConversationRequestSequence = 0
+
+function cancelledRequestError(): Error {
+  const error = new Error("Request cancelled")
+  error.name = "AbortError"
+  return error
+}
+
+function attachFolderConversationFlight(
+  flight: FolderConversationFlight,
+  signal?: AbortSignal
+): Promise<DbConversationDetail> {
+  if (signal?.aborted) return Promise.reject(cancelledRequestError())
+  flight.consumers += 1
+  return new Promise((resolve, reject) => {
+    let finished = false
+    const release = () => {
+      if (finished) return
+      finished = true
+      signal?.removeEventListener("abort", onAbort)
+      flight.consumers = Math.max(0, flight.consumers - 1)
+      if (!flight.settled && flight.consumers === 0) {
+        flight.controller.abort()
+      }
+    }
+    const onAbort = () => {
+      release()
+      reject(cancelledRequestError())
+    }
+    signal?.addEventListener("abort", onAbort, { once: true })
+    flight.promise.then(
+      (detail) => {
+        if (finished) return
+        release()
+        resolve(detail)
+      },
+      (error) => {
+        if (finished) return
+        release()
+        reject(error)
+      }
+    )
+  })
+}
+
+export function invalidateFolderConversationCache(
+  conversationId?: number
+): void {
+  if (conversationId === undefined) {
+    folderConversationCache.clear()
+    return
+  }
+  for (const [key] of folderConversationCache) {
+    try {
+      if (JSON.parse(key).conversationId === conversationId) {
+        folderConversationCache.delete(key)
+      }
+    } catch {
+      folderConversationCache.delete(key)
+    }
+  }
+}
 
 export async function getFolderConversation(
   conversationId: number,
@@ -2181,6 +2259,9 @@ export async function getFolderConversation(
     fromIndex?: number
     beforeCursor?: string | null
     userTurnLimit?: number | null
+    requestGeneration?: number | null
+    signal?: AbortSignal
+    cacheMode?: "default" | "reload"
   }
 ): Promise<DbConversationDetail> {
   const requestKey = {
@@ -2195,28 +2276,82 @@ export async function getFolderConversation(
       : {}),
   }
   const key = JSON.stringify(requestKey)
+  if (options?.signal?.aborted) throw cancelledRequestError()
+  if (process.env.NODE_ENV !== "test" && options?.cacheMode !== "reload") {
+    const cached = folderConversationCache.get(key)
+    if (
+      cached &&
+      Date.now() - cached.storedAt <= FOLDER_CONVERSATION_CACHE_TTL_MS
+    ) {
+      cached.usedAt = Date.now()
+      console.debug("[conversation][perf] detail cache hit", {
+        conversationId,
+        generation: options?.requestGeneration ?? null,
+        sourceVersion: cached.detail.history_page?.source_version ?? null,
+      })
+      return cached.detail
+    }
+    if (cached) folderConversationCache.delete(key)
+  }
   const existing = folderConversationFlights.get(key)
-  if (existing) {
+  if (existing && !existing.controller.signal.aborted) {
     if (process.env.NODE_ENV !== "test") {
       console.debug("[conversation][perf] duplicate detail request reused", {
         conversationId,
         cursor: options?.beforeCursor ?? null,
         userTurnLimit: options?.userTurnLimit ?? null,
+        generation: options?.requestGeneration ?? null,
       })
     }
-    return existing
+    return attachFolderConversationFlight(existing, options?.signal)
+  }
+  // The last consumer may have detached just before a replacement refresh
+  // arrived. Never attach that refresh to an already-aborted transport flight;
+  // its rejection can still be queued in a later microtask.
+  if (existing && folderConversationFlights.get(key) === existing) {
+    folderConversationFlights.delete(key)
   }
   const requestId = `${Date.now().toString(36)}-${(folderConversationRequestSequence += 1).toString(
     36
   )}`
   const args =
     isDesktop() && !isRemoteDesktopMode()
-      ? requestKey
-      : { ...requestKey, requestId }
+      ? { ...requestKey, requestGeneration: options?.requestGeneration ?? null }
+      : {
+          ...requestKey,
+          requestId,
+          requestGeneration: options?.requestGeneration ?? null,
+        }
   const started = Date.now()
-  const flight = getTransport()
-    .call<DbConversationDetail>("get_folder_conversation", args)
+  const controller = new AbortController()
+  const flight: FolderConversationFlight = {
+    controller,
+    consumers: 0,
+    settled: false,
+    promise: Promise.resolve(null as unknown as DbConversationDetail),
+  }
+  flight.promise = getTransport()
+    .call<DbConversationDetail>("get_folder_conversation", args, {
+      signal: controller.signal,
+    })
     .then((detail) => {
+      if (process.env.NODE_ENV !== "test") {
+        const now = Date.now()
+        folderConversationCache.set(key, {
+          detail,
+          storedAt: now,
+          usedAt: now,
+        })
+        while (
+          folderConversationCache.size > FOLDER_CONVERSATION_CACHE_MAX_ENTRIES
+        ) {
+          const oldest = [...folderConversationCache.entries()].sort(
+            (left, right) => left[1].usedAt - right[1].usedAt
+          )[0]?.[0]
+          if (!oldest) break
+          folderConversationCache.delete(oldest)
+        }
+      }
       if (process.env.NODE_ENV !== "test") {
         console.debug("[conversation][perf] detail received", {
           conversationId,
@@ -2226,17 +2361,37 @@ export async function getFolderConversation(
           loadedTurns: detail.turns.length,
           elapsedMs: Date.now() - started,
           requestReused: false,
+          generation: options?.requestGeneration ?? null,
+          readBytes: detail.history_page?.read_bytes ?? null,
+          scanBytes: detail.history_page?.scan_bytes ?? null,
+          parserCacheHit: detail.history_page?.cache_hit ?? null,
+          indexStatus: detail.history_page?.index_status ?? null,
         })
       }
       return detail
     })
+    .catch((error: unknown) => {
+      if (process.env.NODE_ENV !== "test") {
+        console.debug("[conversation][perf] detail request ended", {
+          conversationId,
+          requestId,
+          generation: options?.requestGeneration ?? null,
+          cancelled:
+            controller.signal.aborted ||
+            (error instanceof Error && error.name === "AbortError"),
+          elapsedMs: Date.now() - started,
+        })
+      }
+      throw error
+    })
     .finally(() => {
+      flight.settled = true
       if (folderConversationFlights.get(key) === flight) {
         folderConversationFlights.delete(key)
       }
     })
   folderConversationFlights.set(key, flight)
-  return flight
+  return attachFolderConversationFlight(flight, options?.signal)
 }
 
 /** Fetch one page of older history ending just before `beforeIndex`. */
@@ -2261,6 +2416,51 @@ export async function getDeferredHistoryContent(reference: string): Promise<{
   mime_type?: string | null
 }> {
   return getTransport().call("get_deferred_history_content", { reference })
+}
+
+/** Paged, preview-only branch returns. Complete summaries are fetched through
+ * getDeferredHistoryContent only after an explicit expansion. */
+export async function listConversationBranchMerges(
+  conversationId: number,
+  offset = 0,
+  limit = 20
+): Promise<ConversationBranchMergePreviewPage> {
+  return getTransport().call("list_conversation_branch_merges", {
+    conversationId,
+    offset,
+    limit,
+  })
+}
+
+/** Explicit, independently paged source-branch summaries. No branch rollout
+ * or stored snapshot context is materialized by this request. */
+export async function listConversationBranches(
+  conversationId: number,
+  offset = 0,
+  limit = 20
+): Promise<ConversationSourceBranchPreviewPage> {
+  return getTransport().call("list_conversation_branches", {
+    conversationId,
+    offset,
+    limit,
+  })
+}
+
+/** Refresh output associations for the already-visible transcript window.
+ * Only ids, timestamps, and roles cross the transport; the backend performs no
+ * rollout read and never receives prompt or response content. */
+export async function listConversationOutputWindow(
+  conversationId: number,
+  turns: readonly MessageTurn[]
+): Promise<ConversationOutputWindow> {
+  return getTransport().call("list_conversation_output_window", {
+    conversationId,
+    turnRefs: turns.slice(-200).map((turn) => ({
+      id: turn.id,
+      timestamp: turn.timestamp,
+      isUser: turn.role === "user",
+    })),
+  })
 }
 
 export interface CodexRolloutSizeDiagnostics {

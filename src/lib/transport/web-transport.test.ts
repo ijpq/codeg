@@ -147,6 +147,31 @@ describe("WebTransport connection state machine", () => {
     expect(lastWs()).not.toBe(ws)
   })
 
+  it("propagates caller cancellation to an in-flight history fetch", async () => {
+    const t = new WebTransport("http://localhost")
+    fetchMock.mockImplementation(
+      (_url: string, opts: { signal: AbortSignal }) =>
+        new Promise((_resolve, reject) => {
+          opts.signal.addEventListener(
+            "abort",
+            () => reject(new DOMException("Aborted", "AbortError")),
+            { once: true }
+          )
+        })
+    )
+    const controller = new AbortController()
+    const request = t.call(
+      "get_folder_conversation",
+      {},
+      {
+        signal: controller.signal,
+      }
+    )
+    controller.abort()
+    await expect(request).rejects.toMatchObject({ name: "AbortError" })
+    expect(fetchMock.mock.calls[0]![1].signal.aborted).toBe(true)
+  })
+
   it("starts connected and the first __ready__ does not fire reconnect callbacks", () => {
     const t = new WebTransport("http://localhost")
     const onReconnect = vi.fn()

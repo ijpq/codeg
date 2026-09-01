@@ -89,6 +89,9 @@ export interface CallOptions {
    * backend can return its own structured error.
    */
   timeoutMs?: number
+  /** Cancel an obsolete read. Web fetches are aborted; IPC transports reject
+   * the caller immediately and discard any late backend result. */
+  signal?: AbortSignal
 }
 
 export interface Transport {

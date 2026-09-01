@@ -3312,6 +3312,8 @@
         }
       },
       "contentParts": {
+        "loadBranchMergeSummary": "Charger le résumé complet",
+        "loadingBranchMergeSummary": "Chargement du résumé…",
         "showingTailOutput": "Affichage de la fin de la sortie pendant le streaming pour de meilleures performances.",
         "result": "Résultat",
         "unknown": "inconnu",

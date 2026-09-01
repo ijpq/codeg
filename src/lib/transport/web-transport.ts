@@ -159,16 +159,26 @@ export class WebTransport implements Transport {
   ): Promise<T> {
     const token = getToken()
     const controller = new AbortController()
+    let timedOut = false
+    const abortFromCaller = () => controller.abort()
+    if (options?.signal?.aborted) {
+      controller.abort()
+    } else {
+      options?.signal?.addEventListener("abort", abortFromCaller, {
+        once: true,
+      })
+    }
     // Per-call override beats the transport-wide default. Used for
     // commands whose backend handler has its own long deadline that
     // would otherwise race with `WEB_CALL_TIMEOUT_MS` and surface
     // "Request timed out" before the backend can return a structured
     // error. See `describeAgentOptions` in `lib/api.ts`.
     const effectiveTimeoutMs = options?.timeoutMs ?? WEB_CALL_TIMEOUT_MS
-    const timeout = window.setTimeout(
-      () => controller.abort(),
-      effectiveTimeoutMs
-    )
+    const requestStarted = performance.now()
+    const timeout = window.setTimeout(() => {
+      timedOut = true
+      controller.abort()
+    }, effectiveTimeoutMs)
     let res: Response
     try {
       res = await fetch(`${this.baseUrl}/api/${command}`, {
@@ -182,7 +192,10 @@ export class WebTransport implements Transport {
       })
     } catch (err) {
       if (err instanceof DOMException && err.name === "AbortError") {
-        throw new Error("Request timed out")
+        if (timedOut) throw new Error("Request timed out")
+        const cancelled = new Error("Request cancelled")
+        cancelled.name = "AbortError"
+        throw cancelled
       }
       // A fetch-level network error means no HTTP response was received at
       // all. Rebuild the possibly-half-open WebSocket immediately and let the
@@ -193,6 +206,7 @@ export class WebTransport implements Transport {
       throw err
     } finally {
       window.clearTimeout(timeout)
+      options?.signal?.removeEventListener("abort", abortFromCaller)
     }
     if (res.status === 401) {
       // Definitive auth failure. Surface the unified unauthorized dialog
@@ -209,7 +223,29 @@ export class WebTransport implements Transport {
       }))
       throw error
     }
-    return res.json()
+    const responseText = await res.text()
+    const bodyReceived = performance.now()
+    const parseStarted = performance.now()
+    const parsed = JSON.parse(responseText) as T
+    if (command === "get_folder_conversation") {
+      console.debug("[conversation][perf] browser response parsed", {
+        conversationId:
+          typeof args === "object" && args !== null && "conversationId" in args
+            ? (args as { conversationId?: unknown }).conversationId
+            : null,
+        generation:
+          typeof args === "object" &&
+          args !== null &&
+          "requestGeneration" in args
+            ? (args as { requestGeneration?: unknown }).requestGeneration
+            : null,
+        responseBytes: new TextEncoder().encode(responseText).byteLength,
+        fetchAndTransferMs:
+          Math.round((bodyReceived - requestStarted) * 100) / 100,
+        jsonParseMs: Math.round((performance.now() - parseStarted) * 100) / 100,
+      })
+    }
+    return parsed
   }
 
   async subscribe<T>(

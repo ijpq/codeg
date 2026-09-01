@@ -403,8 +403,8 @@ async fn get_folder_conversation_accepts_turn_window_params() {
     .await
     .expect("create conversation");
 
-    // tailTurns → windowed response: marker fields present even for an empty
-    // transcript (offset/total 0, fingerprint = seed).
+    // tailTurns is accepted only as a compatibility selector and converted to
+    // the same bounded opaque-cursor page used by current clients.
     let resp = server
         .post("/api/get_folder_conversation")
         .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
@@ -412,12 +412,13 @@ async fn get_folder_conversation_accepts_turn_window_params() {
         .await;
     assert_eq!(resp.status_code(), 200);
     let body = resp.json::<Value>();
-    assert_eq!(body["turns_offset"], 0);
-    assert_eq!(body["turns_total"], 0);
-    assert_eq!(body["assistant_turns_before_offset"], 0);
-    assert!(body["prefix_hash"].is_string());
+    assert_eq!(body["history_page"]["loaded_turns"], 0);
+    assert_eq!(body["history_page"]["has_more"], false);
+    assert!(body.get("turns_offset").is_none());
+    assert!(body.get("prefix_hash").is_none());
 
-    // No params → legacy full response: none of the window fields serialize.
+    // No selectors is an ordinary open and must still be bounded. It must
+    // never silently mean "parse the complete transcript".
     let resp = server
         .post("/api/get_folder_conversation")
         .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
@@ -425,6 +426,8 @@ async fn get_folder_conversation_accepts_turn_window_params() {
         .await;
     assert_eq!(resp.status_code(), 200);
     let body = resp.json::<Value>();
+    assert_eq!(body["history_page"]["loaded_turns"], 0);
+    assert_eq!(body["history_page"]["has_more"], false);
     assert!(body.get("turns_offset").is_none());
     assert!(body.get("prefix_hash").is_none());
 

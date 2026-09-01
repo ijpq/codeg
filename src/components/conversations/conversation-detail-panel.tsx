@@ -335,6 +335,7 @@ const ConversationTabView = memo(function ConversationTabView({
     appendViewerUserTurn,
     completeTurn,
     refetchDetail,
+    refreshVisibleOutputs,
     reconcileCompletedTurn,
     removeConversation,
     setAcpLoadError,
@@ -464,7 +465,7 @@ const ConversationTabView = memo(function ConversationTabView({
     const unlistens: (() => void)[] = []
     const scheduleRefresh = (conversationId: number) => {
       if (conversationId === dbConvIdRef.current) {
-        refetchDetail(effectiveConversationId, { preserveLive: true })
+        void refreshVisibleOutputs(effectiveConversationId)
       }
     }
 
@@ -510,7 +511,12 @@ const ConversationTabView = memo(function ConversationTabView({
       unlistens.forEach((dispose) => dispose())
       offReconnect?.()
     }
-  }, [effectiveConversationId, reconcileCompletedTurn, refetchDetail])
+  }, [
+    effectiveConversationId,
+    reconcileCompletedTurn,
+    refetchDetail,
+    refreshVisibleOutputs,
+  ])
 
   useEffect(() => {
     selectedAgentRef.current = selectedAgent
