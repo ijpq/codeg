@@ -46,6 +46,7 @@ function seedSession(
           pendingBackgroundSettlements: [],
           optimisticTurns: [],
           liveMessage: null,
+          promptDeliveries: {},
           syncState: "idle",
           activeTurnToken: null,
           lastTurnOwned: false,

@@ -50,6 +50,7 @@ function toConnStatus(status: string | null): ConnStatusKey {
   switch (status) {
     case "connected":
     case "prompting":
+    case "cancelling":
       return "connected"
     case "connecting":
       return "connecting"

@@ -14,7 +14,8 @@
 pub mod acp;
 pub mod acp_transcript;
 pub use acp::{
-    idle_sweep_task, idle_timeout_from_env, lifecycle_subscriber_task, SWEEP_INTERVAL_SECS,
+    idle_sweep_task, idle_timeout_from_env, lifecycle_subscriber_task, turn_reconciliation_task,
+    SWEEP_INTERVAL_SECS, TURN_RECONCILIATION_INTERVAL_SECS,
 };
 pub use acp::scratch_dir::scratch_sweep_task;
 pub use network::proxy::init_proxy_from_db;
@@ -22,12 +23,14 @@ mod app_error;
 #[cfg(all(feature = "tauri-runtime", target_os = "macos"))]
 mod app_menu;
 pub mod app_state;
+pub mod artifact_tracker;
 pub mod automation;
 pub mod backgrounds;
 /// Built-in browser. Only its wire types and its grant rules compile in server
 /// mode — see `browser/mod.rs` for why those two, and only those two.
 pub mod browser;
 pub mod chat_channel;
+pub mod citations;
 pub mod commands;
 pub mod computer;
 pub mod db;
@@ -93,16 +96,18 @@ mod tauri_app {
         browser as browser_commands,
         canvas as canvas_commands,
         chat_authoring as chat_authoring_commands, chat_channel as chat_channel_commands,
+        conversation_branches,
         clipboard as clipboard_commands,
         config_sync,
         conversation_tags,
         conversations,
         custom_skills as custom_skills_commands,
         deepseek_settings as deepseek_settings_commands, delegation as delegation_commands,
+        deliverables as deliverable_commands,
         experts as experts_commands, feedback as feedback_commands, file_io, folder_commands,
-        folder_links, office_tools as office_tools_commands, open_in,
-        folders, logging as logging_commands, mcp as mcp_commands,
-        model_provider as model_provider_commands, notification, pet as pet_commands, project_boot,
+        folder_links, folders, forge as forge_commands, logging as logging_commands,
+        mcp as mcp_commands, model_provider as model_provider_commands, notification,
+        office_tools as office_tools_commands, open_in, pet as pet_commands, project_boot,
         question as question_commands, quick_messages as quick_messages_commands,
         remote_proxy as remote_proxy_commands,
         remote_workspace as remote_workspace_commands, science as science_commands,
@@ -1204,6 +1209,12 @@ mod tauri_app {
                         std::sync::Arc::new(crate::commands::computer::McpComputerTools::new(
                             computer_service,
                         )),
+                        crate::acp::deliverables::shared_access(
+                            db_conn.clone(),
+                            crate::web::event_bridge::EventEmitter::Tauri(
+                                app.handle().clone(),
+                            ),
+                        ),
                     );
                     // Bind through the service handle rather than a bare
                     // `listener.run` spawn: it keeps the bind error and the
@@ -1241,6 +1252,13 @@ mod tauri_app {
                         cm,
                         bus,
                         Some(broker_for_lifecycle),
+                    ));
+                    tauri::async_runtime::spawn(crate::acp::turn_reconciliation_task(
+                        app.state::<ConnectionManager>().clone_ref(),
+                        app.state::<db::AppDatabase>().conn.clone(),
+                        std::time::Duration::from_secs(
+                            crate::acp::TURN_RECONCILIATION_INTERVAL_SECS,
+                        ),
                     ));
                 }
 
@@ -1677,6 +1695,11 @@ mod tauri_app {
                 conversations::scan_importable_sessions,
                 conversations::import_selected_sessions,
                 conversations::get_folder_conversation,
+                conversations::get_deferred_history_content,
+                conversations::list_conversation_branch_merges,
+                conversations::list_conversation_branches,
+                conversations::list_conversation_output_window,
+                conversations::diagnose_codex_rollout_size,
                 conversations::get_folder_conversation_turns,
                 conversations::list_folders,
                 conversations::get_stats,
@@ -1696,6 +1719,22 @@ mod tauri_app {
                 conversation_tags::get_conversation_branch_tag,
                 conversation_tags::update_conversation_branch_tag,
                 conversations::delete_conversation,
+                conversation_branches::create_conversation_branch,
+                conversation_branches::queue_conversation_branch_creation,
+                conversation_branches::get_conversation_branch_creation_task,
+                conversation_branches::cancel_conversation_branch_creation_task,
+                conversation_branches::get_conversation_branch_info,
+                conversation_branches::merge_conversation_branch,
+                deliverable_commands::deliverable_capabilities,
+                deliverable_commands::list_conversation_deliverables,
+                deliverable_commands::list_turn_deliverables,
+                deliverable_commands::list_conversation_deliverable_runs,
+                deliverable_commands::list_conversation_deliverable_history,
+                deliverable_commands::copy_deliverables,
+                deliverable_commands::open_deliverable,
+                deliverable_commands::reveal_deliverable,
+                deliverable_commands::hide_deliverables,
+                deliverable_commands::save_deliverables,
                 folders::load_folder_history,
                 folders::get_folder,
                 folders::list_open_folder_details,
@@ -1797,6 +1836,7 @@ mod tauri_app {
                 folders::list_workspace_files,
                 folders::read_file_base64,
                 folders::read_workspace_file_base64,
+                folders::stat_workspace_file,
                 folders::read_file_preview,
                 folders::read_file_for_edit,
                 folders::save_file_content,
@@ -1834,6 +1874,7 @@ mod tauri_app {
                 remote_proxy_commands::remote_cancel_workspace_transfer,
                 remote_proxy_commands::remote_download_workspace_file,
                 remote_proxy_commands::remote_download_workspace_dir,
+                remote_proxy_commands::remote_download_deliverables,
                 remote_proxy_commands::read_local_file_for_upload,
                 remote_proxy_commands::remote_ws_subscribe,
                 remote_proxy_commands::remote_ws_unsubscribe,
@@ -1958,7 +1999,9 @@ mod tauri_app {
                 acp_commands::acp_cursor_list_models,
                 acp_commands::acp_qoder_auth_status,
                 acp_commands::acp_connect,
+                acp_commands::acp_restore_conversation,
                 acp_commands::acp_prompt,
+                acp_commands::acp_steer,
                 acp_commands::acp_set_mode,
                 acp_commands::acp_set_config_option,
                 acp_commands::acp_goal_control,
@@ -2100,6 +2143,7 @@ mod tauri_app {
                 token_usage_commands::token_usage_facets,
                 token_usage_commands::token_usage_status,
                 token_usage_commands::token_usage_sync,
+                codex_quota_commands::codex_quota_snapshot,
                 work_task_commands::work_task_list,
                 work_task_commands::work_task_get,
                 work_task_commands::work_task_events,
@@ -2219,6 +2263,7 @@ mod tauri_app {
                 model_provider_commands::create_model_provider,
                 model_provider_commands::update_model_provider,
                 model_provider_commands::delete_model_provider,
+                model_provider_commands::probe_active_model_provider,
                 web::start_web_server,
                 web::stop_web_server,
                 web::get_web_server_status,

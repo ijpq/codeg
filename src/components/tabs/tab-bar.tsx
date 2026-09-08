@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { Reorder } from "motion/react"
 import type { PanInfo } from "motion/react"
 import { Maximize2, Minimize2, SquarePen } from "lucide-react"
+import { ListX, SquarePen } from "lucide-react"
 import { useTranslations } from "next-intl"
 import { cn } from "@/lib/utils"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
@@ -54,6 +55,7 @@ export function TabBar({ groupId, maximizeControl = false }: TabBarProps) {
   // there is one (fusion) — the file strip's own button follows the same rule.
   // Mobile shows one pane at a time and has nothing to cover.
   const showMaximize = maximizeControl && mode === "fusion" && !isMobile
+  const tTabs = useTranslations("Folder.tabs")
   const tabs = useTabStore((s) => s.tabs)
   const activeTabId = useTabStore((s) => s.activeTabId)
   const groupOf = useTabStore((s) => s.groupOf)
@@ -99,6 +101,14 @@ export function TabBar({ groupId, maximizeControl = false }: TabBarProps) {
   )
   const displayActiveId =
     groupId == null ? activeTabId : (groupSelection[groupId] ?? null)
+  // `closeAllTabs` is global, not group-scoped. Keep a single visible control:
+  // the ordinary strip always owns it; while split, only the globally focused
+  // group's strip does. Focusing another group naturally moves the affordance
+  // there instead of repeating a destructive-looking button in every pane.
+  const showCloseAll =
+    groupId == null ||
+    (activeTabId != null &&
+      groupOfTab(groupOf, groupLayout, activeTabId) === stripGroupId)
   const isTileMode = !!tileByGroup[stripGroupId]
   const handleToggleTile = useCallback(
     () => toggleGroupTile(stripGroupId),
@@ -459,6 +469,17 @@ export function TabBar({ groupId, maximizeControl = false }: TabBarProps) {
             ) : (
               <Maximize2 className="h-3.5 w-3.5" />
             )}
+          </button>
+        )}
+        {showCloseAll && (
+          <button
+            type="button"
+            onClick={closeAllTabs}
+            className="mx-1 flex h-7 w-7 shrink-0 items-center justify-center self-start rounded-full text-muted-foreground backdrop-blur-sm transition-colors hover:bg-destructive/10 hover:text-destructive"
+            aria-label={tTabs("closeAll")}
+            title={tTabs("closeAll")}
+          >
+            <ListX className="h-3.5 w-3.5" />
           </button>
         )}
       </div>

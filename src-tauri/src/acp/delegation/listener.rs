@@ -41,6 +41,11 @@ use crate::acp::delegation::transport::{
 use crate::acp::delegation::types::{
     DelegationRequest, DelegationTaskReport, ResumeDelegationRequest, TaskStatus,
 };
+use crate::acp::delegation::transport::BrokerDeliverablesRequest;
+use crate::acp::deliverables::{
+    PublishDeliverablesArgs, PublishDeliverablesOutcome, RejectedDeliverable,
+    SessionDeliverableAccess,
+};
 use crate::acp::feedback::{PendingFeedback, SessionFeedbackAccess};
 use crate::acp::question::{QuestionOutcome, SessionQuestionAccess};
 #[cfg(unix)]
@@ -57,7 +62,6 @@ use serde_json::Value;
 /// `wait_ms = 0` opts out of the ceiling and blocks until the task is terminal.
 const STATUS_WAIT_MAX_MS: u64 = 60_000;
 
-
 /// The bound-but-not-yet-served socket handed from [`DelegationListener::bind`]
 /// to [`DelegationListener::accept_loop`]. A UDS listener on unix; on Windows,
 /// the first named-pipe server instance (the loop creates each subsequent one
@@ -66,7 +70,6 @@ const STATUS_WAIT_MAX_MS: u64 = 60_000;
 pub type BoundSocket = tokio::net::UnixListener;
 #[cfg(windows)]
 pub type BoundSocket = tokio::net::windows::named_pipe::NamedPipeServer;
-
 /// Pluggable "what conversation is this parent currently in?" lookup. The
 /// production impl wraps `ConnectionManager.get_state`; tests use an
 /// in-memory map.
@@ -172,6 +175,8 @@ pub struct DelegationListener {
     /// (`computer_*`). Desktop-only like the browser — server mode gets
     /// `NoComputerDesktop` — and like it, re-checks its switch at call time.
     pub computer: Arc<dyn ComputerToolAccess>,
+    /// Verifies and persists the agent's explicit final-output declaration.
+    pub deliverables: Arc<dyn SessionDeliverableAccess>,
 }
 
 impl DelegationListener {
@@ -187,6 +192,7 @@ impl DelegationListener {
         authoring: Arc<dyn ChatAuthoringAccess>,
         browser: Arc<dyn BrowserToolAccess>,
         computer: Arc<dyn ComputerToolAccess>,
+        deliverables: Arc<dyn SessionDeliverableAccess>,
     ) -> Arc<Self> {
         Arc::new(Self {
             broker,
@@ -199,6 +205,7 @@ impl DelegationListener {
             authoring,
             browser,
             computer,
+            deliverables,
         })
     }
 
@@ -474,10 +481,7 @@ impl DelegationListener {
                         write_frame(conn, &feedback_response(&[])?).await?;
                     }
                     Some(parent_conn_id) => {
-                        let pending = self
-                            .feedback
-                            .read_pending_feedback(&parent_conn_id)
-                            .await;
+                        let pending = self.feedback.read_pending_feedback(&parent_conn_id).await;
                         // Read-only: the response carries the note ids
                         // (`_commit_ids`); delivery is committed LATER, by the
                         // companion's `CommitFeedback` once it actually returns
@@ -659,6 +663,9 @@ impl DelegationListener {
             BrokerMessage::ComputerClipboard(req) => {
                 // To its end: a write cannot be recalled.
                 computer_response(&self.process_computer_clipboard(req).await)?
+            }
+            BrokerMessage::PublishDeliverables(req) => {
+                deliverables_response(self.process_deliverables(req).await)?
             }
             BrokerMessage::Cancel(cancel) => {
                 self.process_cancel(cancel).await;
@@ -1184,6 +1191,43 @@ impl DelegationListener {
         self.authoring.create_work_task(ctx, req.spec).await
     }
 
+    async fn process_deliverables(
+        &self,
+        req: BrokerDeliverablesRequest,
+    ) -> PublishDeliverablesOutcome {
+        let Some(entry) = self.tokens.lookup(&req.token).await else {
+            return publish_rejected("invalid or expired session token");
+        };
+        if entry.parent_connection_id != req.parent_connection_id {
+            return publish_rejected("token does not match the parent connection");
+        }
+        let Some(conversation_id) = self
+            .parent_lookup
+            .current_conversation_id(&req.parent_connection_id)
+            .await
+        else {
+            return publish_rejected("parent has no active conversation");
+        };
+        let request_id = if req.request_id.trim().is_empty() {
+            uuid::Uuid::new_v4().to_string()
+        } else {
+            req.request_id
+        };
+        let args = req.args.unwrap_or_else(|| PublishDeliverablesArgs {
+            deliverables: req.deliverables,
+            ..Default::default()
+        });
+        self.deliverables
+            .publish_deliverables(
+                &request_id,
+                &req.parent_connection_id,
+                conversation_id,
+                &entry.working_dir,
+                args,
+            )
+            .await
+    }
+
     async fn process(&self, req: BrokerRequest) -> DelegationTaskReport {
         // 1. Token + parent_connection_id consistency check. Treat both as
         //    "canceled" since the LLM can't usefully react to either —
@@ -1475,6 +1519,27 @@ fn authoring_response(outcome: AuthoringOutcome) -> std::io::Result<BrokerRespon
     })
 }
 
+fn deliverables_response(outcome: PublishDeliverablesOutcome) -> std::io::Result<BrokerResponse> {
+    Ok(BrokerResponse {
+        outcome: serde_json::to_value(outcome).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("encode: {e}"))
+        })?,
+    })
+}
+
+fn publish_rejected(reason: &str) -> PublishDeliverablesOutcome {
+    PublishDeliverablesOutcome {
+        request_id: String::new(),
+        declaration_status: "failed".to_string(),
+        published: false,
+        accepted: Vec::new(),
+        rejected: vec![RejectedDeliverable {
+            path: String::new(),
+            reason: reason.to_string(),
+        }],
+    }
+}
+
 /// The `declined` outcome — used when the token is invalid, the connection is
 /// gone, or the answer one-shot was dropped without a response. The LLM reads it
 /// as "the user didn't answer; proceed with your own judgment".
@@ -1675,10 +1740,7 @@ mod tests {
     }
     #[async_trait]
     impl SessionFeedbackAccess for StubFeedback {
-        async fn read_pending_feedback(
-            &self,
-            parent_connection_id: &str,
-        ) -> Vec<PendingFeedback> {
+        async fn read_pending_feedback(&self, parent_connection_id: &str) -> Vec<PendingFeedback> {
             *self.read_conn.lock().await = Some(parent_connection_id.to_string());
             self.items.lock().await.clone()
         }
@@ -1698,9 +1760,7 @@ mod tests {
     #[derive(Default)]
     struct StubQuestion {
         pending: tokio::sync::Mutex<HashMap<String, oneshot::Sender<QuestionOutcome>>>,
-        registered: tokio::sync::Mutex<
-            Vec<(String, Vec<crate::acp::question::QuestionSpec>)>,
-        >,
+        registered: tokio::sync::Mutex<Vec<(String, Vec<crate::acp::question::QuestionSpec>)>>,
         canceled: tokio::sync::Mutex<Vec<String>>,
     }
     #[async_trait]
@@ -1923,6 +1983,23 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct StubDeliverables;
+
+    #[async_trait]
+    impl SessionDeliverableAccess for StubDeliverables {
+        async fn publish_deliverables(
+            &self,
+            _request_id: &str,
+            _parent_connection_id: &str,
+            _conversation_id: i32,
+            _workspace_root: &Path,
+            _args: crate::acp::deliverables::PublishDeliverablesArgs,
+        ) -> PublishDeliverablesOutcome {
+            PublishDeliverablesOutcome::default()
+        }
+    }
+
     use tokio::sync::oneshot;
 
     async fn make_broker(mock: Arc<MockSpawner>) -> Arc<DelegationBroker> {
@@ -1959,6 +2036,7 @@ mod tests {
             Arc::new(StubAuthoring::default()),
             Arc::new(NoBrowserTabs),
             Arc::new(NoComputerDesktop),
+            Arc::new(StubDeliverables),
         )
     }
 
@@ -1983,6 +2061,7 @@ mod tests {
             Arc::new(StubAuthoring::default()),
             Arc::new(NoBrowserTabs),
             Arc::new(NoComputerDesktop),
+            Arc::new(StubDeliverables),
         )
     }
 
@@ -2008,6 +2087,7 @@ mod tests {
             Arc::new(StubAuthoring::default()),
             Arc::new(NoBrowserTabs),
             Arc::new(NoComputerDesktop),
+            Arc::new(StubDeliverables),
         )
     }
 
@@ -2032,6 +2112,7 @@ mod tests {
             Arc::new(StubAuthoring::default()),
             Arc::new(NoBrowserTabs),
             Arc::new(NoComputerDesktop),
+            Arc::new(StubDeliverables),
         )
     }
 
@@ -2058,6 +2139,7 @@ mod tests {
             authoring,
             Arc::new(NoBrowserTabs),
             Arc::new(NoComputerDesktop),
+            Arc::new(StubDeliverables),
         )
     }
 
@@ -2083,6 +2165,7 @@ mod tests {
             Arc::new(StubAuthoring::default()),
             browser,
             Arc::new(NoComputerDesktop),
+            Arc::new(StubDeliverables),
         )
     }
 
@@ -2913,7 +2996,10 @@ mod tests {
         let commit_ids = resp.outcome["_commit_ids"].as_array().unwrap();
         assert_eq!(commit_ids, &vec!["f1", "f2"]);
         // Read was scoped to the token's parent connection id.
-        assert_eq!(feedback.read_conn.lock().await.as_deref(), Some("parent-conn"));
+        assert_eq!(
+            feedback.read_conn.lock().await.as_deref(),
+            Some("parent-conn")
+        );
         // The Feedback arm is READ-ONLY — it does NOT commit (delivery is
         // committed later, by the companion's CommitFeedback).
         assert!(feedback.committed.lock().await.is_empty());
@@ -3357,7 +3443,10 @@ mod tests {
             .await
             .expect("serve_one must return after peer close");
         result.unwrap().unwrap();
-        assert_eq!(questions.canceled.lock().await.as_slice(), &["q-1".to_string()]);
+        assert_eq!(
+            questions.canceled.lock().await.as_slice(),
+            &["q-1".to_string()]
+        );
     }
 
     /// An invalid token never registers a question and returns a `declined`
@@ -3365,7 +3454,8 @@ mod tests {
     #[tokio::test]
     async fn ask_invalid_token_declined() {
         let questions = Arc::new(StubQuestion::default());
-        let listener = make_question_listener(Arc::new(TokenRegistry::default()), questions.clone());
+        let listener =
+            make_question_listener(Arc::new(TokenRegistry::default()), questions.clone());
         let (mut client, mut server) = duplex(8 * 1024);
         let server_task = tokio::spawn(async move {
             listener.serve_one(&mut server).await.unwrap();

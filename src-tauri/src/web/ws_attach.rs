@@ -274,3 +274,18 @@ pub fn spawn_forwarder(
         }
     })
 }
+
+#[cfg(test)]
+mod heartbeat_wire_tests {
+    use super::*;
+
+    #[test]
+    fn ping_and_pong_wire_shapes_match_the_web_transport() {
+        let ping: ClientMsg = serde_json::from_str(r#"{"action":"ping"}"#).unwrap();
+        assert!(matches!(ping, ClientMsg::Ping));
+        assert_eq!(
+            serde_json::to_value(ServerMsg::Pong).unwrap(),
+            serde_json::json!({ "type": "pong" })
+        );
+    }
+}
