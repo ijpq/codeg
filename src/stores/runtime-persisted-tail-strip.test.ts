@@ -65,6 +65,7 @@ function seed(turns: MessageTurn[]) {
     backgroundTurns: [],
     pendingBackgroundSettlements: [],
     optimisticTurns: [],
+    promptDeliveries: {},
     liveMessage: null,
     syncState: "idle" as const,
     activeTurnToken: null,

@@ -84,6 +84,7 @@ jobs:
           SERVER_ONLY: ${{ github.event_name == 'workflow_dispatch' }}
         with:
           script: |
+            const fs = require("fs");
             const tag = process.env.RELEASE_TAG;
             const { owner, repo } = context.repo;
             const prerelease = process.env.PRERELEASE === "true";
@@ -117,8 +118,10 @@ jobs:
               ref: commitSha,
             });
 
-            let releaseBody =
-              commit.commit.message?.trim() || "_No commit message._";
+            const releaseNotesPath = `docs/releases/${tag}.md`;
+            let releaseBody = fs.existsSync(releaseNotesPath)
+              ? fs.readFileSync(releaseNotesPath, "utf8").trim()
+              : commit.commit.message?.trim() || "_No commit message._";
             if (context.payload.repository?.fork) {
               releaseBody +=
                 "\n\n> [!WARNING]\n" +
@@ -197,7 +200,9 @@ jobs:
 
   build-tauri:
     needs: create-draft-release
-    if: github.event_name == 'push'
+    # v0.30.5-fix1 is the server-only maintenance release requested by the
+    # operator. Keep the normal desktop matrix for later tags.
+    if: github.event_name == 'push' && github.ref_name != 'v0.30.5-fix1'
     name: Build ${{ matrix.name }}
     permissions:
       contents: write
@@ -894,7 +899,9 @@ jobs:
       always() &&
       needs.create-draft-release.result == 'success' &&
       needs.build-server.result == 'success' &&
-      (github.event_name == 'workflow_dispatch' || needs.build-tauri.result == 'success')
+      (github.event_name == 'workflow_dispatch' ||
+       needs.build-tauri.result == 'success' ||
+       (github.ref_name == 'v0.30.5-fix1' && needs.build-tauri.result == 'skipped'))
     name: Upload complete server asset set
     runs-on: ubuntu-22.04
     permissions:
@@ -991,7 +998,8 @@ jobs:
       - upload-server-assets
     if: >-
       github.event_name == 'push' &&
-      needs.build-tauri.result == 'success' &&
+      (needs.build-tauri.result == 'success' ||
+       (github.ref_name == 'v0.30.5-fix1' && needs.build-tauri.result == 'skipped')) &&
       needs.build-server.result == 'success' &&
       needs.upload-server-assets.result == 'success'
     runs-on: ubuntu-22.04
@@ -1034,8 +1042,15 @@ jobs:
             esac
           done
 
-          if [ "$setup_count" -ne 1 ] || [ "${#remote_assets[@]}" -ne 3 ]; then
-            echo "Expected one Windows setup and two Windows Server files"
+          expected_setup=1
+          expected_count=3
+          if [ "$RELEASE_TAG" = "v0.30.5-fix1" ]; then
+            expected_setup=0
+            expected_count=2
+          fi
+          if [ "$setup_count" -ne "$expected_setup" ] || \
+             [ "${#remote_assets[@]}" -ne "$expected_count" ]; then
+            echo "Expected $expected_setup setup and two Windows Server files"
             exit 1
           fi
 
@@ -1059,3 +1074,74 @@ jobs:
             });
 
             core.info(`Published release #${releaseId}`);
+
+  verify-server-only-release:
+    needs: publish-release
+    if: github.event_name == 'push' && github.ref_name == 'v0.30.5-fix1'
+    name: Re-download and verify Windows Server release
+    runs-on: windows-2022
+    permissions:
+      contents: read
+    steps:
+      - name: Verify published release and exact asset set
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $release = gh release view $env:RELEASE_TAG `
+            --repo $env:GITHUB_REPOSITORY `
+            --json tagName,isDraft,isPrerelease,assets | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw "Could not read published release" }
+          if ($release.tagName -ne $env:RELEASE_TAG -or $release.isDraft) {
+            throw "Release is missing, still a draft, or has the wrong tag"
+          }
+          $assetNames = @($release.assets | ForEach-Object { $_.name } | Sort-Object)
+          $expectedNames = @(
+            "codeg-server-windows-x64.zip",
+            "codeg-server-windows-x64.zip.sha256"
+          ) | Sort-Object
+          if (Compare-Object $assetNames $expectedNames) {
+            throw "Published asset set differs from the two expected Server files"
+          }
+
+      - name: Re-download, checksum, extract, and execute
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          New-Item -ItemType Directory -Force downloaded, expanded | Out-Null
+          gh release download $env:RELEASE_TAG `
+            --repo $env:GITHUB_REPOSITORY `
+            --pattern "codeg-server-windows-x64.zip" `
+            --pattern "codeg-server-windows-x64.zip.sha256" `
+            --dir downloaded
+          if ($LASTEXITCODE -ne 0) { throw "Release asset download failed" }
+
+          $archive = "downloaded/codeg-server-windows-x64.zip"
+          $checksum = "downloaded/codeg-server-windows-x64.zip.sha256"
+          $expectedHash = ((Get-Content $checksum -Raw).Trim() -split '\s+')[0].ToLower()
+          $actualHash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLower()
+          if ($actualHash -ne $expectedHash) {
+            throw "Downloaded archive SHA-256 does not match its checksum asset"
+          }
+
+          Expand-Archive -Path $archive -DestinationPath expanded
+          $root = "expanded/codeg-server-windows-x64"
+          $server = Join-Path $root "codeg-server.exe"
+          $companion = Join-Path $root "codeg-mcp.exe"
+          $index = Join-Path $root "web/index.html"
+          foreach ($required in @($server, $companion, $index)) {
+            if (-not (Test-Path $required -PathType Leaf)) {
+              throw "Required packaged file is missing: $required"
+            }
+          }
+
+          $expectedVersion = $env:RELEASE_TAG.TrimStart('v')
+          $actualVersion = (& $server --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $actualVersion -ne $expectedVersion) {
+            throw "Packaged server version '$actualVersion' does not equal '$expectedVersion'"
+          }
+          $help = (& $companion --help | Out-String)
+          if ($LASTEXITCODE -ne 0 -or $help -notlike "*codeg-mcp --parent-connection-id*") {
+            throw "Packaged codeg-mcp executable did not return the expected help text"
+          }

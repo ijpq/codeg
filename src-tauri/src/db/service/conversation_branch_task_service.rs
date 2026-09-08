@@ -1,3 +1,5 @@
+use std::sync::LazyLock;
+
 use chrono::Utc;
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, DatabaseConnection, EntityTrait};
 
@@ -5,6 +7,7 @@ use crate::db::entities::conversation_branch_creation_task;
 use crate::db::error::DbError;
 
 static TASK_STATE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static WORKER_INSTANCE_ID: LazyLock<String> = LazyLock::new(|| uuid::Uuid::new_v4().to_string());
 
 pub async fn create_or_get(
     conn: &DatabaseConnection,
@@ -36,6 +39,7 @@ pub async fn create_or_get(
         result_json: Set(None),
         error: Set(None),
         cancel_requested: Set(false),
+        worker_instance_id: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
     }
@@ -47,15 +51,44 @@ pub async fn get(
     conn: &DatabaseConnection,
     request_id: &str,
 ) -> Result<Option<conversation_branch_creation_task::Model>, DbError> {
-    Ok(conversation_branch_creation_task::Entity::find_by_id(request_id)
-        .one(conn)
-        .await?)
+    Ok(
+        conversation_branch_creation_task::Entity::find_by_id(request_id)
+            .one(conn)
+            .await?,
+    )
 }
 
-pub async fn mark_running(
+/// Reconcile a row whose in-process worker disappeared during a server
+/// restart. A durable task must never stay `running` forever or be presented
+/// as live work after its owning process is gone.
+pub async fn get_reconciled(
     conn: &DatabaseConnection,
     request_id: &str,
-) -> Result<bool, DbError> {
+) -> Result<Option<conversation_branch_creation_task::Model>, DbError> {
+    let _guard = TASK_STATE_LOCK.lock().await;
+    let Some(row) = conversation_branch_creation_task::Entity::find_by_id(request_id)
+        .one(conn)
+        .await?
+    else {
+        return Ok(None);
+    };
+    if row.status != "running"
+        || row.worker_instance_id.as_deref() == Some(WORKER_INSTANCE_ID.as_str())
+    {
+        return Ok(Some(row));
+    }
+    let mut active: conversation_branch_creation_task::ActiveModel = row.into();
+    active.status = Set("failed".into());
+    active.stage = Set("interrupted".into());
+    active.error = Set(Some(
+        "The server restarted while this branch was running. Check the conversation list for an already-created branch, then retry with a new request id if none exists."
+            .into(),
+    ));
+    active.updated_at = Set(Utc::now());
+    Ok(Some(active.update(conn).await?))
+}
+
+pub async fn mark_running(conn: &DatabaseConnection, request_id: &str) -> Result<bool, DbError> {
     let _guard = TASK_STATE_LOCK.lock().await;
     let Some(row) = get(conn, request_id).await? else {
         return Ok(false);
@@ -66,6 +99,7 @@ pub async fn mark_running(
     let mut active: conversation_branch_creation_task::ActiveModel = row.into();
     active.status = Set("running".into());
     active.stage = Set("creating_branch".into());
+    active.worker_instance_id = Set(Some(WORKER_INSTANCE_ID.clone()));
     active.updated_at = Set(Utc::now());
     active.update(conn).await?;
     Ok(true)
@@ -163,5 +197,30 @@ mod tests {
         assert_eq!(cancelled.status, "cancelled");
         assert!(cancelled.cancel_requested);
         assert!(!mark_running(&db.conn, "cancel-op").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn running_task_from_an_old_server_instance_becomes_interrupted() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let folder_id = crate::db::test_helpers::seed_folder(&db, "/tmp/branch-restart").await;
+        let conversation_id =
+            crate::db::test_helpers::seed_conversation(&db, folder_id, AgentType::Codex).await;
+        create_or_get(&db.conn, "restart-op", conversation_id, None)
+            .await
+            .unwrap();
+        assert!(mark_running(&db.conn, "restart-op").await.unwrap());
+
+        let row = get(&db.conn, "restart-op").await.unwrap().unwrap();
+        let mut active: conversation_branch_creation_task::ActiveModel = row.into();
+        active.worker_instance_id = Set(Some("stopped-server".into()));
+        active.update(&db.conn).await.unwrap();
+
+        let restored = get_reconciled(&db.conn, "restart-op")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.status, "failed");
+        assert_eq!(restored.stage, "interrupted");
+        assert!(restored.error.unwrap().contains("server restarted"));
     }
 }

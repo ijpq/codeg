@@ -4437,13 +4437,9 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
         const session = get().byConversationId.get(runtimeId)
         if (!session || session.localTurns.length === 0) return
         if (session.syncState === "awaiting_persist") return
-        const boundaryIndex = session.batchBoundaryIndex
-
-        // Windowed fetch anchored at the batch boundary: the response then
-        // holds exactly this batch's turns (plus anything appended after),
-        // never the history the baseline counted — so no per-fetch transfer
-        // of the whole transcript just to patch usage metadata. An old
-        // server ignores the selector and returns the legacy full parse.
+        // Read the authoritative newest bounded tail. Aligning its final
+        // assistant turns to the local batch remains valid when compaction has
+        // rewritten an older prefix, and avoids a full rollout parse.
         const metadataRequest = getFolderConversation(dbConversationId, {
           userTurnLimit: HISTORY_PAGE_USER_TURNS,
           cacheMode: "reload",
@@ -4465,46 +4461,20 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
             const parsedAssistantTurns = parsed.turns.filter(
               (t) => t.role === "assistant"
             )
-            // Persisted history precedes this batch in the parse; the count
-            // of leading parsed assistant turns that are history tells the
-            // alignment where the batch starts so it never folds a historical
-            // turn's stats into the first reply.
-            //
-            // WINDOWED response: the fingerprint gate decides. The window was
-            // requested at the batch boundary, so on a verified prefix the
-            // count is simply 0 (the whole window is this session's — the
-            // same semantics as the adopt path). A mismatch — boundary hash
-            // absent (captured under a legacy detail), offset not honored,
-            // or the prefix rewritten by compaction between capture and sync
-            // — means count-based alignment could pin WRONG metadata onto
-            // local turns, and first-write-wins would make that permanent.
-            // Metadata absence is recoverable; a mis-patch is not. So skip
-            // the turn patches entirely (session stats are still safe: they
-            // describe the full transcript regardless of the window).
-            //
-            // LEGACY response (old server): today's math, verbatim — the
-            // global baseline over the full parse.
             const responseWindowed = isWindowedDetail(parsed)
-            const boundaryHash = cur.batchBoundaryPrefixHash
-            const windowVerified =
-              responseWindowed &&
-              boundaryHash != null &&
-              parsed.turns_offset === boundaryIndex &&
-              parsed.prefix_hash === boundaryHash
             const persistedAssistantCount = responseWindowed
-              ? 0
+              ? Math.max(
+                  0,
+                  parsedAssistantTurns.length - localAssistantIndices.length
+                )
               : (cur.historyAssistantBaseline ?? 0)
-            const patches =
-              responseWindowed && !windowVerified
-                ? []
-                : computeTurnMetadataPatches({
-                    localAssistantIndices,
-                    parsedAssistantTurns,
-                    persistedAssistantCount,
-                    parseEndsWithAssistant:
-                      parsed.turns[parsed.turns.length - 1]?.role ===
-                      "assistant",
-                  })
+            const patches = computeTurnMetadataPatches({
+              localAssistantIndices,
+              parsedAssistantTurns,
+              persistedAssistantCount,
+              parseEndsWithAssistant:
+                parsed.turns[parsed.turns.length - 1]?.role === "assistant",
+            })
             if (patches.length > 0 || parsed.session_stats) {
               dispatch({
                 type: "PATCH_TURN_METADATA",

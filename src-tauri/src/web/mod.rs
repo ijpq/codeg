@@ -342,15 +342,21 @@ pub(crate) fn find_static_dir_tauri(app: &tauri::AppHandle) -> PathBuf {
 
 pub(crate) fn find_static_dir_fallback() -> PathBuf {
     // Dev mode: "out/" is at the project root, which is one level above src-tauri/.
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let project_out = manifest_dir.parent().map(|p| p.join("out"));
-    if let Some(ref out) = project_out {
-        if out.join("index.html").exists() {
-            tracing::info!(
-                "[WEB] Serving static files from project out/: {}",
-                out.display()
-            );
-            return out.clone();
+    // Keep the compile-time source path out of optimized release binaries.
+    // Packaged builds resolve CODEG_STATIC_DIR or their sibling `web/`; only
+    // cargo/Tauri development needs to locate the repository's `out/` folder.
+    #[cfg(debug_assertions)]
+    {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let project_out = manifest_dir.parent().map(|p| p.join("out"));
+        if let Some(ref out) = project_out {
+            if out.join("index.html").exists() {
+                tracing::info!(
+                    "[WEB] Serving static files from project out/: {}",
+                    out.display()
+                );
+                return out.clone();
+            }
         }
     }
 
