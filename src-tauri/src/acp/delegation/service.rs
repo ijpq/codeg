@@ -340,6 +340,23 @@ mod tests {
     }
 
     #[async_trait]
+    impl crate::acp::deliverables::SessionDeliverableAccess for Stub {
+        async fn publish_deliverables(
+            &self,
+            request_id: &str,
+            _parent_connection_id: &str,
+            _conversation_id: i32,
+            _workspace_root: &std::path::Path,
+            _args: crate::acp::deliverables::PublishDeliverablesArgs,
+        ) -> crate::acp::deliverables::PublishDeliverablesOutcome {
+            crate::acp::deliverables::PublishDeliverablesOutcome {
+                request_id: request_id.to_string(),
+                ..Default::default()
+            }
+        }
+    }
+
+    #[async_trait]
     impl crate::acp::chat_authoring::ChatAuthoringAccess for Stub {
         async fn create_automation(
             &self,
@@ -365,6 +382,7 @@ mod tests {
         let listener = DelegationListener::new(
             broker,
             Arc::new(TokenRegistry::default()),
+            Arc::new(Stub),
             Arc::new(Stub),
             Arc::new(Stub),
             Arc::new(Stub),

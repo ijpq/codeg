@@ -175,8 +175,13 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog"
 import { cn } from "@/lib/utils"
+import { formatConversationTitle } from "@/lib/conversation-title"
 import { FolderAliasLabel } from "./folder-alias-label"
 import { toErrorMessage } from "@/lib/app-error"
+import {
+  getDatedBranchTitle,
+  requestConversationBranchCreation,
+} from "./conversation-branch-creation-action"
 
 // Layout effect on the client (so the sticky overlay is positioned before
 // paint) but a no-op-safe passive effect during the static-export prerender.
@@ -877,7 +882,7 @@ export interface SidebarConversationListProps {
 export function SidebarConversationList({
   ref,
   showCompleted = true,
-  sortMode = "created",
+  sortMode = "updated",
   sectionOrder = DEFAULT_SECTION_ORDER,
   showWorktrees = false,
   showRecent = false,
@@ -886,9 +891,11 @@ export function SidebarConversationList({
 }) {
   const t = useTranslations("Folder.sidebar")
   const tCommon = useTranslations("Folder.common")
+  const tConversationCard = useTranslations("Folder.conversationCard")
   const tFolderDropdown = useTranslations("Folder.folderNameDropdown")
   const tFileTree = useTranslations("Folder.fileTreeTab")
   const tRemote = useTranslations("RemoteWorkspace")
+  const tBranch = useTranslations("Folder.conversation.branch")
   const { themeColor: appThemeColor } = useThemeColor()
   const { createTerminalInDirectory } = useTerminalContext()
   const { zoomLevel } = useZoomLevel()
@@ -934,6 +941,11 @@ export function SidebarConversationList({
     openChatModeTab,
   } = useTabActions()
   const { openConversations } = useWorkbenchRoute()
+  // One operation id per deliberate sidebar action. Keep it across transient
+  // failures so retrying cannot create a second branch, and share the in-flight
+  // guard across the Recent and canonical copies of the same conversation row.
+  const branchRequestIdsRef = useRef(new Map<number, string>())
+  const branchInFlightRef = useRef(new Set<number>())
 
   const folderIndex = useMemo(() => {
     const map = new Map<
@@ -2072,6 +2084,68 @@ export function SidebarConversationList({
     [updateConversationLocal]
   )
 
+  const handleCreateBranch = useCallback(
+    async (conversation: DbConversationSummary) => {
+      if (branchInFlightRef.current.has(conversation.id)) return
+      branchInFlightRef.current.add(conversation.id)
+      let requestId = branchRequestIdsRef.current.get(conversation.id)
+      if (!requestId) {
+        requestId = crypto.randomUUID()
+        branchRequestIdsRef.current.set(conversation.id, requestId)
+      }
+      try {
+        const action = await requestConversationBranchCreation({
+          conversationId: conversation.id,
+          agentType: conversation.agent_type,
+          requestId,
+        })
+        if (action.kind === "queued") {
+          branchRequestIdsRef.current.delete(conversation.id)
+          return
+        }
+
+        await refreshConversations()
+        const result = action.result
+        const branchTitle = useAppWorkspaceStore
+          .getState()
+          .conversations.find(
+            (candidate) => candidate.id === result.branchConversationId
+          )?.title
+        openConversations()
+        openTab(
+          result.folderId,
+          result.branchConversationId,
+          conversation.agent_type as Parameters<typeof openTab>[2],
+          true,
+          branchTitle ??
+            getDatedBranchTitle(
+              formatConversationTitle(conversation.title) ||
+                tConversationCard("untitledConversation")
+            )
+        )
+        branchRequestIdsRef.current.delete(conversation.id)
+        toast.success(
+          result.inheritanceMode === "native_fork"
+            ? tBranch("nativeCreated")
+            : tBranch("provisionalCreated")
+        )
+      } catch (error) {
+        // Retain requestId so an explicit retry remains idempotent even if the
+        // server completed the operation but the response was lost.
+        toast.error(toErrorMessage(error))
+      } finally {
+        branchInFlightRef.current.delete(conversation.id)
+      }
+    },
+    [
+      openConversations,
+      openTab,
+      refreshConversations,
+      tBranch,
+      tConversationCard,
+    ]
+  )
+
   const handleTogglePin = useCallback(
     async (id: number, nextPinned: boolean) => {
       // Optimistic: instantly move the row into / out of the Pinned section. The
@@ -3018,6 +3092,7 @@ export function SidebarConversationList({
         onRename={handleRename}
         onDelete={handleDelete}
         onStatusChange={handleStatusChange}
+        onCreateBranch={handleCreateBranch}
         onNewConversation={handleNewConversationForFolder}
         onTogglePin={handleTogglePin}
         depth={row.depth}

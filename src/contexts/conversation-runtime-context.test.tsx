@@ -54,6 +54,8 @@ import type {
 
 vi.mock("@/lib/api", () => ({
   getFolderConversation: vi.fn(),
+  invalidateFolderConversationCache: vi.fn(),
+  listConversationOutputWindow: vi.fn(),
 }))
 
 const { getFolderConversation } = await import("@/lib/api")

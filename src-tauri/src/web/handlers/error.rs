@@ -9,16 +9,21 @@ use crate::app_error::{AppCommandError, AppErrorCode};
 fn status_for_app_error_code(code: AppErrorCode) -> StatusCode {
     match code {
         AppErrorCode::InvalidInput => StatusCode::BAD_REQUEST,
-        AppErrorCode::NotFound => StatusCode::NOT_FOUND,
-        AppErrorCode::AlreadyExists | AppErrorCode::TurnInProgress => StatusCode::CONFLICT,
+        AppErrorCode::NotFound | AppErrorCode::ConnectionNotFound => StatusCode::NOT_FOUND,
+        AppErrorCode::ProcessExited => StatusCode::GONE,
+        AppErrorCode::AlreadyExists
+        | AppErrorCode::TurnInProgress
+        | AppErrorCode::NoActiveSteerTurn => StatusCode::CONFLICT,
         AppErrorCode::PermissionDenied => StatusCode::FORBIDDEN,
         AppErrorCode::ConfigurationMissing
         | AppErrorCode::ConfigurationInvalid
         | AppErrorCode::DependencyMissing
+        | AppErrorCode::SteerUnsupported
         | AppErrorCode::NotAGitRepository
         | AppErrorCode::AuthenticationFailed => StatusCode::UNPROCESSABLE_ENTITY,
         AppErrorCode::NetworkError
         | AppErrorCode::DatabaseError
+        | AppErrorCode::BranchMergeFailed
         | AppErrorCode::IoError
         | AppErrorCode::ExternalCommandFailed
         | AppErrorCode::WindowOperationFailed
@@ -42,6 +47,14 @@ mod tests {
         assert_eq!(
             status_for_app_error_code(AppErrorCode::AuthenticationFailed),
             StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+
+    #[test]
+    fn branch_merge_transaction_failure_has_stable_server_error_status() {
+        assert_eq!(
+            status_for_app_error_code(AppErrorCode::BranchMergeFailed),
+            StatusCode::INTERNAL_SERVER_ERROR
         );
     }
 }

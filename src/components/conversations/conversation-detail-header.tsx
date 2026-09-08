@@ -1,31 +1,40 @@
 "use client"
 
-import { memo, useCallback, useState } from "react"
+import { memo, useCallback, useEffect, useRef, useState } from "react"
 import {
+  ArrowLeft,
   ChevronRight,
   Circle,
   EllipsisVertical,
   Info,
+  GitBranch,
+  GitMerge,
   Pencil,
   Pin,
   PinOff,
   SquarePen,
   Trash2,
 } from "lucide-react"
+import { toast } from "sonner"
 import { useTranslations } from "next-intl"
 import { useImeGuard } from "@/hooks/use-ime-guard"
 import {
   deleteConversation,
+  getConversationBranchInfo,
+  mergeConversationBranch,
   updateConversationPinned,
   updateConversationStatus,
   updateConversationTitle,
 } from "@/lib/api"
+import type { ConversationBranchInfo } from "@/lib/api"
 import { formatConversationTitle } from "@/lib/conversation-title"
+import { extractAppCommandError, toErrorMessage } from "@/lib/app-error"
 import { ConversationHeaderFolderPicker } from "@/components/chat/conversation-context-bar"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
 import { useTabActions } from "@/contexts/tab-context"
 import { getRuntimeSession } from "@/stores/conversation-runtime-store"
 import type { ConversationStatus } from "@/lib/types"
+import { subscribe } from "@/lib/platform"
 import { STATUS_ORDER } from "@/lib/types"
 import { ConversationStatusDot } from "@/components/conversations/conversation-status-dot"
 import {
@@ -62,6 +71,10 @@ import {
   type ActiveSessionDetails,
 } from "./active-session-details"
 import { SessionDetailsDialog } from "./session-details-dialog"
+import {
+  getDatedBranchTitle,
+  requestConversationBranchCreation,
+} from "./conversation-branch-creation-action"
 
 interface ConversationDetailHeaderProps {
   tabId: string
@@ -103,9 +116,10 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
   const t = useTranslations("Folder.conversationCard")
   const ime = useImeGuard()
   const tConv = useTranslations("Folder.conversation")
+  const tBranch = useTranslations("Folder.conversation.branch")
   const tStatus = useTranslations("Folder.statusLabels")
   const tDetails = useTranslations("Folder.sessionDetails")
-  const { closeTab, openNewConversationTab } = useTabActions()
+  const { closeTab, openNewConversationTab, openTab } = useTabActions()
   const updateConversationLocal = useAppWorkspaceStore(
     (s) => s.updateConversationLocal
   )
@@ -143,10 +157,217 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
     tabId: string
     title: string
   } | null>(null)
+  const [branchInfo, setBranchInfo] = useState<ConversationBranchInfo | null>(
+    null
+  )
+  const [branchBusy, setBranchBusy] = useState(false)
+  const [mergeStage, setMergeStage] = useState<string | null>(null)
+  const [mergeError, setMergeError] = useState<string | null>(null)
+  const createRequestIdRef = useRef<string | null>(null)
+  const mergeRequestIdRef = useRef<string | null>(null)
+  const mergeInFlightRef = useRef(false)
 
   const persisted = conversationId != null
   const displayTitle =
     formatConversationTitle(title) || t("untitledConversation")
+  const persistedConversation = useAppWorkspaceStore((s) =>
+    conversationId == null
+      ? undefined
+      : s.conversations.find(
+          (conversation) => conversation.id === conversationId
+        )
+  )
+
+  useEffect(() => {
+    let cancelled = false
+    let timer: ReturnType<typeof setTimeout> | null = null
+    setBranchInfo(null)
+    createRequestIdRef.current = null
+    mergeRequestIdRef.current = null
+    mergeInFlightRef.current = false
+    if (conversationId == null) return
+    const load = () => {
+      getConversationBranchInfo(conversationId)
+        .then((info) => {
+          if (cancelled) return
+          setBranchInfo(info)
+          if (
+            info &&
+            [
+              "snapshot_ready",
+              "provisional",
+              "session_creating",
+              "connection_ready",
+              "prompt_ready",
+              "pending_first_prompt",
+              "first_prompt_queued",
+              "retryable_failed",
+            ].includes(info.lifecycleState)
+          ) {
+            timer = setTimeout(load, 2_000)
+          }
+        })
+        .catch((error) => {
+          console.error("[ConversationDetailHeader] branch info:", error)
+          if (!cancelled) timer = setTimeout(load, 2_000)
+        })
+    }
+    load()
+    return () => {
+      cancelled = true
+      if (timer) clearTimeout(timer)
+    }
+  }, [conversationId, persistedConversation?.external_id, title])
+
+  useEffect(() => {
+    if (conversationId == null) return
+    let cancelled = false
+    let unlisten: (() => void) | null = null
+    subscribe<{
+      branchConversationId: number
+      requestId: string
+      stage: string
+      error?: string | null
+    }>("conversation-branch://merge-progress", (progress) => {
+      if (
+        progress.branchConversationId !== conversationId ||
+        progress.requestId !== mergeRequestIdRef.current
+      ) {
+        return
+      }
+      setMergeStage(progress.stage)
+      setMergeError(progress.error ?? null)
+    }).then((dispose) => {
+      if (cancelled) dispose()
+      else unlisten = dispose
+    })
+    return () => {
+      cancelled = true
+      unlisten?.()
+    }
+  }, [conversationId])
+
+  const handleCreateBranch = useCallback(async () => {
+    if (conversationId == null || !persistedConversation || branchBusy) {
+      return
+    }
+    setBranchBusy(true)
+    try {
+      const requestId = (createRequestIdRef.current ??= crypto.randomUUID())
+      const action = await requestConversationBranchCreation({
+        conversationId,
+        agentType: persistedConversation.agent_type,
+        requestId,
+      })
+      if (action.kind === "queued") {
+        // The mounted tab has durably adopted this operation id in its queue.
+        // Retries for that queued item keep using it, while the next deliberate
+        // menu action must receive a fresh id after this item completes.
+        createRequestIdRef.current = null
+        return
+      }
+      const result = action.result
+      await refreshConversations()
+      const branchTitle = useAppWorkspaceStore
+        .getState()
+        .conversations.find(
+          (conversation) => conversation.id === result.branchConversationId
+        )?.title
+      openTab(
+        result.folderId,
+        result.branchConversationId,
+        persistedConversation.agent_type,
+        true,
+        branchTitle ?? getDatedBranchTitle(displayTitle)
+      )
+      createRequestIdRef.current = null
+      toast.success(
+        result.inheritanceMode === "native_fork"
+          ? tBranch("nativeCreated")
+          : tBranch("provisionalCreated")
+      )
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : String(error))
+    } finally {
+      setBranchBusy(false)
+    }
+  }, [
+    branchBusy,
+    conversationId,
+    displayTitle,
+    openTab,
+    persistedConversation,
+    refreshConversations,
+    tBranch,
+  ])
+
+  const handleOpenSource = useCallback(() => {
+    if (!branchInfo?.sourceAvailable || !persistedConversation) return
+    openTab(
+      folderId,
+      branchInfo.sourceConversationId,
+      persistedConversation.agent_type,
+      true,
+      branchInfo.sourceTitle ?? undefined
+    )
+  }, [branchInfo, folderId, openTab, persistedConversation])
+
+  const handleMerge = useCallback(async () => {
+    if (!branchInfo || branchBusy || mergeInFlightRef.current) return
+    mergeInFlightRef.current = true
+    setBranchBusy(true)
+    setMergeStage("started")
+    setMergeError(null)
+    try {
+      const result = await mergeConversationBranch({
+        branchConversationId: branchInfo.branchConversationId,
+        requestId: (mergeRequestIdRef.current ??= crypto.randomUUID()),
+      })
+      mergeRequestIdRef.current = null
+      setMergeStage("completed")
+      toast.success(
+        tBranch("mergeSuccess", {
+          count: result.copiedDeliverableCount,
+        })
+      )
+      await refreshConversations()
+      handleOpenSource()
+      closeTab(tabId)
+    } catch (error) {
+      setMergeStage("failed")
+      const appError = extractAppCommandError(error)
+      const detail = toErrorMessage(error)
+      const message = appError ? `${appError.code}: ${detail}` : detail
+      setMergeError(message)
+      toast.error(message)
+    } finally {
+      mergeInFlightRef.current = false
+      setBranchBusy(false)
+    }
+  }, [
+    branchBusy,
+    branchInfo,
+    closeTab,
+    handleOpenSource,
+    tBranch,
+    refreshConversations,
+    tabId,
+  ])
+
+  const mergeStageLabel =
+    mergeStage == null
+      ? null
+      : mergeStage === "determining_boundary"
+        ? tBranch("mergeDeterminingBoundary")
+        : mergeStage === "extracting_increment"
+          ? tBranch("mergeExtractingIncrement")
+          : mergeStage === "writing_source"
+            ? tBranch("mergeWritingSource")
+            : mergeStage === "failed"
+              ? tBranch("mergeFailed")
+              : mergeStage === "completed"
+                ? tBranch("mergeCompleted")
+                : tBranch("mergePreparing")
 
   const handleTogglePin = useCallback(() => {
     if (conversationId == null) return
@@ -259,6 +480,50 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
         >
           {displayTitle}
         </span>
+        {branchInfo && (
+          <button
+            type="button"
+            className="flex max-w-56 shrink-0 items-center gap-1 truncate rounded bg-muted/70 px-2 py-1 text-xs text-muted-foreground hover:text-foreground"
+            onClick={handleOpenSource}
+            disabled={!branchInfo.sourceAvailable}
+            title={
+              branchInfo.sourceAvailable
+                ? `${tBranch("source", { title: branchInfo.sourceTitle ?? `#${branchInfo.sourceConversationId}` })} · ${branchInfo.inheritanceMode === "native_fork" ? tBranch("nativeMode") : tBranch("snapshotMode")} · ${tBranch("inheritanceRange", { count: branchInfo.inheritedMessageCount, boundary: branchInfo.forkMessageId ?? branchInfo.forkedThroughAt ?? "—" })}${branchInfo.inheritanceTruncated ? ` · ${tBranch("inheritanceTruncated")}` : ""}${branchInfo.inheritanceNote ? ` · ${branchInfo.inheritanceNote}` : ""}`
+                : tBranch("sourceDeletedHint")
+            }
+          >
+            <ArrowLeft className="h-3 w-3" />
+            {branchInfo.sourceAvailable
+              ? tBranch("source", {
+                  title:
+                    branchInfo.sourceTitle ??
+                    `#${branchInfo.sourceConversationId}`,
+                })
+              : tBranch("sourceDeleted", {
+                  title:
+                    branchInfo.sourceTitle ??
+                    `#${branchInfo.sourceConversationId}`,
+                })}
+            <span className="hidden xl:inline">
+              {` · ${branchInfo.inheritanceMode === "native_fork" ? tBranch("nativeMode") : tBranch("snapshotMode")}`}
+            </span>
+            {!["ready", "merged"].includes(branchInfo.lifecycleState) && (
+              <span className="hidden 2xl:inline">
+                {` · ${branchInfo.lifecycleState.includes("failed") ? tBranch("retryableFailed") : tBranch("pendingFirstPrompt")}`}
+              </span>
+            )}
+          </button>
+        )}
+        {(branchBusy || mergeStage === "failed") && mergeStageLabel && (
+          <span
+            className="max-w-72 shrink-0 truncate text-xs text-muted-foreground"
+            role="status"
+            title={mergeError ?? undefined}
+          >
+            {mergeStageLabel}
+            {mergeError ? ` · ${mergeError}` : ""}
+          </span>
+        )}
       </div>
       <div className="flex shrink-0 items-center">
         <DropdownMenu>
@@ -285,6 +550,22 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
               <Pencil className="h-4 w-4" />
               {t("rename")}
             </DropdownMenuItem>
+            <DropdownMenuItem
+              disabled={!persisted || branchBusy}
+              onSelect={handleCreateBranch}
+            >
+              <GitBranch className="h-4 w-4" />
+              {tBranch("create")}
+            </DropdownMenuItem>
+            {branchInfo && (
+              <DropdownMenuItem
+                disabled={branchBusy || !branchInfo.sourceAvailable}
+                onSelect={handleMerge}
+              >
+                <GitMerge className="h-4 w-4" />
+                {tBranch("merge")}
+              </DropdownMenuItem>
+            )}
             <DropdownMenuItem disabled={!persisted} onSelect={handleTogglePin}>
               {isPinned ? (
                 <PinOff className="h-4 w-4" />

@@ -82,6 +82,40 @@ function searchPart(
 }
 
 describe("codex search command-action card", () => {
+  it("resolves Codex citation ids from structured WebSearch metadata", () => {
+    renderParts(
+      [
+        {
+          type: "tool-call",
+          toolCallId: "ws-citation",
+          toolName: "web_search",
+          input: null,
+          state: "output-available",
+          meta: {
+            "codeg.citations": [
+              {
+                reference_id: "turn0search0",
+                url: "https://example.com/source",
+                title: "Source title",
+                site_name: "example.com",
+              },
+            ],
+          },
+        },
+        {
+          type: "text",
+          text: "Answer\uE200cite\uE202turn0search0\uE201",
+        },
+      ],
+      false
+    )
+
+    expect(document.body.textContent).toContain(
+      'Answer[1](<https://example.com/source> "Source title — example.com")'
+    )
+    expect(document.body.textContent).not.toContain("\uE200cite")
+  })
+
   it("titles the card from the pattern and never shows the raw envelope", () => {
     renderParts([
       searchPart(

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::extract::ws::{Message, WebSocket};
 use axum::{
@@ -47,6 +48,14 @@ fn apply_cleanup_signal(
 // clients (web / remote desktop) continue to work while transports migrate.
 // Phase 4 will retire this channel.
 const WS_READY_CHANNEL: &str = "__ready__";
+// Native WebSocket heartbeat protects the server-side attach lease when a
+// browser backgrounds JavaScript timers, while still reaping a genuinely dead
+// half-open peer. Browsers answer protocol Ping frames in the network stack, so
+// background JavaScript throttling does not create a false disconnect; a
+// genuinely sleeping/offline device is expired and reconnects on wake. Three
+// missed intervals gives subnet/DERP transitions ample recovery time.
+const WS_PROTOCOL_PING_INTERVAL: Duration = Duration::from_secs(30);
+const WS_PEER_TIMEOUT: Duration = Duration::from_secs(90);
 
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
@@ -129,9 +138,31 @@ async fn handle_ws_connection(
     // reading behind a steady side-channel stream can't trickle near-duplicate
     // lines. Task-local: one instance per WS connection.
     let mut lag_throttle = LagLogThrottle::new(LAG_LOG_WINDOW);
+    let mut heartbeat = tokio::time::interval(WS_PROTOCOL_PING_INTERVAL);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // `interval`'s first tick is immediate; consume it so the ready frame is not
+    // followed by a redundant protocol ping in the same scheduler turn.
+    heartbeat.tick().await;
+    let mut last_peer_activity = Instant::now();
 
     loop {
         tokio::select! {
+            _ = heartbeat.tick() => {
+                let idle = last_peer_activity.elapsed();
+                if idle >= WS_PEER_TIMEOUT {
+                    tracing::warn!(
+                        "[WS][WARN] peer heartbeat timed out after {}s; closing socket subscriptions={}",
+                        idle.as_secs(),
+                        subscriptions.len()
+                    );
+                    let _ = socket.send(Message::Close(None)).await;
+                    break;
+                }
+                if socket.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    break;
+                }
+            }
+
             // Server-initiated shutdown: notify any active attach
             // subscriptions before closing so the client can decide
             // whether to retry on the next reconnect.
@@ -213,12 +244,14 @@ async fn handle_ws_connection(
                 }
             }
 
-            // Client-→-server messages. Text frames are parsed as
-            // `ClientMsg`; everything else is ignored (binary, ping/pong
-            // are handled by axum, close is handled by the None match arm).
+            // Client-→-server messages. Text frames are parsed as `ClientMsg`.
+            // Protocol Pong (automatically sent by browsers) and any other
+            // non-close frame refresh peer liveness, keeping an attached but
+            // background-throttled conversation leased without JavaScript.
             msg = socket.recv() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
+                        last_peer_activity = Instant::now();
                         match serde_json::from_str::<ClientMsg>(&text) {
                             Ok(cmsg) => {
                                 handle_client_msg(
@@ -235,8 +268,11 @@ async fn handle_ws_connection(
                             }
                         }
                     }
+                    Some(Ok(Message::Close(_))) => break,
                     Some(Ok(_)) => {
-                        // Binary / ping / pong: ignore.
+                        // Binary / protocol ping / protocol pong all prove the
+                        // peer and the complete transport path are alive.
+                        last_peer_activity = Instant::now();
                     }
                     _ => break,
                 }

@@ -558,6 +558,9 @@ pub fn build_meta(def: &CustomAgentDef) -> Result<AcpAgentMeta, CustomAgentError
         // Built-ins declare the same flag as a constant, where OpenClaw is the
         // only opt-out (see `only_builtin_openclaw_opts_out_of_mcp`).
         supports_mcp: def.supports_mcp,
+        // Custom adapters have not declared compatibility with Codeg's native
+        // steer extension; keep them on the normal prompt path by default.
+        supports_steer: false,
         name: intern(def.name.trim()),
         description: intern(def.description.trim()),
         distribution,
@@ -884,6 +887,7 @@ pub fn unregistered_meta(registry_id: &'static str) -> AcpAgentMeta {
     AcpAgentMeta {
         agent_type: AgentType::Custom(registry_id),
         supports_mcp: true,
+        supports_steer: false,
         name: registry_id,
         description: "Unregistered custom ACP agent",
         distribution: AgentDistribution::Npx {

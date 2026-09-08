@@ -7,7 +7,8 @@ import { useAcpActions } from "@/contexts/acp-connections-context"
 import { useTaskContext } from "@/contexts/task-context"
 import { useConnection, type UseConnectionReturn } from "@/hooks/use-connection"
 import { extractAppCommandError } from "@/lib/app-error"
-import { isConnectionBusy } from "@/lib/connection-teardown"
+import { isNetworkOrOfflineError } from "@/lib/network-error"
+import { isSessionRestorePendingError } from "@/lib/session-restore"
 import { TurnBusyError } from "@/lib/turn-busy"
 import { type AgentType, type PromptDraft } from "@/lib/types"
 import { getAgentLabel } from "@/lib/custom-agents"
@@ -39,6 +40,8 @@ export interface UseConnectionLifecycleReturn {
   modeLoading: boolean
   configOptionsLoading: boolean
   selectorsLoading: boolean
+  /** True while the backend-owned persisted-session restore flight is pending. */
+  restorePending: boolean
   autoConnectError: string | null
   handleFocus: () => void
   handleSend: (
@@ -55,18 +58,24 @@ export interface UseConnectionLifecycleReturn {
        */
       onTurnInProgress?: () => void
       /**
-       * Called for every OTHER send failure (413, hydration failure, network
-       * drop) after the error toast is shown. The caller must settle any
-       * optimistic state it created for this send — roll back the optimistic
-       * user turn so the conversation doesn't stay `awaiting_persist` (which
-       * would block queue auto-flush) and doesn't display the failed prompt
-       * as though it were sent. The draft is deliberately NOT re-queued: a
-       * deterministic failure would otherwise retry forever.
+       * The historical ACP session exists but has not completed its exact
+       * snapshot/identity handoff. The caller retains the draft in its durable
+       * queue and retries after readiness instead of surfacing an error.
        */
-      onSendFailed?: (error: unknown) => void
+      onSessionRestorePending?: () => void
+      /** Fired only after `/acp_prompt` returned success (backend accepted). */
+      onAccepted?: () => void
+      /**
+       * Called for every non-Busy failure after the error toast is shown.
+       * `ambiguous=true` means the transport
+       * response was lost and the backend may already have accepted the prompt;
+       * callers must keep the optimistic message and reconcile by id.
+       */
+      onSendFailed?: (error: unknown, ambiguous: boolean) => void
     }
-  ) => void
+  ) => Promise<void>
   handleSetConfigOption: (configId: string, valueId: string) => void
+  isCancelling: boolean
   handleCancel: () => void
   handleRespondPermission: (requestId: string, optionId: string) => void
 }
@@ -87,15 +96,10 @@ export interface UseConnectionLifecycleReturn {
  * (`disconnectIfIdle`) so the two teardown paths can't drift apart.
  * Exported for tests.
  */
-export function shouldDisconnectOnUnmount(args: {
-  status: string | null
-  isViewer: boolean
-  backgroundOutstanding: number
+export function shouldReleaseSurfaceOnUnmount(args: {
   transientUnmount?: boolean
 }): boolean {
-  if (args.transientUnmount) return false
-  if (args.isViewer) return true
-  return !isConnectionBusy(args)
+  return !args.transientUnmount
 }
 
 function normalizeErrorMessage(error: unknown): string {
@@ -118,7 +122,7 @@ export function useConnectionLifecycle({
   isTransientUnmount,
 }: UseConnectionLifecycleOptions): UseConnectionLifecycleReturn {
   const t = useTranslations("Folder.chat.connectionLifecycle")
-  const { setActiveKey, touchActivity } = useAcpActions()
+  const { setActiveKey, touchActivity, releaseSurface } = useAcpActions()
   const { addTask, updateTask, removeTask } = useTaskContext()
   const conn = useConnection(contextKey)
 
@@ -127,12 +131,14 @@ export function useConnectionLifecycle({
   const {
     status,
     selectorsReady,
+    promptReady,
     connect: connConnect,
-    disconnect: connDisconnect,
     sendPrompt,
     setMode: connSetMode,
     setConfigOption: connSetConfigOption,
     cancel: connCancel,
+    refreshSnapshot: connRefreshSnapshot,
+    reconnect: connReconnect,
     respondPermission: connRespondPermission,
     modes,
     configOptions,
@@ -154,6 +160,32 @@ export function useConnectionLifecycle({
     !hasCachedSelectors &&
     (status === "connecting" ||
       (isInteractiveStatus && !effectiveSelectorsReady))
+  const [isCancelling, setIsCancelling] = useState(false)
+  const cancelRequestInFlightRef = useRef(false)
+  const cancelReconcileTimerRef = useRef<number | null>(null)
+  useEffect(() => {
+    if (status === "prompting") return
+    // Status is an external ACP snapshot. Defer the local visual reset to the
+    // subscription turn rather than cascading a synchronous render from the
+    // effect body.
+    const timer = window.setTimeout(() => {
+      cancelRequestInFlightRef.current = false
+      setIsCancelling(false)
+      if (cancelReconcileTimerRef.current !== null) {
+        window.clearTimeout(cancelReconcileTimerRef.current)
+        cancelReconcileTimerRef.current = null
+      }
+    }, 0)
+    return () => window.clearTimeout(timer)
+  }, [status])
+  useEffect(
+    () => () => {
+      if (cancelReconcileTimerRef.current !== null) {
+        window.clearTimeout(cancelReconcileTimerRef.current)
+      }
+    },
+    []
+  )
   // Gate for send button: block until the backend session is fully
   // initialized (selectorsReady from the real backend event, not cache).
   const selectorsLoading = isInteractiveStatus && !selectorsReady
@@ -162,23 +194,13 @@ export function useConnectionLifecycle({
     agentType: AgentType
     message: string
   } | null>(null)
+  const [restorePending, setRestorePending] = useState(false)
+  const restoreGenerationRef = useRef(0)
 
   // Refs for auto-connect effect, which intentionally avoids volatile
   // dependencies to prevent reconnect loops. Synced via useEffect —
   // effects run in declaration order, so these are current before
   // the auto-connect effect reads them.
-  const statusRef = useRef(status)
-  useEffect(() => {
-    statusRef.current = status
-  }, [status])
-  const isViewerRef = useRef(conn.isViewer)
-  useEffect(() => {
-    isViewerRef.current = conn.isViewer
-  }, [conn.isViewer])
-  const backgroundOutstandingRef = useRef(conn.backgroundOutstanding)
-  useEffect(() => {
-    backgroundOutstandingRef.current = conn.backgroundOutstanding
-  }, [conn.backgroundOutstanding])
   const contextKeyRef = useRef(contextKey)
   useEffect(() => {
     contextKeyRef.current = contextKey
@@ -208,7 +230,13 @@ export function useConnectionLifecycle({
   }, [isActive, contextKey, setActiveKey, touchActivity])
 
   // Auto-connect when tab becomes active and workingDir is available.
-  // Depends on isActive + workingDir + agentType so that connections wait
+  // Depends on isActive + workingDir + agentType + persisted identities so
+  // that a detail/runtime load resolving `sessionId` cannot strand the early
+  // `session_id=None` connection. `connect()` deduplicates an identical target,
+  // while a newly-resolved session/conversation id enters the backend atomic
+  // restore path.
+  //
+  // The working-directory dependency ensures connections wait
   // for folder info to load (workingDir transitions from undefined →
   // folder.path), and so that changing folders or agents on an already-
   // connected tab triggers a reconnect. The context's connect() dedups
@@ -219,6 +247,18 @@ export function useConnectionLifecycle({
     if (!isActive) return
     if (!workingDir) return
     let cancelled = false
+    const generation = ++restoreGenerationRef.current
+    const restoringPersistedCodex =
+      agentType === "codex" &&
+      conversationIdRef.current != null &&
+      conversationIdRef.current > 0
+    if (restoringPersistedCodex) {
+      queueMicrotask(() => {
+        if (!cancelled && restoreGenerationRef.current === generation) {
+          setRestorePending(true)
+        }
+      })
+    }
     connConnectRef
       .current(
         agentType,
@@ -227,12 +267,12 @@ export function useConnectionLifecycle({
         conversationIdRef.current
       )
       .then(() => {
-        if (!cancelled) {
+        if (!cancelled && restoreGenerationRef.current === generation) {
           setLastAutoConnectError(null)
         }
       })
       .catch((e: unknown) => {
-        if (!cancelled) {
+        if (!cancelled && restoreGenerationRef.current === generation) {
           setLastAutoConnectError({
             contextKey: contextKeyRef.current,
             agentType,
@@ -243,15 +283,20 @@ export function useConnectionLifecycle({
           console.error("[ConnLifecycle] auto-connect:", e)
         }
       })
+      .finally(() => {
+        if (!cancelled && restoreGenerationRef.current === generation) {
+          setRestorePending(false)
+        }
+      })
     return () => {
       cancelled = true
     }
-  }, [isActive, workingDir, agentType])
+  }, [isActive, workingDir, agentType, sessionId, conversationId])
 
   // Manage task status for connection progress
   const taskIdRef = useRef<string | null>(null)
   useEffect(() => {
-    if (status === "connecting") {
+    if (status === "connecting" || restorePending) {
       if (!taskIdRef.current) {
         const id = `acp-connect-${Date.now()}`
         taskIdRef.current = id
@@ -282,7 +327,7 @@ export function useConnectionLifecycle({
         taskIdRef.current = null
       }
     }
-  }, [status, addTask, updateTask, removeTask, agentType, t])
+  }, [status, restorePending, addTask, updateTask, removeTask, agentType, t])
 
   const clearSelectorTask = useCallback(() => {
     if (selectorTaskIdRef.current) {
@@ -324,45 +369,35 @@ export function useConnectionLifecycle({
     t,
   ])
 
-  // Keep a ref to disconnect so the unmount cleanup always calls the
-  // latest version without adding it as a dependency.
-  const connDisconnectRef = useRef(connDisconnect)
+  // Keep a ref to the non-destructive surface release so unmount never turns a
+  // React/browser lifecycle event into a backend task interruption.
+  const releaseSurfaceRef = useRef(releaseSurface)
   useEffect(() => {
-    connDisconnectRef.current = connDisconnect
-  }, [connDisconnect])
+    releaseSurfaceRef.current = releaseSurface
+  }, [releaseSurface])
   const isTransientUnmountRef = useRef(isTransientUnmount)
   useEffect(() => {
     isTransientUnmountRef.current = isTransientUnmount
   }, [isTransientUnmount])
 
-  // Clean up on unmount (e.g. tab closed): disconnect the ACP connection
-  // so it doesn't leak, and remove lingering tasks.
-  // However, if the agent is actively prompting (generating a response),
-  // keep it alive so it can finish in the background — the idle sweep
-  // will clean it up once it transitions back to "connected".
+  // Clean up on unmount (e.g. tab closed) by detaching this frontend surface.
+  // The backend connection is deliberately not stopped: React remounts,
+  // WebSocket churn, and stale client status are not cancellation intent.
+  // Backend activity/idle reconciliation owns eventual process cleanup.
   useEffect(() => {
     return () => {
-      // Owners keep a prompting agent alive in the background to finish the
-      // turn (the idle sweep reclaims it once it returns to "connected"), and
-      // likewise while background work is still outstanding (async sub-agents
-      // / background shells) — disconnecting kills the agent CLI and the
-      // background work with it. Both sweeps already exempt such connections;
-      // once the work settles (or the max-age valve expires it) outstanding
-      // drops to 0 and the normal idle sweep reclaims the connection.
-      // Viewers are different: disconnect() only DETACHES them (it never
-      // acpDisconnects — that belongs to the owner), so tearing a viewer down
-      // mid-turn is safe and leaves the owner's agent untouched. And it's
-      // necessary: the idle sweep skips viewers, so a viewer left attached
-      // here would leak its WS subscription until the whole provider unmounts.
       if (
-        shouldDisconnectOnUnmount({
-          status: statusRef.current,
-          isViewer: isViewerRef.current,
-          backgroundOutstanding: backgroundOutstandingRef.current,
+        shouldReleaseSurfaceOnUnmount({
           transientUnmount: isTransientUnmountRef.current?.() === true,
         })
       ) {
-        connDisconnectRef.current().catch(() => {})
+        // A few isolated hook harnesses provide a deliberately minimal mocked
+        // action object. Production providers always expose releaseSurface;
+        // tolerate the old mock shape so unmount cannot mask the assertion the
+        // test actually owns.
+        if (typeof releaseSurfaceRef.current === "function") {
+          releaseSurfaceRef.current(contextKeyRef.current).catch(() => {})
+        }
       }
       // Task cleanup stays unconditional even on transient unmounts — the
       // remounted instance mints fresh task ids, so stale ones would orphan.
@@ -379,7 +414,16 @@ export function useConnectionLifecycle({
     // avoid connecting with sessionId=undefined and orphaning context.
     if (!isActive) return
     touchActivity(contextKey)
-    if (!status || status === "disconnected" || status === "error") {
+    if (
+      !status ||
+      status === "disconnected" ||
+      status === "error" ||
+      // A durable idle connection with a stale frontend prompt latch should
+      // re-run the idempotent atomic restore. The backend normally reuses the
+      // same ready connection in a few milliseconds; the authoritative result
+      // then repairs promptReady even if no WebSocket ready event is replayed.
+      (status === "connected" && !promptReady)
+    ) {
       setLastAutoConnectError(null)
       connConnect(agentType, workingDir, sessionId, conversationId).catch(
         (e: unknown) => {
@@ -396,6 +440,7 @@ export function useConnectionLifecycle({
     sessionId,
     conversationId,
     status,
+    promptReady,
     connConnect,
     contextKey,
     touchActivity,
@@ -420,13 +465,22 @@ export function useConnectionLifecycle({
         conversationId?: number | null
         clientMessageId?: string | null
         onTurnInProgress?: () => void
-        onSendFailed?: (error: unknown) => void
+        onSessionRestorePending?: () => void
+        onAccepted?: () => void
+        /**
+         * Called for every non-Busy failure. The boolean marks an ambiguous
+         * network/offline loss, where the backend may already have accepted
+         * the prompt and the optimistic message must remain visible.
+         */
+        onSendFailed?: (error: unknown, ambiguous: boolean) => void
       }
-    ) => {
+    ): Promise<void> => {
       touchActivity(contextKey)
       const onTurnInProgress = opts?.onTurnInProgress
+      const onSessionRestorePending = opts?.onSessionRestorePending
+      const onAccepted = opts?.onAccepted
       const onSendFailed = opts?.onSendFailed
-      void (async () => {
+      return (async () => {
         const currentModeId = modeIdRef.current
         if (modeId && modeId !== currentModeId) {
           await connSetMode(modeId)
@@ -435,6 +489,7 @@ export function useConnectionLifecycle({
           modeIdRef.current = modeId
         }
         await sendPrompt(draft.blocks, opts)
+        onAccepted?.()
       })().catch((e: unknown) => {
         if (e instanceof TurnBusyError) {
           // A turn was already in flight on the connection (another
@@ -442,6 +497,10 @@ export function useConnectionLifecycle({
           // observed yet). Not an error — the draft is re-queued by the caller
           // so it auto-sends when the current turn finishes.
           onTurnInProgress?.()
+          return
+        }
+        if (isSessionRestorePendingError(e)) {
+          onSessionRestorePending?.()
           return
         }
         console.error("[ConnLifecycle] sendPrompt:", e)
@@ -455,21 +514,73 @@ export function useConnectionLifecycle({
           appError?.message ??
           (e instanceof Error ? e.message : String(e ?? "unknown error"))
         toast.error(t("errors.sendPromptFailed", { error: message }))
-        // Let the caller settle its optimistic state (roll back the phantom
-        // user turn, drop out of awaiting_persist so the queue keeps
-        // flushing). Runs after the toast so the state rollback can't hide
-        // the failure.
-        onSendFailed?.(e)
+        // Let the caller distinguish a transport loss (the backend may have
+        // accepted the id) from a deterministic rejection.
+        onSendFailed?.(e, isNetworkOrOfflineError(e))
       })
     },
     [connSetMode, sendPrompt, contextKey, touchActivity, t]
   )
 
   const handleCancel = useCallback(() => {
-    connCancel().catch((e: unknown) =>
-      console.error("[ConnLifecycle] cancel:", e)
-    )
-  }, [connCancel])
+    // The button stays mounted while the first HTTP request is in flight, so a
+    // double click previously invoked /acp_cancel twice. This synchronous ref
+    // closes that render gap; the backend's run CAS covers other tabs/devices.
+    if (cancelRequestInFlightRef.current) return
+    cancelRequestInFlightRef.current = true
+    setIsCancelling(true)
+    connCancel()
+      .then((result) => {
+        if (
+          !result ||
+          result.outcome === "already_finished" ||
+          result.outcome === "run_not_found"
+        ) {
+          cancelRequestInFlightRef.current = false
+          setIsCancelling(false)
+          return
+        }
+        // Attach/replay normally delivers the terminal event. This one-shot
+        // authoritative snapshot check is the backstop for a lost event: wait
+        // through the backend cancel deadline and its 10s reconciliation tick,
+        // then hydrate the real state. A still-prompting or missing connection
+        // is re-established through the existing targeted reconnect path.
+        if (result.deadlineAt) {
+          const deadlineMs = Date.parse(result.deadlineAt)
+          const delay = Number.isFinite(deadlineMs)
+            ? Math.max(0, deadlineMs - Date.now()) + 12_000
+            : 37_000
+          if (cancelReconcileTimerRef.current !== null) {
+            window.clearTimeout(cancelReconcileTimerRef.current)
+          }
+          cancelReconcileTimerRef.current = window.setTimeout(() => {
+            cancelReconcileTimerRef.current = null
+            void connRefreshSnapshot()
+              .then((authoritativeStatus) => {
+                if (
+                  authoritativeStatus === null ||
+                  authoritativeStatus === "prompting"
+                ) {
+                  return connReconnect()
+                }
+                return false
+              })
+              .catch((error: unknown) => {
+                console.warn("[ConnLifecycle] cancel reconciliation:", error)
+                return connReconnect()
+              })
+          }, delay)
+        }
+      })
+      .catch((e: unknown) => {
+        cancelRequestInFlightRef.current = false
+        setIsCancelling(false)
+        console.error("[ConnLifecycle] cancel:", e)
+        toast.error(
+          e instanceof Error ? e.message : String(e ?? "Unable to stop task")
+        )
+      })
+  }, [connCancel, connReconnect, connRefreshSnapshot])
 
   const handleSetConfigOption = useCallback(
     (configId: string, valueId: string) => {
@@ -496,10 +607,12 @@ export function useConnectionLifecycle({
     modeLoading,
     configOptionsLoading,
     selectorsLoading,
+    restorePending,
     autoConnectError,
     handleFocus,
     handleSend,
     handleSetConfigOption,
+    isCancelling,
     handleCancel,
     handleRespondPermission,
   }

@@ -9,8 +9,9 @@
 //!   proxy uses for transfer progress (`remote_proxy.rs` reads
 //!   `response.content_length()`); compressing them would strip it, waste CPU
 //!   re-compressing already-compressed archives, and break progress display.
-//!   An allowlist keeps every `application/octet-stream` / `application/zip`
-//!   response untouched by construction.
+//!   Downloaded text/CSV files are still `text/*`, so MIME filtering alone is
+//!   insufficient: every `Content-Disposition: attachment` response and every
+//!   response carrying `Cache-Control: no-transform` is excluded explicitly.
 //! - `text/event-stream` (the office-watch SSE proxy) must never be
 //!   compressed: a custom `compress_when` REPLACES tower-http's default
 //!   predicate — which is what normally excludes SSE — so the exclusion has
@@ -34,6 +35,23 @@ impl Predicate for CompressibleContentType {
     where
         B: http_body::Body,
     {
+        let is_attachment = response
+            .headers()
+            .get(http::header::CONTENT_DISPOSITION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .is_some_and(|disposition| disposition.trim().eq_ignore_ascii_case("attachment"));
+        let has_no_transform = response
+            .headers()
+            .get_all(http::header::CACHE_CONTROL)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .flat_map(|value| value.split(','))
+            .any(|directive| directive.trim().eq_ignore_ascii_case("no-transform"));
+        if is_attachment || has_no_transform {
+            return false;
+        }
+
         let mime = response
             .headers()
             .get(http::header::CONTENT_TYPE)
@@ -74,6 +92,17 @@ mod tests {
             .unwrap()
     }
 
+    fn text_response_with_header(
+        name: http::header::HeaderName,
+        value: &'static str,
+    ) -> http::Response<axum::body::Body> {
+        http::Response::builder()
+            .header(http::header::CONTENT_TYPE, "text/csv; charset=utf-8")
+            .header(name, value)
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }
+
     #[test]
     fn allowlist_compresses_text_like_types() {
         let p = CompressibleContentType;
@@ -105,5 +134,22 @@ mod tests {
             assert!(!p.should_compress(&response_with_content_type(ct)), "{ct}");
         }
         assert!(!p.should_compress(&http::Response::new(axum::body::Body::empty())));
+    }
+
+    #[test]
+    fn allowlist_never_compresses_text_attachments_or_no_transform_responses() {
+        let p = CompressibleContentType;
+        assert!(!p.should_compress(&text_response_with_header(
+            http::header::CONTENT_DISPOSITION,
+            "attachment; filename=report.csv",
+        )));
+        assert!(!p.should_compress(&text_response_with_header(
+            http::header::CONTENT_DISPOSITION,
+            "ATTACHMENT ; filename=report.txt",
+        )));
+        assert!(!p.should_compress(&text_response_with_header(
+            http::header::CACHE_CONTROL,
+            "private, no-store, no-transform",
+        )));
     }
 }

@@ -45,6 +45,8 @@ export interface ImageInputAttachment {
    *  flight (`uri` not yet assigned). Sends are blocked while any image is
    *  uploading; never serialized into prompt blocks. */
   uploading?: boolean
+  /** UI-only thumbnail URL. Never serialized into a PromptInputBlock. */
+  previewUrl?: string
 }
 
 export type InputAttachment = ResourceInputAttachment | ImageInputAttachment

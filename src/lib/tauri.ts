@@ -49,6 +49,7 @@ import type {
   FileTreeNode,
   DirectoryEntry,
   FilePreviewContent,
+  WorkspaceFileStat,
   FileEditContent,
   FileSaveResult,
   WorkspaceSnapshotResponse,
@@ -72,6 +73,13 @@ import type {
   McpMarketplaceItem,
   McpMarketplaceServerDetail,
 } from "./types"
+
+let acpLifecycleGeneration = 0
+
+function nextAcpLifecycleGeneration(): number {
+  acpLifecycleGeneration += 1
+  return acpLifecycleGeneration
+}
 
 export async function listConversations(params?: {
   agent_type?: AgentType | null
@@ -142,8 +150,27 @@ export async function acpSetConfigOption(
   return invoke("acp_set_config_option", { connectionId, configId, valueId })
 }
 
-export async function acpCancel(connectionId: string): Promise<void> {
-  return invoke("acp_cancel", { connectionId })
+export interface AcpCancelResult {
+  outcome:
+    | "cancelled"
+    | "cancel_requested"
+    | "already_cancelling"
+    | "already_finished"
+    | "run_not_found"
+  cancelRequestId: string
+  turnRunId?: string | null
+  conversationId?: number | null
+  deadlineAt?: string | null
+}
+
+export async function acpCancel(
+  connectionId: string
+): Promise<AcpCancelResult> {
+  return invoke("acp_cancel", {
+    connectionId,
+    requestSource: "user_stop",
+    frontendGeneration: nextAcpLifecycleGeneration(),
+  })
 }
 
 export interface ForkResult {
@@ -169,7 +196,11 @@ export async function acpRespondPermission(
 }
 
 export async function acpDisconnect(connectionId: string): Promise<void> {
-  return invoke("acp_disconnect", { connectionId })
+  return invoke("acp_disconnect", {
+    connectionId,
+    requestSource: "frontend_disconnect",
+    frontendGeneration: nextAcpLifecycleGeneration(),
+  })
 }
 
 export async function acpListConnections(): Promise<ConnectionInfo[]> {
@@ -637,12 +668,23 @@ export async function importLocalConversations(
 
 export async function getFolderConversation(
   conversationId: number,
-  window?: { tailTurns?: number; fromIndex?: number }
+  options?: {
+    tailTurns?: number
+    fromIndex?: number
+    beforeCursor?: string | null
+    userTurnLimit?: number | null
+  }
 ): Promise<DbConversationDetail> {
   return invoke("get_folder_conversation", {
     conversationId,
-    ...(window?.tailTurns != null ? { tailTurns: window.tailTurns } : {}),
-    ...(window?.fromIndex != null ? { fromIndex: window.fromIndex } : {}),
+    ...(options?.tailTurns != null ? { tailTurns: options.tailTurns } : {}),
+    ...(options?.fromIndex != null ? { fromIndex: options.fromIndex } : {}),
+    ...(options?.beforeCursor !== undefined
+      ? { beforeCursor: options.beforeCursor }
+      : {}),
+    ...(options?.userTurnLimit !== undefined
+      ? { userTurnLimit: options.userTurnLimit }
+      : {}),
   })
 }
 
@@ -1224,6 +1266,13 @@ export async function readFilePreview(
   path: string
 ): Promise<FilePreviewContent> {
   return invoke("read_file_preview", { rootPath, path })
+}
+
+export async function statWorkspaceFile(
+  rootPath: string,
+  path: string
+): Promise<WorkspaceFileStat> {
+  return invoke("stat_workspace_file", { rootPath, path })
 }
 
 export async function readFileForEdit(

@@ -10,6 +10,8 @@ import { downloadImage } from "@/lib/image-download"
 import { saveTextFile, type SaveFileResult } from "@/lib/save-file"
 import { toPng } from "html-to-image"
 
+export { saveTextFile } from "@/lib/save-file"
+
 /** Outcome of an export operation — see {@link SaveFileResult}. */
 export type ExportResult = SaveFileResult
 

@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Serialize;
-use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::{broadcast, mpsc};
 
 use crate::app_error::AppCommandError;
 use crate::commands::folders::{self, FileTreeNode};
@@ -23,6 +23,7 @@ const WATCH_DEBOUNCE_MS: u64 = 300;
 const WATCH_MAX_BATCH_WINDOW_MS: u64 = 1_500;
 const WATCH_MAX_CHANGED_PATHS: usize = 2_000;
 const WATCH_EVENT_CHANNEL_CAPACITY: usize = 2_048;
+const WATCH_CHANGE_BROADCAST_CAPACITY: usize = 128;
 const RECENT_EVENT_CAPACITY: usize = 24;
 const WORKSPACE_TREE_MAX_DEPTH: usize = 2;
 
@@ -274,14 +275,43 @@ struct WorkspaceStreamEntry {
     // with repository size. Shared with the flush task via Arc.
     full_subscribers: Arc<AtomicUsize>,
     state: Arc<Mutex<WorkspaceStateCore>>,
+    /// Backend-only path change feed. Artifact tracking subscribes here so the
+    /// watcher remains useful even when no browser/file tree is mounted.
+    path_change_tx: broadcast::Sender<WorkspacePathChangeBatch>,
 }
 
 static WORKSPACE_STREAMS: LazyLock<Mutex<HashMap<String, WorkspaceStreamEntry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkspacePathChangeKind {
+    Created,
+    Modified,
+    Deleted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorkspacePathChange {
+    pub path: String,
+    pub kind: WorkspacePathChangeKind,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct WorkspacePathChangeBatch {
+    pub root_path: String,
+    pub changes: Vec<WorkspacePathChange>,
+    pub overflowed: bool,
+}
+
+pub(crate) struct WorkspaceChangeSubscription {
+    pub root_path: String,
+    pub degraded: bool,
+    pub receiver: broadcast::Receiver<WorkspacePathChangeBatch>,
+}
+
 #[derive(Default)]
 struct WatchEventBatch {
-    changed_paths: HashSet<String>,
+    changed_paths: HashMap<String, WorkspacePathChangeKind>,
     has_create: bool,
     has_remove: bool,
     overflowed: bool,
@@ -313,36 +343,51 @@ impl WatchEventBatch {
             return;
         }
 
-        let mut has_relevant_path = false;
-        for path in event.paths {
+        let event_kind = event.kind;
+        let event_path_count = event.paths.len();
+        for (path_index, path) in event.paths.into_iter().enumerate() {
             let Some(relative) = classify_watch_path(&path, root_canonical, git_watch_dirs) else {
                 continue;
             };
 
-            self.changed_paths.insert(relative);
-            has_relevant_path = true;
+            let incoming = match &event_kind {
+                // notify represents a rename as a name-modify event. With the
+                // common `Both` shape, the first path vanished and the last
+                // appeared. Persisting those two semantic edges is enough for
+                // the artifact layer to retain the destination without trying
+                // to expose platform-specific rename cookies.
+                EventKind::Modify(notify::event::ModifyKind::Name(_)) if event_path_count > 1 => {
+                    if path_index == 0 {
+                        WorkspacePathChangeKind::Deleted
+                    } else {
+                        WorkspacePathChangeKind::Created
+                    }
+                }
+                EventKind::Create(_) => WorkspacePathChangeKind::Created,
+                EventKind::Remove(_) => WorkspacePathChangeKind::Deleted,
+                _ => WorkspacePathChangeKind::Modified,
+            };
+            match incoming {
+                WorkspacePathChangeKind::Created => self.has_create = true,
+                WorkspacePathChangeKind::Deleted => self.has_remove = true,
+                WorkspacePathChangeKind::Modified => {}
+            }
+            self.changed_paths
+                .entry(relative)
+                .and_modify(|current| *current = merge_path_change(*current, incoming))
+                .or_insert(incoming);
             if self.changed_paths.len() > WATCH_MAX_CHANGED_PATHS {
                 self.overflowed = true;
                 self.changed_paths.clear();
                 break;
             }
         }
-
-        if !has_relevant_path {
-            return;
-        }
-
-        match event.kind {
-            EventKind::Create(_) => self.has_create = true,
-            EventKind::Remove(_) => self.has_remove = true,
-            _ => {}
-        }
     }
 
     fn kind(&self, root_canonical: &Path) -> String {
         let has_missing_path = !self.has_remove
             && !self.overflowed
-            && self.changed_paths.iter().any(|p| {
+            && self.changed_paths.keys().any(|p| {
                 // Synthetic `.git/*` entries (a linked worktree's external
                 // metadata, mapped in via `classify_watch_path`) resolve to
                 // nothing under the working dir, so probing `root/join` would
@@ -359,6 +404,20 @@ impl WatchEventBatch {
         } else {
             "modify".to_string()
         }
+    }
+}
+
+fn merge_path_change(
+    current: WorkspacePathChangeKind,
+    incoming: WorkspacePathChangeKind,
+) -> WorkspacePathChangeKind {
+    use WorkspacePathChangeKind::{Created, Deleted, Modified};
+    match (current, incoming) {
+        (Created, _) => Created,
+        (Deleted, Created | Modified) => Modified,
+        (_, Deleted) => Deleted,
+        (_, Created) => Modified,
+        (kind, Modified) => kind,
     }
 }
 
@@ -906,6 +965,7 @@ async fn flush_watch_batch(
     root_display: &str,
     root_canonical: &Path,
     full_subscribers: &AtomicUsize,
+    path_change_tx: &broadcast::Sender<WorkspacePathChangeBatch>,
     batch: &WatchEventBatch,
 ) {
     if batch.is_empty() {
@@ -913,13 +973,33 @@ async fn flush_watch_batch(
     }
 
     let event_kind_hint = batch.kind(root_canonical);
-    let changed_paths = if batch.overflowed {
+    let path_changes = if batch.overflowed {
         Vec::new()
     } else {
-        let mut paths = batch.changed_paths.iter().cloned().collect::<Vec<_>>();
-        paths.sort();
-        paths
+        let mut changes = batch
+            .changed_paths
+            .iter()
+            .map(|(path, kind)| WorkspacePathChange {
+                path: path.clone(),
+                kind: *kind,
+            })
+            .collect::<Vec<_>>();
+        changes.sort_by(|a, b| a.path.cmp(&b.path));
+        changes
     };
+    let changed_paths = path_changes
+        .iter()
+        .map(|change| change.path.clone())
+        .collect::<Vec<_>>();
+
+    // Persistable consumers receive the semantic per-path batch before any
+    // optional tree/git scan. Sending is best-effort when nobody is tracking a
+    // turn; an active tracker owns a receiver and keeps the stream ref alive.
+    let _ = path_change_tx.send(WorkspacePathChangeBatch {
+        root_path: root_display.to_string(),
+        changes: path_changes,
+        overflowed: batch.overflowed,
+    });
 
     // Paths-only lite mode: with no tree/git subscriber on this root, the
     // batch costs nothing beyond the (already-debounced) FS events — no
@@ -929,8 +1009,7 @@ async fn flush_watch_batch(
     // mid-stream upgrades the very next batch.
     let wants_tree_git = full_subscribers.load(Ordering::Acquire) > 0;
 
-    let should_refresh_tree =
-        wants_tree_git && (batch.overflowed || event_kind_hint != "modify");
+    let should_refresh_tree = wants_tree_git && (batch.overflowed || event_kind_hint != "modify");
     let is_git = wants_tree_git && is_git_repo(root_canonical);
     let should_refresh_git = is_git
         && (batch.overflowed
@@ -951,7 +1030,8 @@ async fn flush_watch_batch(
             Ok(tree) => refreshed_tree = Some(tree),
             Err(err) => tracing::error!(
                 "[workspace-state-watch] tree refresh failed for {}: {}",
-                root_display, err
+                root_display,
+                err
             ),
         }
     }
@@ -961,7 +1041,8 @@ async fn flush_watch_batch(
             Ok(git_snapshot) => refreshed_git = Some(git_snapshot),
             Err(err) => tracing::error!(
                 "[workspace-state-watch] git refresh failed for {}: {}",
-                root_display, err
+                root_display,
+                err
             ),
         }
     }
@@ -1058,6 +1139,7 @@ async fn run_workspace_watch_event_loop(
     root_canonical: PathBuf,
     git_watch_dirs: Vec<GitWatchDir>,
     full_subscribers: Arc<AtomicUsize>,
+    path_change_tx: broadcast::Sender<WorkspacePathChangeBatch>,
 ) {
     let git_watch_dirs = git_watch_dirs.as_slice();
     let debounce = Duration::from_millis(WATCH_DEBOUNCE_MS);
@@ -1095,6 +1177,7 @@ async fn run_workspace_watch_event_loop(
                         &root_display,
                         &root_canonical,
                         &full_subscribers,
+                        &path_change_tx,
                         &batch,
                     )
                     .await;
@@ -1107,6 +1190,7 @@ async fn run_workspace_watch_event_loop(
                         &root_display,
                         &root_canonical,
                         &full_subscribers,
+                        &path_change_tx,
                         &batch,
                     )
                     .await;
@@ -1139,6 +1223,7 @@ async fn run_workspace_watch_event_loop(
                 &root_display,
                 &root_canonical,
                 &full_subscribers,
+                &path_change_tx,
                 &batch,
             )
             .await;
@@ -1154,6 +1239,7 @@ async fn run_workspace_watch_event_loop(
             &root_display,
             &root_canonical,
             &full_subscribers,
+            &path_change_tx,
             &batch,
         )
         .await;
@@ -1170,19 +1256,22 @@ async fn refresh_tree_git_snapshots(
     root_display: &str,
     root_canonical: &Path,
 ) {
-    let refreshed_tree =
-        match folders::get_file_tree(root_display.to_string(), Some(WORKSPACE_TREE_MAX_DEPTH))
-            .await
-        {
-            Ok(tree) => Some(tree),
-            Err(err) => {
-                tracing::error!(
-                    "[workspace-state-watch] upgrade tree refresh failed for {}: {}",
-                    root_display, err
-                );
-                None
-            }
-        };
+    let refreshed_tree = match folders::get_file_tree(
+        root_display.to_string(),
+        Some(WORKSPACE_TREE_MAX_DEPTH),
+    )
+    .await
+    {
+        Ok(tree) => Some(tree),
+        Err(err) => {
+            tracing::error!(
+                "[workspace-state-watch] upgrade tree refresh failed for {}: {}",
+                root_display,
+                err
+            );
+            None
+        }
+    };
     let is_git = is_git_repo(root_canonical);
     let refreshed_git = if is_git {
         collect_git_snapshot(root_display).await.ok()
@@ -1250,8 +1339,8 @@ pub async fn start_workspace_state_stream_core(
         })?;
         if let Some(entry) = streams.get_mut(&key) {
             entry.ref_count += 1;
-            let became_full = wants_tree_git
-                && entry.full_subscribers.fetch_add(1, Ordering::AcqRel) == 0;
+            let became_full =
+                wants_tree_git && entry.full_subscribers.fetch_add(1, Ordering::AcqRel) == 0;
             if !became_full {
                 let snapshot = entry.state.lock().map_err(|_| {
                     AppCommandError::task_execution_failed(
@@ -1267,8 +1356,7 @@ pub async fn start_workspace_state_stream_core(
     };
 
     if let Some((existing_state, root_display)) = existing_upgrade {
-        refresh_tree_git_snapshots(&existing_state, &emitter, &root_display, &root_canonical)
-            .await;
+        refresh_tree_git_snapshots(&existing_state, &emitter, &root_display, &root_canonical).await;
         let snapshot = existing_state.lock().map_err(|_| {
             AppCommandError::task_execution_failed("Failed to lock workspace state snapshot")
         })?;
@@ -1313,6 +1401,7 @@ pub async fn start_workspace_state_stream_core(
     let (event_tx, event_rx) = mpsc::channel::<notify::Event>(WATCH_EVENT_CHANNEL_CAPACITY);
     let dropped_events = Arc::new(AtomicBool::new(false));
     let full_subscribers = Arc::new(AtomicUsize::new(usize::from(wants_tree_git)));
+    let (path_change_tx, _) = broadcast::channel(WATCH_CHANGE_BROADCAST_CAPACITY);
 
     let state_for_task = Arc::clone(&state);
     let emitter_for_task = emitter.clone();
@@ -1321,6 +1410,7 @@ pub async fn start_workspace_state_stream_core(
     let git_watch_dirs_for_task = git_watch_dirs.clone();
     let dropped_events_for_task = Arc::clone(&dropped_events);
     let full_subscribers_for_task = Arc::clone(&full_subscribers);
+    let path_change_tx_for_task = path_change_tx.clone();
     let mut task = Some(tokio::spawn(async move {
         run_workspace_watch_event_loop(
             event_rx,
@@ -1331,6 +1421,7 @@ pub async fn start_workspace_state_stream_core(
             root_canonical_for_task,
             git_watch_dirs_for_task,
             full_subscribers_for_task,
+            path_change_tx_for_task,
         )
         .await;
     }));
@@ -1350,7 +1441,8 @@ pub async fn start_workspace_state_stream_core(
                 Err(err) => {
                     tracing::error!(
                         "[workspace-state-watch] failed event for {}: {}",
-                        root_display_for_error, err
+                        root_display_for_error,
+                        err
                     );
                 }
             },
@@ -1369,7 +1461,8 @@ pub async fn start_workspace_state_stream_core(
     if let Err(err) = watch_result {
         tracing::info!(
             "[workspace-state-watch] degraded (no realtime updates) for {}: {}",
-            root_path, err
+            root_path,
+            err
         );
         if let Some(mut created_watcher) = watcher.take() {
             let _ = created_watcher.unwatch(&root_canonical);
@@ -1413,8 +1506,8 @@ pub async fn start_workspace_state_stream_core(
             // (outside the lock, below) so this response carries fresh
             // snapshots instead of the winner's empty paths-only seed.
             entry.ref_count += 1;
-            let became_full = wants_tree_git
-                && entry.full_subscribers.fetch_add(1, Ordering::AcqRel) == 0;
+            let became_full =
+                wants_tree_git && entry.full_subscribers.fetch_add(1, Ordering::AcqRel) == 0;
             let upgrade = if became_full {
                 Some((Arc::clone(&entry.state), entry.root_display.clone()))
             } else {
@@ -1443,6 +1536,7 @@ pub async fn start_workspace_state_stream_core(
                     ref_count: 1,
                     full_subscribers: Arc::clone(&full_subscribers),
                     state: Arc::clone(&state),
+                    path_change_tx,
                 },
             );
             (false, snapshot, None)
@@ -1459,8 +1553,7 @@ pub async fn start_workspace_state_stream_core(
     }
 
     if let Some((winner_state, winner_display)) = lost_race_upgrade {
-        refresh_tree_git_snapshots(&winner_state, &emitter, &winner_display, &root_canonical)
-            .await;
+        refresh_tree_git_snapshots(&winner_state, &emitter, &winner_display, &root_canonical).await;
         let snapshot = winner_state
             .lock()
             .map_err(|_| {
@@ -1507,11 +1600,12 @@ pub async fn stop_workspace_state_stream_core(
         // between start and stop bookkeeping) must not underflow and wedge
         // the stream in permanent full-scan mode.
         if wants_tree_git {
-            let _ = entry.full_subscribers.fetch_update(
-                Ordering::AcqRel,
-                Ordering::Acquire,
-                |count| count.checked_sub(1),
-            );
+            let _ =
+                entry
+                    .full_subscribers
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                        count.checked_sub(1)
+                    });
         }
         if entry.ref_count > 1 {
             entry.ref_count -= 1;
@@ -1533,6 +1627,56 @@ pub async fn stop_workspace_state_stream_core(
     }
 
     Ok(())
+}
+
+/// Acquire a paths-only watcher lease and subscribe to its backend semantic
+/// change feed. The lease participates in the same ref-count as frontend file
+/// tree/tab subscriptions, so an active ACP turn keeps watching even when every
+/// browser disconnects. Call [`unsubscribe_workspace_changes`] once the turn is
+/// finalized.
+pub(crate) async fn subscribe_workspace_changes(
+    emitter: EventEmitter,
+    root_path: String,
+) -> Result<WorkspaceChangeSubscription, AppCommandError> {
+    let snapshot = start_workspace_state_stream_core(emitter, root_path.clone(), false).await?;
+    let root = PathBuf::from(&root_path);
+    let key = canonicalize_watch_root(&root)
+        .map(|(_, key)| key)
+        .unwrap_or_else(|_| normalize_slash_path(&root));
+
+    let subscription = {
+        let streams = WORKSPACE_STREAMS.lock().map_err(|_| {
+            AppCommandError::task_execution_failed("Failed to lock workspace stream registry")
+        })?;
+        let entry = streams
+            .get(&key)
+            .or_else(|| {
+                streams
+                    .values()
+                    .find(|entry| entry.root_display == root_path)
+            })
+            .ok_or_else(|| {
+                AppCommandError::task_execution_failed(
+                    "Workspace stream disappeared while subscribing to changes",
+                )
+            })?;
+        WorkspaceChangeSubscription {
+            root_path: entry.root_display.clone(),
+            degraded: snapshot.degraded,
+            receiver: entry.path_change_tx.subscribe(),
+        }
+    };
+    Ok(subscription)
+}
+
+pub(crate) async fn unsubscribe_workspace_changes(root_path: String) {
+    if let Err(err) = stop_workspace_state_stream_core(root_path.clone(), false).await {
+        tracing::error!(
+            "[artifact-tracker] failed to release workspace watcher for {}: {}",
+            root_path,
+            err
+        );
+    }
 }
 
 pub async fn get_workspace_snapshot_core(
@@ -1594,8 +1738,7 @@ pub async fn get_workspace_snapshot_core(
     let wants_tree_git = full_subscribers.load(Ordering::Acquire) > 0;
     let is_git = wants_tree_git && is_git_repo(&root_canonical);
     let (refreshed_tree, refreshed_git) = if wants_tree_git {
-        let tree_fut =
-            folders::get_file_tree(root_display.clone(), Some(WORKSPACE_TREE_MAX_DEPTH));
+        let tree_fut = folders::get_file_tree(root_display.clone(), Some(WORKSPACE_TREE_MAX_DEPTH));
         let git_fut = async {
             if is_git {
                 collect_git_snapshot(&root_display).await.ok()
@@ -1676,10 +1819,16 @@ mod tests {
         EventEmitter::Noop
     }
 
+    fn test_change_sender() -> broadcast::Sender<WorkspacePathChangeBatch> {
+        broadcast::channel(8).0
+    }
+
     fn batch_with_paths(paths: &[&str]) -> WatchEventBatch {
         let mut batch = WatchEventBatch::default();
         for path in paths {
-            batch.changed_paths.insert((*path).to_string());
+            batch
+                .changed_paths
+                .insert((*path).to_string(), WorkspacePathChangeKind::Modified);
         }
         batch
     }
@@ -1705,6 +1854,7 @@ mod tests {
             &root_display,
             dir.path(),
             &full_subscribers,
+            &test_change_sender(),
             &batch,
         )
         .await;
@@ -1750,6 +1900,7 @@ mod tests {
             &root_display,
             dir.path(),
             &full_subscribers,
+            &test_change_sender(),
             &batch,
         )
         .await;
@@ -1790,6 +1941,7 @@ mod tests {
             &root_display,
             dir.path(),
             &full_subscribers,
+            &test_change_sender(),
             &batch,
         )
         .await;
@@ -1813,10 +1965,9 @@ mod tests {
         let root = dir.path().to_string_lossy().to_string();
 
         // Paths-only cold start: seeding scans are skipped entirely.
-        let paths_snapshot =
-            start_workspace_state_stream_core(test_emitter(), root.clone(), false)
-                .await
-                .expect("paths start");
+        let paths_snapshot = start_workspace_state_stream_core(test_emitter(), root.clone(), false)
+            .await
+            .expect("paths start");
         assert!(
             paths_snapshot.tree_snapshot.unwrap_or_default().is_empty(),
             "paths-only seed must not scan the tree"
@@ -1824,10 +1975,9 @@ mod tests {
 
         // First full subscriber: the upgrade contract guarantees a freshly
         // scanned tree in the start response (not the empty paths seed).
-        let full_snapshot =
-            start_workspace_state_stream_core(test_emitter(), root.clone(), true)
-                .await
-                .expect("full start");
+        let full_snapshot = start_workspace_state_stream_core(test_emitter(), root.clone(), true)
+            .await
+            .expect("full start");
         assert!(
             !full_snapshot.tree_snapshot.unwrap_or_default().is_empty(),
             "first full subscriber must receive a refreshed tree snapshot"
@@ -2223,7 +2373,7 @@ mod tests {
         let git_dir = &dirs[0].path;
         let mut batch = WatchEventBatch::default();
         batch.ingest_event(root, &dirs, modify_event(git_dir.join("index")));
-        assert!(batch.changed_paths.contains(".git/index"));
+        assert!(batch.changed_paths.contains_key(".git/index"));
         // `.git/index` is git-metadata → drives a git-status refresh, exactly
         // like a normal repo's in-tree `.git/index`.
         assert!(is_git_metadata_rel_path(".git/index"));

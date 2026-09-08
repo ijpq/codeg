@@ -20,6 +20,7 @@ import {
 } from "@/components/chat/message-input"
 import { MessageQueueDisplay } from "@/components/chat/message-queue-display"
 import { cn } from "@/lib/utils"
+import { Loader2 } from "lucide-react"
 
 interface ChatInputProps {
   status: ConnectionStatus | null
@@ -28,6 +29,8 @@ interface ChatInputProps {
   agentName?: string
   onFocus?: () => void
   onSend: (draft: PromptDraft, modeId?: string | null) => void
+  supportsSteer?: boolean
+  onGuide?: (draft: PromptDraft) => void | Promise<void>
   onCancel: () => void
   modes?: SessionModeInfo[]
   configOptions?: SessionConfigOptionInfo[]
@@ -52,12 +55,16 @@ interface ChatInputProps {
   onQueueReorder?: (items: QueuedMessage[]) => void
   onQueueEdit?: (id: string) => void
   onQueueDelete?: (id: string) => void
+  onQueueRetry?: (id: string) => void
+  onConvertGuideToPrompt?: (id: string) => void
   editingItemId?: string | null
   editingDraftText?: string | null
   editingDraftBlocks?: PromptInputBlock[] | null
   isEditingQueueItem?: boolean
   onSaveQueueEdit?: (draft: PromptDraft) => void
   onCancelQueueEdit?: () => void
+  /** Fork the session and send this draft through the durable branch queue. */
+  onForkSend?: (draft: PromptDraft, modeId?: string | null) => void
   /** Send the draft into the RUNNING turn over the session's live-feedback
    *  channel. Present only when the session has a working delivery channel
    *  (`useSessionFeedback().steerAvailable`); resolves once recorded, rejects
@@ -75,11 +82,9 @@ interface ChatInputProps {
   onAddFeedback?: () => void
   feedbackAddDisabled?: boolean
   /**
-   * Keep the composer usable even while disconnected. Set for a folderless chat
-   * draft: it has no working dir yet (so it never auto-connects), and the FIRST
-   * send is precisely what lazily creates its conversation + scratch dir and
-   * triggers the connection. Without this the composer would be permanently
-   * disabled and the chat could never be started.
+   * Keep the composer usable while a persisted historical session is restoring.
+   * The parent retains those drafts in its durable per-conversation queue and
+   * sends them only after the exact ACP session finishes attaching.
    */
   allowOfflineCompose?: boolean
   injectContent?: ComposerInjectContent | null
@@ -100,6 +105,8 @@ export const ChatInput = memo(function ChatInput({
   agentName,
   onFocus,
   onSend,
+  supportsSteer = false,
+  onGuide,
   onCancel,
   modes,
   configOptions,
@@ -121,12 +128,15 @@ export const ChatInput = memo(function ChatInput({
   onQueueReorder,
   onQueueEdit,
   onQueueDelete,
+  onQueueRetry,
+  onConvertGuideToPrompt,
   editingItemId,
   editingDraftText,
   editingDraftBlocks,
   isEditingQueueItem,
   onSaveQueueEdit,
   onCancelQueueEdit,
+  onForkSend,
   onSteer,
   steerChannel,
   onAddFeedback,
@@ -140,6 +150,7 @@ export const ChatInput = memo(function ChatInput({
   const t = useTranslations("Folder.chat.chatInput")
   const isConnected = status === "connected"
   const isPrompting = status === "prompting"
+  const isCancelling = status === "cancelling"
   const isConnecting = status === "connecting"
   // The agent names its slash commands as part of coming up, so until it has
   // the composer's `/` panel shows a loading row rather than refusing to open.
@@ -153,6 +164,7 @@ export const ChatInput = memo(function ChatInput({
   // and is bounded: `selectors_ready` fires on every establishment path whether
   // or not the agent has any commands, so this can never hang on a spinner.
   const commandsLoading = isConnecting || selectorsLoading
+  const isNativeGuide = isPrompting && supportsSteer && Boolean(onGuide)
 
   // Active/historical conversations dock the composer at the very bottom of the
   // message list. The attached folder/branch selector row now sits at the
@@ -176,6 +188,12 @@ export const ChatInput = memo(function ChatInput({
         if (event.pointerType !== "mouse") event.stopPropagation()
       }}
     >
+      {isCancelling && (
+        <div className="mb-2 flex items-center gap-2 text-xs text-muted-foreground">
+          <Loader2 className="size-3.5 animate-spin" />
+          {t("stopping")}
+        </div>
+      )}
       {queue &&
         queue.length > 0 &&
         onQueueReorder &&
@@ -186,11 +204,15 @@ export const ChatInput = memo(function ChatInput({
             onReorder={onQueueReorder}
             onEdit={onQueueEdit}
             onDelete={onQueueDelete}
+            onRetry={onQueueRetry}
+            onConvertGuideToPrompt={onConvertGuideToPrompt}
             editingItemId={editingItemId ?? null}
           />
         )}
       <MessageInput
         onSend={onSend}
+        supportsSteer={supportsSteer}
+        onGuide={onGuide}
         promptCapabilities={promptCapabilities}
         onFocus={onFocus}
         defaultPath={defaultPath}
@@ -200,6 +222,7 @@ export const ChatInput = memo(function ChatInput({
             : (!isConnected && !isPrompting) || selectorsLoading
         }
         isPrompting={isPrompting}
+        isCancelling={isCancelling}
         onCancel={onCancel}
         modes={modes}
         configOptions={configOptions}
@@ -223,6 +246,7 @@ export const ChatInput = memo(function ChatInput({
         isEditingQueueItem={isEditingQueueItem}
         onSaveQueueEdit={onSaveQueueEdit}
         onCancelQueueEdit={onCancelQueueEdit}
+        onForkSend={onForkSend}
         onSteer={onSteer}
         steerChannel={steerChannel}
         onAddFeedback={onAddFeedback}
@@ -232,9 +256,11 @@ export const ChatInput = memo(function ChatInput({
         placeholder={
           isConnecting
             ? t("connecting")
-            : isPrompting
-              ? t("agentResponding", { agent: agentName ?? "Agent" })
-              : t("sendMessage")
+            : isNativeGuide
+              ? t("guideAgent", { agent: agentName ?? "Agent" })
+              : isPrompting
+                ? t("agentResponding", { agent: agentName ?? "Agent" })
+                : t("sendMessage")
         }
         className={cn(tall ? "min-h-30" : "min-h-24", "max-h-60")}
       />

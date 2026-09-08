@@ -12,12 +12,25 @@ export class TauriTransport implements Transport {
     args?: Record<string, unknown>,
     options?: CallOptions
   ): Promise<T> {
-    // Tauri invoke() has no client-side timeout — the IPC channel runs
-    // for as long as the command needs. `options.timeoutMs` is part
-    // of the Transport contract for web-mode parity, ignored here.
-    void options
+    if (options?.signal?.aborted) {
+      const cancelled = new Error("Request cancelled")
+      cancelled.name = "AbortError"
+      throw cancelled
+    }
     const { invoke } = await import("@tauri-apps/api/core")
-    return invoke(command, args)
+    const call = invoke<T>(command, args)
+    if (!options?.signal) return call
+    return new Promise<T>((resolve, reject) => {
+      const onAbort = () => {
+        const cancelled = new Error("Request cancelled")
+        cancelled.name = "AbortError"
+        reject(cancelled)
+      }
+      options.signal!.addEventListener("abort", onAbort, { once: true })
+      call.then(resolve, reject).finally(() => {
+        options.signal!.removeEventListener("abort", onAbort)
+      })
+    })
   }
 
   // Bypasses `@tauri-apps/api/event#listen` to sidestep an intermittent race:

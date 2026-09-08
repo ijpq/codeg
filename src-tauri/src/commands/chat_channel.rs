@@ -398,6 +398,16 @@ pub async fn weixin_get_qrcode_core() -> Result<WeixinQrcodeInfo, AppCommandErro
         .map_err(AppCommandError::from)
 }
 
+fn merge_weixin_base_url(existing_config: &str, base_url: &str) -> Result<String, AppCommandError> {
+    let mut config: serde_json::Value =
+        serde_json::from_str(existing_config).unwrap_or_else(|_| serde_json::json!({}));
+    let object = config.as_object_mut().ok_or_else(|| {
+        AppCommandError::invalid_input("chat channel config must be a JSON object")
+    })?;
+    object.insert("base_url".to_string(), serde_json::json!(base_url));
+    Ok(config.to_string())
+}
+
 pub async fn weixin_check_qrcode_core(
     db: &AppDatabase,
     channel_id: i32,
@@ -409,19 +419,11 @@ pub async fn weixin_check_qrcode_core(
 
     // On confirmed: save token + update config with base_url
     if result.status == "confirmed" {
-        tracing::error!(
-            "[Weixin] QR confirmed for channel {channel_id}, bot_token={}, base_url={}",
-            result
-                .bot_token
-                .as_deref()
-                .map(|t| {
-                    // Char-boundary-safe prefix: `&t[..8]` panics if a multibyte
-                    // char straddles byte 8.
-                    let end = t.char_indices().nth(8).map_or(t.len(), |(i, _)| i);
-                    &t[..end]
-                })
-                .unwrap_or("None"),
-            result.base_url.as_deref().unwrap_or("None"),
+        tracing::info!(
+            channel_id,
+            has_token = result.bot_token.is_some(),
+            has_base_url = result.base_url.is_some(),
+            "[Weixin] QR confirmation received"
         );
         if let Some(ref token) = result.bot_token {
             save_chat_channel_token_core(channel_id, token)?;
@@ -432,7 +434,15 @@ pub async fn weixin_check_qrcode_core(
             );
         }
         if let Some(ref base_url) = result.base_url {
-            let config_json = serde_json::json!({ "base_url": base_url }).to_string();
+            // QR renewal updates only the credential endpoint. Preserve default
+            // folder/agent/conversation fields already configured by the user.
+            let existing =
+                crate::db::service::chat_channel_service::get_by_id(&db.conn, channel_id)
+                    .await?
+                    .ok_or_else(|| {
+                        AppCommandError::not_found(format!("Chat channel {channel_id} not found"))
+                    })?;
+            let config_json = merge_weixin_base_url(&existing.config_json, base_url)?;
             update_chat_channel_core(
                 db,
                 channel_id,
@@ -888,5 +898,19 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[test]
+    fn weixin_qr_refresh_preserves_default_conversation_config() {
+        let merged = merge_weixin_base_url(
+            r#"{"base_url":"https://old","default_folder_id":8,"default_agent_type":"codex","default_conversation_id":75}"#,
+            "https://new",
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        assert_eq!(value["base_url"], "https://new");
+        assert_eq!(value["default_folder_id"], 8);
+        assert_eq!(value["default_agent_type"], "codex");
+        assert_eq!(value["default_conversation_id"], 75);
     }
 }

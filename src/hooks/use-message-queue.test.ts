@@ -1,6 +1,10 @@
-import { describe, it, expect } from "vitest"
+import { describe, it, expect, beforeEach, afterEach } from "vitest"
 import { act, renderHook } from "@testing-library/react"
-import { useMessageQueue } from "./use-message-queue"
+import {
+  enqueuePersistedMessageForConversation,
+  isQueuedGuideTargetCurrent,
+  useMessageQueue,
+} from "./use-message-queue"
 import type { PromptDraft } from "@/lib/types"
 
 function draft(text: string): PromptDraft {
@@ -113,5 +117,334 @@ describe("useMessageQueue bounce FIFO ordering", () => {
     // use the authoritative edited A (by id), only applying the requested order.
     act(() => result.current.reorder([b, a]))
     expect(texts(result.current.queue)).toEqual(["B", "A-edited"])
+  })
+})
+
+describe("useMessageQueue persistence (offline survival across reload)", () => {
+  const KEY = "codeg:msg-queue:v1:42"
+  beforeEach(() => localStorage.clear())
+  afterEach(() => localStorage.clear())
+
+  it("does not touch localStorage without a persistKey", () => {
+    const { result } = renderHook(() => useMessageQueue())
+    act(() => result.current.enqueue(draft("hi"), null))
+    expect(result.current.queue).toHaveLength(1)
+    expect(localStorage.getItem(KEY)).toBeNull()
+  })
+
+  it("persists the queue and rehydrates it on a fresh mount (reload)", () => {
+    const first = renderHook(() => useMessageQueue(42))
+    act(() =>
+      first.result.current.enqueue(
+        draft("offline message"),
+        "modeA",
+        "optimistic-stable"
+      )
+    )
+    expect(JSON.parse(localStorage.getItem(KEY)!)).toHaveLength(1)
+
+    // A fresh mount (page reload during the outage) restores the queue.
+    const reloaded = renderHook(() => useMessageQueue(42))
+    expect(texts(reloaded.result.current.queue)).toEqual(["offline message"])
+    expect(reloaded.result.current.queue[0].modeId).toBe("modeA")
+    expect(reloaded.result.current.queue[0].clientMessageId).toBe(
+      "optimistic-stable"
+    )
+  })
+
+  it("persists one idempotent create-branch request across reload", () => {
+    const first = renderHook(() => useMessageQueue(42))
+    act(() => {
+      first.result.current.enqueue(
+        { blocks: [], displayText: "Create branch" },
+        "modeA",
+        "branch-create-stable",
+        { intent: "branch" }
+      )
+      first.result.current.enqueue(
+        { blocks: [], displayText: "Create branch" },
+        "modeA",
+        "branch-create-stable",
+        { intent: "branch" }
+      )
+    })
+    expect(first.result.current.queue).toHaveLength(1)
+
+    const reloaded = renderHook(() => useMessageQueue(42))
+    expect(reloaded.result.current.peekNext("branch")).toMatchObject({
+      clientMessageId: "branch-create-stable",
+      intent: "branch",
+      modeId: "modeA",
+    })
+  })
+
+  it("preserves restore-waiting text, image, attachment, and stable id", () => {
+    const pendingDraft: PromptDraft = {
+      displayText: "inspect these files",
+      blocks: [
+        { type: "text", text: "inspect these files" },
+        {
+          type: "image",
+          data: "base64-image",
+          mime_type: "image/png",
+          uri: "file:///uploads/screenshot.png",
+        },
+        {
+          type: "resource",
+          uri: "file:///uploads/spec.pdf",
+          mime_type: "application/pdf",
+          blob: "base64-pdf",
+        },
+      ],
+    }
+    const first = renderHook(() => useMessageQueue(42))
+    act(() =>
+      first.result.current.enqueue(
+        pendingDraft,
+        "modeA",
+        "optimistic-with-attachments",
+        { state: "waiting_session_restore" }
+      )
+    )
+
+    const reloaded = renderHook(() => useMessageQueue(42))
+    const restored = reloaded.result.current.peekNext("prompt")
+    expect(restored).toMatchObject({
+      clientMessageId: "optimistic-with-attachments",
+      state: "waiting_session_restore",
+      draft: pendingDraft,
+    })
+  })
+
+  it("compacts uploaded image bytes only in persisted remote copies", () => {
+    const uploadedDraft: PromptDraft = {
+      displayText: "with image",
+      blocks: [
+        {
+          type: "image",
+          data: "large-base64-image",
+          mime_type: "image/png",
+          uri: "file:///uploads/image.png",
+        },
+        {
+          type: "resource",
+          uri: "file:///uploads/embedded.png",
+          mime_type: "image/png",
+          blob: "large-base64-resource",
+        },
+      ],
+    }
+    const { result } = renderHook(() =>
+      useMessageQueue(42, { compactUploadedImages: true })
+    )
+    act(() =>
+      result.current.enqueue(uploadedDraft, null, "optimistic-uploaded", {
+        state: "waiting_session_restore",
+      })
+    )
+
+    expect(result.current.queue[0].draft.blocks).toEqual(uploadedDraft.blocks)
+    const [persisted] = JSON.parse(localStorage.getItem(KEY)!)
+    expect(persisted.draft.blocks[0]).toMatchObject({
+      data: "",
+      uri: "file:///uploads/image.png",
+    })
+    expect(persisted.draft.blocks[1]).toMatchObject({
+      blob: "",
+      uri: "file:///uploads/embedded.png",
+    })
+  })
+
+  it("auto-retries a stable id after the connection recovers", () => {
+    const { result } = renderHook(() => useMessageQueue(42))
+    act(() =>
+      result.current.enqueue(draft("maybe accepted"), null, "stable-retry", {
+        state: "waiting_connection",
+      })
+    )
+    expect(result.current.peekNext("prompt")?.clientMessageId).toBe(
+      "stable-retry"
+    )
+  })
+
+  it("persists guide identity and only converts it to a prompt explicitly", () => {
+    const target = {
+      sessionId: "session-original",
+      connectionId: "connection-original",
+      userMessageId: "optimistic-original-task",
+    }
+    const first = renderHook(() => useMessageQueue(42))
+    act(() =>
+      first.result.current.enqueue(
+        draft("change direction"),
+        null,
+        "optimistic-guide",
+        {
+          intent: "guide",
+          state: "waiting_session_restore",
+          guideTarget: target,
+        }
+      )
+    )
+
+    const reloaded = renderHook(() => useMessageQueue(42))
+    expect(reloaded.result.current.peekNext("guide")).toMatchObject({
+      intent: "guide",
+      clientMessageId: "optimistic-guide",
+      guideTarget: target,
+    })
+    const id = reloaded.result.current.queue[0].id
+    act(() =>
+      reloaded.result.current.markState(
+        id,
+        "expired_guide",
+        "original task ended"
+      )
+    )
+    expect(reloaded.result.current.peekNext("prompt")).toBeUndefined()
+    act(() => reloaded.result.current.convertGuideToPrompt(id))
+    expect(reloaded.result.current.peekNext("prompt")).toMatchObject({
+      intent: "prompt",
+      guideTarget: null,
+      clientMessageId: "optimistic-guide",
+    })
+  })
+
+  it("moves fork-and-send into the branch queue exactly once across retries", () => {
+    const forkItem = {
+      id: "fork-queue-item",
+      clientMessageId: "fork-request-and-prompt-id",
+      draft: draft("continue independently"),
+      modeId: "code",
+      intent: "prompt" as const,
+      state: "queued" as const,
+      error: null,
+      guideTarget: null,
+    }
+    enqueuePersistedMessageForConversation(99, forkItem)
+    enqueuePersistedMessageForConversation(99, {
+      ...forkItem,
+      id: "network-retry-copy",
+    })
+
+    const branch = renderHook(() => useMessageQueue(99))
+    expect(branch.result.current.queue).toHaveLength(1)
+    expect(branch.result.current.peekNext("prompt")).toMatchObject({
+      clientMessageId: "fork-request-and-prompt-id",
+      draft: draft("continue independently"),
+    })
+  })
+
+  it("persists authoritative branch admission states across reload", () => {
+    const first = renderHook(() => useMessageQueue(42))
+    act(() =>
+      first.result.current.enqueue(draft("Create branch"), null, "branch-1", {
+        intent: "branch",
+        state: "waiting_source_turn",
+      })
+    )
+    const id = first.result.current.queue[0].id
+    act(() => first.result.current.markState(id, "creating_branch"))
+
+    const reloaded = renderHook(() => useMessageQueue(42))
+    expect(reloaded.result.current.queue).toHaveLength(1)
+    expect(reloaded.result.current.queue[0]).toMatchObject({
+      clientMessageId: "branch-1",
+      intent: "branch",
+      state: "creating_branch",
+    })
+  })
+
+  it("coalesces duplicate Create Branch operations while one is pending", () => {
+    const { result } = renderHook(() => useMessageQueue(42))
+    act(() => {
+      result.current.enqueue(draft("Create branch"), null, "operation-a", {
+        intent: "branch",
+      })
+      result.current.enqueue(draft("Create branch"), null, "operation-b", {
+        intent: "branch",
+      })
+    })
+    expect(result.current.queue).toHaveLength(1)
+    expect(result.current.queue[0].clientMessageId).toBe("operation-a")
+  })
+
+  it("preserves client_message_id across dequeue and Busy requeue", () => {
+    const { result } = renderHook(() => useMessageQueue())
+    act(() =>
+      result.current.enqueue(draft("image prompt"), null, "optimistic-image")
+    )
+    let item: ReturnType<typeof result.current.dequeue>
+    act(() => {
+      item = result.current.dequeue()
+    })
+    act(() =>
+      result.current.requeueFront(
+        item!.draft,
+        item!.modeId,
+        item!.clientMessageId
+      )
+    )
+    expect(result.current.queue[0].clientMessageId).toBe("optimistic-image")
+  })
+
+  it("backfills stable ids for legacy persisted queue entries", () => {
+    localStorage.setItem(
+      KEY,
+      JSON.stringify([
+        { id: "legacy-id", draft: draft("legacy"), modeId: null },
+      ])
+    )
+    const { result } = renderHook(() => useMessageQueue(42))
+    expect(result.current.queue[0].clientMessageId).toBe("optimistic-legacy-id")
+  })
+
+  it("clears the persisted slot when the queue drains", () => {
+    const { result } = renderHook(() => useMessageQueue(42))
+    act(() => result.current.enqueue(draft("m1"), null))
+    expect(localStorage.getItem(KEY)).toBeTruthy()
+    act(() => {
+      result.current.dequeue()
+    })
+    expect(result.current.queue).toHaveLength(0)
+    expect(localStorage.getItem(KEY)).toBeNull()
+  })
+})
+
+describe("deferred guide target safety", () => {
+  const target = {
+    sessionId: "session-original",
+    connectionId: "connection-original",
+    userMessageId: "optimistic-original-task",
+  }
+
+  it("accepts a guide only for the same still-running task", () => {
+    expect(
+      isQueuedGuideTargetCurrent(target, {
+        sessionId: "session-original",
+        connectionId: "connection-restored",
+        pendingUserMessageId: "optimistic-original-task",
+        status: "prompting",
+      })
+    ).toBe(true)
+  })
+
+  it("rejects a guide after the original task ended or a new task started", () => {
+    expect(
+      isQueuedGuideTargetCurrent(target, {
+        sessionId: "session-original",
+        connectionId: "connection-original",
+        pendingUserMessageId: null,
+        status: "connected",
+      })
+    ).toBe(false)
+    expect(
+      isQueuedGuideTargetCurrent(target, {
+        sessionId: "session-original",
+        connectionId: "connection-original",
+        pendingUserMessageId: "optimistic-new-task",
+        status: "prompting",
+      })
+    ).toBe(false)
   })
 })
