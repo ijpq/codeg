@@ -177,6 +177,7 @@ export class WebEventStream implements EventStream {
   private sendAttach(subscriptionId: string): void {
     const sub = this.subs.get(subscriptionId)
     if (!sub) return
+    safeInvoke("onAttaching", () => sub.handlers.onAttaching?.())
     this.host.sendFrame({
       action: "attach",
       subscription_id: subscriptionId,

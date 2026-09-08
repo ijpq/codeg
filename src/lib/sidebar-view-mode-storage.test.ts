@@ -8,6 +8,7 @@ import {
   loadSectionOrder,
   loadShowRecent,
   loadTagFilter,
+  loadSortMode,
   moveSectionInOrder,
   normalizeSectionOrder,
   saveRecentFilter,
@@ -15,12 +16,16 @@ import {
   saveShowRecent,
   saveTagFilter,
   type SidebarRecentFilter,
+  saveSortMode,
 } from "./sidebar-view-mode-storage"
 
-const SECTION_ORDER_KEY = "workspace:sidebar-section-order"
+const LEGACY_SECTION_ORDER_KEY = "workspace:sidebar-section-order"
+const SECTION_ORDER_KEY = "workspace:sidebar-section-order:v2"
 const SHOW_RECENT_KEY = "workspace:sidebar-show-recent"
 const RECENT_FILTER_KEY = "workspace:sidebar-recent-filter"
 const TAG_FILTER_KEY = "workspace:sidebar-tag-filter"
+const LEGACY_SORT_MODE_KEY = "workspace:sidebar-sort-mode"
+const SORT_MODE_KEY = "workspace:sidebar-sort-mode:v2"
 
 describe("normalizeSectionOrder", () => {
   it("passes a complete order through unchanged", () => {
@@ -53,9 +58,11 @@ describe("normalizeSectionOrder", () => {
       "folders",
       "recent",
     ])
-    expect(normalizeSectionOrder("folders-first")).toEqual(
-      DEFAULT_SECTION_ORDER
-    )
+    expect(normalizeSectionOrder("folders-first")).toEqual([
+      "folders",
+      "chats",
+      "recent",
+    ])
   })
 
   it("falls back to the default for anything unusable", () => {
@@ -107,15 +114,20 @@ describe("section-order persistence", () => {
     expect(loadSectionOrder()).toEqual(["recent", "folders", "chats"])
   })
 
-  it("defaults to Folders → Chat → Recent with nothing stored", () => {
-    expect(loadSectionOrder()).toEqual(["folders", "chats", "recent"])
+  it("defaults to Recent → Folders → Chat with nothing stored", () => {
+    expect(loadSectionOrder()).toEqual(["recent", "folders", "chats"])
   })
 
-  it("migrates a legacy bare string left by an older build", () => {
+  it("migrates a legacy order and promotes Recent while preserving the rest", () => {
     // The old format was not JSON, so the loader must survive the parse failure
-    // rather than resetting the user's preference.
-    localStorage.setItem(SECTION_ORDER_KEY, "chats-first")
-    expect(loadSectionOrder()).toEqual(["chats", "folders", "recent"])
+    // rather than resetting the user's Folders/Chat preference.
+    localStorage.setItem(LEGACY_SECTION_ORDER_KEY, "chats-first")
+    expect(loadSectionOrder()).toEqual(["recent", "chats", "folders"])
+    expect(JSON.parse(localStorage.getItem(SECTION_ORDER_KEY) ?? "")).toEqual([
+      "recent",
+      "chats",
+      "folders",
+    ])
   })
 
   it("falls back to the default for corrupt JSON", () => {
@@ -219,5 +231,32 @@ describe("tag filter persistence", () => {
       JSON.stringify({ tagIds: [4, "x", 4, 9], mode: "weird" })
     )
     expect(loadTagFilter()).toEqual({ tagIds: [4, 9], mode: "any" })
+  })
+})
+
+describe("sidebar sort-mode storage", () => {
+  beforeEach(() => localStorage.clear())
+
+  it("defaults new installations to latest activity", () => {
+    expect(loadSortMode()).toBe("updated")
+  })
+
+  it("migrates the historical created-time default to latest activity", () => {
+    localStorage.setItem(LEGACY_SORT_MODE_KEY, "created")
+
+    expect(loadSortMode()).toBe("updated")
+  })
+
+  it("persists an explicit choice made after the default migration", () => {
+    saveSortMode("created")
+
+    expect(localStorage.getItem(SORT_MODE_KEY)).toBe("created")
+    expect(loadSortMode()).toBe("created")
+  })
+
+  it("falls back to latest activity for an invalid stored value", () => {
+    localStorage.setItem(SORT_MODE_KEY, "unexpected")
+
+    expect(loadSortMode()).toBe("updated")
   })
 })

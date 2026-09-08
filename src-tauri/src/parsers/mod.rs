@@ -6,6 +6,7 @@ pub mod codebuddy;
 pub mod codex;
 pub mod codex_code_mode;
 mod codex_desktop_attachments;
+pub mod codex_quota;
 pub mod cursor;
 pub mod deepseek;
 pub mod gemini;

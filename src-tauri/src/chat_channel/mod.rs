@@ -3,6 +3,7 @@ pub mod command_dispatcher;
 pub mod command_handlers;
 pub mod error;
 pub mod event_subscriber;
+pub mod final_delivery;
 pub mod i18n;
 pub mod manager;
 pub mod message_formatter;

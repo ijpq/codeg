@@ -24,6 +24,29 @@ pub trait ChatChannelBackend: Send + Sync + 'static {
     /// Send a plain text message.
     async fn send_message(&self, text: &str) -> Result<SentMessageId, ChatChannelError>;
 
+    /// Send an idempotent outbox item and report whether the provider accepted
+    /// it or the current reply context has expired. Backends without expiring
+    /// reply capabilities use their ordinary send implementation.
+    async fn send_outbox_message(
+        &self,
+        text: &str,
+        _idempotency_key: &str,
+    ) -> Result<DeliveryOutcome, ChatChannelError> {
+        Ok(DeliveryOutcome::Delivered {
+            message_id: self.send_message(text).await?,
+            context_generation: None,
+        })
+    }
+
+    async fn send_outbox_message_to(
+        &self,
+        text: &str,
+        idempotency_key: &str,
+        _target: &ChannelMessageTarget,
+    ) -> Result<DeliveryOutcome, ChatChannelError> {
+        self.send_outbox_message(text, idempotency_key).await
+    }
+
     /// Send a rich/structured message (Telegram Markdown / Lark Card).
     async fn send_rich_message(
         &self,
@@ -41,10 +64,7 @@ pub trait ChatChannelBackend: Send + Sync + 'static {
     }
 
     /// Create a provider-specific thread/topic target.
-    async fn create_thread(
-        &self,
-        _title: &str,
-    ) -> Result<ChannelMessageTarget, ChatChannelError> {
+    async fn create_thread(&self, _title: &str) -> Result<ChannelMessageTarget, ChatChannelError> {
         Err(ChatChannelError::Unsupported(
             "thread creation is not supported by this channel".to_string(),
         ))

@@ -165,18 +165,34 @@ export class RemoteDesktopTransport implements Transport {
     args?: Record<string, unknown>,
     options?: CallOptions
   ): Promise<T> {
+    if (options?.signal?.aborted) {
+      const cancelled = new Error("Request cancelled")
+      cancelled.name = "AbortError"
+      throw cancelled
+    }
     try {
       // Forward `timeoutMs` through to `remote_http_call`. Without this,
       // the Rust client's 30s default fires before the backend can answer
       // — long-running commands (the 60s ACP probe in particular) would
       // surface "Request timed out" before reaching their own deadline.
-      const result = await invoke<T>("remote_http_call", {
+      const call = invoke<T>("remote_http_call", {
         connectionId: this.config.id,
         command,
         args: args ?? {},
         timeoutMs: options?.timeoutMs,
       })
-      return result
+      if (!options?.signal) return await call
+      return await new Promise<T>((resolve, reject) => {
+        const onAbort = () => {
+          const cancelled = new Error("Request cancelled")
+          cancelled.name = "AbortError"
+          reject(cancelled)
+        }
+        options.signal!.addEventListener("abort", onAbort, { once: true })
+        call.then(resolve, reject).finally(() => {
+          options.signal!.removeEventListener("abort", onAbort)
+        })
+      })
     } catch (err) {
       // The Rust proxy returns 401 from the remote server as
       // `AppErrorCode::AuthenticationFailed`. Surface the connection-expired
