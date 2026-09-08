@@ -167,7 +167,7 @@ pub async fn get_conversation_branch_creation_task_core(
     db: &AppDatabase,
     request_id: &str,
 ) -> Result<Option<ConversationBranchCreationTask>, AppCommandError> {
-    Ok(conversation_branch_task_service::get(&db.conn, request_id)
+    Ok(conversation_branch_task_service::get_reconciled(&db.conn, request_id)
         .await
         .map_err(AppCommandError::from)?
         .map(branch_creation_task_view))

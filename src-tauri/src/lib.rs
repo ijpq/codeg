@@ -96,6 +96,7 @@ mod tauri_app {
         browser as browser_commands,
         canvas as canvas_commands,
         chat_authoring as chat_authoring_commands, chat_channel as chat_channel_commands,
+        codex_quota as codex_quota_commands,
         conversation_branches,
         clipboard as clipboard_commands,
         config_sync,

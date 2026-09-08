@@ -12,6 +12,7 @@ pub struct Model {
     pub result_json: Option<String>,
     pub error: Option<String>,
     pub cancel_requested: bool,
+    pub worker_instance_id: Option<String>,
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
 }
