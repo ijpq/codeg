@@ -205,6 +205,10 @@ export function ComposerContextUsage({ tabId }: { tabId: string | null }) {
                   : `${formatTokenCount(contextUsed)} / ${formatTokenCount(contextMax)}`}
               </span>
             </div>
+            <div className="flex items-center justify-between text-xs leading-none text-muted-foreground">
+              <span>{t("source")}</span>
+              <span>{t("contextSource")}</span>
+            </div>
           </div>
         ) : null}
         {hasTokenSection ? (

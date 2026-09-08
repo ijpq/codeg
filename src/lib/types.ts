@@ -56,10 +56,13 @@ export type AppErrorCode =
   | "network_error"
   | "authentication_failed"
   | "database_error"
+  | "branch_merge_failed"
   | "io_error"
   | "external_command_failed"
   | "window_operation_failed"
   | "task_execution_failed"
+  | "connection_not_found"
+  | "process_exited"
   | (string & {})
 
 export interface AppCommandError {
@@ -831,13 +834,21 @@ export interface DbConversationDetail {
    * mid-stream, which would otherwise double-render against the live reply.
    */
   in_flight_user_turn_id?: string | null
-  /**
-   * Turn-window metadata, present only when the request asked for a window
-   * (`tailTurns`/`fromIndex`); their absence marks a legacy full response
-   * (old server) and disables windowed merging. `turns` then holds
-   * `full[turns_offset..]` while every other field still describes the full
-   * transcript. See `src/lib/turn-window.ts` for the derivation helpers.
-   */
+  /** Backend filesystem change diagnostics, grouped by accepted ACP turn.
+   * These are not final deliverables. Older servers omit this field. */
+  artifact_runs?: ConversationTurnArtifactRun[]
+  /** Legacy aggregate retained for wire compatibility. New detail responses
+   * leave it empty; use deliverable_runs or the paged history API. */
+  deliverables?: ConversationDeliverable[]
+  /** Confirmed outputs grouped by the producing backend turn run. */
+  deliverable_runs?: ConversationTurnDeliverableSet[]
+  /** Opaque cursor metadata returned by bounded history reads. */
+  history_page?: ConversationHistoryPage | null
+  /** Fixed read-only source prefix composed ahead of branch-local turns. */
+  branch_history?: ConversationBranchHistory | null
+  /** Legacy index-window metadata used only by explicit `tailTurns` or
+   * `fromIndex` compatibility requests. Current conversation pages use the
+   * opaque `history_page` cursor instead. */
   turns_offset?: number | null
   turns_total?: number | null
   /** Assistant turns in `full[0..turns_offset)` (baseline globalization). */
@@ -858,6 +869,53 @@ export interface DbConversationDetail {
   uncovered_prefix_max_ts?: string | null
 }
 
+export interface ConversationBranchHistory {
+  source_conversation_id: number
+  fork_message_id?: string | null
+  inherited_turn_count: number
+  branch_turn_count: number
+  inheritance_mode: string
+}
+
+export interface ConversationBranchMergePreview {
+  id: string
+  branch_conversation_id: number
+  created_at: string
+  summary_preview: string
+  summary_bytes: number
+}
+
+export interface ConversationBranchMergePreviewPage {
+  items: ConversationBranchMergePreview[]
+  next_offset?: number | null
+  has_more: boolean
+}
+
+export interface ConversationSourceBranchPreview {
+  branch_conversation_id: number
+  branch_session_id?: string | null
+  fork_mode: string
+  inheritance_mode: string
+  inherited_message_count: number
+  inherited_context_chars: number
+  inherited_estimated_tokens: number
+  lifecycle_state: string
+  created_at: string
+  last_merged_at?: string | null
+  merge_target_conversation_id?: number | null
+}
+
+export interface ConversationSourceBranchPreviewPage {
+  items: ConversationSourceBranchPreview[]
+  next_offset?: number | null
+  has_more: boolean
+}
+
+export interface ConversationOutputWindow {
+  artifact_runs: ConversationTurnArtifactRun[]
+  deliverable_runs: ConversationTurnDeliverableSet[]
+}
+
 /** One page of older history for reverse infinite scroll:
  *  `full[turns_offset .. turns_offset + turns.length)`. */
 export interface ConversationTurnsPage {
@@ -872,6 +930,163 @@ export interface ConversationTurnsPage {
   prefix_hash_before_index: string
   uncovered_prefix_max_ts?: string | null
 }
+
+export interface ConversationHistoryPage {
+  next_cursor?: string | null
+  has_more: boolean
+  loaded_turns: number
+  source_version?: string | null
+  read_start_offset?: number | null
+  read_end_offset?: number | null
+  read_bytes?: number | null
+  scan_bytes?: number | null
+  cache_hit?: boolean | null
+  index_hit?: boolean | null
+  index_status?:
+    | "missing"
+    | "building"
+    | "ready"
+    | "stale"
+    | "corrupt"
+    | "limited"
+    | null
+  indexed_through_offset?: number | null
+}
+
+export interface ConversationDeliverable {
+  id: string
+  conversation_id: number
+  turn_run_id?: string | null
+  root_path: string
+  path: string
+  kind: "file" | "directory"
+  title: string
+  description?: string | null
+  role: "primary" | "supporting"
+  category?: "code_change" | "standalone_output"
+  change_kind?: ConversationTurnFileChangeKind
+  position: number
+  source: "declared" | "inferred"
+  file_name: string
+  extension?: string | null
+  size_bytes?: number | null
+  modified_at?: string | null
+  is_valid: boolean
+  invalid_reason?: string | null
+  verified_at: string
+  last_checked_at?: string | null
+  turn_client_message_id?: string | null
+  turn_started_at?: string | null
+  produced_at: string
+  created_at: string
+  updated_at: string
+}
+
+export interface ConversationTurnDeliverableSet {
+  turn_run_id: string
+  conversation_id: number
+  client_message_id?: string | null
+  /** Durable parser user-turn id resolved by the backend from the accepted
+   * prompt fingerprint. Present on new runs so every viewing machine attaches
+   * the output card to the same reply. */
+  user_turn_id?: string | null
+  started_at: string
+  completed_at?: string | null
+  deliverables: ConversationDeliverable[]
+}
+
+export interface ConversationDeliverableHistoryGroup {
+  path_key: string
+  latest: ConversationDeliverable
+  versions: ConversationDeliverable[]
+}
+
+export interface ConversationDeliverableHistoryPage {
+  items: ConversationDeliverableHistoryGroup[]
+  offset: number
+  next_offset?: number | null
+  has_more: boolean
+  total: number
+}
+
+export type ConversationTurnArtifactStatus =
+  | "running"
+  | "cancelling"
+  | "completed"
+  | "cancelled"
+  | "interrupted"
+  | "failed"
+
+export type ConversationTurnFileChangeKind =
+  | "created"
+  | "modified"
+  | "deleted"
+  | "renamed"
+
+export interface ConversationTurnFileChange {
+  id: number
+  path: string
+  old_path?: string | null
+  kind: ConversationTurnFileChangeKind
+  source: string
+  attribution: "exclusive" | "ambiguous" | string
+  first_seen_at: string
+  last_seen_at: string
+  event_count: number
+  final_exists: boolean | null
+  size_bytes?: number | null
+  modified_at?: string | null
+}
+
+export interface ConversationTurnArtifactRun {
+  id: string
+  conversation_id: number
+  connection_id: string
+  client_message_id?: string | null
+  /** Durable receipt written only after ACP accepted the prompt command. */
+  prompt_accepted_at?: string | null
+  folder_id?: number | null
+  root_path: string
+  status: ConversationTurnArtifactStatus
+  capture_incomplete: boolean
+  stop_reason?: string | null
+  started_at: string
+  completed_at?: string | null
+  cancel_request_id?: string | null
+  cancel_requested_at?: string | null
+  cancel_deadline_at?: string | null
+  declaration_status?:
+    | "not_called"
+    | "success"
+    | "success_empty"
+    | "partial"
+    | "failed"
+    | string
+  declaration_attempted_at?: string | null
+  deliverables_declared_at?: string | null
+  declaration_error?: string | null
+  expectation_json?: string
+  settlement_status?: "pending" | "settled" | "settled_incomplete" | string
+  settled_at?: string | null
+  missing_expected_paths?: string[]
+  changes: ConversationTurnFileChange[]
+}
+
+export interface ConversationArtifactsChanged {
+  conversation_id: number
+  turn_run_id: string
+}
+
+export const CONVERSATION_ARTIFACTS_CHANGED_EVENT =
+  "conversation://artifacts-changed"
+
+export interface ConversationDeliverablesChanged {
+  conversation_id: number
+  deliverable_ids: string[]
+}
+
+export const CONVERSATION_DELIVERABLES_CHANGED_EVENT =
+  "conversation://deliverables-changed"
 
 export type ConversationStatus =
   | "in_progress"
@@ -1295,6 +1510,7 @@ export type ConnectionStatus =
   | "connecting"
   | "connected"
   | "prompting"
+  | "cancelling"
   | "disconnected"
   | "error"
 
@@ -1326,6 +1542,14 @@ export type PromptInputBlock =
       mime_type?: string | null
       description?: string | null
     }
+
+/** Successful native Codex steering injection. */
+export interface SteerResult {
+  /** Present only for the legacy `turn/steer` compatibility protocol. */
+  turn_id: string | null
+  message_id: string
+  deduplicated: boolean
+}
 
 export interface PromptDraft {
   blocks: PromptInputBlock[]
@@ -2378,6 +2602,24 @@ export interface SessionUsageUpdateInfo {
   size: number
 }
 
+export interface CodexQuotaWindow {
+  usedPercent: number
+  windowMinutes: number
+  resetsAt: number | null
+}
+
+/** Last subscription allowance carried by a real Codex response. Account
+ * identifiers are intentionally absent; relays may use `limitName` as an
+ * anonymous package/pool label. */
+export interface CodexQuotaSnapshot {
+  planType: string
+  limitId: string | null
+  limitName: string | null
+  weekly: CodexQuotaWindow | null
+  shortWindow: CodexQuotaWindow | null
+  observedAt: string | null
+}
+
 /**
  * Wire-level image attached to a tool call (e.g. codex image generation).
  * Mirrors Rust's `ToolCallImageInfo`. Reused by snapshot endpoints and
@@ -2551,6 +2793,10 @@ export type AcpEvent =
       supported: boolean
     }
   | {
+      type: "steer_supported"
+      supported: boolean
+    }
+  | {
       type: "mode_changed"
       mode_id: string
     }
@@ -2561,6 +2807,12 @@ export type AcpEvent =
   | {
       type: "status_changed"
       status: ConnectionStatus
+    }
+  | {
+      type: "steer_message"
+      message_id: string
+      blocks: UserMessageBlock[]
+      turn_id: string | null
     }
   | {
       type: "error"
@@ -3116,12 +3368,25 @@ export interface LiveSessionSnapshot {
    *  version proof — the frontend must NOT re-derive it from agent type).
    *  Absent → `false`. */
   native_steering_available?: boolean
+  /** Built-in codeg-mcp was included in this connection's session request. */
+  codeg_mcp_available?: boolean
+  /** User MCP servers plus the built-in companion; diagnostic only. */
+  mcp_server_count?: number
   modes: SessionModeStateInfo | null
   current_mode: string | null
   config_options: SessionConfigOptionInfo[] | null
   prompt_capabilities: PromptCapabilitiesInfo | null
   usage: SessionUsageUpdateInfo | null
   fork_supported: boolean
+  /** Whether this concrete adapter/app-server connection supports native
+   *  in-turn steering. Absent on older Codeg servers. */
+  supports_steer?: boolean
+  /** Successfully injected guide messages still associated with the active
+   *  turn, recoverable after refresh/reconnect. */
+  steer_messages?: Array<{
+    message_id: string
+    blocks: UserMessageBlock[]
+  }>
   available_commands: AvailableCommandInfo[]
   selectors_ready: boolean
   /** Whether the running session is on stale (launch-time) config after a later
@@ -3164,6 +3429,19 @@ export interface ConnectionInfo {
 export interface ConversationConnectionInfo {
   connection_id: string
   event_seq: number
+}
+
+/** Atomic persisted-conversation restore result. Camel-cased by the Rust wire
+ * type so desktop invoke and Server HTTP return the same shape. */
+export interface RestoredConversationConnectionInfo {
+  connectionId: string
+  externalSessionId: string
+  reusedExisting: boolean
+  codegMcpAvailable: boolean
+  mcpServerCount: number
+  replacedConnectionIds: string[]
+  lifecycleState?: string
+  durableSession?: boolean
 }
 
 // ACP agent info returned by acp_list_agents
@@ -4208,6 +4486,12 @@ export interface FilePreviewContent {
   content: string
 }
 
+export interface WorkspaceFileStat {
+  path: string
+  size: number
+  mtime_ms: number | null
+}
+
 export interface FileEditContent {
   path: string
   content: string
@@ -4529,6 +4813,26 @@ export interface ModelProviderInfo {
 export interface UpdateModelProviderResult {
   provider: ModelProviderInfo
   affectedRunningSessions: number
+}
+
+/** Result of `probeActiveModelProvider` (mirror of Rust
+ *  `ModelProviderProbeResult`): a lightweight reachability + latency probe of
+ *  the custom provider bound to an agent, used by the streaming-diagnostics
+ *  panel to tell a stalled network path (CF tunnel / VPS) apart from a model
+ *  that is still working. */
+export interface ModelProviderProbeResult {
+  /** False when the agent has no custom provider bound (official/direct). */
+  configured: boolean
+  /** True when the endpoint returned any HTTP response (tunnel/VPS alive). */
+  reachable: boolean
+  /** HTTP status code, when a response was received. */
+  status: number | null
+  /** Round-trip latency in ms, when a response was received. */
+  latencyMs: number | null
+  /** The provider's base URL, when configured. */
+  apiUrl: string | null
+  /** Error string on a failed probe (connection refused / timeout / DNS). */
+  error: string | null
 }
 
 export interface ClaudeProviderModel {

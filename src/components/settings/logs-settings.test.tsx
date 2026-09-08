@@ -19,6 +19,10 @@ vi.mock("@/lib/platform", () => ({
   revealItemInDir: vi.fn(),
 }))
 
+vi.mock("@/lib/diagnostic-report", () => ({
+  exportDiagnosticReport: vi.fn(),
+}))
+
 vi.mock("sonner", () => ({
   toast: { success: vi.fn(), error: vi.fn(), info: vi.fn() },
 }))
@@ -109,6 +113,7 @@ vi.mock("@/components/ui/scroll-area", () => ({
 
 import { LogsSettings } from "./logs-settings"
 import enMessages from "@/i18n/messages/en.json"
+import { exportDiagnosticReport } from "@/lib/diagnostic-report"
 import {
   getLogSettings,
   getRecentLogs,
@@ -123,6 +128,7 @@ const mockGetRecent = vi.mocked(getRecentLogs)
 const mockSetSettings = vi.mocked(setLogSettings)
 const mockSubAppended = vi.mocked(subscribeLogAppended)
 const mockSubSettings = vi.mocked(subscribeLogSettingsChanged)
+const mockExportDiagnostics = vi.mocked(exportDiagnosticReport)
 
 const M = enMessages.LogsSettings
 
@@ -209,6 +215,7 @@ beforeEach(() => {
   mockGetRecent.mockResolvedValue([])
   mockSetSettings.mockResolvedValue({ level: "info", targets: [] })
   mockSubSettings.mockResolvedValue(() => {})
+  mockExportDiagnostics.mockResolvedValue("saved")
   mockSubAppended.mockImplementation(async (handler) => {
     appendedHandler = handler
     return () => {}
@@ -220,6 +227,17 @@ afterEach(() => {
 })
 
 describe("LogsSettings", () => {
+  it("exports a shareable diagnostic report", async () => {
+    renderWithIntl()
+    const button = await screen.findByRole("button", {
+      name: M.exportDiagnostics,
+    })
+
+    fireEvent.click(button)
+
+    await waitFor(() => expect(mockExportDiagnostics).toHaveBeenCalledTimes(1))
+  })
+
   it("renders recent log records", async () => {
     mockGetRecent.mockResolvedValue([
       rec(1, "ERROR", "acp", "boom happened"),

@@ -33,6 +33,7 @@ import { LiveTurnStats } from "./live-turn-stats"
 import { ReplyArtifacts } from "./reply-artifacts"
 import { UserResourceLinks } from "./user-resource-links"
 import { UserImageAttachments } from "./user-image-attachments"
+import type { LiveMessage } from "@/contexts/acp-connections-context"
 import { AgentPlanOverlay } from "@/components/chat/agent-plan-overlay"
 import { SubAgentOverlay } from "@/components/chat/sub-agent-overlay"
 import { SessionViewerHost } from "@/components/message/session-viewer-host"
@@ -56,6 +57,7 @@ import {
   AlertCircle,
   CheckIcon,
   CopyIcon,
+  GitBranch,
   Loader2,
   Plus,
   RefreshCw,
@@ -68,18 +70,67 @@ import {
   buildPlanKey,
   extractLatestPlanEntriesFromMessages,
 } from "@/lib/agent-plan"
-import type { AgentType, ConnectionStatus, MessageTurn } from "@/lib/types"
-import { copyTextToClipboard } from "@/lib/utils"
+import type {
+  AgentType,
+  ConversationDeliverable,
+  ConversationTurnDeliverableSet,
+  ConnectionStatus,
+  MessageTurn,
+} from "@/lib/types"
+import { cn, copyTextToClipboard } from "@/lib/utils"
 import { VirtualizedMessageThread } from "@/components/message/virtualized-message-thread"
 import { SelectionActionBubble } from "@/components/message/selection-action-bubble"
 import {
   ConversationMessageNav,
   type MessageNavEntry,
 } from "@/components/message/conversation-message-nav"
+import { ConversationDeliverablesPanel } from "@/components/message/conversation-deliverables-panel"
+import { ReplyDeliverables } from "@/components/message/reply-deliverables"
 import type { MessageScrollContextValue } from "@/components/message/message-scroll-context"
 import { extractSessionFilesGrouped } from "@/lib/session-files"
 import { unescapeComposerText } from "@/lib/composer-copy-text"
 import { useStickToBottomContext } from "use-stick-to-bottom"
+import type {
+  PromptDeliveryPhase,
+  PromptDeliveryState,
+} from "@/lib/prompt-delivery-state"
+import { MessageBottomFollowGuard } from "./message-bottom-follow-guard"
+import {
+  extractCitationSources,
+  renderCitationPlainText,
+} from "@/lib/citations"
+
+type DeliveryLabelKey =
+  | "delivery.submitting"
+  | "delivery.accepted"
+  | "delivery.running"
+  | "delivery.failed"
+  | "delivery.queued"
+  | "delivery.persisted"
+  | "delivery.completed"
+
+function deliveryPhaseLabel(
+  phase: PromptDeliveryPhase,
+  t: (key: DeliveryLabelKey) => string
+): string {
+  switch (phase) {
+    case "draft":
+    case "submitting":
+      return t("delivery.submitting")
+    case "accepted":
+      return t("delivery.accepted")
+    case "running":
+      return t("delivery.running")
+    case "persisted":
+      return t("delivery.persisted")
+    case "completed":
+      return t("delivery.completed")
+    case "failed":
+      return t("delivery.failed")
+    case "queued":
+      return t("delivery.queued")
+  }
+}
 
 interface MessageListViewProps {
   conversationId: number
@@ -98,6 +149,10 @@ interface MessageListViewProps {
    * Reload / New session actions), since the agent can't continue the thread.
    */
   acpLoadError?: string | null
+  hasEarlierHistory?: boolean
+  earlierHistoryLoading?: boolean
+  earlierHistoryError?: string | null
+  onLoadEarlierHistory?: () => Promise<void> | void
   hideEmptyState?: boolean
   onReload?: () => void
   onNewSession?: () => void
@@ -144,11 +199,18 @@ interface MessageListViewProps {
    * (see `forkBusy`) rather than making every reply's footer flicker.
    */
   onForkFromTurn?: (turnId: string) => void
+  /** Per-turn output associations used at the producing assistant reply. */
+  deliverableRuns?: ConversationTurnDeliverableSet[]
+  /** Create a durable user branch at this exact source message. */
+  onForkFromMessage?: ((messageId: string) => void) | null
 }
 
 export interface ResolvedMessageGroup {
   id: string
   role: "user" | "assistant" | "system"
+  /** Source turn timestamp, retained so durable backend run ids can be
+   * correlated after optimistic client ids disappear on a cold reload. */
+  timestamp?: string
   parts: AdaptedContentPart[]
   resources: UserResourceDisplay[]
   images: UserImageDisplay[]
@@ -174,6 +236,7 @@ export type ThreadRenderItem =
       showStats: boolean
       isRoleTransition: boolean
       previousUserIndex: number | null
+      previousUserId?: string | null
       /** The newest assistant reply in the thread. Together with the view's
        *  `armed` flag this is what makes a run "the current round" — see the
        *  fold state below. */
@@ -191,6 +254,15 @@ export type ThreadRenderItem =
   | {
       key: string
       kind: "typing"
+    }
+  | {
+      // Durable outputs returned for the loaded transcript window whose
+      // producing user turn could not be mapped onto the adapted frontend
+      // groups. Keep them visible at the conversation tail without guessing
+      // that they belong to a specific assistant reply.
+      key: string
+      kind: "deliverables"
+      deliverables: ConversationDeliverable[]
     }
   | {
       // A context-compaction event hoisted OUT of an assistant turn into its own
@@ -367,13 +439,11 @@ const EMPTY_DELEGATIONS: DelegationCardSource[] = []
 // Stable empty reference so the navigator memo / equality checks don't churn
 // when a conversation has no user messages.
 const EMPTY_NAV_ENTRIES: MessageNavEntry[] = []
+const EMPTY_DELIVERABLES: ConversationDeliverable[] = []
+const EMPTY_PROMPT_DELIVERIES: Record<string, PromptDeliveryState> = {}
 
-// A single turn's `sourceTurns` is just `[turn]`. Cache the wrapper per turn
-// object so an unchanged historical turn keeps a stable `sourceTurns` reference
-// across streaming-token re-renders — that's the last prop preventing
-// `HistoricalMessageGroup`'s memo from bailing out (its `group` and the
-// phase-derived flags are already reference-/value-stable). The streaming turn
-// is rebuilt every token, so it gets a fresh wrapper and still re-renders.
+// A settled turn keeps object identity while unrelated live tokens arrive.
+// Reuse its one-element wrapper so memoized historical rows do not re-render.
 const sourceTurnsSingletonCache = new WeakMap<MessageTurn, MessageTurn[]>()
 export function singletonSourceTurns(turn: MessageTurn): MessageTurn[] {
   let cached = sourceTurnsSingletonCache.get(turn)
@@ -402,6 +472,185 @@ export function singletonSourceTurns(turn: MessageTurn): MessageTurn[] {
 //
 // `seenTaskIds` de-dupes repeated resumes of one task inside a single reply
 // (the second is refused, but the overlay renders a row per source regardless).
+export function resolveMessageThreadResizeBehavior(
+  isActive: boolean,
+  detailLoading: boolean,
+  hasTimelineTurns: boolean
+): "instant" | "smooth" {
+  // `undefined` is not a disabled resize animation in use-stick-to-bottom: it
+  // falls back to the library's spring. While a reply streams, row measurement
+  // can move the target again before that spring settles and leave the viewport
+  // a few pixels behind. An explicit instant resize keeps the active transcript
+  // pinned; the library still stops following after the user scrolls upward.
+  return isActive && !detailLoading && hasTimelineTurns ? "instant" : "smooth"
+}
+
+export interface DeliverableUserTurnRef {
+  id: string
+  timestamp?: string
+}
+
+/**
+ * A reply tail has a strict user-facing contract: an explicit declaration is
+ * the complete authoritative set for that turn. Only when none exists do we
+ * fall back to filtered standalone outputs inferred by the backend.
+ */
+export function replyDeliverablesForRun(
+  deliverables: ConversationDeliverable[]
+): ConversationDeliverable[] {
+  const declared = deliverables.filter(
+    (item) =>
+      item.source === "declared" &&
+      item.is_valid &&
+      item.change_kind !== "deleted"
+  )
+  if (declared.length > 0) return declared
+
+  const eligible = deliverables.filter((item) => {
+    return (
+      item.category === "standalone_output" &&
+      item.is_valid &&
+      item.change_kind !== "deleted"
+    )
+  })
+  return eligible
+}
+
+export interface DeliverableAssociationResult {
+  byUserId: Map<string, ConversationDeliverable[]>
+  /**
+   * Durable output sets that could not be correlated to a user turn in the
+   * currently loaded history page. They must never be guessed onto a specific
+   * assistant reply, but remain visible in a conversation-tail fallback.
+   */
+  unassociated: ConversationDeliverable[]
+}
+
+function dedupeDeliverables(
+  deliverables: ConversationDeliverable[]
+): ConversationDeliverable[] {
+  const seen = new Set<string>()
+  return deliverables.filter((item) => {
+    const key = item.id || `${item.turn_run_id ?? ""}:${item.path}`
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+}
+
+/**
+ * Prefer the backend's prompt-fingerprint link, then the exact optimistic id
+ * while a session is live. Historical rows created before that link existed
+ * retain the guarded timestamp fallback. This deliberately refuses distant
+ * guesses; unmatched durable outputs are returned separately for diagnostics
+ * and the conversation history panel.
+ */
+export function associateDeliverablesWithUserTurns(
+  runs: ConversationTurnDeliverableSet[],
+  userTurns: DeliverableUserTurnRef[]
+): Map<string, ConversationDeliverable[]> {
+  return resolveDeliverableAssociations(runs, userTurns).byUserId
+}
+
+export function resolveDeliverableAssociations(
+  runs: ConversationTurnDeliverableSet[],
+  userTurns: DeliverableUserTurnRef[]
+): DeliverableAssociationResult {
+  const byUserId = new Map<string, ConversationDeliverable[]>()
+  const userIds = new Set(userTurns.map((turn) => turn.id))
+  const used = new Set<string>()
+  const unresolved: ConversationTurnDeliverableSet[] = []
+  const attach = (userId: string, deliverables: ConversationDeliverable[]) => {
+    byUserId.set(
+      userId,
+      dedupeDeliverables([
+        ...(byUserId.get(userId) ?? EMPTY_DELIVERABLES),
+        ...deliverables,
+      ])
+    )
+  }
+
+  for (const run of runs) {
+    const deliverables = replyDeliverablesForRun(run.deliverables)
+    if (deliverables.length === 0) continue
+    const exactId =
+      run.user_turn_id && userIds.has(run.user_turn_id)
+        ? run.user_turn_id
+        : run.client_message_id && userIds.has(run.client_message_id)
+          ? run.client_message_id
+          : null
+    if (exactId) {
+      attach(exactId, deliverables)
+      used.add(exactId)
+    } else {
+      unresolved.push({ ...run, deliverables })
+    }
+  }
+
+  const candidates = userTurns
+    .filter((turn) => !used.has(turn.id))
+    .map((turn) => ({ ...turn, time: Date.parse(turn.timestamp ?? "") }))
+    .filter((turn) => Number.isFinite(turn.time))
+
+  for (const run of [...unresolved].sort(
+    (left, right) => Date.parse(left.started_at) - Date.parse(right.started_at)
+  )) {
+    const started = Date.parse(run.started_at)
+    if (!Number.isFinite(started)) continue
+    const completed = Date.parse(run.completed_at ?? "")
+    const latest = Number.isFinite(completed)
+      ? completed + 60_000
+      : started + 90_000
+    let best: (typeof candidates)[number] | null = null
+    for (const candidate of candidates) {
+      if (
+        used.has(candidate.id) ||
+        candidate.time < started - 60_000 ||
+        candidate.time > latest
+      ) {
+        continue
+      }
+      if (
+        best === null ||
+        Math.abs(candidate.time - started) < Math.abs(best.time - started)
+      ) {
+        best = candidate
+      }
+    }
+    if (best) {
+      attach(best.id, run.deliverables)
+      used.add(best.id)
+      unresolved.splice(unresolved.indexOf(run), 1)
+    }
+  }
+
+  return {
+    byUserId,
+    unassociated: dedupeDeliverables(
+      unresolved.flatMap((run) => run.deliverables)
+    ),
+  }
+}
+
+export function appendUnassociatedDeliverablesTail(
+  items: ThreadRenderItem[],
+  deliverables: ConversationDeliverable[]
+): ThreadRenderItem[] {
+  if (deliverables.length === 0) return items
+  return [
+    ...items,
+    {
+      key: "unassociated-deliverables-tail",
+      kind: "deliverables",
+      deliverables,
+    },
+  ]
+}
+
+// Collect the `delegate_to_agent` tool calls within a turn's adapted parts,
+// recursing through tool-groups and goal-runs (a delegate call is normally a
+// standalone part — `isAgentLikeToolName` keeps it out of tool-groups — but we
+// scan nested containers defensively so a delegation is never missed).
 function collectDelegationSources(
   parts: AdaptedContentPart[],
   out: DelegationCardSource[],
@@ -463,7 +712,7 @@ export function extractDelegationSources(
 }
 
 function extractTextFromParts(parts: AdaptedContentPart[]): string {
-  return parts
+  const text = parts
     .flatMap((p): string[] => {
       if (p.type === "text") return [p.text]
       if (p.type === "goal-run") return [extractTextFromParts(p.items)]
@@ -471,6 +720,7 @@ function extractTextFromParts(parts: AdaptedContentPart[]): string {
     })
     .filter((text) => text.length > 0)
     .join("\n")
+  return renderCitationPlainText(text, extractCitationSources(parts))
 }
 
 type AssistantTurnItem = Extract<ThreadRenderItem, { kind: "turn" }>
@@ -868,12 +1118,39 @@ export function isForkPointUnnamed(
   if (forkPoint === null || isThreadTail) return false
   return forkPoint.source_turn_id == null && isLiveTurnId(forkPoint.id)
 }
+const MessageBranchButton = memo(function MessageBranchButton({
+  messageId,
+  onFork,
+  align,
+}: {
+  messageId: string
+  onFork: (messageId: string) => void
+  align: "user" | "assistant"
+}) {
+  const tBranch = useTranslations("Folder.conversation.branch")
+  return (
+    <MessageAction
+      tooltip={tBranch("createFromMessage")}
+      className={cn(
+        "self-end opacity-0 transition-opacity",
+        align === "user"
+          ? "group-hover/user-msg:opacity-100"
+          : "group-hover/assistant-msg:opacity-100"
+      )}
+      onClick={() => onFork(messageId)}
+      size="icon-xs"
+    >
+      <GitBranch size={12} />
+    </MessageAction>
+  )
+})
 
 const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
   group,
   dimmed = false,
   showStats = true,
   previousUserIndex = null,
+  previousUserId = null,
   isResponseComplete = true,
   sourceTurns,
   currentRound = false,
@@ -883,11 +1160,16 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
   onForkFromTurn,
   forkDisabled = false,
   isThreadTail = false,
+  conversationId,
+  deliverables = EMPTY_DELIVERABLES,
+  delivery = null,
+  onForkFromMessage = null,
 }: {
   group: ResolvedMessageGroup
   dimmed?: boolean
   showStats?: boolean
   previousUserIndex?: number | null
+  previousUserId?: string | null
   isResponseComplete?: boolean
   sourceTurns?: MessageTurn[]
   currentRound?: boolean
@@ -899,7 +1181,12 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
   /** Whether nothing follows this group in the thread — the one position where
    *  a turn the backend cannot name still forks where the user pointed. */
   isThreadTail?: boolean
+  conversationId: number
+  deliverables?: ConversationDeliverable[]
+  delivery?: PromptDeliveryState | null
+  onForkFromMessage?: ((messageId: string) => void) | null
 }) {
+  const t = useTranslations("Folder.chat.messageList")
   if (group.role === "system") {
     return <CollapsibleSystemMessage parts={group.parts} />
   }
@@ -919,6 +1206,13 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
         ) : null}
         {group.role === "user" ? (
           <div className="group/user-msg flex w-fit ml-auto max-w-full items-start gap-1">
+            {onForkFromMessage && (
+              <MessageBranchButton
+                messageId={group.id}
+                onFork={onForkFromMessage}
+                align="user"
+              />
+            )}
             <UserMessageTaskButton parts={group.parts} />
             <UserMessageCopyButton parts={group.parts} />
             <MessageContent>
@@ -926,22 +1220,52 @@ const HistoricalMessageGroup = memo(function HistoricalMessageGroup({
             </MessageContent>
           </div>
         ) : (
-          <MessageContent>
-            <CompletedTurnContent
-              parts={group.parts}
-              durationMs={group.duration_ms}
-              completed={isResponseComplete}
-              currentRound={currentRound}
-              roundOpen={roundOpen}
-              onRoundOpenChange={onRoundOpenChange}
-              foldEpoch={foldEpoch}
-            />
-          </MessageContent>
+          <div className="group/assistant-msg flex max-w-full items-start gap-1">
+            <MessageContent>
+              <CompletedTurnContent
+                parts={group.parts}
+                durationMs={group.duration_ms}
+                completed={isResponseComplete}
+                currentRound={currentRound}
+                roundOpen={roundOpen}
+                onRoundOpenChange={onRoundOpenChange}
+                foldEpoch={foldEpoch}
+              />
+            </MessageContent>
+            {onForkFromMessage && (
+              <MessageBranchButton
+                messageId={group.id}
+                onFork={onForkFromMessage}
+                align="assistant"
+              />
+            )}
+          </div>
         )}
         {group.role === "user" && group.resources.length > 0 ? (
           <UserResourceLinks resources={group.resources} className="self-end" />
         ) : null}
+        {group.role === "user" &&
+          delivery &&
+          delivery.phase !== "completed" &&
+          delivery.phase !== "persisted" && (
+            <span
+              aria-live="polite"
+              className={cn(
+                "self-end text-[11px] text-muted-foreground",
+                delivery.phase === "failed" && "text-destructive"
+              )}
+              title={delivery.error ?? undefined}
+            >
+              {deliveryPhaseLabel(delivery.phase, t)}
+            </span>
+          )}
       </Message>
+      {group.role === "assistant" && previousUserId && (
+        <ReplyDeliverables
+          conversationId={conversationId}
+          deliverables={deliverables}
+        />
+      )}
       {showStats && group.role === "assistant" && sourceTurns && (
         <ReplyArtifacts
           sourceTurns={sourceTurns}
@@ -1020,6 +1344,57 @@ const AutoScrollOnSend = memo(function AutoScrollOnSend({
   return null
 })
 
+const LoadEarlierHistoryControl = memo(function LoadEarlierHistoryControl({
+  loading,
+  error,
+  onLoad,
+}: {
+  loading: boolean
+  error: string | null
+  onLoad: () => Promise<void> | void
+}) {
+  const t = useTranslations("Folder.chat.messageList")
+  const { scrollRef } = useStickToBottomContext()
+  const handleLoad = useCallback(async () => {
+    const viewport = scrollRef.current
+    const previousHeight = viewport?.scrollHeight ?? 0
+    const previousTop = viewport?.scrollTop ?? 0
+    await onLoad()
+    // Prepending a virtualized page changes the scrollable height. Preserve
+    // the reader's visual anchor instead of jumping them to the new first row.
+    requestAnimationFrame(() => {
+      if (!viewport) return
+      viewport.scrollTop =
+        previousTop + Math.max(0, viewport.scrollHeight - previousHeight)
+    })
+  }, [onLoad, scrollRef])
+
+  return (
+    <div className="shrink-0 border-b border-border/40 px-3 py-1.5 text-center">
+      <Button
+        type="button"
+        size="sm"
+        variant="ghost"
+        disabled={loading}
+        onClick={() => void handleLoad()}
+      >
+        {loading ? (
+          <Loader2
+            aria-hidden="true"
+            className="me-1.5 size-3.5 animate-spin"
+          />
+        ) : null}
+        {error ? t("retryEarlierHistory") : t("loadEarlierHistory")}
+      </Button>
+      {error ? (
+        <p className="truncate text-xs text-destructive" title={error}>
+          {error}
+        </p>
+      ) : null}
+    </div>
+  )
+})
+
 export function MessageListView({
   conversationId,
   agentType,
@@ -1029,6 +1404,10 @@ export function MessageListView({
   detailLoading = false,
   detailError = null,
   acpLoadError = null,
+  hasEarlierHistory = false,
+  earlierHistoryLoading = false,
+  earlierHistoryError = null,
+  onLoadEarlierHistory,
   hideEmptyState = false,
   onReload,
   onNewSession,
@@ -1038,6 +1417,8 @@ export function MessageListView({
   onAskSelection,
   onSaveNoteSelection,
   onForkFromTurn,
+  deliverableRuns = [],
+  onForkFromMessage = null,
 }: MessageListViewProps) {
   const t = useTranslations("Folder.chat.messageList")
   const sharedT = useTranslations("Folder.chat.shared")
@@ -1049,9 +1430,89 @@ export function MessageListView({
     (s) => s.byConversationId.get(conversationId) ?? null
   )
   const liveMessage = session?.liveMessage ?? null
+  const promptDeliveries = session?.promptDeliveries ?? EMPTY_PROMPT_DELIVERIES
+  const activeDelivery = session?.activeTurnToken
+    ? (promptDeliveries[session.activeTurnToken] ?? null)
+    : null
   const timelineTurns = useConversationRuntimeStore((s) =>
     selectTimelineTurns(s, conversationId)
   )
+  const measuredDetailRef = useRef<object | null>(null)
+  useEffect(() => {
+    const measuredDetail = session?.detail ?? null
+    if (
+      process.env.NODE_ENV === "test" ||
+      !measuredDetail ||
+      detailLoading ||
+      measuredDetailRef.current === measuredDetail
+    ) {
+      return
+    }
+    measuredDetailRef.current = measuredDetail
+    const committedAt = performance.now()
+    const startMarks = performance.getEntriesByName(
+      `codeg-conversation-${conversationId}-request-start`,
+      "mark"
+    )
+    const readyMarks = performance.getEntriesByName(
+      `codeg-conversation-${conversationId}-data-ready`,
+      "mark"
+    )
+    const startedAt =
+      startMarks[startMarks.length - 1]?.startTime ?? committedAt
+    const dataReadyAt =
+      readyMarks[readyMarks.length - 1]?.startTime ?? committedAt
+    let secondFrame = 0
+    const firstFrame = requestAnimationFrame(() => {
+      secondFrame = requestAnimationFrame(() => {
+        const interactiveAt = performance.now()
+        console.debug("[conversation][perf] first screen committed", {
+          conversationId,
+          loadedTurns: measuredDetail.turns.length,
+          timelineTurns: timelineTurns.length,
+          reactCommitMs: Math.round((committedAt - dataReadyAt) * 100) / 100,
+          firstScreenRenderMs:
+            Math.round((interactiveAt - startedAt) * 100) / 100,
+          interactiveAfterDataMs:
+            Math.round((interactiveAt - dataReadyAt) * 100) / 100,
+        })
+      })
+    })
+    return () => {
+      cancelAnimationFrame(firstFrame)
+      if (secondFrame) cancelAnimationFrame(secondFrame)
+    }
+  }, [conversationId, detailLoading, session?.detail, timelineTurns.length])
+  const pendingUserStartedAt = useMemo(() => {
+    for (let index = timelineTurns.length - 1; index >= 0; index -= 1) {
+      const turn = timelineTurns[index].turn
+      if (turn.role !== "user") continue
+      const parsed = Date.parse(turn.timestamp)
+      return Number.isFinite(parsed) ? parsed : null
+    }
+    return null
+  }, [timelineTurns])
+  const statsMessage = useMemo<LiveMessage | null>(() => {
+    if (connStatus !== "prompting") return null
+    if (liveMessage) return liveMessage
+    const startedAt =
+      activeDelivery?.acceptedAt ??
+      activeDelivery?.submittedAt ??
+      pendingUserStartedAt
+    if (startedAt === null) return null
+    return {
+      id: `pending-${conversationId}`,
+      role: "assistant",
+      content: [],
+      startedAt,
+    }
+  }, [
+    activeDelivery,
+    connStatus,
+    conversationId,
+    liveMessage,
+    pendingUserStartedAt,
+  ])
 
   // Reverse infinite scroll: older history exists above the loaded window
   // (windowed detail with a non-zero offset). Legacy full responses never
@@ -1064,10 +1525,10 @@ export function MessageListView({
     loadOlderTurns(conversationId)
   }, [loadOlderTurns, conversationId])
 
-  const shouldUseSmoothResize = !(
-    isActive &&
-    !detailLoading &&
-    timelineTurns.length
+  const messageThreadResize = resolveMessageThreadResizeBehavior(
+    isActive,
+    detailLoading,
+    timelineTurns.length > 0
   )
 
   const adapterText = useMemo(
@@ -1137,6 +1598,7 @@ export function MessageListView({
         group = {
           id: msg.id,
           role,
+          timestamp: msg.timestamp,
           parts: msg.content,
           resources: msg.userResources ?? [],
           images: msg.userImages ?? [],
@@ -1178,6 +1640,7 @@ export function MessageListView({
         showStats: false,
         isRoleTransition: false,
         previousUserIndex: null,
+        previousUserId: null,
         isLastAssistantRun: false,
         isThreadTail: false,
         sourceTurns: singletonSourceTurns(allTurns[i]),
@@ -1199,6 +1662,7 @@ export function MessageListView({
     // post-stream stats row's "jump to previous user message" button).
     let lastUserIdx: number | null = null
     let lastAssistantItem: AssistantTurnItem | null = null
+    let lastUserId: string | null = null
     for (let idx = 0; idx < items.length; idx++) {
       const item = items[idx]
       if (item.kind !== "turn") continue
@@ -1208,6 +1672,7 @@ export function MessageListView({
       item.showStats = false
       item.isRoleTransition = false
       item.previousUserIndex = null
+      item.previousUserId = null
       item.isLastAssistantRun = false
       item.isThreadTail = false
 
@@ -1221,6 +1686,7 @@ export function MessageListView({
 
       if (item.group.role === "user") {
         lastUserIdx = idx
+        lastUserId = item.group.id
       }
 
       // showStats: only on the last assistant turn before a non-assistant or end
@@ -1230,6 +1696,7 @@ export function MessageListView({
         if (!next || next.kind !== "turn" || next.group.role !== "assistant") {
           item.showStats = true
           item.previousUserIndex = lastUserIdx
+          item.previousUserId = lastUserId
         }
       }
     }
@@ -1305,6 +1772,26 @@ export function MessageListView({
   // "not right now" instead of dropping its button and shifting the icon row.
   const forkBusy = connStatus === "prompting"
 
+  const deliverableAssociations = useMemo(
+    () =>
+      resolveDeliverableAssociations(
+        deliverableRuns,
+        threadItems.flatMap((item) =>
+          item.kind === "turn" && item.group.role === "user"
+            ? [{ id: item.group.id, timestamp: item.group.timestamp }]
+            : []
+        )
+      ),
+    [deliverableRuns, threadItems]
+  )
+  const renderableThreadItems = useMemo(
+    () =>
+      appendUnassociatedDeliverablesTail(
+        threadItems,
+        deliverableAssociations.unassociated
+      ),
+    [deliverableAssociations.unassociated, threadItems]
+  )
   const renderThreadItem = useCallback(
     (item: ThreadRenderItem) => {
       switch (item.kind) {
@@ -1314,6 +1801,9 @@ export function MessageListView({
             item.group.role === "user" && userTurnHeader
               ? userTurnHeader(item.group)
               : null
+          const associatedDeliverables = item.previousUserId
+            ? deliverableAssociations.byUserId.get(item.previousUserId)
+            : undefined
           return (
             <div style={pt > 0 ? { paddingTop: pt } : undefined}>
               {phaseLabel ? (
@@ -1330,6 +1820,7 @@ export function MessageListView({
                 dimmed={item.phase === "optimistic"}
                 showStats={item.showStats}
                 previousUserIndex={item.previousUserIndex}
+                previousUserId={item.previousUserId}
                 isResponseComplete={item.isResponseComplete}
                 sourceTurns={item.sourceTurns}
                 currentRound={item.isLastAssistantRun && fold.armed}
@@ -1339,12 +1830,23 @@ export function MessageListView({
                 onForkFromTurn={onForkFromTurn}
                 forkDisabled={forkBusy}
                 isThreadTail={item.isThreadTail}
+                conversationId={conversationId}
+                delivery={promptDeliveries[item.group.id] ?? null}
+                deliverables={associatedDeliverables}
+                onForkFromMessage={onForkFromMessage}
               />
             </div>
           )
         }
         case "typing":
           return <PendingTypingIndicator />
+        case "deliverables":
+          return (
+            <ReplyDeliverables
+              conversationId={conversationId}
+              deliverables={item.deliverables}
+            />
+          )
         case "compaction":
           // Chrome-less centered divider between turns (no avatar / stats footer).
           return (
@@ -1357,13 +1859,17 @@ export function MessageListView({
       }
     },
     [
-      userTurnHeader,
+      conversationId,
+      deliverableAssociations,
       fold.armed,
       fold.roundOpen,
       fold.epoch,
       handleRoundOpenChange,
       onForkFromTurn,
       forkBusy,
+      onForkFromMessage,
+      promptDeliveries,
+      userTurnHeader,
     ]
   )
 
@@ -1430,6 +1936,15 @@ export function MessageListView({
   // never overlaps the composer or the tab strip.
   const selectionBoxRef = useRef<HTMLDivElement | null>(null)
 
+  // Converges the exact bottom after a live row becomes persisted or a
+  // deliverable card mounts. Content/viewport ResizeObservers handle all
+  // intermediate geometry changes; this signal covers same-height swaps that
+  // do not necessarily produce an observer entry.
+  const bottomLayoutSignal = `${conversationId}:${connStatus ?? "none"}:${renderableThreadItems.length}:${deliverableRuns.reduce(
+    (count, run) => count + run.deliverables.length,
+    0
+  )}`
+
   // Cheap user-message tally for the collapsed chip — counts user turns without
   // parsing any file diffs.
   const userMessageCount = useMemo(() => {
@@ -1488,7 +2003,11 @@ export function MessageListView({
     return entries.length > 0 ? entries : EMPTY_NAV_ENTRIES
   }, [showMessageNav, navExpanded, timelineTurns, threadItems])
 
-  const hasRenderableContent = threadItems.length > 0 || Boolean(liveMessage)
+  // --- Explicit final-deliverables panel -------------------------------------
+  const [deliverablesExpanded, setDeliverablesExpanded] = useState(false)
+
+  const hasRenderableContent =
+    renderableThreadItems.length > 0 || Boolean(liveMessage)
 
   if (detailLoading && !hasRenderableContent) {
     return (
@@ -1571,13 +2090,22 @@ export function MessageListView({
         ref={selectionBoxRef}
         className="relative flex h-full min-h-0 flex-col"
       >
-        <MessageThread
-          className="flex-1 min-h-0"
-          resize={shouldUseSmoothResize ? "smooth" : undefined}
-        >
+        <MessageThread className="flex-1 min-h-0" resize={messageThreadResize}>
           <AutoScrollOnSend signal={sendSignal} />
+          <MessageBottomFollowGuard
+            layoutSignal={bottomLayoutSignal}
+            scopeKey={conversationId}
+          />
+          {(hasEarlierHistory || earlierHistoryError) &&
+          onLoadEarlierHistory ? (
+            <LoadEarlierHistoryControl
+              loading={earlierHistoryLoading}
+              error={earlierHistoryError}
+              onLoad={onLoadEarlierHistory}
+            />
+          ) : null}
           <VirtualizedMessageThread
-            items={threadItems}
+            items={renderableThreadItems}
             getItemKey={getThreadItemKey}
             renderItem={renderThreadItem}
             emptyState={emptyState}
@@ -1592,9 +2120,9 @@ export function MessageListView({
           />
           <MessageThreadScrollButton />
         </MessageThread>
-        {liveMessage && connStatus === "prompting" && (
+        {statsMessage && connStatus === "prompting" && (
           <LiveTurnStats
-            message={liveMessage}
+            message={statsMessage}
             agentType={agentType}
             isStreaming={connStatus === "prompting"}
           />
@@ -1608,7 +2136,7 @@ export function MessageListView({
           edge), rounded on the end side — that expand toward the inline-end on
           hover. Logical `start-0` + `items-start` keep the anchor and the bullet
           on the same side, so the whole stack mirrors cleanly in RTL. */}
-        <div className="pointer-events-none absolute start-0 top-4 z-20 flex max-w-[min(22rem,calc(100%-2rem))] flex-col items-start gap-2">
+        <div className="pointer-events-none absolute start-0 top-4 z-20 flex max-w-[min(30rem,calc(100%-2rem))] flex-col items-start gap-2">
           {showMessageNav && userMessageCount > 0 && (
             <ConversationMessageNav
               count={userMessageCount}
@@ -1618,6 +2146,11 @@ export function MessageListView({
               scrollApiRef={scrollApiRef}
             />
           )}
+          <ConversationDeliverablesPanel
+            conversationId={conversationId}
+            expanded={deliverablesExpanded}
+            onToggle={setDeliverablesExpanded}
+          />
           <AgentPlanOverlay
             key={agentPlanOverlayKey}
             message={liveMessage ?? null}

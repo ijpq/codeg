@@ -1,5 +1,6 @@
-use std::collections::BTreeMap;
-use std::collections::HashMap;
+#[cfg(any(test, feature = "test-utils"))]
+use std::collections::VecDeque;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,8 +17,8 @@ use crate::acp::connection::{
 use crate::acp::agent_mentions::strip_route_separator_from_prompt;
 use crate::acp::error::AcpError;
 use crate::acp::feedback::{
-    bounded_feedback_batch, FeedbackItem, FeedbackStatus, PendingFeedback,
-    SessionFeedbackAccess, MAX_FEEDBACK_CHARS, MAX_FEEDBACK_RESPONSE_BYTES,
+    bounded_feedback_batch, FeedbackItem, FeedbackStatus, PendingFeedback, SessionFeedbackAccess,
+    MAX_FEEDBACK_CHARS, MAX_FEEDBACK_RESPONSE_BYTES,
 };
 use crate::acp::plan_approval::{
     PlanApprovalAnswer, RegisteredPlanApproval, SessionPlanApprovalAccess,
@@ -28,11 +29,15 @@ use crate::acp::question::{
 };
 use crate::acp::terminal_runtime::TerminalShellRuntimeConfig;
 use crate::acp::types::{
-    AcpEvent, AgentOptionsSnapshot, ConfigStaleKind, ConnectionInfo, ConnectionStatus,
-    ForkResultInfo, PromptCapabilitiesInfo, PromptInputBlock,
+    AcpCancelResult, AcpEvent, AgentOptionsSnapshot, ConfigStaleKind, ConnectionInfo,
+    ConnectionStatus, ForkProtocolResult, ForkResultInfo, PromptCapabilitiesInfo, PromptInputBlock,
+    SteerResult,
 };
+use crate::artifact_tracker::{ArtifactTracker, ArtifactTurnFinishStatus};
 use crate::db::entities::conversation::{self, ConversationKind, ConversationStatus};
-use crate::db::service::conversation_service;
+use crate::db::entities::conversation_turn_run::{self, ConversationTurnRunStatus};
+use crate::db::entities::{conversation_branch, conversation_branch_merge};
+use crate::db::service::{artifact_service, conversation_branch_service, conversation_service};
 use crate::db::AppDatabase;
 use crate::models::agent::AgentType;
 use crate::web::event_bridge::{emit_with_state, emit_with_state_gated, EventEmitter};
@@ -43,6 +48,49 @@ use crate::web::event_bridge::{emit_with_state, emit_with_state_gated, EventEmit
 /// event payload so a large paste can't bloat the ring buffer, the per-channel
 /// IM message, or the webhook body.
 const USER_PROMPT_PREVIEW_MAX_CHARS: usize = 500;
+const STEER_CLIENT_MESSAGE_ID_MAX_CHARS: usize = 256;
+const STEER_RESPONSE_TIMEOUT_SECS: u64 = 30;
+const ACCEPTED_PROMPT_ID_CACHE_LIMIT: usize = 128;
+const DEFAULT_CANCEL_TIMEOUT_SECS: u64 = 25;
+const DEFAULT_ZOMBIE_PROMPT_TIMEOUT_SECS: u64 = 600;
+const DEFAULT_STALE_RUN_TIMEOUT_SECS: u64 = 120;
+const DEFAULT_STALE_CONFIRMATION_SECS: u64 = 15;
+
+fn cancel_timeout_from_env() -> Duration {
+    let seconds = std::env::var("CODEG_ACP_CANCEL_TIMEOUT_SECS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_CANCEL_TIMEOUT_SECS)
+        .clamp(1, 300);
+    Duration::from_secs(seconds)
+}
+
+fn zombie_prompt_timeout_from_env() -> chrono::Duration {
+    let seconds = std::env::var("CODEG_ACP_ZOMBIE_PROMPT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|raw| raw.parse::<i64>().ok())
+        .unwrap_or(DEFAULT_ZOMBIE_PROMPT_TIMEOUT_SECS as i64)
+        .clamp(30, 3_600);
+    chrono::Duration::seconds(seconds)
+}
+
+fn stale_run_timeout_from_env() -> Duration {
+    let seconds = std::env::var("CODEG_ACP_STALE_RUN_TIMEOUT_SECS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_STALE_RUN_TIMEOUT_SECS)
+        .clamp(30, 3_600);
+    Duration::from_secs(seconds)
+}
+
+fn stale_confirmation_from_env() -> Duration {
+    let seconds = std::env::var("CODEG_ACP_STALE_CONFIRMATION_SECS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_STALE_CONFIRMATION_SECS)
+        .clamp(5, 300);
+    Duration::from_secs(seconds)
+}
 
 /// Grace window `disconnect_all` waits after firing every `Disconnect` before
 /// hard-killing surviving agent process trees. Long enough for a driver thread
@@ -285,6 +333,15 @@ struct SpawnDedupKey {
     session_id: String,
 }
 
+/// Agent-owned sessions have one writer regardless of which CodeG folder path
+/// a caller happened to resolve. Keeping cwd out of this key also protects
+/// corrupted/legacy rows whose folder changed after the session was created.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct SessionOperationKey {
+    agent_type: AgentType,
+    session_id: String,
+}
+
 /// Default upper bound on how long `spawn_agent` will hold the per-session
 /// dedup lock waiting for `SessionStarted`. Picked to comfortably cover
 /// cold-start agents (claude-code/codex warm: <2s; npx-fetched cold: 10–30s)
@@ -312,6 +369,12 @@ fn steered_turn_changed(
 ) -> bool {
     !now_in_flight || now_turns_completed != admitted_turns_completed
 }
+/// Restoring an existing session is materially different from starting an ACP
+/// process. Codex has to index and resume the complete rollout and large real
+/// sessions routinely take longer than the 60 second process-handshake bound.
+/// Keep a separate, deliberately generous end-to-end deadline so a healthy
+/// two-minute resume is not mistaken for a dead adapter.
+pub(crate) const RESTORE_TIMEOUT_SECS: u64 = 300;
 
 /// Read the spawn-handshake timeout from `CODEG_ACP_SPAWN_HANDSHAKE_TIMEOUT_SECS`,
 /// falling back to `SPAWN_HANDSHAKE_TIMEOUT_SECS`. Returns the configured
@@ -322,6 +385,15 @@ fn spawn_handshake_timeout_from_env() -> Duration {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(SPAWN_HANDSHAKE_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
+
+fn restore_timeout_from_env() -> Duration {
+    let secs = std::env::var("CODEG_ACP_RESTORE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(RESTORE_TIMEOUT_SECS)
+        .clamp(120, 1_800);
     Duration::from_secs(secs)
 }
 
@@ -337,6 +409,27 @@ enum HandshakeWaitOutcome {
     /// Timeout elapsed before either of the above. Releases the dedup lock
     /// so the next caller can proceed; the slow agent is no worse off.
     TimedOut,
+}
+
+/// Spawn result used by the persisted-conversation restore path. The ordinary
+/// `spawn_agent` API intentionally keeps returning only the id for compatibility;
+/// restore additionally needs ownership information so a second browser can
+/// attach as a viewer instead of later killing a connection it did not create.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SpawnAgentOutcome {
+    pub connection_id: String,
+    pub reused_existing: bool,
+}
+
+/// Result of switching the backend's authoritative conversation mapping to a
+/// restored connection. Old connections have already been removed from the
+/// manager (so no subsequent prompt can race through them) and have received a
+/// best-effort Disconnect command when this is returned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConversationActivationOutcome {
+    pub codeg_mcp_available: bool,
+    pub mcp_server_count: u32,
+    pub replaced_connection_ids: Vec<String>,
 }
 
 impl HandshakeWaitOutcome {
@@ -394,6 +487,40 @@ fn prune_reaped(draining: &mut DrainingChildren) {
     });
 }
 
+async fn hard_kill_process_cell(
+    child_pid: Arc<std::sync::atomic::AtomicU32>,
+    reason: &'static str,
+    connection_id: Option<String>,
+) {
+    let pid = child_pid.load(std::sync::atomic::Ordering::SeqCst);
+    if pid == 0 {
+        return;
+    }
+    let outcome = tokio::task::spawn_blocking(move || kill_tree::blocking::kill_tree(pid)).await;
+    match outcome {
+        Ok(Ok(_)) => tracing::info!(
+            connection_id,
+            pid,
+            reason,
+            "[ACP] per-connection teardown killed process tree"
+        ),
+        Ok(Err(error)) => tracing::debug!(
+            connection_id,
+            pid,
+            reason,
+            error = %error,
+            "[ACP] process tree was already gone during teardown"
+        ),
+        Err(error) => tracing::warn!(
+            connection_id,
+            pid,
+            reason,
+            error = %error,
+            "[ACP] process-tree cleanup task failed"
+        ),
+    }
+}
+
 pub struct ConnectionManager {
     pub(crate) connections: Arc<Mutex<HashMap<String, AgentConnection>>>,
     /// Connections whose teardown was requested but whose child process has
@@ -428,11 +555,45 @@ pub struct ConnectionManager {
     /// process lifetime — bounded by the number of distinct sessions ever
     /// connected.
     spawn_locks: Arc<Mutex<HashMap<SpawnDedupKey, Arc<Mutex<()>>>>>,
+    /// End-to-end restore single-flight keyed by the durable CodeG
+    /// conversation. Unlike `spawn_locks`, this guard covers metadata
+    /// reconciliation, ACP resume/load, prompt readiness and publication. A
+    /// duplicate HTTP request therefore waits for the first restore and then
+    /// observes/reuses its published connection instead of racing it.
+    restore_request_locks: Arc<Mutex<HashMap<i32, Arc<Mutex<()>>>>>,
+    /// Serializes every operation that needs an exclusive writer for a
+    /// persisted ACP session (restore and native fork source loading). Codex
+    /// rejects a second writer even when it comes from a different CodeG
+    /// conversation/window, so conversation-only locking is insufficient.
+    session_operation_locks: Arc<Mutex<HashMap<SessionOperationKey, Arc<Mutex<()>>>>>,
+    /// Per-conversation switchover mutex. Session spawn is deduplicated by
+    /// `spawn_locks`; this second lock serializes the shorter authoritative
+    /// mapping update + old-connection removal phase.
+    restore_locks: Arc<Mutex<HashMap<i32, Arc<Mutex<()>>>>>,
+    /// Serializes the narrowly-scoped repair of an empty, unconsumed snapshot
+    /// branch whose previously-recorded ACP session cannot be loaded. Fresh
+    /// session ids cannot use `spawn_locks` (the agent assigns the id), so this
+    /// conversation-keyed lock prevents concurrent restores from creating two
+    /// replacement sessions.
+    branch_recovery_locks: Arc<Mutex<HashMap<i32, Arc<Mutex<()>>>>>,
+    /// Reconciliation can be started by the periodic monitor, restore, branch
+    /// handoff, and page attach. Serialize the complete check/confirm/finalize
+    /// lifecycle for one conversation so two callers cannot both settle it.
+    reconciliation_locks: Arc<Mutex<HashMap<i32, Arc<Mutex<()>>>>>,
+    /// First-pass stale observations. A run is never finalized from a single
+    /// sample; the second pass must see the same connection/run generation and
+    /// unchanged activity after the confirmation window.
+    stale_run_suspicions: Arc<Mutex<HashMap<String, StaleRunSuspicion>>>,
+    stale_run_timeout: Duration,
+    stale_confirmation: Duration,
     /// Bound on how long `spawn_agent` waits for the agent's handshake
     /// before releasing the dedup lock. Configurable per-instance for
     /// tests; in production initialized from env via
     /// `spawn_handshake_timeout_from_env`.
     spawn_handshake_timeout: Duration,
+    /// End-to-end deadline for persisted session resume/load and prompt
+    /// readiness. This is also the lease duration used by restore waiters.
+    restore_timeout: Duration,
     /// Shared General Settings shell used by ACP terminal fallbacks. Cloned
     /// into each connection runtime so a setting update applies to existing
     /// model sessions as well as newly spawned ones.
@@ -471,6 +632,10 @@ pub struct ConnectionManager {
     /// touch the same map. At most one per connection (the agent is blocked in
     /// its `exit_plan_mode` call) — no cap, no cumulative growth.
     pending_plan_approvals: Arc<Mutex<HashMap<String, PendingPlanApprovalEntry>>>,
+    /// Backend-owned per-turn filesystem capture. Shared across every
+    /// `clone_ref` so prompt start and lifecycle completion operate on the same
+    /// generation map.
+    artifact_tracker: Arc<ArtifactTracker>,
 }
 
 /// A parked `ask_user_question` awaiting its answer. The `sender` resolves the
@@ -490,6 +655,36 @@ struct PendingPlanApprovalEntry {
     sender: tokio::sync::oneshot::Sender<PlanApprovalAnswer>,
 }
 
+#[derive(Clone, Debug)]
+struct StaleRunSuspicion {
+    conversation_id: i32,
+    first_seen_at: chrono::DateTime<chrono::Utc>,
+    connection_id: String,
+    connection_generation: Option<u64>,
+    heartbeat_at: Option<chrono::DateTime<chrono::Utc>>,
+    output_at: Option<chrono::DateTime<chrono::Utc>>,
+    reason: String,
+}
+
+#[derive(Clone, Debug)]
+struct RunLiveObservation {
+    status: ConnectionStatus,
+    turn_in_flight: bool,
+    heartbeat_at: chrono::DateTime<chrono::Utc>,
+    output_at: chrono::DateTime<chrono::Utc>,
+    has_live_text: bool,
+    has_interaction: bool,
+    all_tools_terminal: bool,
+    pending_tool_count: usize,
+    child_pid: u32,
+    process_alive: Option<bool>,
+    event_seq: u64,
+    active_turn_run_id: Option<String>,
+    active_turn_generation: Option<u64>,
+    restore_in_progress: bool,
+    conversation_id: Option<i32>,
+}
+
 impl Default for ConnectionManager {
     fn default() -> Self {
         Self::new()
@@ -503,13 +698,23 @@ impl ConnectionManager {
             external_restore_lock: Arc::new(tokio::sync::RwLock::new(())),
             draining: Arc::new(Mutex::new(Vec::new())),
             spawn_locks: Arc::new(Mutex::new(HashMap::new())),
+            restore_request_locks: Arc::new(Mutex::new(HashMap::new())),
+            session_operation_locks: Arc::new(Mutex::new(HashMap::new())),
+            restore_locks: Arc::new(Mutex::new(HashMap::new())),
+            branch_recovery_locks: Arc::new(Mutex::new(HashMap::new())),
+            reconciliation_locks: Arc::new(Mutex::new(HashMap::new())),
+            stale_run_suspicions: Arc::new(Mutex::new(HashMap::new())),
+            stale_run_timeout: stale_run_timeout_from_env(),
+            stale_confirmation: stale_confirmation_from_env(),
             spawn_handshake_timeout: spawn_handshake_timeout_from_env(),
+            restore_timeout: restore_timeout_from_env(),
             terminal_shell_config: TerminalShellRuntimeConfig::new(),
             delegation_injection: Arc::new(std::sync::OnceLock::new()),
             chat_channel: Arc::new(std::sync::OnceLock::new()),
             probe_locks: Arc::new(Mutex::new(HashMap::new())),
             pending_questions: Arc::new(Mutex::new(HashMap::new())),
             pending_plan_approvals: Arc::new(Mutex::new(HashMap::new())),
+            artifact_tracker: Arc::new(ArtifactTracker::new()),
         }
     }
 
@@ -520,13 +725,23 @@ impl ConnectionManager {
             external_restore_lock: self.external_restore_lock.clone(),
             draining: self.draining.clone(),
             spawn_locks: self.spawn_locks.clone(),
+            restore_request_locks: self.restore_request_locks.clone(),
+            session_operation_locks: self.session_operation_locks.clone(),
+            restore_locks: self.restore_locks.clone(),
+            branch_recovery_locks: self.branch_recovery_locks.clone(),
+            reconciliation_locks: self.reconciliation_locks.clone(),
+            stale_run_suspicions: self.stale_run_suspicions.clone(),
+            stale_run_timeout: self.stale_run_timeout,
+            stale_confirmation: self.stale_confirmation,
             spawn_handshake_timeout: self.spawn_handshake_timeout,
+            restore_timeout: self.restore_timeout,
             terminal_shell_config: self.terminal_shell_config.clone(),
             delegation_injection: self.delegation_injection.clone(),
             chat_channel: self.chat_channel.clone(),
             probe_locks: self.probe_locks.clone(),
             pending_questions: self.pending_questions.clone(),
             pending_plan_approvals: self.pending_plan_approvals.clone(),
+            artifact_tracker: self.artifact_tracker.clone(),
         }
     }
 
@@ -564,6 +779,20 @@ impl ConnectionManager {
         self.terminal_shell_config.clone()
     }
 
+    /// Maximum wall time owned by one persisted-conversation restore flight.
+    /// Exposed to the command layer so the cancellation-shielded supervisor
+    /// and the manager's internal waits share one policy.
+    pub(crate) fn restore_timeout(&self) -> Duration {
+        self.restore_timeout
+    }
+
+    /// Stable identity shared by every `clone_ref` of this manager. Used only
+    /// to scope the command-layer restore-flight registry in tests/processes
+    /// that may host more than one independent manager.
+    pub(crate) fn instance_identity(&self) -> usize {
+        Arc::as_ptr(&self.connections) as usize
+    }
+
     /// Test-only constructor that overrides the spawn-handshake timeout.
     /// Production code should use `new()`.
     #[cfg(test)]
@@ -573,14 +802,49 @@ impl ConnectionManager {
             external_restore_lock: Arc::new(tokio::sync::RwLock::new(())),
             draining: Arc::new(Mutex::new(Vec::new())),
             spawn_locks: Arc::new(Mutex::new(HashMap::new())),
+            restore_request_locks: Arc::new(Mutex::new(HashMap::new())),
+            session_operation_locks: Arc::new(Mutex::new(HashMap::new())),
+            restore_locks: Arc::new(Mutex::new(HashMap::new())),
+            branch_recovery_locks: Arc::new(Mutex::new(HashMap::new())),
+            reconciliation_locks: Arc::new(Mutex::new(HashMap::new())),
+            stale_run_suspicions: Arc::new(Mutex::new(HashMap::new())),
+            stale_run_timeout: stale_run_timeout_from_env(),
+            stale_confirmation: stale_confirmation_from_env(),
             spawn_handshake_timeout: timeout,
+            restore_timeout: timeout,
             terminal_shell_config: TerminalShellRuntimeConfig::new(),
             delegation_injection: Arc::new(std::sync::OnceLock::new()),
             chat_channel: Arc::new(std::sync::OnceLock::new()),
             probe_locks: Arc::new(Mutex::new(HashMap::new())),
             pending_questions: Arc::new(Mutex::new(HashMap::new())),
             pending_plan_approvals: Arc::new(Mutex::new(HashMap::new())),
+            artifact_tracker: Arc::new(ArtifactTracker::new()),
         }
+    }
+
+    pub(crate) async fn finish_artifact_turn(
+        &self,
+        connection_id: &str,
+        completion_event_seq: u64,
+        status: ArtifactTurnFinishStatus,
+        stop_reason: Option<String>,
+    ) {
+        self.artifact_tracker
+            .finish_turn(connection_id, completion_event_seq, status, stop_reason)
+            .await;
+    }
+
+    pub(crate) async fn ingest_agent_file_change_report(
+        &self,
+        db: &DatabaseConnection,
+        connection_id: &str,
+        request_id: &str,
+        paths: &[String],
+        emitter: &EventEmitter,
+    ) -> Result<usize, crate::db::error::DbError> {
+        self.artifact_tracker
+            .ingest_agent_file_change_report(db, connection_id, request_id, paths, emitter)
+            .await
     }
 
     /// Insert a synthetic `AgentConnection` for tests that need to exercise
@@ -620,6 +884,9 @@ impl ConnectionManager {
             state: Arc::new(tokio::sync::RwLock::new(state)),
             emitter,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
+            steer_lock: Arc::new(tokio::sync::Mutex::new(())),
+            completed_steers: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
+            accepted_prompt_ids: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
             config_fingerprint: String::new(),
             last_observed_fingerprint: String::new(),
             child_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -663,6 +930,9 @@ impl ConnectionManager {
             state: Arc::new(tokio::sync::RwLock::new(state)),
             emitter,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
+            steer_lock: Arc::new(tokio::sync::Mutex::new(())),
+            completed_steers: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
+            accepted_prompt_ids: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
             config_fingerprint: String::new(),
             last_observed_fingerprint: String::new(),
             child_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -689,6 +959,386 @@ impl ConnectionManager {
         // re-entrant: nothing reachable from here calls `spawn_agent` again.
         let _restore_guard = self.external_restore_lock.read().await;
 
+        Ok(self
+            .spawn_agent_with_requirements(
+                agent_type,
+                working_dir,
+                session_id,
+                runtime_env,
+                owner_window_label,
+                emitter,
+                preferred_mode_id,
+                preferred_config_values,
+                false,
+                None,
+            )
+            .await?
+            .connection_id)
+    }
+
+    /// Start a brand-new ACP session and do not publish it to a caller until
+    /// the agent has returned its real session id and completed selector/config
+    /// initialization. A `Connected` status alone is intentionally
+    /// insufficient: `run_connection` publishes it before `session/new`, while
+    /// [`SessionState::selectors_ready`] is the existing prompt-readiness
+    /// latch emitted only after the new session is attached and configured.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn spawn_fresh_session_ready(
+        &self,
+        agent_type: AgentType,
+        working_dir: Option<String>,
+        runtime_env: BTreeMap<String, String>,
+        owner_window_label: String,
+        emitter: EventEmitter,
+        preferred_mode_id: Option<String>,
+        preferred_config_values: BTreeMap<String, String>,
+    ) -> Result<(String, String), AcpError> {
+        let connection_id = self
+            .spawn_agent(
+                agent_type,
+                working_dir,
+                None,
+                runtime_env,
+                owner_window_label,
+                emitter,
+                preferred_mode_id,
+                preferred_config_values,
+            )
+            .await?;
+        match self.wait_for_prompt_ready(&connection_id, None).await {
+            Ok(session_id) => Ok((connection_id, session_id)),
+            Err(error) => {
+                let _ = self.disconnect(&connection_id).await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Wait until an ACP connection is backed by a real, prompt-capable
+    /// session. This deliberately builds on the existing `selectors_ready`
+    /// state instead of introducing another readiness state machine.
+    pub(crate) async fn wait_for_prompt_ready(
+        &self,
+        connection_id: &str,
+        expected_session_id: Option<&str>,
+    ) -> Result<String, AcpError> {
+        let timeout = if expected_session_id.is_some() {
+            self.restore_timeout
+        } else {
+            self.spawn_handshake_timeout
+        };
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let state = self
+                .get_state(connection_id)
+                .await
+                .ok_or_else(|| AcpError::ConnectionNotFound(connection_id.to_string()))?;
+            let state = state.read().await;
+            if matches!(
+                state.status,
+                ConnectionStatus::Disconnected | ConnectionStatus::Error
+            ) {
+                let detail = state
+                    .last_error
+                    .as_ref()
+                    .map(|error| error.message.as_str())
+                    .unwrap_or("ACP connection ended during session initialization");
+                return Err(AcpError::protocol(detail));
+            }
+            if let (Some(expected), Some(actual)) =
+                (expected_session_id, state.external_id.as_deref())
+            {
+                if actual != expected {
+                    return Err(AcpError::protocol(format!(
+                        "ACP session mismatch: expected {expected}, got {actual}"
+                    )));
+                }
+            }
+            if state.selectors_ready
+                && matches!(
+                    state.status,
+                    ConnectionStatus::Connected | ConnectionStatus::Prompting
+                )
+            {
+                let session_id = state.external_id.clone().ok_or_else(|| {
+                    AcpError::protocol("ACP reported prompt readiness without a real session id")
+                })?;
+                if expected_session_id.is_none_or(|expected| expected == session_id) {
+                    return Ok(session_id);
+                }
+            }
+            drop(state);
+
+            if tokio::time::Instant::now() >= deadline {
+                return Err(AcpError::protocol(format!(
+                    "ACP session did not become prompt-ready within {} seconds",
+                    timeout.as_secs()
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    pub(crate) async fn lock_branch_session_recovery(
+        &self,
+        conversation_id: i32,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.branch_recovery_locks.lock().await;
+            locks
+                .entry(conversation_id)
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        lock.lock_owned().await
+    }
+
+    /// Acquire the end-to-end single-flight for a durable conversation
+    /// restore. The wait is bounded so a cancelled or wedged caller cannot
+    /// leave every later browser tab on an unending "initializing" state.
+    pub(crate) async fn lock_restore_request(
+        &self,
+        conversation_id: i32,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, AcpError> {
+        let lock = {
+            let mut locks = self.restore_request_locks.lock().await;
+            locks
+                .entry(conversation_id)
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let timeout = self.restore_timeout;
+        tokio::time::timeout(timeout, lock.lock_owned())
+            .await
+            .map_err(|_| {
+                AcpError::protocol(format!(
+                    "conversation {conversation_id} restore is still in progress; retry"
+                ))
+            })
+    }
+
+    /// Acquire the exclusive-writer guard for one persisted ACP session.
+    /// Restore and native fork source loading both use this lock, preventing
+    /// Codex's `thread already has an active writer` failure inside CodeG.
+    pub(crate) async fn lock_session_operation(
+        &self,
+        agent_type: AgentType,
+        _working_dir: Option<&std::path::Path>,
+        session_id: &str,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, AcpError> {
+        let key = SessionOperationKey {
+            agent_type,
+            session_id: session_id.to_string(),
+        };
+        let lock = {
+            let mut locks = self.session_operation_locks.lock().await;
+            locks
+                .entry(key)
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let timeout = self.restore_timeout;
+        tokio::time::timeout(timeout, lock.lock_owned())
+            .await
+            .map_err(|_| {
+                AcpError::protocol(format!(
+                    "ACP session {session_id} is busy in another restore or fork; retry"
+                ))
+            })
+    }
+
+    /// Start a second process for an existing session without reuse. User
+    /// conversation branching needs an isolated source handle: `session/fork`
+    /// mutates the connection it runs on, so using the source tab's live
+    /// connection would steal that tab and couple both sides' turn state.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn spawn_isolated_session(
+        &self,
+        agent_type: AgentType,
+        working_dir: Option<String>,
+        session_id: String,
+        runtime_env: BTreeMap<String, String>,
+        owner_window_label: String,
+        emitter: EventEmitter,
+        preferred_mode_id: Option<String>,
+        preferred_config_values: BTreeMap<String, String>,
+    ) -> Result<String, AcpError> {
+        let connection_id = uuid::Uuid::new_v4().to_string();
+        let ready_rx = spawn_agent_connection(
+            connection_id.clone(),
+            agent_type,
+            working_dir,
+            Some(session_id.clone()),
+            runtime_env,
+            owner_window_label,
+            emitter,
+            self.connections.clone(),
+            preferred_mode_id,
+            preferred_config_values,
+            self.delegation_snapshot(),
+            self.terminal_shell_config.clone(),
+            None,
+        )
+        .await?;
+        let (outcome, elapsed) =
+            wait_for_session_started(ready_rx, self.spawn_handshake_timeout).await;
+        tracing::info!(
+            connection_id,
+            external_session_id = session_id,
+            outcome = outcome.as_str(),
+            elapsed_ms = elapsed.as_millis() as u64,
+            "[ACP][branch] isolated source session initialized"
+        );
+        if !matches!(outcome, HandshakeWaitOutcome::Ready) {
+            let _ = self.disconnect(&connection_id).await;
+            return Err(AcpError::protocol(format!(
+                "isolated branch source did not become ready ({})",
+                outcome.as_str()
+            )));
+        }
+        if let Err(error) = self
+            .wait_for_prompt_ready(&connection_id, Some(&session_id))
+            .await
+        {
+            let _ = self.disconnect(&connection_id).await;
+            return Err(error);
+        }
+        Ok(connection_id)
+    }
+
+    /// Execute a native fork and retire the adapter process before returning.
+    ///
+    /// Codex's persistent `thread/fork` creates S2, while the codex-acp process
+    /// that performed the request continues to own an active writer for S1.
+    /// Attaching S2 on that same process therefore strands the original thread
+    /// behind `already has an active writer`.  A user-created conversation
+    /// branch must instead verify S2 from an independent process after this
+    /// method has observed the original process exit.
+    pub(crate) async fn fork_protocol_detached(
+        &self,
+        conn_id: &str,
+    ) -> Result<ForkProtocolResult, AcpError> {
+        let (state, cmd_tx, child_pid) = {
+            let connections = self.connections.lock().await;
+            let conn = connections
+                .get(conn_id)
+                .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?;
+            (
+                conn.state.clone(),
+                conn.cmd_tx.clone(),
+                conn.child_pid.clone(),
+            )
+        };
+        let prompt_lock = self.clone_prompt_lock(conn_id).await?;
+        let _guard = prompt_lock.lock_owned().await;
+        if state.read().await.turn_in_flight {
+            return Err(AcpError::TurnInProgress);
+        }
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        cmd_tx
+            .send(ConnectionCommand::ForkDetached { reply: reply_tx })
+            .await
+            .map_err(|_| AcpError::ProcessExited)?;
+        let result = reply_rx
+            .await
+            .map_err(|_| AcpError::protocol("Fork reply channel closed".to_string()))??;
+
+        let deadline = tokio::time::Instant::now() + self.spawn_handshake_timeout;
+        loop {
+            let removed = !self.connections.lock().await.contains_key(conn_id);
+            let reaped = child_pid.load(std::sync::atomic::Ordering::SeqCst) == 0;
+            if removed && reaped {
+                tracing::info!(
+                    connection_id = conn_id,
+                    source_session_id = result.original_session_id,
+                    branch_session_id = result.forked_session_id,
+                    "[ACP][branch] detached fork writer handoff completed"
+                );
+                return Ok(result);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(AcpError::protocol(format!(
+                    "forked session {} was created, but the source writer did not retire before timeout",
+                    result.forked_session_id
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    pub(crate) async fn bind_connection_to_conversation(
+        &self,
+        conn_id: &str,
+        conversation_id: i32,
+        folder_id: i32,
+    ) -> Result<(), AcpError> {
+        let (state, emitter) = {
+            let connections = self.connections.lock().await;
+            let conn = connections
+                .get(conn_id)
+                .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?;
+            (conn.state.clone(), conn.emitter.clone())
+        };
+        emit_with_state(
+            &state,
+            &emitter,
+            AcpEvent::ConversationLinked {
+                conversation_id,
+                folder_id,
+                parent_conversation_id: None,
+                parent_tool_use_id: None,
+            },
+        )
+        .await;
+        Ok(())
+    }
+
+    /// Spawn or reuse a connection for an atomic persisted-conversation
+    /// restore. When `require_codeg_mcp` is true, an older connection without
+    /// the built-in companion is deliberately ineligible for reuse.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn spawn_agent_for_restore(
+        &self,
+        agent_type: AgentType,
+        working_dir: Option<String>,
+        session_id: String,
+        runtime_env: BTreeMap<String, String>,
+        owner_window_label: String,
+        emitter: EventEmitter,
+        preferred_mode_id: Option<String>,
+        preferred_config_values: BTreeMap<String, String>,
+        require_codeg_mcp: bool,
+        conversation_id: i32,
+    ) -> Result<SpawnAgentOutcome, AcpError> {
+        self.spawn_agent_with_requirements(
+            agent_type,
+            working_dir,
+            Some(session_id),
+            runtime_env,
+            owner_window_label,
+            emitter,
+            preferred_mode_id,
+            preferred_config_values,
+            require_codeg_mcp,
+            Some(conversation_id),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_agent_with_requirements(
+        &self,
+        agent_type: AgentType,
+        working_dir: Option<String>,
+        session_id: Option<String>,
+        runtime_env: BTreeMap<String, String>,
+        owner_window_label: String,
+        emitter: EventEmitter,
+        preferred_mode_id: Option<String>,
+        preferred_config_values: BTreeMap<String, String>,
+        require_codeg_mcp: bool,
+        target_conversation_id: Option<i32>,
+    ) -> Result<SpawnAgentOutcome, AcpError> {
         // Connection dedup: when resuming an agent session (session_id is
         // Some), look for a live AgentConnection that already represents
         // the same external session in the same working_dir for the same
@@ -726,21 +1376,33 @@ impl ConnectionManager {
         };
 
         if let Some(existing) = self
-            .find_connection_for_reuse(agent_type, working_dir_path.as_ref(), session_id.as_deref())
+            .find_connection_for_reuse_with_requirements(
+                agent_type,
+                working_dir_path.as_ref(),
+                session_id.as_deref(),
+                require_codeg_mcp,
+                target_conversation_id,
+            )
             .await
         {
             tracing::info!(
-                "[ACP] reusing connection id={} for session_id={}",
-                existing,
-                session_id.as_deref().unwrap_or("")
+                connection_id = %existing,
+                external_session_id = session_id.as_deref().unwrap_or(""),
+                require_codeg_mcp,
+                "[ACP] reusing compatible connection"
             );
-            return Ok(existing);
+            return Ok(SpawnAgentOutcome {
+                connection_id: existing,
+                reused_existing: true,
+            });
         }
 
         let connection_id = uuid::Uuid::new_v4().to_string();
         tracing::info!(
             "[ACP] spawning connection id={} owner_window={} agent={:?}",
-            connection_id, owner_window_label, agent_type
+            connection_id,
+            owner_window_label,
+            agent_type
         );
 
         // `spawn_agent_connection` inserts the entry into `self.connections`,
@@ -760,6 +1422,7 @@ impl ConnectionManager {
             preferred_config_values,
             self.delegation_snapshot(),
             self.terminal_shell_config.clone(),
+            target_conversation_id,
         )
         .await?;
 
@@ -769,7 +1432,11 @@ impl ConnectionManager {
         // Logged on every wait so production can audit real-world handshake
         // latencies and tune `CODEG_ACP_SPAWN_HANDSHAKE_TIMEOUT_SECS`.
         if dedup_lock.is_some() {
-            let timeout = self.spawn_handshake_timeout;
+            let timeout = if target_conversation_id.is_some() {
+                self.restore_timeout
+            } else {
+                self.spawn_handshake_timeout
+            };
             let (outcome, elapsed) = wait_for_session_started(session_started_rx, timeout).await;
             tracing::info!(
                 "[ACP] dedup_wait connection_id={} session_id={} outcome={} \
@@ -780,6 +1447,16 @@ impl ConnectionManager {
                 elapsed.as_millis(),
                 timeout.as_millis(),
             );
+            if target_conversation_id.is_some()
+                && !matches!(outcome, HandshakeWaitOutcome::Ready)
+            {
+                let _ = self.disconnect_and_wait(&connection_id).await;
+                return Err(AcpError::protocol(format!(
+                    "persisted ACP session did not finish resume/load within {} seconds ({})",
+                    timeout.as_secs(),
+                    outcome.as_str()
+                )));
+            }
         }
         // session_started_rx (in the no-dedup branch) is dropped here. tx
         // staying inside SessionState gets dropped naturally when the
@@ -787,7 +1464,10 @@ impl ConnectionManager {
 
         drop(dedup_lock);
 
-        Ok(connection_id)
+        Ok(SpawnAgentOutcome {
+            connection_id,
+            reused_existing: false,
+        })
     }
 
     /// Bump `last_activity_at` for a live connection so the idle sweep
@@ -817,12 +1497,12 @@ impl ConnectionManager {
     }
 
     /// Disconnect connections that have been idle longer than `idle_timeout`.
-    /// "Idle" means: status is `Connected`, no `pending_permission`, no
-    /// launched-but-unresolved background work (async sub-agent / background
-    /// shell — disconnecting kills the agent CLI and the background work with
-    /// it), and no activity (no events, no commands) for at least
-    /// `idle_timeout`. `Prompting` connections are always preserved (a turn is
-    /// in flight). Returns the number of connections that were disconnected.
+    /// "Idle" means: status is `Connected`, no live WebSocket attach lease, no
+    /// `pending_permission`, no launched-but-unresolved background work (async
+    /// sub-agent / background shell — disconnecting kills the agent CLI and the
+    /// background work with it), and no activity (no events, no commands) for
+    /// at least `idle_timeout`. `Prompting` connections and conversations open
+    /// in any web client are always preserved. Returns the number disconnected.
     pub async fn sweep_idle(&self, idle_timeout: Duration) -> usize {
         let now = chrono::Utc::now();
         let timeout = match chrono::Duration::from_std(idle_timeout) {
@@ -842,7 +1522,30 @@ impl ConnectionManager {
                 if state.status != ConnectionStatus::Connected {
                     continue;
                 }
+                // Initialize used to publish Connected before a historical
+                // session had finished resume/load. A large Codex rollout can
+                // legitimately remain in that phase for minutes; the durable
+                // restore marker plus the selectors latch is an explicit lease
+                // and must beat ordinary idle age.
+                if state.restore_conversation_id.is_some() && !state.selectors_ready {
+                    tracing::debug!(
+                        connection_id = id,
+                        conversation_id = ?state.restore_conversation_id,
+                        restore_elapsed_ms = state
+                            .restore_started_at
+                            .map(|started| started.elapsed().as_millis() as u64),
+                        "[ACP][restore] idle sweep preserved active restore lease"
+                    );
+                    continue;
+                }
                 if state.pending_permission.is_some() {
+                    continue;
+                }
+                // An attach receiver lives for exactly as long as its browser
+                // WebSocket subscription. Treat it as a server-side lease so a
+                // background-throttled tab does not lose its ACP process merely
+                // because its 30s JavaScript touch interval was suspended.
+                if state.event_stream.receiver_count() > 0 {
                     continue;
                 }
                 if state.has_active_background_work(now) {
@@ -909,7 +1612,12 @@ impl ConnectionManager {
             }
         }
         for (state, emitter, stale) in targets {
-            emit_with_state(&state, &emitter, AcpEvent::SessionConfigStale { stale, kind }).await;
+            emit_with_state(
+                &state,
+                &emitter,
+                AcpEvent::SessionConfigStale { stale, kind },
+            )
+            .await;
         }
         stale_count
     }
@@ -921,6 +1629,8 @@ impl ConnectionManager {
     /// - the connection's `agent_type` equals the requested one
     /// - the connection's `working_dir` equals the requested one (compared as
     ///   `Option<PathBuf>` so canonicalization is the caller's concern)
+    /// - when restoring a persisted conversation, the connection is unbound or
+    ///   already bound to that same conversation
     /// - the connection's `state.status` is neither `Disconnected` nor `Error`
     ///
     /// Per-session state is acquired via `read().await` rather than `try_read`:
@@ -931,11 +1641,30 @@ impl ConnectionManager {
     /// for an imperceptible latency win. The connections-map mutex is held
     /// across the awaits — fine because no path takes `state.write()` while
     /// holding the connections mutex (no lock-cycle).
+    #[cfg(test)]
     pub(crate) async fn find_connection_for_reuse(
         &self,
         agent_type: AgentType,
         working_dir: Option<&PathBuf>,
         session_id: Option<&str>,
+    ) -> Option<String> {
+        self.find_connection_for_reuse_with_requirements(
+            agent_type,
+            working_dir,
+            session_id,
+            false,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn find_connection_for_reuse_with_requirements(
+        &self,
+        agent_type: AgentType,
+        working_dir: Option<&PathBuf>,
+        session_id: Option<&str>,
+        require_codeg_mcp: bool,
+        target_conversation_id: Option<i32>,
     ) -> Option<String> {
         // No session_id → caller is opening a fresh session; never dedup.
         let session_id = session_id?;
@@ -948,18 +1677,235 @@ impl ConnectionManager {
             if state.external_id.as_deref() != Some(session_id) {
                 continue;
             }
+            if require_codeg_mcp && !state.codeg_mcp_available {
+                continue;
+            }
+            if target_conversation_id.is_some_and(|expected| {
+                state.conversation_id.is_some_and(|bound| bound != expected)
+            }) {
+                continue;
+            }
             if state.working_dir.as_ref() != working_dir {
                 continue;
             }
             if matches!(
                 state.status,
-                ConnectionStatus::Disconnected | ConnectionStatus::Error
+                ConnectionStatus::Prompting
+                    | ConnectionStatus::Disconnected
+                    | ConnectionStatus::Error
             ) {
+                continue;
+            }
+            if state.turn_in_flight {
                 continue;
             }
             return Some(id.clone());
         }
         None
+    }
+
+    /// Make `connection_id` the sole live connection for a persisted
+    /// conversation after session resume/load has completed.
+    ///
+    /// The old connections' prompt mutexes are held while the map and all
+    /// SessionState bindings change. Consequently a stale `/acp_prompt` either
+    /// completes before this method (and makes the old connection busy, causing
+    /// us to abort without changing anything) or looks up the old id after it
+    /// has been removed and fails with ConnectionNotFound. It can never silently
+    /// re-bind the superseded connection after the switch.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn activate_restored_conversation(
+        &self,
+        connection_id: &str,
+        conversation_id: i32,
+        folder_id: i32,
+        expected_session_id: &str,
+        require_codeg_mcp: bool,
+        parent_conversation_id: Option<i32>,
+        parent_tool_use_id: Option<String>,
+    ) -> Result<ConversationActivationOutcome, AcpError> {
+        let restore_lock = {
+            let mut locks = self.restore_locks.lock().await;
+            locks
+                .entry(conversation_id)
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let _restore_guard = restore_lock.lock_owned().await;
+
+        // Lock the target and every connection currently mapped to this
+        // conversation in deterministic id order. send_prompt_linked takes the
+        // same per-connection lock before reading/writing the mapping.
+        let mut prompt_locks: Vec<(String, Arc<tokio::sync::Mutex<()>>)> = {
+            let connections = self.connections.lock().await;
+            if !connections.contains_key(connection_id) {
+                return Err(AcpError::ConnectionNotFound(connection_id.into()));
+            }
+            let mut locks = Vec::new();
+            for (id, conn) in connections.iter() {
+                let is_target = id == connection_id;
+                let is_current = if is_target {
+                    false
+                } else {
+                    conn.state.read().await.conversation_id == Some(conversation_id)
+                };
+                if is_target || is_current {
+                    locks.push((id.clone(), Arc::clone(&conn.prompt_lock)));
+                }
+            }
+            locks
+        };
+        prompt_locks.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut prompt_guards = Vec::with_capacity(prompt_locks.len());
+        for (_, lock) in prompt_locks {
+            prompt_guards.push(lock.lock_owned().await);
+        }
+
+        let (target_state, target_emitter, codeg_mcp_available, mcp_server_count, replaced) = {
+            let mut connections = self.connections.lock().await;
+            let target = connections
+                .get(connection_id)
+                .ok_or_else(|| AcpError::ConnectionNotFound(connection_id.into()))?;
+            let target_state = Arc::clone(&target.state);
+            let target_emitter = target.emitter.clone();
+
+            let (codeg_mcp_available, mcp_server_count) = {
+                let state = target_state.read().await;
+                if state.external_id.as_deref() != Some(expected_session_id) {
+                    return Err(AcpError::protocol(format!(
+                        "restored session mismatch for conversation {conversation_id}: expected {expected_session_id}, got {}",
+                        state.external_id.as_deref().unwrap_or("none")
+                    )));
+                }
+                if !matches!(
+                    state.status,
+                    ConnectionStatus::Connected | ConnectionStatus::Prompting
+                ) {
+                    return Err(AcpError::protocol(format!(
+                        "restored connection {connection_id} is not ready"
+                    )));
+                }
+                if !state.selectors_ready {
+                    return Err(AcpError::protocol(format!(
+                        "restored connection {connection_id} is not prompt-ready"
+                    )));
+                }
+                if require_codeg_mcp && !state.codeg_mcp_available {
+                    return Err(AcpError::protocol(
+                        "restored Codex session did not configure the required codeg-mcp companion",
+                    ));
+                }
+                if let Some(bound) = state.conversation_id {
+                    if bound != conversation_id {
+                        return Err(AcpError::protocol(format!(
+                            "restored connection {connection_id} is already bound to conversation {bound}"
+                        )));
+                    }
+                }
+                (state.codeg_mcp_available, state.mcp_server_count)
+            };
+
+            let mut old_ids = Vec::new();
+            let mut old_states = Vec::new();
+            for (id, conn) in connections.iter() {
+                if id == connection_id {
+                    continue;
+                }
+                let state = conn.state.read().await;
+                if state.conversation_id != Some(conversation_id) {
+                    continue;
+                }
+                if state.turn_in_flight || state.status == ConnectionStatus::Prompting {
+                    return Err(AcpError::TurnInProgress);
+                }
+                old_ids.push(id.clone());
+                old_states.push(Arc::clone(&conn.state));
+            }
+
+            // All validation is complete. These writes happen while the
+            // connections map is exclusively locked, so every manager lookup
+            // observes either the old mapping or the complete new mapping.
+            {
+                let mut state = target_state.write().await;
+                state.conversation_id = Some(conversation_id);
+                state.folder_id = Some(folder_id);
+            }
+            for state in old_states {
+                let mut state = state.write().await;
+                state.conversation_id = None;
+                state.folder_id = None;
+            }
+
+            let mut removed = Vec::with_capacity(old_ids.len());
+            for old_id in old_ids {
+                if let Some(old) = connections.remove(&old_id) {
+                    removed.push((old_id, old.cmd_tx, old.child_pid));
+                }
+            }
+            (
+                target_state,
+                target_emitter,
+                codeg_mcp_available,
+                mcp_server_count,
+                removed,
+            )
+        };
+
+        // Publish the already-applied binding so attached clients and internal
+        // lifecycle consumers converge without waiting for the first prompt.
+        emit_with_state(
+            &target_state,
+            &target_emitter,
+            AcpEvent::ConversationLinked {
+                conversation_id,
+                folder_id,
+                parent_conversation_id,
+                parent_tool_use_id,
+            },
+        )
+        .await;
+
+        let mut replaced_connection_ids = Vec::with_capacity(replaced.len());
+        for (old_id, cmd_tx, child_pid) in replaced {
+            replaced_connection_ids.push(old_id.clone());
+            if cmd_tx.try_send(ConnectionCommand::Disconnect).is_err() {
+                tracing::warn!(
+                    conversation_id,
+                    old_connection_id = %old_id,
+                    new_connection_id = %connection_id,
+                    "[ACP] superseded connection command channel already closed"
+                );
+            }
+            let connection_id = old_id.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(DISCONNECT_ALL_GRACE).await;
+                hard_kill_process_cell(
+                    child_pid,
+                    "restore_binding_replaced",
+                    Some(connection_id),
+                )
+                .await;
+            });
+        }
+        drop(prompt_guards);
+
+        tracing::info!(
+            conversation_id,
+            external_session_id = expected_session_id,
+            new_connection_id = connection_id,
+            old_connection_ids = ?replaced_connection_ids,
+            mcp_server_count,
+            codeg_mcp_available,
+            binding_updated = true,
+            old_connections_cleaned = true,
+            "[ACP] restored conversation binding activated"
+        );
+
+        Ok(ConversationActivationOutcome {
+            codeg_mcp_available,
+            mcp_server_count,
+            replaced_connection_ids,
+        })
     }
 
     /// Forwards a prompt to the connection's command channel without
@@ -972,6 +1918,7 @@ impl ConnectionManager {
         conn_id: &str,
         mut blocks: Vec<PromptInputBlock>,
         user_message: Option<(String, Vec<crate::acp::UserMessageBlock>)>,
+        agent_file_change_report_request_id: Option<String>,
     ) -> Result<(), AcpError> {
         // Reject an empty prompt BEFORE touching the concurrency gate. An empty
         // prompt produces no turn — and thus no `TurnComplete` to clear the gate
@@ -1032,6 +1979,7 @@ impl ConnectionManager {
         permit.send(ConnectionCommand::Prompt {
             blocks,
             user_message,
+            agent_file_change_report_request_id,
         });
         Ok(())
     }
@@ -1057,7 +2005,96 @@ impl ConnectionManager {
     ) -> Result<(), AcpError> {
         let prompt_lock = self.clone_prompt_lock(conn_id).await?;
         let _guard = prompt_lock.lock_owned().await;
-        self.send_prompt_inner(conn_id, blocks, None).await
+        self.send_prompt_inner(
+            conn_id,
+            blocks,
+            None,
+            Some(uuid::Uuid::new_v4().to_string()),
+        )
+        .await
+    }
+
+    /// Inject additional user input into the current native Codex app-server
+    /// turn. This is deliberately separate from both `send_prompt` (which
+    /// starts a new turn) and live feedback (which waits for an MCP tool pull).
+    ///
+    /// Requests are serialized per connection and keyed by a caller-stable
+    /// message id. The connection loop records success before resolving the
+    /// one-shot, so a retry after a lost HTTP/Tauri response returns the cached
+    /// result instead of issuing `turn/steer` twice.
+    pub async fn steer(
+        &self,
+        conn_id: &str,
+        blocks: Vec<PromptInputBlock>,
+        client_message_id: String,
+    ) -> Result<SteerResult, AcpError> {
+        if blocks.is_empty() {
+            return Err(AcpError::InvalidSteer(
+                "message must contain at least one content block".into(),
+            ));
+        }
+        let client_message_id = client_message_id.trim().to_string();
+        if client_message_id.is_empty()
+            || client_message_id.chars().count() > STEER_CLIENT_MESSAGE_ID_MAX_CHARS
+            || is_reserved_turn_id(&client_message_id)
+        {
+            return Err(AcpError::InvalidSteer(
+                "client_message_id is empty, too long, or reserved".into(),
+            ));
+        }
+
+        let (cmd_tx, state, steer_lock, completion_cache) = {
+            let connections = self.connections.lock().await;
+            let conn = connections
+                .get(conn_id)
+                .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?;
+            (
+                conn.cmd_tx.clone(),
+                conn.state.clone(),
+                conn.steer_lock.clone(),
+                conn.completed_steers.clone(),
+            )
+        };
+
+        let _guard = steer_lock.lock_owned().await;
+        if let Some(previous) = completion_cache
+            .lock()
+            .await
+            .iter()
+            .find(|entry| entry.message_id == client_message_id)
+            .cloned()
+        {
+            return Ok(SteerResult {
+                deduplicated: true,
+                ..previous
+            });
+        }
+
+        {
+            let snapshot = state.read().await;
+            if !snapshot.supports_steer {
+                return Err(AcpError::SteerUnsupported);
+            }
+            if !snapshot.turn_in_flight {
+                return Err(AcpError::NoActiveSteerTurn);
+            }
+        }
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        cmd_tx
+            .send(ConnectionCommand::NativeSteer {
+                blocks,
+                client_message_id,
+                completion_cache,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| AcpError::ProcessExited)?;
+
+        tokio::time::timeout(Duration::from_secs(STEER_RESPONSE_TIMEOUT_SECS), reply_rx)
+            .await
+            .map_err(|_| AcpError::protocol("turn/steer response timed out"))?
+            .map_err(|_| AcpError::ProcessExited)?
     }
 
     /// Send a prompt while ensuring a `Conversation` DB row is bound to this
@@ -1118,6 +2155,17 @@ impl ConnectionManager {
         delegation: Option<crate::acp::delegation::spawner::DelegationLink>,
         client_message_id: Option<String>,
     ) -> Result<Option<i32>, AcpError> {
+        // Normalize the caller-stable id once. Invalid/untrusted ids retain the
+        // legacy fallback behavior (a connection-scoped event id), while valid
+        // ids also key the accepted-prompt idempotency cache below.
+        let client_message_id = client_message_id
+            .map(|id| id.trim().to_string())
+            .filter(|id| {
+                !id.is_empty()
+                    && id.chars().count() <= STEER_CLIENT_MESSAGE_ID_MAX_CHARS
+                    && !is_reserved_turn_id(id)
+            });
+
         // Reject an empty prompt up front, BEFORE any side effects: linking /
         // creating the conversation row, flipping it to InProgress, or emitting
         // events. An empty prompt is never accepted, so it must not mutate
@@ -1154,6 +2202,17 @@ impl ConnectionManager {
                 "delegation link is incompatible with caller-supplied conversation_id".to_string(),
             ));
         }
+        if let Some(conversation_id) = conversation_id {
+            if conversation_branch_service::is_merged_branch(&db.conn, conversation_id)
+                .await
+                .map_err(|error| AcpError::protocol(error.to_string()))?
+            {
+                return Err(AcpError::protocol(
+                    "This branch has already been returned to its source conversation and is read-only"
+                        .to_string(),
+                ));
+            }
+        }
 
         // Acquire the per-connection prompt lock for the entire link-check
         // + DB write + emit + cmd_tx.send sequence. Two concurrent prompts
@@ -1167,23 +2226,87 @@ impl ConnectionManager {
         // Snapshot what we need from the connection map under one short lock.
         // The conversation-linked check happens INSIDE the prompt lock so
         // any racing send sees a consistent post-link state.
-        let (state_arc, emitter, agent_type, already_linked, turn_in_flight) = {
+        let (
+            state_arc,
+            emitter,
+            agent_type,
+            linked_conversation_id,
+            turn_in_flight,
+            accepted_prompt_ids,
+        ) = {
             let connections = self.connections.lock().await;
             let conn = connections
                 .get(conn_id)
                 .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?;
-            let (already, in_flight) = {
+            let (linked_conversation_id, in_flight) = {
                 let s = conn.state.read().await;
-                (s.conversation_id.is_some(), s.turn_in_flight)
+                (s.conversation_id, s.turn_in_flight)
             };
             (
                 conn.state.clone(),
                 conn.emitter.clone(),
                 conn.agent_type,
-                already,
+                linked_conversation_id,
                 in_flight,
+                conn.accepted_prompt_ids.clone(),
             )
         };
+        let already_linked = linked_conversation_id.is_some();
+
+        // A stale tab must never use a still-live connection from a different
+        // conversation. Before the restore fix the already-linked branch simply
+        // ignored the caller's id, which made `/acp_prompt` appear successful
+        // while writing into whichever session the old connection owned.
+        if let (Some(expected), Some(actual)) = (conversation_id, linked_conversation_id) {
+            if expected != actual {
+                tracing::warn!(
+                    requested_conversation_id = expected,
+                    bound_conversation_id = actual,
+                    connection_id = conn_id,
+                    "[ACP] rejecting prompt on mismatched conversation binding"
+                );
+                return Err(AcpError::protocol(format!(
+                    "connection {conn_id} is bound to conversation {actual}, not {expected}"
+                )));
+            }
+        }
+
+        // The original request reached `send_prompt_inner` and was accepted,
+        // but its HTTP/Tauri response may have been lost. The same id is a
+        // status recovery request, not a second turn — return after validating
+        // the conversation binding, but before Busy/DB/event side effects.
+        if let Some(id) = client_message_id.as_ref() {
+            if accepted_prompt_ids.lock().await.contains(id) {
+                tracing::info!(
+                    connection_id = conn_id,
+                    client_message_id = id,
+                    "[ACP] deduplicated already-accepted prompt"
+                );
+                return Ok(linked_conversation_id.or(conversation_id));
+            }
+            if let Some(cid) = linked_conversation_id.or(conversation_id) {
+                if artifact_service::was_prompt_accepted(&db.conn, cid, id)
+                    .await
+                    .map_err(|e| AcpError::protocol(e.to_string()))?
+                    || conversation_branch_service::was_first_prompt_accepted(&db.conn, cid, id)
+                        .await
+                        .map_err(|e| AcpError::protocol(e.to_string()))?
+                {
+                    tracing::info!(
+                        conversation_id = cid,
+                        connection_id = conn_id,
+                        client_message_id = id,
+                        "[ACP] deduplicated durably accepted prompt"
+                    );
+                    let mut cache = accepted_prompt_ids.lock().await;
+                    cache.push_back(id.clone());
+                    while cache.len() > ACCEPTED_PROMPT_ID_CACHE_LIMIT {
+                        cache.pop_front();
+                    }
+                    return Ok(Some(cid));
+                }
+            }
+        }
 
         // Reject a concurrent prompt while a turn is already in flight, BEFORE
         // any side effects (row creation, InProgress emit, user-message
@@ -1202,6 +2325,14 @@ impl ConnectionManager {
             );
             return Err(AcpError::TurnInProgress);
         }
+
+        // A terminal turn's filesystem/deliverable settlement is auxiliary and
+        // must never gate the next user prompt. `turn_in_flight` above remains
+        // the authoritative core-turn gate. ArtifactTracker::begin_turn owns
+        // the narrower process-local handoff: if the prior capture has not yet
+        // consumed TurnComplete it settles that exact generation before
+        // installing the new one. Historical `settlement_status=pending` rows
+        // therefore cannot strand the frontend queue.
 
         // Re-hydrate uploaded image attachments (web / remote-workspace mode
         // sends empty-payload marker blocks with a `file://` uri into the
@@ -1542,8 +2673,8 @@ impl ConnectionManager {
                     // untrusted (the web/Tauri prompt API accepts it verbatim), so
                     // reject that shape and fall back to a connection-scoped id;
                     // legitimate UI senders use `optimistic-<uuid>`.
-                    let message_id = match client_message_id {
-                        Some(id) if !is_reserved_turn_id(&id) => id,
+                    let message_id = match client_message_id.clone() {
+                        Some(id) => id,
                         _ => format!("user-{}-{}", conn_id, state_arc.read().await.event_seq),
                     };
                     Some((message_id, user_blocks))
@@ -1551,6 +2682,165 @@ impl ConnectionManager {
             } else {
                 None
             };
+
+        // Arm filesystem capture BEFORE enqueueing the prompt. Once the
+        // connection loop receives `ConnectionCommand::Prompt`, the agent may
+        // create a file immediately; starting from UserMessage/TurnComplete in
+        // an async subscriber would leave a race window for that first write.
+        let (working_dir_for_artifacts, event_seq_before_prompt, state_folder_id) = {
+            let state = state_arc.read().await;
+            (state.working_dir.clone(), state.event_seq, state.folder_id)
+        };
+        let artifact_run_id = if let (Some(cid), Some(root_path)) =
+            (conversation_id_for_status, working_dir_for_artifacts)
+        {
+            let input_paths = crate::artifact_tracker::input_paths_from_prompt(&blocks, &root_path);
+            let expectation = crate::artifact_tracker::expectation_from_prompt(&blocks, &root_path);
+            let prompt_fingerprint = crate::artifact_tracker::prompt_fingerprint(&blocks);
+            match self
+                .artifact_tracker
+                .begin_turn(
+                    &db.conn,
+                    conn_id,
+                    cid,
+                    user_message.as_ref().map(|(id, _)| id.clone()),
+                    prompt_fingerprint,
+                    folder_id.or(state_folder_id),
+                    root_path,
+                    input_paths,
+                    expectation,
+                    emitter.clone(),
+                    event_seq_before_prompt,
+                )
+                .await
+            {
+                Ok(run_id) => Some(run_id),
+                Err(err) => {
+                    // Artifact persistence is observability, not permission to
+                    // run the agent: keep the prompt usable and make the loss
+                    // loud in diagnostics.
+                    tracing::error!(
+                        "[artifact-tracker] failed to begin turn for connection {}: {}",
+                        conn_id,
+                        err
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(run_id) = artifact_run_id.as_ref() {
+            let mut state = state_arc.write().await;
+            state.active_turn_run_id = Some(run_id.clone());
+            state.active_turn_generation = Some(event_seq_before_prompt.saturating_add(1));
+        }
+
+        // Snapshot branches bootstrap their fresh ACP session exactly once.
+        // Projection of the user-visible message and artifact expectation has
+        // already happened above, so this private context block reaches only
+        // the agent; the detail loader strips the marker from the persisted
+        // transcript after reload.
+        let branch_snapshot = if let Some(cid) = conversation_id_for_status {
+            conversation_branch_service::pending_snapshot(&db.conn, cid)
+                .await
+                .map_err(|e| AcpError::protocol(e.to_string()))?
+        } else {
+            None
+        };
+        if branch_snapshot.is_some() {
+            if let Some(cid) = conversation_id_for_status {
+                conversation_branch_service::mark_first_prompt_queued(
+                    &db.conn,
+                    cid,
+                    client_message_id.as_deref(),
+                    conn_id,
+                )
+                .await
+                .map_err(|e| AcpError::protocol(e.to_string()))?;
+                tracing::info!(
+                    branch_conversation_id = cid,
+                    connection_id = conn_id,
+                    client_message_id = ?client_message_id,
+                    lifecycle_state = "first_prompt_queued",
+                    stage = "first_prompt_queued",
+                    "[ACP][branch] first prompt entered durable client-id admission"
+                );
+            }
+        }
+        if let Some(snapshot) = branch_snapshot.as_ref() {
+            blocks.insert(
+                0,
+                PromptInputBlock::Text {
+                    text: format!(
+                        "<codeg-branch-context>\nThis is read-only initialization context from the source conversation. Preserve it as prior context; the current user request follows after this block.\n\n{}\n</codeg-branch-context>",
+                        snapshot.context
+                    ),
+                },
+            );
+            let prompt_capabilities = match state_arc.read().await.prompt_capabilities.clone() {
+                Some(capabilities) => Some(capabilities),
+                None if !snapshot.images.is_empty() => {
+                    self.wait_for_prompt_capabilities(conn_id, Duration::from_secs(2))
+                        .await
+                }
+                None => None,
+            };
+            let accepts_images = prompt_capabilities.is_some_and(|capabilities| capabilities.image);
+            if accepts_images {
+                for (index, image) in snapshot.images.iter().enumerate() {
+                    blocks.insert(
+                        index + 1,
+                        PromptInputBlock::Image {
+                            data: image.data.clone(),
+                            mime_type: image.mime_type.clone(),
+                            uri: Some(format!("codeg-branch-context://image/{index}")),
+                        },
+                    );
+                }
+            }
+        }
+        // A merge is an append-only Codeg-authored turn, not an immediate
+        // agent request. Feed unconsumed merge conclusions into the target
+        // session with its next real prompt, and acknowledge them only after
+        // that prompt is accepted. This makes the result useful as agent
+        // context without creating a surprise extra turn at merge time.
+        let pending_merge_context = if let Some(cid) = conversation_id_for_status {
+            conversation_branch_service::pending_merge_context(&db.conn, cid)
+                .await
+                .map_err(|e| AcpError::protocol(e.to_string()))?
+        } else {
+            Vec::new()
+        };
+        if !pending_merge_context.is_empty() {
+            let text = pending_merge_context
+                .iter()
+                .map(|(_, context)| context.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            let insert_at = blocks
+                .iter()
+                .position(|block| {
+                    !matches!(
+                        block,
+                        PromptInputBlock::Text { text }
+                            if text.starts_with("<codeg-branch-context>")
+                    ) && !matches!(
+                        block,
+                        PromptInputBlock::Image { uri: Some(uri), .. }
+                            if uri.starts_with("codeg-branch-context://")
+                    )
+                })
+                .unwrap_or(blocks.len());
+            blocks.insert(
+                insert_at,
+                PromptInputBlock::Text {
+                    text: format!(
+                        "<codeg-branch-merge-context>\n{text}\n</codeg-branch-merge-context>"
+                    ),
+                },
+            );
+        }
 
         // We hold `_prompt_guard` here, so call the lock-free inner helper —
         // re-entering `send_prompt` would try to acquire the same mutex and
@@ -1563,11 +2853,112 @@ impl ConnectionManager {
         // for a prompt that never reached the agent, so without this the
         // lifecycle subscriber's PendingReview write also never fires and the
         // row would be stuck until a follow-up `send_prompt_linked` re-flipped it.
+        let report_request_id = artifact_run_id
+            .clone()
+            .or_else(|| Some(uuid::Uuid::new_v4().to_string()));
         match self
-            .send_prompt_inner(conn_id, blocks, user_message)
+            .send_prompt_inner(conn_id, blocks, user_message, report_request_id)
             .await
         {
             Ok(()) => {
+                if branch_snapshot.is_some() {
+                    if let Some(cid) = conversation_id_for_status {
+                        let session_id = state_arc.read().await.external_id.clone();
+                        let finalize_result = if let Some(session_id) = session_id.as_deref() {
+                            conversation_branch_service::finalize_first_prompt(
+                                &db.conn,
+                                cid,
+                                session_id,
+                                conn_id,
+                                client_message_id.as_deref(),
+                            )
+                            .await
+                        } else {
+                            Err(crate::db::error::DbError::Validation(
+                                "provisional branch prompt was accepted without a session id"
+                                    .into(),
+                            ))
+                        };
+                        if let Err(error) = finalize_result {
+                            tracing::error!(
+                                branch_conversation_id = cid,
+                                connection_id = conn_id,
+                                client_message_id = ?client_message_id,
+                                error = %error,
+                                rollback_result = "snapshot_preserved",
+                                failure_classification = "first_prompt_persistence_failed",
+                                "[ACP][branch] prompt reached agent but durable branch promotion failed"
+                            );
+                        } else {
+                            crate::commands::conversations::emit_conversation_upsert(
+                                &emitter, &db.conn, cid,
+                            )
+                            .await;
+                            tracing::info!(
+                                branch_conversation_id = cid,
+                                connection_id = conn_id,
+                                client_message_id = ?client_message_id,
+                                lifecycle_state = "ready",
+                                snapshot_consumed = true,
+                                stage = "first_prompt_accepted",
+                                "[ACP][branch] first prompt accepted and durable session promoted"
+                            );
+                        }
+                    }
+                }
+                if !pending_merge_context.is_empty() {
+                    if let Some(cid) = conversation_id_for_status {
+                        let merge_ids = pending_merge_context
+                            .iter()
+                            .map(|(id, _)| id.clone())
+                            .collect::<Vec<_>>();
+                        if let Err(error) =
+                            conversation_branch_service::mark_merge_context_consumed(
+                                &db.conn, cid, &merge_ids,
+                            )
+                            .await
+                        {
+                            tracing::error!(
+                                conversation_id = cid,
+                                error = %error,
+                                "[ACP][branch] failed to mark merged context consumed"
+                            );
+                        }
+                    }
+                }
+                if let Some(run_id) = artifact_run_id.as_ref() {
+                    match artifact_service::mark_prompt_accepted(&db.conn, run_id).await {
+                        Ok(()) => {
+                            if let Some(cid) = conversation_id_for_status {
+                                crate::artifact_tracker::emit_artifacts_changed(
+                                    &emitter,
+                                    cid,
+                                    run_id.clone(),
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            // The command already reached the agent, so returning
+                            // an error here would invite a duplicate retry. Keep
+                            // the connection-local receipt and report the
+                            // durability degradation in diagnostics.
+                            tracing::error!(
+                                run_id,
+                                client_message_id = ?client_message_id,
+                                "[ACP] failed to persist accepted prompt receipt: {err}"
+                            );
+                        }
+                    }
+                }
+                if let Some(id) = client_message_id {
+                    let mut cache = accepted_prompt_ids.lock().await;
+                    if !cache.contains(&id) {
+                        cache.push_back(id);
+                        while cache.len() > ACCEPTED_PROMPT_ID_CACHE_LIMIT {
+                            cache.pop_front();
+                        }
+                    }
+                }
                 // The prompt reached the agent: surface it to the chat-channel
                 // "user message" event feed. Notification-only — never gates the
                 // send result.
@@ -1609,11 +3000,36 @@ impl ConnectionManager {
                 Ok(conversation_id_for_status)
             }
             Err(send_err) => {
+                if artifact_run_id.is_some() {
+                    self.artifact_tracker.cancel_unsent_turn(conn_id).await;
+                    let mut state = state_arc.write().await;
+                    if state.active_turn_run_id.as_ref() == artifact_run_id.as_ref() {
+                        state.active_turn_run_id = None;
+                        state.active_turn_generation = None;
+                    }
+                }
                 if let Some(cid) = conversation_id_for_status {
+                    let pending_branch = branch_snapshot.is_some();
+                    if pending_branch {
+                        let _ = conversation_branch_service::mark_initialization_state(
+                            &db.conn,
+                            cid,
+                            "retryable_failed",
+                            Some(conn_id.to_string()),
+                            Some(send_err.to_string()),
+                            true,
+                        )
+                        .await;
+                    }
+                    let rollback_status = if pending_branch {
+                        ConversationStatus::PendingReview
+                    } else {
+                        ConversationStatus::Cancelled
+                    };
                     match conversation_service::update_status(
                         &db.conn,
                         cid,
-                        ConversationStatus::Cancelled,
+                        rollback_status.clone(),
                     )
                     .await
                     {
@@ -1623,7 +3039,7 @@ impl ConnectionManager {
                                 &emitter,
                                 AcpEvent::ConversationStatusChanged {
                                     conversation_id: cid,
-                                    status: ConversationStatus::Cancelled,
+                                    status: rollback_status,
                                 },
                             )
                             .await;
@@ -1713,9 +3129,9 @@ impl ConnectionManager {
     /// case that motivated this. Any post-hoc read is unsound anyway: by the
     /// time the manager acts on it the turn it described may have ended. With
     /// the goal known active, the interrupt means precisely "press Stop on the
-    /// user's behalf": `cancel()`'s row write is CAS'd from `InProgress`, a
-    /// `session/cancel` with nothing running is a no-op, and its permission
-    /// drain / delegation cascade are the semantics the Stop button already has
+    /// user's behalf": a raw `session/cancel` with nothing running is a no-op,
+    /// and its permission drain / delegation cascade are the semantics the Stop
+    /// button already has
     /// (including its own turn-boundary race, which is not made worse here).
     ///
     /// Awaiting the round-trip is deliberate and cheap — an out-of-band control
@@ -1767,7 +3183,36 @@ impl ConnectionManager {
             action,
             conn_id
         );
-        self.cancel(db, conn_id).await
+        // A user-owned turn gets the same durable lifecycle and timeout as the
+        // Stop button. Goal continuations can also be agent-owned detached
+        // turns with no CodeG run row; those still need the raw protocol
+        // interrupt but must not manufacture a durable cancellation record.
+        if artifact_service::latest_run_for_connection(db, conn_id)
+            .await
+            .map_err(|error| AcpError::protocol(error.to_string()))?
+            .is_some_and(|run| {
+                matches!(
+                    run.status,
+                    crate::db::entities::conversation_turn_run::ConversationTurnRunStatus::Running
+                        | crate::db::entities::conversation_turn_run::ConversationTurnRunStatus::Cancelling
+                )
+            })
+        {
+            self.cancel(db, conn_id).await?;
+            return Ok(());
+        }
+        let cmd_tx = {
+            let connections = self.connections.lock().await;
+            connections
+                .get(conn_id)
+                .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?
+                .cmd_tx
+                .clone()
+        };
+        cmd_tx
+            .send(ConnectionCommand::Cancel { reply: None })
+            .await
+            .map_err(|_| AcpError::ProcessExited)
     }
 
     /// Stop one AIR async task (`_session/async_task/stop`).
@@ -1806,62 +3251,952 @@ impl ConnectionManager {
             .map_err(|_| AcpError::protocol("Async task stop reply channel closed".to_string()))?
     }
 
-    pub async fn cancel(&self, db: &DatabaseConnection, conn_id: &str) -> Result<(), AcpError> {
-        let (cmd_tx, state_arc, emitter) = {
+    pub async fn cancel(
+        &self,
+        db: &DatabaseConnection,
+        conn_id: &str,
+    ) -> Result<AcpCancelResult, AcpError> {
+        self.cancel_with_origin(db, conn_id, "internal", None).await
+    }
+
+    /// Cancel with an audited caller origin. Public UI/API entry points use
+    /// this form so a field report can distinguish an explicit Stop click from
+    /// automation, shutdown, or another lifecycle path without logging user
+    /// content or credentials.
+    pub async fn cancel_with_origin(
+        &self,
+        db: &DatabaseConnection,
+        conn_id: &str,
+        request_source: &str,
+        frontend_generation: Option<u64>,
+    ) -> Result<AcpCancelResult, AcpError> {
+        let prompt_lock = self.clone_prompt_lock(conn_id).await?;
+        let _cancel_guard = prompt_lock.lock_owned().await;
+        let (cmd_tx, state_arc) = {
             let connections = self.connections.lock().await;
             let conn = connections
                 .get(conn_id)
                 .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?;
+            (conn.cmd_tx.clone(), conn.state.clone())
+        };
+        let (
+            conversation_id,
+            external_session_id,
+            client_message_id,
+            folder_id,
+            root_path,
+            turn_in_flight,
+        ) = {
+            let state = state_arc.read().await;
             (
-                conn.cmd_tx.clone(),
-                conn.state.clone(),
-                conn.emitter.clone(),
+                state.conversation_id,
+                state.external_id.clone(),
+                state
+                    .pending_user_message
+                    .as_ref()
+                    .map(|item| item.message_id.clone()),
+                state.folder_id,
+                state
+                    .working_dir
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+                state.turn_in_flight,
             )
         };
-        cmd_tx
-            .send(ConnectionCommand::Cancel)
-            .await
-            .map_err(|_| AcpError::ProcessExited)?;
-
-        // Eagerly flip the row to `Cancelled` so the sidebar/tabs leave the
-        // "running" state immediately. The agent typically replies with
-        // `TurnComplete{cancelled}` which the lifecycle subscriber ignores,
-        // and stays connected (so `handle_terminal_event` doesn't fire either)
-        // — without this write the row would strand on `InProgress`.
-        // CAS-guarded so we don't overwrite a `PendingReview`/`Completed`
-        // status if the turn happened to end just before the user clicked.
-        let conversation_id = state_arc.read().await.conversation_id;
-        if let Some(cid) = conversation_id {
-            match conversation_service::update_status_if(
+        let cancel_request_id = uuid::Uuid::new_v4().to_string();
+        let requested_at = chrono::Utc::now();
+        let timeout = cancel_timeout_from_env();
+        let deadline_at = requested_at
+            + chrono::Duration::from_std(timeout)
+                .unwrap_or_else(|_| chrono::Duration::seconds(DEFAULT_CANCEL_TIMEOUT_SECS as i64));
+        let mut transition = artifact_service::request_cancel(
+            db,
+            conn_id,
+            &cancel_request_id,
+            requested_at,
+            deadline_at,
+        )
+        .await
+        .map_err(|error| AcpError::protocol(error.to_string()))?;
+        // Artifact capture is deliberately best-effort during prompt admission.
+        // If its initial INSERT lost a SQLite lock race, the agent can still be
+        // running with no turn row. Repair that observability gap before
+        // cancelling so a successful response can still prove all durable
+        // layers reached a terminal state.
+        if transition.disposition == artifact_service::CancelRequestDisposition::RunNotFound
+            && turn_in_flight
+        {
+            let conversation_id = conversation_id.ok_or_else(|| {
+                AcpError::protocol(
+                    "active ACP turn has no durable conversation binding".to_string(),
+                )
+            })?;
+            let run_id = uuid::Uuid::new_v4().to_string();
+            artifact_service::create_run(
                 db,
-                cid,
-                ConversationStatus::InProgress,
-                ConversationStatus::Cancelled,
+                artifact_service::NewTurnRun {
+                    id: run_id.clone(),
+                    conversation_id,
+                    connection_id: conn_id.to_string(),
+                    client_message_id: client_message_id.clone(),
+                    prompt_fingerprint: None,
+                    folder_id,
+                    root_path,
+                    capture_incomplete: true,
+                    input_paths_json: "[]".to_string(),
+                    expectation_json: r#"{"publish_required":false,"expects_code_changes":false,"requested_paths":[]}"#.to_string(),
+                },
             )
             .await
+            .map_err(|error| AcpError::protocol(error.to_string()))?;
+            artifact_service::mark_prompt_accepted(db, &run_id)
+                .await
+                .map_err(|error| AcpError::protocol(error.to_string()))?;
+            transition = artifact_service::request_cancel(
+                db,
+                conn_id,
+                &cancel_request_id,
+                requested_at,
+                deadline_at,
+            )
+            .await
+            .map_err(|error| AcpError::protocol(error.to_string()))?;
+            tracing::warn!(
+                conversation_id,
+                turn_run_id = %run_id,
+                connection_id = conn_id,
+                transition_reason = "missing_artifact_run_repaired",
+                "[ACP][cancel] reconstructed missing durable turn before cancellation"
+            );
+        }
+        let stored_request_id = transition
+            .run
+            .as_ref()
+            .and_then(|run| run.cancel_request_id.clone())
+            .unwrap_or_else(|| cancel_request_id.clone());
+        let run_id = transition.run.as_ref().map(|run| run.id.clone());
+        let disposition = match transition.disposition {
+            artifact_service::CancelRequestDisposition::CancelRequested => "cancel_requested",
+            artifact_service::CancelRequestDisposition::AlreadyCancelling => "already_cancelling",
+            artifact_service::CancelRequestDisposition::AlreadyFinished => "already_finished",
+            artifact_service::CancelRequestDisposition::RunNotFound => "run_not_found",
+        };
+        tracing::info!(
+            conversation_id,
+            turn_run_id = ?run_id,
+            connection_id = conn_id,
+            external_session_id = ?external_session_id,
+            client_message_id = ?client_message_id,
+            cancel_request_id = %stored_request_id,
+            current_state = ?transition.run.as_ref().map(|run| &run.status),
+            target_state = "cancelling",
+            duplicate_cancel = disposition == "already_cancelling",
+            cancel_requested_at = %requested_at,
+            cancel_deadline = %deadline_at,
+            cancel_acknowledgment = disposition,
+            request_source,
+            frontend_generation,
+            "[ACP][cancel] cancellation transition evaluated"
+        );
+
+        if transition.disposition == artifact_service::CancelRequestDisposition::CancelRequested {
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            if cmd_tx
+                .send(ConnectionCommand::Cancel {
+                    reply: Some(ack_tx),
+                })
+                .await
+                .is_err()
             {
-                Ok(true) => {
-                    emit_with_state(
-                        &state_arc,
-                        &emitter,
-                        AcpEvent::ConversationStatusChanged {
-                            conversation_id: cid,
-                            status: ConversationStatus::Cancelled,
+                if let Some(run_id) = run_id.as_deref() {
+                    self.force_finish_cancelled_run(
+                        db,
+                        conn_id,
+                        run_id,
+                        "cancel_command_channel_closed",
+                        true,
+                    )
+                    .await?;
+                }
+                return Err(AcpError::ProcessExited);
+            }
+
+            let acknowledgment = tokio::time::timeout(Duration::from_secs(5), ack_rx).await;
+            let acknowledgment_error = match acknowledgment {
+                Ok(Ok(Ok(()))) => None,
+                Ok(Ok(Err(error))) => Some(format!(
+                    "ACP rejected the cancel notification before delivery: {error}"
+                )),
+                Ok(Err(_)) => Some(
+                    "ACP connection closed before acknowledging the cancel notification"
+                        .to_string(),
+                ),
+                Err(_) => Some(
+                    "ACP connection did not acknowledge the cancel notification within 5 seconds"
+                        .to_string(),
+                ),
+            };
+            if let Some(acknowledgment_error) = acknowledgment_error {
+                let manager = self.clone_ref();
+                let db = db.clone();
+                let connection_id = conn_id.to_string();
+                let timeout_run_id = run_id.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(timeout).await;
+                    if let Some(run_id) = timeout_run_id.as_deref() {
+                        if let Err(error) = manager
+                            .force_finish_cancelled_run(
+                                &db,
+                                &connection_id,
+                                run_id,
+                                "cancel_timeout",
+                                true,
+                            )
+                            .await
+                        {
+                            tracing::error!(
+                                turn_run_id = run_id,
+                                connection_id,
+                                error = %error,
+                                "[ACP][cancel] timeout finalization failed"
+                            );
+                        }
+                    }
+                });
+                return Err(AcpError::protocol(format!(
+                    "{acknowledgment_error}; targeted recovery is scheduled"
+                )));
+            }
+
+            if let Some(run_id) = run_id.as_deref() {
+                self.force_finish_cancelled_run(db, conn_id, run_id, "cancelled", false)
+                    .await?;
+            }
+        }
+
+        Ok(AcpCancelResult {
+            outcome: if disposition == "cancel_requested" {
+                "cancelled".to_string()
+            } else {
+                disposition.to_string()
+            },
+            cancel_request_id: stored_request_id,
+            turn_run_id: run_id,
+            conversation_id,
+            deadline_at: transition.run.and_then(|run| run.cancel_deadline_at),
+        })
+    }
+
+    async fn force_finish_cancelled_run(
+        &self,
+        db: &DatabaseConnection,
+        connection_id: &str,
+        run_id: &str,
+        stop_reason: &str,
+        disconnect: bool,
+    ) -> Result<bool, AcpError> {
+        let Some(run) = conversation_turn_run::Entity::find_by_id(run_id.to_string())
+            .one(db)
+            .await
+            .map_err(|error| AcpError::protocol(error.to_string()))?
+        else {
+            return Err(AcpError::protocol(format!(
+                "turn run {run_id} was not found"
+            )));
+        };
+        if run.connection_id != connection_id {
+            return Err(AcpError::protocol(format!(
+                "turn run {run_id} belongs to another connection"
+            )));
+        }
+
+        let finalized = artifact_service::finalize_turn_state(
+            db,
+            run_id,
+            ConversationTurnRunStatus::Cancelled,
+            stop_reason,
+            ConversationStatus::Cancelled,
+            true,
+            true,
+        )
+        .await
+        .map_err(|error| AcpError::protocol(error.to_string()))?;
+
+        let state_and_emitter = self.get_state_and_emitter(connection_id).await;
+        if let Some((state, emitter)) = state_and_emitter.as_ref() {
+            let (session_id, agent_type) = {
+                let snapshot = state.read().await;
+                (
+                    snapshot.external_id.clone().unwrap_or_default(),
+                    snapshot.agent_type.to_string(),
+                )
+            };
+            if state.read().await.turn_in_flight {
+                emit_with_state(
+                    state,
+                    emitter,
+                    AcpEvent::TurnComplete {
+                        session_id,
+                        stop_reason: stop_reason.to_string(),
+                        agent_type,
+                    },
+                )
+                .await;
+            }
+        }
+
+        let capture_finished = self
+            .artifact_tracker
+            .force_finish_turn(
+                connection_id,
+                run_id,
+                ArtifactTurnFinishStatus::Cancelled,
+                stop_reason.to_string(),
+            )
+            .await;
+        if let Some((state, emitter)) = state_and_emitter {
+            emit_with_state(
+                &state,
+                &emitter,
+                AcpEvent::ConversationStatusChanged {
+                    conversation_id: run.conversation_id,
+                    status: ConversationStatus::Cancelled,
+                },
+            )
+            .await;
+        }
+
+        tracing::warn!(
+            conversation_id = run.conversation_id,
+            turn_run_id = run.id,
+            connection_id,
+            cancel_request_id = ?run.cancel_request_id,
+            current_state = ?run.status,
+            target_state = "cancelled",
+            durable_state_changed = finalized,
+            forced_finalization = true,
+            final_stop_reason = stop_reason,
+            artifact_tracker_settled = capture_finished,
+            connection_cleanup_requested = disconnect,
+            "[ACP][cancel] forced single-turn cancellation finalization"
+        );
+        if disconnect {
+            let _ = self.disconnect(connection_id).await;
+        }
+        Ok(finalized)
+    }
+
+    async fn reconciliation_lock(&self, conversation_id: i32) -> Arc<Mutex<()>> {
+        let mut locks = self.reconciliation_locks.lock().await;
+        locks
+            .entry(conversation_id)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    async fn observe_run_connection(&self, connection_id: &str) -> Option<RunLiveObservation> {
+        let handle = {
+            let connections = self.connections.lock().await;
+            connections.get(connection_id).map(|connection| {
+                (
+                    Arc::clone(&connection.state),
+                    connection
+                        .child_pid
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                )
+            })
+        }?;
+        let (state, child_pid) = handle;
+        let state = state.read().await;
+        let pending_tool_count = state
+            .active_tool_calls
+            .values()
+            .filter(|tool| {
+                matches!(
+                    tool.status,
+                    crate::acp::session_state::ToolCallStatus::Pending
+                        | crate::acp::session_state::ToolCallStatus::InProgress
+                )
+            })
+            .count();
+        let all_tools_terminal = !state.active_tool_calls.is_empty()
+            && state.active_tool_calls.values().all(|tool| {
+                matches!(
+                    tool.status,
+                    crate::acp::session_state::ToolCallStatus::Completed
+                        | crate::acp::session_state::ToolCallStatus::Failed
+                )
+            });
+        Some(RunLiveObservation {
+            status: state.status.clone(),
+            turn_in_flight: state.turn_in_flight,
+            heartbeat_at: state.last_agent_activity_at,
+            output_at: state.last_turn_progress_at,
+            has_live_text: state.has_effective_live_text(),
+            has_interaction: state.has_active_turn_interaction(),
+            all_tools_terminal,
+            pending_tool_count,
+            child_pid,
+            process_alive: (child_pid != 0)
+                .then(|| crate::acp::delegation::parent_watcher::parent_alive(child_pid)),
+            event_seq: state.event_seq,
+            active_turn_run_id: state.active_turn_run_id.clone(),
+            active_turn_generation: state.active_turn_generation,
+            restore_in_progress: state.restore_conversation_id.is_some() && !state.selectors_ready,
+            conversation_id: state.conversation_id,
+        })
+    }
+
+    async fn clear_stale_suspicion(&self, run_id: &str) {
+        self.stale_run_suspicions.lock().await.remove(run_id);
+    }
+
+    async fn confirm_stale_observation(
+        &self,
+        run_id: &str,
+        observation: StaleRunSuspicion,
+    ) -> (bool, u8) {
+        let mut suspicions = self.stale_run_suspicions.lock().await;
+        if let Some(previous) = suspicions.get(run_id) {
+            let unchanged = previous.connection_id == observation.connection_id
+                && previous.connection_generation == observation.connection_generation
+                && previous.heartbeat_at == observation.heartbeat_at
+                && previous.output_at == observation.output_at
+                && previous.reason == observation.reason;
+            if unchanged {
+                let elapsed = observation
+                    .first_seen_at
+                    .signed_duration_since(previous.first_seen_at)
+                    .to_std()
+                    .unwrap_or_default();
+                if elapsed >= self.stale_confirmation {
+                    suspicions.remove(run_id);
+                    return (true, 2);
+                }
+                return (false, 2);
+            }
+        }
+        suspicions.insert(run_id.to_string(), observation);
+        (false, 1)
+    }
+
+    /// Reconcile durable active runs against the process-local connection map.
+    /// A first stale observation is diagnostic only. Finalization requires the
+    /// same run/connection generation, heartbeat, output clock, and stale basis
+    /// to survive a confirmation window and a final prompt-lock recheck. Fresh
+    /// agent activity, tools/interactions, restore/handoff work, or a newer run
+    /// veto the candidate immediately.
+    pub async fn reconcile_conversation_runs(
+        &self,
+        db: &DatabaseConnection,
+        conversation_id: i32,
+    ) -> Result<usize, AcpError> {
+        use crate::db::entities::conversation_turn_run::ConversationTurnRunStatus;
+
+        let reconciliation_lock = self.reconciliation_lock(conversation_id).await;
+        let _reconciliation_guard = reconciliation_lock.lock().await;
+        let runs = artifact_service::active_runs_for_conversation(db, conversation_id)
+            .await
+            .map_err(|error| AcpError::protocol(error.to_string()))?;
+        if runs.is_empty() {
+            self.stale_run_suspicions
+                .lock()
+                .await
+                .retain(|_, suspicion| suspicion.conversation_id != conversation_id);
+            return Ok(0);
+        }
+        let conversation_status = conversation_service::get_by_id(db, conversation_id)
+            .await
+            .map_err(|error| AcpError::protocol(error.to_string()))?
+            .status;
+        let now = chrono::Utc::now();
+        let stale_threshold = chrono::Duration::from_std(self.stale_run_timeout)
+            .unwrap_or_else(|_| chrono::Duration::seconds(DEFAULT_STALE_RUN_TIMEOUT_SECS as i64));
+        let newest_run_id = runs.first().map(|run| run.id.clone());
+        let mut reconciled = 0;
+
+        for run in runs {
+            let live = self.observe_run_connection(&run.connection_id).await;
+            let capture = self
+                .artifact_tracker
+                .active_capture_info(&run.connection_id)
+                .await;
+            let connection_generation = live
+                .as_ref()
+                .and_then(|observation| observation.active_turn_generation)
+                .or_else(|| {
+                    capture
+                        .as_ref()
+                        .filter(|capture| capture.run_id == run.id)
+                        .map(|capture| capture.generation)
+                });
+            let heartbeat_age_ms = live.as_ref().map(|observation| {
+                now.signed_duration_since(observation.heartbeat_at)
+                    .num_milliseconds()
+                    .max(0)
+            });
+            let output_age_ms = live.as_ref().map(|observation| {
+                now.signed_duration_since(observation.output_at)
+                    .num_milliseconds()
+                    .max(0)
+            });
+            let run_age = now.signed_duration_since(run.started_at);
+            let owns_current_generation = live.as_ref().is_some_and(|observation| {
+                observation.conversation_id == Some(conversation_id)
+                    && observation.active_turn_run_id.as_deref() == Some(run.id.as_str())
+            }) || capture
+                .as_ref()
+                .is_some_and(|capture| capture.run_id == run.id);
+            let newer_run_detected = newest_run_id.as_deref() != Some(run.id.as_str());
+
+            // Old duplicate rows can exist after crashes, but they are never
+            // allowed to act on the current capture, connection state, or
+            // conversation status. They get their own two-pass, run-only CAS.
+            if newer_run_detected {
+                if run_age < stale_threshold {
+                    self.clear_stale_suspicion(&run.id).await;
+                    tracing::debug!(
+                        conversation_id,
+                        turn_run_id = run.id,
+                        connection_id = run.connection_id,
+                        connection_generation,
+                        veto_reason = "newer_run_detected",
+                        "[ACP][reconcile] stale finalization vetoed"
+                    );
+                    continue;
+                }
+                let (confirmed, attempt) = self
+                    .confirm_stale_observation(
+                        &run.id,
+                        StaleRunSuspicion {
+                            conversation_id,
+                            first_seen_at: now,
+                            connection_id: run.connection_id.clone(),
+                            connection_generation,
+                            heartbeat_at: live
+                                .as_ref()
+                                .map(|observation| observation.heartbeat_at),
+                            output_at: live.as_ref().map(|observation| observation.output_at),
+                            reason: "superseded_active_row".to_string(),
                         },
                     )
                     .await;
+                if !confirmed {
+                    tracing::warn!(
+                        conversation_id,
+                        turn_id = ?run.client_message_id,
+                        turn_run_id = run.id,
+                        client_message_id = ?run.client_message_id,
+                        connection_id = run.connection_id,
+                        connection_generation,
+                        confirmation_attempt = attempt,
+                        final_basis = "superseded_active_row",
+                        state_changed = false,
+                        "[ACP][reconcile] suspected stale run retained for confirmation"
+                    );
+                    continue;
                 }
-                Ok(false) => {}
-                Err(e) => {
-                    tracing::error!(
-                        "[ACP][ERROR] failed to mark conversation {cid} cancelled \
-                         on user cancel (conn={conn_id}): {e}"
+                let changed = artifact_service::force_finish_incomplete(
+                    db,
+                    &run.id,
+                    ConversationTurnRunStatus::Interrupted,
+                    "superseded_run_reconciled",
+                )
+                .await
+                .map_err(|error| AcpError::protocol(error.to_string()))?;
+                tracing::warn!(
+                    conversation_id,
+                    turn_run_id = run.id,
+                    connection_id = run.connection_id,
+                    connection_generation,
+                    confirmation_attempt = 2,
+                    final_basis = "superseded_active_row",
+                    state_changed = changed,
+                    artifact_tracker_state = "preserved_newer_generation",
+                    "[ACP][reconcile] superseded durable run finalized in isolation"
+                );
+                reconciled += usize::from(changed);
+                continue;
+            }
+
+            let deadline_expired = run
+                .cancel_deadline_at
+                .is_some_and(|deadline| deadline <= now);
+            let contradiction = conversation_status == "cancelled";
+            let fresh_heartbeat = owns_current_generation
+                && live.as_ref().is_some_and(|observation| {
+                    now.signed_duration_since(observation.heartbeat_at) < stale_threshold
+                });
+            let fresh_output = owns_current_generation
+                && live.as_ref().is_some_and(|observation| {
+                    now.signed_duration_since(observation.output_at) < stale_threshold
+                });
+            let restore_in_progress = live
+                .as_ref()
+                .is_some_and(|observation| observation.restore_in_progress);
+            let active_interaction = owns_current_generation
+                && live
+                .as_ref()
+                .is_some_and(|observation| observation.has_interaction);
+            let prompting = owns_current_generation
+                && live.as_ref().is_some_and(|observation| {
+                    observation.status == ConnectionStatus::Prompting
+                        && observation.turn_in_flight
+                });
+            let stalled_terminal_tools = live.as_ref().is_some_and(|observation| {
+                prompting
+                    && observation.all_tools_terminal
+                    && !observation.has_live_text
+                    && !observation.has_interaction
+                    && now.signed_duration_since(observation.output_at)
+                        >= zombie_prompt_timeout_from_env()
+            });
+
+            match run.status {
+                ConversationTurnRunStatus::Cancelling if deadline_expired => {
+                    self.clear_stale_suspicion(&run.id).await;
+                    tracing::warn!(
+                        conversation_id,
+                        turn_id = ?run.client_message_id,
+                        turn_run_id = run.id,
+                        client_message_id = ?run.client_message_id,
+                        connection_id = run.connection_id,
+                        current_state = "cancelling",
+                        cancel_deadline = ?run.cancel_deadline_at,
+                        heartbeat_age_ms,
+                        output_age_ms,
+                        process_id = ?live.as_ref().map(|observation| observation.child_pid),
+                        connection_exists = live.is_some(),
+                        contradiction,
+                        failure_classification = "stale_cancelling_run",
+                        "[ACP][reconcile] forcing expired/orphaned cancellation"
+                    );
+                    if let Err(error) = self
+                        .force_finish_cancelled_run(
+                            db,
+                            &run.connection_id,
+                            &run.id,
+                            "cancel_timeout",
+                            live.is_some(),
+                        )
+                        .await
+                    {
+                        tracing::error!(
+                            conversation_id,
+                            turn_run_id = %run.id,
+                            connection_id = %run.connection_id,
+                            error = %error,
+                            "[ACP][reconcile] stale cancelling turn finalization failed"
+                        );
+                        continue;
+                    }
+                    reconciled += 1;
+                }
+                ConversationTurnRunStatus::Running => {
+                    let veto_reason = if fresh_heartbeat {
+                        Some("fresh_heartbeat")
+                    } else if fresh_output {
+                        Some("fresh_output")
+                    } else if active_interaction {
+                        Some("active_tool_or_interaction")
+                    } else if restore_in_progress {
+                        Some("restore_in_progress")
+                    } else {
+                        None
+                    };
+                    if let Some(veto_reason) = veto_reason {
+                        self.clear_stale_suspicion(&run.id).await;
+                        tracing::debug!(
+                            conversation_id,
+                            turn_run_id = run.id,
+                            connection_id = run.connection_id,
+                            connection_generation,
+                            connection_event_seq = live.as_ref().map(|observation| observation.event_seq),
+                            current_state = "running",
+                            heartbeat_age_ms,
+                            output_age_ms,
+                            tool_activity_age_ms = output_age_ms,
+                            connection_exists = live.is_some(),
+                            process_alive = ?live.as_ref().and_then(|observation| observation.process_alive),
+                            pending_tool_count = live.as_ref().map_or(0, |observation| observation.pending_tool_count),
+                            artifact_tracker_state = if capture.as_ref().is_some_and(|capture| capture.run_id == run.id) { "current" } else { "missing_or_other_generation" },
+                            stale_threshold_ms = self.stale_run_timeout.as_millis() as u64,
+                            veto_reason,
+                            state_changed = false,
+                            "[ACP][reconcile] stale finalization vetoed"
+                        );
+                        continue;
+                    }
+
+                    let candidate_reason = if live.is_none() && run_age >= stale_threshold {
+                        Some("connection_missing")
+                    } else if stalled_terminal_tools {
+                        Some("terminal_tools_without_terminal_event")
+                    } else if let Some(observation) = live.as_ref() {
+                        if matches!(
+                            observation.status,
+                            ConnectionStatus::Error | ConnectionStatus::Disconnected
+                        ) {
+                            Some("connection_terminal")
+                        } else if !prompting && run_age >= stale_threshold {
+                            Some("run_not_owned_by_prompting_state")
+                        } else if prompting
+                            && now.signed_duration_since(observation.output_at)
+                                >= zombie_prompt_timeout_from_env()
+                        {
+                            Some("prompt_activity_stalled")
+                        } else if contradiction && run_age >= stale_threshold {
+                            Some("durable_state_contradiction")
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    let Some(candidate_reason) = candidate_reason else {
+                        self.clear_stale_suspicion(&run.id).await;
+                        continue;
+                    };
+
+                    let observed_heartbeat = live
+                        .as_ref()
+                        .map(|observation| observation.heartbeat_at);
+                    let observed_output = live.as_ref().map(|observation| observation.output_at);
+                    let (confirmed, attempt) = self
+                        .confirm_stale_observation(
+                            &run.id,
+                            StaleRunSuspicion {
+                                conversation_id,
+                                first_seen_at: now,
+                                connection_id: run.connection_id.clone(),
+                                connection_generation,
+                                heartbeat_at: observed_heartbeat,
+                                output_at: observed_output,
+                                reason: candidate_reason.to_string(),
+                            },
+                        )
+                        .await;
+                    if !confirmed {
+                        tracing::warn!(
+                            conversation_id,
+                            turn_run_id = run.id,
+                            connection_id = run.connection_id,
+                            connection_generation,
+                            current_state = "running",
+                            heartbeat_age_ms,
+                            output_age_ms,
+                            tool_activity_age_ms = output_age_ms,
+                            connection_exists = live.is_some(),
+                            process_alive = ?live.as_ref().and_then(|observation| observation.process_alive),
+                            pending_tool_count = live.as_ref().map_or(0, |observation| observation.pending_tool_count),
+                            artifact_tracker_state = if capture.as_ref().is_some_and(|capture| capture.run_id == run.id) { "current" } else { "missing_or_other_generation" },
+                            stale_threshold_ms = self.stale_run_timeout.as_millis() as u64,
+                            confirmation_attempt = attempt,
+                            final_basis = candidate_reason,
+                            state_changed = false,
+                            "[ACP][reconcile] suspected stale run retained for confirmation"
+                        );
+                        continue;
+                    }
+
+                    // Block a prompt admission on this connection while the
+                    // second observation is revalidated and committed.
+                    let prompt_lock = {
+                        let connections = self.connections.lock().await;
+                        connections
+                            .get(&run.connection_id)
+                            .map(|connection| Arc::clone(&connection.prompt_lock))
+                    };
+                    let _prompt_guard = match prompt_lock.as_ref() {
+                        Some(lock) => Some(lock.lock().await),
+                        None => None,
+                    };
+                    let latest = artifact_service::active_runs_for_conversation(db, conversation_id)
+                        .await
+                        .map_err(|error| AcpError::protocol(error.to_string()))?;
+                    if latest.first().map(|active| active.id.as_str()) != Some(run.id.as_str()) {
+                        self.clear_stale_suspicion(&run.id).await;
+                        tracing::info!(
+                            conversation_id,
+                            turn_run_id = run.id,
+                            connection_id = run.connection_id,
+                            veto_reason = "newer_run_detected",
+                            state_changed = false,
+                            "[ACP][reconcile] confirmed stale observation invalidated"
+                        );
+                        continue;
+                    }
+                    let live_after = self.observe_run_connection(&run.connection_id).await;
+                    let capture_after = self
+                        .artifact_tracker
+                        .active_capture_info(&run.connection_id)
+                        .await;
+                    let generation_after = live_after
+                        .as_ref()
+                        .and_then(|observation| observation.active_turn_generation)
+                        .or_else(|| {
+                            capture_after
+                                .as_ref()
+                                .filter(|capture| capture.run_id == run.id)
+                                .map(|capture| capture.generation)
+                        });
+                    let changed_activity = generation_after != connection_generation
+                        || live_after.as_ref().map(|observation| observation.heartbeat_at)
+                            != observed_heartbeat
+                        || live_after.as_ref().map(|observation| observation.output_at)
+                            != observed_output;
+                    let newer_owner = live_after.as_ref().is_some_and(|observation| {
+                        observation.conversation_id != Some(conversation_id)
+                            || observation.active_turn_run_id.as_deref().is_some_and(|active| active != run.id)
+                    }) || capture_after.as_ref().is_some_and(|capture| capture.run_id != run.id);
+                    if changed_activity || newer_owner {
+                        self.clear_stale_suspicion(&run.id).await;
+                        tracing::info!(
+                            conversation_id,
+                            turn_run_id = run.id,
+                            connection_id = run.connection_id,
+                            connection_generation = generation_after,
+                            veto_reason = if newer_owner { "newer_run_detected" } else { "fresh_activity_during_confirmation" },
+                            state_changed = false,
+                            "[ACP][reconcile] confirmed stale observation invalidated"
+                        );
+                        continue;
+                    }
+
+                    let stop_reason = if stalled_terminal_tools {
+                        "zombie_prompting_reconciled"
+                    } else {
+                        "stale_run_reconciled"
+                    };
+                    let finalized = artifact_service::finalize_stale_turn_state(
+                        db,
+                        &run.id,
+                        &run.connection_id,
+                        stop_reason,
+                    )
+                    .await
+                    .map_err(|error| AcpError::protocol(error.to_string()))?;
+                    let state_and_emitter = self.get_state_and_emitter(&run.connection_id).await;
+                    let exact_live_owner = live_after.as_ref().is_some_and(|observation| {
+                        observation.conversation_id == Some(conversation_id)
+                            && observation.active_turn_run_id.as_deref() == Some(run.id.as_str())
+                    }) || capture_after
+                        .as_ref()
+                        .is_some_and(|capture| capture.run_id == run.id);
+                    if finalized.run_changed && exact_live_owner {
+                        if let Some((state, emitter)) = state_and_emitter.as_ref() {
+                            let (session_id, agent_type) = {
+                                let snapshot = state.read().await;
+                                (
+                                    snapshot.external_id.clone().unwrap_or_default(),
+                                    snapshot.agent_type.to_string(),
+                                )
+                            };
+                            emit_with_state(
+                                state,
+                                emitter,
+                                AcpEvent::TurnComplete {
+                                    session_id,
+                                    stop_reason: stop_reason.to_string(),
+                                    agent_type,
+                                },
+                            )
+                            .await;
+                        }
+                    }
+                    let capture_finished = self
+                        .artifact_tracker
+                        .force_finish_turn(
+                            &run.connection_id,
+                            &run.id,
+                            ArtifactTurnFinishStatus::Interrupted,
+                            stop_reason.to_string(),
+                        )
+                        .await;
+                    if finalized.conversation_changed {
+                        if let Some((state, emitter)) = state_and_emitter.as_ref() {
+                            emit_with_state(
+                                state,
+                                emitter,
+                                AcpEvent::ConversationStatusChanged {
+                                    conversation_id,
+                                    status: ConversationStatus::PendingReview,
+                                },
+                            )
+                            .await;
+                        }
+                    }
+                    let connection_unhealthy = live_after.as_ref().is_some_and(|observation| {
+                        matches!(
+                            observation.status,
+                            ConnectionStatus::Error | ConnectionStatus::Disconnected
+                        ) || observation.process_alive == Some(false)
+                    }) || matches!(
+                        candidate_reason,
+                        "prompt_activity_stalled" | "terminal_tools_without_terminal_event"
+                    );
+                    tracing::warn!(
+                        conversation_id,
+                        turn_run_id = run.id,
+                        connection_id = run.connection_id,
+                        connection_generation,
+                        current_state = "running",
+                        target_state = "interrupted",
+                        turn_id = ?run.client_message_id,
+                        client_message_id = ?run.client_message_id,
+                        heartbeat_age_ms,
+                        output_age_ms,
+                        tool_activity_age_ms = output_age_ms,
+                        connection_exists = live_after.is_some(),
+                        process_alive = ?live_after.as_ref().and_then(|observation| observation.process_alive),
+                        pending_tool_count = live_after.as_ref().map_or(0, |observation| observation.pending_tool_count),
+                        artifact_tracker_state = if capture_finished { "settled_exact_generation" } else { "not_owned_or_already_settled" },
+                        stale_threshold_ms = self.stale_run_timeout.as_millis() as u64,
+                        confirmation_attempt = 2,
+                        final_basis = candidate_reason,
+                        durable_state_changed = finalized.run_changed,
+                        conversation_state_changed = finalized.conversation_changed,
+                        connection_cleanup_requested = connection_unhealthy,
+                        "[ACP][reconcile] stale running turn finalized"
+                    );
+                    if connection_unhealthy {
+                        let _ = self.disconnect(&run.connection_id).await;
+                    }
+                    reconciled += usize::from(finalized.run_changed);
+                }
+                _ => {
+                    self.clear_stale_suspicion(&run.id).await;
+                    tracing::debug!(
+                        conversation_id,
+                        turn_run_id = run.id,
+                        connection_id = run.connection_id,
+                        current_state = ?run.status,
+                        heartbeat_age_ms,
+                        connection_exists = live.is_some(),
+                        "[ACP][reconcile] active run retained"
                     );
                 }
             }
         }
+        Ok(reconciled)
+    }
 
-        Ok(())
+    pub async fn reconcile_all_runs(&self, db: &DatabaseConnection) -> Result<usize, AcpError> {
+        let runs = artifact_service::list_active_runs(db)
+            .await
+            .map_err(|error| AcpError::protocol(error.to_string()))?;
+        let mut conversations = std::collections::HashSet::new();
+        for run in runs {
+            conversations.insert(run.conversation_id);
+        }
+        let mut reconciled = 0;
+        for conversation_id in conversations {
+            reconciled += self
+                .reconcile_conversation_runs(db, conversation_id)
+                .await?;
+        }
+        Ok(reconciled)
     }
 
     pub async fn respond_permission(
@@ -1927,6 +4262,60 @@ impl ConnectionManager {
             )
         };
 
+        // Lock order is session-operation → prompt-lock, matching restore
+        // (session-operation → activation prompt locks). Holding this guard
+        // through protocol fork and DB persistence prevents a restore request
+        // from loading S1 while the live writer is changing S1 → S2.
+        let (
+            session_agent,
+            session_cwd,
+            state_session_id,
+            state_conversation_id,
+            state_turn_in_flight,
+        ) = {
+            let state = state_arc.read().await;
+            (
+                state.agent_type,
+                state.working_dir.clone(),
+                state.external_id.clone(),
+                state.conversation_id,
+                state.turn_in_flight,
+            )
+        };
+        // A positive gate can be rejected before resolving durable metadata.
+        // The check under the prompt lock below remains authoritative for the
+        // false→true race; this early arm simply preserves the established
+        // TurnInProgress behavior for an already-busy connection.
+        if state_turn_in_flight {
+            return Err(AcpError::TurnInProgress);
+        }
+        let linkable_conversation_id = state_conversation_id
+            .or_else(|| link_conversation_id.filter(|_| link_folder_id.is_some()));
+        let Some(linkable_conversation_id) = linkable_conversation_id else {
+            return Err(AcpError::protocol(
+                "fork_session requires a linked conversation row".to_string(),
+            ));
+        };
+        // SessionState normally carries the external id after SessionStarted.
+        // A restored historical row can briefly be linkable before that cache
+        // is populated, though, so use its durable binding rather than losing
+        // the fork capability. This read is validated again after both locks.
+        let source_session_id = if let Some(session_id) = state_session_id {
+            session_id
+        } else {
+            conversation_service::get_by_id(&db.conn, linkable_conversation_id)
+                .await
+                .map_err(|error| AcpError::protocol(error.to_string()))?
+                .external_id
+                .filter(|session_id| !session_id.trim().is_empty())
+                .ok_or_else(|| {
+                    AcpError::protocol("fork_session requires an active ACP session id")
+                })?
+        };
+        let session_operation_guard = self
+            .lock_session_operation(session_agent, session_cwd.as_deref(), &source_session_id)
+            .await?;
+
         // Serialize the fork against concurrent prompts on this connection via
         // the same per-connection `prompt_lock` that `send_prompt`/
         // `send_prompt_linked` hold. A fork re-points the live session, so a
@@ -1939,6 +4328,23 @@ impl ConnectionManager {
         // back to `Cancelled`.
         let prompt_lock = self.clone_prompt_lock(conn_id).await?;
         let prompt_guard = prompt_lock.lock_owned().await;
+        let current_session_id = state_arc.read().await.external_id.clone();
+        if let Some(current_session_id) = current_session_id {
+            if current_session_id != source_session_id {
+                return Err(AcpError::protocol(
+                    "ACP session changed while the fork operation was waiting",
+                ));
+            }
+        } else {
+            let durable = conversation_service::get_by_id(&db.conn, linkable_conversation_id)
+                .await
+                .map_err(|error| AcpError::protocol(error.to_string()))?;
+            if durable.external_id.as_deref() != Some(source_session_id.as_str()) {
+                return Err(AcpError::protocol(
+                    "ACP session changed while the fork operation was waiting",
+                ));
+            }
+        }
 
         // Link the conversation row on demand, under the prompt lock so it
         // can't race a concurrent first prompt. A conversation opened from
@@ -2051,6 +4457,7 @@ impl ConnectionManager {
         let handle = tokio::spawn(async move {
             // Holding the owned guard for the whole task is what shields the
             // persistence from caller cancellation.
+            let _session_operation_guard = session_operation_guard;
             let _prompt_guard = prompt_guard;
             let outcome: Result<ForkResultInfo, AcpError> = async {
                 // Protocol-only round trip — no DB writes inside the loop.
@@ -2072,6 +4479,7 @@ impl ConnectionManager {
                 let sibling_id = Self::persist_fork_outcome(
                     &db_conn,
                     conversation_id,
+                    &conn_id_for_task,
                     forked_session_id.clone(),
                     original_session_id.clone(),
                 )
@@ -2105,7 +4513,9 @@ impl ConnectionManager {
             // Surface failures even when the caller is gone (the detached task's
             // Result would otherwise be dropped silently).
             if let Err(ref e) = outcome {
-                tracing::error!("[ACP][ERROR] fork persistence failed (conn={conn_id_for_task}): {e}");
+                tracing::error!(
+                    "[ACP][ERROR] fork persistence failed (conn={conn_id_for_task}): {e}"
+                );
             }
             outcome
         });
@@ -2169,12 +4579,14 @@ impl ConnectionManager {
     async fn persist_fork_outcome(
         db_conn: &DatabaseConnection,
         conversation_id: i32,
+        connection_id: &str,
         forked_session_id: String,
         original_session_id: String,
     ) -> Result<i32, AcpError> {
         use sea_orm::sea_query::Expr;
         use sea_orm::{ColumnTrait, QueryFilter};
 
+        let connection_id = connection_id.to_string();
         db_conn
             .transaction::<_, i32, sea_orm::DbErr>(|txn| {
                 Box::pin(async move {
@@ -2224,9 +4636,15 @@ impl ConnectionManager {
                             .to_string()
                     });
 
+                    let previous_branch = conversation_branch::Entity::find_by_id(conversation_id)
+                        .one(txn)
+                        .await?;
+                    let inherited_message_count = current.message_count;
                     let folder_id = current.folder_id;
                     let agent_type_str = current.agent_type.clone();
                     let git_branch = current.git_branch.clone();
+                    let model = current.model.clone();
+                    let origin_cwd = current.origin_cwd.clone();
                     // The lock rides along with the title it protects: the
                     // sibling holds the pre-fork history of the very row the
                     // user renamed, so a hand-picked name has to stay locked
@@ -2269,7 +4687,7 @@ impl ConnectionManager {
                         // still give it its first name.
                         active.title_locked = Set(true);
                     }
-                    active.external_id = Set(Some(forked_session_id));
+                    active.external_id = Set(Some(forked_session_id.clone()));
                     active.updated_at = Set(now);
                     active.update(txn).await?;
 
@@ -2289,7 +4707,7 @@ impl ConnectionManager {
                     // instead and return ITS id — the caller feeds that straight
                     // into `ForkResultInfo.sibling_conversation_id` and the
                     // sidebar upsert, both of which must name a real row.
-                    if let Some(existing) = conversation::Entity::find()
+                    let sibling = if let Some(existing) = conversation::Entity::find()
                         .filter(conversation::Column::ExternalId.eq(original_session_id.clone()))
                         .filter(conversation::Column::AgentType.eq(agent_type_str.clone()))
                         .filter(conversation::Column::Id.ne(conversation_id))
@@ -2297,34 +4715,114 @@ impl ConnectionManager {
                         .one(txn)
                         .await?
                     {
-                        return Ok(existing.id);
+                        existing
+                    } else {
+                        // INSERT sibling row preserving pre-fork (S1) history.
+                        // PendingReview because no live agent is attached to S1.
+                        conversation::ActiveModel {
+                            id: NotSet,
+                            folder_id: Set(folder_id),
+                            title: Set(clean_title.clone()),
+                            title_locked: Set(title_locked),
+                            agent_type: Set(agent_type_str),
+                            status: Set(ConversationStatus::PendingReview),
+                            kind: Set(sibling_kind),
+                            model: Set(model),
+                            git_branch: Set(git_branch),
+                            external_id: Set(Some(original_session_id.clone())),
+                            parent_id: Set(None),
+                            parent_tool_use_id: Set(None),
+                            delegation_call_id: Set(None),
+                            message_count: Set(inherited_message_count),
+                            created_at: Set(now),
+                            updated_at: Set(now),
+                            deleted_at: Set(None),
+                            pinned_at: Set(None),
+                            origin_cwd: Set(origin_cwd),
+                        }
+                        .insert(txn)
+                        .await?
+                    };
+
+                    // `fork-send` historically persisted only the two
+                    // conversation rows. Record the same durable branch
+                    // relation used by the explicit "Create branch" flow so
+                    // both entry points expose Return/Merge and survive a
+                    // restart. Re-forking an existing branch moves its prior
+                    // relation (and merge audit rows) to the newly preserved S1
+                    // sibling, then records the current S2 row as that
+                    // sibling's child. This preserves the complete branch
+                    // chain instead of silently replacing its original root.
+                    if let Some(previous) = previous_branch {
+                        conversation_branch_merge::Entity::update_many()
+                            .col_expr(
+                                conversation_branch_merge::Column::BranchConversationId,
+                                Expr::value(sibling.id),
+                            )
+                            .filter(
+                                conversation_branch_merge::Column::BranchConversationId
+                                    .eq(conversation_id),
+                            )
+                            .exec(txn)
+                            .await?;
+                        conversation_branch::Entity::delete_by_id(conversation_id)
+                            .exec(txn)
+                            .await?;
+                        let mut moved: conversation_branch::ActiveModel = previous.into();
+                        moved.branch_conversation_id = Set(sibling.id);
+                        moved.branch_session_id = Set(Some(original_session_id.clone()));
+                        moved.last_connection_id = Set(None);
+                        moved.lifecycle_updated_at = Set(Some(now));
+                        moved.insert(txn).await?;
                     }
 
-                    // INSERT sibling row preserving pre-fork (S1) history.
-                    // PendingReview because no live agent is attached to S1.
-                    let sibling = conversation::ActiveModel {
-                        id: NotSet,
-                        folder_id: Set(folder_id),
-                        title: Set(clean_title),
-                        title_locked: Set(title_locked),
-                        agent_type: Set(agent_type_str),
-                        status: Set(ConversationStatus::PendingReview),
-                        kind: Set(sibling_kind),
-                        model: Set(None),
-                        git_branch: Set(git_branch),
-                        external_id: Set(Some(original_session_id)),
-                        parent_id: Set(None),
-                        parent_tool_use_id: Set(None),
-                        delegation_call_id: Set(None),
-                        message_count: Set(0),
+                    conversation_branch::ActiveModel {
+                        branch_conversation_id: Set(conversation_id),
+                        creation_request_id: Set(None),
+                        operation_id: Set(None),
+                        source_conversation_id: Set(sibling.id),
+                        source_title: Set(clean_title),
+                        fork_message_id: Set(None),
+                        fork_mode: Set("native".into()),
+                        source_session_id: Set(Some(original_session_id)),
+                        branch_session_id: Set(Some(forked_session_id)),
+                        inheritance_mode: Set("native_fork".into()),
+                        inherited_message_count: Set(inherited_message_count),
+                        inherited_context_chars: Set(0),
+                        inherited_estimated_tokens: Set(0),
+                        inheritance_compressed: Set(false),
+                        inheritance_truncated: Set(false),
+                        inheritance_note: Set(Some(
+                            "Created with ACP session/fork; the complete native session context was inherited."
+                                .into(),
+                        )),
+                        forked_through_at: Set(Some(now)),
+                        source_rollout_offset: Set(None),
+                        branch_rollout_offset: Set(None),
+                        fork_boundary_kind: Set(None),
+                        snapshot_version: Set(2),
+                        snapshot_images_json: Set(None),
+                        snapshot_context: Set(None),
+                        snapshot_consumed_at: Set(None),
+                        lifecycle_state: Set("ready".into()),
+                        lifecycle_error: Set(None),
+                        lifecycle_updated_at: Set(Some(now)),
+                        session_verified_at: Set(Some(now)),
+                        first_prompt_client_message_id: Set(None),
+                        first_prompt_queued_at: Set(None),
+                        first_prompt_accepted_at: Set(None),
+                        initialization_retry_count: Set(0),
+                        last_connection_id: Set(Some(connection_id)),
+                        snapshot_digest: Set(None),
                         created_at: Set(now),
-                        updated_at: Set(now),
-                        deleted_at: Set(None),
-                        pinned_at: Set(None),
-                        origin_cwd: Set(None),
-                    };
-                    let inserted = sibling.insert(txn).await?;
-                    Ok(inserted.id)
+                        last_merged_at: Set(None),
+                        last_merge_key: Set(None),
+                        merge_target_conversation_id: Set(None),
+                    }
+                    .insert(txn)
+                    .await?;
+
+                    Ok(sibling.id)
                 })
             })
             .await
@@ -2345,7 +4843,17 @@ impl ConnectionManager {
         };
         if let Some(conn) = removed {
             tracing::info!("[ACP] disconnect connection={}", conn_id);
-            let _ = conn.cmd_tx.send(ConnectionCommand::Disconnect).await;
+            // Never await a full command queue on teardown. A connection stuck
+            // inside session/resume is not polling this queue; the per-process
+            // backstop below is what guarantees its Codex/codeg-mcp tree does
+            // not retain the external-session writer after CodeG forgets it.
+            let _ = conn.cmd_tx.try_send(ConnectionCommand::Disconnect);
+            let connection_id = conn_id.to_string();
+            let child_pid = conn.child_pid;
+            tokio::spawn(async move {
+                tokio::time::sleep(DISCONNECT_ALL_GRACE).await;
+                hard_kill_process_cell(child_pid, "disconnect", Some(connection_id)).await;
+            });
             Ok(())
         } else {
             Err(AcpError::ConnectionNotFound(conn_id.into()))
@@ -2390,6 +4898,177 @@ impl ConnectionManager {
         names.sort();
         names.dedup();
         names
+    }
+
+    /// Disconnect one ACP process and wait until its child has actually been
+    /// reaped. Ordinary UI teardown need not block on this, but an external
+    /// session writer handoff must not start its replacement while the old
+    /// adapter still owns the thread inside Codex.
+    pub(crate) async fn disconnect_and_wait(&self, conn_id: &str) -> Result<(), AcpError> {
+        let (cmd_tx, child_pid) = {
+            let mut connections = self.connections.lock().await;
+            let connection = connections
+                .remove(conn_id)
+                .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?;
+            (connection.cmd_tx, connection.child_pid)
+        };
+        tracing::info!("[ACP] disconnect-and-wait connection={}", conn_id);
+        let _ = cmd_tx.try_send(ConnectionCommand::Disconnect);
+        tokio::time::sleep(DISCONNECT_ALL_GRACE).await;
+        hard_kill_process_cell(
+            child_pid.clone(),
+            "disconnect_and_wait",
+            Some(conn_id.to_string()),
+        )
+        .await;
+        let cleanup_timeout = self.spawn_handshake_timeout.min(Duration::from_secs(30));
+        let deadline = tokio::time::Instant::now() + cleanup_timeout;
+        while child_pid.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(AcpError::protocol(format!(
+                    "ACP connection {conn_id} did not release its process before writer handoff timeout"
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Ok(())
+    }
+
+    /// Reclaim only the processes provisionally owned by one restore. Used by
+    /// the end-to-end restore supervisor on timeout/panic; it never touches a
+    /// prompt-ready connection or any other conversation.
+    pub(crate) async fn terminate_incomplete_restore_connections(
+        &self,
+        conversation_id: i32,
+    ) -> usize {
+        let candidates: Vec<_> = {
+            let connections = self.connections.lock().await;
+            connections
+                .iter()
+                .map(|(id, connection)| (id.clone(), connection.state.clone()))
+                .collect()
+        };
+        let mut victims = Vec::new();
+        for (connection_id, state) in candidates {
+            let state = state.read().await;
+            if state.restore_conversation_id == Some(conversation_id) && !state.selectors_ready {
+                victims.push(connection_id);
+            }
+        }
+        for connection_id in &victims {
+            let _ = self.disconnect_and_wait(connection_id).await;
+        }
+        victims.len()
+    }
+
+    /// User/API initiated disconnect with a durable lifecycle boundary. The
+    /// low-level [`disconnect`] remains available to cleanup paths that have
+    /// already settled their run; public endpoints must use this method so a
+    /// removed process cannot leave a `running` row behind.
+    pub async fn disconnect_reconciled(
+        &self,
+        db: &DatabaseConnection,
+        conn_id: &str,
+    ) -> Result<(), AcpError> {
+        self.disconnect_reconciled_with_origin(db, conn_id, "internal", None)
+            .await
+    }
+
+    /// Disconnect with an audited frontend/lifecycle origin. The durable
+    /// settlement remains identical; metadata exists solely to make an
+    /// unexpected interruption attributable in production logs.
+    pub async fn disconnect_reconciled_with_origin(
+        &self,
+        db: &DatabaseConnection,
+        conn_id: &str,
+        request_source: &str,
+        frontend_generation: Option<u64>,
+    ) -> Result<(), AcpError> {
+        if let Some(run) = artifact_service::latest_run_for_connection(db, conn_id)
+            .await
+            .map_err(|error| AcpError::protocol(error.to_string()))?
+            .filter(|run| {
+                matches!(
+                    run.status,
+                    ConversationTurnRunStatus::Running | ConversationTurnRunStatus::Cancelling
+                )
+            })
+        {
+            if run.status == ConversationTurnRunStatus::Cancelling {
+                self.force_finish_cancelled_run(
+                    db,
+                    conn_id,
+                    &run.id,
+                    "disconnect_during_cancel",
+                    false,
+                )
+                .await?;
+            } else {
+                artifact_service::finalize_turn_state(
+                    db,
+                    &run.id,
+                    ConversationTurnRunStatus::Interrupted,
+                    "connection_disconnected",
+                    ConversationStatus::Cancelled,
+                    true,
+                    true,
+                )
+                .await
+                .map_err(|error| AcpError::protocol(error.to_string()))?;
+                let state_and_emitter = self.get_state_and_emitter(conn_id).await;
+                if let Some((state, emitter)) = state_and_emitter.as_ref() {
+                    let snapshot = state.read().await;
+                    let session_id = snapshot.external_id.clone().unwrap_or_default();
+                    let agent_type = snapshot.agent_type.to_string();
+                    drop(snapshot);
+                    emit_with_state(
+                        state,
+                        emitter,
+                        AcpEvent::TurnComplete {
+                            session_id,
+                            stop_reason: "connection_disconnected".to_string(),
+                            agent_type,
+                        },
+                    )
+                    .await;
+                    emit_with_state(
+                        state,
+                        emitter,
+                        AcpEvent::ConversationStatusChanged {
+                            conversation_id: run.conversation_id,
+                            status: ConversationStatus::Cancelled,
+                        },
+                    )
+                    .await;
+                }
+                self.artifact_tracker
+                    .force_finish_turn(
+                        conn_id,
+                        &run.id,
+                        ArtifactTurnFinishStatus::Interrupted,
+                        "connection_disconnected".to_string(),
+                    )
+                    .await;
+                tracing::warn!(
+                    conversation_id = run.conversation_id,
+                    turn_run_id = %run.id,
+                    connection_id = conn_id,
+                    old_state = ?run.status,
+                    new_state = "interrupted",
+                    transition_reason = "explicit_disconnect",
+                    request_source,
+                    frontend_generation,
+                    "[ACP][disconnect] active turn settled before connection removal"
+                );
+            }
+        }
+        tracing::info!(
+            connection_id = conn_id,
+            request_source,
+            frontend_generation,
+            "[ACP][disconnect] connection teardown requested"
+        );
+        self.disconnect(conn_id).await
     }
 
     /// Probe an agent for the modes / config_options it advertises on a fresh
@@ -2526,13 +5205,7 @@ impl ConnectionManager {
         let grace_period = Duration::from_millis(500);
         let mut selectors_ready_at: Option<std::time::Instant> = None;
         loop {
-            let (
-                config_options,
-                modes,
-                available_commands,
-                prompt_capabilities,
-                selectors_ready,
-            ) = {
+            let (config_options, modes, available_commands, prompt_capabilities, selectors_ready) = {
                 let conns = self.connections.lock().await;
                 let conn = conns
                     .get(conn_id)
@@ -2598,7 +5271,8 @@ impl ConnectionManager {
         }
         tracing::info!(
             "[ACP] disconnect by owner window owner_window={} count={}",
-            owner_window_label, disconnected
+            owner_window_label,
+            disconnected
         );
         disconnected
     }
@@ -2865,8 +5539,7 @@ impl ConnectionManager {
         let mut out = Vec::new();
         for (id, conn) in connections.iter() {
             let state = conn.state.read().await;
-            let (Some(conversation_id), Some(folder_id)) =
-                (state.conversation_id, state.folder_id)
+            let (Some(conversation_id), Some(folder_id)) = (state.conversation_id, state.folder_id)
             else {
                 continue;
             };
@@ -3032,7 +5705,6 @@ impl ConnectionManager {
         if !native && !tool_available {
             return Err(AcpError::FeedbackDisabled);
         }
-
         if native {
             return Self::submit_feedback_native(conn_id, state, cmd_tx, emitter, text, blocks)
                 .await;
@@ -3051,12 +5723,8 @@ impl ConnectionManager {
         if blocks.is_some() {
             return Err(AcpError::NoActiveTurn);
         }
-
-        let item = FeedbackItem::new_pending(
-            uuid::Uuid::new_v4().to_string(),
-            text,
-            chrono::Utc::now(),
-        );
+        let item =
+            FeedbackItem::new_pending(uuid::Uuid::new_v4().to_string(), text, chrono::Utc::now());
         // Gate on `turn_in_flight` and append in ONE critical section (via the
         // gated emit): a `TurnComplete` (flips the flag) or `UserMessage`
         // (clears `feedback`) can't slip between the gate and the append+seq, so
@@ -3214,9 +5882,9 @@ impl ConnectionManager {
                     })
                     .await
                     .map_err(|_| AcpError::ProcessExited)?;
-                let steer = reply_rx.await.map_err(|_| {
-                    AcpError::protocol("Steer reply channel closed".to_string())
-                })??;
+                let steer = reply_rx
+                    .await
+                    .map_err(|_| AcpError::protocol("Steer reply channel closed".to_string()))??;
                 match steer {
                     // Honored opt-in: the content was NOT consumed and is
                     // still host-owned. Surface the frontend's existing
@@ -3438,7 +6106,12 @@ impl ConnectionManager {
         state: &std::sync::Arc<tokio::sync::RwLock<crate::acp::SessionState>>,
         emitter: &EventEmitter,
     ) -> bool {
-        if self.pending_questions.lock().await.contains_key(question_id) {
+        if self
+            .pending_questions
+            .lock()
+            .await
+            .contains_key(question_id)
+        {
             return false;
         }
         emit_with_state(
@@ -3476,7 +6149,9 @@ impl ConnectionManager {
         // (peer-close) at the same instant; the resolved-event below still clears
         // the card.
         let _ = entry.sender.send(outcome);
-        if let Some((state, emitter)) = self.get_state_and_emitter(&entry.parent_connection_id).await
+        if let Some((state, emitter)) = self
+            .get_state_and_emitter(&entry.parent_connection_id)
+            .await
         {
             emit_with_state(
                 &state,
@@ -3501,7 +6176,9 @@ impl ConnectionManager {
         let Some(entry) = removed else {
             return;
         };
-        if let Some((state, emitter)) = self.get_state_and_emitter(&entry.parent_connection_id).await
+        if let Some((state, emitter)) = self
+            .get_state_and_emitter(&entry.parent_connection_id)
+            .await
         {
             emit_with_state(
                 &state,
@@ -3622,7 +6299,12 @@ impl ConnectionManager {
         state: &std::sync::Arc<tokio::sync::RwLock<crate::acp::SessionState>>,
         emitter: &EventEmitter,
     ) -> bool {
-        if self.pending_plan_approvals.lock().await.contains_key(approval_id) {
+        if self
+            .pending_plan_approvals
+            .lock()
+            .await
+            .contains_key(approval_id)
+        {
             return false;
         }
         emit_with_state(
@@ -3659,8 +6341,9 @@ impl ConnectionManager {
         // (teardown) at the same instant; the resolved event below still clears
         // the card.
         let _ = entry.sender.send(answer);
-        if let Some((state, emitter)) =
-            self.get_state_and_emitter(&entry.parent_connection_id).await
+        if let Some((state, emitter)) = self
+            .get_state_and_emitter(&entry.parent_connection_id)
+            .await
         {
             emit_with_state(
                 &state,
@@ -3699,8 +6382,12 @@ impl ConnectionManager {
         // (disconnect removes it before this sweep), so tolerate `None`.
         if let Some((state, emitter)) = self.get_state_and_emitter(conn_id).await {
             for approval_id in drained {
-                emit_with_state(&state, &emitter, AcpEvent::PlanApprovalResolved { approval_id })
-                    .await;
+                emit_with_state(
+                    &state,
+                    &emitter,
+                    AcpEvent::PlanApprovalResolved { approval_id },
+                )
+                .await;
             }
         }
     }
@@ -3982,10 +6669,12 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
         let working_dir_path = effective_working_dir.as_ref().map(std::path::PathBuf::from);
         let pre_existing = self
             .manager
-            .find_connection_for_reuse(
+            .find_connection_for_reuse_with_requirements(
                 agent_type,
                 working_dir_path.as_ref(),
                 Some(external_session_id),
+                false,
+                None,
             )
             .await;
 
@@ -4054,6 +6743,7 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
         self.manager
             .cancel(&self.db.conn, conn_id)
             .await
+            .map(|_| ())
             .map_err(|e| crate::acp::delegation::spawner::SpawnerError::Cancel(e.to_string()))
     }
 
@@ -4099,10 +6789,7 @@ pub struct ConnectionManagerFeedbackLookup {
 
 #[async_trait::async_trait]
 impl SessionFeedbackAccess for ConnectionManagerFeedbackLookup {
-    async fn read_pending_feedback(
-        &self,
-        parent_connection_id: &str,
-    ) -> Vec<PendingFeedback> {
+    async fn read_pending_feedback(&self, parent_connection_id: &str) -> Vec<PendingFeedback> {
         self.manager
             .read_pending_feedback(parent_connection_id)
             .await
@@ -4324,6 +7011,7 @@ mod tests {
     use crate::acp::session_state::SessionState;
     use crate::acp::types::ConnectionStatus;
     use crate::web::event_bridge::{EventEmitter, WebEvent, WebEventBroadcaster};
+    use sea_orm::{ColumnTrait, QueryFilter};
     use std::path::PathBuf;
     use std::sync::Arc;
     use tokio::sync::{broadcast, mpsc, RwLock};
@@ -4364,6 +7052,9 @@ mod tests {
             state: Arc::new(RwLock::new(state)),
             emitter: EventEmitter::Noop,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
+            steer_lock: Arc::new(tokio::sync::Mutex::new(())),
+            completed_steers: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
+            accepted_prompt_ids: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
             config_fingerprint: String::new(),
             last_observed_fingerprint: String::new(),
             child_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -4382,7 +7073,10 @@ mod tests {
     async fn spawn_process_tree(pidfile: &std::path::Path) -> (std::process::Child, i32) {
         let mut child = std::process::Command::new("sh")
             .arg("-c")
-            .arg(format!("sleep 30 & echo $! > '{}'; wait", pidfile.display()))
+            .arg(format!(
+                "sleep 30 & echo $! > '{}'; wait",
+                pidfile.display()
+            ))
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -4450,6 +7144,38 @@ mod tests {
             wait_until_dead(gpid).await,
             "grandchild {gpid} survived — the quit backstop did not kill the tree"
         );
+        let _ = child.wait();
+    }
+
+    /// A failed restore uses the single-connection teardown path rather than
+    /// application-wide shutdown. It must reclaim the same complete process
+    /// tree without touching any other manager entry.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn disconnect_backstop_kills_only_its_agent_process_tree() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut child, grandchild_pid) = spawn_process_tree(&dir.path().join("g.pid")).await;
+
+        let mgr = ConnectionManager::new();
+        let victim = fake_connection("restore-victim", None);
+        victim
+            .child_pid
+            .store(child.id(), std::sync::atomic::Ordering::SeqCst);
+        mgr.connections
+            .lock()
+            .await
+            .insert("restore-victim".to_string(), victim);
+        mgr.connections.lock().await.insert(
+            "unrelated".to_string(),
+            fake_connection("unrelated", None),
+        );
+
+        mgr.disconnect("restore-victim").await.unwrap();
+        assert!(
+            wait_until_dead(grandchild_pid).await,
+            "grandchild {grandchild_pid} survived per-connection teardown"
+        );
+        assert!(mgr.connections.lock().await.contains_key("unrelated"));
         let _ = child.wait();
     }
 
@@ -4819,6 +7545,9 @@ mod tests {
             state: Arc::new(RwLock::new(state)),
             emitter: EventEmitter::Noop,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
+            steer_lock: Arc::new(tokio::sync::Mutex::new(())),
+            completed_steers: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
+            accepted_prompt_ids: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
             config_fingerprint: String::new(),
             last_observed_fingerprint: String::new(),
             child_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -4834,7 +7563,677 @@ mod tests {
     /// [`insert_live_connection`] (which starts them `Connected`).
     async fn mark_prompting(mgr: &ConnectionManager, conn_id: &str) {
         let state = mgr.get_state(conn_id).await.expect("connection");
-        state.write().await.status = ConnectionStatus::Prompting;
+        let mut state = state.write().await;
+        state.status = ConnectionStatus::Prompting;
+        state.turn_in_flight = true;
+    }
+
+    async fn seed_live_turn_run(
+        db: &AppDatabase,
+        mgr: &ConnectionManager,
+        conn_id: &str,
+    ) -> (i32, String) {
+        let folder_id = crate::db::test_helpers::seed_folder(db, "/tmp/cancel-manager").await;
+        let conversation_id =
+            crate::db::test_helpers::seed_conversation(db, folder_id, AgentType::Codex).await;
+        let run_id = format!("run-{conn_id}");
+        artifact_service::create_run(
+            &db.conn,
+            artifact_service::NewTurnRun {
+                id: run_id.clone(),
+                conversation_id,
+                connection_id: conn_id.into(),
+                client_message_id: Some(format!("message-{conn_id}")),
+                prompt_fingerprint: None,
+                folder_id: Some(folder_id),
+                root_path: "/tmp/cancel-manager".into(),
+                capture_incomplete: false,
+                input_paths_json: "[]".into(),
+                expectation_json: "{}".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let state = mgr.get_state(conn_id).await.unwrap();
+        let mut state = state.write().await;
+        state.conversation_id = Some(conversation_id);
+        state.external_id = Some(format!("session-{conn_id}"));
+        state.status = ConnectionStatus::Prompting;
+        state.turn_in_flight = true;
+        state.active_turn_run_id = Some(run_id.clone());
+        state.active_turn_generation = Some(1);
+        (conversation_id, run_id)
+    }
+
+    #[tokio::test]
+    async fn two_cancel_requests_enqueue_only_one_agent_interrupt() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let mgr = ConnectionManager::new();
+        let mut rx = insert_live_connection(&mgr, "cancel-once", AgentType::Codex, None).await;
+        seed_live_turn_run(&db, &mgr, "cancel-once").await;
+
+        let cancel_manager = mgr.clone_ref();
+        let cancel_db = db.conn.clone();
+        let first =
+            tokio::spawn(async move { cancel_manager.cancel(&cancel_db, "cancel-once").await });
+        match rx.recv().await.expect("cancel reaches connection loop") {
+            ConnectionCommand::Cancel { reply } => {
+                reply
+                    .expect("API cancel has an acknowledgement")
+                    .send(Ok(()))
+                    .expect("cancel caller remains alive");
+            }
+            _ => panic!("expected cancel command"),
+        }
+        let first = first.await.unwrap();
+        let second = mgr.cancel(&db.conn, "cancel-once").await;
+        let outcomes = [first.unwrap().outcome, second.unwrap().outcome];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|value| *value == "cancelled")
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|value| *value == "already_finished")
+                .count(),
+            1
+        );
+        assert!(rx.try_recv().is_err(), "duplicate cancel reached the agent");
+    }
+
+    #[tokio::test]
+    async fn failed_cancel_delivery_is_not_reported_as_success() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let mgr = ConnectionManager::new();
+        let mut rx =
+            insert_live_connection(&mgr, "cancel-delivery-fails", AgentType::Codex, None).await;
+        let (_, run_id) = seed_live_turn_run(&db, &mgr, "cancel-delivery-fails").await;
+
+        let cancel_manager = mgr.clone_ref();
+        let cancel_db = db.conn.clone();
+        let cancel = tokio::spawn(async move {
+            cancel_manager
+                .cancel(&cancel_db, "cancel-delivery-fails")
+                .await
+        });
+        match rx.recv().await.expect("cancel reaches connection loop") {
+            ConnectionCommand::Cancel { reply } => {
+                reply
+                    .expect("API cancel has an acknowledgement")
+                    .send(Err("notification channel closed".to_string()))
+                    .expect("cancel caller remains alive");
+            }
+            _ => panic!("expected cancel command"),
+        }
+
+        let error = cancel
+            .await
+            .unwrap()
+            .expect_err("failed protocol delivery must not be a successful cancel");
+        assert!(error.to_string().contains("recovery is scheduled"));
+        let run = conversation_turn_run::Entity::find_by_id(run_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.status, ConversationTurnRunStatus::Cancelling);
+        assert!(run.completed_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn reconciliation_preserves_a_healthy_long_running_turn() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let mgr = ConnectionManager::new();
+        let _rx = insert_live_connection(&mgr, "healthy-long", AgentType::Codex, None).await;
+        let (conversation_id, run_id) = seed_live_turn_run(&db, &mgr, "healthy-long").await;
+        conversation_turn_run::Entity::update_many()
+            .col_expr(
+                conversation_turn_run::Column::StartedAt,
+                sea_orm::sea_query::Expr::value(chrono::Utc::now() - chrono::Duration::hours(1)),
+            )
+            .filter(conversation_turn_run::Column::Id.eq(run_id.clone()))
+            .exec(&db.conn)
+            .await
+            .unwrap();
+        {
+            let state = mgr.get_state("healthy-long").await.unwrap();
+            let mut state = state.write().await;
+            state.live_message = None;
+            state.last_turn_progress_at = chrono::Utc::now() - chrono::Duration::hours(1);
+            state.last_agent_activity_at = chrono::Utc::now();
+        }
+
+        assert_eq!(
+            mgr.reconcile_conversation_runs(&db.conn, conversation_id)
+                .await
+                .unwrap(),
+            0
+        );
+        let run = artifact_service::latest_run_for_connection(&db.conn, "healthy-long")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.id, run_id);
+        assert_eq!(
+            run.status,
+            crate::db::entities::conversation_turn_run::ConversationTurnRunStatus::Running
+        );
+        assert!(mgr.get_state("healthy-long").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn reconciliation_never_interrupts_a_six_second_prompt_admission_window() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let mgr = ConnectionManager::new();
+        let _rx = insert_live_connection(&mgr, "settlement-grace", AgentType::Codex, None).await;
+        let (conversation_id, run_id) = seed_live_turn_run(&db, &mgr, "settlement-grace").await;
+        let state = mgr.get_state("settlement-grace").await.unwrap();
+        {
+            let mut state = state.write().await;
+            state.status = ConnectionStatus::Connected;
+            state.turn_in_flight = false;
+            state.last_activity_at = chrono::Utc::now();
+            state.last_agent_activity_at = chrono::Utc::now();
+            state.last_turn_progress_at = chrono::Utc::now() - chrono::Duration::hours(1);
+        }
+
+        assert_eq!(
+            mgr.reconcile_conversation_runs(&db.conn, conversation_id)
+                .await
+                .unwrap(),
+            0,
+            "the normal TurnComplete -> artifact settlement handoff gets a grace window"
+        );
+        {
+            let mut state = state.write().await;
+            state.last_activity_at = chrono::Utc::now() - chrono::Duration::seconds(6);
+            state.last_agent_activity_at = chrono::Utc::now() - chrono::Duration::seconds(6);
+        }
+        assert_eq!(
+            mgr.reconcile_conversation_runs(&db.conn, conversation_id)
+                .await
+                .unwrap(),
+            0,
+            "a newly-created durable run can precede Prompting while prompt context is prepared"
+        );
+        let run = crate::db::entities::conversation_turn_run::Entity::find_by_id(run_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            run.status,
+            crate::db::entities::conversation_turn_run::ConversationTurnRunStatus::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn reconciliation_vetoes_an_active_tool_even_without_text_or_heartbeat() {
+        use crate::acp::session_state::{ToolCallState, ToolCallStatus, ToolKind};
+
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let mut mgr = ConnectionManager::new();
+        mgr.stale_run_timeout = Duration::ZERO;
+        mgr.stale_confirmation = Duration::ZERO;
+        let _rx = insert_live_connection(&mgr, "active-tool", AgentType::Codex, None).await;
+        let (conversation_id, run_id) = seed_live_turn_run(&db, &mgr, "active-tool").await;
+        let state = mgr.get_state("active-tool").await.unwrap();
+        {
+            let mut state = state.write().await;
+            state.last_activity_at = chrono::Utc::now() - chrono::Duration::hours(1);
+            state.last_agent_activity_at = chrono::Utc::now() - chrono::Duration::hours(1);
+            state.last_turn_progress_at = chrono::Utc::now() - chrono::Duration::hours(1);
+            state.active_tool_calls.insert(
+                "long-tool".into(),
+                ToolCallState {
+                    id: "long-tool".into(),
+                    kind: ToolKind::Execute,
+                    label: "long build".into(),
+                    status: ToolCallStatus::InProgress,
+                    input: None,
+                    output: None,
+                    content: None,
+                    locations: None,
+                    meta: None,
+                    images: Vec::new(),
+                    raw_input_chunks: Vec::new(),
+                },
+            );
+        }
+
+        assert_eq!(
+            mgr.reconcile_conversation_runs(&db.conn, conversation_id)
+                .await
+                .unwrap(),
+            0
+        );
+        let run = conversation_turn_run::Entity::find_by_id(run_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.status, ConversationTurnRunStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn activity_between_stale_passes_cancels_the_suspicion() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let mut mgr = ConnectionManager::new();
+        mgr.stale_run_timeout = Duration::from_secs(30);
+        mgr.stale_confirmation = Duration::ZERO;
+        let _rx = insert_live_connection(&mgr, "activity-veto", AgentType::Codex, None).await;
+        let (conversation_id, run_id) = seed_live_turn_run(&db, &mgr, "activity-veto").await;
+        conversation_turn_run::Entity::update_many()
+            .col_expr(
+                conversation_turn_run::Column::StartedAt,
+                sea_orm::sea_query::Expr::value(chrono::Utc::now() - chrono::Duration::hours(1)),
+            )
+            .filter(conversation_turn_run::Column::Id.eq(run_id.clone()))
+            .exec(&db.conn)
+            .await
+            .unwrap();
+        let state = mgr.get_state("activity-veto").await.unwrap();
+        {
+            let mut state = state.write().await;
+            state.status = ConnectionStatus::Connected;
+            state.turn_in_flight = false;
+            state.last_activity_at = chrono::Utc::now() - chrono::Duration::hours(1);
+            state.last_agent_activity_at = chrono::Utc::now() - chrono::Duration::hours(1);
+            state.last_turn_progress_at = chrono::Utc::now() - chrono::Duration::hours(1);
+        }
+        assert_eq!(
+            mgr.reconcile_conversation_runs(&db.conn, conversation_id)
+                .await
+                .unwrap(),
+            0
+        );
+        state.write().await.last_agent_activity_at = chrono::Utc::now();
+        assert_eq!(
+            mgr.reconcile_conversation_runs(&db.conn, conversation_id)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(mgr.stale_run_suspicions.lock().await.get(&run_id).is_none());
+        let run = conversation_turn_run::Entity::find_by_id(run_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.status, ConversationTurnRunStatus::Running);
+    }
+
+    #[tokio::test]
+    async fn old_reconciler_cannot_settle_or_demote_a_newer_run() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let mut mgr = ConnectionManager::new();
+        mgr.stale_run_timeout = Duration::ZERO;
+        mgr.stale_confirmation = Duration::ZERO;
+        let _rx = insert_live_connection(&mgr, "generation-race", AgentType::Codex, None).await;
+        let (conversation_id, old_run_id) =
+            seed_live_turn_run(&db, &mgr, "generation-race").await;
+        let state = mgr.get_state("generation-race").await.unwrap();
+        {
+            let mut state = state.write().await;
+            state.status = ConnectionStatus::Connected;
+            state.turn_in_flight = false;
+            state.last_activity_at = chrono::Utc::now() - chrono::Duration::hours(1);
+            state.last_agent_activity_at = chrono::Utc::now() - chrono::Duration::hours(1);
+            state.last_turn_progress_at = chrono::Utc::now() - chrono::Duration::hours(1);
+        }
+        assert_eq!(
+            mgr.reconcile_conversation_runs(&db.conn, conversation_id)
+                .await
+                .unwrap(),
+            0
+        );
+
+        let new_run_id = "run-generation-race-new".to_string();
+        artifact_service::create_run(
+            &db.conn,
+            artifact_service::NewTurnRun {
+                id: new_run_id.clone(),
+                conversation_id,
+                connection_id: "generation-race".into(),
+                client_message_id: Some("message-new".into()),
+                prompt_fingerprint: None,
+                folder_id: None,
+                root_path: "/tmp/cancel-manager".into(),
+                capture_incomplete: false,
+                input_paths_json: "[]".into(),
+                expectation_json: "{}".into(),
+            },
+        )
+        .await
+        .unwrap();
+        conversation_service::update_status(
+            &db.conn,
+            conversation_id,
+            ConversationStatus::InProgress,
+        )
+        .await
+        .unwrap();
+        {
+            let mut state = state.write().await;
+            state.status = ConnectionStatus::Prompting;
+            state.turn_in_flight = true;
+            state.active_turn_run_id = Some(new_run_id.clone());
+            state.active_turn_generation = Some(2);
+            state.last_activity_at = chrono::Utc::now();
+            state.last_agent_activity_at = chrono::Utc::now();
+            state.last_turn_progress_at = chrono::Utc::now();
+        }
+
+        assert_eq!(
+            mgr.reconcile_conversation_runs(&db.conn, conversation_id)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            mgr.reconcile_conversation_runs(&db.conn, conversation_id)
+                .await
+                .unwrap(),
+            1,
+            "only the superseded row is repaired after its own confirmation"
+        );
+        let old_run = conversation_turn_run::Entity::find_by_id(old_run_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let new_run = conversation_turn_run::Entity::find_by_id(new_run_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let conversation = conversation::Entity::find_by_id(conversation_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(old_run.status, ConversationTurnRunStatus::Interrupted);
+        assert_eq!(new_run.status, ConversationTurnRunStatus::Running);
+        assert_eq!(conversation.status, ConversationStatus::InProgress);
+        assert_eq!(
+            state.read().await.active_turn_run_id.as_deref(),
+            Some("run-generation-race-new")
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_reconciliation_finalizes_a_stale_run_once() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let mut mgr = ConnectionManager::new();
+        mgr.stale_run_timeout = Duration::ZERO;
+        mgr.stale_confirmation = Duration::ZERO;
+        let _rx = insert_live_connection(&mgr, "concurrent-stale", AgentType::Codex, None).await;
+        let (conversation_id, run_id) = seed_live_turn_run(&db, &mgr, "concurrent-stale").await;
+        mgr.connections.lock().await.remove("concurrent-stale");
+        let left = mgr.clone_ref();
+        let right = mgr.clone_ref();
+        let left_db = db.conn.clone();
+        let right_db = db.conn.clone();
+        let (left_count, right_count) = tokio::join!(
+            left.reconcile_conversation_runs(&left_db, conversation_id),
+            right.reconcile_conversation_runs(&right_db, conversation_id)
+        );
+        assert_eq!(left_count.unwrap() + right_count.unwrap(), 1);
+        let run = conversation_turn_run::Entity::find_by_id(run_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.status, ConversationTurnRunStatus::Interrupted);
+    }
+
+    #[tokio::test]
+    async fn reconciliation_interrupts_orphaned_running_row() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let mut mgr = ConnectionManager::new();
+        mgr.stale_run_timeout = Duration::ZERO;
+        mgr.stale_confirmation = Duration::ZERO;
+        let _rx = insert_live_connection(&mgr, "orphaned", AgentType::Codex, None).await;
+        let (conversation_id, run_id) = seed_live_turn_run(&db, &mgr, "orphaned").await;
+        mgr.connections.lock().await.remove("orphaned");
+
+        assert_eq!(
+            mgr.reconcile_conversation_runs(&db.conn, conversation_id)
+                .await
+                .unwrap(),
+            0,
+            "the first stale observation is diagnostic only"
+        );
+        assert_eq!(
+            mgr.reconcile_conversation_runs(&db.conn, conversation_id)
+                .await
+                .unwrap(),
+            1
+        );
+        let run = crate::db::entities::conversation_turn_run::Entity::find_by_id(run_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            run.status,
+            crate::db::entities::conversation_turn_run::ConversationTurnRunStatus::Interrupted
+        );
+        assert_eq!(run.settlement_status, "settled_incomplete");
+    }
+
+    #[tokio::test]
+    async fn reconciled_disconnect_cannot_leave_a_running_turn() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let mgr = ConnectionManager::new();
+        let _rx = insert_live_connection(&mgr, "disconnect-active", AgentType::Codex, None).await;
+        let (conversation_id, run_id) = seed_live_turn_run(&db, &mgr, "disconnect-active").await;
+
+        mgr.disconnect_reconciled(&db.conn, "disconnect-active")
+            .await
+            .unwrap();
+
+        let run = crate::db::entities::conversation_turn_run::Entity::find_by_id(run_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let conversation = crate::db::entities::conversation::Entity::find_by_id(conversation_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            run.status,
+            crate::db::entities::conversation_turn_run::ConversationTurnRunStatus::Interrupted
+        );
+        assert_eq!(run.settlement_status, "settled_incomplete");
+        assert_eq!(
+            conversation.status,
+            crate::db::entities::conversation::ConversationStatus::Cancelled
+        );
+        assert!(mgr.get_state("disconnect-active").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn reconciliation_closes_blank_zombie_after_all_tools_finished() {
+        use crate::acp::session_state::{
+            LiveContentBlock, LiveMessage, ToolCallState, ToolCallStatus, ToolKind,
+        };
+        use crate::models::message::MessageRole;
+
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let mut mgr = ConnectionManager::new();
+        mgr.stale_run_timeout = Duration::ZERO;
+        mgr.stale_confirmation = Duration::ZERO;
+        let _rx = insert_live_connection(&mgr, "blank-zombie", AgentType::Codex, None).await;
+        let (conversation_id, run_id) = seed_live_turn_run(&db, &mgr, "blank-zombie").await;
+        let state = mgr.get_state("blank-zombie").await.unwrap();
+        {
+            let mut state = state.write().await;
+            state.last_activity_at = chrono::Utc::now() - chrono::Duration::hours(1);
+            state.last_agent_activity_at = chrono::Utc::now() - chrono::Duration::hours(1);
+            state.last_turn_progress_at = chrono::Utc::now() - chrono::Duration::hours(1);
+            state.live_message = Some(LiveMessage {
+                id: "blank-live".into(),
+                role: MessageRole::Assistant,
+                content: vec![LiveContentBlock::Text {
+                    text: " \n\t".into(),
+                    parent_tool_use_id: None,
+                }],
+                started_at: chrono::Utc::now(),
+            });
+            state.active_tool_calls.insert(
+                "finished-tool".into(),
+                ToolCallState {
+                    id: "finished-tool".into(),
+                    kind: ToolKind::Execute,
+                    label: "finished".into(),
+                    status: ToolCallStatus::Completed,
+                    input: None,
+                    output: None,
+                    content: None,
+                    locations: None,
+                    meta: None,
+                    images: Vec::new(),
+                    raw_input_chunks: Vec::new(),
+                },
+            );
+        }
+
+        assert_eq!(
+            mgr.reconcile_conversation_runs(&db.conn, conversation_id)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            mgr.reconcile_conversation_runs(&db.conn, conversation_id)
+                .await
+                .unwrap(),
+            1
+        );
+        let run = crate::db::entities::conversation_turn_run::Entity::find_by_id(run_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            run.status,
+            crate::db::entities::conversation_turn_run::ConversationTurnRunStatus::Interrupted
+        );
+        assert_eq!(
+            run.stop_reason.as_deref(),
+            Some("zombie_prompting_reconciled")
+        );
+        assert!(mgr.get_state("blank-zombie").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn reconciliation_eventually_closes_a_truly_silent_dead_prompt() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let mut mgr = ConnectionManager::new();
+        mgr.stale_run_timeout = Duration::ZERO;
+        mgr.stale_confirmation = Duration::ZERO;
+        let _rx = insert_live_connection(&mgr, "silent-zombie", AgentType::Codex, None).await;
+        let (conversation_id, run_id) = seed_live_turn_run(&db, &mgr, "silent-zombie").await;
+        let state = mgr.get_state("silent-zombie").await.unwrap();
+        {
+            let mut state = state.write().await;
+            state.last_activity_at = chrono::Utc::now() - chrono::Duration::hours(1);
+            state.last_agent_activity_at = chrono::Utc::now() - chrono::Duration::hours(1);
+            state.last_turn_progress_at = chrono::Utc::now() - chrono::Duration::hours(1);
+            state.live_message = None;
+        }
+
+        assert_eq!(
+            mgr.reconcile_conversation_runs(&db.conn, conversation_id)
+                .await
+                .unwrap(),
+            0,
+            "the first silent observation must never finalize a run"
+        );
+        assert_eq!(
+            mgr.reconcile_conversation_runs(&db.conn, conversation_id)
+                .await
+                .unwrap(),
+            1,
+            "an unchanged silent prompt is repairable after confirmation"
+        );
+        let run = conversation_turn_run::Entity::find_by_id(run_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.status, ConversationTurnRunStatus::Interrupted);
+        assert_eq!(run.stop_reason.as_deref(), Some("stale_run_reconciled"));
+        assert!(mgr.get_state("silent-zombie").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancel_timeout_finalizes_only_its_connection_and_settles_once() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let mgr = ConnectionManager::new();
+        let _target_rx =
+            insert_live_connection(&mgr, "timeout-target", AgentType::Codex, None).await;
+        let _neighbor_rx =
+            insert_live_connection(&mgr, "timeout-neighbor", AgentType::Codex, None).await;
+        let (_, target_run_id) = seed_live_turn_run(&db, &mgr, "timeout-target").await;
+        let (_, neighbor_run_id) = seed_live_turn_run(&db, &mgr, "timeout-neighbor").await;
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            mgr.force_finish_cancelled_run(
+                &db.conn,
+                "timeout-target",
+                &target_run_id,
+                "cancel_timeout",
+                true,
+            ),
+        )
+        .await
+        .expect("targeted cancellation finalization must not block")
+        .expect("targeted finalization succeeds");
+        // A repeated deadline/reconciliation race is a no-op.
+        mgr.force_finish_cancelled_run(
+            &db.conn,
+            "timeout-target",
+            &target_run_id,
+            "cancel_timeout",
+            true,
+        )
+        .await
+        .expect("duplicate finalization is idempotent");
+
+        let target = crate::db::entities::conversation_turn_run::Entity::find_by_id(target_run_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            target.status,
+            crate::db::entities::conversation_turn_run::ConversationTurnRunStatus::Cancelled
+        );
+        assert_eq!(target.stop_reason.as_deref(), Some("cancel_timeout"));
+        assert_eq!(target.settlement_status, "settled_incomplete");
+        assert!(target.completed_at.is_some());
+        assert!(mgr.get_state("timeout-target").await.is_none());
+
+        let neighbor =
+            crate::db::entities::conversation_turn_run::Entity::find_by_id(neighbor_run_id)
+                .one(&db.conn)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            neighbor.status,
+            crate::db::entities::conversation_turn_run::ConversationTurnRunStatus::Running
+        );
+        assert!(mgr.get_state("timeout-neighbor").await.is_some());
     }
 
     /// Mirror what a live `active` goal snapshot leaves on the state.
@@ -4851,8 +8250,9 @@ mod tests {
         mut rx: tokio::sync::mpsc::Receiver<crate::acp::connection::ConnectionCommand>,
         expected: GoalControlAction,
         landed: bool,
-    ) -> tokio::task::JoinHandle<tokio::sync::mpsc::Receiver<crate::acp::connection::ConnectionCommand>>
-    {
+    ) -> tokio::task::JoinHandle<
+        tokio::sync::mpsc::Receiver<crate::acp::connection::ConnectionCommand>,
+    > {
         tokio::spawn(async move {
             match rx.recv().await.expect("goal control enqueued") {
                 ConnectionCommand::GoalControl { action, reply } => {
@@ -4889,7 +8289,10 @@ mod tests {
             .unwrap();
 
         let mut rx = loop_stub.await.unwrap();
-        assert!(matches!(rx.try_recv(), Ok(ConnectionCommand::Cancel)));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ConnectionCommand::Cancel { .. })
+        ));
         assert!(rx.try_recv().is_err(), "nothing else is enqueued");
     }
 
@@ -4937,7 +8340,10 @@ mod tests {
             .unwrap();
 
         let mut rx = loop_stub.await.unwrap();
-        assert!(matches!(rx.try_recv(), Ok(ConnectionCommand::Cancel)));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ConnectionCommand::Cancel { .. })
+        ));
         assert!(rx.try_recv().is_err(), "nothing else is enqueued");
     }
 
@@ -4952,7 +8358,7 @@ mod tests {
         let mgr = ConnectionManager::new();
         let mut rx = insert_live_connection(&mgr, "c-goal-paused", AgentType::Codex, None).await;
         mark_prompting(&mgr, "c-goal-paused").await; // the user's own prompt
-        // `goal_active` stays false: the last snapshot was `paused`.
+                                                     // `goal_active` stays false: the last snapshot was `paused`.
 
         mgr.goal_control(&db.conn, "c-goal-paused", GoalControlAction::Clear)
             .await
@@ -4996,6 +8402,110 @@ mod tests {
             _ => panic!("expected a GoalControl command"),
         }
         assert!(rx.try_recv().is_err(), "the carrying turn survives");
+    }
+
+    async fn mark_native_steer_ready(mgr: &ConnectionManager, conn_id: &str) {
+        let state = mgr.get_state(conn_id).await.expect("test connection");
+        let mut state = state.write().await;
+        state.supports_steer = true;
+        state.turn_in_flight = true;
+        state.status = ConnectionStatus::Prompting;
+    }
+
+    #[tokio::test]
+    async fn native_steer_is_idempotent_by_client_message_id() {
+        let mgr = ConnectionManager::new();
+        let mut cmd_rx = insert_live_connection(&mgr, "codex-steer", AgentType::Codex, None).await;
+        mark_native_steer_ready(&mgr, "codex-steer").await;
+
+        let worker = tokio::spawn(async move {
+            let Some(ConnectionCommand::NativeSteer {
+                blocks,
+                client_message_id,
+                completion_cache,
+                reply,
+            }) = cmd_rx.recv().await
+            else {
+                panic!("expected steer command")
+            };
+            assert_eq!(client_message_id, "optimistic-guide-1");
+            assert_eq!(
+                blocks,
+                vec![PromptInputBlock::Text {
+                    text: "check B instead".into()
+                }]
+            );
+            let result = SteerResult {
+                turn_id: Some("turn-active".into()),
+                message_id: client_message_id,
+                deduplicated: false,
+            };
+            completion_cache.lock().await.push_back(result.clone());
+            reply.send(Ok(result)).expect("manager still waiting");
+            // A retry must be answered from the manager/cache and never enqueue
+            // a second command on the adapter connection.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(cmd_rx.try_recv().is_err());
+        });
+
+        let first = mgr
+            .steer(
+                "codex-steer",
+                vec![PromptInputBlock::Text {
+                    text: "check B instead".into(),
+                }],
+                "optimistic-guide-1".into(),
+            )
+            .await
+            .expect("first guide succeeds");
+        assert_eq!(first.turn_id.as_deref(), Some("turn-active"));
+        assert!(!first.deduplicated);
+
+        let retry = mgr
+            .steer(
+                "codex-steer",
+                vec![PromptInputBlock::Text {
+                    text: "check B instead".into(),
+                }],
+                "optimistic-guide-1".into(),
+            )
+            .await
+            .expect("retry returns cached success");
+        assert!(retry.deduplicated);
+        assert_eq!(retry.turn_id, first.turn_id);
+        worker.await.expect("worker completes");
+    }
+
+    #[tokio::test]
+    async fn native_steer_rejects_unsupported_and_finished_turns() {
+        let mgr = ConnectionManager::new();
+        let _cmd_rx =
+            insert_live_connection(&mgr, "codex-steer-gates", AgentType::Codex, None).await;
+
+        let unsupported = mgr
+            .steer(
+                "codex-steer-gates",
+                one_text_block(),
+                "guide-unsupported".into(),
+            )
+            .await
+            .expect_err("capability gate");
+        assert!(matches!(unsupported, AcpError::SteerUnsupported));
+
+        let state = mgr
+            .get_state("codex-steer-gates")
+            .await
+            .expect("test connection");
+        state.write().await.supports_steer = true;
+        let finished = mgr
+            .steer(
+                "codex-steer-gates",
+                one_text_block(),
+                "guide-finished".into(),
+            )
+            .await
+            .expect_err("turn gate");
+        assert!(matches!(finished, AcpError::NoActiveSteerTurn));
     }
 
     #[tokio::test]
@@ -5084,6 +8594,7 @@ mod tests {
         let ConnectionCommand::Prompt {
             blocks,
             user_message,
+            ..
         } = command
         else {
             panic!("expected prompt command");
@@ -5501,6 +9012,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn historical_pending_artifact_settlement_does_not_block_prompt() {
+        use crate::db::test_helpers;
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/settlement-admission").await;
+        let conversation_id =
+            test_helpers::seed_conversation(&db, folder_id, AgentType::ClaudeCode).await;
+        let mgr = ConnectionManager::new();
+        let conn_id = "conn-settlement-admission";
+        let mut cmd_rx = insert_live_connection(
+            &mgr,
+            conn_id,
+            AgentType::ClaudeCode,
+            Some(PathBuf::from("/tmp/settlement-admission")),
+        )
+        .await;
+        {
+            let state = mgr.get_state(conn_id).await.unwrap();
+            let mut state = state.write().await;
+            state.conversation_id = Some(conversation_id);
+            state.external_id = Some("session-settlement-admission".into());
+        }
+
+        artifact_service::create_run(
+            &db.conn,
+            artifact_service::NewTurnRun {
+                id: "old-terminal-pending".into(),
+                conversation_id,
+                connection_id: conn_id.into(),
+                client_message_id: Some("old-message".into()),
+                prompt_fingerprint: None,
+                folder_id: Some(folder_id),
+                root_path: "/tmp/settlement-admission".into(),
+                capture_incomplete: false,
+                input_paths_json: "[]".into(),
+                expectation_json: "{}".into(),
+            },
+        )
+        .await
+        .unwrap();
+        artifact_service::finish_run(
+            &db.conn,
+            "old-terminal-pending",
+            ConversationTurnRunStatus::Completed,
+            Some("end_turn".into()),
+        )
+        .await
+        .unwrap();
+
+        let result = mgr
+            .send_prompt_linked_with_message_id(
+                &db,
+                conn_id,
+                vec![PromptInputBlock::Text {
+                    text: "follow-up after initialization".into(),
+                }],
+                Some(folder_id),
+                Some(conversation_id),
+                None,
+                Some("new-message".into()),
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "optional historical settlement must not reject a ready prompt: {result:?}"
+        );
+        let prompts = drain_prompt_user_messages(&mut cmd_rx);
+        assert_eq!(prompts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn independent_branch_connection_does_not_share_source_prompt_gate() {
+        use crate::db::test_helpers;
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/branch-parallel").await;
+        let mgr = ConnectionManager::new();
+        let mut source_rx = insert_live_connection(
+            &mgr,
+            "source-connection",
+            AgentType::ClaudeCode,
+            Some(PathBuf::from("/tmp/branch-parallel")),
+        )
+        .await;
+        let mut branch_rx = insert_live_connection(
+            &mgr,
+            "branch-connection",
+            AgentType::ClaudeCode,
+            Some(PathBuf::from("/tmp/branch-parallel")),
+        )
+        .await;
+
+        mgr.send_prompt_linked(
+            &db,
+            "source-connection",
+            vec![PromptInputBlock::Text {
+                text: "source task".into(),
+            }],
+            Some(folder_id),
+            None,
+            None,
+        )
+        .await
+        .expect("source prompt");
+        mgr.send_prompt_linked(
+            &db,
+            "branch-connection",
+            vec![PromptInputBlock::Text {
+                text: "parallel branch task".into(),
+            }],
+            Some(folder_id),
+            None,
+            None,
+        )
+        .await
+        .expect("branch prompt must not queue behind source");
+
+        assert_eq!(drain_prompt_user_messages(&mut source_rx).len(), 1);
+        assert_eq!(drain_prompt_user_messages(&mut branch_rx).len(), 1);
+    }
+
+    #[tokio::test]
     async fn send_prompt_linked_rejects_empty_prompt_without_wedging_gate() {
         // An empty prompt is rejected BEFORE any side effects: it must NOT
         // create/link a conversation row, must NOT set the concurrency gate
@@ -5712,6 +9343,9 @@ mod tests {
             state: Arc::new(RwLock::new(state)),
             emitter: EventEmitter::Noop,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
+            steer_lock: Arc::new(tokio::sync::Mutex::new(())),
+            completed_steers: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
+            accepted_prompt_ids: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
             config_fingerprint: String::new(),
             last_observed_fingerprint: String::new(),
             child_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -5813,6 +9447,7 @@ mod tests {
                     text: "filler".into(),
                 }],
                 user_message: None,
+                agent_file_change_report_request_id: None,
             })
             .await
             .unwrap();
@@ -5824,6 +9459,7 @@ mod tests {
             vec![PromptInputBlock::Text {
                 text: "blocked".into(),
             }],
+            None,
             None,
         );
         let res = tokio::time::timeout(std::time::Duration::from_millis(50), fut).await;
@@ -5880,6 +9516,119 @@ mod tests {
                 .map(|(id, _)| id.as_str()),
             Some("optimistic-abc"),
             "Prompt's user_message must carry the client-supplied message_id verbatim"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_prompt_linked_is_idempotent_by_client_message_id() {
+        use crate::db::test_helpers;
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/prompt-idem").await;
+        let mgr = ConnectionManager::new();
+        let conn_id = "conn-prompt-idem";
+        let mut cmd_rx = insert_live_connection(
+            &mgr,
+            conn_id,
+            AgentType::Codex,
+            Some(PathBuf::from("/tmp/prompt-idem")),
+        )
+        .await;
+        let blocks = vec![PromptInputBlock::Text {
+            text: "image context and instructions".into(),
+        }];
+        let message_id = Some("optimistic-stable-id".to_string());
+
+        let first = mgr
+            .send_prompt_linked_with_message_id(
+                &db,
+                conn_id,
+                blocks.clone(),
+                Some(folder_id),
+                None,
+                None,
+                message_id.clone(),
+            )
+            .await
+            .expect("first prompt accepted");
+        let retry = mgr
+            .send_prompt_linked_with_message_id(
+                &db,
+                conn_id,
+                blocks,
+                Some(folder_id),
+                first,
+                None,
+                message_id,
+            )
+            .await
+            .expect("same-id retry recovers accepted status");
+
+        assert_eq!(retry, first);
+        let prompts = drain_prompt_user_messages(&mut cmd_rx);
+        assert_eq!(
+            prompts.len(),
+            1,
+            "same client_message_id must enqueue exactly one agent turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn accepted_prompt_id_survives_replacement_connection() {
+        use crate::db::test_helpers;
+        let db = test_helpers::fresh_in_memory_db().await;
+        let root = PathBuf::from("/tmp/prompt-idem-reconnect");
+        let folder_id = test_helpers::seed_folder(&db, root.to_str().unwrap()).await;
+        let mgr = ConnectionManager::new();
+        let mut first_rx = insert_live_connection(
+            &mgr,
+            "conn-before-reload",
+            AgentType::Codex,
+            Some(root.clone()),
+        )
+        .await;
+        let blocks = vec![PromptInputBlock::Text {
+            text: "run exactly once".into(),
+        }];
+        let message_id = Some("optimistic-survives-reload".to_string());
+
+        let conversation_id = mgr
+            .send_prompt_linked_with_message_id(
+                &db,
+                "conn-before-reload",
+                blocks.clone(),
+                Some(folder_id),
+                None,
+                None,
+                message_id.clone(),
+            )
+            .await
+            .expect("first prompt accepted")
+            .expect("conversation linked");
+        assert_eq!(drain_prompt_user_messages(&mut first_rx).len(), 1);
+
+        // A page reload can restore the conversation through a replacement ACP
+        // connection whose in-memory accepted-id cache is empty. The persisted
+        // receipt must still turn the same stable id into a status recovery,
+        // without enqueueing a second agent command.
+        let mut restored_rx =
+            insert_live_connection(&mgr, "conn-after-reload", AgentType::Codex, Some(root)).await;
+        let retry = mgr
+            .send_prompt_linked_with_message_id(
+                &db,
+                "conn-after-reload",
+                blocks,
+                Some(folder_id),
+                Some(conversation_id),
+                None,
+                message_id,
+            )
+            .await
+            .expect("same-id retry recovers durable accepted status");
+
+        assert_eq!(retry, Some(conversation_id));
+        assert!(
+            drain_prompt_user_messages(&mut restored_rx).is_empty(),
+            "replacement connection must not receive a duplicate prompt"
         );
     }
 
@@ -6070,10 +9819,10 @@ mod tests {
         // Empty / whitespace / image-only prompts seed no title (stays NULL,
         // backfilled on first detail load as before).
         assert!(delegation_child_title_seed(&[]).is_none());
-        assert!(
-            delegation_child_title_seed(&[PromptInputBlock::Text { text: "  \n ".into() }])
-                .is_none()
-        );
+        assert!(delegation_child_title_seed(&[PromptInputBlock::Text {
+            text: "  \n ".into()
+        }])
+        .is_none());
         let img = vec![PromptInputBlock::Image {
             data: "x".into(),
             mime_type: "image/png".into(),
@@ -6554,6 +10303,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn send_prompt_linked_rejects_connection_bound_to_another_conversation() {
+        use crate::db::test_helpers;
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/prompt-binding-guard").await;
+        let first = conversation_service::create(
+            &db.conn,
+            folder_id,
+            AgentType::Codex,
+            Some("first".into()),
+            None,
+        )
+        .await
+        .unwrap();
+        let second = conversation_service::create(
+            &db.conn,
+            folder_id,
+            AgentType::Codex,
+            Some("second".into()),
+            None,
+        )
+        .await
+        .unwrap();
+        let mgr = ConnectionManager::new();
+        let mut rx = insert_live_connection(&mgr, "wrong-binding", AgentType::Codex, None).await;
+        mgr.get_state("wrong-binding")
+            .await
+            .unwrap()
+            .write()
+            .await
+            .conversation_id = Some(first.id);
+
+        let error = mgr
+            .send_prompt_linked(
+                &db,
+                "wrong-binding",
+                one_text_block(),
+                Some(folder_id),
+                Some(second.id),
+                None,
+            )
+            .await
+            .expect_err("mismatched conversation must be rejected");
+        assert!(error.to_string().contains("not"));
+        assert!(
+            rx.try_recv().is_err(),
+            "no prompt may reach the old session"
+        );
+    }
+
+    #[tokio::test]
     async fn send_prompt_linked_caller_id_is_noop_when_already_linked() {
         use crate::db::test_helpers;
         let db = test_helpers::fresh_in_memory_db().await;
@@ -6853,6 +10652,236 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persisted_codex_restore_does_not_reuse_connection_without_codeg_mcp() {
+        let mgr = ConnectionManager::new();
+        let working_dir = PathBuf::from("/tmp/codex-restore-mcp");
+        let _rx = insert_live_connection(
+            &mgr,
+            "legacy-codex",
+            AgentType::Codex,
+            Some(working_dir.clone()),
+        )
+        .await;
+        let state = mgr.get_state("legacy-codex").await.unwrap();
+        {
+            let mut state = state.write().await;
+            state.external_id = Some("codex-session-1".into());
+            state.codeg_mcp_available = false;
+        }
+
+        assert_eq!(
+            mgr.find_connection_for_reuse_with_requirements(
+                AgentType::Codex,
+                Some(&working_dir),
+                Some("codex-session-1"),
+                false,
+                None,
+            )
+            .await
+            .as_deref(),
+            Some("legacy-codex"),
+            "ordinary compatibility lookup may reuse the legacy connection"
+        );
+        assert!(
+            mgr.find_connection_for_reuse_with_requirements(
+                AgentType::Codex,
+                Some(&working_dir),
+                Some("codex-session-1"),
+                true,
+                Some(42),
+            )
+            .await
+            .is_none(),
+            "historical Codex restore must require the built-in MCP companion"
+        );
+
+        state.write().await.codeg_mcp_available = true;
+        assert_eq!(
+            mgr.find_connection_for_reuse_with_requirements(
+                AgentType::Codex,
+                Some(&working_dir),
+                Some("codex-session-1"),
+                true,
+                Some(42),
+            )
+            .await
+            .as_deref(),
+            Some("legacy-codex")
+        );
+
+        state.write().await.conversation_id = Some(41);
+        assert!(
+            mgr.find_connection_for_reuse_with_requirements(
+                AgentType::Codex,
+                Some(&working_dir),
+                Some("codex-session-1"),
+                true,
+                Some(42),
+            )
+            .await
+            .is_none(),
+            "a connection owned by another conversation must not be reused"
+        );
+        assert_eq!(
+            mgr.find_connection_for_reuse_with_requirements(
+                AgentType::Codex,
+                Some(&working_dir),
+                Some("codex-session-1"),
+                true,
+                Some(41),
+            )
+            .await
+            .as_deref(),
+            Some("legacy-codex")
+        );
+    }
+
+    #[tokio::test]
+    async fn activate_restored_conversation_atomically_rebinds_and_stops_old_connection() {
+        let mgr = ConnectionManager::new();
+        let mut old_rx = insert_live_connection(&mgr, "old", AgentType::Codex, None).await;
+        let _new_rx = insert_live_connection(&mgr, "new", AgentType::Codex, None).await;
+        {
+            let old = mgr.get_state("old").await.unwrap();
+            let mut state = old.write().await;
+            state.conversation_id = Some(42);
+            state.folder_id = Some(7);
+            state.external_id = Some("session-42".into());
+        }
+        {
+            let new = mgr.get_state("new").await.unwrap();
+            let mut state = new.write().await;
+            state.external_id = Some("session-42".into());
+            state.codeg_mcp_available = true;
+            state.mcp_server_count = 3;
+            state.selectors_ready = true;
+        }
+
+        let outcome = mgr
+            .activate_restored_conversation("new", 42, 7, "session-42", true, None, None)
+            .await
+            .expect("atomic activation");
+        assert_eq!(outcome.replaced_connection_ids, vec!["old"]);
+        assert!(outcome.codeg_mcp_available);
+        assert_eq!(outcome.mcp_server_count, 3);
+        assert!(mgr.get_state("old").await.is_none());
+        let new = mgr.get_state("new").await.unwrap();
+        let new = new.read().await;
+        assert_eq!(new.conversation_id, Some(42));
+        assert_eq!(new.folder_id, Some(7));
+        drop(new);
+        assert!(matches!(
+            old_rx.recv().await,
+            Some(ConnectionCommand::Disconnect)
+        ));
+    }
+
+    #[tokio::test]
+    async fn activate_restored_conversation_failure_preserves_existing_binding() {
+        let mgr = ConnectionManager::new();
+        let _old_rx = insert_live_connection(&mgr, "old", AgentType::Codex, None).await;
+        let _new_rx = insert_live_connection(&mgr, "new", AgentType::Codex, None).await;
+        {
+            let old = mgr.get_state("old").await.unwrap();
+            let mut state = old.write().await;
+            state.conversation_id = Some(42);
+            state.folder_id = Some(7);
+            state.external_id = Some("session-42".into());
+        }
+        {
+            let new = mgr.get_state("new").await.unwrap();
+            let mut state = new.write().await;
+            state.external_id = Some("session-42".into());
+            state.codeg_mcp_available = false;
+            state.selectors_ready = true;
+        }
+
+        let error = mgr
+            .activate_restored_conversation("new", 42, 7, "session-42", true, None, None)
+            .await
+            .expect_err("missing MCP must reject restore");
+        assert!(error.to_string().contains("codeg-mcp"));
+        assert_eq!(
+            mgr.get_state("old")
+                .await
+                .unwrap()
+                .read()
+                .await
+                .conversation_id,
+            Some(42)
+        );
+        assert_eq!(
+            mgr.get_state("new")
+                .await
+                .unwrap()
+                .read()
+                .await
+                .conversation_id,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn connected_session_is_not_prompt_ready_until_selectors_latch() {
+        let mgr = ConnectionManager::with_spawn_handshake_timeout(Duration::from_millis(25));
+        let _rx = insert_live_connection(&mgr, "warming", AgentType::Codex, None).await;
+        {
+            let state = mgr.get_state("warming").await.unwrap();
+            let mut state = state.write().await;
+            state.external_id = Some("session-warming".into());
+            state.codeg_mcp_available = true;
+            assert_eq!(state.status, ConnectionStatus::Connected);
+            assert!(!state.selectors_ready);
+        }
+
+        let error = mgr
+            .wait_for_prompt_ready("warming", Some("session-warming"))
+            .await
+            .expect_err("Connected without SelectorsReady must not pass");
+        assert!(error.to_string().contains("prompt-ready"));
+
+        mgr.get_state("warming")
+            .await
+            .unwrap()
+            .write()
+            .await
+            .selectors_ready = true;
+        assert_eq!(
+            mgr.wait_for_prompt_ready("warming", Some("session-warming"))
+                .await
+                .unwrap(),
+            "session-warming"
+        );
+    }
+
+    #[tokio::test]
+    async fn activation_rejects_connected_session_before_prompt_ready() {
+        let mgr = ConnectionManager::new();
+        let _rx = insert_live_connection(&mgr, "warming", AgentType::Codex, None).await;
+        {
+            let state = mgr.get_state("warming").await.unwrap();
+            let mut state = state.write().await;
+            state.external_id = Some("session-42".into());
+            state.codeg_mcp_available = true;
+        }
+
+        let error = mgr
+            .activate_restored_conversation("warming", 42, 7, "session-42", true, None, None)
+            .await
+            .expect_err("half-initialized session must not activate");
+        assert!(error.to_string().contains("not prompt-ready"));
+        assert_eq!(
+            mgr.get_state("warming")
+                .await
+                .unwrap()
+                .read()
+                .await
+                .conversation_id,
+            None
+        );
+    }
+
+    #[tokio::test]
     async fn find_connection_for_reuse_skips_disconnected_or_errored() {
         let mgr = ConnectionManager::new();
         let (broadcaster, _rx) = make_test_broadcaster();
@@ -6944,6 +10973,109 @@ mod tests {
         let n = mgr.sweep_idle(Duration::from_secs(300)).await;
         assert_eq!(n, 0);
         assert!(mgr.connections.lock().await.contains_key("fresh"));
+    }
+
+    #[tokio::test]
+    async fn sweep_idle_never_reaps_a_long_historical_restore() {
+        let mgr = ConnectionManager::new();
+        insert_fake_connection(
+            &mgr,
+            "large-restore",
+            AgentType::Codex,
+            None,
+            EventEmitter::Noop,
+        )
+        .await;
+        backdate_last_activity(&mgr, "large-restore", 900).await;
+        {
+            let state = mgr.get_state("large-restore").await.unwrap();
+            let mut state = state.write().await;
+            state.restore_conversation_id = Some(26);
+            state.restore_started_at = Some(std::time::Instant::now());
+            state.selectors_ready = false;
+        }
+
+        let n = mgr.sweep_idle(Duration::from_secs(300)).await;
+        assert_eq!(n, 0);
+        assert!(mgr.connections.lock().await.contains_key("large-restore"));
+
+        // Once prompt readiness has been verified, the restore lease ends and
+        // ordinary idle policy applies again.
+        mgr.get_state("large-restore")
+            .await
+            .unwrap()
+            .write()
+            .await
+            .selectors_ready = true;
+        let n = mgr.sweep_idle(Duration::from_secs(300)).await;
+        assert_eq!(n, 1);
+    }
+
+    #[tokio::test]
+    async fn persisted_prompt_readiness_uses_restore_not_spawn_timeout() {
+        let mut mgr =
+            ConnectionManager::with_spawn_handshake_timeout(Duration::from_millis(20));
+        // Keep the semantic gap large while leaving enough wall-clock margin
+        // for saturated macOS CI runners. The assertion is that readiness may
+        // arrive after the 20 ms spawn deadline but before the restore lease,
+        // not that Tokio timers fire within a sub-second benchmark budget.
+        mgr.restore_timeout = Duration::from_secs(3);
+        let _rx = insert_live_connection(&mgr, "slow-resume", AgentType::Codex, None).await;
+        {
+            let state = mgr.get_state("slow-resume").await.unwrap();
+            state.write().await.external_id = Some("large-session".into());
+        }
+        let state = mgr.get_state("slow-resume").await.unwrap();
+        tokio::spawn(async move {
+            // Five times the ordinary process-handshake deadline, standing in
+            // for a >120s large rollout under the production 60s/300s policy.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            state.write().await.selectors_ready = true;
+        });
+
+        assert_eq!(
+            mgr.wait_for_prompt_ready("slow-resume", Some("large-session"))
+                .await
+                .unwrap(),
+            "large-session"
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_idle_treats_live_web_attach_as_a_lease() {
+        let mgr = ConnectionManager::new();
+        insert_fake_connection(
+            &mgr,
+            "open-in-browser",
+            AgentType::ClaudeCode,
+            None,
+            EventEmitter::Noop,
+        )
+        .await;
+        backdate_last_activity(&mgr, "open-in-browser", 600).await;
+
+        let stream = {
+            let state = mgr.get_state("open-in-browser").await.unwrap();
+            let stream = state.read().await.event_stream();
+            stream
+        };
+        let lease = stream.subscribe();
+
+        let n = mgr.sweep_idle(Duration::from_secs(300)).await;
+        assert_eq!(
+            n, 0,
+            "an open web conversation must survive timer suspension"
+        );
+        assert!(mgr.connections.lock().await.contains_key("open-in-browser"));
+
+        // Closing the WebSocket drops its receiver. With no other activity,
+        // the same connection is eligible on the next sweep.
+        drop(lease);
+        let n = mgr.sweep_idle(Duration::from_secs(300)).await;
+        assert_eq!(
+            n, 1,
+            "a released attach lease must not leak the ACP process"
+        );
     }
 
     #[tokio::test]
@@ -7093,6 +11225,49 @@ mod tests {
             cloned_locks.contains_key(&key),
             "spawn_locks must be shared between original and clone_ref"
         );
+    }
+
+    #[tokio::test]
+    async fn restore_and_session_operation_locks_are_shared_across_clone_ref() {
+        let mgr = ConnectionManager::new();
+        let cloned = mgr.clone_ref();
+
+        let restore_guard = mgr
+            .lock_restore_request(42)
+            .await
+            .expect("first restore lock");
+        let restore_wait = cloned.lock_restore_request(42);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), restore_wait)
+                .await
+                .is_err(),
+            "a second manager clone must wait for the same conversation restore"
+        );
+        drop(restore_guard);
+        cloned
+            .lock_restore_request(42)
+            .await
+            .expect("restore lock is released");
+
+        let cwd = PathBuf::from("/tmp/session-operation-test");
+        let session_guard = mgr
+            .lock_session_operation(AgentType::Codex, Some(&cwd), "session-1")
+            .await
+            .expect("first session writer lock");
+        let other_cwd = PathBuf::from("/tmp/same-session-different-folder");
+        let session_wait =
+            cloned.lock_session_operation(AgentType::Codex, Some(&other_cwd), "session-1");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), session_wait)
+                .await
+                .is_err(),
+            "restore and fork operations must not write one ACP session concurrently"
+        );
+        drop(session_guard);
+        cloned
+            .lock_session_operation(AgentType::Codex, Some(&cwd), "session-1")
+            .await
+            .expect("session writer lock is released");
     }
 
     /// Two concurrent `send_prompt_linked` calls on the SAME connection
@@ -7343,6 +11518,7 @@ mod tests {
             None,
         );
         state.conversation_id = Some(conversation_id);
+        state.external_id = Some(original_session_id.to_string());
         state.status = ConnectionStatus::Connected;
         let conn = AgentConnection {
             id: conn_id.to_string(),
@@ -7353,6 +11529,9 @@ mod tests {
             state: Arc::new(RwLock::new(state)),
             emitter: EventEmitter::Noop,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
+            steer_lock: Arc::new(tokio::sync::Mutex::new(())),
+            completed_steers: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
+            accepted_prompt_ids: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
             config_fingerprint: String::new(),
             last_observed_fingerprint: String::new(),
             child_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -7430,6 +11609,80 @@ mod tests {
         assert_eq!(sibling.status, "pending_review");
         assert_eq!(sibling.folder_id, folder_id);
         assert_eq!(sibling.git_branch.as_deref(), Some("feature/x"));
+
+        // Fork & Send is a first-class conversation branch, not merely two
+        // rows with swapped session ids. The shared relation unlocks Return to
+        // source and the existing idempotent merge flow immediately.
+        let branch = conversation_branch_service::get_info(&db.conn, pre.id)
+            .await
+            .unwrap()
+            .expect("fork-send branch relation");
+        assert_eq!(branch.source_conversation_id, sibling_id);
+        assert_eq!(branch.fork_mode, "native");
+        assert_eq!(branch.inheritance_mode, "native_fork");
+        assert!(!branch.inheritance_compressed);
+        assert!(!branch.inheritance_truncated);
+        let merged = conversation_branch_service::merge_branch(
+            &db.conn,
+            pre.id,
+            "fork-send-merge".into(),
+            "Native fork result".into(),
+            Vec::new(),
+        )
+        .await
+        .expect("fork-send result merges through shared branch service");
+        assert_eq!(merged.target_conversation_id, sibling_id);
+    }
+
+    #[tokio::test]
+    async fn repeated_fork_send_preserves_the_branch_chain() {
+        use crate::db::test_helpers;
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/fork-chain").await;
+        let current = conversation_service::create(
+            &db.conn,
+            folder_id,
+            AgentType::Codex,
+            Some("Topic".into()),
+            None,
+        )
+        .await
+        .unwrap();
+        conversation_service::bind_external_id(&db.conn, current.id, "session-S1", &[])
+            .await
+            .unwrap();
+
+        let root_id = ConnectionManager::persist_fork_outcome(
+            &db.conn,
+            current.id,
+            "connection-S2",
+            "session-S2".into(),
+            "session-S1".into(),
+        )
+        .await
+        .unwrap();
+        let middle_id = ConnectionManager::persist_fork_outcome(
+            &db.conn,
+            current.id,
+            "connection-S3",
+            "session-S3".into(),
+            "session-S2".into(),
+        )
+        .await
+        .unwrap();
+
+        let latest = conversation_branch_service::get_info(&db.conn, current.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let middle = conversation_branch_service::get_info(&db.conn, middle_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.source_conversation_id, middle_id);
+        assert_eq!(middle.source_conversation_id, root_id);
+        assert_eq!(latest.branch_session_id.as_deref(), Some("session-S3"));
+        assert_eq!(middle.branch_session_id.as_deref(), Some("session-S2"));
     }
 
     #[tokio::test]
@@ -7450,7 +11703,10 @@ mod tests {
         .unwrap();
         let (mgr, join) =
             manager_with_fake_fork("c-restack", pre.id, "session-S2", "session-S1").await;
-        let result = mgr.fork_session(&db, "c-restack", None, None, None).await.unwrap();
+        let result = mgr
+            .fork_session(&db, "c-restack", None, None, None)
+            .await
+            .unwrap();
         let _ = join.await;
 
         let current = conversation_service::get_by_id(&db.conn, pre.id)
@@ -7497,10 +11753,11 @@ mod tests {
             .await
             .unwrap();
         // Lifecycle got there first: S2 landed on the row and S1 was preserved.
-        let preserved_id = conversation_service::bind_external_id(&db.conn, pre.id, "session-S2", &[])
-            .await
-            .unwrap()
-            .expect("the lifecycle bind preserves S1");
+        let preserved_id =
+            conversation_service::bind_external_id(&db.conn, pre.id, "session-S2", &[])
+                .await
+                .unwrap()
+                .expect("the lifecycle bind preserves S1");
 
         let (mgr, join) =
             manager_with_fake_fork("c-raced", pre.id, "session-S2", "session-S1").await;
@@ -7653,7 +11910,10 @@ mod tests {
 
         let (mgr, join) =
             manager_with_fake_fork("c-fork-lock", pre.id, "session-S2", "session-S1").await;
-        let result = mgr.fork_session(&db, "c-fork-lock", None, None, None).await.unwrap();
+        let result = mgr
+            .fork_session(&db, "c-fork-lock", None, None, None)
+            .await
+            .unwrap();
         let _ = join.await;
 
         let sibling_id = result.sibling_conversation_id;
@@ -7788,7 +12048,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(current.title, None, "no title to prefix");
-        assert!(!current.title_locked, "an unwritten title must stay unlocked");
+        assert!(
+            !current.title_locked,
+            "an unwritten title must stay unlocked"
+        );
         let sibling = conversation_service::get_by_id(&db.conn, result.sibling_conversation_id)
             .await
             .unwrap();
@@ -7800,11 +12063,13 @@ mod tests {
                 .await
                 .unwrap()
         );
-        assert!(
-            conversation_service::refresh_auto_title(&db.conn, sibling.id, "First Name".into())
-                .await
-                .unwrap()
-        );
+        assert!(conversation_service::refresh_auto_title(
+            &db.conn,
+            sibling.id,
+            "First Name".into()
+        )
+        .await
+        .unwrap());
     }
 
     #[tokio::test]
@@ -8024,6 +12289,9 @@ mod tests {
             state: Arc::new(RwLock::new(state)),
             emitter: EventEmitter::Noop,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
+            steer_lock: Arc::new(tokio::sync::Mutex::new(())),
+            completed_steers: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
+            accepted_prompt_ids: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
             config_fingerprint: String::new(),
             last_observed_fingerprint: String::new(),
             child_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -8362,7 +12630,11 @@ mod tests {
         let at_bound = "y".repeat(MAX_FEEDBACK_CHARS);
         assert!(mgr.submit_feedback("c1", at_bound, None).await.is_ok());
         let state = mgr.get_state("c1").await.unwrap();
-        assert_eq!(state.read().await.feedback.len(), 1, "only the valid note stuck");
+        assert_eq!(
+            state.read().await.feedback.len(),
+            1,
+            "only the valid note stuck"
+        );
     }
 
     // --- native steering (push channel) ----------------------------------
@@ -8472,7 +12744,10 @@ mod tests {
         set_feedback_tool_available(&mgr, "c1").await;
         let fake_loop = answer_steer(rx, Ok(SteerOutcome::Injected));
 
-        let item = mgr.submit_feedback("c1", "  ship it  ".into(), None).await.unwrap();
+        let item = mgr
+            .submit_feedback("c1", "  ship it  ".into(), None)
+            .await
+            .unwrap();
         assert_eq!(item.status, FeedbackStatus::Delivered);
         assert!(item.delivered_at.is_some());
         assert_eq!(item.text, "ship it");
@@ -8948,7 +13223,10 @@ mod tests {
         mark_native_steering_ready(&mgr, "c1").await;
         // feedback_tool_available stays false.
         let fake_loop = answer_steer(rx, Ok(SteerOutcome::Injected));
-        let item = mgr.submit_feedback("c1", "no tool needed".into(), None).await.unwrap();
+        let item = mgr
+            .submit_feedback("c1", "no tool needed".into(), None)
+            .await
+            .unwrap();
         assert_eq!(item.status, FeedbackStatus::Delivered);
         let _ = fake_loop.await;
     }
@@ -9260,7 +13538,12 @@ mod tests {
         // The first is still the pending one and still answerable.
         let state = mgr.get_state("cc2").await.unwrap();
         assert_eq!(
-            state.read().await.pending_question.as_ref().map(|p| p.question_id.clone()),
+            state
+                .read()
+                .await
+                .pending_question
+                .as_ref()
+                .map(|p| p.question_id.clone()),
             Some(first.question_id.clone())
         );
         mgr.answer_question(
@@ -9296,12 +13579,7 @@ mod tests {
         assert_eq!(texts, vec!["a", "b"]);
         // A second read still returns them — read is non-destructive, so an
         // abandoned (peer-closed) call leaves the notes retryable.
-        assert_eq!(
-            mgr.read_pending_feedback("c1")
-                .await
-                .len(),
-            2
-        );
+        assert_eq!(mgr.read_pending_feedback("c1").await.len(), 2);
         {
             let state = mgr.get_state("c1").await.unwrap();
             assert!(state
@@ -9316,10 +13594,7 @@ mod tests {
         mgr.commit_feedback_delivered("c1", vec![a.id.clone(), b.id.clone()])
             .await;
         // Now READ returns nothing (delivered notes are filtered out).
-        assert!(mgr
-            .read_pending_feedback("c1")
-            .await
-            .is_empty());
+        assert!(mgr.read_pending_feedback("c1").await.is_empty());
         let state = mgr.get_state("c1").await.unwrap();
         assert!(state
             .read()
@@ -9335,12 +13610,9 @@ mod tests {
     #[tokio::test]
     async fn read_pending_missing_connection_returns_empty() {
         let mgr = ConnectionManager::new();
-        assert!(mgr
-            .read_pending_feedback("nope")
-            .await
-            .is_empty());
+        assert!(mgr.read_pending_feedback("nope").await.is_empty());
         // Commit on a missing connection is a safe no-op.
-        mgr.commit_feedback_delivered("nope", vec!["x".into()]).await;
+        mgr.commit_feedback_delivered("nope", vec!["x".into()])
+            .await;
     }
-
 }

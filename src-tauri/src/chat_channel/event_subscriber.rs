@@ -51,6 +51,7 @@ pub fn bump_event_config_epoch() {
 struct CachedChannel {
     id: i32,
     event_filter_json: Option<String>,
+    weixin_push_mode: Option<super::types::WeixinPushMode>,
 }
 
 struct EventConfigCache {
@@ -180,6 +181,8 @@ impl EventConfigCache {
                 .map(|ch| CachedChannel {
                     id: ch.id,
                     event_filter_json: ch.event_filter_json,
+                    weixin_push_mode: (ch.channel_type == "weixin")
+                        .then(|| super::types::WeixinPushMode::from_config_json(&ch.config_json)),
                 })
                 .collect();
         }
@@ -349,6 +352,15 @@ async fn process_envelope(
     );
 
     for ch in &config.enabled_channels {
+        // Weixin final-result modes are driven exclusively by the scoped
+        // SessionBridge route and durable outbox. The global ACP fan-out has no
+        // origin_message_id and would leak Web/Desktop turns into Weixin.
+        if ch
+            .weixin_push_mode
+            .is_some_and(|mode| !mode.allows_progress())
+        {
+            continue;
+        }
         // Per-channel event filter
         if let Some(filter_json) = &ch.event_filter_json {
             if let Ok(filter) = serde_json::from_str::<Vec<String>>(filter_json) {
@@ -524,6 +536,7 @@ mod permission_push_tests {
             enabled_channels: vec![CachedChannel {
                 id: channel_id,
                 event_filter_json: None,
+                weixin_push_mode: None,
             }],
             webhooks: Vec::new(),
             last_refresh: Instant::now(),
@@ -652,7 +665,8 @@ mod permission_push_tests {
             tool_call_inputs: HashMap::new(),
             delegation_rendered: HashSet::new(),
             last_flushed: Instant::now(),
-            pending_prompt: None,
+            pending_prompts: std::collections::VecDeque::new(),
+            forward_events: true,
             permission_pending: None,
         }
     }

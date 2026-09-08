@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { Reorder } from "motion/react"
 import type { PanInfo } from "motion/react"
-import { SquarePen } from "lucide-react"
+import { ListX, SquarePen } from "lucide-react"
 import { useTranslations } from "next-intl"
 import { cn } from "@/lib/utils"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
@@ -37,6 +37,7 @@ interface TabBarProps {
 // and navigates tabs from the sidebar.
 export function TabBar({ groupId }: TabBarProps) {
   const t = useTranslations("Folder.conversationCard")
+  const tTabs = useTranslations("Folder.tabs")
   const tabs = useTabStore((s) => s.tabs)
   const activeTabId = useTabStore((s) => s.activeTabId)
   const groupOf = useTabStore((s) => s.groupOf)
@@ -82,6 +83,14 @@ export function TabBar({ groupId }: TabBarProps) {
   )
   const displayActiveId =
     groupId == null ? activeTabId : (groupSelection[groupId] ?? null)
+  // `closeAllTabs` is global, not group-scoped. Keep a single visible control:
+  // the ordinary strip always owns it; while split, only the globally focused
+  // group's strip does. Focusing another group naturally moves the affordance
+  // there instead of repeating a destructive-looking button in every pane.
+  const showCloseAll =
+    groupId == null ||
+    (activeTabId != null &&
+      groupOfTab(groupOf, groupLayout, activeTabId) === stripGroupId)
   const isTileMode = !!tileByGroup[stripGroupId]
   const handleToggleTile = useCallback(
     () => toggleGroupTile(stripGroupId),
@@ -368,16 +377,17 @@ export function TabBar({ groupId }: TabBarProps) {
           />
         )
       })}
-      {/* The new-conversation button + drag spacer are the Reorder.Group's own
-          trailing children, so they share the tabs' flex line — the button hugs
-          the last tab and the spacer fills the leftover row as a window-drag
-          region. They are not Reorder.Items, so dragging a tab only ever permutes
-          the tabs. Wrapped in one `flex-1` `ws-strip-line` box so the
-          workspace-bg bottom hairline runs unbroken under both — the short
-          `self-start h-7` button can't carry the line itself. NO `min-w-0`: its
-          min-content (the shrink-0 button + the spacer's `min-w-10`) is its floor,
-          so under many-tab overflow the tabs shrink to reserve it instead of it
-          collapsing to 0 and clipping the button. */}
+      {/* The new-conversation button + drag spacer + close-all button are the
+          Reorder.Group's own trailing children, so they share the tabs' flex
+          line — New hugs the last tab, the spacer fills the leftover row as a
+          window-drag region, and Close All stays at the far right. They are not
+          Reorder.Items, so dragging a tab only ever permutes the tabs. Wrapped
+          in one `flex-1` `ws-strip-line` box so the workspace-bg bottom hairline
+          runs unbroken under all three — the short `self-start h-7` buttons
+          can't carry the line themselves. NO `min-w-0`: its min-content (the
+          shrink-0 buttons + the spacer's `min-w-10`) is its floor, so under
+          many-tab overflow the tabs shrink to reserve the controls instead of
+          clipping them. */}
       <div
         // `relative` anchors two decorative pseudo-elements: the
         // `data-adjacent-active` inset baseline (globals.css `.ws-strip-line`
@@ -414,15 +424,24 @@ export function TabBar({ groupId }: TabBarProps) {
         </button>
         {/* Drag spacer, floored at `min-w-10` (40px) instead of `min-w-0`: even
             when many tabs overflow and squeeze this region, a grabbable
-            window-drag gap always remains to the RIGHT of the new-conversation
-            button, so the button never reaches the strip's right edge and the
-            packed strip stays draggable. Group strips keep the drag region too:
-            while split there is NO dedicated title-bar row above the shells
-            (the workspace layout drops it), so each strip's tail is that
-            group's slice of the window-drag surface — for the top row it IS
-            the title bar, and lower rows offer the same grab area, mirroring
-            the unsplit strip. */}
+            window-drag gap always remains between New and the far-right Close
+            All control. Group strips keep the drag region too: while split
+            there is NO dedicated title-bar row above the shells (the workspace
+            layout drops it), so each strip's tail is that group's slice of the
+            window-drag surface — for the top row it IS the title bar, and lower
+            rows offer the same grab area, mirroring the unsplit strip. */}
         <div data-tauri-drag-region className="h-full min-w-10 flex-1" />
+        {showCloseAll && (
+          <button
+            type="button"
+            onClick={closeAllTabs}
+            className="mx-1 flex h-7 w-7 shrink-0 items-center justify-center self-start rounded-full text-muted-foreground backdrop-blur-sm transition-colors hover:bg-destructive/10 hover:text-destructive"
+            aria-label={tTabs("closeAll")}
+            title={tTabs("closeAll")}
+          >
+            <ListX className="h-3.5 w-3.5" />
+          </button>
+        )}
       </div>
     </Reorder.Group>
   )

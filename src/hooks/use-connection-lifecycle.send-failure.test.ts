@@ -18,6 +18,7 @@ import { act, renderHook } from "@testing-library/react"
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
 import { TurnBusyError } from "@/lib/turn-busy"
+import { SessionRestorePendingError } from "@/lib/session-restore"
 
 const toastError = vi.fn()
 
@@ -151,7 +152,7 @@ describe("useConnectionLifecycle send-failure surfacing", () => {
     })
 
     expect(onSendFailed).toHaveBeenCalledTimes(1)
-    expect(onSendFailed).toHaveBeenCalledWith(error)
+    expect(onSendFailed).toHaveBeenCalledWith(error, false)
     // Toast first, then the state rollback — the rollback must not hide the
     // failure from the user.
     expect(calls).toEqual(["toast", "onSendFailed"])
@@ -173,6 +174,25 @@ describe("useConnectionLifecycle send-failure surfacing", () => {
     })
 
     expect(onTurnInProgress).toHaveBeenCalledTimes(1)
+    expect(onSendFailed).not.toHaveBeenCalled()
+    expect(toastError).not.toHaveBeenCalled()
+  })
+
+  it("routes restore-pending to the durable queue without an error toast", async () => {
+    sendPrompt.mockRejectedValue(new SessionRestorePendingError())
+    const onSessionRestorePending = vi.fn()
+    const onSendFailed = vi.fn()
+
+    const { result } = renderLifecycle()
+    await act(async () => {
+      result.current.handleSend(draft(), null, {
+        onSessionRestorePending,
+        onSendFailed,
+      })
+      await flush()
+    })
+
+    expect(onSessionRestorePending).toHaveBeenCalledTimes(1)
     expect(onSendFailed).not.toHaveBeenCalled()
     expect(toastError).not.toHaveBeenCalled()
   })

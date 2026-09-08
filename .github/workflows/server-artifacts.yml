@@ -1,0 +1,333 @@
+name: Fork Artifacts
+
+# Fork-friendly desktop and standalone server builds. A branch push uploads the
+# bundles as workflow artifacts and publishes the same files in a snapshot
+# prerelease; a manual run only produces workflow artifacts. Unlike release.yml,
+# this needs no signing or notarization secrets.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - custom/fork-features
+
+concurrency:
+  # A SHA-specific group keeps reruns orderly without cancelling a previous
+  # push: every distinct pushed commit must be able to reach publish-release.
+  group: fork-artifacts-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  build-client:
+    name: codeg-client ${{ matrix.os }}-x64
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            bundles: nsis
+            bundle_path: src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+          shared-key: client-${{ matrix.target }}
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Stage codeg-mcp sidecar
+        run: pnpm tauri:prepare-sidecars --target ${{ matrix.target }}
+
+      - name: Build unsigned x64 desktop bundle
+        shell: bash
+        env:
+          CODEG_SKIP_SIDECAR: "1"
+        run: >-
+          pnpm tauri build
+          --target ${{ matrix.target }}
+          --bundles ${{ matrix.bundles }}
+          --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: codeg-client-${{ matrix.os }}-x64
+          path: ${{ matrix.bundle_path }}
+          retention-days: 14
+          if-no-files-found: error
+
+  build-server:
+    name: codeg-server ${{ matrix.os }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows
+            arch: x64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+          shared-key: server-${{ matrix.os }}-${{ matrix.arch }}
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build static frontend
+        run: pnpm build
+
+      # `--no-default-features` drops the `tauri-runtime` feature, so the server
+      # and its stdio MCP companion build with no webkit/appindicator system
+      # deps (the same command `test.yml`'s server job compiles on a bare
+      # ubuntu runner). Both bins land in the target-specific release folder.
+      - name: Build server binaries
+        working-directory: src-tauri
+        run: cargo build --release --bin codeg-server --bin codeg-mcp --no-default-features --target ${{ matrix.target }}
+
+      # Bundle a runnable server: the two binaries side-by-side (codeg-mcp must
+      # sit next to codeg-server for its exe-sibling lookup) + the static export
+      # as `./web` (auto-detected by `find_static_dir_standalone`).
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          NAME="codeg-server-${{ matrix.os }}-${{ matrix.arch }}"
+          mkdir -p "dist/$NAME/web"
+          cp "src-tauri/target/${{ matrix.target }}/release/codeg-server" "src-tauri/target/${{ matrix.target }}/release/codeg-mcp" "dist/$NAME/"
+          cp -R out/. "dist/$NAME/web/"
+          cat > "dist/$NAME/README.txt" <<'EOF'
+          codeg-server standalone build.
+
+          Run from THIS folder so the bundled ./web static UI is auto-detected:
+
+              CODEG_TOKEN=your-secret ./codeg-server
+
+          Then open http://<host>:3080/ and enter the token.
+
+          Optional env:
+            CODEG_PORT        listen port (default 3080)
+            CODEG_HOST        bind host (default 0.0.0.0)
+            CODEG_DATA_DIR    data/db directory
+            CODEG_STATIC_DIR  static web root (defaults to ./web next to the binary)
+
+          `codeg-mcp` must stay next to `codeg-server`.
+          EOF
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $NAME = "codeg-server-${{ matrix.os }}-${{ matrix.arch }}"
+          New-Item -ItemType Directory -Force "dist/$NAME/web" | Out-Null
+          Copy-Item "src-tauri/target/${{ matrix.target }}/release/codeg-server.exe","src-tauri/target/${{ matrix.target }}/release/codeg-mcp.exe" "dist/$NAME/"
+          Copy-Item -Recurse -Force "out/*" "dist/$NAME/web/"
+          @'
+          codeg-server standalone build.
+
+          Run from THIS folder so the bundled .\web static UI is auto-detected:
+
+              $env:CODEG_TOKEN="your-secret"; .\codeg-server.exe
+
+          Then open http://<host>:3080/ and enter the token.
+
+          Optional env:
+            CODEG_PORT        listen port (default 3080)
+            CODEG_HOST        bind host (default 0.0.0.0)
+            CODEG_DATA_DIR    data/db directory
+            CODEG_STATIC_DIR  static web root (defaults to .\web next to the binary)
+
+          codeg-mcp.exe must stay next to codeg-server.exe.
+          '@ | Out-File -Encoding utf8 "dist/$NAME/README.txt"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: codeg-server-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/codeg-server-${{ matrix.os }}-${{ matrix.arch }}
+          retention-days: 14
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish snapshot release
+    if: github.event_name == 'push'
+    needs: [build-client, build-server]
+    runs-on: ubuntu-22.04
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download desktop bundles
+        uses: actions/download-artifact@v4
+        with:
+          pattern: codeg-client-*
+          path: release-assets
+          merge-multiple: true
+
+      # Keep server artifacts in separate directories. Merging them would make
+      # their codeg-server/codeg-mcp binaries and web trees overwrite each other.
+      - name: Download standalone server bundles
+        uses: actions/download-artifact@v4
+        with:
+          pattern: codeg-server-*
+          path: server-artifacts
+
+      - name: Package server bundles and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! command -v zip > /dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y zip
+          fi
+
+          for directory in server-artifacts/codeg-server-*; do
+            name="$(basename "$directory")"
+            if [[ "$name" == *-windows-* ]]; then
+              (
+                cd server-artifacts
+                zip -q -r "../release-assets/$name.zip" "$name"
+              )
+            else
+              # upload-artifact/download-artifact normalizes file modes. Put
+              # the executable bit back before wrapping Unix bundles in tar.
+              find "$directory" -type f \
+                \( -name codeg-server -o -name codeg-mcp \) \
+                -exec chmod 755 {} +
+              tar -C server-artifacts -czf "release-assets/$name.tar.gz" "$name"
+            fi
+          done
+
+          if ! compgen -G 'release-assets/*' > /dev/null; then
+            echo 'No release assets were prepared.'
+            exit 1
+          fi
+
+          (
+            cd release-assets
+            sha256sum ./* > SHA256SUMS.txt
+          )
+
+          setup_count="$(
+            find release-assets -maxdepth 1 -type f \
+              -name 'codeg_*_x64-setup.exe' \
+              | wc -l
+          )"
+          actual_count="$(find release-assets -maxdepth 1 -type f | wc -l)"
+          test -s release-assets/codeg-server-windows-x64.zip
+          test -s release-assets/SHA256SUMS.txt
+          if [ "$setup_count" -ne 1 ] || [ "$actual_count" -ne 3 ]; then
+            echo 'Expected only Windows setup, Windows Server, and SHA256SUMS.txt'
+            find release-assets -maxdepth 1 -type f -printf '%f\n' | sort
+            exit 1
+          fi
+
+      - id: release-meta
+        name: Generate release metadata and notes
+        shell: bash
+        env:
+          BASE_BRANCH: main
+        run: |
+          set -euo pipefail
+
+          git fetch --no-tags origin "$BASE_BRANCH"
+
+          short_sha="${GITHUB_SHA::12}"
+          tag="snapshot-$short_sha"
+          title="Codeg custom snapshot $short_sha"
+          compare_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/compare/${BASE_BRANCH}...${GITHUB_SHA}"
+          commits="$(git log --reverse --no-merges --format='- %s (`%h`)' "origin/$BASE_BRANCH..$GITHUB_SHA")"
+
+          {
+            cat .github/release-notes/custom-fork.md
+            printf '\n## 相对 `%s` 的提交\n\n' "$BASE_BRANCH"
+            if [[ -n "$commits" ]]; then
+              printf '%s\n' "$commits"
+            else
+              printf '_当前提交与 `%s` 没有差异。_\n' "$BASE_BRANCH"
+            fi
+            printf '\n[查看相对 `%s` 的完整差异](%s)\n' "$BASE_BRANCH" "$compare_url"
+          } > release-notes.md
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "title=$title" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update snapshot prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release-meta.outputs.tag }}
+          TITLE: ${{ steps.release-meta.outputs.title }}
+        run: |
+          set -euo pipefail
+
+          release_is_draft="$(
+            gh release view "$TAG" --json isDraft --jq .isDraft 2> /dev/null || true
+          )"
+
+          if [[ "$release_is_draft" == "false" ]]; then
+            echo "Release $TAG is already published; nothing to update."
+            exit 0
+          elif [[ "$release_is_draft" == "true" ]]; then
+            gh release edit "$TAG" \
+              --title "$TITLE" \
+              --notes-file release-notes.md
+          else
+            gh release create "$TAG" \
+              --draft \
+              --target "$GITHUB_SHA" \
+              --title "$TITLE" \
+              --notes-file release-notes.md
+          fi
+
+          gh release upload "$TAG" release-assets/* --clobber
+          gh release edit "$TAG" --draft=false --prerelease

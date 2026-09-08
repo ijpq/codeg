@@ -133,6 +133,20 @@ describe("ChatInput slash-command loading window", () => {
     ).toBe(true)
   })
 
+  it("preserves running-turn controls while the refreshed snapshot is loading", () => {
+    const props = renderStatus({
+      status: "prompting",
+      selectorsLoading: true,
+    })
+    // `disabled` protects ordinary prompt submission during attach, while
+    // `isPrompting` keeps MessageInput's Stop/queue/guide routing active.
+    expect(props).toMatchObject({
+      disabled: true,
+      isPrompting: true,
+      onCancel: expect.any(Function),
+    })
+  })
+
   it("stops once the session is initialized", () => {
     expect(
       renderStatus({ status: "connected", selectorsLoading: false })

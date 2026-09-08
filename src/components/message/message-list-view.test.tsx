@@ -6,7 +6,12 @@ import {
   extractDelegationSources,
   isForkPointUnnamed,
   markThreadTail,
+  appendUnassociatedDeliverablesTail,
+  associateDeliverablesWithUserTurns,
   mergeConsecutiveAssistantTurns,
+  replyDeliverablesForRun,
+  resolveDeliverableAssociations,
+  resolveMessageThreadResizeBehavior,
   singletonSourceTurns,
   type MergedAssistantRunCache,
   type ReplyFoldState,
@@ -14,11 +19,33 @@ import {
   type ThreadRenderItem,
 } from "./message-list-view"
 import type { AdaptedContentPart } from "@/lib/adapters/ai-elements-adapter"
-import type { MessageTurn } from "@/lib/types"
+import type {
+  ConversationDeliverable,
+  ConversationTurnDeliverableSet,
+  MessageTurn,
+} from "@/lib/types"
 
 function turn(id: string): MessageTurn {
   return { id, role: "assistant", blocks: [], timestamp: "" }
 }
+
+describe("resolveMessageThreadResizeBehavior", () => {
+  it("pins an active loaded transcript immediately as streaming rows resize", () => {
+    expect(resolveMessageThreadResizeBehavior(true, false, true)).toBe(
+      "instant"
+    )
+  })
+
+  it("keeps smooth resizing while a transcript is inactive, loading, or empty", () => {
+    expect(resolveMessageThreadResizeBehavior(false, false, true)).toBe(
+      "smooth"
+    )
+    expect(resolveMessageThreadResizeBehavior(true, true, true)).toBe("smooth")
+    expect(resolveMessageThreadResizeBehavior(true, false, false)).toBe(
+      "smooth"
+    )
+  })
+})
 
 type ThreadItem = Parameters<typeof mergeConsecutiveAssistantTurns>[0][number]
 type TurnItem = Extract<ThreadItem, { kind: "turn" }>
@@ -43,6 +70,7 @@ function assistantItem(
     showStats: false,
     isRoleTransition: false,
     previousUserIndex: null,
+    previousUserId: null,
     isLastAssistantRun: false,
     isThreadTail: false,
     sourceTurns: [],
@@ -313,6 +341,259 @@ describe("mergeConsecutiveAssistantTurns", () => {
   })
 })
 
+describe("associateDeliverablesWithUserTurns", () => {
+  const deliverable = (
+    id: string,
+    overrides: Partial<ConversationDeliverable> = {}
+  ) =>
+    ({
+      id,
+      role: "primary",
+      category: "standalone_output",
+      source: "declared",
+      is_valid: true,
+      ...overrides,
+    }) as ConversationDeliverable
+  const run = (
+    id: string,
+    clientMessageId: string | null,
+    startedAt: string,
+    completedAt: string,
+    outputId: string
+  ): ConversationTurnDeliverableSet => ({
+    turn_run_id: id,
+    conversation_id: 1,
+    client_message_id: clientMessageId,
+    started_at: startedAt,
+    completed_at: completedAt,
+    deliverables: [deliverable(outputId)],
+  })
+
+  it("uses the exact live client message id when it still exists", () => {
+    const mapped = associateDeliverablesWithUserTurns(
+      [
+        run(
+          "run-1",
+          "optimistic-1",
+          "2026-07-20T10:00:00Z",
+          "2026-07-20T10:01:00Z",
+          "output-1"
+        ),
+      ],
+      [{ id: "optimistic-1", timestamp: "2026-07-20T10:00:01Z" }]
+    )
+    expect(mapped.get("optimistic-1")?.[0].id).toBe("output-1")
+  })
+
+  it("prefers the backend durable user turn id on a different machine", () => {
+    const linked = run(
+      "run-1",
+      "optimistic-only-on-sender",
+      "2026-07-20T10:00:00Z",
+      "2026-07-20T10:01:00Z",
+      "output-1"
+    )
+    linked.user_turn_id = "parsed-user-turn"
+    const mapped = associateDeliverablesWithUserTurns(
+      [linked],
+      [{ id: "parsed-user-turn", timestamp: "2026-07-20T12:00:00Z" }]
+    )
+    expect(mapped.get("parsed-user-turn")?.[0].id).toBe("output-1")
+  })
+
+  it("recovers the producing reply by timestamp after a cold parser reload", () => {
+    const mapped = associateDeliverablesWithUserTurns(
+      [
+        run(
+          "run-1",
+          "optimistic-gone",
+          "2026-07-20T10:00:00Z",
+          "2026-07-20T10:05:00Z",
+          "output-1"
+        ),
+      ],
+      [
+        { id: "old-turn", timestamp: "2026-07-20T09:00:00Z" },
+        { id: "parsed-user-turn", timestamp: "2026-07-20T10:00:01Z" },
+        // A steer recorded later in the same run must not steal the card from
+        // the initial user prompt.
+        { id: "parsed-steer", timestamp: "2026-07-20T10:03:00Z" },
+      ]
+    )
+    expect(mapped.get("parsed-user-turn")?.[0].id).toBe("output-1")
+    expect(mapped.has("old-turn")).toBe(false)
+    expect(mapped.has("parsed-steer")).toBe(false)
+  })
+
+  it("does not guess when every user turn is outside the run window", () => {
+    const mapped = associateDeliverablesWithUserTurns(
+      [
+        run(
+          "run-1",
+          "optimistic-gone",
+          "2026-07-20T10:00:00Z",
+          "2026-07-20T10:01:00Z",
+          "output-1"
+        ),
+      ],
+      [{ id: "unrelated", timestamp: "2026-07-20T12:00:00Z" }]
+    )
+    expect(mapped.size).toBe(0)
+  })
+})
+
+describe("replyDeliverablesForRun", () => {
+  const output = (
+    id: string,
+    overrides: Partial<ConversationDeliverable> = {}
+  ) =>
+    ({
+      id,
+      role: "primary",
+      category: "standalone_output",
+      source: "declared",
+      is_valid: true,
+      change_kind: "created",
+      ...overrides,
+    }) as ConversationDeliverable
+
+  it("treats every explicit declaration as the authoritative turn set", () => {
+    const all = [
+      output("report"),
+      output("supporting", { role: "supporting" }),
+      output("source", { category: "code_change" }),
+      output("missing-inferred", { source: "inferred", is_valid: false }),
+      output("expected-inferred", { source: "inferred" }),
+    ]
+    expect(replyDeliverablesForRun(all).map((item) => item.id)).toEqual([
+      "report",
+      "supporting",
+      "source",
+    ])
+    expect(all).toHaveLength(5)
+  })
+
+  it("shows supporting declarations and ignores inferred QA noise", () => {
+    const all = [
+      output("designed-pdf", { role: "supporting" }),
+      output("source", {
+        role: "supporting",
+        category: "code_change",
+      }),
+      output("ambiguous-image", {
+        role: "supporting",
+        source: "inferred",
+      }),
+    ]
+
+    expect(replyDeliverablesForRun(all).map((item) => item.id)).toEqual([
+      "designed-pdf",
+      "source",
+    ])
+  })
+
+  it("does not hide a turn that contains multiple declared primary files", () => {
+    const all = [
+      output("final-pdf"),
+      output("second-primary-pdf"),
+      output("qa-page-1", { source: "inferred" }),
+      output("merged-docx", { role: "supporting" }),
+    ]
+
+    expect(replyDeliverablesForRun(all).map((item) => item.id)).toEqual([
+      "final-pdf",
+      "second-primary-pdf",
+      "merged-docx",
+    ])
+  })
+
+  it("shows server-filtered inferred outputs and omits empty cards", () => {
+    expect(replyDeliverablesForRun([])).toEqual([])
+    expect(
+      replyDeliverablesForRun([
+        output("qa-supporting", {
+          role: "supporting",
+          source: "inferred",
+        }),
+      ])
+    ).toHaveLength(1)
+    expect(
+      replyDeliverablesForRun([
+        output("invalid", {
+          source: "inferred",
+          is_valid: false,
+        }),
+      ])
+    ).toEqual([])
+  })
+})
+
+describe("resolveDeliverableAssociations", () => {
+  const declared = {
+    id: "published-pdf",
+    role: "primary",
+    category: "standalone_output",
+    source: "declared",
+    is_valid: true,
+    change_kind: "created",
+  } as ConversationDeliverable
+
+  it("retains a persisted declaration when historical turn linkage is missing", () => {
+    const result = resolveDeliverableAssociations(
+      [
+        {
+          turn_run_id: "run-orphaned",
+          conversation_id: 1,
+          client_message_id: null,
+          user_turn_id: null,
+          started_at: "invalid",
+          completed_at: "invalid",
+          deliverables: [declared],
+        },
+      ],
+      [{ id: "parsed-user", timestamp: "2026-08-05T03:01:20Z" }]
+    )
+
+    expect(result.byUserId.size).toBe(0)
+    expect(result.unassociated.map((item) => item.id)).toEqual([
+      "published-pdf",
+    ])
+  })
+
+  it("does not manufacture an unassociated card for a turn without outputs", () => {
+    const result = resolveDeliverableAssociations(
+      [
+        {
+          turn_run_id: "run-empty",
+          conversation_id: 1,
+          client_message_id: null,
+          user_turn_id: null,
+          started_at: "2026-08-05T03:01:20Z",
+          completed_at: "2026-08-05T03:02:20Z",
+          deliverables: [],
+        },
+      ],
+      [{ id: "parsed-user", timestamp: "2026-08-05T03:01:20Z" }]
+    )
+
+    expect(result.byUserId.size).toBe(0)
+    expect(result.unassociated).toEqual([])
+  })
+
+  it("keeps unmatched durable outputs visible in a conversation-tail card", () => {
+    const items: ThreadRenderItem[] = []
+    const withTail = appendUnassociatedDeliverablesTail(items, [declared])
+
+    expect(withTail).toHaveLength(1)
+    expect(withTail[0]).toMatchObject({
+      key: "unassociated-deliverables-tail",
+      kind: "deliverables",
+      deliverables: [declared],
+    })
+    expect(appendUnassociatedDeliverablesTail(items, [])).toBe(items)
+  })
+})
+
 function makeGroup(
   role: "user" | "assistant",
   id: string
@@ -321,7 +602,7 @@ function makeGroup(
 }
 
 // Fresh render-item objects per call, like the rawItems map in threadItems —
-// only `group`, `key`, and the sourceTurns wrapper carry identity.
+// only `group` and `key` carry identity.
 function makeItem(
   group: ResolvedMessageGroup,
   index: number,
@@ -336,6 +617,7 @@ function makeItem(
     showStats: false,
     isRoleTransition: false,
     previousUserIndex: null,
+    previousUserId: null,
     isLastAssistantRun: false,
     isThreadTail: false,
     sourceTurns: singletonSourceTurns(turn(group.id)),
@@ -351,7 +633,7 @@ function makeUserItem(id: string, index: number): ThreadRenderItem {
 }
 
 describe("mergeConsecutiveAssistantTurns merged-run cache", () => {
-  it("reuses the merged item (group/parts/sourceTurns) when membership is unchanged", () => {
+  it("reuses the merged item and group when membership is unchanged", () => {
     const cache: MergedAssistantRunCache = new WeakMap()
     const g1 = makeGroup("assistant", "a1")
     const g2 = makeGroup("assistant", "a2")
@@ -374,7 +656,6 @@ describe("mergeConsecutiveAssistantTurns merged-run cache", () => {
     expect(second).toBe(first)
     expect(second.group).toBe(first.group)
     expect(second.group.parts).toBe(first.group.parts)
-    expect(second.sourceTurns).toBe(first.sourceTurns)
     expect(first.key).toBe("merged-persisted-a1-0")
     expect(first.group.id).toBe("a1")
   })

@@ -1042,7 +1042,8 @@
       "loggedIn": "アカウントにログイン済み",
       "loginRelogin": "再ログイン / アカウント切替",
       "loginTimeout": "ログインがタイムアウトしました。再試行してください",
-      "loginSaveFailed": "ログインは成功しましたが、設定の保存に失敗しました"
+      "loginSaveFailed": "ログインは成功しましたが、設定の保存に失敗しました",
+      "selectReasoningEffort": "Reasoning Effort を選択"
     },
     "gemini": {
       "authConfig": "Gemini 認証設定",
@@ -1324,7 +1325,13 @@
       "sendAttributionHeader": "API に帰属/課金識別子を送信",
       "sendAttributionHeaderAria": "API に Claude Code の帰属/課金識別子を送信",
       "disableNonessentialTraffic": "テレメトリや不要なネットワークリクエストを無効化",
-      "disableNonessentialTrafficAria": "Claude Code のテレメトリや不要なネットワークリクエストを無効化"
+      "disableNonessentialTrafficAria": "Claude Code のテレメトリや不要なネットワークリクエストを無効化",
+      "effortLevel": "推論レベル",
+      "effortLevelDefault": "デフォルトレベル",
+      "effortLevel_low": "低",
+      "effortLevel_medium": "中",
+      "effortLevel_high": "高",
+      "effortLevel_xhigh": "超高"
     },
     "dialogs": {
       "confirmDeleteProvider": "Provider {providerId} を削除しますか？",
@@ -1777,7 +1784,8 @@
         "updateGroupFailed": "グループの更新に失敗しました: {message}",
         "deleteGroupFailed": "グループの削除に失敗しました: {message}",
         "moveToGroupFailed": "フォルダの移動に失敗しました: {message}",
-        "applyLayoutFailed": "フォルダの並び順の保存に失敗しました: {message}"
+        "applyLayoutFailed": "フォルダの並び順の保存に失敗しました: {message}",
+        "reorderFoldersFailed": "フォルダの並べ替えに失敗しました: {message}"
       },
       "statsLabel": "{folders} フォルダ · {convos} 会話",
       "reorderHandle": "ドラッグして並べ替え",
@@ -1918,7 +1926,46 @@
         "toolResult": "結果",
         "toolError": "エラー"
       },
-      "moreActions": "その他の操作"
+      "moreActions": "その他の操作",
+      "steerInjected": "現在のターンに指示を注入しました",
+      "steerFallbackFeedback": "ネイティブ誘導が利用できないため、リアルタイムフィードバックとして送信しました",
+      "steerTurnEndedQueued": "ターンが終了したため、次のメッセージとしてキューに追加しました",
+      "imageSteerQueued": "実行中のターンには画像を追加できないため、次のメッセージとしてキューに追加しました",
+      "promptAcceptanceUnknown": "接続が中断されました。バックエンドの受信状況を確認しています",
+      "steerUnsupportedQueued": "ネイティブ誘導が利用できないため、次のメッセージとしてキューに追加しました",
+      "steerFailedQueued": "誘導に失敗したため、次のメッセージとしてキューに追加しました",
+      "steerWaitingRestore": "ガイドを保存し、元のセッションの復旧を待っています",
+      "steerOriginalTurnEnded": "元のタスクは終了したため、このガイドは送信されませんでした",
+      "branch": {
+        "create": "ブランチを作成",
+        "createFromMessage": "ここからブランチを作成",
+        "nativeCreated": "独立したネイティブブランチを作成しました",
+        "snapshotCreated": "コンテキストスナップショットからブランチを作成しました",
+        "provisionalCreated": "ブランチのスナップショットを準備しました。最初のメッセージを送信できます",
+        "runningForkHint": "Fork & Send は現在のターンの完了を待ちます。今すぐ分岐するには「ブランチを作成」を使用してください。最後に完了したターンまでを継承します。作業ディレクトリは共有されるため、同じファイルの同時編集は避けてください。",
+        "source": "分岐元：{title}",
+        "sourceDeleted": "削除された分岐元：{title}",
+        "sourceDeletedHint": "元の会話は削除されましたが、このブランチは独立して利用できます。",
+        "nativeMode": "ネイティブブランチ",
+        "snapshotMode": "コンテキストスナップショット",
+        "inheritanceRange": "{boundary} までの {count} 件のメッセージ",
+        "inheritanceTruncated": "コンテキスト圧縮済み",
+        "pendingFirstPrompt": "最初のメッセージによる初期化待ち",
+        "retryableFailed": "初期化を再試行できます",
+        "merge": "メイン会話へマージ",
+        "mergeSuccess": "メイン会話へマージしました（成果物 {count} 件）",
+        "mergePreparing": "マージを準備中…",
+        "mergeDeterminingBoundary": "分岐境界を確認中…",
+        "mergeExtractingIncrement": "ブランチの差分を抽出中…",
+        "mergeWritingSource": "メイン会話へ書き込み中…",
+        "mergeCompleted": "マージが完了しました",
+        "mergeFailed": "マージに失敗しました。再試行できます",
+        "mergeDescription": "結論と選択した成果物のみを追加し、既存履歴は書き換えません。",
+        "summaryPlaceholder": "戻す結論を入力",
+        "selectMessages": "戻す表示可能な返信を選択（本文は編集できます）",
+        "mergeKeep": "マージしてブランチを継続",
+        "mergeArchive": "マージしてブランチを完了にする"
+      }
     },
     "sessionDetails": {
       "menuLabel": "セッション詳細",
@@ -2035,6 +2082,8 @@
         "contextWindowUsageAria": "コンテキストウィンドウ使用率",
         "contextWindow": "コンテキストウィンドウ",
         "usedMax": "使用 / 最大",
+        "source": "ソース",
+        "contextSource": "ランタイム応答",
         "tokenUsage": "トークン使用量",
         "input": "入力",
         "output": "出力",
@@ -2047,7 +2096,8 @@
         "groups": {
           "workspace": "ワークスペース",
           "navigation": "ナビゲーション",
-          "more": "その他"
+          "more": "その他",
+          "sessions": "セッション"
         },
         "showPet": "ペットを表示"
       },
@@ -2093,6 +2143,18 @@
         "loadFailed": "状態を取得できませんでした: {message}",
         "openSettings": "詳細設定を開く",
         "refresh": "更新"
+      },
+      "quota": {
+        "summary": "{plan} · 週間残量 {remaining}",
+        "lastRoutedPlan": "直近のリクエストで使用したプラン",
+        "weeklyShort": "週残",
+        "weeklyRemaining": "週間残量",
+        "weeklyUsed": "週間使用量",
+        "resetsAt": "リセット日時",
+        "observedAt": "更新日時",
+        "refresh": "残量を更新",
+        "unknown": "不明",
+        "sourceHint": "直近の実 Codex 応答から取得し、中継への追加リクエストは行いません。"
       }
     },
     "auxPanel": {
@@ -2956,7 +3018,9 @@
       "chatInput": {
         "connecting": "接続中...",
         "agentResponding": "{agent} が応答中...",
-        "sendMessage": "メッセージを送信..."
+        "sendMessage": "メッセージを送信...",
+        "stopping": "停止しています...",
+        "guideAgent": "{agent} の現在のターンを誘導..."
       },
       "messageInput": {
         "askAnything": "何でも質問してください...",
@@ -3020,14 +3084,28 @@
         "mentionGroupAgent": "エージェント",
         "mentionGroupSession": "セッション",
         "mentionGroupCommit": "コミット",
-        "mentionGroupSkill": "スキル"
+        "mentionGroupSkill": "スキル",
+        "stopping": "停止しています...",
+        "steer": "現在のターンを誘導",
+        "steerSending": "指示を注入中...",
+        "forkAndSend": "フォークして送信",
+        "steerAttachmentsUnsupported": "テキストのみ対応です。添付ファイル付きの下書きはキューをご利用ください。"
       },
       "messageQueue": {
         "addToQueue": "キューに追加",
         "saveEdit": "保存",
         "cancelEdit": "編集をキャンセル",
         "editItem": "編集",
-        "deleteItem": "削除"
+        "deleteItem": "削除",
+        "queued": "キュー済み",
+        "waiting_source_turn": "元のタスクの完了を待機中",
+        "creating_branch": "ブランチを作成中",
+        "waiting_session_restore": "セッションの復旧待ち",
+        "waiting_connection": "接続の再試行待ち",
+        "failed": "送信失敗",
+        "expired_guide": "元のタスクは終了済み",
+        "retry": "再試行",
+        "sendAsPrompt": "新しいメッセージとして送信"
       },
       "welcomeInputPanel": {
         "agentsSettingsPath": "設定 > エージェント",
@@ -3071,7 +3149,8 @@
           "liveFeedback": "「+」メニューのライブフィードバックを使えば、エージェントが実行中のターンに、中断させずにメモを差し込めます。",
           "skillPacks": "設定 → スキルパックには、コーディング専門家・科学研究・オフィス作業のスキルがまとまっています。エージェントごとに有効化できます。",
           "modelProviders": "設定 → モデルプロバイダーでは自分の API キーやエンドポイントを登録でき、モデルは入力欄からそのまま切り替えられます。",
-          "workspaceBackground": "設定 → 外観では、ワークスペースの背景画像・パネルの不透明度・アプリのフォントを変更できます。"
+          "workspaceBackground": "設定 → 外観では、ワークスペースの背景画像・パネルの不透明度・アプリのフォントを変更できます。",
+          "forkSend": "送信ボタンのドロップダウンで「分岐して送信」を選ぶと、現在の地点から新しいタブに分岐できます"
         },
         "quickActions": {
           "excel": "Excel ブック",
@@ -3304,7 +3383,18 @@
         "completedAt": "完了時刻",
         "jumpToPreviousUserMessage": "前のユーザーメッセージへ",
         "showMore": "もっと見る",
-        "showLess": "折りたたむ"
+        "showLess": "折りたたむ",
+        "loadEarlierHistory": "以前のメッセージを読み込む",
+        "retryEarlierHistory": "以前のメッセージを再読み込み",
+        "delivery": {
+          "submitting": "送信中…",
+          "accepted": "送信済み",
+          "running": "バックエンド処理中",
+          "persisted": "保存済み",
+          "completed": "完了",
+          "failed": "送信状態を確認中",
+          "queued": "キュー済み"
+        }
       },
       "liveTurnStats": {
         "thinking": "考え中...",
@@ -3313,7 +3403,28 @@
         "elapsedMinutes": "{value}分",
         "elapsedSeconds": "{value}秒",
         "outputSpeedAria": "推定出力速度",
-        "outputSpeedTooltip": "推定出力速度（テキスト + 思考）"
+        "outputSpeedTooltip": "推定出力速度（テキスト + 思考）",
+        "sent": "送信済み",
+        "backendProcessing": "バックエンド処理中",
+        "stillProcessing": "バックエンドで処理を継続中",
+        "toolUseCount": "{count} 回のツール使用",
+        "diagnostics": {
+          "open": "接続診断",
+          "title": "生成の診断",
+          "phase": "現在の段階",
+          "phaseThinking": "思考中",
+          "phaseTool": "ツール実行中",
+          "phaseOutput": "応答を出力中",
+          "phaseWaiting": "応答待ち",
+          "sinceLastData": "最後の受信からの経過",
+          "testLink": "接続をテスト",
+          "testing": "テスト中…",
+          "reachable": "到達可能 · HTTP {status} · {latency}ms",
+          "unreachable": "接続できません · {error}",
+          "notConfigured": "公式への直接接続のため、テスト対象がありません。",
+          "hintReachable": "接続は正常です。しばらく新しいデータが来ない場合は、モデルが処理中の可能性が高いです。",
+          "hintUnreachable": "接続に問題があります。ネットワーク/トンネルが停止している可能性があります。"
+        }
       },
       "jsonTree": {
         "viewRaw": "生の JSON を表示",
@@ -3539,7 +3650,8 @@
           "reviewKept": "プランモードを維持",
           "reviewPending": "計画の判断待ち",
           "submitted": "計画を送信しました",
-          "switched": "モードを切り替え"
+          "switched": "モードを切り替え",
+          "planLabel": "計画"
         },
         "backgroundTask": {
           "title": "バックグラウンドタスク",
@@ -3557,7 +3669,9 @@
           "outputMissing": "codex がスクリプト出力を切り詰めた際にこのコマンドの区切り行が失われたため、出力を割り当てられませんでした。",
           "sharedWith": "この範囲には {commands} の出力も含まれます — 区切り行が codex により切り捨てられました。",
           "truncated": "切り詰め済み"
-        }
+        },
+        "loadBranchMergeSummary": "完全なマージ概要を読み込む",
+        "loadingBranchMergeSummary": "マージ概要を読み込み中…"
       },
       "messageNav": {
         "title": "メッセージナビ",
@@ -3575,7 +3689,9 @@
         "openFile": "{filePath} を開く",
         "openInEditor": "エディタで開く",
         "remove": "削除",
-        "noDiffDataAvailable": "{filePath} の差分データがありません"
+        "noDiffDataAvailable": "{filePath} の差分データがありません",
+        "downloadToPc": "PC にダウンロード",
+        "fileUnavailable": "ファイルが利用できないか、存在しません: {filePath}"
       },
       "askQuestion": {
         "title": "エージェントが選択を求めています",
@@ -3739,6 +3855,67 @@
       "proposedPlan": {
         "title": "提案された計画",
         "planning": "計画中…"
+      },
+      "conversationDeliverables": {
+        "collapsedSummary": "成果物 {count}",
+        "historyTitle": "成果物の履歴",
+        "loadingHistory": "成果物の履歴を読み込み中…",
+        "retry": "再試行",
+        "versions": "{count} バージョン",
+        "toggleVersions": "{count} 件の履歴バージョンを切り替え",
+        "loadMore": "さらに読み込む",
+        "title": "最終成果物",
+        "collapse": "折りたたむ",
+        "openFile": "{filePath} を開く",
+        "revealInFolder": "ファイルマネージャーで表示",
+        "primary": "メイン",
+        "supporting": "補足",
+        "downloadToPc": "PC にダウンロード",
+        "fileUnavailable": "ファイルが利用できないか、存在しません: {filePath}",
+        "turnTitle": "Outputs from this turn",
+        "download": "Download to this device",
+        "openWithDefaultAppHost": "Open with default app (Codeg host)",
+        "copyFileHost": "Copy file object (Codeg host)",
+        "copyPath": "Copy path",
+        "revealOnHost": "Reveal on the Codeg host",
+        "fileCopied": "File copied; you can paste it directly",
+        "pathCopied": "Path copied",
+        "filesCopied": "Files copied; you can paste them together",
+        "opened": "Opened with the Codeg host's default app",
+        "operationFailed": "Deliverable operation failed",
+        "declared": "Declared",
+        "inferred": "Automatically inferred",
+        "codeChange": "コード変更",
+        "deleted": "削除済み",
+        "allTypes": "All types",
+        "allSources": "All sources",
+        "allTurns": "All turns",
+        "turnNumber": "Turn {number}",
+        "allTimes": "Any time",
+        "lastDay": "Last 24 hours",
+        "lastWeek": "Last 7 days",
+        "lastMonth": "Last 30 days",
+        "newest": "Recently updated",
+        "oldest": "Oldest updated",
+        "selectAll": "Select filtered items",
+        "selectedCount": "{count} selected",
+        "downloadSelected": "Download selected files individually",
+        "downloadZip": "Download selected files as ZIP",
+        "copySelectedHost": "Copy selected file objects (Codeg host)",
+        "revealFirstHost": "Reveal the first file on the Codeg host",
+        "removeInvalid": "Remove selected invalid records",
+        "removed": "Invalid records removed",
+        "downloadStarted": "Download started",
+        "revealed": "File revealed on the Codeg host",
+        "selectFile": "Select {name}",
+        "missing": "File missing",
+        "empty": "This conversation has no confirmed deliverables yet",
+        "noFilterResults": "No deliverables match these filters",
+        "hostActionNotice": "Open, copy file, and reveal actions affect the host running Codeg Server; downloads always go to the current device."
+      },
+      "userResources": {
+        "openFile": "{filePath} を開く",
+        "fileUnavailable": "ファイルが利用できないか、存在しません: {filePath}"
       }
     },
     "diffPreview": {
@@ -4056,7 +4233,17 @@
       "fr": "フランス語",
       "pt": "ポルトガル語",
       "ar": "アラビア語"
-    }
+    },
+    "defaultConversation": "Default conversation",
+    "defaultConversationHint": "Use this conversation for the first WeChat message when the sender has no saved binding.",
+    "defaultFolderId": "Folder ID",
+    "defaultConversationId": "Conversation ID",
+    "defaultAgentType": "Agent type",
+    "weixinPushMode": "WeChat push mode",
+    "weixinPushFinalOnly": "Final result only",
+    "weixinPushFinalAndInteractions": "Final result and required interactions",
+    "weixinPushDebug": "Debug mode",
+    "weixinPushModeHint": "Only the final answer is pushed by default. Expired reply tokens keep the result pending until the next inbound message."
   },
   "ModelProviderSettings": {
     "sectionTitle": "モデルプロバイダー",
@@ -4295,7 +4482,9 @@
       "syncFailed": "スキルの同期に失敗"
     },
     "autoPreviewLabel": "プレビューを自動で開く",
-    "autoPreviewHint": "エージェントが Word、Excel、PowerPoint ファイルを作成または編集したときに、ライブプレビューを自動で開きます。"
+    "autoPreviewHint": "エージェントが Word、Excel、PowerPoint ファイルを作成または編集したときに、ライブプレビューを自動で開きます。",
+    "autoDownloadProducedLabel": "最終成果物を自動ダウンロード",
+    "autoDownloadProducedHint": "Web サーバー（Tailscale/LAN 経由など）で使用する際、エージェントが宣言し検証された最終成果物ファイルを、このブラウザーのダウンロードフォルダーに自動ダウンロードします。"
   },
   "SkillPacksSettings": {
     "title": "スキルパック",
@@ -4786,7 +4975,12 @@
     "targetsDescription": "グローバルレベルを変えずに、特定モジュール（例: codeg_lib::acp）のレベルを個別に設定します。",
     "targetsAdd": "追加",
     "targetsRemove": "オーバーライドを削除",
-    "toggleDetails": "詳細を切り替え"
+    "toggleDetails": "詳細を切り替え",
+    "exportDiagnostics": "診断情報をエクスポート",
+    "exporting": "エクスポート中…",
+    "exportDescription": "アプリと実行環境、ログ設定、ログファイル情報、最近のログを JSON で出力します。一般的な認証情報は伏せられ、会話本文やデータベース内容は含まれませんが、共有前にパスとログ本文を確認してください。",
+    "exportSuccess": "診断レポートをエクスポートしました",
+    "exportFailed": "診断レポートをエクスポートできませんでした"
   },
   "Automations": {
     "title": "オートメーション",
@@ -4923,7 +5117,8 @@
     "branchLocal": "ローカル",
     "branchRemote": "リモート",
     "branchSearchPlaceholder": "ブランチを検索…",
-    "branchNone": "ブランチがありません"
+    "branchNone": "ブランチがありません",
+    "advanced": "詳細設定"
   },
   "Tasks": {
     "title": "ToDo タスク",

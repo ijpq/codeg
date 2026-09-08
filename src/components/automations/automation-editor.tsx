@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react"
 import { getAgentLabel } from "@/lib/custom-agents"
-import { ArrowLeft, Globe, Wand2 } from "lucide-react"
+import { ArrowLeft, ChevronRight, Globe, Wand2 } from "lucide-react"
 import { useTranslations } from "next-intl"
 import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
 import { AgentSelector } from "@/components/chat/agent-selector"
@@ -27,9 +27,12 @@ import {
 import { CronBuilderDialog } from "./cron-builder-dialog"
 import { useAgentOptions } from "./use-agent-options"
 import { Button } from "@/components/ui/button"
-import { Checkbox } from "@/components/ui/checkbox"
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible"
 import { Input } from "@/components/ui/input"
-import { Label } from "@/components/ui/label"
 import { FolderSelect } from "@/components/shared/folder-select"
 import { cn } from "@/lib/utils"
 import { automationComputeNextRun } from "@/lib/api"
@@ -118,6 +121,7 @@ export function AutomationEditor({
   const [saving, setSaving] = useState(false)
   const [nextRun, setNextRun] = useState<string | null>(null)
   const [cronBuilderOpen, setCronBuilderOpen] = useState(false)
+  const [cronAdvancedOpen, setCronAdvancedOpen] = useState(false)
 
   const editorRef = useRef<RichComposerHandle>(null)
   // The composer's outer box, so the `@` panel spans it like the `/` menu does.
@@ -485,11 +489,42 @@ export function AutomationEditor({
             title={t("folder")}
           />
 
-          {/* A worktree run gets its own fresh tree, so a branch only applies to
-              the shared-folder case — the picker shows there and the checkbox
-              sits after it. Ticking the checkbox switches to worktree isolation
-              and hides the picker. Enqueued tasks mint their own worktree in
-              the work-task engine, so neither control applies. */}
+          {/* Isolation — an explicit two-way choice. (Replaces a checkbox whose
+              ticking implicitly hid the branch picker, which was easy to
+              misread.) A worktree run gets its own fresh tree, so a branch only
+              applies to the shared-folder case; the picker shows only then.
+              Enqueued tasks mint their own worktree in the task engine, so
+              neither control applies. */}
+          {action === "launch_session" ? (
+            <div
+              role="group"
+              aria-label={t("isolation")}
+              className="inline-flex w-fit rounded-lg border border-border bg-card/40 p-0.5"
+            >
+              {(
+                [
+                  { value: "shared_in_root", label: t("isolationShared") },
+                  { value: "worktree_per_run", label: t("isolationWorktree") },
+                ] as Array<{ value: AutomationIsolation; label: string }>
+              ).map((opt) => (
+                <button
+                  key={opt.value}
+                  type="button"
+                  aria-pressed={isolation === opt.value}
+                  onClick={() => setIsolation(opt.value)}
+                  className={cn(
+                    "rounded-md px-3 py-1 text-xs font-medium transition-colors",
+                    isolation === opt.value
+                      ? "bg-background text-foreground shadow-sm"
+                      : "text-muted-foreground hover:text-foreground"
+                  )}
+                >
+                  {opt.label}
+                </button>
+              ))}
+            </div>
+          ) : null}
+
           {action === "launch_session" && isolation === "shared_in_root" ? (
             <AutomationBranchPicker
               folderPath={folderPath}
@@ -505,20 +540,6 @@ export function AutomationEditor({
               // combination, so don't offer it here.
               allowRemote={false}
             />
-          ) : null}
-
-          {action === "launch_session" ? (
-            <Label className="h-7 text-xs font-normal text-muted-foreground">
-              <Checkbox
-                checked={isolation === "worktree_per_run"}
-                onCheckedChange={(v) =>
-                  setIsolation(
-                    v === true ? "worktree_per_run" : "shared_in_root"
-                  )
-                }
-              />
-              {t("isolationWorktree")}
-            </Label>
           ) : null}
         </div>
         {/* Running in the folder shares the user's working tree (and any
@@ -565,7 +586,7 @@ export function AutomationEditor({
 
         {trigger === "schedule" ? (
           <div className="flex flex-col gap-2 rounded-lg border border-border bg-card/40 p-3">
-            <div className="flex flex-wrap gap-1.5">
+            <div className="flex flex-wrap items-center gap-1.5">
               {CRON_PRESETS.map((p) => (
                 <Button
                   key={p.key}
@@ -577,24 +598,17 @@ export function AutomationEditor({
                   {t(p.key)}
                 </Button>
               ))}
-            </div>
-            <div className="flex items-center gap-1.5">
-              <Input
-                value={cron}
-                onChange={(e) => setCron(e.target.value)}
-                placeholder={t("cronPlaceholder")}
-                aria-label={t("cron")}
-                className="flex-1 font-mono"
-              />
+              {/* The visual builder covers the non-preset cases; the raw cron
+                  string moves behind "advanced" below. */}
               <Button
                 type="button"
                 variant="outline"
-                size="icon"
+                size="sm"
                 onClick={() => setCronBuilderOpen(true)}
                 aria-label={t("cronOpenBuilder")}
-                title={t("cronOpenBuilder")}
               >
-                <Wand2 className="size-4" aria-hidden="true" />
+                <Wand2 className="me-1.5 size-4" aria-hidden="true" />
+                {t("cronOpenBuilder")}
               </Button>
             </div>
             <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
@@ -615,6 +629,37 @@ export function AutomationEditor({
                 <span className="font-mono">{timezone}</span>
               </span>
             </div>
+            {/* Raw cron expression, tucked behind "advanced" — presets + the
+                visual builder cover the common cases. */}
+            <Collapsible
+              open={cronAdvancedOpen}
+              onOpenChange={setCronAdvancedOpen}
+            >
+              <CollapsibleTrigger asChild>
+                <button
+                  type="button"
+                  className="inline-flex w-fit items-center gap-1 text-xs text-muted-foreground transition-colors hover:text-foreground"
+                >
+                  <ChevronRight
+                    className={cn(
+                      "size-3 transition-transform",
+                      cronAdvancedOpen && "rotate-90"
+                    )}
+                    aria-hidden="true"
+                  />
+                  {t("advanced")}
+                </button>
+              </CollapsibleTrigger>
+              <CollapsibleContent className="pt-2">
+                <Input
+                  value={cron}
+                  onChange={(e) => setCron(e.target.value)}
+                  placeholder={t("cronPlaceholder")}
+                  aria-label={t("cron")}
+                  className="font-mono"
+                />
+              </CollapsibleContent>
+            </Collapsible>
           </div>
         ) : null}
       </div>

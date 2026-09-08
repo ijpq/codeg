@@ -22,7 +22,6 @@ import {
   UPLOAD_I18N_KEY_NOT_A_FILE,
   UPLOAD_I18N_KEY_QUOTA_EXCEEDED,
   UPLOAD_I18N_KEY_TOO_LARGE,
-  UPLOAD_MAX_BYTES,
 } from "@/lib/api"
 // Local-IPC file read (never proxied to a remote workspace). Used for the
 // thumbnail preview of a locally-dropped image whose BYTES were uploaded to
@@ -73,6 +72,23 @@ import {
   mimeTypeFromPath,
   pointWithinElement,
 } from "@/components/chat/composer/attachment-files"
+
+function createObjectPreviewUrl(blob: Blob): string | undefined {
+  return typeof URL !== "undefined" && typeof URL.createObjectURL === "function"
+    ? URL.createObjectURL(blob)
+    : undefined
+}
+
+function revokeObjectPreviewUrl(attachment: InputAttachment): void {
+  if (
+    attachment.type === "image" &&
+    attachment.previewUrl &&
+    typeof URL !== "undefined" &&
+    typeof URL.revokeObjectURL === "function"
+  ) {
+    URL.revokeObjectURL(attachment.previewUrl)
+  }
+}
 
 /**
  * The composer's attachment engine, shared by the conversation composer and the
@@ -206,6 +222,7 @@ export function useComposerAttachments({
     promptCapabilities.image || promptCapabilities.embedded_context
 
   const [attachments, setAttachments] = useState<InputAttachment[]>([])
+  const attachmentsRef = useRef<InputAttachment[]>([])
   const embeddedPayloadsRef = useRef<Map<string, PromptInputBlock>>(new Map())
   const [isDragActive, setIsDragActive] = useState(false)
   const dragActiveRef = useRef(false)
@@ -216,6 +233,19 @@ export function useComposerAttachments({
   useEffect(() => {
     disabledRef.current = disabled
   }, [disabled])
+
+  useEffect(() => {
+    attachmentsRef.current = attachments
+  }, [attachments])
+
+  useEffect(
+    () => () => {
+      for (const attachment of attachmentsRef.current) {
+        revokeObjectPreviewUrl(attachment)
+      }
+    },
+    []
+  )
 
   const setDragActiveIfChanged = useCallback((next: boolean) => {
     if (dragActiveRef.current === next) return
@@ -369,33 +399,26 @@ export function useComposerAttachments({
   const uploadAndAppendFiles = useCallback(
     async (files: File[]) => {
       if (files.length === 0) return
-      const oversized = files.filter((f) => f.size > UPLOAD_MAX_BYTES)
-      const accepted = files.filter((f) => f.size <= UPLOAD_MAX_BYTES)
-      const limitMb = Math.round(UPLOAD_MAX_BYTES / (1024 * 1024))
-      if (oversized.length > 0) {
-        toast.error(
-          tAttach("attachUploadTooLarge", {
-            limit: limitMb,
-            names: oversized.map((f) => f.name).join(", "),
-          })
-        )
-      }
-      if (accepted.length === 0) return
 
-      // Concurrent uploads — one failure doesn't block the rest. Cap at 3:
-      // small enough to keep server load predictable, large enough to feel
-      // responsive for a handful of files.
+      // No client-side size pre-filter: streamed web uploads are unlimited by
+      // default. An operator-configured server cap is reported below with its
+      // effective limit.
       const uploaded: string[] = []
       const failed: Array<{ name: string; reason: unknown }> = []
       const quotaRejected: string[] = []
+      const oversize: string[] = []
+      let oversizeLimitBytes: number | null = null
+      // Concurrent uploads — one failure doesn't block the rest. Cap at 3:
+      // small enough to keep server load predictable, large enough to feel
+      // responsive for a handful of files.
       const CONCURRENCY = 3
       let cursor = 0
       const workers = Array.from(
-        { length: Math.min(CONCURRENCY, accepted.length) },
+        { length: Math.min(CONCURRENCY, files.length) },
         async () => {
-          while (cursor < accepted.length) {
+          while (cursor < files.length) {
             const idx = cursor++
-            const file = accepted[idx]
+            const file = files[idx]
             try {
               const r = await uploadAttachment(file, attachmentTabId ?? null)
               uploaded.push(r.path)
@@ -409,6 +432,12 @@ export function useComposerAttachments({
                 continue
               }
               const appError = extractAppCommandError(error)
+              if (appError?.i18n_key === UPLOAD_I18N_KEY_TOO_LARGE) {
+                oversize.push(file.name)
+                const limit = Number(appError.i18n_params?.limit)
+                if (Number.isFinite(limit)) oversizeLimitBytes = limit
+                continue
+              }
               if (appError?.i18n_key === UPLOAD_I18N_KEY_QUOTA_EXCEEDED) {
                 quotaRejected.push(file.name)
                 continue
@@ -420,6 +449,17 @@ export function useComposerAttachments({
       )
       await Promise.all(workers)
 
+      if (oversize.length > 0) {
+        toast.error(
+          tAttach("attachUploadTooLarge", {
+            limit: Math.max(
+              1,
+              Math.round((oversizeLimitBytes ?? 0) / (1024 * 1024))
+            ),
+            names: oversize.join(", "),
+          })
+        )
+      }
       if (quotaRejected.length > 0) {
         toast.error(
           tAttach("attachUploadQuotaExceeded", {
@@ -587,19 +627,7 @@ export function useComposerAttachments({
       // limit and the workspace has no uploads dir.
       const uploadImages = !showNativePaperclip
 
-      const oversized = uploadImages
-        ? files.filter((f) => f.size > UPLOAD_MAX_BYTES)
-        : []
-      if (oversized.length > 0) {
-        toast.error(
-          tAttach("attachUploadTooLarge", {
-            limit: Math.round(UPLOAD_MAX_BYTES / (1024 * 1024)),
-            names: oversized.map((f) => f.name).join(", "),
-          })
-        )
-      }
       const accepted = files.filter((file) => {
-        if (uploadImages && file.size > UPLOAD_MAX_BYTES) return false
         if (uploadImages && file.size === 0) {
           // Matches `uploadAttachment`'s EmptyAttachmentError semantics:
           // dropped silently, no toast, no broken thumbnail.
@@ -627,6 +655,7 @@ export function useComposerAttachments({
               uri: null,
               name: file.name || `image-${Date.now()}-${index + 1}`,
               mimeType,
+              previewUrl: createObjectPreviewUrl(file),
               ...(uploadImages ? { uploading: true } : {}),
             },
             file,
@@ -657,9 +686,13 @@ export function useComposerAttachments({
                 )
               )
             } catch (error) {
-              setAttachments((prev) =>
-                prev.filter((a) => a.id !== attachment.id)
-              )
+              setAttachments((prev) => {
+                const failedAttachment = prev.find(
+                  (a) => a.id === attachment.id
+                )
+                if (failedAttachment) revokeObjectPreviewUrl(failedAttachment)
+                return prev.filter((a) => a.id !== attachment.id)
+              })
               if (isEmptyAttachmentError(error)) {
                 console.warn(
                   `[${logLabel}] skipping empty image attachment: ${attachment.name}`
@@ -782,10 +815,10 @@ export function useComposerAttachments({
       )
       if (normalized.length === 0) return
 
-      const limitMb = Math.round(UPLOAD_MAX_BYTES / (1024 * 1024))
       const succeeded: string[] = []
       const failed: Array<{ name: string; reason: unknown }> = []
       const oversize: string[] = []
+      let oversizeLimitBytes: number | null = null
       const directories: string[] = []
       const quotaRejected: string[] = []
       const imageAttachmentsToAdd: ImageInputAttachment[] = []
@@ -814,7 +847,7 @@ export function useComposerAttachments({
               if (canAttachImages && mimeType.startsWith("image/")) {
                 const previewData = await readLocalFileBase64(
                   path,
-                  UPLOAD_MAX_BYTES
+                  DRAG_DROP_IMAGE_MAX_BYTES
                 )
                 imageAttachmentsToAdd.push({
                   id: `image:${Date.now()}:${idx}:${randomUUID()}`,
@@ -844,6 +877,8 @@ export function useComposerAttachments({
               const i18nKey = appError?.i18n_key ?? null
               if (i18nKey === UPLOAD_I18N_KEY_TOO_LARGE) {
                 oversize.push(name)
+                const limit = Number(appError?.i18n_params?.limit)
+                if (Number.isFinite(limit)) oversizeLimitBytes = limit
               } else if (i18nKey === UPLOAD_I18N_KEY_NOT_A_FILE) {
                 // Dragging a directory or a special file (FIFO, device
                 // node) lands here. The Rust guard short-circuits before
@@ -864,7 +899,10 @@ export function useComposerAttachments({
       if (oversize.length > 0) {
         toast.error(
           tAttach("attachUploadTooLarge", {
-            limit: limitMb,
+            limit: Math.max(
+              1,
+              Math.round((oversizeLimitBytes ?? 0) / (1024 * 1024))
+            ),
             names: oversize.join(", "),
           })
         )
@@ -1263,9 +1301,14 @@ export function useComposerAttachments({
     (editor: Editor, blocks: PromptInputBlock[]) => {
       embeddedPayloadsRef.current.clear()
       const restored = restoreBlocksIntoEditor(editor, blocks)
-      setAttachments(
-        restored.filter((a): a is ImageInputAttachment => a.type === "image")
-      )
+      setAttachments((previous) => {
+        for (const attachment of previous) {
+          revokeObjectPreviewUrl(attachment)
+        }
+        return restored.filter(
+          (a): a is ImageInputAttachment => a.type === "image"
+        )
+      })
       const resources = restored.filter(
         (a): a is ResourceInputAttachment => a.type === "resource"
       )
@@ -1306,11 +1349,20 @@ export function useComposerAttachments({
   )
 
   const removeAttachment = useCallback((id: string) => {
-    setAttachments((prev) => prev.filter((item) => item.id !== id))
+    setAttachments((previous) => {
+      const removed = previous.find((item) => item.id === id)
+      if (removed) revokeObjectPreviewUrl(removed)
+      return previous.filter((item) => item.id !== id)
+    })
   }, [])
 
   const clearAttachments = useCallback(() => {
-    setAttachments([])
+    setAttachments((previous) => {
+      for (const attachment of previous) {
+        revokeObjectPreviewUrl(attachment)
+      }
+      return []
+    })
     embeddedPayloadsRef.current.clear()
   }, [])
 

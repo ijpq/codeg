@@ -39,6 +39,9 @@ use crate::app_error::AppCommandError;
 use crate::app_state::AppState;
 use crate::workspace_transfer::{DownloadKind, DownloadTicketIssued, DownloadTicketSpec};
 
+const DOWNLOAD_CACHE_CONTROL: &str = "private, no-store, no-transform";
+const CODEG_FILE_SIZE_HEADER: &str = "x-codeg-file-size";
+
 // ---------------------------------------------------------------------------
 // Wire types
 // ---------------------------------------------------------------------------
@@ -230,7 +233,7 @@ fn header_safe_filename(name: &str) -> String {
         .collect()
 }
 
-fn attachment_header(name: &str) -> Option<HeaderValue> {
+pub(crate) fn attachment_header(name: &str) -> Option<HeaderValue> {
     HeaderValue::from_str(&format!(
         "attachment; filename=\"{}\"; filename*=UTF-8''{}",
         header_safe_filename(name),
@@ -732,16 +735,20 @@ pub(crate) async fn stream_file_response(
     let body = Body::from_stream(body_stream);
 
     let mut headers = HeaderMap::new();
-    headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/octet-stream"),
-    );
+    let content_type = mime_guess::from_path(target).first_or_octet_stream();
+    if let Ok(value) = HeaderValue::from_str(content_type.as_ref()) {
+        headers.insert(header::CONTENT_TYPE, value);
+    }
     if let Ok(v) = HeaderValue::from_str(&size.to_string()) {
         headers.insert(header::CONTENT_LENGTH, v);
+    }
+    if let Ok(v) = HeaderValue::from_str(&size.to_string()) {
+        headers.insert(CODEG_FILE_SIZE_HEADER, v);
     }
     if let Some(v) = attachment_header(name) {
         headers.insert(header::CONTENT_DISPOSITION, v);
     }
+    apply_download_response_policy(&mut headers);
 
     Ok((StatusCode::OK, headers, body).into_response())
 }
@@ -778,7 +785,15 @@ async fn stream_zip_response(
     if let Some(v) = attachment_header(&zip_name) {
         headers.insert(header::CONTENT_DISPOSITION, v);
     }
+    apply_download_response_policy(&mut headers);
     Ok((StatusCode::OK, headers, body).into_response())
+}
+
+pub(crate) fn apply_download_response_policy(headers: &mut HeaderMap) {
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(DOWNLOAD_CACHE_CONTROL),
+    );
 }
 
 fn zip_body_stream(
@@ -1072,8 +1087,8 @@ mod tests {
         // `link` component is a symlink that would carry create_dir_all
         // out of the root.
         let target = root.path().join("link").join("sub");
-        let err = resolve_upload_chain(root.path(), &target)
-            .expect_err("should reject symlink in chain");
+        let err =
+            resolve_upload_chain(root.path(), &target).expect_err("should reject symlink in chain");
         assert!(
             err.message.contains("symlink"),
             "unexpected error: {}",

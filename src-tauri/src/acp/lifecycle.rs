@@ -24,9 +24,10 @@ use crate::acp::internal_bus::InternalEventBus;
 use crate::acp::manager::ConnectionManager;
 use crate::acp::session_state::SessionState;
 use crate::acp::types::{AcpEvent, ConnectionStatus, EventEnvelope};
+use crate::artifact_tracker::ArtifactTurnFinishStatus;
 use crate::db::entities::conversation::ConversationStatus;
 use crate::db::error::DbError;
-use crate::db::service::conversation_service;
+use crate::db::service::{artifact_service, conversation_branch_service, conversation_service};
 use crate::logging::throttle::{LagLogThrottle, LAG_LOG_WINDOW};
 use crate::models::AgentType;
 use crate::web::event_bridge::{emit_with_state, EventEmitter};
@@ -63,6 +64,7 @@ fn is_lifecycle_relevant(event: &AcpEvent) -> bool {
     matches!(
         event,
         AcpEvent::SessionStarted { .. }
+            | AcpEvent::AgentFileChangeReport { .. }
             | AcpEvent::TurnComplete { .. }
             | AcpEvent::ConversationLinked { .. }
             | AcpEvent::NativeSessionTitle { .. }
@@ -208,14 +210,32 @@ pub(crate) async fn handle_event(
                 (snap.conversation_id, snap.agent_type)
             };
             if let Some(cid) = conversation_id {
-                // Guarded bind: the row may already be bound to a DIFFERENT
-                // session. That is legitimate for a fork (which has already
-                // inserted the sibling holding the outgoing id, so this is a
-                // plain re-point) and for a custom agent continuing its
-                // conversation under a new session (`continues`), and
-                // destructive otherwise — a session re-minted under a live
-                // binding would otherwise overwrite the id the row's whole
-                // history hangs off. See codeg#500.
+                // session/new publishes an id before Codex has a durable
+                // rollout. A provisional snapshot branch promotes that id only
+                // after the snapshot and first real user prompt are accepted.
+                if conversation_branch_service::is_provisional_snapshot(db_conn, cid).await? {
+                    conversation_branch_service::mark_initialization_state(
+                        db_conn,
+                        cid,
+                        "connection_ready",
+                        Some(envelope.connection_id.clone()),
+                        None,
+                        false,
+                    )
+                    .await?;
+                    tracing::info!(
+                        branch_conversation_id = cid,
+                        connection_id = %envelope.connection_id,
+                        external_session_id = %session_id,
+                        lifecycle_state = "connection_ready",
+                        session_verification_result = "not_durable_until_first_prompt",
+                        "[ACP][branch] skipped premature external session persistence"
+                    );
+                    return Ok(());
+                }
+                // Guarded bind: a non-provisional row may already be bound to a
+                // different session. Preserve that history instead of silently
+                // overwriting its owning id (codeg#500).
                 let continues = crate::acp::continued_session_ids(agent_type, session_id);
                 let preserved =
                     conversation_service::bind_external_id(db_conn, cid, session_id, &continues)
@@ -234,7 +254,65 @@ pub(crate) async fn handle_event(
             }
             Ok(())
         }
+        AcpEvent::AgentFileChangeReport { report } => {
+            if report.status != "reported" {
+                tracing::info!(
+                    connection_id = %envelope.connection_id,
+                    request_id = %report.request_id,
+                    status = %report.status,
+                    reason = report.reason.as_deref().unwrap_or("not_reported"),
+                    "[artifact-tracker] AIR report unavailable; using workspace watcher fallback"
+                );
+                return Ok(());
+            }
+            let emitter = manager
+                .get_state_and_emitter(&envelope.connection_id)
+                .await
+                .map(|(_, emitter)| emitter)
+                .unwrap_or(EventEmitter::Noop);
+            match manager
+                .ingest_agent_file_change_report(
+                    db_conn,
+                    &envelope.connection_id,
+                    &report.request_id,
+                    &report.paths,
+                    &emitter,
+                )
+                .await
+            {
+                Ok(accepted) => tracing::info!(
+                    connection_id = %envelope.connection_id,
+                    request_id = %report.request_id,
+                    reported_paths = report.paths.len(),
+                    accepted_paths = accepted,
+                    declared_complete = report.declared_complete,
+                    truncated = report.truncated,
+                    "[artifact-tracker] AIR report processed"
+                ),
+                Err(error) => tracing::error!(
+                    connection_id = %envelope.connection_id,
+                    request_id = %report.request_id,
+                    error = %error,
+                    "[artifact-tracker] AIR report persistence failed; using workspace watcher fallback"
+                ),
+            }
+            // Audit metadata must never fail or delay the user's turn lifecycle.
+            Ok(())
+        }
         AcpEvent::TurnComplete { stop_reason, .. } => {
+            let artifact_status = match stop_reason.as_str() {
+                "end_turn" => ArtifactTurnFinishStatus::Completed,
+                "cancelled" | "cancel_timeout" | "cancel_command_channel_closed" => {
+                    ArtifactTurnFinishStatus::Cancelled
+                }
+                "refusal" | "max_tokens" | "max_turn_requests" | "unknown" | "empty" => {
+                    ArtifactTurnFinishStatus::Failed
+                }
+                // Transport/process loss is finalized by the terminal Error or
+                // Disconnected lifecycle path as `interrupted`. An unrecognised
+                // protocol stop is a completed turn with a failed outcome.
+                _ => ArtifactTurnFinishStatus::Failed,
+            };
             // Centralized status transition: when the agent reports the turn
             // is done, flip the conversation row and re-broadcast the change
             // as `ConversationStatusChanged`. This lives in the lifecycle
@@ -260,10 +338,13 @@ pub(crate) async fn handle_event(
             // CAS InProgress → Cancelled at the user-cancel entry point), so
             // we leave it alone here. `completed` transitions remain
             // frontend-driven.
-            let target_status = match stop_reason.as_str() {
+            let mut target_status = match stop_reason.as_str() {
                 "end_turn" => Some(ConversationStatus::PendingReview),
                 "refusal" | "max_tokens" | "max_turn_requests" | "unknown" | "empty"
                 | "auth_required" => Some(ConversationStatus::Cancelled),
+                "cancelled" | "cancel_timeout" | "cancel_command_channel_closed" => {
+                    Some(ConversationStatus::Cancelled)
+                }
                 // `cancelled` and any future reason: don't write here.
                 _ => None,
             };
@@ -282,11 +363,87 @@ pub(crate) async fn handle_event(
             let Some(cid) = conversation_id else {
                 return Ok(());
             };
+            let latest_run =
+                artifact_service::latest_run_for_connection(db_conn, &envelope.connection_id)
+                    .await?;
+            let current_conversation_status = match conversation_service::get_by_id(db_conn, cid)
+                .await?
+                .status
+                .as_str()
+            {
+                "in_progress" => ConversationStatus::InProgress,
+                "pending_review" => ConversationStatus::PendingReview,
+                "completed" => ConversationStatus::Completed,
+                "cancelled" => ConversationStatus::Cancelled,
+                // The SeaORM enum currently makes this unreachable. If a
+                // future binary adds a value, fail closed into a terminal
+                // state instead of reviving the conversation as active.
+                _ => ConversationStatus::Cancelled,
+            };
+            // Cancellation owns the first terminal CAS. If an agent delivers
+            // a late `end_turn` after cancellation/reconciliation already won,
+            // never resurrect the conversation as pending_review.
+            if stop_reason == "end_turn"
+                && latest_run.as_ref().is_some_and(|run| {
+                    matches!(
+                        run.status,
+                        crate::db::entities::conversation_turn_run::ConversationTurnRunStatus::Cancelled
+                            | crate::db::entities::conversation_turn_run::ConversationTurnRunStatus::Interrupted
+                            | crate::db::entities::conversation_turn_run::ConversationTurnRunStatus::Failed
+                    )
+                })
+            {
+                target_status = Some(current_conversation_status.clone());
+            }
             if let Some(ts) = target_status.clone() {
-                // DB write before emit so any downstream subscriber that observes
-                // the ConversationStatusChanged event can assume the row is
-                // already at the target status.
-                conversation_service::update_status(db_conn, cid, ts.clone()).await?;
+                let run_status = match artifact_status {
+                    ArtifactTurnFinishStatus::Completed => crate::db::entities::conversation_turn_run::ConversationTurnRunStatus::Completed,
+                    ArtifactTurnFinishStatus::Cancelled => crate::db::entities::conversation_turn_run::ConversationTurnRunStatus::Cancelled,
+                    ArtifactTurnFinishStatus::Interrupted => crate::db::entities::conversation_turn_run::ConversationTurnRunStatus::Interrupted,
+                    ArtifactTurnFinishStatus::Failed => crate::db::entities::conversation_turn_run::ConversationTurnRunStatus::Failed,
+                };
+                let incomplete = artifact_status != ArtifactTurnFinishStatus::Completed;
+                let active_run = latest_run.as_ref().filter(|run| {
+                    matches!(
+                        run.status,
+                        crate::db::entities::conversation_turn_run::ConversationTurnRunStatus::Running
+                            | crate::db::entities::conversation_turn_run::ConversationTurnRunStatus::Cancelling
+                    )
+                });
+                let finalized = if let Some(run) = active_run {
+                    artifact_service::finalize_turn_state(
+                        db_conn,
+                        &run.id,
+                        run_status.clone(),
+                        stop_reason,
+                        ts.clone(),
+                        incomplete,
+                        incomplete,
+                    )
+                    .await?
+                } else if current_conversation_status == ConversationStatus::InProgress {
+                    // Capture setup is best-effort. Preserve the user-visible
+                    // lifecycle when the current prompt has no run at all. A
+                    // terminal row from a prior race is distinguished by the
+                    // already-terminal conversation status and must not be
+                    // overwritten by a late event.
+                    conversation_service::update_status(db_conn, cid, ts.clone()).await?;
+                    true
+                } else {
+                    false
+                };
+                tracing::info!(
+                    conversation_id = cid,
+                    turn_run_id = ?latest_run.as_ref().map(|run| &run.id),
+                    connection_id = %envelope.connection_id,
+                    event_seq = envelope.seq,
+                    stage = "durable_terminal_persisted",
+                    old_state = ?latest_run.as_ref().map(|run| &run.status),
+                    new_state = ?run_status,
+                    transition_reason = %stop_reason,
+                    durable_state_changed = finalized,
+                    "[ACP][lifecycle] terminal turn state persisted before artifact settlement"
+                );
                 emit_with_state(
                     &state_arc,
                     &emitter,
@@ -297,6 +454,25 @@ pub(crate) async fn handle_event(
                 )
                 .await;
             }
+
+            // Filesystem debounce, stat calls and inferred deliverable writes
+            // are auxiliary. They run after the atomic user-visible terminal
+            // transaction and may retry independently without pinning the
+            // lifecycle worker (or a queued follow-up) behind SQLite locks.
+            let tracker_manager = manager.clone_ref();
+            let tracker_connection_id = envelope.connection_id.clone();
+            let tracker_stop_reason = stop_reason.clone();
+            let tracker_seq = envelope.seq;
+            tokio::spawn(async move {
+                tracker_manager
+                    .finish_artifact_turn(
+                        &tracker_connection_id,
+                        tracker_seq,
+                        artifact_status,
+                        Some(tracker_stop_reason),
+                    )
+                    .await;
+            });
 
             // If this conversation was spawned by a delegation, resolve the
             // pending broker call. The broker maps the outcome onto the
@@ -484,6 +660,17 @@ async fn handle_terminal_event(
         return Ok(());
     };
     let cid = entry.conversation_id;
+    if conversation_branch_service::is_provisional_snapshot(db_conn, cid).await? {
+        tracing::info!(
+            branch_conversation_id = cid,
+            connection_id,
+            lifecycle_state = "provisional",
+            idle_sweep_action = "connection_disconnected_branch_preserved",
+            snapshot_consumed_at = ?Option::<chrono::DateTime<chrono::Utc>>::None,
+            "[ACP][branch] transient disconnect preserved provisional branch"
+        );
+        return Ok(());
+    }
     let changed = conversation_service::update_status_if(
         db_conn,
         cid,
@@ -1504,6 +1691,14 @@ async fn connection_worker_loop(
                 if terminal_dispatched {
                     continue;
                 }
+                manager
+                    .finish_artifact_turn(
+                        &connection_id,
+                        envelope.seq,
+                        ArtifactTurnFinishStatus::Interrupted,
+                        Some("connection_disconnected".to_string()),
+                    )
+                    .await;
                 if let Err(e) = handle_terminal_event(&db, &mut cache, &connection_id).await {
                     tracing::error!("[lifecycle][ERROR] terminal event for {connection_id}: {e}");
                 }
@@ -1536,6 +1731,18 @@ async fn connection_worker_loop(
                 if terminal_dispatched {
                     continue;
                 }
+                manager
+                    .finish_artifact_turn(
+                        &connection_id,
+                        envelope.seq,
+                        ArtifactTurnFinishStatus::Interrupted,
+                        Some(
+                            code.as_deref()
+                                .map(|code| format!("terminal_error:{code}"))
+                                .unwrap_or_else(|| "terminal_error".to_string()),
+                        ),
+                    )
+                    .await;
                 // Genuinely terminal (the `run_connection` failure path at
                 // `connection.rs:493`). Drain the broker NOW with the error
                 // detail instead of waiting for the trailing `Disconnected`.
@@ -1570,7 +1777,7 @@ async fn connection_worker_loop(
 /// connections, workers run independently so a slow SQLite write on one
 /// connection doesn't backpressure the others.
 ///
-/// All forwarded events (the 6 types in `is_lifecycle_relevant`) use
+/// All forwarded events (the bounded set in `is_lifecycle_relevant`) use
 /// blocking `send().await` to guarantee delivery even when the worker
 /// mailbox is full — `SessionStarted` (writes external_id) and
 /// `TurnComplete` (writes terminal status) are correctness-critical and
@@ -1752,6 +1959,11 @@ mod tests {
             state: Arc::new(RwLock::new(state)),
             emitter: EventEmitter::Noop,
             prompt_lock: Arc::new(tokio::sync::Mutex::new(())),
+            steer_lock: Arc::new(tokio::sync::Mutex::new(())),
+            completed_steers: Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::new())),
+            accepted_prompt_ids: Arc::new(tokio::sync::Mutex::new(
+                std::collections::VecDeque::new(),
+            )),
             config_fingerprint: String::new(),
             last_observed_fingerprint: String::new(),
             child_pid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -2097,6 +2309,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn late_end_turn_cannot_overwrite_an_interrupted_terminal_run() {
+        use crate::db::entities::conversation_turn_run::{self, ConversationTurnRunStatus};
+        use sea_orm::EntityTrait;
+
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/late-end-turn").await;
+        let conv =
+            conversation_service::create(&db.conn, folder_id, AgentType::ClaudeCode, None, None)
+                .await
+                .unwrap();
+        artifact_service::create_run(
+            &db.conn,
+            artifact_service::NewTurnRun {
+                id: "late-end-run".into(),
+                conversation_id: conv.id,
+                connection_id: "late-end-conn".into(),
+                client_message_id: Some("late-end-message".into()),
+                prompt_fingerprint: None,
+                folder_id: Some(folder_id),
+                root_path: "/tmp/late-end-turn".into(),
+                capture_incomplete: false,
+                input_paths_json: "[]".into(),
+                expectation_json: "{}".into(),
+            },
+        )
+        .await
+        .unwrap();
+        artifact_service::finalize_turn_state(
+            &db.conn,
+            "late-end-run",
+            ConversationTurnRunStatus::Interrupted,
+            "connection_lost",
+            ConversationStatus::PendingReview,
+            true,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let mgr = ConnectionManager::new();
+        mgr.connections.lock().await.insert(
+            "late-end-conn".to_string(),
+            fake_connection_with_state("late-end-conn", Some(conv.id)),
+        );
+        handle_event(
+            &db.conn,
+            &mgr,
+            &EventEnvelope {
+                seq: 2,
+                connection_id: "late-end-conn".into(),
+                payload: AcpEvent::TurnComplete {
+                    session_id: "late-end-session".into(),
+                    stop_reason: "end_turn".into(),
+                    agent_type: "claude_code".into(),
+                },
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        let run = conversation_turn_run::Entity::find_by_id("late-end-run")
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.status, ConversationTurnRunStatus::Interrupted);
+        assert_eq!(run.stop_reason.as_deref(), Some("connection_lost"));
+        assert_eq!(
+            read_row_status(&db, conv.id).await,
+            ConversationStatus::PendingReview
+        );
+    }
+
+    #[tokio::test]
     async fn handle_event_writes_cancelled_on_turn_failure_stop_reasons() {
         // OpenCode (and similar agents) maps backend errors to `Refusal`.
         // The lifecycle subscriber must flip the conversation to Cancelled
@@ -2150,10 +2437,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_event_skips_write_on_cancelled_stop_reason() {
-        // `cancelled` is already written by `manager.cancel()` (eager CAS
-        // InProgress → Cancelled at the user-cancel entry point), so the
-        // TurnComplete arm must not double-write.
+    async fn handle_event_writes_cancelled_on_cancelled_stop_reason() {
+        // The durable turn enters `cancelling` at request time; TurnComplete
+        // owns the conversation's terminal transition.
         let db = test_helpers::fresh_in_memory_db().await;
         let folder_id = test_helpers::seed_folder(&db, "/tmp/turn-cancelled").await;
         let conv =
@@ -2181,8 +2467,8 @@ mod tests {
         handle_event(&db.conn, &mgr, &env, None).await.unwrap();
         assert_eq!(
             read_row_status(&db, conv.id).await,
-            ConversationStatus::InProgress,
-            "TurnComplete{{cancelled}} must not overwrite the row — user-cancel path owns it"
+            ConversationStatus::Cancelled,
+            "TurnComplete{{cancelled}} must close the conversation state"
         );
     }
 
@@ -2272,6 +2558,72 @@ mod tests {
         assert!(
             !cache.contains_key("c1"),
             "cache entry must be drained after first terminal event"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_disconnect_preserves_unconsumed_provisional_branch() {
+        let db = test_helpers::fresh_in_memory_db().await;
+        let folder_id = test_helpers::seed_folder(&db, "/tmp/term-provisional").await;
+        let source_id =
+            test_helpers::seed_conversation(&db, folder_id, AgentType::ClaudeCode).await;
+        let source = conversation_service::get_by_id(&db.conn, source_id)
+            .await
+            .unwrap();
+        let (branch, _) = conversation_branch_service::create_branch_row(
+            &db.conn,
+            &source,
+            None,
+            None,
+            "snapshot",
+            conversation_branch_service::BranchInheritanceRecord {
+                source_session_id: None,
+                branch_session_id: None,
+                inheritance_mode: "structured_snapshot".into(),
+                inherited_message_count: 1,
+                inherited_context_chars: 7,
+                inherited_estimated_tokens: 2,
+                inheritance_compressed: false,
+                inheritance_truncated: false,
+                inheritance_note: None,
+                forked_through_at: None,
+                source_rollout_offset: None,
+                branch_rollout_offset: None,
+                fork_boundary_kind: None,
+                snapshot_version: 2,
+                snapshot_context: Some("context".into()),
+                snapshot_images: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+        // Reproduce the old bad status so the lifecycle guard, rather than the
+        // create-time PendingReview default alone, proves the idle invariant.
+        conversation_service::update_status(&db.conn, branch.id, ConversationStatus::InProgress)
+            .await
+            .unwrap();
+
+        let mgr = ConnectionManager::new();
+        mgr.connections.lock().await.insert(
+            "branch-idle".into(),
+            fake_connection_with_state("branch-idle", Some(branch.id)),
+        );
+        let mut cache = HashMap::new();
+        seed_cache(&mut cache, &mgr, "branch-idle", branch.id).await;
+        handle_terminal_event(&db.conn, &mut cache, "branch-idle")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            read_row_status(&db, branch.id).await,
+            ConversationStatus::InProgress,
+            "an idle disconnect is not a user cancellation"
+        );
+        assert!(
+            conversation_branch_service::pending_snapshot(&db.conn, branch.id)
+                .await
+                .unwrap()
+                .is_some()
         );
     }
 
@@ -2455,7 +2807,10 @@ mod tests {
         let env = EventEnvelope {
             seq: 1,
             connection_id: "c1".to_string(),
-            payload: AcpEvent::ContentDelta { text: "hi".into(), parent_tool_use_id: None },
+            payload: AcpEvent::ContentDelta {
+                text: "hi".into(),
+                parent_tool_use_id: None,
+            },
         };
         handle_event(&db.conn, &mgr, &env, None).await.unwrap();
 
@@ -2474,6 +2829,30 @@ mod tests {
     // dispatcher → per-conn worker → DB) so the integration between the
     // filter predicate and the worker's match arms cannot silently drift.
 
+    #[tokio::test]
+    async fn unavailable_agent_file_change_report_is_a_noop_fallback() {
+        let db = test_helpers::fresh_in_memory_db().await;
+        let mgr = ConnectionManager::new();
+        let env = EventEnvelope {
+            seq: 1,
+            connection_id: "gone-connection".to_string(),
+            payload: AcpEvent::AgentFileChangeReport {
+                report: crate::acp::types::AgentFileChangeReport {
+                    request_id: "run-timeout".into(),
+                    status: "unavailable".into(),
+                    paths: Vec::new(),
+                    declared_complete: false,
+                    truncated: false,
+                    reason: Some("timeout".into()),
+                },
+            },
+        };
+
+        handle_event(&db.conn, &mgr, &env, None)
+            .await
+            .expect("audit timeout must not fail the user's turn");
+    }
+
     use crate::acp::internal_bus::{EventBusMetrics, InternalEventBus};
     use std::time::Duration;
 
@@ -2490,6 +2869,16 @@ mod tests {
             session_id: "s".into(),
             stop_reason: "end_turn".into(),
             agent_type: "claude_code".into(),
+        }));
+        assert!(is_lifecycle_relevant(&AcpEvent::AgentFileChangeReport {
+            report: crate::acp::types::AgentFileChangeReport {
+                request_id: "run-1".into(),
+                status: "reported".into(),
+                paths: vec!["/workspace/result.pdf".into()],
+                declared_complete: true,
+                truncated: false,
+                reason: None,
+            },
         }));
         assert!(is_lifecycle_relevant(&AcpEvent::ConversationLinked {
             conversation_id: 1,

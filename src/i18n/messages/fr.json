@@ -1042,7 +1042,8 @@
       "loggedIn": "Compte connecté",
       "loginRelogin": "Reconnecter / Changer de compte",
       "loginTimeout": "Connexion expirée, veuillez réessayer",
-      "loginSaveFailed": "Connexion réussie mais échec de la sauvegarde de la configuration"
+      "loginSaveFailed": "Connexion réussie mais échec de la sauvegarde de la configuration",
+      "selectReasoningEffort": "Sélectionner Reasoning Effort"
     },
     "gemini": {
       "authConfig": "Configuration d’authentification Gemini",
@@ -1324,7 +1325,13 @@
       "sendAttributionHeader": "Envoyer l'identifiant d'attribution/facturation à l'API",
       "sendAttributionHeaderAria": "Envoyer l'identifiant d'attribution/facturation de Claude Code à l'API",
       "disableNonessentialTraffic": "Désactiver la télémétrie ou les requêtes réseau superflues",
-      "disableNonessentialTrafficAria": "Désactiver la télémétrie ou les requêtes réseau superflues de Claude Code"
+      "disableNonessentialTrafficAria": "Désactiver la télémétrie ou les requêtes réseau superflues de Claude Code",
+      "effortLevel": "Niveau de raisonnement",
+      "effortLevelDefault": "Niveau par défaut",
+      "effortLevel_low": "Bas",
+      "effortLevel_medium": "Moyen",
+      "effortLevel_high": "Élevé",
+      "effortLevel_xhigh": "Très Élevé"
     },
     "dialogs": {
       "confirmDeleteProvider": "Supprimer le provider {providerId} ?",
@@ -1777,7 +1784,8 @@
         "updateGroupFailed": "Échec de la mise à jour du groupe : {message}",
         "deleteGroupFailed": "Échec de la suppression du groupe : {message}",
         "moveToGroupFailed": "Échec du déplacement du dossier : {message}",
-        "applyLayoutFailed": "Échec de l'enregistrement de l'ordre des dossiers : {message}"
+        "applyLayoutFailed": "Échec de l'enregistrement de l'ordre des dossiers : {message}",
+        "reorderFoldersFailed": "Échec du réordonnancement des dossiers : {message}"
       },
       "statsLabel": "{folders} dossiers · {convos} conversations",
       "reorderHandle": "Glisser pour réorganiser",
@@ -1918,7 +1926,46 @@
         "toolResult": "Résultat",
         "toolError": "Erreur"
       },
-      "moreActions": "Plus d’actions"
+      "moreActions": "Plus d’actions",
+      "steerInjected": "Instruction injectée dans le tour actuel",
+      "steerFallbackFeedback": "Le guidage natif est indisponible ; envoyé comme retour en direct",
+      "steerTurnEndedQueued": "Le tour vient de se terminer ; message placé dans la file du prochain tour",
+      "imageSteerQueued": "Les images ne peuvent pas être injectées pendant un tour ; message mis en file pour le suivant",
+      "promptAcceptanceUnknown": "Connexion interrompue ; vérification de la réception par le serveur",
+      "steerUnsupportedQueued": "Le guidage natif est indisponible ; message placé dans la file du prochain tour",
+      "steerFailedQueued": "Échec du guidage ; message placé dans la file du prochain tour",
+      "steerWaitingRestore": "Guidage conservé ; attente de la restauration de la session d’origine",
+      "steerOriginalTurnEnded": "La tâche d’origine est terminée ; ce guidage n’a pas été envoyé",
+      "branch": {
+        "create": "Créer une branche",
+        "createFromMessage": "Créer une branche à partir d’ici",
+        "nativeCreated": "Branche native indépendante créée",
+        "snapshotCreated": "Branche créée depuis un instantané de contexte",
+        "provisionalCreated": "L’instantané de branche est prêt ; envoyez le premier message quand vous voulez",
+        "runningForkHint": "Fork & Send attend la fin du tour actuel. Pour créer une branche immédiatement, utilisez « Créer une branche » : elle héritera jusqu’au dernier tour terminé. Les deux conversations partagent le même dossier de travail ; évitez de modifier simultanément les mêmes fichiers.",
+        "source": "Branche issue de : {title}",
+        "sourceDeleted": "Source supprimée : {title}",
+        "sourceDeletedHint": "La conversation source a été supprimée ; cette branche reste indépendante.",
+        "nativeMode": "Branche native",
+        "snapshotMode": "Instantané de contexte",
+        "inheritanceRange": "{count} messages jusqu’à {boundary}",
+        "inheritanceTruncated": "contexte compressé",
+        "pendingFirstPrompt": "en attente de l’initialisation par le premier message",
+        "retryableFailed": "l’initialisation peut être relancée",
+        "merge": "Fusionner dans la conversation principale",
+        "mergeSuccess": "Fusion effectuée ({count} livrables)",
+        "mergePreparing": "Préparation de la fusion…",
+        "mergeDeterminingBoundary": "Détermination du point de branchement…",
+        "mergeExtractingIncrement": "Extraction des changements de la branche…",
+        "mergeWritingSource": "Écriture dans la conversation principale…",
+        "mergeCompleted": "Fusion terminée",
+        "mergeFailed": "Échec de la fusion ; réessayez",
+        "mergeDescription": "Seuls la conclusion et les livrables sélectionnés sont ajoutés ; l’historique n’est pas réécrit.",
+        "summaryPlaceholder": "Conclusion à renvoyer",
+        "selectMessages": "Sélectionnez les réponses visibles (texte modifiable)",
+        "mergeKeep": "Fusionner et continuer la branche",
+        "mergeArchive": "Fusionner et marquer la branche terminée"
+      }
     },
     "sessionDetails": {
       "menuLabel": "Détails de la session",
@@ -2035,6 +2082,8 @@
         "contextWindowUsageAria": "Utilisation de la fenêtre de contexte",
         "contextWindow": "Fenêtre de contexte",
         "usedMax": "Utilisé / Max",
+        "source": "Source",
+        "contextSource": "Réponse d’exécution",
         "tokenUsage": "Utilisation des tokens",
         "input": "Entrée",
         "output": "Sortie",
@@ -2047,7 +2096,8 @@
         "groups": {
           "workspace": "Espace de travail",
           "navigation": "Navigation",
-          "more": "Plus"
+          "more": "Plus",
+          "sessions": "Sessions"
         },
         "showPet": "Afficher la mascotte"
       },
@@ -2093,6 +2143,18 @@
         "loadFailed": "Impossible de lire l'état : {message}",
         "openSettings": "Ouvrir les paramètres",
         "refresh": "Actualiser"
+      },
+      "quota": {
+        "summary": "{plan} · {remaining} restant cette semaine",
+        "lastRoutedPlan": "Forfait de la dernière requête",
+        "weeklyShort": "Reste sem.",
+        "weeklyRemaining": "Reste hebdomadaire",
+        "weeklyUsed": "Utilisé cette semaine",
+        "resetsAt": "Réinitialisation",
+        "observedAt": "Mis à jour",
+        "refresh": "Actualiser le quota",
+        "unknown": "Inconnu",
+        "sourceHint": "Lu dans la dernière réponse Codex réelle, sans requête relay supplémentaire."
       }
     },
     "auxPanel": {
@@ -2956,7 +3018,9 @@
       "chatInput": {
         "connecting": "Connexion...",
         "agentResponding": "{agent} répond...",
-        "sendMessage": "Envoyer un message..."
+        "sendMessage": "Envoyer un message...",
+        "stopping": "Arrêt en cours...",
+        "guideAgent": "Guider le tour actuel de {agent}..."
       },
       "messageInput": {
         "askAnything": "Posez n'importe quelle question...",
@@ -3020,14 +3084,28 @@
         "mentionGroupAgent": "Agents",
         "mentionGroupSession": "Sessions",
         "mentionGroupCommit": "Commits",
-        "mentionGroupSkill": "Compétences"
+        "mentionGroupSkill": "Compétences",
+        "stopping": "Arrêt en cours...",
+        "steer": "Guider le tour actuel",
+        "steerSending": "Injection de l’instruction...",
+        "forkAndSend": "Fork & Envoyer",
+        "steerAttachmentsUnsupported": "Texte uniquement — les brouillons avec pièces jointes passent par la file d'attente."
       },
       "messageQueue": {
         "addToQueue": "Mettre en file",
         "saveEdit": "Enregistrer",
         "cancelEdit": "Annuler la modification",
         "editItem": "Modifier",
-        "deleteItem": "Supprimer"
+        "deleteItem": "Supprimer",
+        "queued": "En attente",
+        "waiting_source_turn": "Attente de la fin de la tâche source",
+        "creating_branch": "Création de la branche",
+        "waiting_session_restore": "Attente de restauration de la session",
+        "waiting_connection": "Attente de reconnexion",
+        "failed": "Échec de l’envoi",
+        "expired_guide": "Tâche d’origine terminée",
+        "retry": "Réessayer",
+        "sendAsPrompt": "Envoyer comme nouveau message"
       },
       "welcomeInputPanel": {
         "agentsSettingsPath": "Paramètres > Agents",
@@ -3071,7 +3149,8 @@
           "liveFeedback": "Retour en direct, dans le menu +, glisse une note dans le tour que l'agent exécute déjà, sans l'interrompre.",
           "skillPacks": "Paramètres → Packs de compétences regroupe experts du code, recherche scientifique et bureautique ; activez-les agent par agent.",
           "modelProviders": "Paramètres → Fournisseurs de Modèles accepte votre propre clé d'API ou endpoint, puis vous choisissez le modèle dans la zone de saisie.",
-          "workspaceBackground": "Paramètres → Apparence définit une image de fond pour l'espace de travail, l'opacité des panneaux et les polices de l'application."
+          "workspaceBackground": "Paramètres → Apparence définit une image de fond pour l'espace de travail, l'opacité des panneaux et les polices de l'application.",
+          "forkSend": "Le menu déroulant du bouton d'envoi propose Bifurquer et envoyer pour ouvrir une branche dans un nouvel onglet à partir du point actuel."
         },
         "quickActions": {
           "excel": "Classeur Excel",
@@ -3304,7 +3383,18 @@
         "completedAt": "Terminé à",
         "jumpToPreviousUserMessage": "Aller au message utilisateur",
         "showMore": "Afficher plus",
-        "showLess": "Afficher moins"
+        "showLess": "Afficher moins",
+        "loadEarlierHistory": "Charger les messages précédents",
+        "retryEarlierHistory": "Réessayer les messages précédents",
+        "delivery": {
+          "submitting": "Envoi…",
+          "accepted": "Envoyé",
+          "running": "Traitement serveur",
+          "persisted": "Enregistré",
+          "completed": "Terminé",
+          "failed": "État d’envoi inconnu",
+          "queued": "En file"
+        }
       },
       "liveTurnStats": {
         "thinking": "Réflexion...",
@@ -3313,7 +3403,28 @@
         "elapsedMinutes": "{value} min",
         "elapsedSeconds": "{value} s",
         "outputSpeedAria": "Vitesse de sortie estimée",
-        "outputSpeedTooltip": "Vitesse de sortie estimée (texte + raisonnement)"
+        "outputSpeedTooltip": "Vitesse de sortie estimée (texte + raisonnement)",
+        "sent": "Envoyé",
+        "backendProcessing": "Traitement serveur",
+        "stillProcessing": "Le serveur traite toujours",
+        "toolUseCount": "{count, plural, one {# appel d'outil} other {# appels d'outil}}",
+        "diagnostics": {
+          "open": "Diagnostic de connexion",
+          "title": "Diagnostic de génération",
+          "phase": "Phase actuelle",
+          "phaseThinking": "Réflexion",
+          "phaseTool": "Exécution d'outil",
+          "phaseOutput": "Rédaction de la réponse",
+          "phaseWaiting": "En attente de réponse",
+          "sinceLastData": "Depuis les dernières données",
+          "testLink": "Tester la liaison",
+          "testing": "Test en cours…",
+          "reachable": "Joignable · HTTP {status} · {latency}ms",
+          "unreachable": "Injoignable · {error}",
+          "notConfigured": "Connexion directe/officielle — rien à tester.",
+          "hintReachable": "La liaison fonctionne. Sans nouvelles données pendant un moment, le modèle travaille probablement encore.",
+          "hintUnreachable": "Problème de liaison — le réseau/tunnel est peut-être bloqué."
+        }
       },
       "jsonTree": {
         "viewRaw": "Afficher le JSON brut",
@@ -3539,7 +3650,8 @@
           "reviewKept": "Reste en mode plan",
           "reviewPending": "En attente de la décision sur le plan",
           "submitted": "Plan soumis",
-          "switched": "Mode changé"
+          "switched": "Mode changé",
+          "planLabel": "Plan"
         },
         "backgroundTask": {
           "title": "Tâche en arrière-plan",
@@ -3557,7 +3669,9 @@
           "outputMissing": "Codex a tronqué la sortie du script et supprimé le séparateur de cette commande ; aucune sortie n'a donc pu lui être attribuée.",
           "sharedWith": "Contient aussi la sortie de {commands} — codex en a tronqué les séparateurs.",
           "truncated": "tronqué"
-        }
+        },
+        "loadBranchMergeSummary": "Charger le résumé complet",
+        "loadingBranchMergeSummary": "Chargement du résumé…"
       },
       "messageNav": {
         "title": "Navigation des messages",
@@ -3575,7 +3689,9 @@
         "openFile": "Ouvrir {filePath}",
         "openInEditor": "Ouvrir dans l'éditeur",
         "remove": "Retirer",
-        "noDiffDataAvailable": "Aucune donnée de diff disponible pour {filePath}"
+        "noDiffDataAvailable": "Aucune donnée de diff disponible pour {filePath}",
+        "downloadToPc": "Télécharger sur mon PC",
+        "fileUnavailable": "Fichier indisponible ou inexistant : {filePath}"
       },
       "askQuestion": {
         "title": "L'agent attend votre choix",
@@ -3739,6 +3855,67 @@
       "proposedPlan": {
         "title": "Plan proposé",
         "planning": "Planification…"
+      },
+      "conversationDeliverables": {
+        "collapsedSummary": "Livrables {count}",
+        "historyTitle": "Historique des livrables",
+        "loadingHistory": "Chargement de l’historique…",
+        "retry": "Réessayer",
+        "versions": "{count} versions",
+        "toggleVersions": "Afficher ou masquer {count} versions historiques",
+        "loadMore": "Charger plus",
+        "title": "Livrables finaux",
+        "collapse": "Réduire",
+        "openFile": "Ouvrir {filePath}",
+        "revealInFolder": "Afficher dans le gestionnaire de fichiers",
+        "primary": "Principal",
+        "supporting": "Complémentaire",
+        "downloadToPc": "Télécharger sur mon ordinateur",
+        "fileUnavailable": "Fichier indisponible ou inexistant : {filePath}",
+        "turnTitle": "Outputs from this turn",
+        "download": "Download to this device",
+        "openWithDefaultAppHost": "Open with default app (Codeg host)",
+        "copyFileHost": "Copy file object (Codeg host)",
+        "copyPath": "Copy path",
+        "revealOnHost": "Reveal on the Codeg host",
+        "fileCopied": "File copied; you can paste it directly",
+        "pathCopied": "Path copied",
+        "filesCopied": "Files copied; you can paste them together",
+        "opened": "Opened with the Codeg host's default app",
+        "operationFailed": "Deliverable operation failed",
+        "declared": "Declared",
+        "inferred": "Automatically inferred",
+        "codeChange": "Modification du code",
+        "deleted": "Supprimé",
+        "allTypes": "All types",
+        "allSources": "All sources",
+        "allTurns": "All turns",
+        "turnNumber": "Turn {number}",
+        "allTimes": "Any time",
+        "lastDay": "Last 24 hours",
+        "lastWeek": "Last 7 days",
+        "lastMonth": "Last 30 days",
+        "newest": "Recently updated",
+        "oldest": "Oldest updated",
+        "selectAll": "Select filtered items",
+        "selectedCount": "{count} selected",
+        "downloadSelected": "Download selected files individually",
+        "downloadZip": "Download selected files as ZIP",
+        "copySelectedHost": "Copy selected file objects (Codeg host)",
+        "revealFirstHost": "Reveal the first file on the Codeg host",
+        "removeInvalid": "Remove selected invalid records",
+        "removed": "Invalid records removed",
+        "downloadStarted": "Download started",
+        "revealed": "File revealed on the Codeg host",
+        "selectFile": "Select {name}",
+        "missing": "File missing",
+        "empty": "This conversation has no confirmed deliverables yet",
+        "noFilterResults": "No deliverables match these filters",
+        "hostActionNotice": "Open, copy file, and reveal actions affect the host running Codeg Server; downloads always go to the current device."
+      },
+      "userResources": {
+        "openFile": "Ouvrir {filePath}",
+        "fileUnavailable": "Fichier indisponible ou inexistant : {filePath}"
       }
     },
     "diffPreview": {
@@ -4056,7 +4233,17 @@
       "fr": "Français",
       "pt": "Portugais",
       "ar": "Arabe"
-    }
+    },
+    "defaultConversation": "Default conversation",
+    "defaultConversationHint": "Use this conversation for the first WeChat message when the sender has no saved binding.",
+    "defaultFolderId": "Folder ID",
+    "defaultConversationId": "Conversation ID",
+    "defaultAgentType": "Agent type",
+    "weixinPushMode": "WeChat push mode",
+    "weixinPushFinalOnly": "Final result only",
+    "weixinPushFinalAndInteractions": "Final result and required interactions",
+    "weixinPushDebug": "Debug mode",
+    "weixinPushModeHint": "Only the final answer is pushed by default. Expired reply tokens keep the result pending until the next inbound message."
   },
   "ModelProviderSettings": {
     "sectionTitle": "Fournisseurs de Modèles",
@@ -4295,7 +4482,9 @@
       "syncFailed": "Échec de la synchronisation des compétences"
     },
     "autoPreviewLabel": "Ouvrir l'aperçu automatiquement",
-    "autoPreviewHint": "Lorsqu'un agent crée ou modifie un fichier Word, Excel ou PowerPoint, ouvrir automatiquement son aperçu en direct."
+    "autoPreviewHint": "Lorsqu'un agent crée ou modifie un fichier Word, Excel ou PowerPoint, ouvrir automatiquement son aperçu en direct.",
+    "autoDownloadProducedLabel": "Télécharger automatiquement les livrables finaux",
+    "autoDownloadProducedHint": "Lors de l'utilisation du serveur web (par ex. via Tailscale/LAN), télécharge automatiquement dans le dossier Téléchargements de ce navigateur les fichiers de livrables finaux déclarés par l'agent et vérifiés."
   },
   "SkillPacksSettings": {
     "title": "Packs de compétences",
@@ -4786,7 +4975,12 @@
     "targetsDescription": "Définissez un niveau différent pour des modules spécifiques (p. ex. codeg_lib::acp) sans changer le niveau global.",
     "targetsAdd": "Ajouter",
     "targetsRemove": "Supprimer le remplacement",
-    "toggleDetails": "Afficher les détails"
+    "toggleDetails": "Afficher les détails",
+    "exportDiagnostics": "Exporter le diagnostic",
+    "exporting": "Exportation…",
+    "exportDescription": "Exporte en JSON les informations de l’application et de l’environnement, les réglages, les métadonnées des fichiers et les journaux récents. Les identifiants courants sont masqués et les conversations et bases de données sont exclues ; vérifiez les chemins et le texte avant partage.",
+    "exportSuccess": "Rapport de diagnostic exporté",
+    "exportFailed": "Échec de l’export du rapport de diagnostic"
   },
   "Automations": {
     "title": "Automatisations",
@@ -4923,7 +5117,8 @@
     "branchLocal": "Locale",
     "branchRemote": "Distante",
     "branchSearchPlaceholder": "Rechercher des branches…",
-    "branchNone": "Aucune branche"
+    "branchNone": "Aucune branche",
+    "advanced": "Avancé"
   },
   "Tasks": {
     "title": "Tâches à faire",

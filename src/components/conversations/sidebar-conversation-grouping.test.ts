@@ -106,6 +106,32 @@ describe("groupByFolderWithReuse", () => {
     expect(grouped.get(10)!.map((c) => c.id)).toEqual([2, 1])
   })
 
+  it("moves a conversation to the top when a later task or reply updates it", () => {
+    const older = conv(1, 10, {
+      updated_at: new Date(1000).toISOString(),
+    })
+    const current = conv(2, 10, {
+      updated_at: new Date(2000).toISOString(),
+    })
+    const first = groupByFolderWithReuse([older, current], "updated", new Map())
+    expect(first.get(10)!.map((c) => c.id)).toEqual([2, 1])
+
+    // A turn-boundary status event replaces the touched summary and advances
+    // updated_at. The same folder must immediately re-sort without a refetch.
+    const olderAfterReply = {
+      ...older,
+      status: "pending_review",
+      updated_at: new Date(3000).toISOString(),
+    }
+    const second = groupByFolderWithReuse(
+      [olderAfterReply, current],
+      "updated",
+      first
+    )
+    expect(second.get(10)!.map((c) => c.id)).toEqual([1, 2])
+    expect(second.get(10)).not.toBe(first.get(10))
+  })
+
   it("reuses the prior bucket array for folders whose membership is unchanged", () => {
     const a1 = conv(1, 10)
     const a2 = conv(2, 10)
@@ -914,11 +940,11 @@ describe("buildRows — Recent section", () => {
     const matches = rows.filter(
       (r) => r.kind === "conversation" && r.conversation.id === 1
     )
-    // The same conversation appears twice: once under its folder (untagged),
-    // once in Recent (tagged).
+    // The same conversation appears twice: first in Recent (tagged), then under
+    // its folder (untagged), matching the product's section order.
     expect(matches).toEqual([
-      { kind: "conversation", conversation: c1, depth: 0 },
       { kind: "conversation", conversation: c1, depth: 0, recent: true },
+      { kind: "conversation", conversation: c1, depth: 0 },
     ])
   })
 
@@ -938,8 +964,8 @@ describe("buildRows — Recent section", () => {
     expect(
       rows.filter((r) => r.kind === "conversation" && r.conversation.id === 2)
     ).toEqual([
-      { kind: "conversation", conversation: kid, depth: 1 },
       { kind: "conversation", conversation: kid, depth: 1, recent: true },
+      { kind: "conversation", conversation: kid, depth: 1 },
     ])
 
     const loadingRows = buildRows({
@@ -952,8 +978,8 @@ describe("buildRows — Recent section", () => {
       childrenLoading: new Set([1]),
     }).filter((r) => r.kind === "subsession-loading")
     expect(loadingRows).toEqual([
-      { kind: "subsession-loading", parentId: 1, depth: 1 },
       { kind: "subsession-loading", parentId: 1, depth: 1, recent: true },
+      { kind: "subsession-loading", parentId: 1, depth: 1 },
     ])
   })
 

@@ -50,8 +50,12 @@ pub enum LiveContentBlock {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         parent_tool_use_id: Option<String>,
     },
-    ToolCallRef { tool_call_id: String },
-    Plan { entries: serde_json::Value },
+    ToolCallRef {
+        tool_call_id: String,
+    },
+    Plan {
+        entries: serde_json::Value,
+    },
 }
 
 /// 工具调用的运行态。turn 完成时统一 clear。
@@ -245,6 +249,12 @@ pub struct SessionState {
     // 身份
     pub connection_id: String,
     pub conversation_id: Option<i32>,
+    /// Persisted conversation that requested this connection while its atomic
+    /// restore is still in progress. Diagnostic only: unlike
+    /// `conversation_id`, it never participates in routing or ownership.
+    pub restore_conversation_id: Option<i32>,
+    /// Monotonic origin for structured restore-stage timing logs.
+    pub restore_started_at: Option<std::time::Instant>,
     pub external_id: Option<String>,
     /// Wall-clock instant `external_id` last CHANGED value (SessionStarted
     /// for a new/loaded/forked session). The transcript watcher uses this as
@@ -352,6 +362,8 @@ pub struct SessionState {
     pub asserted_config_values: BTreeMap<String, String>,
     pub prompt_capabilities: Option<PromptCapabilitiesInfo>,
     pub fork_supported: bool,
+    /// Native in-turn steering capability of this concrete adapter process.
+    pub supports_steer: bool,
     pub available_commands: Vec<AvailableCommandInfo>,
     pub usage: Option<UsageInfo>,
     /// True once the agent's initial selectors handshake (modes +
@@ -386,6 +398,15 @@ pub struct SessionState {
     // 事件锚点
     pub event_seq: u64,
     pub last_activity_at: DateTime<Utc>,
+    /// Last event emitted by the ACP/agent connection itself. Unlike
+    /// `last_activity_at`, browser attach keepalives never update this clock.
+    /// Reconciliation therefore treats it as the run heartbeat while idle
+    /// sweeping can continue to use the broader client-or-agent activity.
+    pub last_agent_activity_at: DateTime<Utc>,
+    /// Last event proving an in-flight turn is making real progress. Status,
+    /// usage and selector heartbeats deliberately do not update this clock:
+    /// they can continue forever after an adapter has lost its terminal event.
+    pub last_turn_progress_at: DateTime<Utc>,
 
     /// Per-connection event broadcaster used by the WS attach protocol.
     /// New subscribers register receivers here while holding the SessionState
@@ -413,6 +434,17 @@ pub struct SessionState {
     /// would just be told to route through something it cannot call. Backend-only
     /// and fixed for the connection's lifetime.
     pub delegation_enabled: bool,
+    /// Whether the built-in `codeg-mcp` companion was successfully added to
+    /// this connection's session new/load/resume request. This is fixed at
+    /// launch and is the compatibility bit used when reopening a historical
+    /// Codex conversation: a pre-deliverables connection must never be reused
+    /// just because its external session id happens to match.
+    pub codeg_mcp_available: bool,
+
+    /// Number of MCP server entries accepted into this connection's session
+    /// establishment request (user-configured servers plus `codeg-mcp`).
+    /// Diagnostic only; no server configuration or secrets are serialized.
+    pub mcp_server_count: u32,
 
     /// Whether the `check_user_feedback` MCP tool was exposed to THIS agent at
     /// launch (the `feedback` feature was on when its companion was injected).
@@ -521,12 +553,22 @@ pub struct SessionState {
     /// `delegation_call_id`-bound child outcome. Cleared on the next prompt.
     pub last_assistant_text: Option<String>,
 
+    /// Structured WebSearch sources captured for the just-completed assistant
+    /// answer. Kept beside `last_assistant_text` so plain-text channels can
+    /// resolve Codex citation markers after the live tool map is cleared.
+    pub last_assistant_citations: Vec<crate::citations::CitationSource>,
+
     /// The in-flight user prompt for the current turn, captured from
     /// `AcpEvent::UserMessage` and cleared on `TurnComplete` (alongside
     /// `live_message`). Carried on `to_snapshot()` so a client attaching
     /// mid-turn renders the user turn even though no `UserMessage` event will
     /// replay for it. `None` outside an active turn.
     pub pending_user_message: Option<PendingUserMessage>,
+
+    /// Successfully injected guide messages for the current turn. Kept beside
+    /// the original pending prompt so a refresh/second viewer can reconstruct
+    /// every user intervention without replaying one-shot events.
+    pub steer_messages: Vec<PendingUserMessage>,
 
     /// Backend wall-clock instant the in-flight turn started, captured alongside
     /// `pending_user_message` from `AcpEvent::UserMessage` and cleared on
@@ -565,6 +607,18 @@ pub struct SessionState {
     /// `ConnectionManager::submit_feedback_native`, which re-checks it across
     /// attachment hydration so a steered note cannot ride into the next turn.
     pub turns_completed: u64,
+    /// Durable turn-run identity owned by the current in-memory prompt. This is
+    /// installed as soon as the artifact/run row is created, before any branch
+    /// snapshot or merge context is prepared, and cleared with TurnComplete.
+    /// Reconciliation uses it to ensure an old run (or an old connection
+    /// generation) can never settle the prompt that currently owns this
+    /// connection. Backend-internal; the public snapshot already exposes the
+    /// client message and connection event sequence needed by the UI.
+    pub active_turn_run_id: Option<String>,
+    /// Event-sequence boundary captured with `active_turn_run_id`. Unlike a
+    /// wall-clock timestamp this is monotonic for one connection and changes
+    /// when a new prompt generation is armed.
+    pub active_turn_generation: Option<u64>,
 
     /// Whether the most recently completed turn ended via a stop reason other
     /// than `"end_turn"` (cancelled, refusal, max_tokens, max_turn_requests,
@@ -613,6 +667,8 @@ impl SessionState {
         Self {
             connection_id,
             conversation_id: None,
+            restore_conversation_id: None,
+            restore_started_at: None,
             external_id: None,
             external_id_changed_at: None,
             agent_type,
@@ -636,6 +692,7 @@ impl SessionState {
             asserted_config_values: BTreeMap::new(),
             prompt_capabilities: None,
             fork_supported: false,
+            supports_steer: false,
             available_commands: Vec::new(),
             usage: None,
             selectors_ready: false,
@@ -643,10 +700,14 @@ impl SessionState {
             session_started_tx: None,
             event_seq: 0,
             last_activity_at: Utc::now(),
+            last_agent_activity_at: Utc::now(),
+            last_turn_progress_at: Utc::now(),
             event_stream: Arc::new(ConnectionEventStream::new()),
             recent_events: RecentEventsBuffer::new(),
             delegation_token: None,
             delegation_enabled: false,
+            codeg_mcp_available: false,
+            mcp_server_count: 0,
             feedback_tool_available: false,
             native_steering_available: false,
             neutral_goal_channel: false,
@@ -657,10 +718,14 @@ impl SessionState {
             async_tasks: BTreeMap::new(),
             async_task_activity_at: None,
             last_assistant_text: None,
+            last_assistant_citations: Vec::new(),
             pending_user_message: None,
+            steer_messages: Vec::new(),
             pending_user_message_started_at: None,
             turn_in_flight: false,
             turns_completed: 0,
+            active_turn_run_id: None,
+            active_turn_generation: None,
             last_turn_ended_abnormally: false,
             config_stale: false,
             config_stale_kind: None,
@@ -709,9 +774,27 @@ impl SessionState {
     /// 单一分发器：把一个 AcpEvent 应用到 self。注意此方法**不**自增 event_seq——
     /// seq 由 emit_with_state 在外层管理（这样 apply_event 可独立单元测试）。
     pub fn apply_event(&mut self, payload: &AcpEvent) {
+        if matches!(
+            payload,
+            AcpEvent::ContentDelta { .. }
+                | AcpEvent::Thinking { .. }
+                | AcpEvent::ToolCall { .. }
+                | AcpEvent::ToolCallUpdate { .. }
+                | AcpEvent::PermissionRequest { .. }
+                | AcpEvent::PermissionResolved { .. }
+                | AcpEvent::QuestionRequest { .. }
+                | AcpEvent::QuestionResolved { .. }
+                | AcpEvent::PlanApprovalRequest { .. }
+                | AcpEvent::PlanApprovalResolved { .. }
+                | AcpEvent::UserMessage { .. }
+                | AcpEvent::BackgroundActivity { .. }
+        ) {
+            self.last_turn_progress_at = Utc::now();
+        }
         match payload {
             AcpEvent::SessionStarted { session_id } => {
-                if self.external_id.as_deref() != Some(session_id.as_str()) {
+                let session_changed = self.external_id.as_deref() != Some(session_id.as_str());
+                if session_changed {
                     self.external_id_changed_at = Some(std::time::SystemTime::now());
                     // The AIR task table is keyed to the session we just left.
                     // Its rows can never settle here again: the adapter
@@ -726,6 +809,11 @@ impl SessionState {
                     // accepted between turns.
                     self.async_tasks.clear();
                     self.async_task_activity_at = None;
+                    // `session/fork` reuses the process and SessionState but
+                    // attaches a different ACP session. The old session's
+                    // readiness latch must not make the new session appear
+                    // prompt-capable before its modes/config have finished.
+                    self.selectors_ready = false;
                 }
                 self.external_id = Some(session_id.clone());
                 self.status = ConnectionStatus::Connected;
@@ -737,6 +825,17 @@ impl SessionState {
                 // fired in spawn_agent) — also a no-op.
                 if let Some(tx) = self.session_started_tx.take() {
                     let _ = tx.send(());
+                }
+                if let Some(conversation_id) = self.restore_conversation_id {
+                    tracing::info!(
+                        conversation_id,
+                        connection_id = %self.connection_id,
+                        stage = "session_started",
+                        total_elapsed_ms = self
+                            .restore_started_at
+                            .map(|started| started.elapsed().as_millis() as u64),
+                        "[ACP][restore] stage completed"
+                    );
                 }
             }
             AcpEvent::StatusChanged { status } => {
@@ -791,6 +890,9 @@ impl SessionState {
             }
             AcpEvent::ForkSupported { supported } => {
                 self.fork_supported = *supported;
+            }
+            AcpEvent::SteerSupported { supported } => {
+                self.supports_steer = *supported;
             }
             AcpEvent::AvailableCommands { commands } => {
                 self.available_commands = commands.clone();
@@ -1025,6 +1127,10 @@ impl SessionState {
                 // call (no concluding text) → empty, which CLEARS the field so a
                 // prior turn's text can't leak as this turn's result; the LLM
                 // reads the full result by opening the child session instead.
+                let completed_message_id = self
+                    .live_message
+                    .as_ref()
+                    .map(|message| message.id.clone());
                 //
                 // Cleared FIRST, because a turn can end with no live message at
                 // all — cancelled before it produced anything, or one whose only
@@ -1068,6 +1174,64 @@ impl SessionState {
                         self.last_assistant_text = Some(assembled);
                     }
                 }
+                let mut citation_sources = Vec::new();
+                for tool_call in self.active_tool_calls.values() {
+                    citation_sources.extend(crate::citations::sources_from_meta(
+                        tool_call.meta.as_ref(),
+                    ));
+                }
+                self.last_assistant_citations =
+                    crate::citations::merge_sources(citation_sources.iter());
+                for source in &mut self.last_assistant_citations {
+                    if source.message_id.is_none() {
+                        source.message_id.clone_from(&completed_message_id);
+                    }
+                }
+                if let Some(answer) = self.last_assistant_text.as_deref() {
+                    let references = crate::citations::reference_ids(answer);
+                    let resolved = self
+                        .last_assistant_citations
+                        .iter()
+                        .map(|source| source.reference_id.as_str())
+                        .collect::<std::collections::HashSet<_>>();
+                    let unresolved = references
+                        .iter()
+                        .filter(|reference| !resolved.contains(reference.as_str()))
+                        .count();
+                    let resolved_count = references.len().saturating_sub(unresolved);
+                    let mut source_event_types = self
+                        .last_assistant_citations
+                        .iter()
+                        .map(|source| source.source_type.as_str())
+                        .collect::<Vec<_>>();
+                    source_event_types.sort_unstable();
+                    source_event_types.dedup();
+                    let source_event_types = source_event_types.join(",");
+                    if unresolved > 0 {
+                        tracing::warn!(
+                            connection_id = %self.connection_id,
+                            conversation_id = ?self.conversation_id,
+                            message_id = completed_message_id.as_deref().unwrap_or_default(),
+                            citation_reference_count = references.len(),
+                            resolved_citation_count = resolved_count,
+                            unresolved_citation_count = unresolved,
+                            metadata_first_missing_stage = "acp_session_update",
+                            citation_source_event_types = source_event_types,
+                            "[ACP][citations] assistant answer contains citation ids without URL metadata"
+                        );
+                    } else if !references.is_empty() {
+                        tracing::debug!(
+                            connection_id = %self.connection_id,
+                            conversation_id = ?self.conversation_id,
+                            message_id = completed_message_id.as_deref().unwrap_or_default(),
+                            citation_reference_count = references.len(),
+                            resolved_citation_count = resolved_count,
+                            unresolved_citation_count = 0,
+                            citation_source_event_types = source_event_types,
+                            "[ACP][citations] assistant citation metadata resolved"
+                        );
+                    }
+                }
                 self.live_message = None;
                 self.active_tool_calls.clear();
                 // The turn's user prompt is no longer "in flight" — the
@@ -1076,6 +1240,7 @@ impl SessionState {
                 // pending user message into a fresh attach.
                 self.pending_user_message = None;
                 self.pending_user_message_started_at = None;
+                self.steer_messages.clear();
                 // Turn finished: release the concurrency gate so the next prompt
                 // is accepted. (All connection-alive turn endings — normal,
                 // cancel, stop-reason — emit TurnComplete; disconnect/error
@@ -1085,6 +1250,8 @@ impl SessionState {
                 // admitted against" can now see that it is gone, even if a new
                 // turn sets `turn_in_flight` again before they look.
                 self.turns_completed = self.turns_completed.saturating_add(1);
+                self.active_turn_run_id = None;
+                self.active_turn_generation = None;
                 // NOTE: `active_delegations` is intentionally NOT cleared here.
                 // A running delegation's child runs in the background long after
                 // the parent's `delegate_to_agent` tool call returns and this
@@ -1148,6 +1315,20 @@ impl SessionState {
                     failure.resolved = true;
                 }
             }
+            AcpEvent::SteerMessage {
+                message_id, blocks, ..
+            } => {
+                if !self
+                    .steer_messages
+                    .iter()
+                    .any(|message| message.message_id == *message_id)
+                {
+                    self.steer_messages.push(PendingUserMessage {
+                        message_id: message_id.clone(),
+                        blocks: blocks.clone(),
+                    });
+                }
+            }
             AcpEvent::ConversationLinked {
                 conversation_id,
                 folder_id,
@@ -1187,6 +1368,28 @@ impl SessionState {
                 // after browser refresh) can tell the initial handshake is
                 // already done — the event fires only once per connection.
                 self.selectors_ready = true;
+                if let Some(conversation_id) = self.restore_conversation_id {
+                    let total_elapsed_ms = self
+                        .restore_started_at
+                        .map(|started| started.elapsed().as_millis() as u64);
+                    tracing::info!(
+                        conversation_id,
+                        connection_id = %self.connection_id,
+                        stage = "selectors_ready",
+                        total_elapsed_ms,
+                        "[ACP][restore] stage completed"
+                    );
+                    // SelectorsReady is the backend's prompt-readiness latch;
+                    // name both product stages explicitly for production
+                    // timelines without inventing a second behavioural event.
+                    tracing::info!(
+                        conversation_id,
+                        connection_id = %self.connection_id,
+                        stage = "prompt_ready",
+                        total_elapsed_ms,
+                        "[ACP][restore] stage completed"
+                    );
+                }
             }
             AcpEvent::Error {
                 message,
@@ -1354,6 +1557,7 @@ impl SessionState {
                 self.async_task_activity_at = Some(Utc::now());
             }
             AcpEvent::ClaudeSdkMessage { .. }
+            | AcpEvent::AgentFileChangeReport { .. }
             | AcpEvent::ConfigOptionRejected { .. }
             | AcpEvent::SessionLoadFailed { .. }
             | AcpEvent::TurnRetrying { .. }
@@ -1367,7 +1571,9 @@ impl SessionState {
                 // 权威值已由紧随其后的 SessionConfigOptions 落进快照。
             }
         }
-        self.last_activity_at = Utc::now();
+        let now = Utc::now();
+        self.last_activity_at = now;
+        self.last_agent_activity_at = now;
     }
 
     /// Whether this connection has launched background work (async sub-agent /
@@ -1441,6 +1647,33 @@ impl SessionState {
             Some(at) => now.signed_duration_since(at) < background_keepalive_max_age(),
             None => false,
         }
+    }
+
+    /// Whitespace-only streaming payloads are protocol noise, not evidence of
+    /// an answer. Used by zombie reconciliation and intentionally ignores tool
+    /// references; tool liveness is evaluated independently from their status.
+    pub fn has_effective_live_text(&self) -> bool {
+        self.live_message.as_ref().is_some_and(|message| {
+            message.content.iter().any(|block| match block {
+                LiveContentBlock::Text { text, .. } | LiveContentBlock::Thinking { text, .. } => {
+                    !text.trim().is_empty()
+                }
+                _ => false,
+            })
+        })
+    }
+
+    pub fn has_active_turn_interaction(&self) -> bool {
+        self.pending_permission.is_some()
+            || self.pending_question.is_some()
+            || self.pending_plan_approval.is_some()
+            || self.active_tool_calls.values().any(|tool| {
+                matches!(
+                    tool.status,
+                    ToolCallStatus::Pending | ToolCallStatus::InProgress
+                )
+            })
+            || self.background_outstanding > 0
     }
 
     /// A single-line "what the sub-agent is doing right now" hint, used by the
@@ -1783,7 +2016,10 @@ impl SessionState {
             entry.locations = Some(loc.clone());
         }
         if let Some(m) = meta {
-            entry.meta = Some(m.clone());
+            entry.meta = Some(crate::citations::merge_citations_in_meta(
+                entry.meta.as_ref(),
+                m,
+            ));
         }
         if let Some(imgs) = images {
             // Replace-on-update: the agent re-sends the full image list on
@@ -1813,12 +2049,16 @@ impl SessionState {
             background_outstanding: self.background_outstanding,
             feedback_tool_available: self.feedback_tool_available,
             native_steering_available: self.native_steering_available,
+            codeg_mcp_available: self.codeg_mcp_available,
+            mcp_server_count: self.mcp_server_count,
             modes: self.modes.clone(),
             current_mode: self.current_mode.clone(),
             config_options: self.config_options.clone(),
             prompt_capabilities: self.prompt_capabilities.clone(),
             usage: self.usage.clone(),
             fork_supported: self.fork_supported,
+            supports_steer: self.supports_steer,
+            steer_messages: self.steer_messages.clone(),
             available_commands: self.available_commands.clone(),
             selectors_ready: self.selectors_ready,
             config_stale: self.config_stale,
@@ -1912,12 +2152,25 @@ pub struct LiveSessionSnapshot {
     /// like `feedback_tool_available` so the frontend can rely on it.
     #[serde(default)]
     pub native_steering_available: bool,
+    /// Whether `codeg-mcp` was included in the session establishment request.
+    /// Defaults false for snapshots emitted by older Codeg versions.
+    #[serde(default)]
+    pub codeg_mcp_available: bool,
+    /// Total MCP server entries on this concrete connection. Diagnostic only.
+    #[serde(default)]
+    pub mcp_server_count: u32,
     pub modes: Option<SessionModeStateInfo>,
     pub current_mode: Option<String>,
     pub config_options: Option<Vec<SessionConfigOptionInfo>>,
     pub prompt_capabilities: Option<PromptCapabilitiesInfo>,
     pub usage: Option<UsageInfo>,
     pub fork_supported: bool,
+    /// Native `turn/steer` is available on this concrete live connection.
+    #[serde(default)]
+    pub supports_steer: bool,
+    /// Successfully injected guide messages in the current turn.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steer_messages: Vec<PendingUserMessage>,
     pub available_commands: Vec<AvailableCommandInfo>,
     pub selectors_ready: bool,
     /// Whether the running session is on stale (launch-time) config after a
@@ -2094,6 +2347,27 @@ mod tests {
 
         assert_eq!(s.conversation_id, Some(7));
         assert!(s.last_native_title.is_none());
+    }
+
+    #[test]
+    fn whitespace_stream_is_not_progress_and_finished_tools_are_not_active() {
+        let mut state = fresh_state();
+        state.apply_event(&AcpEvent::ContentDelta {
+            text: " \n\t".into(),
+            parent_tool_use_id: None,
+        });
+        assert!(!state.has_effective_live_text());
+
+        state.apply_event(&tool_call_event("finished", "command"));
+        assert!(state.has_active_turn_interaction());
+        state.active_tool_calls.get_mut("finished").unwrap().status = ToolCallStatus::Completed;
+        assert!(!state.has_active_turn_interaction());
+
+        state.apply_event(&AcpEvent::ContentDelta {
+            text: "real output".into(),
+            parent_tool_use_id: None,
+        });
+        assert!(state.has_effective_live_text());
     }
 
     #[test]
@@ -2424,7 +2698,12 @@ mod tests {
             }
         }
         let mut s = fresh_state();
-        s.apply_event(&failure("t1:error", 5, "warning", "Reconnecting, attempt 5 of 5."));
+        s.apply_event(&failure(
+            "t1:error",
+            5,
+            "warning",
+            "Reconnecting, attempt 5 of 5.",
+        ));
 
         // A cancelled/failed/empty exit is NOT recovery — the incident (e.g.
         // reconnect attempts with the network still down) must stay active
@@ -2706,6 +2985,37 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_restores_accepted_steers_and_turn_complete_clears_them() {
+        let mut s = fresh_state();
+        s.apply_event(&AcpEvent::SteerSupported { supported: true });
+        let steer = AcpEvent::SteerMessage {
+            message_id: "guide-1".into(),
+            blocks: vec![UserMessageBlock::Text {
+                text: "check B instead".into(),
+            }],
+            turn_id: Some("turn-active".into()),
+        };
+        s.apply_event(&steer);
+        s.apply_event(&steer);
+
+        let snapshot = s.to_snapshot();
+        assert!(snapshot.supports_steer);
+        assert_eq!(snapshot.steer_messages.len(), 1, "message id deduplicates");
+        assert_eq!(snapshot.steer_messages[0].message_id, "guide-1");
+
+        s.apply_event(&AcpEvent::TurnComplete {
+            session_id: "sess".into(),
+            stop_reason: "end_turn".into(),
+            agent_type: "codex".into(),
+        });
+        assert!(s.steer_messages.is_empty());
+        assert!(
+            s.supports_steer,
+            "connection capability survives individual turns"
+        );
+    }
+
+    #[test]
     fn to_snapshot_carries_pending_user_message() {
         let mut s = fresh_state();
         s.apply_event(&text_user_message("user-7", "snapshot me"));
@@ -2876,7 +3186,10 @@ mod tests {
             text: "Answer ".into(),
             parent_tool_use_id: None,
         });
-        s.apply_event(&AcpEvent::Thinking { text: "hmm".into(), parent_tool_use_id: None });
+        s.apply_event(&AcpEvent::Thinking {
+            text: "hmm".into(),
+            parent_tool_use_id: None,
+        });
         s.apply_event(&AcpEvent::ContentDelta {
             text: "continues here".into(),
             parent_tool_use_id: None,
@@ -2896,6 +3209,25 @@ mod tests {
         assert!(s.selectors_ready);
         assert!(s.to_snapshot().selectors_ready);
         // Idempotent — staying true on a second apply.
+        s.apply_event(&AcpEvent::SelectorsReady);
+        assert!(s.selectors_ready);
+    }
+
+    #[test]
+    fn a_new_session_id_resets_the_previous_sessions_readiness_latch() {
+        let mut s = fresh_state();
+        s.apply_event(&AcpEvent::SessionStarted {
+            session_id: "source-session".into(),
+        });
+        s.apply_event(&AcpEvent::SelectorsReady);
+        assert!(s.selectors_ready);
+
+        s.apply_event(&AcpEvent::SessionStarted {
+            session_id: "branch-session".into(),
+        });
+        assert!(!s.selectors_ready);
+        assert_eq!(s.external_id.as_deref(), Some("branch-session"));
+
         s.apply_event(&AcpEvent::SelectorsReady);
         assert!(s.selectors_ready);
     }
@@ -3072,9 +3404,18 @@ mod tests {
     #[test]
     fn thinking_delta_creates_separate_block_from_text() {
         let mut s = fresh_state();
-        s.apply_event(&AcpEvent::ContentDelta { text: "T".into(), parent_tool_use_id: None });
-        s.apply_event(&AcpEvent::Thinking { text: "X".into(), parent_tool_use_id: None });
-        s.apply_event(&AcpEvent::ContentDelta { text: "Y".into(), parent_tool_use_id: None });
+        s.apply_event(&AcpEvent::ContentDelta {
+            text: "T".into(),
+            parent_tool_use_id: None,
+        });
+        s.apply_event(&AcpEvent::Thinking {
+            text: "X".into(),
+            parent_tool_use_id: None,
+        });
+        s.apply_event(&AcpEvent::ContentDelta {
+            text: "Y".into(),
+            parent_tool_use_id: None,
+        });
         let live = s.live_message.as_ref().unwrap();
         assert_eq!(live.content.len(), 3);
         match &live.content[0] {
@@ -3433,7 +3774,10 @@ mod tests {
     #[test]
     fn turn_complete_clears_live_and_tool_calls_and_pending_permission() {
         let mut s = fresh_state();
-        s.apply_event(&AcpEvent::ContentDelta { text: "hi".into(), parent_tool_use_id: None });
+        s.apply_event(&AcpEvent::ContentDelta {
+            text: "hi".into(),
+            parent_tool_use_id: None,
+        });
         s.apply_event(&AcpEvent::ToolCall {
             tool_call_id: "tc-1".into(),
             title: "x".into(),
@@ -3698,6 +4042,47 @@ mod tests {
     }
 
     #[test]
+    fn turn_complete_keeps_live_citations_for_plain_text_channels() {
+        let mut s = fresh_state();
+        s.apply_event(&AcpEvent::ToolCall {
+            tool_call_id: "ws-1".into(),
+            title: "Search".into(),
+            kind: "search".into(),
+            status: "completed".into(),
+            content: None,
+            raw_input: None,
+            raw_output: None,
+            locations: None,
+            meta: Some(serde_json::json!({
+                "codeg.citations": [{
+                    "citation_id": "turn0search0",
+                    "url": "https://example.com/source",
+                    "title": "Source",
+                    "domain": "example.com"
+                }]
+            })),
+            images: None,
+        });
+        s.apply_event(&AcpEvent::ContentDelta {
+            text: "answer \u{e200}cite\u{e202}turn0search0\u{e201}".into(),
+            parent_tool_use_id: None,
+        });
+        s.apply_event(&AcpEvent::TurnComplete {
+            session_id: "ext".into(),
+            stop_reason: "end_turn".into(),
+            agent_type: "codex".into(),
+        });
+        assert_eq!(s.last_assistant_citations.len(), 1);
+        assert_eq!(
+            crate::citations::render_plain_text_citations(
+                s.last_assistant_text.as_deref().expect("final text"),
+                &s.last_assistant_citations,
+            ),
+            "answer [1]\n\n来源：\n[1] Source：https://example.com/source"
+        );
+    }
+
+    #[test]
     fn turn_complete_trailing_tool_call_captures_no_text() {
         // A turn ending on a tool call has no concluding text block; the result
         // text stays unset (the LLM opens the child session for detail).
@@ -3884,7 +4269,10 @@ mod tests {
         s.apply_event(&AcpEvent::PermissionQueueDepth { depth: 2 });
         let p = s.pending_permission.as_ref().expect("card still up");
         assert_eq!(p.queued, 2);
-        assert_eq!(p.request_id, "p-1", "depth must not change which card is up");
+        assert_eq!(
+            p.request_id, "p-1",
+            "depth must not change which card is up"
+        );
     }
 
     #[test]
@@ -4380,6 +4768,61 @@ mod tests {
     }
 
     #[test]
+    fn partial_web_search_updates_merge_citation_metadata() {
+        let mut s = fresh_state();
+        s.apply_event(&AcpEvent::ToolCall {
+            tool_call_id: "ws-1".into(),
+            title: "Search".into(),
+            kind: "search".into(),
+            status: "in_progress".into(),
+            content: None,
+            raw_input: None,
+            raw_output: None,
+            locations: None,
+            meta: Some(serde_json::json!({
+                "codeg.citations": [{
+                    "citation_id": "turn0search0",
+                    "url": "https://example.com/a",
+                    "title": "A",
+                    "domain": "example.com"
+                }]
+            })),
+            images: None,
+        });
+        s.apply_event(&AcpEvent::ToolCallUpdate {
+            tool_call_id: "ws-1".into(),
+            title: None,
+            status: Some("completed".into()),
+            content: None,
+            raw_input: None,
+            raw_output: None,
+            raw_output_append: None,
+            locations: None,
+            meta: Some(serde_json::json!({
+                "codeg.citations": [{
+                    "citation_id": "turn0view0",
+                    "url": "https://docs.example.org/open",
+                    "title": "Open",
+                    "domain": "docs.example.org"
+                }]
+            })),
+            images: None,
+        });
+        let entry = s.active_tool_calls.get("ws-1").expect("search call");
+        let sources = crate::citations::sources_from_meta(entry.meta.as_ref());
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0].reference_id, "turn0search0");
+        assert_eq!(sources[1].reference_id, "turn0view0");
+        let snapshot_sources = s
+            .to_snapshot()
+            .active_tool_calls
+            .into_iter()
+            .flat_map(|call| crate::citations::sources_from_meta(call.meta.as_ref()))
+            .collect::<Vec<_>>();
+        assert_eq!(snapshot_sources, sources);
+    }
+
+    #[test]
     fn tool_call_images_replace_or_preserve_on_update() {
         let mut s = fresh_state();
         let img_v1 = ToolCallImageInfo {
@@ -4485,7 +4928,10 @@ mod tests {
     fn plan_update_appends_at_end_replacing_existing() {
         use crate::acp::types::PlanEntryInfo;
         let mut s = fresh_state();
-        s.apply_event(&AcpEvent::ContentDelta { text: "A".into(), parent_tool_use_id: None });
+        s.apply_event(&AcpEvent::ContentDelta {
+            text: "A".into(),
+            parent_tool_use_id: None,
+        });
         s.apply_event(&AcpEvent::PlanUpdate {
             entries: vec![PlanEntryInfo {
                 content: "step v1".into(),
@@ -4493,7 +4939,10 @@ mod tests {
                 status: "pending".into(),
             }],
         });
-        s.apply_event(&AcpEvent::ContentDelta { text: "B".into(), parent_tool_use_id: None });
+        s.apply_event(&AcpEvent::ContentDelta {
+            text: "B".into(),
+            parent_tool_use_id: None,
+        });
         s.apply_event(&AcpEvent::PlanUpdate {
             entries: vec![PlanEntryInfo {
                 content: "step v2".into(),
@@ -4555,7 +5004,10 @@ mod tests {
     fn turn_complete_clears_plan_and_tool_refs() {
         use crate::acp::types::PlanEntryInfo;
         let mut s = fresh_state();
-        s.apply_event(&AcpEvent::ContentDelta { text: "x".into(), parent_tool_use_id: None });
+        s.apply_event(&AcpEvent::ContentDelta {
+            text: "x".into(),
+            parent_tool_use_id: None,
+        });
         s.apply_event(&tool_call_event("tc-1", "ls"));
         s.apply_event(&AcpEvent::PlanUpdate {
             entries: vec![PlanEntryInfo {
@@ -4585,7 +5037,10 @@ mod tests {
         let env = EventEnvelope {
             seq: 7,
             connection_id: "conn-x".into(),
-            payload: AcpEvent::ContentDelta { text: "abc".into(), parent_tool_use_id: None },
+            payload: AcpEvent::ContentDelta {
+                text: "abc".into(),
+                parent_tool_use_id: None,
+            },
         };
         let json = serde_json::to_string(&env).unwrap();
         let back: EventEnvelope = serde_json::from_str(&json).unwrap();

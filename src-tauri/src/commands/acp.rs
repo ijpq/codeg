@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -19,12 +20,14 @@ use crate::acp::types::{
     AgentSkillLocation, AgentSkillScope, AgentSkillsListResult, CodexGranularApproval,
     CodexSandboxSettings, CodexSandboxStructuredConfig, CodexWorkspaceWrite, ConfigStaleKind,
     ConnectionStatus, DiagCheck, DiagLevel, DiagSection, DiagnosticsVerdict, GrokSettings,
-    GrokStructuredConfig,
+    GrokStructuredConfig, RestoredConversationConnectionInfo,
 };
 #[cfg(feature = "tauri-runtime")]
 use crate::acp::types::{ConnectionInfo, ForkResultInfo, PromptInputBlock};
-use crate::db::service::agent_setting_service;
 use crate::db::service::model_provider_service;
+use crate::db::service::{
+    agent_setting_service, conversation_branch_service, conversation_service, folder_service,
+};
 use crate::db::AppDatabase;
 use crate::models::agent::AgentType;
 use crate::web::event_bridge::EventEmitter;
@@ -33,6 +36,129 @@ const ACP_AGENTS_UPDATED_EVENT: &str = "app://acp-agents-updated";
 const NPM_PREFIX_TIMEOUT: Duration = Duration::from_millis(1500);
 
 static NPM_GLOBAL_PREFIX_CACHE: tokio::sync::OnceCell<PathBuf> = tokio::sync::OnceCell::const_new();
+
+/// One cancellation-shielded restore task per durable conversation. The
+/// previous mutex lived inside the HTTP/Tauri request future: navigating away
+/// dropped that future (and its guard) while the separately spawned ACP process
+/// continued to own Codex's writer. A retry could then start a second process.
+/// This registry owns the task independently and gives every caller the exact
+/// same terminal result. The external-session writer lock inside the task is
+/// the second tier, serializing different conversation rows that reference the
+/// same `(agent_type, external_session_id)`.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct ManagedRestoreFlightKey {
+    manager_identity: usize,
+    conversation_id: i32,
+}
+
+struct ManagedRestoreFlight {
+    generation: String,
+    result: tokio::sync::watch::Sender<
+        Option<Result<RestoredConversationConnectionInfo, AcpError>>,
+    >,
+}
+
+fn managed_restore_flights(
+) -> &'static tokio::sync::Mutex<HashMap<ManagedRestoreFlightKey, Arc<ManagedRestoreFlight>>> {
+    static FLIGHTS: OnceLock<
+        tokio::sync::Mutex<HashMap<ManagedRestoreFlightKey, Arc<ManagedRestoreFlight>>>,
+    > = OnceLock::new();
+    FLIGHTS.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
+}
+
+async fn acquire_managed_restore_flight(
+    key: ManagedRestoreFlightKey,
+) -> (Arc<ManagedRestoreFlight>, bool) {
+    let mut flights = managed_restore_flights().lock().await;
+    if let Some(existing) = flights.get(&key) {
+        return (existing.clone(), false);
+    }
+    let (result, _) = tokio::sync::watch::channel(None);
+    let flight = Arc::new(ManagedRestoreFlight {
+        generation: uuid::Uuid::new_v4().to_string(),
+        result,
+    });
+    flights.insert(key, flight.clone());
+    (flight, true)
+}
+
+fn is_active_writer_restore_error(error: &AcpError) -> bool {
+    let normalized = error.to_string().to_ascii_lowercase();
+    normalized.contains("active writer") || normalized.contains("already has a writer")
+}
+
+fn has_live_external_session_owner_conflict(
+    requested_conversation_id: i32,
+    owner_conversation_id: Option<i32>,
+    owner_status: &ConnectionStatus,
+) -> bool {
+    owner_conversation_id.is_some_and(|owner| owner != requested_conversation_id)
+        && !matches!(
+            owner_status,
+            ConnectionStatus::Disconnected | ConnectionStatus::Error
+        )
+}
+
+async fn release_idle_legacy_fork_writer(
+    manager: &ConnectionManager,
+    db: &AppDatabase,
+    source_conversation_id: i32,
+    source_session_id: &str,
+) -> Result<bool, AcpError> {
+    let candidates =
+        conversation_branch_service::native_branch_sessions_for_source(&db.conn, source_session_id)
+            .await
+            .map_err(|error| AcpError::protocol(error.to_string()))?;
+    for (branch_conversation_id, branch_session_id) in candidates {
+        let connection_id = match manager
+            .find_connection_by_conversation_id(branch_conversation_id)
+            .await
+        {
+            Some(connection_id) => Some(connection_id),
+            None => {
+                manager
+                    .find_connection_by_external_id(&branch_session_id, AgentType::Codex)
+                    .await
+            }
+        };
+        let Some(connection_id) = connection_id else {
+            continue;
+        };
+        let Some(state) = manager.get_state(&connection_id).await else {
+            continue;
+        };
+        let can_handoff = {
+            let state = state.read().await;
+            state.external_id.as_deref() == Some(branch_session_id.as_str())
+                && state.status == ConnectionStatus::Connected
+                && !state.turn_in_flight
+        };
+        if !can_handoff {
+            tracing::warn!(
+                source_conversation_id,
+                source_session_id,
+                branch_conversation_id,
+                branch_session_id,
+                connection_id,
+                stage = "legacy_fork_writer_handoff_blocked",
+                "[ACP][restore] legacy native-fork owner is busy; preserving both sessions"
+            );
+            continue;
+        }
+        manager.disconnect_and_wait(&connection_id).await?;
+        tracing::warn!(
+            source_conversation_id,
+            source_session_id,
+            branch_conversation_id,
+            branch_session_id,
+            connection_id,
+            stage = "legacy_fork_writer_released",
+            "[ACP][restore] retired an idle legacy fork adapter that retained the source writer"
+        );
+        return Ok(true);
+    }
+    Ok(false)
+}
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "snake_case")]
@@ -313,7 +439,10 @@ pub(crate) fn resolve_uvx_command() -> Option<PathBuf> {
     }
     let exe = if cfg!(windows) { "uvx.exe" } else { "uvx" };
     let home = home_dir_or_default();
-    for dir in [home.join(".local").join("bin"), home.join(".cargo").join("bin")] {
+    for dir in [
+        home.join(".local").join("bin"),
+        home.join(".cargo").join("bin"),
+    ] {
         let cand = dir.join(exe);
         if cand.is_file() {
             return Some(cand);
@@ -760,9 +889,17 @@ const DIAG_SAFE_ENV_KEYS: &[&str] = &[
 /// `models::model_provider::mask_api_key`) so it never panics on a UTF-8 value.
 fn redact_secret(key: &str, value: &str) -> String {
     let lower = key.to_ascii_lowercase();
-    let secretish = ["key", "token", "secret", "password", "passwd", "auth", "credential"]
-        .iter()
-        .any(|needle| lower.contains(needle));
+    let secretish = [
+        "key",
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "auth",
+        "credential",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
     if !secretish {
         return value.to_string();
     }
@@ -910,7 +1047,12 @@ async fn diag_cmd_probe(cmd: &str, version_args: &[&str]) -> CmdProbe {
 
 /// Major version from `v20.11.1` / `20.11.1`.
 fn parse_node_major(v: &str) -> Option<u64> {
-    v.trim().trim_start_matches('v').split('.').next()?.parse().ok()
+    v.trim()
+        .trim_start_matches('v')
+        .split('.')
+        .next()?
+        .parse()
+        .ok()
 }
 
 /// Compare the user's login-shell PATH against the app PATH. Unix-only; on
@@ -949,7 +1091,8 @@ async fn diag_terminal_probe(cmd: &str, app_path: &[String]) -> TerminalProbe {
         }
     }
     if let Some(tp) = term_path {
-        let app_set: std::collections::HashSet<&str> = app_path.iter().map(String::as_str).collect();
+        let app_set: std::collections::HashSet<&str> =
+            app_path.iter().map(String::as_str).collect();
         let mut seen = std::collections::HashSet::new();
         probe.extra_dirs = tp
             .split(':')
@@ -1018,10 +1161,12 @@ async fn collect_agent_diag(
                 cand.is_file().then(|| cand.to_string_lossy().to_string())
             });
             diag.homebrew_bin = if cfg!(target_os = "macos") {
-                ["/opt/homebrew/bin", "/usr/local/bin"].iter().find_map(|d| {
-                    let cand = Path::new(d).join(diag_exe_name(cmd));
-                    cand.is_file().then(|| cand.to_string_lossy().to_string())
-                })
+                ["/opt/homebrew/bin", "/usr/local/bin"]
+                    .iter()
+                    .find_map(|d| {
+                        let cand = Path::new(d).join(diag_exe_name(cmd));
+                        cand.is_file().then(|| cand.to_string_lossy().to_string())
+                    })
             } else {
                 None
             };
@@ -1040,7 +1185,8 @@ async fn collect_agent_diag(
             // open) this report is on demand, so it can afford `--version` —
             // naming the exact build is what makes "we DID see your CLI" land.
             if let Some(relation) = registry::acp_adapter_relation(agent_type) {
-                let native_path = resolve_vendor_cli(relation.native_cmd, relation.extra_dirs).await;
+                let native_path =
+                    resolve_vendor_cli(relation.native_cmd, relation.extra_dirs).await;
                 let native_version = match &native_path {
                     Some(p) => diag_run(p, &["--version"]).await,
                     None => None,
@@ -1146,7 +1292,8 @@ async fn collect_diag_inputs(db: &AppDatabase, agent_type: Option<AgentType>) ->
     for &key in DIAG_SAFE_ENV_KEYS {
         if let Ok(val) = std::env::var(key) {
             if !val.trim().is_empty() {
-                inp.safe_env.push((key.to_string(), redact_secret(key, &val)));
+                inp.safe_env
+                    .push((key.to_string(), redact_secret(key, &val)));
             }
         }
     }
@@ -1341,14 +1488,30 @@ fn build_report(
 
     // 1. Runtime
     let mut runtime = vec![
-        diag_check("os / arch", &format!("{} / {}", inp.os, inp.arch), DiagLevel::Info, None),
+        diag_check(
+            "os / arch",
+            &format!("{} / {}", inp.os, inp.arch),
+            DiagLevel::Info,
+            None,
+        ),
         diag_check("app version", &inp.app_version, DiagLevel::Info, None),
     ];
-    let fix_failed = inp.path_logs.iter().any(|l| l.contains("fix_path_env failed"));
+    let fix_failed = inp
+        .path_logs
+        .iter()
+        .any(|l| l.contains("fix_path_env failed"));
     runtime.push(diag_check(
         "fix_path_env",
-        if fix_failed { "failed at startup" } else { "no failure logged" },
-        if fix_failed { DiagLevel::Warn } else { DiagLevel::Info },
+        if fix_failed {
+            "failed at startup"
+        } else {
+            "no failure logged"
+        },
+        if fix_failed {
+            DiagLevel::Warn
+        } else {
+            DiagLevel::Info
+        },
         Some("app imports the login-shell PATH at startup; a failure leaves a narrow GUI PATH"),
     ));
     for (k, v) in &inp.safe_env {
@@ -1360,10 +1523,19 @@ fn build_report(
         DiagLevel::Info,
         None,
     ));
-    sections.push(DiagSection { title: "Runtime".to_string(), checks: runtime });
+    sections.push(DiagSection {
+        title: "Runtime".to_string(),
+        checks: runtime,
+    });
 
     // 2. Node / npm / npx
-    let node_status = |p: &CmdProbe| if p.path.is_some() { DiagLevel::Ok } else { DiagLevel::Fail };
+    let node_status = |p: &CmdProbe| {
+        if p.path.is_some() {
+            DiagLevel::Ok
+        } else {
+            DiagLevel::Fail
+        }
+    };
     let cmd_value = |p: &CmdProbe| match (&p.path, &p.version) {
         (Some(path), Some(ver)) => format!("{ver}  ({path})"),
         (Some(path), None) => path.clone(),
@@ -1390,17 +1562,31 @@ fn build_report(
                     inp.npm_prefix_g.as_deref().unwrap_or("N/A"),
                     inp.npm_prefix_g_ms
                 ),
-                if prefix_slow { DiagLevel::Warn } else { DiagLevel::Info },
+                if prefix_slow {
+                    DiagLevel::Warn
+                } else {
+                    DiagLevel::Info
+                },
                 prefix_slow.then_some("exceeds the 1.5s gate used at detection time"),
             ),
-            diag_check("npm root -g", inp.npm_root_g.as_deref().unwrap_or("N/A"), DiagLevel::Info, None),
+            diag_check(
+                "npm root -g",
+                inp.npm_root_g.as_deref().unwrap_or("N/A"),
+                DiagLevel::Info,
+                None,
+            ),
             diag_check(
                 "npm config get prefix",
                 inp.npm_config_prefix.as_deref().unwrap_or("N/A"),
                 DiagLevel::Info,
                 None,
             ),
-            diag_check("cached prefix", inp.cached_prefix.as_deref().unwrap_or("N/A"), DiagLevel::Info, None),
+            diag_check(
+                "cached prefix",
+                inp.cached_prefix.as_deref().unwrap_or("N/A"),
+                DiagLevel::Info,
+                None,
+            ),
         ],
     });
 
@@ -1414,7 +1600,11 @@ fn build_report(
         let mut checks = vec![diag_check(
             &launch_label,
             a.launchable.as_deref().unwrap_or("NOT RESOLVED"),
-            if a.launchable.is_some() { DiagLevel::Ok } else { DiagLevel::Fail },
+            if a.launchable.is_some() {
+                DiagLevel::Ok
+            } else {
+                DiagLevel::Fail
+            },
             (a.distribution == "npx").then_some("this is exactly what the new-session page checks"),
         )];
         if let Some(p) = &a.package {
@@ -1425,20 +1615,34 @@ fn build_report(
             checks.push(diag_check(
                 "<npm prefix -g>/bin/<cmd>",
                 a.system_prefix_bin.as_deref().unwrap_or("absent"),
-                if a.system_prefix_bin.is_some() { DiagLevel::Ok } else { DiagLevel::Info },
+                if a.system_prefix_bin.is_some() {
+                    DiagLevel::Ok
+                } else {
+                    DiagLevel::Info
+                },
                 None,
             ));
             checks.push(diag_check(
                 "~/.codeg/npm-global/bin/<cmd>",
                 a.user_prefix_bin.as_deref().unwrap_or("absent"),
-                if a.user_prefix_bin.is_some() { DiagLevel::Warn } else { DiagLevel::Info },
-                a.user_prefix_bin.as_ref().map(|_| "EACCES fallback dir — reached by the connect gate only if it's on PATH"),
+                if a.user_prefix_bin.is_some() {
+                    DiagLevel::Warn
+                } else {
+                    DiagLevel::Info
+                },
+                a.user_prefix_bin.as_ref().map(|_| {
+                    "EACCES fallback dir — reached by the connect gate only if it's on PATH"
+                }),
             ));
             if cfg!(target_os = "macos") {
                 checks.push(diag_check(
                     "homebrew bin/<cmd>",
                     a.homebrew_bin.as_deref().unwrap_or("absent"),
-                    if a.homebrew_bin.is_some() { DiagLevel::Warn } else { DiagLevel::Info },
+                    if a.homebrew_bin.is_some() {
+                        DiagLevel::Warn
+                    } else {
+                        DiagLevel::Info
+                    },
                     None,
                 ));
             }
@@ -1538,7 +1742,11 @@ fn build_report(
                 } else {
                     format!("{} (see copied text)", inp.terminal.extra_dirs.len())
                 },
-                if inp.terminal.extra_dirs.is_empty() { DiagLevel::Ok } else { DiagLevel::Warn },
+                if inp.terminal.extra_dirs.is_empty() {
+                    DiagLevel::Ok
+                } else {
+                    DiagLevel::Warn
+                },
                 (!inp.terminal.extra_dirs.is_empty())
                     .then_some("the app can't see these dirs — the likely GUI PATH gap"),
             ),
@@ -1551,7 +1759,10 @@ fn build_report(
             None,
         )]
     };
-    sections.push(DiagSection { title: "Terminal comparison".to_string(), checks: term_checks });
+    sections.push(DiagSection {
+        title: "Terminal comparison".to_string(),
+        checks: term_checks,
+    });
 
     let plain_text = render_plain_text(inp, &verdict, &sections, &generated_at, agent_type);
 
@@ -1585,11 +1796,19 @@ fn render_plain_text(
     if let Some(at) = agent_type {
         out.push_str(&format!("agent: {at:?}\n"));
     }
-    out.push_str(&format!("verdict [{}]: {}\n", verdict.code, verdict.summary));
+    out.push_str(&format!(
+        "verdict [{}]: {}\n",
+        verdict.code, verdict.summary
+    ));
     for sec in sections {
         out.push_str(&format!("\n## {}\n", sec.title));
         for c in &sec.checks {
-            out.push_str(&format!("  [{}] {}: {}\n", glyph(c.status), c.label, c.value));
+            out.push_str(&format!(
+                "  [{}] {}: {}\n",
+                glyph(c.status),
+                c.label,
+                c.value
+            ));
             if let Some(h) = &c.hint {
                 out.push_str(&format!("        ↳ {h}\n"));
             }
@@ -1623,7 +1842,9 @@ pub(crate) async fn acp_env_diagnostics_core(
     agent_type: Option<AgentType>,
 ) -> Result<AgentDiagnosticsReport, AcpError> {
     let inputs = collect_diag_inputs(db, agent_type).await;
-    let generated_at = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %z").to_string();
+    let generated_at = chrono::Local::now()
+        .format("%Y-%m-%d %H:%M:%S %z")
+        .to_string();
     Ok(build_report(&inputs, generated_at, agent_type))
 }
 
@@ -1712,7 +1933,8 @@ mod diagnostics_tests {
         let mut a = agent_installed_unresolved();
         a.detected_version = Some("1.1.2".to_string());
         inp.agent = Some(a);
-        inp.terminal.cmd_resolved = Some("/Users/u/.nvm/versions/node/v20/bin/codex-acp".to_string());
+        inp.terminal.cmd_resolved =
+            Some("/Users/u/.nvm/versions/node/v20/bin/codex-acp".to_string());
         assert_eq!(compute_verdict(&inp).code, "terminal_only_path");
     }
 
@@ -1825,7 +2047,9 @@ mod diagnostics_tests {
     #[test]
     fn verdict_adapter_missing_while_vendor_cli_present() {
         let mut inp = base_inputs();
-        inp.agent = Some(adapter_agent_never_installed(Some("/opt/homebrew/bin/codex")));
+        inp.agent = Some(adapter_agent_never_installed(Some(
+            "/opt/homebrew/bin/codex",
+        )));
         let v = compute_verdict(&inp);
         assert_eq!(v.code, "adapter_missing_native_present");
         assert_eq!(v.level, DiagLevel::Info);
@@ -1877,12 +2101,16 @@ mod diagnostics_tests {
     #[test]
     fn report_names_the_vendor_cli_and_shared_config_dir() {
         let mut inp = base_inputs();
-        inp.agent = Some(adapter_agent_never_installed(Some("/opt/homebrew/bin/codex")));
+        inp.agent = Some(adapter_agent_never_installed(Some(
+            "/opt/homebrew/bin/codex",
+        )));
         let r = build_report(&inp, "FIXED-TS".to_string(), Some(AgentType::Codex));
         assert!(r.plain_text.contains("codex (your own CLI)"));
         assert!(r.plain_text.contains("/opt/homebrew/bin/codex"));
         assert!(r.plain_text.contains("~/.codex"));
-        assert!(r.plain_text.contains("verdict [adapter_missing_native_present]"));
+        assert!(r
+            .plain_text
+            .contains("verdict [adapter_missing_native_present]"));
     }
 
     // Non-adapter agents keep the old shape exactly — no stray rows.
@@ -1994,10 +2222,7 @@ fn extract_version_token(text: &str) -> Option<String> {
             .strip_prefix('v')
             .or_else(|| piece.strip_prefix('V'))
             .unwrap_or(piece);
-        let starts_digit = candidate
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_digit());
+        let starts_digit = candidate.chars().next().is_some_and(|c| c.is_ascii_digit());
         (starts_digit
             && candidate.contains('.')
             && candidate
@@ -2337,7 +2562,12 @@ async fn install_npm_global_package_streaming_inner(
         format!("$ npm install -g {NPM_INCLUDE_OPTIONAL} {package}"),
     );
 
-    let mut args = vec!["install", "-g", NPM_INCLUDE_OPTIONAL, NPM_FOREGROUND_SCRIPTS];
+    let mut args = vec![
+        "install",
+        "-g",
+        NPM_INCLUDE_OPTIONAL,
+        NPM_FOREGROUND_SCRIPTS,
+    ];
     if run_scripts {
         args.push(NPM_RUN_SCRIPTS_OVERRIDE);
     }
@@ -2456,7 +2686,12 @@ async fn install_npm_to_user_prefix_streaming(
         ),
     );
 
-    let mut args = vec!["install", "-g", NPM_INCLUDE_OPTIONAL, NPM_FOREGROUND_SCRIPTS];
+    let mut args = vec![
+        "install",
+        "-g",
+        NPM_INCLUDE_OPTIONAL,
+        NPM_FOREGROUND_SCRIPTS,
+    ];
     if run_scripts {
         args.push(NPM_RUN_SCRIPTS_OVERRIDE);
     }
@@ -4238,8 +4473,16 @@ fn apply_grok_custom_model(
                 let tbl = grok_model_table_mut(doc, id)?;
                 // `model` is the id sent to the API; always kept in sync with <id>.
                 grok_tbl_set_str(tbl, "model", Some(id));
-                grok_tbl_set_str(tbl, "base_url", trimmed_opt(settings.custom_base_url.as_deref()));
-                grok_tbl_set_str(tbl, "api_key", trimmed_opt(settings.custom_api_key.as_deref()));
+                grok_tbl_set_str(
+                    tbl,
+                    "base_url",
+                    trimmed_opt(settings.custom_base_url.as_deref()),
+                );
+                grok_tbl_set_str(
+                    tbl,
+                    "api_key",
+                    trimmed_opt(settings.custom_api_key.as_deref()),
+                );
                 grok_tbl_set_str(
                     tbl,
                     "api_backend",
@@ -4382,7 +4625,9 @@ fn set_or_remove_grok_key(
             }
         }
         None => {
-            if let Some(table) = doc.get_mut(section).and_then(|item| item.as_table_like_mut())
+            if let Some(table) = doc
+                .get_mut(section)
+                .and_then(|item| item.as_table_like_mut())
             {
                 table.remove(key);
             }
@@ -4416,7 +4661,9 @@ fn set_or_remove_grok_number(
             }
         }
         None => {
-            if let Some(table) = doc.get_mut(section).and_then(|item| item.as_table_like_mut())
+            if let Some(table) = doc
+                .get_mut(section)
+                .and_then(|item| item.as_table_like_mut())
             {
                 table.remove(key);
             }
@@ -4590,10 +4837,20 @@ fn apply_kimi_managed_block(
                 "type".to_string(),
                 toml::Value::String(spec.interface_type.clone()),
             );
-            if let Some(url) = spec.base_url.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            if let Some(url) = spec
+                .base_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
                 provider_table.insert("base_url".to_string(), toml::Value::String(url.to_string()));
             }
-            if let Some(key) = spec.api_key.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            if let Some(key) = spec
+                .api_key
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
                 provider_table.insert("api_key".to_string(), toml::Value::String(key.to_string()));
             }
             if !spec.env.is_empty() {
@@ -4678,8 +4935,9 @@ fn apply_kimi_managed_block(
             );
         }
         None => {
-            let providers_empty = if let Some(providers) =
-                table.get_mut("providers").and_then(toml::Value::as_table_mut)
+            let providers_empty = if let Some(providers) = table
+                .get_mut("providers")
+                .and_then(toml::Value::as_table_mut)
             {
                 providers.remove(KIMI_MANAGED_PROVIDER);
                 providers.is_empty()
@@ -4689,18 +4947,18 @@ fn apply_kimi_managed_block(
             if providers_empty {
                 table.remove("providers");
             }
-            let models_empty = if let Some(models) =
-                table.get_mut("models").and_then(toml::Value::as_table_mut)
-            {
-                models.remove(KIMI_MANAGED_MODEL_ALIAS);
-                models.is_empty()
-            } else {
-                false
-            };
+            let models_empty =
+                if let Some(models) = table.get_mut("models").and_then(toml::Value::as_table_mut) {
+                    models.remove(KIMI_MANAGED_MODEL_ALIAS);
+                    models.is_empty()
+                } else {
+                    false
+                };
             if models_empty {
                 table.remove("models");
             }
-            if table.get("default_model").and_then(toml::Value::as_str) == Some(KIMI_MANAGED_MODEL_ALIAS)
+            if table.get("default_model").and_then(toml::Value::as_str)
+                == Some(KIMI_MANAGED_MODEL_ALIAS)
             {
                 table.remove("default_model");
             }
@@ -4758,7 +5016,9 @@ fn kimi_token_is_synthetic(token: &serde_json::Value) -> bool {
         .get("_codeg_synthetic")
         .and_then(serde_json::Value::as_bool)
         == Some(true)
-        || token.get("access_token").and_then(serde_json::Value::as_str)
+        || token
+            .get("access_token")
+            .and_then(serde_json::Value::as_str)
             == Some(KIMI_SYNTHETIC_TOKEN_ACCESS)
 }
 
@@ -4774,7 +5034,9 @@ fn kimi_token_has_access(token: &serde_json::Value) -> bool {
 
 /// Whether any usable credential (real or synthetic) is present.
 fn kimi_credential_present() -> bool {
-    read_kimi_token().map(|t| kimi_token_has_access(&t)).unwrap_or(false)
+    read_kimi_token()
+        .map(|t| kimi_token_has_access(&t))
+        .unwrap_or(false)
 }
 
 /// Whether the present credential is codeg's synthetic gate token.
@@ -4872,33 +5134,48 @@ fn project_kimi_managed_config(value: &toml::Value) -> serde_json::Map<String, s
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
-            merged.insert("key".to_string(), serde_json::Value::String(key.to_string()));
+            merged.insert(
+                "key".to_string(),
+                serde_json::Value::String(key.to_string()),
+            );
             merged.insert(
                 "authType".to_string(),
                 serde_json::Value::String("api_key".to_string()),
             );
         }
         if let Some(env) = provider.get("env").and_then(toml::Value::as_table) {
-            if let Some(project) = env.get("GOOGLE_CLOUD_PROJECT").and_then(toml::Value::as_str) {
+            if let Some(project) = env
+                .get("GOOGLE_CLOUD_PROJECT")
+                .and_then(toml::Value::as_str)
+            {
                 merged.insert(
                     "vertexProject".to_string(),
                     serde_json::Value::String(project.to_string()),
                 );
             }
-            if let Some(location) = env.get("GOOGLE_CLOUD_LOCATION").and_then(toml::Value::as_str) {
+            if let Some(location) = env
+                .get("GOOGLE_CLOUD_LOCATION")
+                .and_then(toml::Value::as_str)
+            {
                 merged.insert(
                     "vertexLocation".to_string(),
                     serde_json::Value::String(location.to_string()),
                 );
             }
-            if let Some(var) = interface_type.as_deref().and_then(kimi_provider_key_env_var) {
+            if let Some(var) = interface_type
+                .as_deref()
+                .and_then(kimi_provider_key_env_var)
+            {
                 if let Some(key) = env
                     .get(var)
                     .and_then(toml::Value::as_str)
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
                 {
-                    merged.insert("key".to_string(), serde_json::Value::String(key.to_string()));
+                    merged.insert(
+                        "key".to_string(),
+                        serde_json::Value::String(key.to_string()),
+                    );
                     merged.insert(
                         "authType".to_string(),
                         serde_json::Value::String("env".to_string()),
@@ -4923,7 +5200,10 @@ fn project_kimi_managed_config(value: &toml::Value) -> serde_json::Map<String, s
                 serde_json::Value::String(model_id.to_string()),
             );
         }
-        if let Some(ctx) = model.get("max_context_size").and_then(toml::Value::as_integer) {
+        if let Some(ctx) = model
+            .get("max_context_size")
+            .and_then(toml::Value::as_integer)
+        {
             merged.insert(
                 "maxContextSize".to_string(),
                 serde_json::Value::Number(ctx.into()),
@@ -4968,17 +5248,26 @@ fn project_kimi_managed_config(value: &toml::Value) -> serde_json::Map<String, s
     }
 
     let has_managed = merged.contains_key("interfaceType");
-    merged.insert("hasManagedBlock".to_string(), serde_json::Value::Bool(has_managed));
+    merged.insert(
+        "hasManagedBlock".to_string(),
+        serde_json::Value::Bool(has_managed),
+    );
     merged
 }
 
 fn load_kimi_code_config_json() -> Option<String> {
     let raw = fs::read_to_string(kimi_code_config_toml_path()).ok();
-    let mut merged = match raw.as_deref().and_then(|text| text.parse::<toml::Value>().ok()) {
+    let mut merged = match raw
+        .as_deref()
+        .and_then(|text| text.parse::<toml::Value>().ok())
+    {
         Some(value) => project_kimi_managed_config(&value),
         None => {
             let mut m = serde_json::Map::new();
-            m.insert("hasManagedBlock".to_string(), serde_json::Value::Bool(false));
+            m.insert(
+                "hasManagedBlock".to_string(),
+                serde_json::Value::Bool(false),
+            );
             m
         }
     };
@@ -5033,7 +5322,11 @@ pub(crate) struct KimiCodeConfigUpdate {
 
 /// Validate + resolve a `native`-mode update into the managed block to write.
 fn build_kimi_managed_spec(update: &KimiCodeConfigUpdate) -> Result<KimiManagedSpec, AcpError> {
-    let interface_type = update.interface_type.as_deref().map(str::trim).unwrap_or("");
+    let interface_type = update
+        .interface_type
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("");
     if !KIMI_INTERFACE_TYPES.contains(&interface_type) {
         return Err(AcpError::protocol(format!(
             "unknown kimi interface type: '{interface_type}'"
@@ -5054,7 +5347,9 @@ fn build_kimi_managed_spec(update: &KimiCodeConfigUpdate) -> Result<KimiManagedS
         .map(str::to_string);
     if let Some(url) = &base_url {
         if url.contains(['\n', '\r']) {
-            return Err(AcpError::protocol("kimi base url must not contain newlines"));
+            return Err(AcpError::protocol(
+                "kimi base url must not contain newlines",
+            ));
         }
     }
 
@@ -5245,7 +5540,9 @@ pub(crate) async fn acp_update_kimi_code_config_core(
             (FileAction::Raw(raw.to_string()), CredentialAction::Seed)
         }
         other => {
-            return Err(AcpError::protocol(format!("unknown kimi config mode: '{other}'")));
+            return Err(AcpError::protocol(format!(
+                "unknown kimi config mode: '{other}'"
+            )));
         }
     };
 
@@ -5869,7 +6166,9 @@ pub(crate) async fn acp_pi_project_trust_state_core(
 /// Record that the user has seen and kept an existing trust grant, so the launch
 /// gate stops blocking this folder. Writes only codeg's own record — pi's
 /// `trust.json` is untouched, because the grant itself is not changing.
-pub(crate) async fn acp_pi_acknowledge_project_trust_core(workspace: String) -> Result<(), AcpError> {
+pub(crate) async fn acp_pi_acknowledge_project_trust_core(
+    workspace: String,
+) -> Result<(), AcpError> {
     tokio::task::spawn_blocking(move || {
         pi_set_trust_acknowledged_at(&pi_trust_ack_path(), Path::new(&workspace), true)
     })
@@ -7145,8 +7444,10 @@ fn shell_quote_arg_for(arg: &str, windows: bool) -> String {
     } else {
         "[](){}'\"$&;|<>*?`\\!#~"
     };
-    let needs_quoting =
-        arg.is_empty() || arg.chars().any(|c| c.is_whitespace() || special.contains(c));
+    let needs_quoting = arg.is_empty()
+        || arg
+            .chars()
+            .any(|c| c.is_whitespace() || special.contains(c));
     if !needs_quoting {
         return arg.to_string();
     }
@@ -8077,7 +8378,7 @@ pub(crate) fn skill_storage_spec(agent_type: AgentType) -> Option<SkillStorageSp
         AgentType::KimiCode => Some(SkillStorageSpec {
             kind: SkillStorageKind::SkillDirectoryOnly,
             global_dirs: vec![
-                crate::parsers::kimi_code::resolve_kimi_code_home_dir().join("skills"),
+                crate::parsers::kimi_code::resolve_kimi_code_home_dir().join("skills")
             ],
             project_rel_dirs: vec![".kimi-code/skills"],
         }),
@@ -8856,7 +9157,10 @@ fn resolve_qoder_binary() -> Option<PathBuf> {
 /// `PAT` is always materialized (empty when unset) so `run_qoder_probe` makes
 /// an explicit set-or-remove decision — an inherited token from the user's dev
 /// shell must not make the card claim an account that a launch would not use.
-async fn qoder_probe_env(db: &AppDatabase, personal_access_token: Option<&str>) -> BTreeMap<String, String> {
+async fn qoder_probe_env(
+    db: &AppDatabase,
+    personal_access_token: Option<&str>,
+) -> BTreeMap<String, String> {
     let mut env: BTreeMap<String, String> =
         agent_setting_service::get_by_agent_type(&db.conn, AgentType::Qoder)
             .await
@@ -8901,7 +9205,11 @@ async fn run_qoder_probe(
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     if !output.status.success() && stdout.trim().is_empty() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("qoder {} failed: {}", args.join(" "), stderr.trim()));
+        return Err(format!(
+            "qoder {} failed: {}",
+            args.join(" "),
+            stderr.trim()
+        ));
     }
     Ok(stdout)
 }
@@ -8969,9 +9277,7 @@ pub(crate) async fn acp_qoder_auth_status_core(
                         // The CLI emits 0/1 here rather than a JSON boolean.
                         allow_byok: v
                             .get("allow_byok")
-                            .and_then(|b| {
-                                b.as_bool().or_else(|| b.as_i64().map(|n| n != 0))
-                            }),
+                            .and_then(|b| b.as_bool().or_else(|| b.as_i64().map(|n| n != 0))),
                         error: None,
                         binary_path: binary_path.clone(),
                     }
@@ -9049,13 +9355,10 @@ async fn run_cursor_probe(
             cmd.env(key, value);
         }
     }
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_secs),
-        cmd.output(),
-    )
-    .await
-    .map_err(|_| format!("cursor-agent {} timed out", args.join(" ")))?
-    .map_err(|e| format!("failed to run cursor-agent: {e}"))?;
+    let output = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), cmd.output())
+        .await
+        .map_err(|_| format!("cursor-agent {} timed out", args.join(" ")))?
+        .map_err(|e| format!("failed to run cursor-agent: {e}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     if !output.status.success() && stdout.trim().is_empty() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -9235,7 +9538,15 @@ fn strip_ansi(input: &str) -> String {
 fn truncate_probe_output(s: &str) -> String {
     let t = s.trim();
     if t.len() > 400 {
-        format!("{}…", &t[..t.char_indices().take_while(|(i, _)| *i < 400).last().map(|(i, c)| i + c.len_utf8()).unwrap_or(400)])
+        format!(
+            "{}…",
+            &t[..t
+                .char_indices()
+                .take_while(|(i, _)| *i < 400)
+                .last()
+                .map(|(i, c)| i + c.len_utf8())
+                .unwrap_or(400)]
+        )
     } else {
         t.to_string()
     }
@@ -9281,7 +9592,11 @@ fn agent_env_keys(agent_type: AgentType) -> (&'static str, &'static str, &'stati
         // Kimi Code does NOT read shell KIMI_API_KEY/OPENAI_API_KEY; the only
         // non-interactive credential path is the `KIMI_MODEL_*` family, which
         // also takes priority over `~/.kimi-code/config.toml`.
-        AgentType::KimiCode => ("KIMI_MODEL_BASE_URL", "KIMI_MODEL_API_KEY", "KIMI_MODEL_NAME"),
+        AgentType::KimiCode => (
+            "KIMI_MODEL_BASE_URL",
+            "KIMI_MODEL_API_KEY",
+            "KIMI_MODEL_NAME",
+        ),
         // Grok's non-interactive credential is `XAI_API_KEY`. Model + endpoint
         // also have working env overrides (verified against the 0.2.94 binary):
         // `GROK_DEFAULT_MODEL` selects the default model and `GROK_XAI_API_BASE_URL`
@@ -10068,7 +10383,14 @@ pub(crate) async fn acp_update_agent_env_and_refresh(
     emitter: &EventEmitter,
 ) -> Result<usize, AcpError> {
     acp_update_agent_env_core(agent_type, enabled, env, model_provider_id, db, emitter).await?;
-    Ok(refresh_config_staleness(manager, db, data_dir, &[agent_type], ConfigStaleKind::AgentConfig).await)
+    Ok(refresh_config_staleness(
+        manager,
+        db,
+        data_dir,
+        &[agent_type],
+        ConfigStaleKind::AgentConfig,
+    )
+    .await)
 }
 
 /// `acp_update_agent_preferences_core` followed by a staleness refresh. Shared
@@ -10100,7 +10422,953 @@ pub(crate) async fn acp_update_agent_preferences_and_refresh(
         emitter,
     )
     .await?;
-    Ok(refresh_config_staleness(manager, db, data_dir, &[agent_type], ConfigStaleKind::AgentConfig).await)
+    Ok(refresh_config_staleness(
+        manager,
+        db,
+        data_dir,
+        &[agent_type],
+        ConfigStaleKind::AgentConfig,
+    )
+    .await)
+}
+
+/// Attach a fresh, explicitly provisional ACP session to an unconsumed
+/// snapshot branch. session/new may advertise an id before Codex has written a
+/// rollout; that id is intentionally returned to the live client but is not
+/// stored on the conversation until the first real prompt is accepted.
+#[allow(clippy::too_many_arguments)]
+async fn prepare_provisional_snapshot_branch(
+    conversation_id: i32,
+    preferred_mode_id: Option<String>,
+    preferred_config_values: BTreeMap<String, String>,
+    manager: &ConnectionManager,
+    db: &AppDatabase,
+    data_dir: &Path,
+    owner_window_label: String,
+    emitter: EventEmitter,
+) -> Result<Option<RestoredConversationConnectionInfo>, AcpError> {
+    conversation_branch_service::repair_empty_snapshot_as_provisional(&db.conn, conversation_id)
+        .await
+        .map_err(|error| AcpError::protocol(error.to_string()))?;
+    if !conversation_branch_service::is_provisional_snapshot(&db.conn, conversation_id)
+        .await
+        .map_err(|error| AcpError::protocol(error.to_string()))?
+    {
+        return Ok(None);
+    }
+
+    let _guard = manager.lock_branch_session_recovery(conversation_id).await;
+    conversation_branch_service::repair_empty_snapshot_as_provisional(&db.conn, conversation_id)
+        .await
+        .map_err(|error| AcpError::protocol(error.to_string()))?;
+    if !conversation_branch_service::is_provisional_snapshot(&db.conn, conversation_id)
+        .await
+        .map_err(|error| AcpError::protocol(error.to_string()))?
+    {
+        return Ok(None);
+    }
+
+    if let Some(connection_id) = manager
+        .find_connection_by_conversation_id(conversation_id)
+        .await
+    {
+        if let Ok(session_id) = manager.wait_for_prompt_ready(&connection_id, None).await {
+            let state = manager
+                .get_state(&connection_id)
+                .await
+                .ok_or_else(|| AcpError::ConnectionNotFound(connection_id.clone()))?;
+            let state = state.read().await;
+            conversation_branch_service::mark_initialization_state(
+                &db.conn,
+                conversation_id,
+                "pending_first_prompt",
+                Some(connection_id.clone()),
+                None,
+                false,
+            )
+            .await
+            .map_err(|error| AcpError::protocol(error.to_string()))?;
+            tracing::info!(
+                branch_conversation_id = conversation_id,
+                lifecycle_state = "pending_first_prompt",
+                external_session_id = %session_id,
+                connection_id = %connection_id,
+                session_verification_result = "ephemeral_prompt_ready",
+                reused_existing = true,
+                "[ACP][branch] reused provisional prompt-ready connection"
+            );
+            return Ok(Some(RestoredConversationConnectionInfo {
+                connection_id,
+                external_session_id: session_id,
+                reused_existing: true,
+                codeg_mcp_available: state.codeg_mcp_available,
+                mcp_server_count: state.mcp_server_count,
+                replaced_connection_ids: Vec::new(),
+                lifecycle_state: "pending_first_prompt".into(),
+                durable_session: false,
+            }));
+        }
+    }
+
+    let conversation = conversation_service::get_by_id(&db.conn, conversation_id)
+        .await
+        .map_err(|error| AcpError::protocol(error.to_string()))?;
+    let folder = folder_service::get_folder_by_id(&db.conn, conversation.folder_id)
+        .await
+        .map_err(|error| AcpError::protocol(error.to_string()))?
+        .ok_or_else(|| {
+            AcpError::protocol(format!(
+                "folder {} for branch {conversation_id} was not found",
+                conversation.folder_id
+            ))
+        })?;
+    conversation_branch_service::mark_initialization_state(
+        &db.conn,
+        conversation_id,
+        "session_creating",
+        None,
+        None,
+        false,
+    )
+    .await
+    .map_err(|error| AcpError::protocol(error.to_string()))?;
+    tracing::info!(
+        branch_conversation_id = conversation_id,
+        lifecycle_state = "session_creating",
+        external_session_id = ?Option::<String>::None,
+        connection_id = ?Option::<String>::None,
+        session_verification_result = "pending_first_prompt",
+        "[ACP][branch] provisional session initialization started"
+    );
+
+    let create_result: Result<RestoredConversationConnectionInfo, AcpError> = async {
+        let runtime_env =
+            build_session_runtime_env(db, conversation.agent_type, None, data_dir).await?;
+        verify_agent_installed(conversation.agent_type).await?;
+        let (connection_id, session_id) = manager
+            .spawn_fresh_session_ready(
+                conversation.agent_type,
+                Some(folder.path),
+                runtime_env,
+                owner_window_label,
+                emitter,
+                preferred_mode_id,
+                preferred_config_values,
+            )
+            .await?;
+        let activation = match manager
+            .activate_restored_conversation(
+                &connection_id,
+                conversation_id,
+                conversation.folder_id,
+                &session_id,
+                conversation.agent_type == AgentType::Codex,
+                conversation.parent_id,
+                conversation.parent_tool_use_id,
+            )
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = manager.disconnect(&connection_id).await;
+                return Err(error);
+            }
+        };
+        conversation_branch_service::mark_initialization_state(
+            &db.conn,
+            conversation_id,
+            "pending_first_prompt",
+            Some(connection_id.clone()),
+            None,
+            false,
+        )
+        .await
+        .map_err(|error| AcpError::protocol(error.to_string()))?;
+        tracing::info!(
+            branch_conversation_id = conversation_id,
+            lifecycle_state = "pending_first_prompt",
+            external_session_id = %session_id,
+            connection_id = %connection_id,
+            session_verification_result = "ephemeral_prompt_ready",
+            snapshot_consumed_at = ?Option::<chrono::DateTime<chrono::Utc>>::None,
+            "[ACP][branch] provisional session accepts a first prompt"
+        );
+        Ok(RestoredConversationConnectionInfo {
+            connection_id,
+            external_session_id: session_id,
+            reused_existing: false,
+            codeg_mcp_available: activation.codeg_mcp_available,
+            mcp_server_count: activation.mcp_server_count,
+            replaced_connection_ids: activation.replaced_connection_ids,
+            lifecycle_state: "pending_first_prompt".into(),
+            durable_session: false,
+        })
+    }
+    .await;
+    match create_result {
+        Ok(result) => Ok(Some(result)),
+        Err(error) => {
+            let message = error.to_string();
+            let _ = conversation_branch_service::mark_initialization_state(
+                &db.conn,
+                conversation_id,
+                "retryable_failed",
+                None,
+                Some(message.clone()),
+                true,
+            )
+            .await;
+            tracing::warn!(
+                branch_conversation_id = conversation_id,
+                lifecycle_state = "retryable_failed",
+                failure_classification = "session_initialization_failed",
+                error = %message,
+                "[ACP][branch] provisional initialization failed; snapshot preserved"
+            );
+            Err(error)
+        }
+    }
+}
+
+/// Restore an existing DB conversation onto a fully initialized ACP
+/// connection, then atomically replace its previous live binding. The DB row is
+/// authoritative for agent, folder and external session identity; callers only
+/// supply the conversation id and selector preferences.
+#[allow(clippy::too_many_arguments)]
+async fn acp_restore_conversation_inner(
+    conversation_id: i32,
+    preferred_mode_id: Option<String>,
+    preferred_config_values: BTreeMap<String, String>,
+    manager: &ConnectionManager,
+    db: &AppDatabase,
+    data_dir: &Path,
+    owner_window_label: String,
+    emitter: EventEmitter,
+) -> Result<RestoredConversationConnectionInfo, AcpError> {
+    let restore_started = std::time::Instant::now();
+    let restore_request_id = uuid::Uuid::new_v4().to_string();
+    tracing::info!(
+        conversation_id,
+        restore_request_id,
+        stage = "restore_request_received",
+        total_elapsed_ms = 0u64,
+        "[ACP][restore] request received"
+    );
+    // Full-request single-flight. The older spawn dedup guarded only process
+    // creation and the publication lock guarded only the final mapping swap;
+    // two HTTP requests could still run resume/load concurrently between those
+    // points. The waiter re-runs the cheap lookup after the first request has
+    // published and therefore returns the same ready connection.
+    let restore_wait_started = std::time::Instant::now();
+    let _restore_request_guard = manager.lock_restore_request(conversation_id).await?;
+    tracing::info!(
+        conversation_id,
+        restore_request_id,
+        stage = "restore_single_flight_acquired",
+        wait_elapsed_ms = restore_wait_started.elapsed().as_millis() as u64,
+        total_elapsed_ms = restore_started.elapsed().as_millis() as u64,
+        "[ACP][restore] end-to-end single-flight acquired"
+    );
+    if let Some(prepared) = prepare_provisional_snapshot_branch(
+        conversation_id,
+        preferred_mode_id.clone(),
+        preferred_config_values.clone(),
+        manager,
+        db,
+        data_dir,
+        owner_window_label.clone(),
+        emitter.clone(),
+    )
+    .await?
+    {
+        crate::commands::conversations::emit_conversation_upsert(
+            &emitter,
+            &db.conn,
+            conversation_id,
+        )
+        .await;
+        return Ok(prepared);
+    }
+    let metadata_started = std::time::Instant::now();
+    let conversation = conversation_service::get_by_id(&db.conn, conversation_id)
+        .await
+        .map_err(|e| AcpError::protocol(e.to_string()))?;
+    let external_session_id = conversation
+        .external_id
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            AcpError::protocol(format!(
+                "conversation {conversation_id} has no external session to restore"
+            ))
+        })?;
+    let folder = folder_service::get_folder_by_id(&db.conn, conversation.folder_id)
+        .await
+        .map_err(|e| AcpError::protocol(e.to_string()))?
+        .ok_or_else(|| {
+            AcpError::protocol(format!(
+                "folder {} for conversation {conversation_id} was not found",
+                conversation.folder_id
+            ))
+        })?;
+    let agent_type = conversation.agent_type;
+    let require_codeg_mcp = agent_type == AgentType::Codex;
+    let working_dir = PathBuf::from(&folder.path);
+    // A native branch operation may temporarily load the same source session
+    // on an isolated connection. Serialize that protocol writer with restore,
+    // not merely with other restores for this conversation id.
+    let session_wait_started = std::time::Instant::now();
+    let _session_operation_guard = manager
+        .lock_session_operation(
+            agent_type,
+            Some(working_dir.as_path()),
+            &external_session_id,
+        )
+        .await?;
+    tracing::info!(
+        conversation_id,
+        restore_request_id,
+        external_session_id = %external_session_id,
+        stage = "restore_session_writer_acquired",
+        wait_elapsed_ms = session_wait_started.elapsed().as_millis() as u64,
+        total_elapsed_ms = restore_started.elapsed().as_millis() as u64,
+        "[ACP][restore] session writer single-flight acquired"
+    );
+    // A fork or administrator repair may have changed durable metadata while
+    // this request waited. Never publish a connection from the stale snapshot;
+    // current branch creation deliberately leaves the source mapping immutable,
+    // but this guard also protects upgrades from older swap-based releases.
+    let current_conversation = conversation_service::get_by_id(&db.conn, conversation_id)
+        .await
+        .map_err(|error| AcpError::protocol(error.to_string()))?;
+    if current_conversation.external_id.as_deref() != Some(external_session_id.as_str())
+        || current_conversation.agent_type != agent_type
+        || current_conversation.folder_id != conversation.folder_id
+    {
+        tracing::info!(
+            conversation_id,
+            restore_request_id,
+            expected_external_session_id = %external_session_id,
+            current_external_session_id = ?current_conversation.external_id,
+            stage = "restore_generation_superseded",
+            binding_updated = false,
+            "[ACP][restore] durable conversation mapping changed while restore waited"
+        );
+        return Err(AcpError::protocol(format!(
+            "conversation {conversation_id} session changed during restore; retry"
+        )));
+    }
+    if let Some(owner_connection_id) = manager
+        .find_connection_by_external_id(&external_session_id, agent_type)
+        .await
+    {
+        if let Some(owner_state) = manager.get_state(&owner_connection_id).await {
+            let (owner_conversation_id, owner_status) = {
+                let state = owner_state.read().await;
+                (state.conversation_id, state.status.clone())
+            };
+            if has_live_external_session_owner_conflict(
+                conversation_id,
+                owner_conversation_id,
+                &owner_status,
+            ) {
+                tracing::warn!(
+                    conversation_id,
+                    restore_request_id,
+                    external_session_id,
+                    owner_connection_id,
+                    owner_conversation_id = ?owner_conversation_id,
+                    owner_status = ?owner_status,
+                    stage = "restore_external_session_owner_conflict",
+                    "[ACP][restore] refused to start a second writer for one external session"
+                );
+                return Err(AcpError::protocol(format!(
+                    "ACP session {external_session_id} is already owned by conversation {}; repair the duplicate binding before retrying",
+                    owner_conversation_id.unwrap_or_default()
+                )));
+            }
+        }
+    }
+    let reconciled_runs = manager
+        .reconcile_conversation_runs(&db.conn, conversation_id)
+        .await?;
+    if reconciled_runs > 0 {
+        tracing::info!(
+            conversation_id,
+            reconciled_runs,
+            stage = "restore_run_reconciliation",
+            "[ACP][restore] stale turn state reconciled before connection selection"
+        );
+    }
+    let durable_active_runs = crate::db::service::artifact_service::active_runs_for_conversation(
+        &db.conn,
+        conversation_id,
+    )
+    .await
+    .map_err(|error| AcpError::protocol(error.to_string()))?;
+    if !durable_active_runs.is_empty() {
+        // A browser refresh (or a second client opening the same conversation)
+        // must ATTACH to the turn that is already running, not wait for that
+        // turn to finish before it can reconstruct the composer.  The latter
+        // left the refreshed page without any connection id, so it could
+        // neither steer nor cancel the still-live task.
+        //
+        // Do not trust the durable row alone: only publish an attachment when
+        // the exact run connection still owns this conversation/session and
+        // its in-memory state independently confirms a Prompting in-flight
+        // turn.  A stale database row continues into the existing rejection
+        // below and is handled by reconciliation rather than being exposed as
+        // a live connection.
+        for run in &durable_active_runs {
+            let Some(state) = manager.get_state(&run.connection_id).await else {
+                continue;
+            };
+            let active = {
+                let state = state.read().await;
+                if active_turn_matches_restore_target(
+                    &state,
+                    conversation_id,
+                    &external_session_id,
+                    agent_type,
+                ) {
+                    Some((
+                        state.codeg_mcp_available,
+                        state.mcp_server_count,
+                        state.status.clone(),
+                    ))
+                } else {
+                    None
+                }
+            };
+            let Some((codeg_mcp_available, mcp_server_count, status)) = active else {
+                continue;
+            };
+
+            manager.touch(&run.connection_id).await;
+            tracing::info!(
+                conversation_id,
+                turn_run_id = %run.id,
+                connection_id = %run.connection_id,
+                external_session_id = %external_session_id,
+                connection_status = ?status,
+                codeg_mcp_available,
+                mcp_server_count,
+                active_run_count = durable_active_runs.len(),
+                stage = "restore_active_turn_attached",
+                total_elapsed_ms = restore_started.elapsed().as_millis() as u64,
+                "[ACP][restore] attached refreshed client to the existing active turn"
+            );
+            return Ok(RestoredConversationConnectionInfo {
+                connection_id: run.connection_id.clone(),
+                external_session_id,
+                reused_existing: true,
+                codeg_mcp_available,
+                mcp_server_count,
+                replaced_connection_ids: Vec::new(),
+                lifecycle_state: "active_turn_attached".into(),
+                durable_session: true,
+            });
+        }
+
+        tracing::info!(
+            conversation_id,
+            active_run_count = durable_active_runs.len(),
+            active_run_statuses = ?durable_active_runs
+                .iter()
+                .map(|run| (&run.id, &run.status))
+                .collect::<Vec<_>>(),
+            stage = "restore_active_turn_preserved",
+            "[ACP][restore] durable active turn blocks warm connection reuse"
+        );
+        return Err(AcpError::TurnInProgress);
+    }
+    tracing::info!(
+        conversation_id,
+        stage = "restore_metadata_loaded",
+        stage_elapsed_ms = metadata_started.elapsed().as_millis() as u64,
+        total_elapsed_ms = restore_started.elapsed().as_millis() as u64,
+        "[ACP][restore] stage completed"
+    );
+
+    let mut old_connection_id = manager
+        .find_connection_by_conversation_id(conversation_id)
+        .await;
+    let mut old_mcp_server_count = 0;
+    let mut old_codeg_mcp_available = false;
+    let mut old_status = None;
+    let mut old_turn_in_flight = false;
+    if let Some(old_id) = old_connection_id.as_deref() {
+        if let Some(state) = manager.get_state(old_id).await {
+            let state = state.read().await;
+            old_mcp_server_count = state.mcp_server_count;
+            old_codeg_mcp_available = state.codeg_mcp_available;
+            old_status = Some(state.status.clone());
+            old_turn_in_flight = state.turn_in_flight;
+        }
+    }
+    if old_turn_in_flight || old_status == Some(ConnectionStatus::Prompting) {
+        // A connection that claims a turn without any durable active run is a
+        // phantom warm handle. Never reuse it: it cannot be reconciled by a
+        // future TurnComplete because there is no run owner left.
+        if let Some(old_id) = old_connection_id.take() {
+            tracing::warn!(
+                conversation_id,
+                old_connection_id = %old_id,
+                old_turn_in_flight,
+                old_status = ?old_status,
+                stage = "restore_phantom_turn_cleanup",
+                "[ACP][restore] discarding warm connection with no active turn run"
+            );
+            let _ = manager.disconnect_and_wait(&old_id).await;
+        }
+        old_status = None;
+        old_turn_in_flight = false;
+        old_codeg_mcp_available = false;
+        old_mcp_server_count = 0;
+    }
+    tracing::info!(
+        conversation_id,
+        external_session_id = %external_session_id,
+        old_connection_id = ?old_connection_id,
+        old_mcp_server_count,
+        old_codeg_mcp_available,
+        old_turn_in_flight,
+        require_codeg_mcp,
+        stage = "restore_start",
+        total_elapsed_ms = restore_started.elapsed().as_millis() as u64,
+        "[ACP] persisted conversation restore starting"
+    );
+
+    // Never interrupt an active turn merely to upgrade its MCP surface. Once
+    // the turn settles, the same open/reconnect path can safely retry.
+    if require_codeg_mcp
+        && !old_codeg_mcp_available
+        && (old_turn_in_flight || old_status == Some(ConnectionStatus::Prompting))
+    {
+        tracing::warn!(
+            conversation_id,
+            external_session_id = %external_session_id,
+            old_connection_id = ?old_connection_id,
+            "[ACP] restore deferred because the incompatible connection has an active turn"
+        );
+        return Err(AcpError::TurnInProgress);
+    }
+
+    let spawn_started = std::time::Instant::now();
+    // A warm restore can attach an already-ready connection without touching
+    // the filesystem or requiring the agent executable to still be resolvable.
+    // This also makes the channel restart path deterministic: reuse is checked
+    // before any cold-start prerequisite can mask the durable conversation.
+    let reusable_connection = manager
+        .find_connection_for_reuse_with_requirements(
+            agent_type,
+            Some(&working_dir),
+            Some(&external_session_id),
+            require_codeg_mcp,
+            Some(conversation_id),
+        )
+        .await;
+    let mut spawned = if let Some(connection_id) = reusable_connection {
+        tracing::info!(
+            conversation_id,
+            connection_id = %connection_id,
+            external_session_id = %external_session_id,
+            stage = "restore_warm_connection_reused",
+            total_elapsed_ms = restore_started.elapsed().as_millis() as u64,
+            "[ACP][restore] warm connection reused"
+        );
+        crate::acp::manager::SpawnAgentOutcome {
+            connection_id,
+            reused_existing: true,
+        }
+    } else {
+        let runtime_env =
+            build_session_runtime_env(db, agent_type, Some(external_session_id.as_str()), data_dir)
+                .await?;
+        verify_agent_installed(agent_type).await?;
+
+        tracing::info!(
+            conversation_id,
+            external_session_id = %external_session_id,
+            old_connection_id = ?old_connection_id,
+            "[ACP] session resume/load requested"
+        );
+        tracing::info!(
+            conversation_id,
+            stage = "acp_process_spawn_start",
+            total_elapsed_ms = restore_started.elapsed().as_millis() as u64,
+            "[ACP][restore] stage started"
+        );
+        manager
+            .spawn_agent_for_restore(
+                agent_type,
+                Some(folder.path.clone()),
+                external_session_id.clone(),
+                runtime_env,
+                owner_window_label.clone(),
+                emitter.clone(),
+                preferred_mode_id.clone(),
+                preferred_config_values.clone(),
+                require_codeg_mcp,
+                conversation_id,
+            )
+            .await?
+    };
+    tracing::info!(
+        conversation_id,
+        connection_id = %spawned.connection_id,
+        reused_existing = spawned.reused_existing,
+        stage = "acp_connection_ready",
+        stage_elapsed_ms = spawn_started.elapsed().as_millis() as u64,
+        total_elapsed_ms = restore_started.elapsed().as_millis() as u64,
+        "[ACP][restore] stage completed"
+    );
+
+    // `Connected` is published before session/load|resume and therefore only
+    // means the ACP process is reachable. Do not switch the durable
+    // conversation binding (or return HTTP 200) until the requested session is
+    // real and the existing SelectorsReady prompt latch has fired. This also
+    // protects warm reuse from a half-initialized connection whose external id
+    // was already observed but whose session later fails to load.
+    let mut readiness_started = std::time::Instant::now();
+    if let Err(mut error) = manager
+        .wait_for_prompt_ready(&spawned.connection_id, Some(&external_session_id))
+        .await
+    {
+        let mut retry_succeeded = false;
+        if !spawned.reused_existing {
+            let _ = manager.disconnect_and_wait(&spawned.connection_id).await;
+        }
+        let released_legacy_writer = !spawned.reused_existing
+            && is_active_writer_restore_error(&error)
+            && release_idle_legacy_fork_writer(manager, db, conversation_id, &external_session_id)
+                .await?;
+        if released_legacy_writer {
+            // Older native-fork adapters retained the parent writer inside the
+            // child's process. Once that idle legacy owner is gone, retry the
+            // exact same persisted session once under the session lock. No new
+            // session is ever created and the child can restore independently.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let runtime_env = build_session_runtime_env(
+                db,
+                agent_type,
+                Some(external_session_id.as_str()),
+                data_dir,
+            )
+            .await?;
+            let retry = manager
+                .spawn_agent_for_restore(
+                    agent_type,
+                    Some(folder.path.clone()),
+                    external_session_id.clone(),
+                    runtime_env,
+                    owner_window_label.clone(),
+                    emitter.clone(),
+                    preferred_mode_id.clone(),
+                    preferred_config_values.clone(),
+                    require_codeg_mcp,
+                    conversation_id,
+                )
+                .await?;
+            readiness_started = std::time::Instant::now();
+            match manager
+                .wait_for_prompt_ready(&retry.connection_id, Some(&external_session_id))
+                .await
+            {
+                Ok(_) => {
+                    tracing::info!(
+                        conversation_id,
+                        external_session_id,
+                        connection_id = retry.connection_id,
+                        stage = "legacy_fork_writer_handoff_retry_succeeded",
+                        "[ACP][restore] source session recovered after retiring legacy fork writer"
+                    );
+                    spawned = retry;
+                    retry_succeeded = true;
+                }
+                Err(retry_error) => {
+                    if !retry.reused_existing {
+                        let _ = manager.disconnect_and_wait(&retry.connection_id).await;
+                    }
+                    error = retry_error;
+                    spawned = retry;
+                }
+            }
+        }
+        if !retry_succeeded {
+            tracing::warn!(
+                conversation_id,
+                external_session_id = %external_session_id,
+                connection_id = %spawned.connection_id,
+                reused_existing = spawned.reused_existing,
+                stage = "prompt_ready_failed",
+                stage_elapsed_ms = readiness_started.elapsed().as_millis() as u64,
+                total_elapsed_ms = restore_started.elapsed().as_millis() as u64,
+                binding_updated = false,
+                error = %error,
+                "[ACP][restore] target session did not become prompt-ready"
+            );
+            return Err(error);
+        }
+    }
+    tracing::info!(
+        conversation_id,
+        external_session_id = %external_session_id,
+        connection_id = %spawned.connection_id,
+        reused_existing = spawned.reused_existing,
+        stage = "session_ready",
+        stage_elapsed_ms = readiness_started.elapsed().as_millis() as u64,
+        total_elapsed_ms = restore_started.elapsed().as_millis() as u64,
+        "[ACP][restore] target external session verified"
+    );
+    tracing::info!(
+        conversation_id,
+        external_session_id = %external_session_id,
+        connection_id = %spawned.connection_id,
+        reused_existing = spawned.reused_existing,
+        stage = "prompt_ready",
+        total_elapsed_ms = restore_started.elapsed().as_millis() as u64,
+        "[ACP][restore] target session accepts prompts"
+    );
+
+    let activation_started = std::time::Instant::now();
+    let activation = manager
+        .activate_restored_conversation(
+            &spawned.connection_id,
+            conversation_id,
+            conversation.folder_id,
+            &external_session_id,
+            require_codeg_mcp,
+            conversation.parent_id,
+            conversation.parent_tool_use_id.clone(),
+        )
+        .await;
+    let activation = match activation {
+        Ok(value) => value,
+        Err(error) => {
+            // A newly spawned, not-yet-published connection is ours to reclaim.
+            // A reused connection belongs to an existing client and remains
+            // untouched because no binding mutation passed validation.
+            if !spawned.reused_existing {
+                let _ = manager.disconnect_and_wait(&spawned.connection_id).await;
+            }
+            tracing::warn!(
+                conversation_id,
+                external_session_id = %external_session_id,
+                old_connection_id = ?old_connection_id,
+                new_connection_id = %spawned.connection_id,
+                reused_existing = spawned.reused_existing,
+                error = %error,
+                binding_updated = false,
+                "[ACP] persisted conversation restore failed"
+            );
+            return Err(error);
+        }
+    };
+
+    // Activation is the publication boundary. Verify both lookup APIs against
+    // the freshly-bound state before returning HTTP 200; otherwise callers can
+    // receive a connection id that the next immediate find/snapshot request
+    // cannot resolve (the field failure that left the browser on its old id).
+    let published_connection = manager
+        .find_connection_by_conversation_id(conversation_id)
+        .await;
+    let published_state = manager.get_state(&spawned.connection_id).await;
+    let publication_valid = if let Some(state) = published_state.as_ref() {
+        let state = state.read().await;
+        published_connection.as_deref() == Some(spawned.connection_id.as_str())
+            && state.conversation_id == Some(conversation_id)
+            && state.external_id.as_deref() == Some(external_session_id.as_str())
+            && state.selectors_ready
+            && state.status == ConnectionStatus::Connected
+            && !state.turn_in_flight
+    } else {
+        false
+    };
+    if !publication_valid {
+        if !spawned.reused_existing {
+            let _ = manager.disconnect_and_wait(&spawned.connection_id).await;
+        }
+        tracing::error!(
+            conversation_id,
+            external_session_id = %external_session_id,
+            new_connection_id = %spawned.connection_id,
+            published_connection_id = ?published_connection,
+            stage = "restore_publication_verification_failed",
+            binding_updated = false,
+            "[ACP][restore] activation did not produce a stable queryable mapping"
+        );
+        return Err(AcpError::protocol(
+            "restored connection could not be published as a stable conversation binding"
+                .to_string(),
+        ));
+    }
+    manager.touch(&spawned.connection_id).await;
+
+    tracing::info!(
+        conversation_id,
+        external_session_id = %external_session_id,
+        old_connection_id = ?old_connection_id,
+        new_connection_id = %spawned.connection_id,
+        reused_existing = spawned.reused_existing,
+        mcp_server_count = activation.mcp_server_count,
+        codeg_mcp_available = activation.codeg_mcp_available,
+        replaced_connection_ids = ?activation.replaced_connection_ids,
+        binding_updated = true,
+        stage = "restore_completed",
+        activation_elapsed_ms = activation_started.elapsed().as_millis() as u64,
+        total_elapsed_ms = restore_started.elapsed().as_millis() as u64,
+        "[ACP] persisted conversation restore completed"
+    );
+
+    Ok(RestoredConversationConnectionInfo {
+        connection_id: spawned.connection_id,
+        external_session_id,
+        reused_existing: spawned.reused_existing,
+        codeg_mcp_available: activation.codeg_mcp_available,
+        mcp_server_count: activation.mcp_server_count,
+        replaced_connection_ids: activation.replaced_connection_ids,
+        lifecycle_state: "ready".into(),
+        durable_session: true,
+    })
+}
+
+/// Cancellation-shielded entry point for persisted conversation restore.
+///
+/// The expensive lifecycle runs in a backend-owned task. Closing a tab,
+/// aborting an HTTP request, or replacing a React component only drops that
+/// caller's watch receiver; it cannot release the writer locks or orphan the
+/// spawned ACP process. Concurrent callers join the same generation and receive
+/// the same success/error value.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn acp_restore_conversation_core(
+    conversation_id: i32,
+    preferred_mode_id: Option<String>,
+    preferred_config_values: BTreeMap<String, String>,
+    manager: &ConnectionManager,
+    db: &AppDatabase,
+    data_dir: &Path,
+    owner_window_label: String,
+    emitter: EventEmitter,
+) -> Result<RestoredConversationConnectionInfo, AcpError> {
+    let key = ManagedRestoreFlightKey {
+        manager_identity: manager.instance_identity(),
+        conversation_id,
+    };
+    let (flight, leader) = acquire_managed_restore_flight(key).await;
+
+    if leader {
+        let manager = manager.clone_ref();
+        let db = db.clone();
+        let data_dir = data_dir.to_path_buf();
+        let flight_for_task = flight.clone();
+        tokio::spawn(async move {
+            let generation = flight_for_task.generation.clone();
+            tracing::info!(
+                conversation_id,
+                restore_generation = generation,
+                stage = "restore_flight_started",
+                "[ACP][restore] backend-owned restore flight started"
+            );
+            let inner_manager = manager.clone_ref();
+            let mut inner = tokio::spawn(async move {
+                acp_restore_conversation_inner(
+                    conversation_id,
+                    preferred_mode_id,
+                    preferred_config_values,
+                    &inner_manager,
+                    &db,
+                    &data_dir,
+                    owner_window_label,
+                    emitter,
+                )
+                .await
+            });
+            let result = match tokio::time::timeout(manager.restore_timeout(), &mut inner).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(join_error)) => Err(AcpError::protocol(format!(
+                    "conversation {conversation_id} restore task stopped unexpectedly: {join_error}"
+                ))),
+                Err(_) => {
+                    inner.abort();
+                    let _ = inner.await;
+                    let cleaned = manager
+                        .terminate_incomplete_restore_connections(conversation_id)
+                        .await;
+                    tracing::warn!(
+                        conversation_id,
+                        restore_generation = generation,
+                        timeout_secs = manager.restore_timeout().as_secs(),
+                        cleaned_connections = cleaned,
+                        stage = "restore_flight_timed_out",
+                        "[ACP][restore] restore timed out and was reclaimed"
+                    );
+                    Err(AcpError::protocol(format!(
+                        "conversation {conversation_id} restore timed out after {} seconds; retry",
+                        manager.restore_timeout().as_secs()
+                    )))
+                }
+            };
+            // `send_replace` retains the terminal result even if every HTTP
+            // caller navigated away. A caller joining during the small
+            // publication/removal window still observes the completed flight;
+            // plain `send` discards the value when no receiver exists.
+            flight_for_task.result.send_replace(Some(result.clone()));
+            {
+                let mut flights = managed_restore_flights().lock().await;
+                if flights
+                    .get(&key)
+                    .is_some_and(|current| Arc::ptr_eq(current, &flight_for_task))
+                {
+                    flights.remove(&key);
+                }
+            }
+            tracing::info!(
+                conversation_id,
+                restore_generation = generation,
+                succeeded = result.is_ok(),
+                stage = "restore_flight_finished",
+                "[ACP][restore] backend-owned restore flight finished"
+            );
+        });
+    } else {
+        tracing::info!(
+            conversation_id,
+            restore_generation = flight.generation,
+            stage = "restore_flight_joined",
+            "[ACP][restore] duplicate caller joined existing restore flight"
+        );
+    }
+
+    let mut receiver = flight.result.subscribe();
+    loop {
+        if let Some(result) = receiver.borrow().clone() {
+            return result;
+        }
+        receiver.changed().await.map_err(|_| {
+            AcpError::protocol(format!(
+                "conversation {conversation_id} restore supervisor ended without a result"
+            ))
+        })?;
+    }
+}
+
+/// A durable `running` row is not sufficient proof that a refreshed client can
+/// control a turn.  Require the process-local connection to independently
+/// confirm the exact conversation, external session, agent and in-flight
+/// Prompting state before the restore endpoint hands that connection to a new
+/// viewer.
+fn active_turn_matches_restore_target(
+    state: &crate::acp::session_state::SessionState,
+    conversation_id: i32,
+    external_session_id: &str,
+    agent_type: AgentType,
+) -> bool {
+    state.status == ConnectionStatus::Prompting
+        && state.turn_in_flight
+        && state.conversation_id == Some(conversation_id)
+        && state.external_id.as_deref() == Some(external_session_id)
+        && state.agent_type == agent_type
 }
 
 #[cfg(feature = "tauri-runtime")]
@@ -10152,6 +11420,36 @@ pub async fn acp_connect(
 
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn acp_restore_conversation(
+    conversation_id: i32,
+    preferred_mode_id: Option<String>,
+    preferred_config_values: Option<BTreeMap<String, String>>,
+    manager: State<'_, ConnectionManager>,
+    db: State<'_, AppDatabase>,
+    app_handle: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+) -> Result<RestoredConversationConnectionInfo, AcpError> {
+    let app_data_dir = app_handle
+        .path()
+        .app_data_dir()
+        .map(|p| crate::paths::resolve_effective_data_dir(&p))
+        .unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let emitter = EventEmitter::Tauri(app_handle);
+    acp_restore_conversation_core(
+        conversation_id,
+        preferred_mode_id,
+        preferred_config_values.unwrap_or_default(),
+        &manager,
+        &db,
+        &app_data_dir,
+        window.label().to_string(),
+        emitter,
+    )
+    .await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn acp_prompt(
     connection_id: String,
     blocks: Vec<PromptInputBlock>,
@@ -10173,6 +11471,19 @@ pub async fn acp_prompt(
         )
         .await
         .map(|_| ())
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn acp_steer(
+    connection_id: String,
+    blocks: Vec<PromptInputBlock>,
+    client_message_id: String,
+    manager: State<'_, ConnectionManager>,
+) -> Result<crate::acp::types::SteerResult, AcpError> {
+    manager
+        .steer(&connection_id, blocks, client_message_id)
+        .await
 }
 
 #[cfg(feature = "tauri-runtime")]
@@ -10206,9 +11517,7 @@ pub async fn acp_goal_control(
     db: State<'_, AppDatabase>,
     manager: State<'_, ConnectionManager>,
 ) -> Result<(), AcpError> {
-    manager
-        .goal_control(&db.conn, &connection_id, action)
-        .await
+    manager.goal_control(&db.conn, &connection_id, action).await
 }
 
 /// Spawn a transient ACP connection for `agent_type` with a silent emitter,
@@ -10260,10 +11569,19 @@ pub async fn acp_describe_agent_options(
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn acp_cancel(
     connection_id: String,
+    request_source: Option<String>,
+    frontend_generation: Option<u64>,
     db: State<'_, AppDatabase>,
     manager: State<'_, ConnectionManager>,
-) -> Result<(), AcpError> {
-    manager.cancel(&db.conn, &connection_id).await
+) -> Result<crate::acp::types::AcpCancelResult, AcpError> {
+    manager
+        .cancel_with_origin(
+            &db.conn,
+            &connection_id,
+            request_source.as_deref().unwrap_or("tauri_unspecified"),
+            frontend_generation,
+        )
+        .await
 }
 
 #[cfg(feature = "tauri-runtime")]
@@ -10345,9 +11663,19 @@ pub async fn acp_answer_plan_approval(
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn acp_disconnect(
     connection_id: String,
+    request_source: Option<String>,
+    frontend_generation: Option<u64>,
     manager: State<'_, ConnectionManager>,
+    db: State<'_, AppDatabase>,
 ) -> Result<(), AcpError> {
-    manager.disconnect(&connection_id).await
+    manager
+        .disconnect_reconciled_with_origin(
+            &db.conn,
+            &connection_id,
+            request_source.as_deref().unwrap_or("tauri_unspecified"),
+            frontend_generation,
+        )
+        .await
 }
 
 #[cfg(feature = "tauri-runtime")]
@@ -10904,10 +12232,7 @@ pub(crate) async fn acp_update_agent_preferences_core(
     }
 
     if agent_type == AgentType::OpenCode {
-        persist_opencode_native_config(
-            opencode_auth_json.as_deref(),
-            config_json.as_deref(),
-        )?;
+        persist_opencode_native_config(opencode_auth_json.as_deref(), config_json.as_deref())?;
         emit_acp_agents_updated(emitter, "preferences_updated", Some(agent_type));
         return Ok(());
     }
@@ -11057,7 +12382,11 @@ pub(crate) async fn acp_update_agent_env_core(
             codex_bound_model = Some(provider.model.clone());
         }
         if agent_type == AgentType::ClaudeCode {
-            claude_local_cascade = Some((provider.api_url.clone(), provider.api_key.clone(), model_env));
+            claude_local_cascade = Some((
+                provider.api_url.clone(),
+                provider.api_key.clone(),
+                model_env,
+            ));
         }
     }
 
@@ -11082,7 +12411,9 @@ pub(crate) async fn acp_update_agent_env_core(
             &CodexModelAction::NoOp,
             None,
         ) {
-            eprintln!("[acp_update_agent_env] cascade_update_agent_config({agent_type}) failed: {e}");
+            eprintln!(
+                "[acp_update_agent_env] cascade_update_agent_config({agent_type}) failed: {e}"
+            );
         }
     }
 
@@ -11397,10 +12728,7 @@ pub(crate) async fn acp_update_agent_config_core(
     }
 
     if agent_type == AgentType::OpenCode {
-        persist_opencode_native_config(
-            opencode_auth_json.as_deref(),
-            config_json.as_deref(),
-        )?;
+        persist_opencode_native_config(opencode_auth_json.as_deref(), config_json.as_deref())?;
         emit_acp_agents_updated(emitter, "config_updated", Some(agent_type));
         return Ok(());
     }
@@ -11462,7 +12790,14 @@ pub(crate) async fn acp_update_agent_config_and_refresh(
         emitter,
     )
     .await?;
-    Ok(refresh_config_staleness(manager, db, data_dir, &[agent_type], ConfigStaleKind::AgentConfig).await)
+    Ok(refresh_config_staleness(
+        manager,
+        db,
+        data_dir,
+        &[agent_type],
+        ConfigStaleKind::AgentConfig,
+    )
+    .await)
 }
 
 #[cfg(feature = "tauri-runtime")]
@@ -11789,9 +13124,8 @@ fn open_external_terminal_impl(command: &str, cwd: Option<&str>) -> Result<(), A
         // literal (backslashes first, then double-quotes).
         let shell_cmd = format!("cd {} && {}", shell_single_quote(&dir), command);
         let escaped = shell_cmd.replace('\\', "\\\\").replace('"', "\\\"");
-        let osa = format!(
-            "tell application \"Terminal\"\nactivate\ndo script \"{escaped}\"\nend tell"
-        );
+        let osa =
+            format!("tell application \"Terminal\"\nactivate\ndo script \"{escaped}\"\nend tell");
         Command::new("osascript")
             .arg("-e")
             .arg(osa)
@@ -11840,7 +13174,9 @@ fn open_external_terminal_impl(command: &str, cwd: Option<&str>) -> Result<(), A
     }
 
     #[allow(unreachable_code)]
-    Err(AcpError::protocol("unsupported platform for terminal launch"))
+    Err(AcpError::protocol(
+        "unsupported platform for terminal launch",
+    ))
 }
 
 /// Quote a string for a single-quoted POSIX shell argument.
@@ -12057,10 +13393,7 @@ pub(crate) async fn acp_install_uv_tool_core(
 
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
-pub async fn acp_install_uv_tool(
-    task_id: String,
-    app: tauri::AppHandle,
-) -> Result<(), AcpError> {
+pub async fn acp_install_uv_tool(task_id: String, app: tauri::AppHandle) -> Result<(), AcpError> {
     let emitter = EventEmitter::Tauri(app);
     acp_install_uv_tool_core(task_id, &emitter).await
 }
@@ -12529,10 +13862,7 @@ pub(crate) async fn acp_install_pi_binary_core(
 
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
-pub async fn acp_install_pi_binary(
-    task_id: String,
-    app: tauri::AppHandle,
-) -> Result<(), AcpError> {
+pub async fn acp_install_pi_binary(task_id: String, app: tauri::AppHandle) -> Result<(), AcpError> {
     let emitter = EventEmitter::Tauri(app);
     acp_install_pi_binary_core(task_id, &emitter).await
 }
@@ -13113,6 +14443,126 @@ pub(crate) async fn codex_poll_device_code_core(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn managed_restore_flight_has_one_leader_and_shared_terminal_result() {
+        static TEST_MANAGER: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(10_000);
+        let key = ManagedRestoreFlightKey {
+            manager_identity: TEST_MANAGER.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+            conversation_id: 26,
+        };
+        let (leader, is_leader) = acquire_managed_restore_flight(key).await;
+        let (waiter, waiter_is_leader) = acquire_managed_restore_flight(key).await;
+        assert!(is_leader);
+        assert!(!waiter_is_leader);
+        assert!(Arc::ptr_eq(&leader, &waiter));
+
+        let mut receiver = waiter.result.subscribe();
+        let expected = RestoredConversationConnectionInfo {
+            connection_id: "connection-26".into(),
+            external_session_id: "session-26".into(),
+            reused_existing: false,
+            codeg_mcp_available: true,
+            mcp_server_count: 1,
+            replaced_connection_ids: Vec::new(),
+            lifecycle_state: "ready".into(),
+            durable_session: true,
+        };
+        leader.result.send_replace(Some(Ok(expected.clone())));
+        receiver.changed().await.unwrap();
+        assert_eq!(receiver.borrow().clone().unwrap().unwrap(), expected);
+
+        managed_restore_flights().lock().await.remove(&key);
+    }
+
+    #[test]
+    fn external_session_writer_conflict_blocks_only_a_live_different_owner() {
+        assert!(has_live_external_session_owner_conflict(
+            91,
+            Some(89),
+            &ConnectionStatus::Connected,
+        ));
+        assert!(!has_live_external_session_owner_conflict(
+            91,
+            Some(91),
+            &ConnectionStatus::Prompting,
+        ));
+        assert!(!has_live_external_session_owner_conflict(
+            91,
+            Some(89),
+            &ConnectionStatus::Disconnected,
+        ));
+        assert!(!has_live_external_session_owner_conflict(
+            91,
+            None,
+            &ConnectionStatus::Connected,
+        ));
+    }
+
+    #[test]
+    fn active_turn_restore_target_requires_the_exact_live_prompt() {
+        let mut state = crate::acp::session_state::SessionState::new(
+            "active-connection".into(),
+            AgentType::Codex,
+            Some(PathBuf::from("/tmp/project")),
+            "test-owner".into(),
+            Some(8),
+        );
+        state.status = ConnectionStatus::Prompting;
+        state.turn_in_flight = true;
+        state.conversation_id = Some(75);
+        state.external_id = Some("session-75".into());
+
+        assert!(active_turn_matches_restore_target(
+            &state,
+            75,
+            "session-75",
+            AgentType::Codex,
+        ));
+        assert!(!active_turn_matches_restore_target(
+            &state,
+            76,
+            "session-75",
+            AgentType::Codex,
+        ));
+        assert!(!active_turn_matches_restore_target(
+            &state,
+            75,
+            "another-session",
+            AgentType::Codex,
+        ));
+    }
+
+    #[test]
+    fn active_turn_restore_target_rejects_idle_or_phantom_connections() {
+        let mut state = crate::acp::session_state::SessionState::new(
+            "idle-connection".into(),
+            AgentType::Codex,
+            None,
+            "test-owner".into(),
+            Some(8),
+        );
+        state.conversation_id = Some(75);
+        state.external_id = Some("session-75".into());
+
+        state.status = ConnectionStatus::Connected;
+        state.turn_in_flight = false;
+        assert!(!active_turn_matches_restore_target(
+            &state,
+            75,
+            "session-75",
+            AgentType::Codex,
+        ));
+
+        state.status = ConnectionStatus::Prompting;
+        assert!(!active_turn_matches_restore_target(
+            &state,
+            75,
+            "session-75",
+            AgentType::Codex,
+        ));
+    }
+
     #[test]
     fn extract_version_token_finds_the_version_in_common_banners() {
         assert_eq!(extract_version_token("0.21.0").as_deref(), Some("0.21.0"));
@@ -13208,8 +14658,7 @@ mod tests {
         // Unregistered custom id → no declared probe → the auto `--version`
         // path, exactly what a hand-added agent without a probe gets. The
         // same path serves built-ins, which can never declare a probe.
-        let version =
-            system_probed_version(AgentType::Custom("probe-e2e-test"), &bin, None).await;
+        let version = system_probed_version(AgentType::Custom("probe-e2e-test"), &bin, None).await;
         assert_eq!(version.as_deref(), Some("1.2.3"));
     }
 
@@ -13222,12 +14671,9 @@ mod tests {
 
         // The declared probe's program doesn't exist, so the probe yields
         // nothing; the convention path must still read the real install.
-        let version = system_probed_version_with(
-            Some("codeg-missing-probe-cmd-e2e --version"),
-            &bin,
-            None,
-        )
-        .await;
+        let version =
+            system_probed_version_with(Some("codeg-missing-probe-cmd-e2e --version"), &bin, None)
+                .await;
         assert_eq!(version.as_deref(), Some("3.2.1"));
     }
 
@@ -13245,7 +14691,10 @@ mod tests {
         // codeg's old codeg-invented markers map onto grok's real enum so the
         // dropdown, launch flag, and grok's TUI agree.
         let approve = parse_grok_settings("[ui]\npermission_mode = \"always-approve\"\n");
-        assert_eq!(approve.permission_mode.as_deref(), Some("bypassPermissions"));
+        assert_eq!(
+            approve.permission_mode.as_deref(),
+            Some("bypassPermissions")
+        );
         let ask = parse_grok_settings("[ui]\npermission_mode = \"ask\"\n");
         assert_eq!(ask.permission_mode.as_deref(), Some("default"));
         // A real grok mode is preserved untouched.
@@ -13319,10 +14768,15 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(merged.contains("session_summary"), "inline sibling preserved");
+        assert!(
+            merged.contains("session_summary"),
+            "inline sibling preserved"
+        );
         assert!(merged.contains("grok-4.5"), "inline default preserved");
         assert_eq!(
-            parse_grok_settings(&merged).default_reasoning_effort.as_deref(),
+            parse_grok_settings(&merged)
+                .default_reasoning_effort
+                .as_deref(),
             Some("high")
         );
     }
@@ -13331,8 +14785,7 @@ mod tests {
     fn apply_grok_structured_config_removes_on_none() {
         let base = "[ui]\npermission_mode = \"ask\"\n\n\
                     [models]\ndefault_reasoning_effort = \"high\"\n";
-        let merged =
-            apply_grok_structured_config(base, &GrokStructuredConfig::default()).unwrap();
+        let merged = apply_grok_structured_config(base, &GrokStructuredConfig::default()).unwrap();
         let back = parse_grok_settings(&merged);
         assert!(back.permission_mode.is_none(), "unset removes the key");
         assert!(back.default_reasoning_effort.is_none());
@@ -14042,7 +15495,10 @@ base_url = \"https://example.test/v1\"
             },
         )
         .unwrap();
-        assert!(!merged.contains("base_url"), "empty base_url must omit the key");
+        assert!(
+            !merged.contains("base_url"),
+            "empty base_url must omit the key"
+        );
         let back = parse_grok_settings(&merged);
         assert_eq!(back.custom_model_id.as_deref(), Some("foo"));
         assert!(back.custom_base_url.is_none());
@@ -14076,7 +15532,10 @@ base_url = \"https://example.test/v1\"
             },
         )
         .unwrap();
-        assert!(!merged.contains("old"), "the stale block + default must be gone");
+        assert!(
+            !merged.contains("old"),
+            "the stale block + default must be gone"
+        );
         let back = parse_grok_settings(&merged);
         assert_eq!(back.custom_model_id.as_deref(), Some("new"));
         assert_eq!(back.custom_base_url.as_deref(), Some("https://new/v1"));
@@ -14085,7 +15544,8 @@ base_url = \"https://example.test/v1\"
     #[test]
     fn apply_grok_custom_model_update_preserves_unmanaged_block_keys() {
         // Editing a managed block keeps keys codeg doesn't own (e.g. temperature).
-        let base = "[model.foo]\nmodel = \"foo\"\ntemperature = 0.7\nbase_url = \"https://old/v1\"\n\n\
+        let base =
+            "[model.foo]\nmodel = \"foo\"\ntemperature = 0.7\nbase_url = \"https://old/v1\"\n\n\
                     [models]\ndefault = \"foo\"\n";
         let merged = apply_grok_structured_config(
             base,
@@ -14105,8 +15565,7 @@ base_url = \"https://example.test/v1\"
     fn apply_grok_custom_model_clear_removes_managed_block_and_default() {
         let base = "[model.foo]\nmodel = \"foo\"\nbase_url = \"https://x/v1\"\n\n\
                     [models]\ndefault = \"foo\"\n";
-        let merged =
-            apply_grok_structured_config(base, &GrokStructuredConfig::default()).unwrap();
+        let merged = apply_grok_structured_config(base, &GrokStructuredConfig::default()).unwrap();
         assert!(!merged.contains("[model."), "managed block removed");
         let back = parse_grok_settings(&merged);
         assert!(back.custom_model_id.is_none());
@@ -14117,8 +15576,7 @@ base_url = \"https://example.test/v1\"
         // Clearing the (empty) custom form must NOT delete a hand-set stock
         // `[models].default` that was never codeg-managed.
         let base = "[models]\ndefault = \"grok-4.5\"\n";
-        let merged =
-            apply_grok_structured_config(base, &GrokStructuredConfig::default()).unwrap();
+        let merged = apply_grok_structured_config(base, &GrokStructuredConfig::default()).unwrap();
         assert!(merged.contains("default = \"grok-4.5\""));
     }
 
@@ -14139,8 +15597,7 @@ base_url = \"https://example.test/v1\"
         );
         // `None` removes an existing key.
         let base = "[session]\nauto_compact_threshold_percent = 70\n";
-        let cleared =
-            apply_grok_structured_config(base, &GrokStructuredConfig::default()).unwrap();
+        let cleared = apply_grok_structured_config(base, &GrokStructuredConfig::default()).unwrap();
         assert!(parse_grok_settings(&cleared)
             .auto_compact_threshold_percent
             .is_none());
@@ -14407,7 +15864,10 @@ base_url = \"https://example.test/v1\"
 
         let after = read_json_object_or_empty(&trust);
         assert_eq!(after.get(&canonical_key(&ws)), None);
-        assert_eq!(after.get("/some/other"), Some(&serde_json::Value::Bool(true)));
+        assert_eq!(
+            after.get("/some/other"),
+            Some(&serde_json::Value::Bool(true))
+        );
         assert_eq!(after.get("/denied"), Some(&serde_json::Value::Bool(false)));
     }
 
@@ -14721,10 +16181,7 @@ base_url = \"https://example.test/v1\"
     // composer sends is clamped straight back and the picker looks broken. These
     // pin the shape pi actually reads.
 
-    fn pi_reasoning_spec(
-        reasoning: bool,
-        map: &[(&str, Option<&str>)],
-    ) -> PiModelReasoningSpec {
+    fn pi_reasoning_spec(reasoning: bool, map: &[(&str, Option<&str>)]) -> PiModelReasoningSpec {
         PiModelReasoningSpec {
             reasoning,
             thinking_level_map: map
@@ -14751,7 +16208,11 @@ base_url = \"https://example.test/v1\"
             "gpt-5.6-sol",
             Some(&pi_reasoning_spec(
                 true,
-                &[("off", Some("none")), ("minimal", None), ("xhigh", Some("xhigh"))],
+                &[
+                    ("off", Some("none")),
+                    ("minimal", None),
+                    ("xhigh", Some("xhigh")),
+                ],
             )),
         );
 
@@ -14895,7 +16356,11 @@ base_url = \"https://example.test/v1\"
             "gpt-5.6-sol",
             Some(&pi_reasoning_spec(
                 true,
-                &[("off", Some("none")), ("minimal", None), ("low", Some("LOW"))],
+                &[
+                    ("off", Some("none")),
+                    ("minimal", None),
+                    ("low", Some("LOW")),
+                ],
             )),
         );
 
@@ -14904,7 +16369,10 @@ base_url = \"https://example.test/v1\"
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "gpt-5.6-sol");
         assert_eq!(models[0].reasoning, Some(true));
-        assert_eq!(models[0].thinking_level_map["off"], Some("none".to_string()));
+        assert_eq!(
+            models[0].thinking_level_map["off"],
+            Some("none".to_string())
+        );
         assert_eq!(models[0].thinking_level_map["minimal"], None);
         assert_eq!(models[0].thinking_level_map["low"], Some("LOW".to_string()));
     }
@@ -15105,10 +16573,7 @@ wire_api = "responses"
 base_url = "https://gateway.example/v1"
 wire_api = "chat"
 "#;
-        let other = codeg.replace(
-            "model_provider = \"codeg\"",
-            "model_provider = \"other\"",
-        );
+        let other = codeg.replace("model_provider = \"codeg\"", "model_provider = \"other\"");
 
         let p_codeg = codex_config_projection_from_toml(codeg);
         let p_other = codex_config_projection_from_toml(&other);
@@ -15144,7 +16609,10 @@ wire_api = "chat"
         // behavior; the bare `model` still projects.
         let bare = codex_config_projection_from_toml("model = \"gpt-5-codex\"\n");
         assert!(!bare.contains_key("modelProvider"));
-        assert_eq!(bare.get("model").and_then(|v| v.as_str()), Some("gpt-5-codex"));
+        assert_eq!(
+            bare.get("model").and_then(|v| v.as_str()),
+            Some("gpt-5-codex")
+        );
 
         // Malformed TOML must not panic — yields an empty projection.
         assert!(codex_config_projection_from_toml("model_provider = ").is_empty());
@@ -15352,7 +16820,10 @@ wire_api = "chat"
             out.get("ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION"),
             Some(&Some("via gateway".to_string()))
         );
-        assert_eq!(out.get("ANTHROPIC_MODEL"), Some(&Some("gw/opus".to_string())));
+        assert_eq!(
+            out.get("ANTHROPIC_MODEL"),
+            Some(&Some("gw/opus".to_string()))
+        );
 
         // Omitted custom keys are authoritative clears (None => remove from env),
         // matching the five model fields' overwrite semantics.
@@ -15375,7 +16846,10 @@ wire_api = "chat"
 
         // A legacy plain slug passes through as the model.
         let legacy = parse_provider_model(AgentType::Codex, Some("gpt-5.5"));
-        assert_eq!(legacy.get("OPENAI_MODEL"), Some(&Some("gpt-5.5".to_string())));
+        assert_eq!(
+            legacy.get("OPENAI_MODEL"),
+            Some(&Some("gpt-5.5".to_string()))
+        );
 
         // No models → OPENAI_MODEL cleared (None).
         let empty = parse_provider_model(AgentType::Codex, Some(r#"{"models":[]}"#));
@@ -15594,7 +17068,9 @@ wire_api = "chat"
     }
 
     fn auth_flag_of(table: &toml::map::Map<String, toml::Value>) -> Option<bool> {
-        table.get("requires_openai_auth").and_then(toml::Value::as_bool)
+        table
+            .get("requires_openai_auth")
+            .and_then(toml::Value::as_bool)
     }
 
     #[test]
@@ -15614,9 +17090,8 @@ wire_api = "chat"
         assert_eq!(auth_flag_of(&explicit_false), Some(false));
 
         // An explicit true is left alone rather than rewritten.
-        let mut explicit_true = provider_table_of(
-            "[model_providers.codeg]\nrequires_openai_auth = true\n",
-        );
+        let mut explicit_true =
+            provider_table_of("[model_providers.codeg]\nrequires_openai_auth = true\n");
         ensure_codex_provider_auth_default(&mut explicit_true);
         assert_eq!(auth_flag_of(&explicit_true), Some(true));
     }
@@ -15853,7 +17328,10 @@ wire_api = "chat"
             "the legacy approvalMode key is dropped: the CLI never reads it \
              from cli-config.json"
         );
-        assert_eq!(v.pointer("/sandbox/mode"), Some(&serde_json::json!("enabled")));
+        assert_eq!(
+            v.pointer("/sandbox/mode"),
+            Some(&serde_json::json!("enabled"))
+        );
         assert_eq!(
             v.pointer("/permissions/allow"),
             Some(&serde_json::json!(["Shell(npm run build)"]))
@@ -15876,7 +17354,9 @@ wire_api = "chat"
         // any inherited one instead of probing a credential a launch wouldn't use.
         let cleared = qoder_probe_env(&db, Some("")).await;
         assert_eq!(
-            cleared.get("QODER_PERSONAL_ACCESS_TOKEN").map(String::as_str),
+            cleared
+                .get("QODER_PERSONAL_ACCESS_TOKEN")
+                .map(String::as_str),
             Some("")
         );
         let unset = qoder_probe_env(&db, None).await;
@@ -15893,11 +17373,11 @@ wire_api = "chat"
         // API-key mode: the form value wins over saved env and is trimmed; the
         // base URL is always scrubbed to empty (⇒ removed by run_cursor_probe).
         let env = cursor_probe_env(&db, Some("  my-key  ")).await;
-        assert_eq!(env.get("CURSOR_API_KEY").map(String::as_str), Some("my-key"));
         assert_eq!(
-            env.get("CURSOR_API_BASE_URL").map(String::as_str),
-            Some("")
+            env.get("CURSOR_API_KEY").map(String::as_str),
+            Some("my-key")
         );
+        assert_eq!(env.get("CURSOR_API_BASE_URL").map(String::as_str), Some(""));
 
         // Subscription passes an empty key → present but empty, so the probe
         // strips any inherited value instead of leaking it.
@@ -15946,8 +17426,7 @@ wire_api = "chat"
     #[test]
     fn parse_cursor_models_tolerates_ansi_markers_and_bare_ids() {
         // ANSI SGR + a leading list marker + a bare-id line with no label.
-        let stdout =
-            "\u{1b}[1mAvailable models\u{1b}[0m\n- gpt-5.2 - GPT-5.2\ncomposer-2.5\n";
+        let stdout = "\u{1b}[1mAvailable models\u{1b}[0m\n- gpt-5.2 - GPT-5.2\ncomposer-2.5\n";
         let (models, default_model) = parse_cursor_models(stdout);
         assert_eq!(default_model, None);
         assert_eq!(models.len(), 2);
@@ -16466,8 +17945,14 @@ wire_api = "chat"
     fn parse_env_file_ignores_comments_and_strips_quotes() {
         let raw = "# comment\n\nexport OPENROUTER_API_KEY=\"sk-or-123\"\nOPENAI_BASE_URL='https://x.test/v1'\nBARE=plain\n=novalue\n";
         let map = parse_env_file(raw);
-        assert_eq!(map.get("OPENROUTER_API_KEY").map(String::as_str), Some("sk-or-123"));
-        assert_eq!(map.get("OPENAI_BASE_URL").map(String::as_str), Some("https://x.test/v1"));
+        assert_eq!(
+            map.get("OPENROUTER_API_KEY").map(String::as_str),
+            Some("sk-or-123")
+        );
+        assert_eq!(
+            map.get("OPENAI_BASE_URL").map(String::as_str),
+            Some("https://x.test/v1")
+        );
         assert_eq!(map.get("BARE").map(String::as_str), Some("plain"));
         assert!(!map.contains_key(""));
     }
@@ -16477,9 +17962,18 @@ wire_api = "chat"
         let existing = "# secrets\nOPENROUTER_API_KEY=old\n\nOTHER_TOKEN=keep\n";
         let out = patch_env_text(existing, &[("OPENROUTER_API_KEY", "new")]);
         assert!(out.contains("# secrets"), "comment preserved: {out}");
-        assert!(out.contains("OPENROUTER_API_KEY=new"), "key replaced: {out}");
-        assert!(!out.contains("OPENROUTER_API_KEY=old"), "old value gone: {out}");
-        assert!(out.contains("OTHER_TOKEN=keep"), "unrelated key preserved: {out}");
+        assert!(
+            out.contains("OPENROUTER_API_KEY=new"),
+            "key replaced: {out}"
+        );
+        assert!(
+            !out.contains("OPENROUTER_API_KEY=old"),
+            "old value gone: {out}"
+        );
+        assert!(
+            out.contains("OTHER_TOKEN=keep"),
+            "unrelated key preserved: {out}"
+        );
         // Replacement happens in place, not appended at the end.
         assert_eq!(out.matches("OPENROUTER_API_KEY=").count(), 1);
         assert!(out.ends_with('\n'));
@@ -16491,13 +17985,22 @@ wire_api = "chat"
         // last-occurrence-wins, so a stale second line would shadow the update.
         let existing = "OPENAI_API_KEY=old1\nKEEP=1\nOPENAI_API_KEY=old2\n";
         let out = patch_env_text(existing, &[("OPENAI_API_KEY", "new")]);
-        assert_eq!(out.matches("OPENAI_API_KEY=").count(), 1, "single key: {out}");
+        assert_eq!(
+            out.matches("OPENAI_API_KEY=").count(),
+            1,
+            "single key: {out}"
+        );
         assert!(out.contains("OPENAI_API_KEY=new"));
-        assert!(!out.contains("old1") && !out.contains("old2"), "stale gone: {out}");
+        assert!(
+            !out.contains("old1") && !out.contains("old2"),
+            "stale gone: {out}"
+        );
         assert!(out.contains("KEEP=1"));
         // And a reader of the result sees the new value, not a stale shadow.
         assert_eq!(
-            parse_env_file(&out).get("OPENAI_API_KEY").map(String::as_str),
+            parse_env_file(&out)
+                .get("OPENAI_API_KEY")
+                .map(String::as_str),
             Some("new")
         );
     }
@@ -16528,7 +18031,8 @@ wire_api = "chat"
 
     #[test]
     fn merge_hermes_model_config_sets_model_and_keeps_other_keys() {
-        let existing = "terminal:\n  backend: local\nmodel:\n  default: old-model\n  provider: openai\n";
+        let existing =
+            "terminal:\n  backend: local\nmodel:\n  default: old-model\n  provider: openai\n";
         let merged = merge_hermes_model_config(
             Some(existing),
             "openrouter",
@@ -16539,14 +18043,20 @@ wire_api = "chat"
         .expect("merge");
         let value: serde_yaml::Value = serde_yaml::from_str(&merged).expect("parse merged");
         let model = value.get("model").expect("model section");
-        assert_eq!(model.get("provider").and_then(|v| v.as_str()), Some("openrouter"));
+        assert_eq!(
+            model.get("provider").and_then(|v| v.as_str()),
+            Some("openrouter")
+        );
         assert_eq!(
             model.get("default").and_then(|v| v.as_str()),
             Some("moonshotai/kimi-k2")
         );
         // Unrelated top-level keys survive the targeted merge.
         assert_eq!(
-            value.get("terminal").and_then(|t| t.get("backend")).and_then(|v| v.as_str()),
+            value
+                .get("terminal")
+                .and_then(|t| t.get("backend"))
+                .and_then(|v| v.as_str()),
             Some("local")
         );
         // No base_url was requested, so none is written.
@@ -16565,7 +18075,10 @@ wire_api = "chat"
         .expect("merge with base");
         let value: serde_yaml::Value = serde_yaml::from_str(&with_base).expect("parse");
         assert_eq!(
-            value.get("model").and_then(|m| m.get("base_url")).and_then(|v| v.as_str()),
+            value
+                .get("model")
+                .and_then(|m| m.get("base_url"))
+                .and_then(|v| v.as_str()),
             Some("https://api.test/v1")
         );
         // Set("") clears the field (user emptied the API URL input).
@@ -16591,7 +18104,10 @@ wire_api = "chat"
         .expect("merge preserve");
         let value: serde_yaml::Value = serde_yaml::from_str(&kept).expect("parse");
         assert_eq!(
-            value.get("model").and_then(|m| m.get("base_url")).and_then(|v| v.as_str()),
+            value
+                .get("model")
+                .and_then(|m| m.get("base_url"))
+                .and_then(|v| v.as_str()),
             Some("https://api.test/v1")
         );
     }
@@ -16612,8 +18128,14 @@ wire_api = "chat"
         .expect("merge custom");
         let value: serde_yaml::Value = serde_yaml::from_str(&with_key).expect("parse");
         let model = value.get("model").expect("model section");
-        assert_eq!(model.get("provider").and_then(|v| v.as_str()), Some("custom"));
-        assert_eq!(model.get("api_key").and_then(|v| v.as_str()), Some("sk-abc"));
+        assert_eq!(
+            model.get("provider").and_then(|v| v.as_str()),
+            Some("custom")
+        );
+        assert_eq!(
+            model.get("api_key").and_then(|v| v.as_str()),
+            Some("sk-abc")
+        );
         assert_eq!(
             model.get("base_url").and_then(|v| v.as_str()),
             Some("https://endpoint.test/v1")
@@ -16636,7 +18158,8 @@ wire_api = "chat"
 
         // custom→custom re-save with scrub_mode=false preserves a raw-editor
         // `api_mode`; switching in with scrub_mode=true drops it.
-        let with_mode = "model:\n  provider: custom\n  default: m\n  api_mode: anthropic_messages\n";
+        let with_mode =
+            "model:\n  provider: custom\n  default: m\n  api_mode: anthropic_messages\n";
         let resaved = merge_hermes_model_config(
             Some(with_mode),
             "custom",
@@ -16686,15 +18209,22 @@ wire_api = "chat"
         .expect("merge switch");
         let value: serde_yaml::Value = serde_yaml::from_str(&switched).expect("parse");
         let model = value.get("model").expect("model section");
-        assert!(model.get("api_key").is_none(), "stale inline key must be scrubbed");
-        assert!(model.get("api_mode").is_none(), "stale api_mode must be scrubbed");
+        assert!(
+            model.get("api_key").is_none(),
+            "stale inline key must be scrubbed"
+        );
+        assert!(
+            model.get("api_mode").is_none(),
+            "stale api_mode must be scrubbed"
+        );
     }
 
     #[test]
     fn plan_hermes_write_preserves_base_url_for_fixed_endpoint_provider() {
         // Anthropic (needsBaseUrl: false) behind a proxy: a structured save that
         // doesn't touch the hidden API URL field must keep the existing endpoint.
-        let existing = "model:\n  provider: anthropic\n  default: old\n  base_url: https://my-proxy/v1\n";
+        let existing =
+            "model:\n  provider: anthropic\n  default: old\n  base_url: https://my-proxy/v1\n";
         let (yaml, env) = plan_hermes_write(
             "anthropic",
             Some("sk-ant"),
@@ -16706,7 +18236,10 @@ wire_api = "chat"
         .expect("plan");
         let value: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("yaml");
         assert_eq!(
-            value.get("model").and_then(|m| m.get("base_url")).and_then(|v| v.as_str()),
+            value
+                .get("model")
+                .and_then(|m| m.get("base_url"))
+                .and_then(|v| v.as_str()),
             Some("https://my-proxy/v1"),
             "out-of-band base_url must survive a structured save"
         );
@@ -16732,7 +18265,10 @@ wire_api = "chat"
         .expect("plan");
         let value: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("yaml");
         assert_eq!(
-            value.get("model").and_then(|m| m.get("provider")).and_then(|v| v.as_str()),
+            value
+                .get("model")
+                .and_then(|m| m.get("provider"))
+                .and_then(|v| v.as_str()),
             Some("anthropic")
         );
         assert!(
@@ -16760,8 +18296,8 @@ wire_api = "chat"
             assert!(!env.iter().any(|(k, _)| *k == "OPENROUTER_API_KEY"));
         }
         // A provided key is written alongside the neutralization.
-        let (_, env) = plan_hermes_write("openrouter", Some("sk-or"), "m", None, None, None)
-            .expect("keyed");
+        let (_, env) =
+            plan_hermes_write("openrouter", Some("sk-or"), "m", None, None, None).expect("keyed");
         assert!(env.contains(&("OPENROUTER_API_KEY", "sk-or".to_string())));
         assert!(env.contains(&("OPENAI_API_KEY", String::new())));
     }
@@ -16808,7 +18344,11 @@ wire_api = "chat"
         let inode_before = fs::metadata(&env_path).unwrap().ino();
         write_hermes_secret_file(&env_path, "OPENROUTER_API_KEY=sk-2\n", ".env")
             .expect("rewrite env");
-        assert_eq!(mode_of(&env_path), 0o640, "existing managed mode must be preserved");
+        assert_eq!(
+            mode_of(&env_path),
+            0o640,
+            "existing managed mode must be preserved"
+        );
         assert_eq!(
             fs::metadata(&env_path).unwrap().ino(),
             inode_before,
@@ -16835,7 +18375,10 @@ wire_api = "chat"
         write_hermes_secret_file(&link, "model:\n  provider: anthropic\n", "config.yaml")
             .expect("write through symlink");
         assert!(
-            fs::symlink_metadata(&link).unwrap().file_type().is_symlink(),
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
             "the symlink must be preserved, not replaced by a regular file"
         );
         assert_eq!(
@@ -16855,7 +18398,10 @@ wire_api = "chat"
         let real = dir.join("vault-hermes.env");
         let link = dir.join(".env");
         std::os::unix::fs::symlink(&real, &link).unwrap();
-        assert!(fs::metadata(&link).is_err(), "precondition: dangling symlink");
+        assert!(
+            fs::metadata(&link).is_err(),
+            "precondition: dangling symlink"
+        );
 
         write_hermes_secret_file(&link, "OPENROUTER_API_KEY=sk\n", ".env").expect("write");
         // The target is created THROUGH the symlink and is owner-only (0600), not
@@ -16865,9 +18411,15 @@ wire_api = "chat"
             0o600,
             "a freshly created symlink target must be 0600"
         );
-        assert_eq!(fs::read_to_string(&real).unwrap(), "OPENROUTER_API_KEY=sk\n");
+        assert_eq!(
+            fs::read_to_string(&real).unwrap(),
+            "OPENROUTER_API_KEY=sk\n"
+        );
         assert!(
-            fs::symlink_metadata(&link).unwrap().file_type().is_symlink(),
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
             "the symlink itself must be preserved"
         );
     }
@@ -16892,7 +18444,11 @@ wire_api = "chat"
         fs::write(&env_path, "OPENROUTER_API_KEY=old\n").unwrap();
         fs::set_permissions(&env_path, fs::Permissions::from_mode(0o644)).unwrap();
         write_hermes_secret_file(&env_path, "OPENROUTER_API_KEY=new\n", ".env").unwrap();
-        assert_eq!(mode_of(&env_path), 0o600, "a world-readable 0644 secret → 0600");
+        assert_eq!(
+            mode_of(&env_path),
+            0o600,
+            "a world-readable 0644 secret → 0600"
+        );
         assert_eq!(
             fs::read_to_string(&env_path).unwrap(),
             "OPENROUTER_API_KEY=new\n"
@@ -16903,7 +18459,11 @@ wire_api = "chat"
         fs::write(&managed, "K=1\n").unwrap();
         fs::set_permissions(&managed, fs::Permissions::from_mode(0o640)).unwrap();
         write_hermes_secret_file(&managed, "K=2\n", ".env").unwrap();
-        assert_eq!(mode_of(&managed), 0o640, "managed group-shared mode preserved");
+        assert_eq!(
+            mode_of(&managed),
+            0o640,
+            "managed group-shared mode preserved"
+        );
     }
 
     #[cfg(unix)]
@@ -16940,7 +18500,11 @@ wire_api = "chat"
         fs::create_dir_all(&managed).unwrap();
         fs::set_permissions(&managed, fs::Permissions::from_mode(0o755)).unwrap();
         ensure_hermes_home_secure(&managed).expect("ensure managed");
-        assert_eq!(mode_of(&managed), 0o755, "existing hermes home mode preserved");
+        assert_eq!(
+            mode_of(&managed),
+            0o755,
+            "existing hermes home mode preserved"
+        );
     }
 
     // ── Hermes base-URL reconcile (auxiliary/main endpoint parity) ──────────
@@ -16971,11 +18535,19 @@ wire_api = "chat"
     fn plan_hermes_base_url_reconcile_ignores_trailing_slash() {
         // Trailing-slash-only differences must not churn .env (both directions).
         assert_eq!(
-            plan_hermes_base_url_reconcile("openai-api", Some("https://x/v1/"), Some("https://x/v1")),
+            plan_hermes_base_url_reconcile(
+                "openai-api",
+                Some("https://x/v1/"),
+                Some("https://x/v1")
+            ),
             None
         );
         assert_eq!(
-            plan_hermes_base_url_reconcile("openai-api", Some("https://x/v1"), Some("https://x/v1/")),
+            plan_hermes_base_url_reconcile(
+                "openai-api",
+                Some("https://x/v1"),
+                Some("https://x/v1/")
+            ),
             None
         );
     }
@@ -16993,9 +18565,18 @@ wire_api = "chat"
     #[test]
     fn plan_hermes_base_url_reconcile_no_op_when_both_empty() {
         // Absent var and explicitly-empty var both → no-op (no redundant `KEY=`).
-        assert_eq!(plan_hermes_base_url_reconcile("openai-api", None, None), None);
-        assert_eq!(plan_hermes_base_url_reconcile("openai-api", None, Some("")), None);
-        assert_eq!(plan_hermes_base_url_reconcile("openai-api", Some("  "), Some("")), None);
+        assert_eq!(
+            plan_hermes_base_url_reconcile("openai-api", None, None),
+            None
+        );
+        assert_eq!(
+            plan_hermes_base_url_reconcile("openai-api", None, Some("")),
+            None
+        );
+        assert_eq!(
+            plan_hermes_base_url_reconcile("openai-api", Some("  "), Some("")),
+            None
+        );
     }
 
     #[test]
@@ -17026,7 +18607,10 @@ wire_api = "chat"
     fn plan_hermes_base_url_reconcile_openrouter_only_touches_its_own_var() {
         // openrouter never returns an OPENAI_BASE_URL write (that would re-pollute
         // the panel's neutralization); it only reconciles OPENROUTER_BASE_URL.
-        assert_eq!(plan_hermes_base_url_reconcile("openrouter", None, None), None);
+        assert_eq!(
+            plan_hermes_base_url_reconcile("openrouter", None, None),
+            None
+        );
         assert_eq!(
             plan_hermes_base_url_reconcile("openrouter", Some("https://or/api/v1"), None),
             Some(("OPENROUTER_BASE_URL", "https://or/api/v1".to_string()))
@@ -17168,7 +18752,10 @@ wire_api = "chat"
         .unwrap();
         reconcile_hermes_runtime_env_in(home).expect("reconcile");
         let env = fs::read_to_string(home.join(".env")).unwrap();
-        assert!(env.contains("OPENAI_BASE_URL=\n"), "stale base url cleared: {env:?}");
+        assert!(
+            env.contains("OPENAI_BASE_URL=\n"),
+            "stale base url cleared: {env:?}"
+        );
         assert!(env.contains("OPENAI_API_KEY=sk"), "key preserved: {env:?}");
     }
 
@@ -17204,11 +18791,17 @@ wire_api = "chat"
         // either (both an absolute path and a literal `~/…` path are passed as-is).
         let mut abs = BTreeMap::new();
         abs.insert("HERMES_HOME".to_string(), "/tmp/hermes-alt".to_string());
-        assert_eq!(hermes_home_for_launch(&abs), PathBuf::from("/tmp/hermes-alt"));
+        assert_eq!(
+            hermes_home_for_launch(&abs),
+            PathBuf::from("/tmp/hermes-alt")
+        );
 
         let mut tilde = BTreeMap::new();
         tilde.insert("HERMES_HOME".to_string(), "~/alt-hermes".to_string());
-        assert_eq!(hermes_home_for_launch(&tilde), PathBuf::from("~/alt-hermes"));
+        assert_eq!(
+            hermes_home_for_launch(&tilde),
+            PathBuf::from("~/alt-hermes")
+        );
 
         // A blank override REPLACES the parent value in the child, and Hermes then
         // falls back to the default `~/.hermes` — not the parent's HERMES_HOME.
@@ -17283,10 +18876,7 @@ wire_api = "chat"
     fn hermes_skip_chmod_requires_a_non_empty_opt_out() {
         // A non-empty opt-out enables skip.
         temp_env::with_vars(
-            [
-                ("HERMES_SKIP_CHMOD", Some("1")),
-                ("HERMES_CONTAINER", None),
-            ],
+            [("HERMES_SKIP_CHMOD", Some("1")), ("HERMES_CONTAINER", None)],
             || assert!(hermes_skip_chmod(), "non-empty HERMES_SKIP_CHMOD skips"),
         );
         // An EMPTY opt-out must NOT skip (Hermes' Python truthiness treats `` as
@@ -17331,9 +18921,14 @@ wire_api = "chat"
         assert_eq!(openai_api.key_env_var, "OPENAI_API_KEY");
         assert!(openai_api.needs_base_url);
         // Hermes' first-priority key var per provider (auth.py PROVIDER_REGISTRY).
-        assert_eq!(hermes_provider("zai").expect("zai").key_env_var, "GLM_API_KEY");
         assert_eq!(
-            hermes_provider("kimi-coding").expect("kimi-coding").key_env_var,
+            hermes_provider("zai").expect("zai").key_env_var,
+            "GLM_API_KEY"
+        );
+        assert_eq!(
+            hermes_provider("kimi-coding")
+                .expect("kimi-coding")
+                .key_env_var,
             "KIMI_API_KEY"
         );
         // OAuth + AWS providers carry no API-key env var (set via terminal --setup
@@ -17446,7 +19041,10 @@ wire_api = "chat"
         assert_eq!(env, vec![("ANTHROPIC_API_KEY", "sk-ant-1".to_string())]);
         let value: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("yaml");
         assert_eq!(
-            value.get("model").and_then(|m| m.get("provider")).and_then(|v| v.as_str()),
+            value
+                .get("model")
+                .and_then(|m| m.get("provider"))
+                .and_then(|v| v.as_str()),
             Some("anthropic")
         );
     }
@@ -17466,9 +19064,18 @@ wire_api = "chat"
         assert!(env.is_empty(), "custom must not write any .env var");
         let value: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("yaml");
         let model = value.get("model").expect("model section");
-        assert_eq!(model.get("provider").and_then(|v| v.as_str()), Some("custom"));
-        assert_eq!(model.get("default").and_then(|v| v.as_str()), Some("gpt-5.5"));
-        assert_eq!(model.get("api_key").and_then(|v| v.as_str()), Some("sk-custom-1"));
+        assert_eq!(
+            model.get("provider").and_then(|v| v.as_str()),
+            Some("custom")
+        );
+        assert_eq!(
+            model.get("default").and_then(|v| v.as_str()),
+            Some("gpt-5.5")
+        );
+        assert_eq!(
+            model.get("api_key").and_then(|v| v.as_str()),
+            Some("sk-custom-1")
+        );
         assert_eq!(
             model.get("base_url").and_then(|v| v.as_str()),
             Some("https://endpoint.test/v1")
@@ -17486,7 +19093,8 @@ wire_api = "chat"
 
         // Switching TO custom from another provider that carried an `api_mode`
         // scrubs the stale mode (it must not bleed into the custom endpoint).
-        let prior = "model:\n  provider: openai-api\n  default: gpt\n  api_mode: chat_completions\n";
+        let prior =
+            "model:\n  provider: openai-api\n  default: gpt\n  api_mode: chat_completions\n";
         let (yaml, _env) = plan_hermes_write(
             "custom",
             Some("sk-2"),
@@ -17517,21 +19125,23 @@ wire_api = "chat"
         )
         .expect("plan");
         assert!(env.is_empty(), "raw mode must not write .env");
-        assert!(yaml.contains("anthropic"), "raw yaml written verbatim: {yaml}");
+        assert!(
+            yaml.contains("anthropic"),
+            "raw yaml written verbatim: {yaml}"
+        );
     }
 
     #[test]
     fn plan_hermes_write_oauth_and_blank_key_produce_no_env() {
         // OAuth provider (empty key var) → no .env update.
-        let (_, env) = plan_hermes_write("nous", Some("ignored"), "m", None, None, None)
-            .expect("oauth");
+        let (_, env) =
+            plan_hermes_write("nous", Some("ignored"), "m", None, None, None).expect("oauth");
         assert!(env.is_empty());
         // Blank key on a keyed provider with no base-URL var → nothing touched.
-        let (_, env) = plan_hermes_write("anthropic", Some("   "), "m", None, None, None)
-            .expect("blank");
-        assert!(env.is_empty());
         let (_, env) =
-            plan_hermes_write("anthropic", None, "m", None, None, None).expect("none");
+            plan_hermes_write("anthropic", Some("   "), "m", None, None, None).expect("blank");
+        assert!(env.is_empty());
+        let (_, env) = plan_hermes_write("anthropic", None, "m", None, None, None).expect("none");
         assert!(env.is_empty());
     }
 
@@ -17542,8 +19152,15 @@ wire_api = "chat"
             "newline in key must be rejected"
         );
         assert!(
-            plan_hermes_write("openai-api", None, "m", None, Some("model: [unterminated"), None)
-                .is_err(),
+            plan_hermes_write(
+                "openai-api",
+                None,
+                "m",
+                None,
+                Some("model: [unterminated"),
+                None
+            )
+            .is_err(),
             "invalid raw yaml must be rejected"
         );
     }
@@ -17570,13 +19187,16 @@ wire_api = "chat"
         );
         let value: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("yaml");
         assert_eq!(
-            value.get("model").and_then(|m| m.get("base_url")).and_then(|v| v.as_str()),
+            value
+                .get("model")
+                .and_then(|m| m.get("base_url"))
+                .and_then(|v| v.as_str()),
             Some("https://api.test/v1")
         );
         // Clearing the base URL writes an empty override so a stale `.env` value
         // can't shadow the default endpoint.
-        let (_, env) = plan_hermes_write("openai-api", None, "m", None, None, None)
-            .expect("clear base");
+        let (_, env) =
+            plan_hermes_write("openai-api", None, "m", None, None, None).expect("clear base");
         assert_eq!(env, vec![("OPENAI_BASE_URL", String::new())]);
     }
 
@@ -17605,7 +19225,10 @@ wire_api = "chat"
     fn project_hermes_key_and_base_falls_back_to_env_base_url() {
         let mut env = BTreeMap::new();
         env.insert("OPENAI_API_KEY".to_string(), "sk-1".to_string());
-        env.insert("OPENAI_BASE_URL".to_string(), "https://proxy/v1".to_string());
+        env.insert(
+            "OPENAI_BASE_URL".to_string(),
+            "https://proxy/v1".to_string(),
+        );
         // No YAML base_url → the panel still sees the endpoint from `.env`, so a
         // later save won't clear it (regression guard for the dual-write change).
         let (key, base) = project_hermes_key_and_base("openai-api", &env, None, None);
@@ -17709,8 +19332,9 @@ wire_api = "chat"
                         || std::path::Path::new(first)
                             .file_name()
                             .and_then(|n| n.to_str())
-                            .is_some_and(|n| n.trim_end_matches(".cmd").trim_end_matches(".exe")
-                                == "hermes"),
+                            .is_some_and(
+                                |n| n.trim_end_matches(".cmd").trim_end_matches(".exe") == "hermes"
+                            ),
                     "unexpected launcher: {argv:?}"
                 );
             }
@@ -17750,7 +19374,10 @@ wire_api = "chat"
         let serialized = toml::to_string_pretty(&doc).expect("serialize");
         let reparsed: toml::Value = serialized.parse().expect("valid toml");
         let t = reparsed.as_table().unwrap();
-        assert_eq!(t.get("telemetry").and_then(toml::Value::as_bool), Some(true));
+        assert_eq!(
+            t.get("telemetry").and_then(toml::Value::as_bool),
+            Some(true)
+        );
         assert_eq!(
             t.get("default_model").and_then(toml::Value::as_str),
             Some(KIMI_MANAGED_MODEL_ALIAS)
@@ -17782,7 +19409,9 @@ wire_api = "chat"
             Some("claude-opus-4-7")
         );
         assert_eq!(
-            model.get("max_context_size").and_then(toml::Value::as_integer),
+            model
+                .get("max_context_size")
+                .and_then(toml::Value::as_integer),
             Some(200_000)
         );
     }
@@ -18152,7 +19781,10 @@ default_effort = "high"
             .filter_map(|v| v.as_str())
             .collect();
         assert_eq!(efforts, vec!["low", "medium", "high"]);
-        assert_eq!(proj.get("defaultEffort").and_then(|v| v.as_str()), Some("high"));
+        assert_eq!(
+            proj.get("defaultEffort").and_then(|v| v.as_str()),
+            Some("high")
+        );
     }
 
     #[test]
@@ -18204,7 +19836,10 @@ max_context_size = 200000
             Some("https://api.anthropic.com")
         );
         assert_eq!(proj.get("key").and_then(|v| v.as_str()), Some("sk-ant"));
-        assert_eq!(proj.get("authType").and_then(|v| v.as_str()), Some("api_key"));
+        assert_eq!(
+            proj.get("authType").and_then(|v| v.as_str()),
+            Some("api_key")
+        );
         assert_eq!(
             proj.get("modelId").and_then(|v| v.as_str()),
             Some("claude-opus-4-7")
@@ -18213,7 +19848,10 @@ max_context_size = 200000
             proj.get("maxContextSize").and_then(|v| v.as_i64()),
             Some(200000)
         );
-        assert_eq!(proj.get("hasManagedBlock"), Some(&serde_json::Value::Bool(true)));
+        assert_eq!(
+            proj.get("hasManagedBlock"),
+            Some(&serde_json::Value::Bool(true))
+        );
         for forbidden in [
             "apiKey",
             "apiBaseUrl",

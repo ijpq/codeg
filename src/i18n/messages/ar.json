@@ -1042,7 +1042,8 @@
       "loggedIn": "تم تسجيل الدخول",
       "loginRelogin": "إعادة تسجيل الدخول / تبديل الحساب",
       "loginTimeout": "انتهت مهلة تسجيل الدخول، يرجى المحاولة مرة أخرى",
-      "loginSaveFailed": "تم تسجيل الدخول بنجاح ولكن فشل حفظ الإعدادات"
+      "loginSaveFailed": "تم تسجيل الدخول بنجاح ولكن فشل حفظ الإعدادات",
+      "selectReasoningEffort": "اختر Reasoning Effort"
     },
     "gemini": {
       "authConfig": "إعداد مصادقة Gemini",
@@ -1324,7 +1325,13 @@
       "sendAttributionHeader": "إرسال معرّف الإسناد/الفوترة إلى الواجهة",
       "sendAttributionHeaderAria": "إرسال معرّف الإسناد/الفوترة الخاص بـ Claude Code إلى الواجهة",
       "disableNonessentialTraffic": "تعطيل القياس عن بُعد أو طلبات الشبكة غير الضرورية",
-      "disableNonessentialTrafficAria": "تعطيل القياس عن بُعد أو طلبات الشبكة غير الضرورية في Claude Code"
+      "disableNonessentialTrafficAria": "تعطيل القياس عن بُعد أو طلبات الشبكة غير الضرورية في Claude Code",
+      "effortLevel": "مستوى الاستدلال",
+      "effortLevelDefault": "المستوى الافتراضي",
+      "effortLevel_low": "منخفض",
+      "effortLevel_medium": "متوسط",
+      "effortLevel_high": "مرتفع",
+      "effortLevel_xhigh": "مرتفع جداً"
     },
     "dialogs": {
       "confirmDeleteProvider": "حذف المزود {providerId}؟",
@@ -1777,7 +1784,8 @@
         "updateGroupFailed": "فشل تحديث المجموعة: {message}",
         "deleteGroupFailed": "فشل حذف المجموعة: {message}",
         "moveToGroupFailed": "فشل نقل المجلد: {message}",
-        "applyLayoutFailed": "فشل حفظ ترتيب المجلدات: {message}"
+        "applyLayoutFailed": "فشل حفظ ترتيب المجلدات: {message}",
+        "reorderFoldersFailed": "فشل إعادة ترتيب المجلدات: {message}"
       },
       "statsLabel": "{folders} مجلدات · {convos} محادثة",
       "reorderHandle": "اسحب لإعادة الترتيب",
@@ -1918,7 +1926,46 @@
         "toolResult": "النتيجة",
         "toolError": "خطأ"
       },
-      "moreActions": "إجراءات إضافية"
+      "moreActions": "إجراءات إضافية",
+      "steerInjected": "تم حقن التوجيه في الجولة الحالية",
+      "steerFallbackFeedback": "التوجيه الأصلي غير متاح؛ أُرسل كملاحظات فورية",
+      "steerTurnEndedQueued": "انتهت الجولة للتو؛ أُضيفت الرسالة إلى قائمة الانتظار التالية",
+      "imageSteerQueued": "لا يمكن إدخال الصور أثناء الجولة؛ أُضيفت الرسالة إلى قائمة الجولة التالية",
+      "promptAcceptanceUnknown": "انقطع الاتصال؛ جارٍ التحقق مما إذا كان الخادم قد استلم الرسالة",
+      "steerUnsupportedQueued": "التوجيه الأصلي غير متاح؛ أُضيفت الرسالة إلى قائمة الانتظار التالية",
+      "steerFailedQueued": "فشل التوجيه؛ أُضيفت الرسالة إلى قائمة الانتظار التالية",
+      "steerWaitingRestore": "تم حفظ التوجيه؛ بانتظار استعادة الجلسة الأصلية",
+      "steerOriginalTurnEnded": "انتهت المهمة الأصلية؛ لم يتم إرسال هذا التوجيه",
+      "branch": {
+        "create": "إنشاء فرع",
+        "createFromMessage": "إنشاء فرع من هنا",
+        "nativeCreated": "تم إنشاء فرع أصلي مستقل",
+        "snapshotCreated": "تم إنشاء فرع من لقطة السياق",
+        "provisionalCreated": "لقطة الفرع جاهزة؛ أرسل الرسالة الأولى عندما تكون مستعدًا",
+        "runningForkHint": "ينتظر الإرسال المتفرع انتهاء الجولة الحالية. للإنشاء فورًا استخدم «إنشاء فرع» ليرث حتى آخر جولة مكتملة. تشترك المحادثتان في مجلد العمل، لذا تجنب تعديل الملفات نفسها بالتزامن.",
+        "source": "متفرع من: {title}",
+        "sourceDeleted": "المصدر محذوف: {title}",
+        "sourceDeletedHint": "حُذفت المحادثة المصدر؛ يظل هذا الفرع مستقلاً وقابلاً للاستخدام.",
+        "nativeMode": "فرع أصلي",
+        "snapshotMode": "لقطة سياق",
+        "inheritanceRange": "{count} رسالة حتى {boundary}",
+        "inheritanceTruncated": "تم ضغط السياق",
+        "pendingFirstPrompt": "بانتظار تهيئة الرسالة الأولى",
+        "retryableFailed": "يمكن إعادة محاولة التهيئة",
+        "merge": "دمج في المحادثة الرئيسية",
+        "mergeSuccess": "تم الدمج في المحادثة الرئيسية ({count} ملفات تسليم)",
+        "mergePreparing": "جارٍ تحضير الدمج…",
+        "mergeDeterminingBoundary": "جارٍ تحديد نقطة التفرع…",
+        "mergeExtractingIncrement": "جارٍ استخراج تغييرات الفرع…",
+        "mergeWritingSource": "جارٍ الكتابة في المحادثة الرئيسية…",
+        "mergeCompleted": "اكتمل الدمج",
+        "mergeFailed": "فشل الدمج؛ يمكن إعادة المحاولة",
+        "mergeDescription": "تُضاف الخلاصة وملفات التسليم المحددة فقط، ولا يُعاد كتابة السجل.",
+        "summaryPlaceholder": "الخلاصة المراد إعادتها",
+        "selectMessages": "حدد الردود المرئية لإعادتها (يمكن تعديل النص)",
+        "mergeKeep": "دمج ومتابعة استخدام الفرع",
+        "mergeArchive": "دمج ووضع علامة مكتمل على الفرع"
+      }
     },
     "sessionDetails": {
       "menuLabel": "تفاصيل الجلسة",
@@ -2035,6 +2082,8 @@
         "contextWindowUsageAria": "استخدام نافذة السياق",
         "contextWindow": "نافذة السياق",
         "usedMax": "المستخدم / الحد الأقصى",
+        "source": "المصدر",
+        "contextSource": "استجابة وقت التشغيل",
         "tokenUsage": "استخدام الرموز",
         "input": "إدخال",
         "output": "إخراج",
@@ -2047,7 +2096,8 @@
         "groups": {
           "workspace": "مساحة العمل",
           "navigation": "التنقل",
-          "more": "المزيد"
+          "more": "المزيد",
+          "sessions": "الجلسات"
         },
         "showPet": "إظهار الحيوان الأليف"
       },
@@ -2093,6 +2143,18 @@
         "loadFailed": "تعذّرت قراءة الحالة: {message}",
         "openSettings": "فتح الإعدادات الكاملة",
         "refresh": "تحديث"
+      },
+      "quota": {
+        "summary": "{plan} · المتبقي أسبوعيًا {remaining}",
+        "lastRoutedPlan": "الخطة المستخدمة في آخر طلب",
+        "weeklyShort": "المتبقي أسبوعيًا",
+        "weeklyRemaining": "المتبقي الأسبوعي",
+        "weeklyUsed": "المستخدم أسبوعيًا",
+        "resetsAt": "موعد إعادة الضبط",
+        "observedAt": "وقت التحديث",
+        "refresh": "تحديث الحصة",
+        "unknown": "غير معروف",
+        "sourceHint": "مقروء من آخر استجابة Codex فعلية دون طلب إضافي إلى المرحّل."
       }
     },
     "auxPanel": {
@@ -2956,7 +3018,9 @@
       "chatInput": {
         "connecting": "جارٍ الاتصال...",
         "agentResponding": "{agent} يرد...",
-        "sendMessage": "أرسل رسالة..."
+        "sendMessage": "أرسل رسالة...",
+        "stopping": "جارٍ الإيقاف...",
+        "guideAgent": "وجّه الجولة الحالية لـ {agent}..."
       },
       "messageInput": {
         "askAnything": "اسأل أي شيء...",
@@ -3020,14 +3084,28 @@
         "mentionGroupAgent": "الوكلاء",
         "mentionGroupSession": "الجلسات",
         "mentionGroupCommit": "عمليات الإيداع",
-        "mentionGroupSkill": "المهارات"
+        "mentionGroupSkill": "المهارات",
+        "stopping": "جارٍ الإيقاف...",
+        "steer": "توجيه الجولة الحالية",
+        "steerSending": "جارٍ حقن التوجيه...",
+        "forkAndSend": "تفريع وإرسال",
+        "steerAttachmentsUnsupported": "نص فقط — المسودات التي تحتوي على مرفقات تمر عبر قائمة الانتظار."
       },
       "messageQueue": {
         "addToQueue": "إضافة للقائمة",
         "saveEdit": "حفظ",
         "cancelEdit": "إلغاء التعديل",
         "editItem": "تعديل",
-        "deleteItem": "حذف"
+        "deleteItem": "حذف",
+        "queued": "في قائمة الانتظار",
+        "waiting_source_turn": "بانتظار انتهاء المهمة المصدر",
+        "creating_branch": "جارٍ إنشاء الفرع",
+        "waiting_session_restore": "بانتظار استعادة الجلسة",
+        "waiting_connection": "بانتظار إعادة الاتصال",
+        "failed": "فشل الإرسال",
+        "expired_guide": "انتهت المهمة الأصلية",
+        "retry": "إعادة المحاولة",
+        "sendAsPrompt": "إرسال كرسالة جديدة"
       },
       "welcomeInputPanel": {
         "agentsSettingsPath": "الإعدادات > الوكلاء",
@@ -3071,7 +3149,8 @@
           "liveFeedback": "تُدرج «ملاحظات مباشرة» في قائمة + ملاحظةً داخل الدور الذي ينفّذه الوكيل بالفعل، دون مقاطعته.",
           "skillPacks": "تجمع الإعدادات ← حزم المهارات خبراء البرمجة والبحث العلمي ومهارات المكتب — فعّلها لكل وكيل على حدة.",
           "modelProviders": "تقبل الإعدادات ← مزودو النماذج مفتاح API أو نقطة نهاية خاصة بك، ثم تختار النموذج مباشرة من حقل الإدخال.",
-          "workspaceBackground": "تحدّد الإعدادات ← المظهر صورة خلفية لمساحة العمل، وشفافية اللوحات، وخطوط التطبيق."
+          "workspaceBackground": "تحدّد الإعدادات ← المظهر صورة خلفية لمساحة العمل، وشفافية اللوحات، وخطوط التطبيق.",
+          "forkSend": "تتضمن قائمة زر الإرسال المنسدلة «تفرّع وأرسل» لإنشاء فرع من النقطة الحالية في تبويب جديد."
         },
         "quickActions": {
           "excel": "مصنّف Excel",
@@ -3304,7 +3383,18 @@
         "completedAt": "وقت الإنجاز",
         "jumpToPreviousUserMessage": "الانتقال إلى رسالة المستخدم",
         "showMore": "عرض المزيد",
-        "showLess": "طي"
+        "showLess": "طي",
+        "loadEarlierHistory": "تحميل الرسائل السابقة",
+        "retryEarlierHistory": "إعادة تحميل الرسائل السابقة",
+        "delivery": {
+          "submitting": "جارٍ الإرسال…",
+          "accepted": "تم الإرسال",
+          "running": "المعالجة في الخادم",
+          "persisted": "تم الحفظ",
+          "completed": "مكتمل",
+          "failed": "حالة الإرسال غير معروفة",
+          "queued": "في قائمة الانتظار"
+        }
       },
       "liveTurnStats": {
         "thinking": "جارٍ التفكير...",
@@ -3313,7 +3403,28 @@
         "elapsedMinutes": "{value}د",
         "elapsedSeconds": "{value}ث",
         "outputSpeedAria": "السرعة التقديرية للإخراج",
-        "outputSpeedTooltip": "السرعة التقديرية للإخراج (نص + تفكير)"
+        "outputSpeedTooltip": "السرعة التقديرية للإخراج (نص + تفكير)",
+        "sent": "تم الإرسال",
+        "backendProcessing": "المعالجة في الخادم",
+        "stillProcessing": "الخادم ما زال يعالج الطلب",
+        "toolUseCount": "{count} استخدام للأداة",
+        "diagnostics": {
+          "open": "تشخيص الاتصال",
+          "title": "تشخيص التوليد",
+          "phase": "المرحلة الحالية",
+          "phaseThinking": "يفكر",
+          "phaseTool": "تشغيل أداة",
+          "phaseOutput": "كتابة الرد",
+          "phaseWaiting": "في انتظار الرد",
+          "sinceLastData": "منذ آخر بيانات",
+          "testLink": "اختبار الاتصال",
+          "testing": "جارٍ الاختبار…",
+          "reachable": "يمكن الوصول · HTTP {status} · {latency}ms",
+          "unreachable": "تعذّر الوصول · {error}",
+          "notConfigured": "اتصال مباشر/رسمي — لا شيء لاختباره.",
+          "hintReachable": "الاتصال يعمل. إذا لم تصل بيانات جديدة لفترة، فالأرجح أن النموذج ما زال يعمل.",
+          "hintUnreachable": "مشكلة في الاتصال — قد تكون الشبكة/النفق متوقفة."
+        }
       },
       "jsonTree": {
         "viewRaw": "عرض JSON الخام",
@@ -3539,7 +3650,8 @@
           "reviewKept": "الاستمرار في وضع الخطة",
           "reviewPending": "في انتظار قرار الخطة",
           "submitted": "تم إرسال الخطة",
-          "switched": "تم تبديل الوضع"
+          "switched": "تم تبديل الوضع",
+          "planLabel": "الخطة"
         },
         "backgroundTask": {
           "title": "مهمة في الخلفية",
@@ -3557,7 +3669,9 @@
           "outputMissing": "اقتطع codex مُخرَج النص البرمجي وأزال الفاصل الخاص بهذا الأمر، لذا تعذّر نسب أي مُخرَج إليه.",
           "sharedWith": "يحتوي هذا المقطع أيضًا على مُخرَج {commands} — إذ اقتطع codex الفواصل الخاصة بها.",
           "truncated": "مقتطع"
-        }
+        },
+        "loadBranchMergeSummary": "تحميل الملخص الكامل",
+        "loadingBranchMergeSummary": "جارٍ تحميل الملخص…"
       },
       "messageNav": {
         "title": "تنقل الرسائل",
@@ -3575,7 +3689,9 @@
         "openFile": "فتح {filePath}",
         "openInEditor": "فتح في المحرر",
         "remove": "إزالة",
-        "noDiffDataAvailable": "لا توجد بيانات diff متاحة لـ {filePath}"
+        "noDiffDataAvailable": "لا توجد بيانات diff متاحة لـ {filePath}",
+        "downloadToPc": "تنزيل إلى جهازي",
+        "fileUnavailable": "الملف غير متاح أو لم يعد موجودًا: {filePath}"
       },
       "askQuestion": {
         "title": "يحتاج الوكيل إلى اختيارك",
@@ -3739,6 +3855,67 @@
       "proposedPlan": {
         "title": "الخطة المقترحة",
         "planning": "جارٍ التخطيط…"
+      },
+      "conversationDeliverables": {
+        "collapsedSummary": "مخرجات {count}",
+        "historyTitle": "سجل المخرجات",
+        "loadingHistory": "جارٍ تحميل سجل المخرجات…",
+        "retry": "إعادة المحاولة",
+        "versions": "{count} إصدارات",
+        "toggleVersions": "عرض أو إخفاء {count} إصدارات سابقة",
+        "loadMore": "تحميل المزيد",
+        "title": "المخرجات النهائية",
+        "collapse": "طيّ",
+        "openFile": "فتح {filePath}",
+        "revealInFolder": "إظهار في مدير الملفات",
+        "primary": "أساسي",
+        "supporting": "داعم",
+        "downloadToPc": "التنزيل إلى جهازي",
+        "fileUnavailable": "الملف غير متاح أو لم يعد موجودًا: {filePath}",
+        "turnTitle": "Outputs from this turn",
+        "download": "Download to this device",
+        "openWithDefaultAppHost": "Open with default app (Codeg host)",
+        "copyFileHost": "Copy file object (Codeg host)",
+        "copyPath": "Copy path",
+        "revealOnHost": "Reveal on the Codeg host",
+        "fileCopied": "File copied; you can paste it directly",
+        "pathCopied": "Path copied",
+        "filesCopied": "Files copied; you can paste them together",
+        "opened": "Opened with the Codeg host's default app",
+        "operationFailed": "Deliverable operation failed",
+        "declared": "Declared",
+        "inferred": "Automatically inferred",
+        "codeChange": "تغيير في الكود",
+        "deleted": "محذوف",
+        "allTypes": "All types",
+        "allSources": "All sources",
+        "allTurns": "All turns",
+        "turnNumber": "Turn {number}",
+        "allTimes": "Any time",
+        "lastDay": "Last 24 hours",
+        "lastWeek": "Last 7 days",
+        "lastMonth": "Last 30 days",
+        "newest": "Recently updated",
+        "oldest": "Oldest updated",
+        "selectAll": "Select filtered items",
+        "selectedCount": "{count} selected",
+        "downloadSelected": "Download selected files individually",
+        "downloadZip": "Download selected files as ZIP",
+        "copySelectedHost": "Copy selected file objects (Codeg host)",
+        "revealFirstHost": "Reveal the first file on the Codeg host",
+        "removeInvalid": "Remove selected invalid records",
+        "removed": "Invalid records removed",
+        "downloadStarted": "Download started",
+        "revealed": "File revealed on the Codeg host",
+        "selectFile": "Select {name}",
+        "missing": "File missing",
+        "empty": "This conversation has no confirmed deliverables yet",
+        "noFilterResults": "No deliverables match these filters",
+        "hostActionNotice": "Open, copy file, and reveal actions affect the host running Codeg Server; downloads always go to the current device."
+      },
+      "userResources": {
+        "openFile": "فتح {filePath}",
+        "fileUnavailable": "الملف غير متاح أو لم يعد موجودًا: {filePath}"
       }
     },
     "diffPreview": {
@@ -4056,7 +4233,17 @@
       "fr": "الفرنسية",
       "pt": "البرتغالية",
       "ar": "العربية"
-    }
+    },
+    "defaultConversation": "Default conversation",
+    "defaultConversationHint": "Use this conversation for the first WeChat message when the sender has no saved binding.",
+    "defaultFolderId": "Folder ID",
+    "defaultConversationId": "Conversation ID",
+    "defaultAgentType": "Agent type",
+    "weixinPushMode": "WeChat push mode",
+    "weixinPushFinalOnly": "Final result only",
+    "weixinPushFinalAndInteractions": "Final result and required interactions",
+    "weixinPushDebug": "Debug mode",
+    "weixinPushModeHint": "Only the final answer is pushed by default. Expired reply tokens keep the result pending until the next inbound message."
   },
   "ModelProviderSettings": {
     "sectionTitle": "مزودو النماذج",
@@ -4295,7 +4482,9 @@
       "syncFailed": "فشل مزامنة المهارات"
     },
     "autoPreviewLabel": "فتح المعاينة تلقائيًا",
-    "autoPreviewHint": "عندما ينشئ وكيل ملف Word أو Excel أو PowerPoint أو يعدّله، افتح معاينته المباشرة تلقائيًا."
+    "autoPreviewHint": "عندما ينشئ وكيل ملف Word أو Excel أو PowerPoint أو يعدّله، افتح معاينته المباشرة تلقائيًا.",
+    "autoDownloadProducedLabel": "تنزيل المخرجات النهائية تلقائيًا",
+    "autoDownloadProducedHint": "عند استخدام خادم الويب (مثلًا عبر Tailscale/الشبكة المحلية)، ينزّل تلقائيًا ملفات المخرجات النهائية التي صرّح بها الوكيل وتم التحقق منها إلى مجلد التنزيلات في هذا المتصفح."
   },
   "SkillPacksSettings": {
     "title": "حزم المهارات",
@@ -4786,7 +4975,12 @@
     "targetsDescription": "عيّن مستوى مختلفًا لوحدات محددة (مثل codeg_lib::acp) دون تغيير المستوى العام.",
     "targetsAdd": "إضافة",
     "targetsRemove": "إزالة التجاوز",
-    "toggleDetails": "تبديل التفاصيل"
+    "toggleDetails": "تبديل التفاصيل",
+    "exportDiagnostics": "تصدير معلومات التشخيص",
+    "exporting": "جارٍ التصدير…",
+    "exportDescription": "يُصدّر معلومات التطبيق وبيئة التشغيل وإعدادات السجل وبيانات ملفات السجل والسجلات الحديثة بصيغة JSON. تُحجب بيانات الاعتماد الشائعة وتُستبعد المحادثات ومحتويات قاعدة البيانات؛ راجع المسارات ونصوص السجل قبل المشاركة.",
+    "exportSuccess": "تم تصدير تقرير التشخيص",
+    "exportFailed": "تعذّر تصدير تقرير التشخيص"
   },
   "Automations": {
     "title": "الأتمتة",
@@ -4923,7 +5117,8 @@
     "branchLocal": "محلي",
     "branchRemote": "بعيد",
     "branchSearchPlaceholder": "بحث في الفروع…",
-    "branchNone": "لا توجد فروع"
+    "branchNone": "لا توجد فروع",
+    "advanced": "متقدم"
   },
   "Tasks": {
     "title": "المهام قيد الانتظار",

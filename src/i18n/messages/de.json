@@ -1042,7 +1042,8 @@
       "loggedIn": "Konto angemeldet",
       "loginRelogin": "Erneut anmelden / Konto wechseln",
       "loginTimeout": "Anmeldung abgelaufen, bitte erneut versuchen",
-      "loginSaveFailed": "Anmeldung erfolgreich, aber Konfiguration konnte nicht gespeichert werden"
+      "loginSaveFailed": "Anmeldung erfolgreich, aber Konfiguration konnte nicht gespeichert werden",
+      "selectReasoningEffort": "Reasoning Effort auswählen"
     },
     "gemini": {
       "authConfig": "Gemini-Auth-Konfiguration",
@@ -1324,7 +1325,13 @@
       "sendAttributionHeader": "Attributions-/Abrechnungskennung an die API senden",
       "sendAttributionHeaderAria": "Attributions-/Abrechnungskennung von Claude Code an die API senden",
       "disableNonessentialTraffic": "Telemetrie oder überflüssige Netzwerkanfragen deaktivieren",
-      "disableNonessentialTrafficAria": "Telemetrie oder überflüssige Netzwerkanfragen von Claude Code deaktivieren"
+      "disableNonessentialTrafficAria": "Telemetrie oder überflüssige Netzwerkanfragen von Claude Code deaktivieren",
+      "effortLevel": "Reasoning-Stufe",
+      "effortLevelDefault": "Standardstufe",
+      "effortLevel_low": "Niedrig",
+      "effortLevel_medium": "Mittel",
+      "effortLevel_high": "Hoch",
+      "effortLevel_xhigh": "Sehr Hoch"
     },
     "dialogs": {
       "confirmDeleteProvider": "Provider {providerId} löschen?",
@@ -1777,7 +1784,8 @@
         "updateGroupFailed": "Gruppe konnte nicht aktualisiert werden: {message}",
         "deleteGroupFailed": "Gruppe konnte nicht gelöscht werden: {message}",
         "moveToGroupFailed": "Ordner konnte nicht verschoben werden: {message}",
-        "applyLayoutFailed": "Ordnerreihenfolge konnte nicht gespeichert werden: {message}"
+        "applyLayoutFailed": "Ordnerreihenfolge konnte nicht gespeichert werden: {message}",
+        "reorderFoldersFailed": "Ordner konnten nicht neu sortiert werden: {message}"
       },
       "statsLabel": "{folders} Ordner · {convos} Konversationen",
       "reorderHandle": "Zum Neuordnen ziehen",
@@ -1918,7 +1926,46 @@
         "toolResult": "Ergebnis",
         "toolError": "Fehler"
       },
-      "moreActions": "Weitere Aktionen"
+      "moreActions": "Weitere Aktionen",
+      "steerInjected": "Anweisung in den aktuellen Turn eingefügt",
+      "steerFallbackFeedback": "Native Steuerung nicht verfügbar; als Live-Feedback gesendet",
+      "steerTurnEndedQueued": "Der Turn ist gerade beendet worden; Nachricht für den nächsten Turn eingereiht",
+      "imageSteerQueued": "Bilder können nicht in einen laufenden Turn eingefügt werden; für den nächsten Turn eingereiht",
+      "promptAcceptanceUnknown": "Verbindung unterbrochen; Annahme durch den Server wird geprüft",
+      "steerUnsupportedQueued": "Native Steuerung nicht verfügbar; Nachricht für den nächsten Turn eingereiht",
+      "steerFailedQueued": "Steuerung fehlgeschlagen; Nachricht für den nächsten Turn eingereiht",
+      "steerWaitingRestore": "Anweisung gespeichert; ursprüngliche Sitzung wird wiederhergestellt",
+      "steerOriginalTurnEnded": "Die ursprüngliche Aufgabe ist beendet; diese Anweisung wurde nicht gesendet",
+      "branch": {
+        "create": "Zweig erstellen",
+        "createFromMessage": "Ab hier Zweig erstellen",
+        "nativeCreated": "Unabhängiger nativer Zweig erstellt",
+        "snapshotCreated": "Zweig aus Kontext-Snapshot erstellt",
+        "provisionalCreated": "Branch-Snapshot ist bereit; die erste Nachricht kann gesendet werden",
+        "runningForkHint": "Fork & Send wartet auf das Ende des aktuellen Durchlaufs. Mit „Zweig erstellen“ können Sie sofort vom letzten abgeschlossenen Durchlauf abzweigen. Beide Konversationen teilen das Arbeitsverzeichnis; vermeiden Sie gleichzeitige Änderungen derselben Dateien.",
+        "source": "Abgezweigt von: {title}",
+        "sourceDeleted": "Quelle gelöscht: {title}",
+        "sourceDeletedHint": "Die Quellkonversation wurde gelöscht; dieser Zweig bleibt unabhängig nutzbar.",
+        "nativeMode": "Nativer Zweig",
+        "snapshotMode": "Kontext-Snapshot",
+        "inheritanceRange": "{count} Nachrichten bis {boundary}",
+        "inheritanceTruncated": "Kontext komprimiert",
+        "pendingFirstPrompt": "wartet auf Initialisierung durch die erste Nachricht",
+        "retryableFailed": "Initialisierung kann erneut versucht werden",
+        "merge": "In Hauptkonversation zusammenführen",
+        "mergeSuccess": "In Hauptkonversation zusammengeführt ({count} Ergebnisse)",
+        "mergePreparing": "Zusammenführung wird vorbereitet…",
+        "mergeDeterminingBoundary": "Verzweigungspunkt wird ermittelt…",
+        "mergeExtractingIncrement": "Branch-Änderungen werden extrahiert…",
+        "mergeWritingSource": "Hauptkonversation wird aktualisiert…",
+        "mergeCompleted": "Zusammenführung abgeschlossen",
+        "mergeFailed": "Zusammenführung fehlgeschlagen; Wiederholung möglich",
+        "mergeDescription": "Nur das Fazit und ausgewählte Ergebnisse werden angehängt; der Verlauf wird nicht umgeschrieben.",
+        "summaryPlaceholder": "Zurückzugebendes Fazit",
+        "selectMessages": "Sichtbare Antworten auswählen (Text bleibt bearbeitbar)",
+        "mergeKeep": "Zusammenführen und Zweig weiterverwenden",
+        "mergeArchive": "Zusammenführen und Zweig abschließen"
+      }
     },
     "sessionDetails": {
       "menuLabel": "Sitzungsdetails",
@@ -2035,6 +2082,8 @@
         "contextWindowUsageAria": "Kontextfenster-Nutzung",
         "contextWindow": "Kontextfenster",
         "usedMax": "Verwendet / Max",
+        "source": "Quelle",
+        "contextSource": "Laufzeitantwort",
         "tokenUsage": "Token-Nutzung",
         "input": "Eingabe",
         "output": "Ausgabe",
@@ -2047,7 +2096,8 @@
         "groups": {
           "workspace": "Arbeitsbereich",
           "navigation": "Navigation",
-          "more": "Mehr"
+          "more": "Mehr",
+          "sessions": "Sitzungen"
         },
         "showPet": "Pet anzeigen"
       },
@@ -2093,6 +2143,18 @@
         "loadFailed": "Status konnte nicht gelesen werden: {message}",
         "openSettings": "Alle Einstellungen öffnen",
         "refresh": "Aktualisieren"
+      },
+      "quota": {
+        "summary": "{plan} · wöchentlich {remaining} übrig",
+        "lastRoutedPlan": "Tarif der letzten Anfrage",
+        "weeklyShort": "Wo. übrig",
+        "weeklyRemaining": "Wöchentlicher Rest",
+        "weeklyUsed": "Wöchentlich verbraucht",
+        "resetsAt": "Zurücksetzung",
+        "observedAt": "Aktualisiert",
+        "refresh": "Kontingent aktualisieren",
+        "unknown": "Unbekannt",
+        "sourceHint": "Aus der letzten echten Codex-Antwort; keine zusätzliche Relay-Anfrage."
       }
     },
     "auxPanel": {
@@ -2956,7 +3018,9 @@
       "chatInput": {
         "connecting": "Verbinden...",
         "agentResponding": "{agent} antwortet...",
-        "sendMessage": "Nachricht senden..."
+        "sendMessage": "Nachricht senden...",
+        "stopping": "Wird gestoppt...",
+        "guideAgent": "Aktuellen Turn von {agent} steuern..."
       },
       "messageInput": {
         "askAnything": "Fragen Sie alles...",
@@ -3020,14 +3084,28 @@
         "mentionGroupAgent": "Agenten",
         "mentionGroupSession": "Sitzungen",
         "mentionGroupCommit": "Commits",
-        "mentionGroupSkill": "Fähigkeiten"
+        "mentionGroupSkill": "Fähigkeiten",
+        "stopping": "Wird gestoppt...",
+        "steer": "Aktuellen Turn steuern",
+        "steerSending": "Anweisung wird eingefügt...",
+        "forkAndSend": "Fork & Senden",
+        "steerAttachmentsUnsupported": "Nur Text – Entwürfe mit Anhängen laufen über die Warteschlange."
       },
       "messageQueue": {
         "addToQueue": "Zur Warteschlange",
         "saveEdit": "Speichern",
         "cancelEdit": "Bearbeitung abbrechen",
         "editItem": "Bearbeiten",
-        "deleteItem": "Entfernen"
+        "deleteItem": "Entfernen",
+        "queued": "Eingereiht",
+        "waiting_source_turn": "Warten auf Abschluss der Quellaufgabe",
+        "creating_branch": "Branch wird erstellt",
+        "waiting_session_restore": "Warten auf Sitzungswiederherstellung",
+        "waiting_connection": "Warten auf Verbindungswiederholung",
+        "failed": "Senden fehlgeschlagen",
+        "expired_guide": "Ursprüngliche Aufgabe beendet",
+        "retry": "Erneut versuchen",
+        "sendAsPrompt": "Als neue Nachricht senden"
       },
       "welcomeInputPanel": {
         "agentsSettingsPath": "Einstellungen > Agenten",
@@ -3071,7 +3149,8 @@
           "liveFeedback": "Live-Feedback im +-Menü schiebt eine Notiz in den Zug, den der Agent gerade ausführt – ohne ihn zu unterbrechen.",
           "skillPacks": "Einstellungen → Skill-Pakete bündelt Coding-Experten, wissenschaftliche Recherche und Office-Skills – pro Agent aktivierbar.",
           "modelProviders": "Einstellungen → Modellanbieter nimmt deinen eigenen API-Key oder Endpunkt entgegen; das Modell wählst du danach direkt im Eingabefeld.",
-          "workspaceBackground": "Einstellungen → Darstellung setzt ein Hintergrundbild für den Arbeitsbereich, die Panel-Deckkraft und die Schriftarten der App."
+          "workspaceBackground": "Einstellungen → Darstellung setzt ein Hintergrundbild für den Arbeitsbereich, die Panel-Deckkraft und die Schriftarten der App.",
+          "forkSend": "Im Dropdown der Senden-Schaltfläche gibt es Verzweigen und senden – verzweige vom aktuellen Punkt in einen neuen Tab."
         },
         "quickActions": {
           "excel": "Excel-Arbeitsmappe",
@@ -3304,7 +3383,18 @@
         "completedAt": "Abgeschlossen um",
         "jumpToPreviousUserMessage": "Zur Benutzernachricht springen",
         "showMore": "Mehr anzeigen",
-        "showLess": "Weniger anzeigen"
+        "showLess": "Weniger anzeigen",
+        "loadEarlierHistory": "Frühere Nachrichten laden",
+        "retryEarlierHistory": "Frühere Nachrichten erneut laden",
+        "delivery": {
+          "submitting": "Wird gesendet…",
+          "accepted": "Gesendet",
+          "running": "Server verarbeitet",
+          "persisted": "Gespeichert",
+          "completed": "Abgeschlossen",
+          "failed": "Sendestatus unbekannt",
+          "queued": "Eingereiht"
+        }
       },
       "liveTurnStats": {
         "thinking": "Denkt nach...",
@@ -3313,7 +3403,28 @@
         "elapsedMinutes": "{value} Min",
         "elapsedSeconds": "{value} Sek",
         "outputSpeedAria": "Geschätzte Ausgabegeschwindigkeit",
-        "outputSpeedTooltip": "Geschätzte Ausgabegeschwindigkeit (Text + Denken)"
+        "outputSpeedTooltip": "Geschätzte Ausgabegeschwindigkeit (Text + Denken)",
+        "sent": "Gesendet",
+        "backendProcessing": "Server verarbeitet",
+        "stillProcessing": "Server verarbeitet weiterhin",
+        "toolUseCount": "{count, plural, one {# Tool-Aufruf} other {# Tool-Aufrufe}}",
+        "diagnostics": {
+          "open": "Verbindungsdiagnose",
+          "title": "Generierungsdiagnose",
+          "phase": "Aktuelle Phase",
+          "phaseThinking": "Denkt nach",
+          "phaseTool": "Tool wird ausgeführt",
+          "phaseOutput": "Antwort wird geschrieben",
+          "phaseWaiting": "Warten auf Antwort",
+          "sinceLastData": "Seit letzten Daten",
+          "testLink": "Verbindung testen",
+          "testing": "Test läuft…",
+          "reachable": "Erreichbar · HTTP {status} · {latency}ms",
+          "unreachable": "Nicht erreichbar · {error}",
+          "notConfigured": "Direkte/offizielle Verbindung – nichts zu testen.",
+          "hintReachable": "Verbindung steht. Kommen längere Zeit keine neuen Daten, arbeitet vermutlich noch das Modell.",
+          "hintUnreachable": "Verbindungsproblem – Netzwerk/Tunnel hängt möglicherweise."
+        }
       },
       "jsonTree": {
         "viewRaw": "Rohes JSON anzeigen",
@@ -3539,7 +3650,8 @@
           "reviewKept": "Im Planmodus geblieben",
           "reviewPending": "Warte auf Planentscheidung",
           "submitted": "Plan eingereicht",
-          "switched": "Modus gewechselt"
+          "switched": "Modus gewechselt",
+          "planLabel": "Plan"
         },
         "backgroundTask": {
           "title": "Hintergrundaufgabe",
@@ -3557,7 +3669,9 @@
           "outputMissing": "Codex hat die Skriptausgabe gekürzt und dabei das Trennzeichen dieses Befehls entfernt, sodass ihm keine Ausgabe zugeordnet werden konnte.",
           "sharedWith": "Enthält auch die Ausgabe von {commands} – codex hat deren Trennzeichen abgeschnitten.",
           "truncated": "gekürzt"
-        }
+        },
+        "loadBranchMergeSummary": "Vollständige Zusammenfassung laden",
+        "loadingBranchMergeSummary": "Zusammenfassung wird geladen…"
       },
       "messageNav": {
         "title": "Nachrichtennavigation",
@@ -3575,7 +3689,9 @@
         "openFile": "{filePath} öffnen",
         "openInEditor": "Im Editor öffnen",
         "remove": "Entfernen",
-        "noDiffDataAvailable": "Keine Diff-Daten verfügbar für {filePath}"
+        "noDiffDataAvailable": "Keine Diff-Daten verfügbar für {filePath}",
+        "downloadToPc": "Auf meinen PC herunterladen",
+        "fileUnavailable": "Datei nicht verfügbar oder nicht mehr vorhanden: {filePath}"
       },
       "askQuestion": {
         "title": "Der Agent benötigt deine Auswahl",
@@ -3739,6 +3855,67 @@
       "proposedPlan": {
         "title": "Vorgeschlagener Plan",
         "planning": "Wird geplant…"
+      },
+      "conversationDeliverables": {
+        "collapsedSummary": "Ergebnisse {count}",
+        "historyTitle": "Lieferverlauf",
+        "loadingHistory": "Lieferverlauf wird geladen…",
+        "retry": "Erneut versuchen",
+        "versions": "{count} Versionen",
+        "toggleVersions": "{count} frühere Versionen umschalten",
+        "loadMore": "Mehr laden",
+        "title": "Endergebnisse",
+        "collapse": "Einklappen",
+        "openFile": "{filePath} öffnen",
+        "revealInFolder": "Im Datei-Manager anzeigen",
+        "primary": "Primär",
+        "supporting": "Ergänzend",
+        "downloadToPc": "Auf meinen Computer herunterladen",
+        "fileUnavailable": "Datei nicht verfügbar oder nicht mehr vorhanden: {filePath}",
+        "turnTitle": "Outputs from this turn",
+        "download": "Download to this device",
+        "openWithDefaultAppHost": "Open with default app (Codeg host)",
+        "copyFileHost": "Copy file object (Codeg host)",
+        "copyPath": "Copy path",
+        "revealOnHost": "Reveal on the Codeg host",
+        "fileCopied": "File copied; you can paste it directly",
+        "pathCopied": "Path copied",
+        "filesCopied": "Files copied; you can paste them together",
+        "opened": "Opened with the Codeg host's default app",
+        "operationFailed": "Deliverable operation failed",
+        "declared": "Declared",
+        "inferred": "Automatically inferred",
+        "codeChange": "Codeänderung",
+        "deleted": "Gelöscht",
+        "allTypes": "All types",
+        "allSources": "All sources",
+        "allTurns": "All turns",
+        "turnNumber": "Turn {number}",
+        "allTimes": "Any time",
+        "lastDay": "Last 24 hours",
+        "lastWeek": "Last 7 days",
+        "lastMonth": "Last 30 days",
+        "newest": "Recently updated",
+        "oldest": "Oldest updated",
+        "selectAll": "Select filtered items",
+        "selectedCount": "{count} selected",
+        "downloadSelected": "Download selected files individually",
+        "downloadZip": "Download selected files as ZIP",
+        "copySelectedHost": "Copy selected file objects (Codeg host)",
+        "revealFirstHost": "Reveal the first file on the Codeg host",
+        "removeInvalid": "Remove selected invalid records",
+        "removed": "Invalid records removed",
+        "downloadStarted": "Download started",
+        "revealed": "File revealed on the Codeg host",
+        "selectFile": "Select {name}",
+        "missing": "File missing",
+        "empty": "This conversation has no confirmed deliverables yet",
+        "noFilterResults": "No deliverables match these filters",
+        "hostActionNotice": "Open, copy file, and reveal actions affect the host running Codeg Server; downloads always go to the current device."
+      },
+      "userResources": {
+        "openFile": "{filePath} öffnen",
+        "fileUnavailable": "Datei nicht verfügbar oder nicht mehr vorhanden: {filePath}"
       }
     },
     "diffPreview": {
@@ -4056,7 +4233,17 @@
       "fr": "Französisch",
       "pt": "Portugiesisch",
       "ar": "Arabisch"
-    }
+    },
+    "defaultConversation": "Default conversation",
+    "defaultConversationHint": "Use this conversation for the first WeChat message when the sender has no saved binding.",
+    "defaultFolderId": "Folder ID",
+    "defaultConversationId": "Conversation ID",
+    "defaultAgentType": "Agent type",
+    "weixinPushMode": "WeChat push mode",
+    "weixinPushFinalOnly": "Final result only",
+    "weixinPushFinalAndInteractions": "Final result and required interactions",
+    "weixinPushDebug": "Debug mode",
+    "weixinPushModeHint": "Only the final answer is pushed by default. Expired reply tokens keep the result pending until the next inbound message."
   },
   "ModelProviderSettings": {
     "sectionTitle": "Modellanbieter",
@@ -4295,7 +4482,9 @@
       "syncFailed": "Skills konnten nicht synchronisiert werden"
     },
     "autoPreviewLabel": "Vorschau automatisch öffnen",
-    "autoPreviewHint": "Wenn ein Agent eine Word-, Excel- oder PowerPoint-Datei erstellt oder bearbeitet, wird die Live-Vorschau automatisch geöffnet."
+    "autoPreviewHint": "Wenn ein Agent eine Word-, Excel- oder PowerPoint-Datei erstellt oder bearbeitet, wird die Live-Vorschau automatisch geöffnet.",
+    "autoDownloadProducedLabel": "Endergebnisse automatisch herunterladen",
+    "autoDownloadProducedHint": "Bei Nutzung des Webservers (z. B. über Tailscale/LAN) vom Agenten deklarierte und geprüfte Endergebnis-Dateien automatisch in den Downloads-Ordner dieses Browsers herunterladen."
   },
   "SkillPacksSettings": {
     "title": "Skill-Pakete",
@@ -4786,7 +4975,12 @@
     "targetsDescription": "Lege für bestimmte Module (z. B. codeg_lib::acp) eine andere Stufe fest, ohne die globale Stufe zu ändern.",
     "targetsAdd": "Hinzufügen",
     "targetsRemove": "Überschreibung entfernen",
-    "toggleDetails": "Details umschalten"
+    "toggleDetails": "Details umschalten",
+    "exportDiagnostics": "Diagnose exportieren",
+    "exporting": "Wird exportiert…",
+    "exportDescription": "Exportiert App-/Laufzeitdaten, Protokolleinstellungen, Dateimetadaten und aktuelle Protokolle als JSON. Übliche Zugangsdaten werden maskiert und Gespräche sowie Datenbankinhalte ausgeschlossen; Pfade und Protokolltexte vor dem Teilen prüfen.",
+    "exportSuccess": "Diagnosebericht exportiert",
+    "exportFailed": "Diagnosebericht konnte nicht exportiert werden"
   },
   "Automations": {
     "title": "Automatisierungen",
@@ -4923,7 +5117,8 @@
     "branchLocal": "Lokal",
     "branchRemote": "Remote",
     "branchSearchPlaceholder": "Branches suchen…",
-    "branchNone": "Keine Branches"
+    "branchNone": "Keine Branches",
+    "advanced": "Erweitert"
   },
   "Tasks": {
     "title": "To-dos",

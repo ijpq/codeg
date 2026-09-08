@@ -74,14 +74,11 @@ describe("ConversationDetailPanel new conversation layout", () => {
     expect(welcomeBranch).toContain("tall")
   })
 
-  it("snaps the hidden keep-alive tab so `transition-all` descendants don't ghost", () => {
-    // Inactive tabs stay mounted and hide with `visibility: hidden` (`invisible`).
-    // In Tailwind v4 `transition-all` transitions `visibility` too, so welcome
-    // controls (agent pills, quick-action tabs, composer buttons) would linger
-    // 150–300ms as ghosts over the newly-active conversation. The wrapper must
-    // carry `conversation-tab-hidden` next to `invisible`, and globals.css must
-    // drop transitions for that subtree so visibility snaps. Both halves are
-    // required — assert they stay coupled.
+  it("snaps the hidden controller wrapper so transitions cannot ghost", () => {
+    // The inactive tab's lightweight controller stays mounted while its heavy
+    // content subtree is suspended. Keep the visibility snap coupled to the
+    // wrapper so a just-deactivated subtree cannot transition over the newly
+    // active conversation during the same commit.
     expect(source).toContain(
       '"conversation-tab-hidden absolute inset-0 invisible pointer-events-none"'
     )
@@ -153,6 +150,46 @@ describe("ConversationDetailPanel new conversation layout", () => {
     // A backgrounded conversation tab behind the selected one.
     expect(source).toContain(
       "<OverlayHostHiddenProvider hidden={!canTileG && !visible}>"
+    )
+  })
+
+  it("loads persisted history only for visible keep-alive tabs", () => {
+    expect(source).toContain("shouldLoadDetail={visible}")
+    expect(source).toContain(
+      "useConversationDetail(effectiveConversationId, {\n    enabled: shouldLoadDetail,"
+    )
+    expect(source).toContain(
+      "preserveLiveOnInitialFetch: usesPersistedDetailIdentity"
+    )
+  })
+
+  it("suspends hidden heavy UI while keeping the tab controller mounted", () => {
+    expect(source).toContain("shouldRenderContent={visible}")
+    expect(source).toContain("if (!shouldRenderContent) {")
+
+    const controllerStart = source.indexOf(
+      "const ConversationTabView = memo(function ConversationTabView"
+    )
+    const connectionController = source.indexOf(
+      "useConnectionLifecycle({",
+      controllerStart
+    )
+    const contentGate = source.indexOf(
+      "if (!shouldRenderContent) {",
+      controllerStart
+    )
+    const heavyContent = source.indexOf("<ConversationShell", contentGate)
+
+    expect(connectionController).toBeGreaterThan(controllerStart)
+    expect(contentGate).toBeGreaterThan(connectionController)
+    expect(heavyContent).toBeGreaterThan(contentGate)
+  })
+
+  it("flushes the active draft before its composer is suspended", () => {
+    expect(messageInputSource).toContain("const persistDraftNow = useCallback(")
+    expect(messageInputSource).toContain("onBlur={persistDraftNow}")
+    expect(messageInputSource).toContain(
+      "saveMessageInputDraft(effectiveDraftStorageKey, text)"
     )
   })
 
@@ -356,7 +393,15 @@ describe("ConversationDetailPanel chat-mode send path", () => {
     // allowOfflineCompose let the user send before connecting, which is what
     // parked the first prompt in the never-flushed queue. The composer now
     // waits for `connected` like a normal conversation.
-    expect(source).not.toContain("allowOfflineCompose")
+    const welcomeStart = source.indexOf("<ChatInput")
+    const welcomeEnd = source.indexOf("</ScrollArea>", welcomeStart)
+    const welcomeComposer = source.slice(welcomeStart, welcomeEnd)
+    expect(welcomeComposer).not.toContain("allowOfflineCompose")
+    // Historical conversations are intentionally different: their persisted
+    // queue accepts drafts while session/load is still restoring.
+    expect(source).toContain(
+      "allowOfflineCompose={hasPersistedConversation && !connectionReady}"
+    )
   })
 
   it("surfaces a non-silent error when the eager scratch-dir prepare fails", () => {
@@ -378,7 +423,14 @@ describe("ConversationDetailPanel send-path hardening", () => {
     // cwd; sending then would hit the wrong workspace. handleSend must gate on
     // the readiness predicate (connected AND cwd matches), like the flush effect.
     expect(source).toContain("isConnectionReady(")
-    expect(source).toContain("if (!connectionReady) return")
+    expect(source).toContain("if (!connectionReady) {")
+    expect(source).toContain('state: "waiting_session_restore"')
+  })
+
+  it("settles reload-surviving queue items from durable acceptance receipts", () => {
+    expect(source).toContain("Boolean(run.prompt_accepted_at)")
+    expect(source).toContain("acceptedIds.has(item.clientMessageId)")
+    expect(source).toContain("mqRemove(item.id)")
   })
 
   it("gates the queue auto-flush on the SAME readiness predicate as the send", () => {
@@ -394,7 +446,7 @@ describe("ConversationDetailPanel send-path hardening", () => {
     // elsewhere in the file (answering a question, forking), so banning it
     // outright would be wrong.
     const start = source.indexOf("// Flush queued messages whenever the agent")
-    const end = source.indexOf("autoSendQueueRef.current()", start)
+    const end = source.indexOf('autoSendQueueRef.current("prompt")', start)
     expect(start).toBeGreaterThan(-1)
     expect(end).toBeGreaterThan(start)
     const flushEffect = source.slice(start, end)
@@ -403,8 +455,23 @@ describe("ConversationDetailPanel send-path hardening", () => {
     expect(flushEffect).toContain("if (!connectionReadyRef.current) return")
     // No re-spelling of the predicate: the connection is judged ONLY through
     // the shared variable.
-    expect(flushEffect).not.toContain("connStatus")
-    expect(flushEffect).not.toContain("connectedWorkingDir")
+    expect(flushEffect).not.toContain("if (connStatus")
+    expect(flushEffect).not.toContain("conn.connectedWorkingDir")
+  })
+
+  it("returns the runtime to idle when a busy rejection re-queues the prompt", () => {
+    const busyStart = source.indexOf("const onTurnInProgress = () => {")
+    const busyEnd = source.indexOf("const onAccepted = () => {", busyStart)
+    expect(busyStart).toBeGreaterThan(-1)
+    expect(busyEnd).toBeGreaterThan(busyStart)
+    const busyHandler = source.slice(busyStart, busyEnd)
+
+    expect(busyHandler).toContain(
+      'setSyncState(effectiveConversationId, "idle")'
+    )
+    expect(
+      busyHandler.indexOf('setSyncState(effectiveConversationId, "idle")')
+    ).toBeLessThan(busyHandler.indexOf('mqMarkState(queueItemId, "queued")'))
   })
 
   it("disables the welcome composer while connected-but-not-ready", () => {
@@ -461,7 +528,8 @@ describe("ConversationDetailPanel session-load failure surface", () => {
       "hideInput={isWelcomeMode || Boolean(acpLoadError)}"
     )
     // …and the banner takes its place, explaining why and offering recovery.
-    expect(source).toContain("composerBanner={acpLoadErrorBanner}")
+    expect(source).toContain("composerBanner={")
+    expect(source).toContain("acpLoadErrorBanner ??")
     const bannerStart = source.indexOf("const acpLoadErrorBanner")
     expect(bannerStart).toBeGreaterThan(-1)
     const bannerEnd = source.indexOf("const goalControlValue", bannerStart)
@@ -543,6 +611,26 @@ describe("ConversationDetailPanel session-load failure surface", () => {
     // forked S1 a second time, chaining rows.
     expect(source).not.toContain(
       "detail?.summary.external_id ?? runtimeExternalId ?? undefined"
+    )
+  })
+})
+
+describe("ConversationDetailPanel branch queue admission", () => {
+  it("uses the server's durable source-turn state and retries lost wake-ups", () => {
+    expect(source).toContain(
+      "The browser's runtime status can lag a durable turn completion"
+    )
+    expect(source).toContain("deferIfSourceBusy: true")
+    expect(source).toContain('mqMarkState(item.id, "creating_branch")')
+    expect(source).toContain('mqMarkState(item.id, "waiting_source_turn")')
+    expect(source).toContain("isTurnInProgressRejection(error)")
+    expect(source).toContain(
+      'extractAppCommandError(error)?.code === "not_found"'
+    )
+    expect(source).toContain("mqRemove(item.id)")
+    expect(source).toContain("}, 2_000)")
+    expect(source).not.toContain(
+      'runtimeSyncState !== "idle" || connStatus === "prompting"'
     )
   })
 })

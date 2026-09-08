@@ -1042,7 +1042,8 @@
       "loggedIn": "账号已登录",
       "loginRelogin": "重新登录 / 切换账号",
       "loginTimeout": "登录超时，请重试",
-      "loginSaveFailed": "登录成功但配置保存失败"
+      "loginSaveFailed": "登录成功但配置保存失败",
+      "selectReasoningEffort": "选择 Reasoning Effort"
     },
     "gemini": {
       "authConfig": "Gemini 认证配置",
@@ -1324,7 +1325,13 @@
       "sendAttributionHeader": "向接口发送归属/计费标识",
       "sendAttributionHeaderAria": "向接口发送 Claude Code 归属/计费标识",
       "disableNonessentialTraffic": "禁用遥测或多余的网络请求",
-      "disableNonessentialTrafficAria": "禁用 Claude Code 遥测或多余的网络请求"
+      "disableNonessentialTrafficAria": "禁用 Claude Code 遥测或多余的网络请求",
+      "effortLevel": "推理级别",
+      "effortLevelDefault": "默认级别",
+      "effortLevel_low": "低",
+      "effortLevel_medium": "中",
+      "effortLevel_high": "高",
+      "effortLevel_xhigh": "超高"
     },
     "dialogs": {
       "confirmDeleteProvider": "确认删除 Provider {providerId}？",
@@ -1777,7 +1784,8 @@
         "updateGroupFailed": "更新分组失败：{message}",
         "deleteGroupFailed": "删除分组失败：{message}",
         "moveToGroupFailed": "移动文件夹失败：{message}",
-        "applyLayoutFailed": "保存文件夹顺序失败：{message}"
+        "applyLayoutFailed": "保存文件夹顺序失败：{message}",
+        "reorderFoldersFailed": "重新排序文件夹失败：{message}"
       },
       "statsLabel": "{folders} 个文件夹 · {convos} 个会话",
       "reorderHandle": "拖拽排序",
@@ -1918,7 +1926,46 @@
         "toolResult": "结果",
         "toolError": "错误"
       },
-      "moreActions": "更多操作"
+      "moreActions": "更多操作",
+      "steerInjected": "已将引导注入当前轮次",
+      "steerFallbackFeedback": "原生引导不可用，已回退为实时反馈",
+      "steerTurnEndedQueued": "当前轮次刚刚结束，消息已进入下一轮队列",
+      "imageSteerQueued": "运行中的轮次不支持注入图片，已作为下一轮普通消息排队",
+      "promptAcceptanceUnknown": "连接中断，正在核对后端是否已接收此消息",
+      "steerUnsupportedQueued": "原生引导不可用，消息已进入下一轮队列",
+      "steerFailedQueued": "引导发送失败，消息已进入下一轮队列",
+      "steerWaitingRestore": "引导已保留，正在等待原会话恢复",
+      "steerOriginalTurnEnded": "原任务已经结束，这条引导未发送",
+      "branch": {
+        "create": "创建分支",
+        "createFromMessage": "从这里创建分支",
+        "nativeCreated": "已创建独立原生分支",
+        "snapshotCreated": "已通过上下文快照创建分支",
+        "provisionalCreated": "分支快照已就绪，可直接发送首条消息",
+        "runningForkHint": "“分叉发送”需等待当前任务结束。如需立即分支，请使用“创建分支”：它会继承到上一完整轮次。两个会话共享工作目录，请避免同时修改同一文件。",
+        "source": "分支自：{title}",
+        "sourceDeleted": "来源已删除：{title}",
+        "sourceDeletedHint": "来源会话已删除；本分支仍可独立使用。",
+        "nativeMode": "原生分支",
+        "snapshotMode": "上下文快照",
+        "inheritanceRange": "继承 {count} 条消息，截止 {boundary}",
+        "inheritanceTruncated": "上下文已压缩",
+        "pendingFirstPrompt": "等待首条消息初始化",
+        "retryableFailed": "初始化可重试",
+        "merge": "合并回主会话",
+        "mergeSuccess": "已合并回主会话（{count} 个交付文件）",
+        "mergePreparing": "正在准备回归…",
+        "mergeDeterminingBoundary": "正在确定分叉边界…",
+        "mergeExtractingIncrement": "正在提取分支增量…",
+        "mergeWritingSource": "正在写入主会话…",
+        "mergeCompleted": "回归主会话已完成",
+        "mergeFailed": "回归失败，可重试",
+        "mergeDescription": "只会向主会话追加下面的结论和你明确选择的交付文件，不会改写原历史。",
+        "summaryPlaceholder": "填写要回传的最终结论",
+        "selectMessages": "选择要回传的用户可见回复（正文仍可继续编辑）",
+        "mergeKeep": "合并并继续使用分支",
+        "mergeArchive": "合并并归档分支（标记完成）"
+      }
     },
     "sessionDetails": {
       "menuLabel": "会话详情",
@@ -2035,6 +2082,8 @@
         "contextWindowUsageAria": "上下文窗口使用率",
         "contextWindow": "上下文窗口",
         "usedMax": "已用 / 上限",
+        "source": "来源",
+        "contextSource": "运行时响应",
         "tokenUsage": "Token 用量",
         "input": "输入",
         "output": "输出",
@@ -2047,7 +2096,8 @@
         "groups": {
           "workspace": "工作区",
           "navigation": "菜单导航",
-          "more": "更多"
+          "more": "更多",
+          "sessions": "会话"
         },
         "showPet": "显示宠物"
       },
@@ -2093,6 +2143,18 @@
         "loadFailed": "无法读取状态：{message}",
         "openSettings": "打开详细设置",
         "refresh": "刷新"
+      },
+      "quota": {
+        "summary": "{plan} · 周余 {remaining}",
+        "lastRoutedPlan": "最近一次请求使用的套餐",
+        "weeklyShort": "周余",
+        "weeklyRemaining": "周余量",
+        "weeklyUsed": "本周已用",
+        "resetsAt": "重置时间",
+        "observedAt": "数据时间",
+        "refresh": "刷新余量",
+        "unknown": "未知",
+        "sourceHint": "来自最近一次真实 Codex 响应，不会额外请求中转。"
       }
     },
     "auxPanel": {
@@ -2956,7 +3018,9 @@
       "chatInput": {
         "connecting": "连接中...",
         "agentResponding": "{agent} 正在响应...",
-        "sendMessage": "发送消息..."
+        "sendMessage": "发送消息...",
+        "stopping": "正在停止...",
+        "guideAgent": "引导 {agent} 的当前轮次..."
       },
       "messageInput": {
         "askAnything": "请开始输入...",
@@ -3020,14 +3084,28 @@
         "mentionGroupAgent": "智能体",
         "mentionGroupSession": "会话",
         "mentionGroupCommit": "提交",
-        "mentionGroupSkill": "技能"
+        "mentionGroupSkill": "技能",
+        "stopping": "正在停止...",
+        "steer": "引导当前轮次",
+        "steerSending": "正在注入引导...",
+        "forkAndSend": "分叉发送",
+        "steerAttachmentsUnsupported": "仅支持纯文本——带附件的草稿请走队列。"
       },
       "messageQueue": {
         "addToQueue": "加入队列",
         "saveEdit": "保存",
         "cancelEdit": "取消编辑",
         "editItem": "编辑",
-        "deleteItem": "删除"
+        "deleteItem": "删除",
+        "queued": "已排队",
+        "waiting_source_turn": "等待源任务结束",
+        "creating_branch": "正在创建分支",
+        "waiting_session_restore": "等待会话恢复",
+        "waiting_connection": "等待连接重试",
+        "failed": "发送失败",
+        "expired_guide": "原任务已结束",
+        "retry": "重试",
+        "sendAsPrompt": "作为新消息发送"
       },
       "welcomeInputPanel": {
         "agentsSettingsPath": "设置 > Agents",
@@ -3071,7 +3149,8 @@
           "liveFeedback": "「+」菜单里的「实时反馈」能把一条便条塞进智能体正在跑的这一轮，不用打断它。",
           "skillPacks": "设置 → 技能包 里打包了编程专家、科研和办公三类技能，可以按智能体分别开关。",
           "modelProviders": "设置 → 模型供应商 支持填自己的 API key 或接口地址，之后直接在输入框里切换模型。",
-          "workspaceBackground": "设置 → 外观 里可以换工作区背景图、调面板不透明度，还能换应用字体。"
+          "workspaceBackground": "设置 → 外观 里可以换工作区背景图、调面板不透明度，还能换应用字体。",
+          "forkSend": "发送按钮旁的下拉选择「分叉发送」，从当前位置开一条新分支"
         },
         "quickActions": {
           "excel": "Excel 工作簿",
@@ -3304,7 +3383,18 @@
         "completedAt": "完成时间",
         "jumpToPreviousUserMessage": "跳转到上一条用户消息",
         "showMore": "展开",
-        "showLess": "收起"
+        "showLess": "收起",
+        "loadEarlierHistory": "加载更早消息",
+        "retryEarlierHistory": "重试加载更早消息",
+        "delivery": {
+          "submitting": "发送中…",
+          "accepted": "已发送",
+          "running": "后端处理中",
+          "persisted": "已保存",
+          "completed": "已完成",
+          "failed": "发送状态待确认",
+          "queued": "已排队"
+        }
       },
       "liveTurnStats": {
         "thinking": "思考中...",
@@ -3313,7 +3403,28 @@
         "elapsedMinutes": "{value} 分钟",
         "elapsedSeconds": "{value} 秒",
         "outputSpeedAria": "估算输出速度",
-        "outputSpeedTooltip": "估算输出速度（正文 + 思考）"
+        "outputSpeedTooltip": "估算输出速度（正文 + 思考）",
+        "sent": "已发送",
+        "backendProcessing": "后端处理中",
+        "stillProcessing": "后台仍在处理中",
+        "toolUseCount": "{count} 次工具调用",
+        "diagnostics": {
+          "open": "连接诊断",
+          "title": "生成诊断",
+          "phase": "当前阶段",
+          "phaseThinking": "思考中",
+          "phaseTool": "执行工具",
+          "phaseOutput": "输出回复",
+          "phaseWaiting": "等待响应",
+          "sinceLastData": "距上次收到数据",
+          "testLink": "测试链路",
+          "testing": "测试中…",
+          "reachable": "链路可达 · HTTP {status} · {latency}ms",
+          "unreachable": "无法连接 · {error}",
+          "notConfigured": "官方直连,无自定义链路可测。",
+          "hintReachable": "链路正常。若长时间没有新数据,多半是模型仍在处理。",
+          "hintUnreachable": "链路异常,可能是网络/隧道卡住了。"
+        }
       },
       "jsonTree": {
         "viewRaw": "查看原始 JSON",
@@ -3539,7 +3650,8 @@
           "reviewKept": "保持在计划模式",
           "reviewPending": "等待计划决定",
           "submitted": "计划已提交",
-          "switched": "切换模式"
+          "switched": "切换模式",
+          "planLabel": "计划"
         },
         "backgroundTask": {
           "title": "后台任务",
@@ -3557,7 +3669,9 @@
           "outputMissing": "codex 截断脚本输出时丢掉了这条命令的分隔行，因此没有输出可以归属给它。",
           "sharedWith": "本段还包含 {commands} 的输出——它们的分隔行被 codex 截断丢弃了。",
           "truncated": "已截断"
-        }
+        },
+        "loadBranchMergeSummary": "加载完整回归正文",
+        "loadingBranchMergeSummary": "正在加载回归正文…"
       },
       "messageNav": {
         "title": "消息导航",
@@ -3575,7 +3689,9 @@
         "openFile": "打开 {filePath}",
         "openInEditor": "在编辑器中打开",
         "remove": "移除",
-        "noDiffDataAvailable": "未找到 {filePath} 的差异数据"
+        "noDiffDataAvailable": "未找到 {filePath} 的差异数据",
+        "downloadToPc": "下载到本机",
+        "fileUnavailable": "文件不可用或已不存在:{filePath}"
       },
       "askQuestion": {
         "title": "智能体需要你的选择",
@@ -3739,6 +3855,67 @@
       "proposedPlan": {
         "title": "计划提案",
         "planning": "规划中…"
+      },
+      "conversationDeliverables": {
+        "collapsedSummary": "产物 {count}",
+        "historyTitle": "历史产物",
+        "loadingHistory": "正在加载历史产物…",
+        "retry": "重试",
+        "versions": "{count} 个版本",
+        "toggleVersions": "展开或收起 {count} 个历史版本",
+        "loadMore": "加载更多",
+        "title": "最终产物",
+        "collapse": "收起",
+        "openFile": "打开 {filePath}",
+        "revealInFolder": "在文件管理器中显示",
+        "primary": "主要",
+        "supporting": "附属",
+        "downloadToPc": "下载到本机",
+        "fileUnavailable": "文件不可用或已不存在:{filePath}",
+        "turnTitle": "本轮产物",
+        "download": "下载到当前设备",
+        "openWithDefaultAppHost": "使用 Codeg 主机的默认应用打开",
+        "copyFileHost": "复制文件本体（Codeg 主机）",
+        "copyPath": "复制路径",
+        "revealOnHost": "在 Codeg 主机的文件夹中显示",
+        "fileCopied": "文件已复制，可直接粘贴",
+        "pathCopied": "路径已复制",
+        "filesCopied": "文件已复制，可一次性粘贴",
+        "opened": "已使用 Codeg 主机的默认应用打开",
+        "operationFailed": "产物操作失败",
+        "declared": "显式声明",
+        "inferred": "自动推断",
+        "codeChange": "代码变更",
+        "deleted": "已删除",
+        "allTypes": "全部类型",
+        "allSources": "全部来源",
+        "allTurns": "全部轮次",
+        "turnNumber": "第 {number} 轮",
+        "allTimes": "全部时间",
+        "lastDay": "最近 24 小时",
+        "lastWeek": "最近 7 天",
+        "lastMonth": "最近 30 天",
+        "newest": "最近更新",
+        "oldest": "最早更新",
+        "selectAll": "选择当前筛选结果",
+        "selectedCount": "已选择 {count} 项",
+        "downloadSelected": "逐个下载所选文件",
+        "downloadZip": "将所选文件打包为 ZIP 下载",
+        "copySelectedHost": "复制所选文件本体（Codeg 主机）",
+        "revealFirstHost": "在 Codeg 主机定位第一个文件",
+        "removeInvalid": "移除所选失效记录",
+        "removed": "失效记录已移除",
+        "downloadStarted": "下载已开始",
+        "revealed": "已在 Codeg 主机定位文件",
+        "selectFile": "选择 {name}",
+        "missing": "文件不存在",
+        "empty": "当前对话还没有确认的产物",
+        "noFilterResults": "没有符合筛选条件的产物",
+        "hostActionNotice": "“打开文件”“复制文件”和“打开文件夹”作用于运行 Codeg Server 的主机；下载始终发送到当前访问设备。"
+      },
+      "userResources": {
+        "openFile": "打开 {filePath}",
+        "fileUnavailable": "文件不可用或已不存在:{filePath}"
       }
     },
     "diffPreview": {
@@ -4068,7 +4245,17 @@
       "fr": "法语",
       "pt": "葡萄牙语",
       "ar": "阿拉伯语"
-    }
+    },
+    "defaultConversation": "默认会话",
+    "defaultConversationHint": "发送者没有已保存绑定时，将第一条微信消息自动转入此会话。",
+    "defaultFolderId": "文件夹 ID",
+    "defaultConversationId": "会话 ID",
+    "defaultAgentType": "Agent 类型",
+    "weixinPushMode": "微信推送模式",
+    "weixinPushFinalOnly": "仅最终结果",
+    "weixinPushFinalAndInteractions": "最终结果与必要交互",
+    "weixinPushDebug": "调试模式",
+    "weixinPushModeHint": "默认仅推送本次微信任务的最终回答；令牌过期时会保留结果，待下一条微信消息后补发。"
   },
   "ModelProviderSettings": {
     "sectionTitle": "模型供应商",
@@ -4307,7 +4494,9 @@
       "syncFailed": "同步技能失败"
     },
     "autoPreviewLabel": "自动打开预览",
-    "autoPreviewHint": "当智能体创建或编辑 Word、Excel、PowerPoint 文件时，自动打开其实时预览。"
+    "autoPreviewHint": "当智能体创建或编辑 Word、Excel、PowerPoint 文件时，自动打开其实时预览。",
+    "autoDownloadProducedLabel": "自动下载最终产物到本机",
+    "autoDownloadProducedHint": "通过 web server（如经 Tailscale/局域网）使用时，自动把智能体声明且经验证的最终产物文件下载到此浏览器的下载目录。"
   },
   "SkillPacksSettings": {
     "title": "技能包",
@@ -4786,7 +4975,12 @@
     "targetsDescription": "为特定模块（如 codeg_lib::acp）单独设置级别，不影响全局级别。",
     "targetsAdd": "添加",
     "targetsRemove": "移除覆盖",
-    "toggleDetails": "切换详情"
+    "toggleDetails": "切换详情",
+    "exportDiagnostics": "导出调试信息",
+    "exporting": "正在导出…",
+    "exportDescription": "导出应用/运行环境、日志设置、日志文件信息和最近日志为 JSON。常见密钥会自动脱敏，不包含会话正文或数据库内容；分享前仍请检查文件路径和日志文本。",
+    "exportSuccess": "调试信息已导出",
+    "exportFailed": "导出调试信息失败"
   },
   "Automations": {
     "title": "自动化",
@@ -4923,7 +5117,8 @@
     "branchLocal": "本地",
     "branchRemote": "远程",
     "branchSearchPlaceholder": "搜索分支…",
-    "branchNone": "无分支"
+    "branchNone": "无分支",
+    "advanced": "高级"
   },
   "Tasks": {
     "title": "待办任务",

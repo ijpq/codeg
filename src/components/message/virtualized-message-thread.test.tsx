@@ -61,6 +61,22 @@ beforeEach(() => {
 })
 
 describe("VirtualizedMessageThread focus origin", () => {
+  it("renders a stable non-virtualized end sentinel after the final row", () => {
+    renderThread()
+
+    const content = screen.getByTestId("content")
+    const row = content.closest<HTMLElement>("[data-message-thread-row]")
+    const sentinel = document.querySelector<HTMLElement>(
+      "[data-message-end-sentinel]"
+    )
+
+    expect(row).toHaveAttribute("data-message-thread-last", "true")
+    expect(sentinel).toBeInTheDocument()
+    expect(sentinel?.compareDocumentPosition(row!)).toBe(
+      Node.DOCUMENT_POSITION_PRECEDING
+    )
+  })
+
   it("marks pointer-origin focus and clears it on blur", () => {
     renderThread()
     const viewport = screen.getByTestId("viewport")

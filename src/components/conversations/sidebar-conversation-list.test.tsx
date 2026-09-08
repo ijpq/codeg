@@ -6,7 +6,7 @@ import {
   useImperativeHandle,
   useState,
 } from "react"
-import { act, fireEvent, render } from "@testing-library/react"
+import { act, fireEvent, render, screen } from "@testing-library/react"
 import { NextIntlClientProvider } from "next-intl"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
@@ -20,6 +20,7 @@ import {
   useAppWorkspaceStore,
 } from "@/stores/app-workspace-store"
 import enMessages from "@/i18n/messages/en.json"
+import { RECENT_PAGE_SIZE } from "./sidebar-conversation-grouping"
 
 // ── Probes ────────────────────────────────────────────────────────────────
 // AgentIcon renders once per card body → counts card re-renders. The Folder /
@@ -1146,6 +1147,43 @@ describe("SidebarConversationList — Recent section", () => {
     expect(document.body.textContent).not.toContain("conv-13")
   })
 
+  it("shows five recent conversations initially and reveals the rest on demand", () => {
+    const conversations = Array.from({ length: 7 }, (_, index) => {
+      const timestamp = new Date(FIXED + index * MINUTE).toISOString()
+      return conv(20 + index, 1, {
+        created_at: timestamp,
+        updated_at: timestamp,
+      })
+    })
+    useAppWorkspaceStore.setState({ conversations })
+
+    render(recentTree(true))
+
+    // All seven have one canonical Folder row. Only the newest five initially
+    // get a second copy in Recent; the two oldest wait behind Show more.
+    expect(
+      document.querySelectorAll('[data-conversation-id="26"]')
+    ).toHaveLength(2)
+    expect(
+      document.querySelectorAll('[data-conversation-id="22"]')
+    ).toHaveLength(2)
+    expect(
+      document.querySelectorAll('[data-conversation-id="21"]')
+    ).toHaveLength(1)
+    expect(
+      document.querySelectorAll('[data-conversation-id="20"]')
+    ).toHaveLength(1)
+
+    fireEvent.click(screen.getByRole("button", { name: "Show more (2)" }))
+    expect(
+      document.querySelectorAll('[data-conversation-id="21"]')
+    ).toHaveLength(2)
+    expect(
+      document.querySelectorAll('[data-conversation-id="20"]')
+    ).toHaveLength(2)
+    expect(screen.queryByRole("button", { name: "Show more (2)" })).toBeNull()
+  })
+
   it("collapses independently of the other sections", () => {
     render(recentTree(true))
     const header = Array.from(document.querySelectorAll("button")).find(
@@ -1167,7 +1205,7 @@ describe("SidebarConversationList — Recent section", () => {
     // `recentLimit` starts at RECENT_PAGE_SIZE and only ever grew, so a list
     // expanded a few pages deep stayed that way for the rest of the session.
     // These cover the way back out.
-    const PAGE = 15
+    const PAGE = RECENT_PAGE_SIZE
     const TOTAL = PAGE + 4
 
     // Recent duplicates every canonical row, so total cards = canonical + recent

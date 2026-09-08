@@ -8,8 +8,9 @@ use crate::acp::error::AcpError;
 use crate::acp::opencode_plugins::PluginCheckSummary;
 use crate::acp::preflight::PreflightResult;
 use crate::acp::types::{
-    AcpAgentInfo, AcpAgentStatus, AgentDiagnosticsReport, AgentSkillContent, AgentSkillLayout,
-    AgentSkillScope, AgentSkillsListResult, ConnectionInfo, ForkResultInfo,
+    AcpAgentInfo, AcpAgentStatus, AcpCancelResult, AgentDiagnosticsReport, AgentSkillContent,
+    AgentSkillLayout, AgentSkillScope, AgentSkillsListResult, ConnectionInfo, ForkResultInfo,
+    RestoredConversationConnectionInfo, SteerResult,
 };
 use crate::app_error::{AppCommandError, AppErrorCode};
 use crate::app_state::AppState;
@@ -117,8 +118,47 @@ pub async fn acp_connect(
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AcpRestoreConversationParams {
+    pub conversation_id: i32,
+    #[serde(default)]
+    pub preferred_mode_id: Option<String>,
+    #[serde(default)]
+    pub preferred_config_values: Option<BTreeMap<String, String>>,
+}
+
+pub async fn acp_restore_conversation(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<AcpRestoreConversationParams>,
+) -> Result<Json<RestoredConversationConnectionInfo>, AppCommandError> {
+    let result = acp_commands::acp_restore_conversation_core(
+        params.conversation_id,
+        params.preferred_mode_id,
+        params.preferred_config_values.unwrap_or_default(),
+        &state.connection_manager,
+        &state.db,
+        &state.data_dir,
+        "web".to_string(),
+        state.emitter.clone(),
+    )
+    .await
+    .map_err(|error| {
+        let message = error.to_string();
+        match error {
+            AcpError::TurnInProgress => AppCommandError::new(AppErrorCode::TurnInProgress, message),
+            _ => AppCommandError::task_execution_failed(message),
+        }
+    })?;
+    Ok(Json(result))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AcpDisconnectParams {
     pub connection_id: String,
+    #[serde(default)]
+    pub request_source: Option<String>,
+    #[serde(default)]
+    pub frontend_generation: Option<u64>,
 }
 
 pub async fn acp_disconnect(
@@ -127,7 +167,15 @@ pub async fn acp_disconnect(
 ) -> Result<Json<()>, AppCommandError> {
     let manager = &state.connection_manager;
     manager
-        .disconnect(&params.connection_id)
+        .disconnect_reconciled_with_origin(
+            &state.db.conn,
+            &params.connection_id,
+            params
+                .request_source
+                .as_deref()
+                .unwrap_or("web_unspecified"),
+            params.frontend_generation,
+        )
         .await
         .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
     Ok(Json(()))
@@ -183,10 +231,50 @@ pub async fn acp_prompt(
                 AcpError::TurnInProgress => {
                     AppCommandError::new(AppErrorCode::TurnInProgress, message)
                 }
+                AcpError::ConnectionNotFound(_) => AppCommandError::connection_not_found(message),
+                AcpError::ProcessExited => AppCommandError::process_exited(message),
                 _ => AppCommandError::task_execution_failed(message),
             }
         })?;
     Ok(Json(()))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcpSteerParams {
+    pub connection_id: String,
+    pub blocks: Vec<crate::acp::types::PromptInputBlock>,
+    pub client_message_id: String,
+}
+
+pub async fn acp_steer(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<AcpSteerParams>,
+) -> Result<Json<SteerResult>, AppCommandError> {
+    let result = state
+        .connection_manager
+        .steer(
+            &params.connection_id,
+            params.blocks,
+            params.client_message_id,
+        )
+        .await
+        .map_err(|error| {
+            let message = error.to_string();
+            match error {
+                AcpError::NoActiveSteerTurn => {
+                    AppCommandError::new(AppErrorCode::NoActiveSteerTurn, message)
+                }
+                AcpError::SteerUnsupported => {
+                    AppCommandError::new(AppErrorCode::SteerUnsupported, message)
+                }
+                AcpError::InvalidSteer(_) => {
+                    AppCommandError::new(AppErrorCode::InvalidInput, message)
+                }
+                _ => AppCommandError::task_execution_failed(message),
+            }
+        })?;
+    Ok(Json(result))
 }
 
 // --- Pattern A: Pure function handlers ---
@@ -311,6 +399,10 @@ pub async fn acp_delete_agent_skill(
 #[serde(rename_all = "camelCase")]
 pub struct AcpConnectionIdParams {
     pub connection_id: String,
+    #[serde(default)]
+    pub request_source: Option<String>,
+    #[serde(default)]
+    pub frontend_generation: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -416,13 +508,21 @@ pub async fn acp_describe_agent_options(
 pub async fn acp_cancel(
     Extension(state): Extension<Arc<AppState>>,
     Json(params): Json<AcpConnectionIdParams>,
-) -> Result<Json<()>, AppCommandError> {
+) -> Result<Json<AcpCancelResult>, AppCommandError> {
     let manager = &state.connection_manager;
-    manager
-        .cancel(&state.db.conn, &params.connection_id)
+    let result = manager
+        .cancel_with_origin(
+            &state.db.conn,
+            &params.connection_id,
+            params
+                .request_source
+                .as_deref()
+                .unwrap_or("web_unspecified"),
+            params.frontend_generation,
+        )
         .await
         .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
-    Ok(Json(()))
+    Ok(Json(result))
 }
 
 pub async fn acp_fork(
@@ -915,8 +1015,8 @@ pub async fn acp_update_pi_config(
     Ok(Json(()))
 }
 
-pub async fn acp_load_pi_config(
-) -> Result<Json<acp_commands::PiConfigProjection>, AppCommandError> {
+pub async fn acp_load_pi_config() -> Result<Json<acp_commands::PiConfigProjection>, AppCommandError>
+{
     Ok(Json(acp_commands::load_pi_config_core()))
 }
 

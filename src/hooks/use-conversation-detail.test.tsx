@@ -28,6 +28,7 @@ function seedSession(detail: DbConversationDetail | null) {
           pendingBackgroundSettlements: [],
           optimisticTurns: [],
           liveMessage: null,
+          promptDeliveries: {},
           syncState: "idle",
           activeTurnToken: null,
           lastTurnOwned: false,

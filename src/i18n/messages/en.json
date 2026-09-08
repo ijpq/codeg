@@ -1042,7 +1042,8 @@
       "loggedIn": "Account logged in",
       "loginRelogin": "Re-login / Switch account",
       "loginTimeout": "Login timed out, please try again",
-      "loginSaveFailed": "Login succeeded but failed to save config"
+      "loginSaveFailed": "Login succeeded but failed to save config",
+      "selectReasoningEffort": "Select Reasoning Effort"
     },
     "gemini": {
       "authConfig": "Gemini Auth Config",
@@ -1324,7 +1325,13 @@
       "sendAttributionHeader": "Send attribution/billing identifier to the API",
       "sendAttributionHeaderAria": "Send Claude Code attribution/billing identifier to the API",
       "disableNonessentialTraffic": "Disable telemetry or redundant network requests",
-      "disableNonessentialTrafficAria": "Disable Claude Code telemetry or redundant network requests"
+      "disableNonessentialTrafficAria": "Disable Claude Code telemetry or redundant network requests",
+      "effortLevel": "Reasoning Effort Level",
+      "effortLevelDefault": "Default Level",
+      "effortLevel_low": "Low",
+      "effortLevel_medium": "Medium",
+      "effortLevel_high": "High",
+      "effortLevel_xhigh": "Extra High"
     },
     "dialogs": {
       "confirmDeleteProvider": "Delete Provider {providerId}?",
@@ -1777,7 +1784,8 @@
         "updateGroupFailed": "Failed to update group: {message}",
         "deleteGroupFailed": "Failed to delete group: {message}",
         "moveToGroupFailed": "Failed to move folder: {message}",
-        "applyLayoutFailed": "Failed to save the folder order: {message}"
+        "applyLayoutFailed": "Failed to save the folder order: {message}",
+        "reorderFoldersFailed": "Failed to reorder folders: {message}"
       },
       "statsLabel": "{folders} folders · {convos} conversations",
       "reorderHandle": "Drag to reorder",
@@ -1918,7 +1926,46 @@
         "toolResult": "Result",
         "toolError": "Error"
       },
-      "moreActions": "More actions"
+      "moreActions": "More actions",
+      "steerInjected": "Guidance injected into the current turn",
+      "steerFallbackFeedback": "Native guidance is unavailable; sent as live feedback",
+      "steerTurnEndedQueued": "The turn just ended; queued as the next message",
+      "imageSteerQueued": "Images cannot be injected into a running turn; queued as the next message",
+      "promptAcceptanceUnknown": "Connection interrupted; checking whether the backend accepted this message",
+      "steerUnsupportedQueued": "Native guidance is unavailable; queued as the next message",
+      "steerFailedQueued": "Guidance failed; queued as the next message",
+      "steerWaitingRestore": "Guidance saved; waiting for the original session to recover",
+      "steerOriginalTurnEnded": "The original task has ended; this guidance was not sent",
+      "branch": {
+        "create": "Create branch",
+        "createFromMessage": "Create branch from here",
+        "nativeCreated": "Independent native branch created",
+        "snapshotCreated": "Branch created from a context snapshot",
+        "provisionalCreated": "Branch snapshot is ready; send the first message when ready",
+        "runningForkHint": "Fork & Send waits for the current turn. To branch now, use Create branch: it inherits through the last completed turn. Both conversations share the same working directory, so avoid concurrent edits to the same files.",
+        "source": "Branched from: {title}",
+        "sourceDeleted": "Source deleted: {title}",
+        "sourceDeletedHint": "The source conversation was deleted; this branch remains independent.",
+        "nativeMode": "Native branch",
+        "snapshotMode": "Context snapshot",
+        "inheritanceRange": "{count} messages through {boundary}",
+        "inheritanceTruncated": "context compressed",
+        "pendingFirstPrompt": "awaiting first-message initialization",
+        "retryableFailed": "initialization can be retried",
+        "merge": "Merge into main conversation",
+        "mergeSuccess": "Merged into the main conversation ({count} deliverables)",
+        "mergePreparing": "Preparing branch merge…",
+        "mergeDeterminingBoundary": "Determining fork boundary…",
+        "mergeExtractingIncrement": "Extracting branch changes…",
+        "mergeWritingSource": "Writing to main conversation…",
+        "mergeCompleted": "Branch merge completed",
+        "mergeFailed": "Branch merge failed; retry is available",
+        "mergeDescription": "Only the conclusion below and explicitly selected deliverables are appended. Existing history is never rewritten.",
+        "summaryPlaceholder": "Conclusion to send back",
+        "selectMessages": "Select visible replies to send back (you can still edit the text)",
+        "mergeKeep": "Merge and keep branch",
+        "mergeArchive": "Merge and mark branch complete"
+      }
     },
     "sessionDetails": {
       "menuLabel": "Session Details",
@@ -2035,6 +2082,8 @@
         "contextWindowUsageAria": "Context window usage",
         "contextWindow": "Context Window",
         "usedMax": "Used / Max",
+        "source": "Source",
+        "contextSource": "Runtime response",
         "tokenUsage": "Token Usage",
         "input": "Input",
         "output": "Output",
@@ -2047,7 +2096,8 @@
         "groups": {
           "workspace": "Workspace",
           "navigation": "Navigation",
-          "more": "More"
+          "more": "More",
+          "sessions": "Sessions"
         },
         "showPet": "Show pet"
       },
@@ -2093,6 +2143,18 @@
         "loadFailed": "Could not read the status: {message}",
         "openSettings": "Open full settings",
         "refresh": "Refresh"
+      },
+      "quota": {
+        "summary": "{plan} · {remaining} weekly left",
+        "lastRoutedPlan": "Plan used by the last request",
+        "weeklyShort": "Wk left",
+        "weeklyRemaining": "Weekly remaining",
+        "weeklyUsed": "Weekly used",
+        "resetsAt": "Resets at",
+        "observedAt": "Updated at",
+        "refresh": "Refresh allowance",
+        "unknown": "Unknown",
+        "sourceHint": "Read from the last real Codex response; no extra relay request."
       }
     },
     "auxPanel": {
@@ -2956,7 +3018,9 @@
       "chatInput": {
         "connecting": "Connecting...",
         "agentResponding": "{agent} is responding...",
-        "sendMessage": "Send a message..."
+        "sendMessage": "Send a message...",
+        "stopping": "Stopping...",
+        "guideAgent": "Guide {agent}'s current turn..."
       },
       "messageInput": {
         "askAnything": "Ask anything...",
@@ -3020,14 +3084,28 @@
         "mentionGroupAgent": "Agents",
         "mentionGroupSession": "Sessions",
         "mentionGroupCommit": "Commits",
-        "mentionGroupSkill": "Skills"
+        "mentionGroupSkill": "Skills",
+        "stopping": "Stopping...",
+        "steer": "Guide current turn",
+        "steerSending": "Injecting guidance...",
+        "forkAndSend": "Fork & Send",
+        "steerAttachmentsUnsupported": "Text only — drafts with attachments go through the queue."
       },
       "messageQueue": {
         "addToQueue": "Queue message",
         "saveEdit": "Save",
         "cancelEdit": "Cancel edit",
         "editItem": "Edit",
-        "deleteItem": "Remove"
+        "deleteItem": "Remove",
+        "queued": "Queued",
+        "waiting_source_turn": "Waiting for the source task",
+        "creating_branch": "Creating branch",
+        "waiting_session_restore": "Waiting for session recovery",
+        "waiting_connection": "Waiting for connection retry",
+        "failed": "Send failed",
+        "expired_guide": "Original task ended",
+        "retry": "Retry",
+        "sendAsPrompt": "Send as a new message"
       },
       "welcomeInputPanel": {
         "agentsSettingsPath": "Settings > Agents",
@@ -3071,7 +3149,8 @@
           "liveFeedback": "Live feedback in the + menu drops a note into the turn the agent is already running, without interrupting it.",
           "skillPacks": "Settings → Skill Packs bundles coding experts, scientific research, and office skills — switch them on per agent.",
           "modelProviders": "Settings → Model Providers takes your own API key or endpoint, and you pick the model right in the composer.",
-          "workspaceBackground": "Settings → Appearance sets a workspace background image, panel opacity, and the app's fonts."
+          "workspaceBackground": "Settings → Appearance sets a workspace background image, panel opacity, and the app's fonts.",
+          "forkSend": "The send button's dropdown has Fork and Send — branch from the current turn into a new tab."
         },
         "quickActions": {
           "excel": "Excel Workbook",
@@ -3304,7 +3383,18 @@
         "completedAt": "Completed at",
         "jumpToPreviousUserMessage": "Jump to user message",
         "showMore": "Show more",
-        "showLess": "Show less"
+        "showLess": "Show less",
+        "loadEarlierHistory": "Load earlier messages",
+        "retryEarlierHistory": "Retry earlier messages",
+        "delivery": {
+          "submitting": "Sending…",
+          "accepted": "Sent",
+          "running": "Backend processing",
+          "persisted": "Saved",
+          "completed": "Completed",
+          "failed": "Send status unknown",
+          "queued": "Queued"
+        }
       },
       "liveTurnStats": {
         "thinking": "Thinking...",
@@ -3313,7 +3403,28 @@
         "elapsedMinutes": "{value}m",
         "elapsedSeconds": "{value}s",
         "outputSpeedAria": "Estimated output speed",
-        "outputSpeedTooltip": "Estimated output speed (text + thinking)"
+        "outputSpeedTooltip": "Estimated output speed (text + thinking)",
+        "sent": "Sent",
+        "backendProcessing": "Backend processing",
+        "stillProcessing": "Backend still processing",
+        "toolUseCount": "{count} tool {count, plural, one {use} other {uses}}",
+        "diagnostics": {
+          "open": "Connection diagnostics",
+          "title": "Generation diagnostics",
+          "phase": "Current phase",
+          "phaseThinking": "Thinking",
+          "phaseTool": "Running tool",
+          "phaseOutput": "Writing reply",
+          "phaseWaiting": "Awaiting response",
+          "sinceLastData": "Since last data",
+          "testLink": "Test link",
+          "testing": "Testing…",
+          "reachable": "Reachable · HTTP {status} · {latency}ms",
+          "unreachable": "Unreachable · {error}",
+          "notConfigured": "Direct/official connection — nothing to test.",
+          "hintReachable": "Link is up. If no new data for a while, the model is likely still working.",
+          "hintUnreachable": "Link problem — the network/tunnel may be stuck."
+        }
       },
       "jsonTree": {
         "viewRaw": "Show raw JSON",
@@ -3539,7 +3650,8 @@
           "reviewKept": "Kept in plan mode",
           "reviewPending": "Awaiting plan decision",
           "submitted": "Plan submitted",
-          "switched": "Switched mode"
+          "switched": "Switched mode",
+          "planLabel": "Plan"
         },
         "backgroundTask": {
           "title": "Background task",
@@ -3557,7 +3669,9 @@
           "outputMissing": "Codex truncated the script output and dropped this command's separator, so none of the output could be attributed to it.",
           "sharedWith": "Also contains the output of {commands} — codex truncated their separators away.",
           "truncated": "truncated"
-        }
+        },
+        "loadBranchMergeSummary": "Load complete merge summary",
+        "loadingBranchMergeSummary": "Loading merge summary…"
       },
       "messageNav": {
         "title": "Message navigation",
@@ -3575,7 +3689,9 @@
         "openFile": "Open {filePath}",
         "openInEditor": "Open in editor",
         "remove": "Remove",
-        "noDiffDataAvailable": "No diff data available for {filePath}"
+        "noDiffDataAvailable": "No diff data available for {filePath}",
+        "downloadToPc": "Download to my PC",
+        "fileUnavailable": "File unavailable or no longer exists: {filePath}"
       },
       "askQuestion": {
         "title": "The agent needs your input",
@@ -3739,6 +3855,67 @@
       "proposedPlan": {
         "title": "Proposed plan",
         "planning": "Planning…"
+      },
+      "conversationDeliverables": {
+        "collapsedSummary": "Deliverables {count}",
+        "historyTitle": "Deliverable history",
+        "loadingHistory": "Loading deliverable history…",
+        "retry": "Retry",
+        "versions": "{count} versions",
+        "toggleVersions": "Toggle {count} historical versions",
+        "loadMore": "Load more",
+        "title": "Final deliverables",
+        "collapse": "Collapse",
+        "openFile": "Open {filePath}",
+        "revealInFolder": "Reveal in file manager",
+        "primary": "Primary",
+        "supporting": "Supporting",
+        "downloadToPc": "Download to my PC",
+        "fileUnavailable": "File unavailable or no longer exists: {filePath}",
+        "turnTitle": "Outputs from this turn",
+        "download": "Download to this device",
+        "openWithDefaultAppHost": "Open with default app (Codeg host)",
+        "copyFileHost": "Copy file object (Codeg host)",
+        "copyPath": "Copy path",
+        "revealOnHost": "Reveal on the Codeg host",
+        "fileCopied": "File copied; you can paste it directly",
+        "pathCopied": "Path copied",
+        "filesCopied": "Files copied; you can paste them together",
+        "opened": "Opened with the Codeg host's default app",
+        "operationFailed": "Deliverable operation failed",
+        "declared": "Declared",
+        "inferred": "Automatically inferred",
+        "codeChange": "Code change",
+        "deleted": "Deleted",
+        "allTypes": "All types",
+        "allSources": "All sources",
+        "allTurns": "All turns",
+        "turnNumber": "Turn {number}",
+        "allTimes": "Any time",
+        "lastDay": "Last 24 hours",
+        "lastWeek": "Last 7 days",
+        "lastMonth": "Last 30 days",
+        "newest": "Recently updated",
+        "oldest": "Oldest updated",
+        "selectAll": "Select filtered items",
+        "selectedCount": "{count} selected",
+        "downloadSelected": "Download selected files individually",
+        "downloadZip": "Download selected files as ZIP",
+        "copySelectedHost": "Copy selected file objects (Codeg host)",
+        "revealFirstHost": "Reveal the first file on the Codeg host",
+        "removeInvalid": "Remove selected invalid records",
+        "removed": "Invalid records removed",
+        "downloadStarted": "Download started",
+        "revealed": "File revealed on the Codeg host",
+        "selectFile": "Select {name}",
+        "missing": "File missing",
+        "empty": "This conversation has no confirmed deliverables yet",
+        "noFilterResults": "No deliverables match these filters",
+        "hostActionNotice": "Open, copy file, and reveal actions affect the host running Codeg Server; downloads always go to the current device."
+      },
+      "userResources": {
+        "openFile": "Open {filePath}",
+        "fileUnavailable": "File unavailable or no longer exists: {filePath}"
       }
     },
     "diffPreview": {
@@ -4068,7 +4245,17 @@
       "fr": "French",
       "pt": "Portuguese",
       "ar": "Arabic"
-    }
+    },
+    "defaultConversation": "Default conversation",
+    "defaultConversationHint": "Use this conversation for the first WeChat message when the sender has no saved binding.",
+    "defaultFolderId": "Folder ID",
+    "defaultConversationId": "Conversation ID",
+    "defaultAgentType": "Agent type",
+    "weixinPushMode": "WeChat push mode",
+    "weixinPushFinalOnly": "Final result only",
+    "weixinPushFinalAndInteractions": "Final result and required interactions",
+    "weixinPushDebug": "Debug mode",
+    "weixinPushModeHint": "By default, only this WeChat task's final answer is pushed. If the reply token expires, the result is retained until the next inbound message."
   },
   "ModelProviderSettings": {
     "sectionTitle": "Model Providers",
@@ -4307,7 +4494,9 @@
       "syncFailed": "Failed to sync skills"
     },
     "autoPreviewLabel": "Auto-open preview",
-    "autoPreviewHint": "When an agent creates or edits a Word, Excel, or PowerPoint file, open its live preview automatically."
+    "autoPreviewHint": "When an agent creates or edits a Word, Excel, or PowerPoint file, open its live preview automatically.",
+    "autoDownloadProducedLabel": "Auto-download final deliverables",
+    "autoDownloadProducedHint": "When using the web server (e.g. over Tailscale/LAN), automatically download verified final-deliverable files declared by the agent to this browser's Downloads folder."
   },
   "SkillPacksSettings": {
     "title": "Skill Packs",
@@ -4786,7 +4975,12 @@
     "targetsDescription": "Set a different level for specific modules (e.g. codeg_lib::acp) without changing the global level.",
     "targetsAdd": "Add",
     "targetsRemove": "Remove override",
-    "toggleDetails": "Toggle details"
+    "toggleDetails": "Toggle details",
+    "exportDiagnostics": "Export diagnostics",
+    "exporting": "Exporting…",
+    "exportDescription": "Exports app/runtime details, log settings, file metadata, and recent logs as JSON. Common credentials are redacted and conversation/database contents are excluded, but review paths and log text before sharing.",
+    "exportSuccess": "Diagnostic report exported",
+    "exportFailed": "Failed to export diagnostic report"
   },
   "Automations": {
     "title": "Automations",
@@ -4923,7 +5117,8 @@
     "branchLocal": "Local",
     "branchRemote": "Remote",
     "branchSearchPlaceholder": "Search branches…",
-    "branchNone": "No branches"
+    "branchNone": "No branches",
+    "advanced": "Advanced"
   },
   "Tasks": {
     "title": "To-dos",

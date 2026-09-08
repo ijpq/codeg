@@ -1,18 +1,22 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use sha2::{Digest, Sha256};
 #[cfg(feature = "tauri-runtime")]
 use tauri::Manager;
 
 use crate::app_error::AppCommandError;
 use crate::db::entities::conversation;
 use crate::db::entities::folder::FolderKind;
-use crate::db::service::{conversation_service, folder_service, import_service, tab_service};
+use crate::db::service::{
+    artifact_service, conversation_branch_service, conversation_service, deliverable_service,
+    folder_service, import_service, tab_service,
+};
 #[cfg(feature = "tauri-runtime")]
 use crate::db::AppDatabase;
 use crate::models::*;
-// Concrete parser type only for `load_thread_name_index`, which is codex's own
-// index reader and not part of the `AgentParser` trait. Every history read goes
-// through `build_agent_parser`.
 use crate::parsers::codex::CodexParser;
 use crate::parsers::{
     build_agent_parser, folder_name_from_path, normalize_path_for_matching, path_eq_for_matching,
@@ -113,8 +117,7 @@ pub async fn list_all_conversations(
 ) -> Result<Vec<DbConversationSummary>, AppCommandError> {
     let emitter = EventEmitter::Tauri(app.clone());
     let db = app.state::<AppDatabase>();
-    let chat_channel_manager =
-        app.state::<crate::chat_channel::manager::ChatChannelManager>();
+    let chat_channel_manager = app.state::<crate::chat_channel::manager::ChatChannelManager>();
     list_all_conversations_core(
         &db.conn,
         &emitter,
@@ -449,9 +452,7 @@ pub async fn import_local_conversations_core(
     // bound chat thread — the same treatment the scan and list paths give a
     // title discovered outside codeg. The importing client refetches the list
     // itself, which also covers the newly imported rows.
-    drop(
-        notify_conversation_title_updates(conn, emitter, chat_channel_manager, updated_ids).await,
-    );
+    drop(notify_conversation_title_updates(conn, emitter, chat_channel_manager, updated_ids).await);
 
     Ok(result)
 }
@@ -524,7 +525,9 @@ async fn load_folder_rows(
 fn index_folder_rows(rows: &[ScanFolderRow]) -> HashMap<String, &ScanFolderRow> {
     let mut index: HashMap<String, &ScanFolderRow> = HashMap::new();
     for row in rows {
-        let slot = index.entry(normalize_path_for_matching(&row.path)).or_insert(row);
+        let slot = index
+            .entry(normalize_path_for_matching(&row.path))
+            .or_insert(row);
         if slot.deleted && !row.deleted {
             *slot = row;
         }
@@ -568,7 +571,9 @@ fn build_scan_result(
                 // Reuse the stored row's exact path string so the import-side
                 // add_folder upsert hits the same UNIQUE(path) key instead of
                 // minting a near-duplicate from a trailing-slash/case variant.
-                path: row.map(|r| r.path.clone()).unwrap_or_else(|| raw_path.clone()),
+                path: row
+                    .map(|r| r.path.clone())
+                    .unwrap_or_else(|| raw_path.clone()),
                 name: row
                     .map(|r| r.name.clone())
                     .or_else(|| summary.folder_name.clone())
@@ -603,8 +608,7 @@ fn build_scan_result(
     let mut folders: Vec<ScanFolder> = groups
         .into_values()
         .map(|mut g| {
-            g.sessions
-                .sort_by_key(|s| std::cmp::Reverse(s.started_at));
+            g.sessions.sort_by_key(|s| std::cmp::Reverse(s.started_at));
             ScanFolder {
                 path: g.path,
                 name: g.name,
@@ -860,9 +864,9 @@ pub(crate) async fn import_selected_from_summaries(
                     restored: tally.restored,
                 });
                 if failed_in_group > 0 && result.errors.len() < MAX_ERRORS {
-                    result
-                        .errors
-                        .push(format!("{target_path}: {failed_in_group} session(s) failed"));
+                    result.errors.push(format!(
+                        "{target_path}: {failed_in_group} session(s) failed"
+                    ));
                 }
                 // Broadcast every touched folder: even a pre-existing row may
                 // have flipped is_open/deleted_at in add_folder, and clients
@@ -1187,16 +1191,1031 @@ fn inject_delegation_meta(turns: &mut [MessageTurn], children: &[DbConversationS
 /// just read (`None` when no file matched). The live wrapper uses that title to
 /// backfill the DB row's title when the user hasn't locked it — reusing this
 /// already-happening per-turn parse rather than reading the file again.
+fn paginate_parsed_turns(
+    turns: &mut Vec<MessageTurn>,
+    request: &ConversationHistoryRequest,
+) -> Result<ConversationHistoryPage, AppCommandError> {
+    let end = match request.before_cursor.as_deref() {
+        Some(cursor) => cursor
+            .strip_prefix("turn:")
+            .ok_or_else(|| AppCommandError::invalid_input("Invalid history cursor"))?
+            .parse::<usize>()
+            .map_err(|_| AppCommandError::invalid_input("Invalid history cursor"))?
+            .min(turns.len()),
+        None => turns.len(),
+    };
+    let limit = request.user_turn_limit.clamp(1, 100) as usize;
+    let mut start = end;
+    let mut user_turns = 0usize;
+    while start > 0 {
+        start -= 1;
+        if matches!(turns[start].role, TurnRole::User) {
+            user_turns += 1;
+            if user_turns >= limit {
+                break;
+            }
+        }
+    }
+    // System-only transcripts are rare, but a cursor must still make forward
+    // progress rather than returning the same empty page forever.
+    if user_turns == 0 && end > 0 {
+        start = end.saturating_sub(limit);
+    }
+    let page_turns = turns[start..end].to_vec();
+    *turns = page_turns;
+    Ok(ConversationHistoryPage {
+        next_cursor: (start > 0).then(|| format!("turn:{start}")),
+        has_more: start > 0,
+        loaded_turns: turns.len() as u32,
+        ..ConversationHistoryPage::default()
+    })
+}
+
+fn branch_inherited_end(
+    turns: &[MessageTurn],
+    fork_message_id: Option<&str>,
+    forked_through_at: Option<chrono::DateTime<chrono::Utc>>,
+    inherited_message_count: i32,
+) -> usize {
+    if let Some(fork_message_id) = fork_message_id {
+        if let Some(index) = turns.iter().position(|turn| turn.id == fork_message_id) {
+            return index + 1;
+        }
+    }
+    if let Some(forked_through_at) = forked_through_at {
+        return turns.partition_point(|turn| turn.timestamp <= forked_through_at);
+    }
+    usize::try_from(inherited_message_count.max(0))
+        .unwrap_or(usize::MAX)
+        .min(turns.len())
+}
+
+fn native_branch_local_start(
+    branch_turns: &[MessageTurn],
+    source_turn_ids: &std::collections::HashSet<String>,
+    forked_through_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> usize {
+    // Codex native fork rollouts replay the parent's persisted transcript at
+    // their head. That replay is protocol context, not branch-local history;
+    // the source prefix is rendered separately through the durable fork
+    // boundary below. Strip only the contiguous opening replay so a later
+    // branch message can never disappear merely because its content resembles
+    // an older source message.
+    branch_turns
+        .iter()
+        .take_while(|turn| {
+            source_turn_ids.contains(&turn.id)
+                || forked_through_at.is_some_and(|boundary| turn.timestamp <= boundary)
+        })
+        .count()
+}
+
+fn inherited_run_belongs_to_boundary(
+    started_at: chrono::DateTime<chrono::Utc>,
+    user_turn_id: Option<&str>,
+    source_turn_ids: &std::collections::HashSet<String>,
+    boundary_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> bool {
+    match user_turn_id {
+        Some(turn_id) => source_turn_ids.contains(turn_id),
+        None => boundary_at.is_some_and(|boundary| started_at <= boundary),
+    }
+}
+
+fn turn_has_renderable_content(turn: &MessageTurn) -> bool {
+    turn.blocks.iter().any(|block| match block {
+        ContentBlock::Text { text } | ContentBlock::Thinking { text } => !text.trim().is_empty(),
+        _ => true,
+    })
+}
+
+fn rewrite_inherited_page_ids(
+    turns: &mut [MessageTurn],
+    branch_conversation_id: i32,
+    source_conversation_id: i32,
+) -> HashMap<String, String> {
+    let mut rewritten = HashMap::new();
+    for turn in turns {
+        let original = turn.id.clone();
+        let inherited = format!(
+            "branch-inherited:{branch_conversation_id}:{source_conversation_id}:{original}"
+        );
+        rewritten.insert(original, inherited.clone());
+        turn.id = inherited;
+    }
+    rewritten
+}
+
+async fn get_snapshot_branch_page(
+    conn: &sea_orm::DatabaseConnection,
+    conversation_id: i32,
+    relation: conversation_branch_service::ConversationBranchInfo,
+    request: ConversationHistoryRequest,
+    branch_path: HashSet<i32>,
+) -> Result<(DbConversationDetail, Option<String>), AppCommandError> {
+    const SOURCE_CURSOR_PREFIX: &str = "branch-source:";
+    if let Some(source_cursor) = request
+        .before_cursor
+        .as_deref()
+        .and_then(|cursor| cursor.strip_prefix(SOURCE_CURSOR_PREFIX))
+    {
+        // Keep branch-owned summary/session metadata cheap by reading one tail
+        // round, then replace only the transcript page with the frozen source
+        // page. The source cursor is an exact JSONL byte offset when available.
+        let (mut branch_detail, title) = get_folder_conversation_raw_impl(
+            conn,
+            conversation_id,
+            Some(ConversationHistoryRequest {
+                before_cursor: None,
+                user_turn_limit: 1,
+                cancellation: request.cancellation.clone(),
+            }),
+        )
+        .await?;
+        let source_before = if source_cursor == "latest" {
+            None
+        } else {
+            Some(format!("codex:{source_cursor}"))
+        };
+        let (mut source_detail, _) = Box::pin(get_folder_conversation_core_impl(
+            conn,
+            relation.source_conversation_id,
+            Some(ConversationHistoryRequest {
+                before_cursor: source_before,
+                user_turn_limit: request.user_turn_limit,
+                cancellation: request.cancellation.clone(),
+            }),
+            branch_path,
+        ))
+        .await?;
+        if let Some(boundary) = relation.forked_through_at {
+            source_detail
+                .turns
+                .retain(|turn| turn.timestamp <= boundary);
+        }
+        source_detail.turns.retain(turn_has_renderable_content);
+        let rewritten = rewrite_inherited_page_ids(
+            &mut source_detail.turns,
+            conversation_id,
+            relation.source_conversation_id,
+        );
+        for run in &mut source_detail.deliverable_runs {
+            if let Some(turn_id) = run.user_turn_id.as_mut() {
+                if let Some(inherited) = rewritten.get(turn_id) {
+                    *turn_id = inherited.clone();
+                }
+            }
+        }
+        let source_page = source_detail.history_page.take();
+        branch_detail.turns = source_detail.turns;
+        branch_detail.artifact_runs = source_detail.artifact_runs;
+        branch_detail.deliverable_runs = source_detail.deliverable_runs;
+        branch_detail.history_page = Some(ConversationHistoryPage {
+            next_cursor: source_page
+                .as_ref()
+                .and_then(|page| page.next_cursor.as_deref())
+                .and_then(|cursor| cursor.strip_prefix("codex:"))
+                .map(|cursor| format!("{SOURCE_CURSOR_PREFIX}{cursor}")),
+            has_more: source_page.as_ref().is_some_and(|page| page.has_more),
+            loaded_turns: branch_detail.turns.len() as u32,
+            source_version: source_page
+                .as_ref()
+                .and_then(|page| page.source_version.clone()),
+            read_start_offset: source_page.as_ref().and_then(|page| page.read_start_offset),
+            read_end_offset: source_page.as_ref().and_then(|page| page.read_end_offset),
+            read_bytes: source_page.as_ref().and_then(|page| page.read_bytes),
+            scan_bytes: source_page.as_ref().and_then(|page| page.scan_bytes),
+            cache_hit: source_page.as_ref().and_then(|page| page.cache_hit),
+            index_hit: source_page.as_ref().and_then(|page| page.index_hit),
+            index_status: source_page
+                .as_ref()
+                .and_then(|page| page.index_status.clone()),
+            indexed_through_offset: source_page
+                .as_ref()
+                .and_then(|page| page.indexed_through_offset),
+        });
+        branch_detail.branch_history =
+            Some(crate::models::conversation::ConversationBranchHistory {
+                source_conversation_id: relation.source_conversation_id,
+                fork_message_id: relation.fork_message_id,
+                inherited_turn_count: relation.inherited_message_count.max(0) as usize,
+                branch_turn_count: 0,
+                inheritance_mode: relation.inheritance_mode,
+            });
+        return Ok((branch_detail, title));
+    }
+
+    let (mut detail, title) =
+        get_folder_conversation_raw_impl(conn, conversation_id, Some(request.clone())).await?;
+    // A snapshot is transport-only initialization context. Once stripped, an
+    // otherwise-empty synthetic user row must not create a blank card/page.
+    detail.turns.retain(turn_has_renderable_content);
+    if detail.turns.is_empty() {
+        // A newly-created snapshot branch has no local user turn yet. Return a
+        // real inherited source page on its first open rather than an empty
+        // placeholder that needs a second observer/request to become useful.
+        let source_cursor = relation
+            .source_rollout_offset
+            .and_then(|value| u64::try_from(value).ok())
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "latest".into());
+        return Box::pin(get_snapshot_branch_page(
+            conn,
+            conversation_id,
+            relation,
+            ConversationHistoryRequest {
+                before_cursor: Some(format!("{SOURCE_CURSOR_PREFIX}{source_cursor}")),
+                user_turn_limit: request.user_turn_limit,
+                cancellation: request.cancellation.clone(),
+            },
+            branch_path,
+        ))
+        .await;
+    }
+    if let Some(page) = detail.history_page.as_mut() {
+        if !page.has_more {
+            page.has_more = true;
+            page.next_cursor = Some(format!(
+                "{SOURCE_CURSOR_PREFIX}{}",
+                relation
+                    .source_rollout_offset
+                    .and_then(|value| u64::try_from(value).ok())
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "latest".into())
+            ));
+        }
+        page.loaded_turns = detail.turns.len() as u32;
+    }
+    detail.branch_history = Some(crate::models::conversation::ConversationBranchHistory {
+        source_conversation_id: relation.source_conversation_id,
+        fork_message_id: relation.fork_message_id,
+        inherited_turn_count: relation.inherited_message_count.max(0) as usize,
+        branch_turn_count: detail.turns.len(),
+        inheritance_mode: relation.inheritance_mode,
+    });
+    Ok((detail, title))
+}
+
 pub async fn get_folder_conversation_core(
     conn: &sea_orm::DatabaseConnection,
     conversation_id: i32,
 ) -> Result<(DbConversationDetail, Option<String>), AppCommandError> {
+    get_folder_conversation_core_impl(
+        conn,
+        conversation_id,
+        None,
+        std::collections::HashSet::new(),
+    )
+    .await
+}
+
+#[derive(Clone, Debug)]
+pub struct ConversationHistoryRequest {
+    pub before_cursor: Option<String>,
+    pub user_turn_limit: u32,
+    pub cancellation: Option<Arc<AtomicBool>>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct HistoryReadMetrics {
+    start_offset: u64,
+    end_offset: u64,
+    scan_bytes: u64,
+    cache_hit: bool,
+    index_hit: bool,
+    index_status: &'static str,
+    indexed_through_offset: u64,
+}
+
+const HISTORY_TOOL_PREVIEW_HEAD_BYTES: usize = 4 * 1024;
+const HISTORY_TOOL_PREVIEW_TAIL_BYTES: usize = 1024;
+const HISTORY_DEFER_THRESHOLD_BYTES: usize = 8 * 1024;
+const HISTORY_REASONING_DEFER_THRESHOLD_BYTES: usize = 32 * 1024;
+const HISTORY_IMAGE_DEFER_THRESHOLD_BYTES: usize = 64 * 1024;
+const HISTORY_DEFERRED_RANGE_LIMIT_BYTES: u64 = 128 * 1024 * 1024;
+const HISTORY_DEFERRED_IMAGE_URI_PREFIX: &str = "codeg-history-content:";
+const HISTORY_DEFERRED_REASONING_MARKER_PREFIX: &str = "<!--codeg-history-reasoning:";
+const HISTORY_DEFERRED_BRANCH_MERGE_MARKER_PREFIX: &str = "<!--codeg-branch-merge-summary:";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct DeferredHistoryContentRef {
+    version: u8,
+    conversation_id: i32,
+    start_offset: u64,
+    end_offset: u64,
+    kind: String,
+    tool_use_id: Option<String>,
+    content_sha256: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DeferredHistoryContent {
+    pub content: String,
+    pub byte_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+}
+
+fn sha256_hex(value: &str) -> String {
+    Sha256::digest(value.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn encode_deferred_history_ref(reference: &DeferredHistoryContentRef) -> Option<String> {
+    serde_json::to_vec(reference)
+        .ok()
+        .map(|bytes| URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn truncate_history_preview(value: &str) -> String {
+    fn boundary_at_or_before(value: &str, offset: usize) -> usize {
+        let mut at = offset.min(value.len());
+        while at > 0 && !value.is_char_boundary(at) {
+            at -= 1;
+        }
+        at
+    }
+    let head_end = boundary_at_or_before(value, HISTORY_TOOL_PREVIEW_HEAD_BYTES);
+    let tail_start = boundary_at_or_before(
+        value,
+        value.len().saturating_sub(HISTORY_TOOL_PREVIEW_TAIL_BYTES),
+    );
+    format!(
+        "{}\n\n… {} bytes deferred; expand to load the complete output …\n\n{}",
+        &value[..head_end],
+        value.len(),
+        &value[tail_start..]
+    )
+}
+
+fn insert_tool_history_meta(
+    meta: &mut Option<serde_json::Value>,
+    key: &str,
+    value: serde_json::Value,
+) {
+    if !meta.as_ref().is_some_and(serde_json::Value::is_object) {
+        *meta = Some(serde_json::json!({}));
+    }
+    if let Some(object) = meta.as_mut().and_then(serde_json::Value::as_object_mut) {
+        object.insert(key.to_string(), value);
+    }
+}
+
+fn defer_heavy_tool_outputs(
+    turns: &mut [MessageTurn],
+    conversation_id: i32,
+    window: HistoryReadMetrics,
+) {
+    for turn in turns {
+        for result_index in 0..turn.blocks.len() {
+            let (tool_use_id, content_sha256, original_bytes) = match &turn.blocks[result_index] {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    output_preview: Some(output),
+                    ..
+                } if output.len() > HISTORY_DEFER_THRESHOLD_BYTES => {
+                    (tool_use_id.clone(), sha256_hex(output), output.len())
+                }
+                _ => continue,
+            };
+            // Do not truncate an orphan result: without an owning ToolUse
+            // there is nowhere in the current wire model to carry the opaque
+            // load reference, and losing access would be worse than a larger
+            // page. Normal Codex transcripts pair these blocks.
+            let matching_index = tool_use_id
+                .as_deref()
+                .and_then(|wanted| {
+                    turn.blocks[..result_index].iter().rposition(|block| {
+                        matches!(block, ContentBlock::ToolUse { tool_use_id: Some(id), .. } if id == wanted)
+                    })
+                })
+                .or_else(|| {
+                    turn.blocks[..result_index]
+                        .iter()
+                        .rposition(|block| matches!(block, ContentBlock::ToolUse { .. }))
+                });
+            let Some(matching_index) = matching_index else {
+                continue;
+            };
+            let reference = DeferredHistoryContentRef {
+                version: 1,
+                conversation_id,
+                start_offset: window.start_offset,
+                end_offset: window.end_offset,
+                kind: "tool_output".into(),
+                tool_use_id: tool_use_id.clone(),
+                content_sha256,
+            };
+            let Some(encoded) = encode_deferred_history_ref(&reference) else {
+                continue;
+            };
+            let preview_bytes = if let ContentBlock::ToolResult {
+                output_preview: Some(output),
+                ..
+            } = &mut turn.blocks[result_index]
+            {
+                *output = truncate_history_preview(output);
+                output.len()
+            } else {
+                continue;
+            };
+            if let ContentBlock::ToolUse { meta, .. } = &mut turn.blocks[matching_index] {
+                insert_tool_history_meta(
+                    meta,
+                    "codeg.historyOutput",
+                    serde_json::json!({
+                        "ref": encoded,
+                        "byteCount": original_bytes,
+                        "previewBytes": preview_bytes,
+                    }),
+                );
+            }
+        }
+
+        for block in &mut turn.blocks {
+            match block {
+                ContentBlock::Thinking { text }
+                    if text.len() > HISTORY_REASONING_DEFER_THRESHOLD_BYTES =>
+                {
+                    let reference = DeferredHistoryContentRef {
+                        version: 1,
+                        conversation_id,
+                        start_offset: window.start_offset,
+                        end_offset: window.end_offset,
+                        kind: "reasoning".into(),
+                        tool_use_id: None,
+                        content_sha256: sha256_hex(text),
+                    };
+                    if let Some(encoded) = encode_deferred_history_ref(&reference) {
+                        *text = format!(
+                            "{}\n\n{HISTORY_DEFERRED_REASONING_MARKER_PREFIX}{encoded}-->",
+                            truncate_history_preview(text)
+                        );
+                    }
+                }
+                ContentBlock::Image { data, uri, .. } => {
+                    defer_history_image(data, uri, conversation_id, window);
+                }
+                ContentBlock::ImageGeneration {
+                    image: Some(image), ..
+                } => {
+                    defer_history_image(&mut image.data, &mut image.uri, conversation_id, window);
+                }
+                ContentBlock::ToolResult { images, .. } => {
+                    for image in images {
+                        defer_history_image(
+                            &mut image.data,
+                            &mut image.uri,
+                            conversation_id,
+                            window,
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn defer_history_image(
+    data: &mut String,
+    uri: &mut Option<String>,
+    conversation_id: i32,
+    window: HistoryReadMetrics,
+) {
+    if data.len() <= HISTORY_IMAGE_DEFER_THRESHOLD_BYTES {
+        return;
+    }
+    let reference = DeferredHistoryContentRef {
+        version: 1,
+        conversation_id,
+        start_offset: window.start_offset,
+        end_offset: window.end_offset,
+        kind: "image".into(),
+        tool_use_id: None,
+        content_sha256: sha256_hex(data),
+    };
+    let Some(encoded) = encode_deferred_history_ref(&reference) else {
+        return;
+    };
+    data.clear();
+    // `uri` is already part of every historical image wire shape, unlike a
+    // new schema field that older clients would discard. The prefix is never
+    // interpreted as a local path; the web client exchanges the opaque token
+    // for bytes through the authenticated history-content endpoint.
+    *uri = Some(format!("{HISTORY_DEFERRED_IMAGE_URI_PREFIX}{encoded}"));
+}
+
+pub async fn get_deferred_history_content_core(
+    conn: &sea_orm::DatabaseConnection,
+    encoded_reference: String,
+) -> Result<DeferredHistoryContent, AppCommandError> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(encoded_reference)
+        .map_err(|_| AppCommandError::invalid_input("Invalid history content reference"))?;
+    let reference: DeferredHistoryContentRef = serde_json::from_slice(&bytes)
+        .map_err(|_| AppCommandError::invalid_input("Invalid history content reference"))?;
+    if reference.version != 1
+        || (reference.kind != "tool_output"
+            && reference.kind != "image"
+            && reference.kind != "reasoning"
+            && reference.kind != "branch_merge")
+    {
+        return Err(AppCommandError::invalid_input(
+            "Unsupported history content reference",
+        ));
+    }
+    if reference.kind == "branch_merge" {
+        let merge_id = reference.tool_use_id.as_deref().ok_or_else(|| {
+            AppCommandError::invalid_input("Branch merge reference has no merge id")
+        })?;
+        let content = conversation_branch_service::merge_summary_for_target(
+            conn,
+            reference.conversation_id,
+            merge_id,
+        )
+        .await
+        .map_err(AppCommandError::from)?
+        .ok_or_else(|| AppCommandError::invalid_input("Branch merge summary no longer exists"))?;
+        if !reference.content_sha256.is_empty() && sha256_hex(&content) != reference.content_sha256
+        {
+            return Err(AppCommandError::invalid_input(
+                "Branch merge summary changed after the preview was issued",
+            ));
+        }
+        return Ok(DeferredHistoryContent {
+            byte_count: content.len() as u64,
+            content,
+            mime_type: None,
+        });
+    }
+
+    let summary = conversation_service::get_by_id(conn, reference.conversation_id)
+        .await
+        .map_err(AppCommandError::from)?;
+    if summary.agent_type != AgentType::Codex {
+        return Err(AppCommandError::invalid_input(
+            "History content reference does not target a Codex conversation",
+        ));
+    }
+    let session_id = summary
+        .external_id
+        .ok_or_else(|| AppCommandError::invalid_input("Conversation has no durable session"))?;
+    let cwd = match summary.origin_cwd {
+        Some(cwd) => Some(cwd),
+        None => folder_service::get_folder_by_id(conn, summary.folder_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|folder| folder.path),
+    };
+    let range = tokio::task::spawn_blocking(move || {
+        CodexParser::new().get_conversation_range_between(
+            &session_id,
+            reference.start_offset,
+            reference.end_offset,
+            HISTORY_DEFERRED_RANGE_LIMIT_BYTES,
+            cwd,
+        )
+    })
+    .await
+    .map_err(|error| {
+        AppCommandError::task_execution_failed("Deferred history reader stopped")
+            .with_detail(error.to_string())
+    })?
+    .map_err(parse_error_to_app_error)?;
+    for turn in range.detail.turns {
+        for block in turn.blocks {
+            let image = match block {
+                ContentBlock::Thinking { text } => {
+                    if reference.kind == "reasoning"
+                        && sha256_hex(&text) == reference.content_sha256
+                    {
+                        return Ok(DeferredHistoryContent {
+                            byte_count: text.len() as u64,
+                            content: text,
+                            mime_type: None,
+                        });
+                    }
+                    None
+                }
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    output_preview,
+                    images,
+                    ..
+                } => {
+                    if reference.kind == "tool_output" {
+                        if reference.tool_use_id.is_some()
+                            && tool_use_id.as_deref() != reference.tool_use_id.as_deref()
+                        {
+                            continue;
+                        }
+                        if let Some(output) = output_preview {
+                            if sha256_hex(&output) == reference.content_sha256 {
+                                return Ok(DeferredHistoryContent {
+                                    byte_count: output.len() as u64,
+                                    content: output,
+                                    mime_type: None,
+                                });
+                            }
+                        }
+                    }
+                    if reference.kind == "image" {
+                        for image in images {
+                            if sha256_hex(&image.data) == reference.content_sha256 {
+                                return Ok(DeferredHistoryContent {
+                                    byte_count: image.data.len() as u64,
+                                    content: image.data,
+                                    mime_type: Some(image.mime_type),
+                                });
+                            }
+                        }
+                    }
+                    None
+                }
+                ContentBlock::Image {
+                    data, mime_type, ..
+                } => Some((data, mime_type)),
+                ContentBlock::ImageGeneration {
+                    image: Some(image), ..
+                } => Some((image.data, image.mime_type)),
+                _ => None,
+            };
+            if reference.kind == "image" {
+                if let Some((data, mime_type)) = image {
+                    if sha256_hex(&data) == reference.content_sha256 {
+                        return Ok(DeferredHistoryContent {
+                            byte_count: data.len() as u64,
+                            content: data,
+                            mime_type: Some(mime_type),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    Err(AppCommandError::task_execution_failed(
+        "Deferred history content no longer matches the transcript",
+    ))
+}
+
+pub async fn list_conversation_branch_merges_core(
+    conn: &sea_orm::DatabaseConnection,
+    conversation_id: i32,
+    offset: u64,
+    limit: u64,
+) -> Result<conversation_branch_service::ConversationBranchMergePreviewPage, AppCommandError> {
+    conversation_branch_service::merge_preview_page_for_target(conn, conversation_id, offset, limit)
+        .await
+        .map_err(AppCommandError::from)
+}
+
+pub async fn list_conversation_branches_core(
+    conn: &sea_orm::DatabaseConnection,
+    conversation_id: i32,
+    offset: u64,
+    limit: u64,
+) -> Result<conversation_branch_service::ConversationSourceBranchPreviewPage, AppCommandError> {
+    conversation_branch_service::branch_preview_page_for_source(
+        conn,
+        conversation_id,
+        offset,
+        limit,
+    )
+    .await
+    .map_err(AppCommandError::from)
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct VisibleConversationTurnRef {
+    pub id: String,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+    pub is_user: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ConversationOutputWindow {
+    pub artifact_runs: Vec<crate::models::ConversationTurnArtifactRun>,
+    pub deliverable_runs: Vec<crate::models::ConversationTurnDeliverableSet>,
+}
+
+pub async fn list_conversation_output_window_core(
+    conn: &sea_orm::DatabaseConnection,
+    conversation_id: i32,
+    turn_refs: Vec<VisibleConversationTurnRef>,
+) -> Result<ConversationOutputWindow, AppCommandError> {
+    let turns = turn_refs
+        .into_iter()
+        .take(200)
+        .map(|turn| MessageTurn {
+            id: turn.id,
+            role: if turn.is_user {
+                TurnRole::User
+            } else {
+                TurnRole::Assistant
+            },
+            blocks: Vec::new(),
+            timestamp: turn.timestamp,
+            usage: None,
+            duration_ms: None,
+            model: None,
+            completed_at: Some(turn.timestamp),
+            agent_message_id: None,
+        })
+        .collect::<Vec<_>>();
+    let started = std::time::Instant::now();
+    let (artifact_runs, deliverable_runs) = tokio::try_join!(
+        artifact_service::list_for_turn_window(conn, conversation_id, &turns),
+        deliverable_service::list_sets_for_turns(conn, conversation_id, &turns),
+    )
+    .map_err(AppCommandError::from)?;
+    tracing::info!(
+        conversation_id,
+        visible_turns = turns.len(),
+        artifact_runs = artifact_runs.len(),
+        deliverable_runs = deliverable_runs.len(),
+        db_elapsed_ms = started.elapsed().as_millis() as u64,
+        "[conversation][perf] visible output associations loaded without transcript parsing"
+    );
+    Ok(ConversationOutputWindow {
+        artifact_runs,
+        deliverable_runs,
+    })
+}
+
+pub async fn diagnose_codex_rollout_size_core(
+    conn: &sea_orm::DatabaseConnection,
+    conversation_id: i32,
+) -> Result<crate::parsers::codex::CodexRolloutSizeDiagnostics, AppCommandError> {
     let summary = conversation_service::get_by_id(conn, conversation_id)
         .await
         .map_err(AppCommandError::from)?;
+    if summary.agent_type != AgentType::Codex {
+        return Err(AppCommandError::invalid_input(
+            "Rollout size diagnostics are available only for Codex conversations",
+        ));
+    }
+    let session_id = summary
+        .external_id
+        .ok_or_else(|| AppCommandError::invalid_input("Conversation has no durable session"))?;
+    let started = std::time::Instant::now();
+    let diagnostics =
+        tokio::task::spawn_blocking(move || CodexParser::new().diagnose_rollout_size(&session_id))
+            .await
+            .map_err(|error| {
+                AppCommandError::task_execution_failed("Rollout diagnostic worker stopped")
+                    .with_detail(error.to_string())
+            })?
+            .map_err(parse_error_to_app_error)?;
+    tracing::info!(
+        route = "diagnose_codex_rollout_size",
+        conversation_id,
+        file_bytes = diagnostics.file_bytes,
+        record_count = diagnostics.record_count,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "[conversation][perf] read-only rollout size diagnostic completed"
+    );
+    Ok(diagnostics)
+}
 
-    let (mut turns, session_stats, resolved_ext_id, parsed_title, parsed_model, transcript_watermark) =
-        if let Some(ref ext_id) = summary.external_id {
+/// Default size for the public conversation-detail command. Keeping this next
+/// to the request type makes the HTTP and Tauri transports agree even when an
+/// older caller omits the newly added paging arguments.
+pub const DEFAULT_HISTORY_PAGE_USER_TURNS: u32 = 25;
+
+pub async fn get_folder_conversation_page_core(
+    conn: &sea_orm::DatabaseConnection,
+    conversation_id: i32,
+    request: ConversationHistoryRequest,
+) -> Result<(DbConversationDetail, Option<String>), AppCommandError> {
+    get_folder_conversation_core_impl(
+        conn,
+        conversation_id,
+        Some(request),
+        std::collections::HashSet::new(),
+    )
+    .await
+}
+
+async fn get_folder_conversation_core_impl(
+    conn: &sea_orm::DatabaseConnection,
+    conversation_id: i32,
+    history_request: Option<ConversationHistoryRequest>,
+    mut branch_path: std::collections::HashSet<i32>,
+) -> Result<(DbConversationDetail, Option<String>), AppCommandError> {
+    if !branch_path.insert(conversation_id) {
+        return Err(AppCommandError::task_execution_failed(
+            "Invalid conversation branch cycle",
+        ));
+    }
+    let relation = conversation_branch_service::get_info(conn, conversation_id)
+        .await
+        .map_err(AppCommandError::from)?;
+    let Some(relation) = relation else {
+        return get_folder_conversation_raw_impl(conn, conversation_id, history_request).await;
+    };
+    if relation.source_conversation_id == conversation_id {
+        return Err(AppCommandError::task_execution_failed(
+            "Invalid conversation branch cycle",
+        ));
+    }
+
+    // Cursor reads must remain cursor reads. The legacy implementation below
+    // composed a branch by fully parsing both rollouts and only then slicing
+    // the Vec, so opening a native fork of a 2 GB source read roughly 4 GB.
+    // A native Codex child already owns an immutable replay of the source
+    // prefix and can be paged directly. Snapshot branches page their local
+    // rollout first, then cross an explicit cursor into the frozen source.
+    if let Some(request) = history_request.as_ref() {
+        if relation.inheritance_mode == "native_fork" {
+            let (mut detail, title) =
+                get_folder_conversation_raw_impl(conn, conversation_id, Some(request.clone()))
+                    .await?;
+            let source_artifacts = artifact_service::list_for_turn_window(
+                conn,
+                relation.source_conversation_id,
+                &detail.turns,
+            )
+            .await
+            .unwrap_or_default();
+            let source_deliverables = deliverable_service::list_sets_for_turns(
+                conn,
+                relation.source_conversation_id,
+                &detail.turns,
+            )
+            .await
+            .unwrap_or_default();
+            detail.artifact_runs.extend(source_artifacts);
+            detail.deliverable_runs.extend(source_deliverables);
+            detail.artifact_runs.sort_by_key(|run| run.started_at);
+            detail
+                .artifact_runs
+                .dedup_by(|left, right| left.id == right.id);
+            detail.deliverable_runs.sort_by_key(|run| run.started_at);
+            detail
+                .deliverable_runs
+                .dedup_by(|left, right| left.turn_run_id == right.turn_run_id);
+            let inherited_turn_count =
+                usize::try_from(relation.inherited_message_count.max(0)).unwrap_or_default();
+            let branch_turn_count = detail
+                .summary
+                .message_count
+                .saturating_sub(inherited_turn_count as u32)
+                as usize;
+            detail.summary.message_count = detail
+                .summary
+                .message_count
+                .max(relation.inherited_message_count.max(0) as u32);
+            detail.branch_history = Some(crate::models::conversation::ConversationBranchHistory {
+                source_conversation_id: relation.source_conversation_id,
+                fork_message_id: relation.fork_message_id,
+                inherited_turn_count,
+                branch_turn_count,
+                inheritance_mode: relation.inheritance_mode,
+            });
+            return Ok((detail, title));
+        }
+
+        if relation.fork_mode == "snapshot" {
+            return get_snapshot_branch_page(
+                conn,
+                conversation_id,
+                relation,
+                request.clone(),
+                branch_path,
+            )
+            .await;
+        }
+    }
+
+    // Branch history is a read-only reference to the source prefix, not copied
+    // conversation rows. Parse both authoritative transcripts, freeze the
+    // source at the persisted fork boundary, then paginate the composed list.
+    // Source turns created after the fork can never leak into this branch.
+    let (mut branch_detail, branch_title) =
+        get_folder_conversation_raw_impl(conn, conversation_id, None).await?;
+    let (mut source_detail, _) = Box::pin(get_folder_conversation_core_impl(
+        conn,
+        relation.source_conversation_id,
+        None,
+        branch_path,
+    ))
+    .await?;
+    let inherited_end = branch_inherited_end(
+        &source_detail.turns,
+        relation.fork_message_id.as_deref(),
+        relation.forked_through_at,
+        relation.inherited_message_count,
+    );
+    source_detail.turns.truncate(inherited_end);
+
+    let source_turn_ids = source_detail
+        .turns
+        .iter()
+        .map(|turn| turn.id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    let inherited_boundary_at = source_detail.turns.last().map(|turn| turn.timestamp);
+    // Raw detail queries load every run owned by the source conversation. A
+    // branch must freeze artifacts at the same immutable boundary as its
+    // messages; otherwise files produced by later source turns leak into an
+    // already-created branch after refresh. Prefer the exact parser turn id
+    // for deliverables and use the run start time for legacy rows/artifacts.
+    source_detail.artifact_runs.retain(|run| {
+        inherited_run_belongs_to_boundary(
+            run.started_at,
+            None,
+            &source_turn_ids,
+            inherited_boundary_at,
+        )
+    });
+    source_detail.deliverable_runs.retain(|run| {
+        inherited_run_belongs_to_boundary(
+            run.started_at,
+            run.user_turn_id.as_deref(),
+            &source_turn_ids,
+            inherited_boundary_at,
+        )
+    });
+    if relation.inheritance_mode == "native_fork" {
+        let local_start = native_branch_local_start(
+            &branch_detail.turns,
+            &source_turn_ids,
+            relation.forked_through_at,
+        );
+        branch_detail.turns.drain(..local_start);
+    }
+
+    let mut inherited_ids = std::collections::HashMap::new();
+    for turn in &mut source_detail.turns {
+        let original = turn.id.clone();
+        let inherited = format!(
+            "branch-inherited:{}:{}:{}",
+            conversation_id, relation.source_conversation_id, original
+        );
+        inherited_ids.insert(original, inherited.clone());
+        turn.id = inherited;
+    }
+    for run in &mut source_detail.deliverable_runs {
+        if let Some(user_turn_id) = run.user_turn_id.as_mut() {
+            if let Some(inherited) = inherited_ids.get(user_turn_id) {
+                *user_turn_id = inherited.clone();
+            }
+        }
+    }
+
+    let inherited_turn_count = source_detail.turns.len();
+    let branch_turn_count = branch_detail.turns.len();
+    source_detail.turns.append(&mut branch_detail.turns);
+    source_detail
+        .artifact_runs
+        .append(&mut branch_detail.artifact_runs);
+    source_detail
+        .deliverable_runs
+        .append(&mut branch_detail.deliverable_runs);
+    branch_detail.turns = source_detail.turns;
+    branch_detail.artifact_runs = source_detail.artifact_runs;
+    branch_detail.deliverable_runs = source_detail.deliverable_runs;
+    branch_detail.summary.message_count = branch_detail.turns.len() as u32;
+    branch_detail.branch_history = Some(crate::models::conversation::ConversationBranchHistory {
+        source_conversation_id: relation.source_conversation_id,
+        fork_message_id: relation.fork_message_id,
+        inherited_turn_count,
+        branch_turn_count,
+        inheritance_mode: relation.inheritance_mode,
+    });
+    branch_detail.history_page = history_request
+        .as_ref()
+        .map(|request| paginate_parsed_turns(&mut branch_detail.turns, request))
+        .transpose()?;
+    Ok((branch_detail, branch_title))
+}
+
+async fn get_folder_conversation_raw_impl(
+    conn: &sea_orm::DatabaseConnection,
+    conversation_id: i32,
+    history_request: Option<ConversationHistoryRequest>,
+) -> Result<(DbConversationDetail, Option<String>), AppCommandError> {
+    let total_started = std::time::Instant::now();
+    let db_started = std::time::Instant::now();
+    let summary = conversation_service::get_by_id(conn, conversation_id)
+        .await
+        .map_err(AppCommandError::from)?;
+    let summary_db_elapsed_ms = db_started.elapsed().as_millis() as u64;
+
+    let parse_started = std::time::Instant::now();
+    let (
+        mut turns,
+        session_stats,
+        resolved_ext_id,
+        parsed_title,
+        parsed_model,
+        transcript_watermark,
+        history_page,
+        history_read_metrics,
+    ) = if let Some(ref ext_id) = summary.external_id {
         let at = summary.agent_type;
         let eid = ext_id.clone();
         let db_created_at = summary.created_at;
@@ -1212,17 +2231,96 @@ pub async fn get_folder_conversation_core(
                 .flatten()
                 .map(|f| f.path),
         };
+        let history_request_for_parse = history_request.clone();
+        let cwd_hint = folder_path_for_fallback.clone();
         tokio::task::spawn_blocking(move || -> Result<_, AppCommandError> {
+            if at == AgentType::Codex {
+                if let Some(request) = history_request_for_parse.as_ref() {
+                    let before_offset = match request.before_cursor.as_deref() {
+                        Some(cursor) => Some(
+                            cursor
+                                .strip_prefix("codex:")
+                                .ok_or_else(|| {
+                                    AppCommandError::invalid_input("Invalid history cursor")
+                                })?
+                                .parse::<u64>()
+                                .map_err(|_| {
+                                    AppCommandError::invalid_input("Invalid history cursor")
+                                })?,
+                        ),
+                        None => None,
+                    };
+                    let parser = CodexParser::new();
+                    let page = match request.cancellation.clone() {
+                        Some(cancelled) => parser.get_conversation_page_cancellable(
+                            &eid,
+                            before_offset,
+                            request.user_turn_limit as usize,
+                            cwd_hint,
+                            cancelled,
+                        ),
+                        None => parser.get_conversation_page(
+                            &eid,
+                            before_offset,
+                            request.user_turn_limit as usize,
+                            cwd_hint,
+                        ),
+                    }
+                    .map_err(parse_error_to_app_error)?;
+                    let loaded_turns = page.detail.turns.len() as u32;
+                    return Ok((
+                        page.detail.turns,
+                        page.detail.session_stats,
+                        None,
+                        page.detail.summary.title,
+                        page.detail.summary.model,
+                        page.detail.transcript_watermark,
+                        Some(ConversationHistoryPage {
+                            next_cursor: page
+                                .has_more
+                                .then(|| format!("codex:{}", page.start_offset)),
+                            has_more: page.has_more,
+                            loaded_turns,
+                            source_version: Some(page.source_version.clone()),
+                            read_start_offset: Some(page.start_offset),
+                            read_end_offset: Some(page.end_offset),
+                            read_bytes: Some(page.end_offset.saturating_sub(page.start_offset)),
+                            scan_bytes: Some(page.scan_bytes),
+                            cache_hit: Some(page.cache_hit),
+                            index_hit: Some(page.index_hit),
+                            index_status: Some(page.index_status.to_string()),
+                            indexed_through_offset: Some(page.indexed_through_offset),
+                        }),
+                        Some(HistoryReadMetrics {
+                            start_offset: page.start_offset,
+                            end_offset: page.end_offset,
+                            scan_bytes: page.scan_bytes,
+                            cache_hit: page.cache_hit,
+                            index_hit: page.index_hit,
+                            index_status: page.index_status,
+                            indexed_through_offset: page.indexed_through_offset,
+                        }),
+                    ));
+                }
+            }
             let parser = build_agent_parser(at);
             match parser.get_conversation(&eid) {
-                Ok(d) => Ok((
-                    d.turns,
-                    d.session_stats,
-                    None,
-                    d.summary.title,
-                    d.summary.model,
-                    d.transcript_watermark,
-                )),
+                Ok(mut d) => {
+                    let page = history_request_for_parse
+                        .as_ref()
+                        .map(|request| paginate_parsed_turns(&mut d.turns, request))
+                        .transpose()?;
+                    Ok((
+                        d.turns,
+                        d.session_stats,
+                        None,
+                        d.summary.title,
+                        d.summary.model,
+                        d.transcript_watermark,
+                        page,
+                        None,
+                    ))
+                }
                 Err(crate::parsers::ParseError::ConversationNotFound(_)) => {
                     // The external_id may no longer match any local file —
                     // e.g. an ACP session UUID (OpenClaw, Cline) or a stale
@@ -1254,7 +2352,11 @@ pub async fn get_folder_conversation_core(
                                 });
                             if let Some(conv) = matched {
                                 let new_ext_id = conv.id.clone();
-                                if let Ok(d) = parser.get_conversation(&new_ext_id) {
+                                if let Ok(mut d) = parser.get_conversation(&new_ext_id) {
+                                    let page = history_request_for_parse
+                                        .as_ref()
+                                        .map(|request| paginate_parsed_turns(&mut d.turns, request))
+                                        .transpose()?;
                                     return Ok((
                                         d.turns,
                                         d.session_stats,
@@ -1262,12 +2364,14 @@ pub async fn get_folder_conversation_core(
                                         d.summary.title,
                                         d.summary.model,
                                         d.transcript_watermark,
+                                        page,
+                                        None,
                                     ));
                                 }
                             }
                         }
                     }
-                    Ok((vec![], None, None, None, None, None))
+                    Ok((vec![], None, None, None, None, None, None, None))
                 }
                 Err(e) => Err(parse_error_to_app_error(e)),
             }
@@ -1280,8 +2384,37 @@ pub async fn get_folder_conversation_core(
             .with_detail(e.to_string())
         })??
     } else {
-        (vec![], None, None, None, None, None)
+        (
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            None,
+            history_request.as_ref().map(|_| ConversationHistoryPage {
+                next_cursor: None,
+                has_more: false,
+                loaded_turns: 0,
+                ..ConversationHistoryPage::default()
+            }),
+            None,
+        )
     };
+    let session_parse_elapsed_ms = parse_started.elapsed().as_millis() as u64;
+
+    // A snapshot fallback is injected into the first ACP prompt so an agent
+    // without native session/fork receives the source context. It is transport
+    // metadata, not user-authored text; remove it from persisted history while
+    // preserving the actual prompt that follows in later text blocks.
+    if conversation_branch_service::get_info(conn, conversation_id)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|info| info.fork_mode == "snapshot")
+    {
+        strip_branch_snapshot_context(&mut turns);
+    }
+    strip_branch_merge_context(&mut turns);
 
     // If we resolved a different external_id (e.g. ACP UUID → parser branch ID),
     // update the database so future lookups are direct.
@@ -1303,7 +2436,11 @@ pub async fn get_folder_conversation_core(
     }
 
     let mut summary = summary;
-    summary.message_count = turns.len() as u32;
+    if history_page.is_some() {
+        summary.message_count = summary.message_count.max(turns.len() as u32);
+    } else {
+        summary.message_count = turns.len() as u32;
+    }
     // The transcript is the richer source for the session's model. Codex is
     // the concrete case: an ACP-driven row is created before any
     // `turn_context` names a model, so the DB column can stay NULL forever
@@ -1326,10 +2463,125 @@ pub async fn get_folder_conversation_core(
     // `parent_id = summary.id` to repopulate it from the DB. Failure to
     // fetch children silently degrades to "no button on the card" (the
     // pre-fix behavior), never to a failed detail load.
+    let related_db_started = std::time::Instant::now();
+    let children_db_started = std::time::Instant::now();
     let children = conversation_service::list_children(conn, conversation_id)
         .await
         .unwrap_or_default();
+    let children_db_elapsed_ms = children_db_started.elapsed().as_millis() as u64;
     inject_delegation_meta(&mut turns, &children);
+    // Authored branch merges live in Codeg's durable DB rather than the
+    // agent-owned transcript. Append them only to the newest history page;
+    // older cursor pages must not repeat the same synthetic turns.
+    let newest_page = history_request
+        .as_ref()
+        .is_none_or(|request| request.before_cursor.is_none());
+    let merge_db_started = std::time::Instant::now();
+    if newest_page {
+        for merge in
+            conversation_branch_service::merge_previews_for_target(conn, conversation_id, 20)
+                .await
+                .map_err(AppCommandError::from)?
+        {
+            let user_turn = MessageTurn {
+                id: format!("branch-merge-{}", merge.id),
+                role: TurnRole::User,
+                blocks: vec![ContentBlock::Text {
+                    text: format!("合并分支 #{} 的成果", merge.branch_conversation_id),
+                }],
+                timestamp: merge.created_at,
+                usage: None,
+                duration_ms: None,
+                model: None,
+                completed_at: Some(merge.created_at),
+                agent_message_id: None,
+            };
+            let mut preview = merge.summary_preview;
+            if merge.summary_bytes > preview.len() as i64 {
+                let reference = DeferredHistoryContentRef {
+                    version: 1,
+                    conversation_id,
+                    start_offset: 0,
+                    end_offset: 0,
+                    kind: "branch_merge".into(),
+                    tool_use_id: Some(merge.id.clone()),
+                    // The immutable DB id is authoritative for branch returns;
+                    // unlike rollout slices, no content hash is needed to
+                    // disambiguate repeated tool blocks inside one byte range.
+                    content_sha256: String::new(),
+                };
+                if let Some(encoded) = encode_deferred_history_ref(&reference) {
+                    preview.push_str(&format!(
+                        "\n\n{HISTORY_DEFERRED_BRANCH_MERGE_MARKER_PREFIX}{encoded}-->"
+                    ));
+                }
+            }
+            let assistant_turn = MessageTurn {
+                id: format!("branch-merge-{}-result", merge.id),
+                role: TurnRole::Assistant,
+                blocks: vec![ContentBlock::Text { text: preview }],
+                timestamp: merge.created_at,
+                usage: None,
+                duration_ms: None,
+                model: None,
+                completed_at: Some(merge.created_at),
+                agent_message_id: None,
+            };
+            for merge_turn in [user_turn, assistant_turn] {
+                let index = turns.partition_point(|turn| turn.timestamp <= merge_turn.timestamp);
+                turns.insert(index, merge_turn);
+            }
+        }
+    }
+    let merge_db_elapsed_ms = merge_db_started.elapsed().as_millis() as u64;
+    if let Some(window) = history_read_metrics {
+        defer_heavy_tool_outputs(&mut turns, conversation_id, window);
+    }
+    let artifacts_db_started = std::time::Instant::now();
+    let artifact_runs = if history_page.is_some() {
+        artifact_service::list_for_turn_window(conn, conversation_id, &turns)
+            .await
+            .map_err(AppCommandError::from)?
+    } else {
+        artifact_service::list_for_conversation(conn, conversation_id)
+            .await
+            .map_err(AppCommandError::from)?
+    };
+    let artifacts_db_elapsed_ms = artifacts_db_started.elapsed().as_millis() as u64;
+    let deliverables_db_started = std::time::Instant::now();
+    let deliverable_runs = deliverable_service::list_sets_for_turns(conn, conversation_id, &turns)
+        .await
+        .map_err(AppCommandError::from)?;
+    let deliverables_db_elapsed_ms = deliverables_db_started.elapsed().as_millis() as u64;
+    // Conversation detail owns only outputs that can be attached to a user
+    // turn in this history page. The conversation-wide ledger is fetched
+    // lazily from the dedicated history endpoint; returning it here caused old
+    // outputs to be rendered as one giant footer under the latest reply.
+    let deliverables = Vec::new();
+    let related_db_elapsed_ms = related_db_started.elapsed().as_millis() as u64;
+
+    tracing::info!(
+        route = "get_folder_conversation",
+        conversation_id,
+        bounded_history = history_page.is_some(),
+        loaded_turns = turns.len(),
+        summary_db_elapsed_ms,
+        session_parse_elapsed_ms,
+        jsonl_read_bytes = history_read_metrics
+            .map(|metrics| metrics.end_offset.saturating_sub(metrics.start_offset)),
+        jsonl_scan_bytes = history_read_metrics.map(|metrics| metrics.scan_bytes),
+        parser_cache_hit = history_read_metrics.is_some_and(|metrics| metrics.cache_hit),
+        offset_index_hit = history_read_metrics.is_some_and(|metrics| metrics.index_hit),
+        index_status = history_read_metrics.map(|metrics| metrics.index_status),
+        indexed_through_offset = history_read_metrics.map(|metrics| metrics.indexed_through_offset),
+        related_db_elapsed_ms,
+        children_db_elapsed_ms,
+        merge_db_elapsed_ms,
+        artifacts_db_elapsed_ms,
+        deliverables_db_elapsed_ms,
+        total_elapsed_ms = total_started.elapsed().as_millis() as u64,
+        "[conversation][perf] detail data loaded"
+    );
 
     Ok((
         DbConversationDetail {
@@ -1343,9 +2595,74 @@ pub async fn get_folder_conversation_core(
             assistant_turns_before_offset: None,
             prefix_hash: None,
             uncovered_prefix_max_ts: None,
+            artifact_runs,
+            deliverables,
+            deliverable_runs,
+            history_page,
+            branch_history: None,
         },
         parsed_title,
     ))
+}
+
+pub(crate) async fn get_folder_conversation_raw_core(
+    conn: &sea_orm::DatabaseConnection,
+    conversation_id: i32,
+) -> Result<(DbConversationDetail, Option<String>), AppCommandError> {
+    get_folder_conversation_raw_impl(conn, conversation_id, None).await
+}
+
+pub(crate) fn strip_branch_snapshot_context(turns: &mut [MessageTurn]) {
+    let Some(first_user) = turns
+        .iter_mut()
+        .find(|turn| matches!(turn.role, TurnRole::User))
+    else {
+        return;
+    };
+    strip_context_marker_from_turn(
+        first_user,
+        "<codeg-branch-context>",
+        "</codeg-branch-context>",
+    );
+    first_user.blocks.retain(|block| {
+        !matches!(
+            block,
+            ContentBlock::Image { uri: Some(uri), .. }
+                if uri.starts_with("codeg-branch-context://")
+        )
+    });
+}
+
+pub(crate) fn strip_branch_merge_context(turns: &mut [MessageTurn]) {
+    for turn in turns
+        .iter_mut()
+        .filter(|turn| matches!(turn.role, TurnRole::User))
+    {
+        strip_context_marker_from_turn(
+            turn,
+            "<codeg-branch-merge-context>",
+            "</codeg-branch-merge-context>",
+        );
+    }
+}
+
+fn strip_context_marker_from_turn(turn: &mut MessageTurn, opening: &str, closing: &str) {
+    turn.blocks.retain_mut(|block| {
+        let ContentBlock::Text { text } = block else {
+            return true;
+        };
+        while let Some(start) = text.find(opening) {
+            let Some(relative_end) = text[start..].find(closing) else {
+                break;
+            };
+            let end = start + relative_end + closing.len();
+            let mut visible = String::new();
+            visible.push_str(&text[..start]);
+            visible.push_str(text[end..].trim_start_matches(['\r', '\n']));
+            *text = visible;
+        }
+        !text.trim().is_empty()
+    });
 }
 
 /// A normalized, comparable view of a user turn's renderable content. Used to
@@ -1544,9 +2861,9 @@ fn apply_turn_window(
 /// reply persisted after it mid-stream. A no-op (one cheap lock pass) when no turn
 /// is in flight. Shared by the Tauri command and the web handler.
 ///
-/// `window`: when set, the response's `turns` are sliced to the requested
-/// window AFTER all full-list post-processing (the summary counts, stats and
-/// watermark keep describing the full transcript).
+/// `window` is the legacy index-window compatibility path. New callers pass a
+/// `ConversationHistoryRequest`, which seeks and parses only the requested
+/// JSONL byte page before applying the same live-state overlays.
 pub async fn get_folder_conversation_with_live_core(
     conn: &sea_orm::DatabaseConnection,
     manager: &crate::acp::manager::ConnectionManager,
@@ -1555,7 +2872,51 @@ pub async fn get_folder_conversation_with_live_core(
     conversation_id: i32,
     window: Option<crate::commands::turn_window::TurnWindowReq>,
 ) -> Result<DbConversationDetail, AppCommandError> {
-    let (mut detail, parsed_title) = get_folder_conversation_core(conn, conversation_id).await?;
+    get_folder_conversation_with_live_impl(
+        conn,
+        manager,
+        chat_channel_manager,
+        emitter,
+        conversation_id,
+        None,
+        window,
+    )
+    .await
+}
+
+pub async fn get_folder_conversation_page_with_live_core(
+    conn: &sea_orm::DatabaseConnection,
+    manager: &crate::acp::manager::ConnectionManager,
+    chat_channel_manager: &crate::chat_channel::manager::ChatChannelManager,
+    emitter: &EventEmitter,
+    conversation_id: i32,
+    request: ConversationHistoryRequest,
+) -> Result<DbConversationDetail, AppCommandError> {
+    get_folder_conversation_with_live_impl(
+        conn,
+        manager,
+        chat_channel_manager,
+        emitter,
+        conversation_id,
+        Some(request),
+        None,
+    )
+    .await
+}
+
+async fn get_folder_conversation_with_live_impl(
+    conn: &sea_orm::DatabaseConnection,
+    manager: &crate::acp::manager::ConnectionManager,
+    chat_channel_manager: &crate::chat_channel::manager::ChatChannelManager,
+    emitter: &EventEmitter,
+    conversation_id: i32,
+    history_request: Option<ConversationHistoryRequest>,
+    window: Option<crate::commands::turn_window::TurnWindowReq>,
+) -> Result<DbConversationDetail, AppCommandError> {
+    let (mut detail, parsed_title) = match history_request {
+        Some(request) => get_folder_conversation_page_core(conn, conversation_id, request).await?,
+        None => get_folder_conversation_core(conn, conversation_id).await?,
+    };
 
     // Per-turn auto-title backfill. The parse `get_folder_conversation_core`
     // just did already produced the session-file title; adopt it (and broadcast
@@ -1637,6 +2998,14 @@ pub async fn get_folder_conversation_turns_core(
     limit: usize,
 ) -> Result<ConversationTurnsPage, AppCommandError> {
     use crate::commands::turn_window;
+    let summary = conversation_service::get_by_id(conn, conversation_id)
+        .await
+        .map_err(AppCommandError::from)?;
+    if summary.agent_type == AgentType::Codex && summary.external_id.is_some() {
+        return Err(AppCommandError::invalid_input(
+            "Index-based Codex history pagination is retired; use the opaque history cursor",
+        ));
+    }
     let (detail, _parsed_title) = get_folder_conversation_core(conn, conversation_id).await?;
     let turns = detail.turns;
     let (start, end) = turn_window::resolve_page_bounds(&turns, before_index, limit);
@@ -1655,6 +3024,7 @@ pub async fn get_folder_conversation_turns_core(
 
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
+#[allow(clippy::too_many_arguments)]
 pub async fn get_folder_conversation(
     app: tauri::AppHandle,
     db: tauri::State<'_, AppDatabase>,
@@ -1663,17 +3033,110 @@ pub async fn get_folder_conversation(
     conversation_id: i32,
     tail_turns: Option<usize>,
     from_index: Option<usize>,
+    before_cursor: Option<String>,
+    user_turn_limit: Option<u32>,
+    request_generation: Option<u64>,
 ) -> Result<DbConversationDetail, AppCommandError> {
-    let window = resolve_turn_window_req(tail_turns, from_index)?;
-    get_folder_conversation_with_live_core(
+    tracing::info!(
+        route = "get_folder_conversation",
+        conversation_id,
+        request_generation,
+        cursor = before_cursor.as_deref(),
+        page_size = user_turn_limit,
+        "[conversation][perf] desktop detail request started"
+    );
+    let emitter = EventEmitter::Tauri(app);
+    if tail_turns.is_some() && from_index.is_some() {
+        return Err(AppCommandError::invalid_input(
+            "tailTurns and fromIndex are mutually exclusive",
+        ));
+    }
+    if from_index.is_some() {
+        return Err(AppCommandError::invalid_input(
+            "fromIndex is retired for conversation opens; use beforeCursor",
+        ));
+    }
+    if tail_turns.is_some() {
+        tracing::warn!(
+            conversation_id,
+            "[conversation][perf] deprecated tailTurns was converted to bounded cursor history"
+        );
+    }
+    get_folder_conversation_page_with_live_core(
         &db.conn,
         &manager,
         &chat_channel_manager,
-        &EventEmitter::Tauri(app),
+        &emitter,
         conversation_id,
-        window,
+        ConversationHistoryRequest {
+            before_cursor,
+            user_turn_limit: user_turn_limit.unwrap_or(DEFAULT_HISTORY_PAGE_USER_TURNS),
+            cancellation: None,
+        },
     )
     .await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn get_deferred_history_content(
+    db: tauri::State<'_, AppDatabase>,
+    reference: String,
+) -> Result<DeferredHistoryContent, AppCommandError> {
+    get_deferred_history_content_core(&db.conn, reference).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn list_conversation_branch_merges(
+    db: tauri::State<'_, AppDatabase>,
+    conversation_id: i32,
+    offset: Option<u64>,
+    limit: Option<u64>,
+) -> Result<conversation_branch_service::ConversationBranchMergePreviewPage, AppCommandError> {
+    list_conversation_branch_merges_core(
+        &db.conn,
+        conversation_id,
+        offset.unwrap_or(0),
+        limit.unwrap_or(20),
+    )
+    .await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn list_conversation_branches(
+    db: tauri::State<'_, AppDatabase>,
+    conversation_id: i32,
+    offset: Option<u64>,
+    limit: Option<u64>,
+) -> Result<conversation_branch_service::ConversationSourceBranchPreviewPage, AppCommandError> {
+    list_conversation_branches_core(
+        &db.conn,
+        conversation_id,
+        offset.unwrap_or(0),
+        limit.unwrap_or(20),
+    )
+    .await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn list_conversation_output_window(
+    db: tauri::State<'_, AppDatabase>,
+    conversation_id: i32,
+    turn_refs: Vec<VisibleConversationTurnRef>,
+) -> Result<ConversationOutputWindow, AppCommandError> {
+    list_conversation_output_window_core(&db.conn, conversation_id, turn_refs).await
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn diagnose_codex_rollout_size(
+    db: tauri::State<'_, AppDatabase>,
+    conversation_id: i32,
+) -> Result<crate::parsers::codex::CodexRolloutSizeDiagnostics, AppCommandError> {
+    diagnose_codex_rollout_size_core(&db.conn, conversation_id).await
 }
 
 #[cfg(feature = "tauri-runtime")]
@@ -1817,8 +3280,7 @@ pub(crate) fn spawn_sync_conversation_title_until_current(
     conversation_id: i32,
 ) {
     tokio::spawn(async move {
-        sync_conversation_title_until_current(&conn, &chat_channel_manager, conversation_id)
-            .await;
+        sync_conversation_title_until_current(&conn, &chat_channel_manager, conversation_id).await;
     });
 }
 
@@ -2177,19 +3639,20 @@ pub async fn create_chat_conversation_core(
     // soft-deleting the just-created hidden folder — otherwise it would linger as
     // an orphan (active, conversation-less, never reached by the delete path) and
     // pollute the active-folder scope.
-    let model =
-        match conversation_service::create_chat(conn, folder.id, agent_type, title, None).await {
-            Ok(model) => model,
-            Err(create_err) => {
-                if let Err(cleanup_err) = folder_service::remove_folder(conn, &folder.path).await {
-                    tracing::error!(
+    let model = match conversation_service::create_chat(conn, folder.id, agent_type, title, None)
+        .await
+    {
+        Ok(model) => model,
+        Err(create_err) => {
+            if let Err(cleanup_err) = folder_service::remove_folder(conn, &folder.path).await {
+                tracing::error!(
                         "[conversations] failed to clean up orphan chat folder {} after conversation create error: {cleanup_err}",
                         folder.id
                     );
-                }
-                return Err(AppCommandError::from(create_err));
             }
-        };
+            return Err(AppCommandError::from(create_err));
+        }
+    };
 
     Ok(CreateChatConversationResult {
         conversation_id: model.id,
@@ -2231,7 +3694,9 @@ pub async fn create_chat_conversation(
 /// conversation are still created lazily on first send (reusing this dir).
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
-pub async fn create_chat_dir(app: tauri::AppHandle) -> Result<CreateChatDirResult, AppCommandError> {
+pub async fn create_chat_dir(
+    app: tauri::AppHandle,
+) -> Result<CreateChatDirResult, AppCommandError> {
     use tauri::Manager;
     let data_dir = app
         .path()
@@ -2327,7 +3792,8 @@ pub async fn update_conversation_title(
 ) -> Result<(), AppCommandError> {
     update_conversation_title_core(&db.conn, conversation_id, title).await?;
     emit_conversation_upsert(&EventEmitter::Tauri(app), &db.conn, conversation_id).await;
-    sync_conversation_title_to_channels_core(&db.conn, &chat_channel_manager, conversation_id).await;
+    sync_conversation_title_to_channels_core(&db.conn, &chat_channel_manager, conversation_id)
+        .await;
     Ok(())
 }
 
@@ -2514,6 +3980,134 @@ mod tests {
     /// locks can't deadlock. Held for the whole test body.
     static IMPORT_GUARD_SERIALIZER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+    #[test]
+    fn snapshot_bootstrap_context_is_not_rendered_as_user_authored_text() {
+        let now = chrono::Utc::now();
+        let mut turns = vec![MessageTurn {
+            id: "branch-first-prompt".into(),
+            agent_message_id: None,
+            role: TurnRole::User,
+            blocks: vec![
+                ContentBlock::Text {
+                    text: "<codeg-branch-context>\nprivate source snapshot\n</codeg-branch-context>"
+                        .into(),
+                },
+                ContentBlock::Text {
+                    text: "<codeg-branch-merge-context>\nprivate merged result\n</codeg-branch-merge-context>"
+                        .into(),
+                },
+                ContentBlock::Text {
+                    text: "continue from the branch".into(),
+                },
+                ContentBlock::Image {
+                    data: "inherited".into(),
+                    mime_type: "image/png".into(),
+                    uri: Some("codeg-branch-context://image/0".into()),
+                },
+                ContentBlock::Image {
+                    data: "current".into(),
+                    mime_type: "image/png".into(),
+                    uri: Some("clipboard://current".into()),
+                },
+            ],
+            timestamp: now,
+            usage: None,
+            duration_ms: None,
+            model: None,
+            completed_at: None,
+        }];
+
+        strip_branch_snapshot_context(&mut turns);
+        strip_branch_merge_context(&mut turns);
+
+        assert_eq!(turns[0].blocks.len(), 2);
+        let ContentBlock::Text { text } = &turns[0].blocks[0] else {
+            panic!("expected visible user text")
+        };
+        assert_eq!(text, "continue from the branch");
+        assert!(matches!(
+            &turns[0].blocks[1],
+            ContentBlock::Image { uri: Some(uri), .. } if uri == "clipboard://current"
+        ));
+    }
+
+    #[test]
+    fn branch_history_boundary_is_fixed_and_excludes_later_source_turns() {
+        let base = chrono::DateTime::parse_from_rfc3339("2026-08-22T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let turn = |id: &str, seconds: i64| MessageTurn {
+            id: id.into(),
+            agent_message_id: None,
+            role: TurnRole::User,
+            blocks: vec![ContentBlock::Text { text: id.into() }],
+            timestamp: base + chrono::Duration::seconds(seconds),
+            usage: None,
+            duration_ms: None,
+            model: None,
+            completed_at: Some(base + chrono::Duration::seconds(seconds)),
+        };
+        let turns = vec![
+            turn("early", 1),
+            turn("fork-point", 2),
+            turn("source-after-fork", 3),
+        ];
+
+        assert_eq!(
+            branch_inherited_end(&turns, Some("fork-point"), None, 99),
+            2,
+            "an explicit message boundary wins over a stale count"
+        );
+        assert_eq!(
+            branch_inherited_end(&turns, None, Some(base + chrono::Duration::seconds(2)), 99,),
+            2,
+            "source messages persisted after the fork timestamp cannot leak"
+        );
+        assert_eq!(branch_inherited_end(&turns, None, None, 1), 1);
+
+        let source_ids = ["early".to_string(), "fork-point".to_string()]
+            .into_iter()
+            .collect();
+        let fork_rollout = vec![
+            turn("early", 1),
+            turn("fork-point", 2),
+            turn("branch-first-prompt", 4),
+        ];
+        assert_eq!(
+            native_branch_local_start(
+                &fork_rollout,
+                &source_ids,
+                Some(base + chrono::Duration::seconds(2)),
+            ),
+            2,
+            "the copied native-fork prefix is rendered only through the source reference"
+        );
+        assert!(inherited_run_belongs_to_boundary(
+            base + chrono::Duration::seconds(1),
+            None,
+            &source_ids,
+            Some(base + chrono::Duration::seconds(2)),
+        ));
+        assert!(!inherited_run_belongs_to_boundary(
+            base + chrono::Duration::seconds(3),
+            None,
+            &source_ids,
+            Some(base + chrono::Duration::seconds(2)),
+        ));
+        assert!(inherited_run_belongs_to_boundary(
+            base + chrono::Duration::seconds(99),
+            Some("fork-point"),
+            &source_ids,
+            Some(base + chrono::Duration::seconds(2)),
+        ));
+        assert!(!inherited_run_belongs_to_boundary(
+            base + chrono::Duration::seconds(1),
+            Some("source-after-fork"),
+            &source_ids,
+            Some(base + chrono::Duration::seconds(2)),
+        ));
+    }
+
     // ──────────────────────────────────────────────────────────────────────
     // Delegation meta injection for historical reload. Parsers always emit
     // `ContentBlock::ToolUse { meta: None }`; without this helper, a
@@ -2632,6 +4226,63 @@ mod tests {
         }
     }
 
+    #[test]
+    fn parsed_history_pages_preserve_order_and_advance_the_cursor() {
+        let mut turns = vec![
+            user_text_turn("u1", "one", at(0)),
+            assistant_text_turn("a1", "one reply", at(1), true),
+            user_text_turn("u2", "two", at(2)),
+            assistant_text_turn("a2", "two reply", at(3), true),
+            user_text_turn("u3", "three", at(4)),
+            assistant_text_turn("a3", "three reply", at(5), true),
+        ];
+        let page = paginate_parsed_turns(
+            &mut turns,
+            &ConversationHistoryRequest {
+                before_cursor: None,
+                user_turn_limit: 2,
+                cancellation: None,
+            },
+        )
+        .expect("latest page");
+        assert_eq!(
+            turns
+                .iter()
+                .map(|turn| turn.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["u2", "a2", "u3", "a3"]
+        );
+        assert_eq!(page.next_cursor.as_deref(), Some("turn:2"));
+        assert!(page.has_more);
+
+        let mut all_turns = vec![
+            user_text_turn("u1", "one", at(0)),
+            assistant_text_turn("a1", "one reply", at(1), true),
+            user_text_turn("u2", "two", at(2)),
+            assistant_text_turn("a2", "two reply", at(3), true),
+            user_text_turn("u3", "three", at(4)),
+            assistant_text_turn("a3", "three reply", at(5), true),
+        ];
+        let earlier = paginate_parsed_turns(
+            &mut all_turns,
+            &ConversationHistoryRequest {
+                before_cursor: page.next_cursor,
+                user_turn_limit: 2,
+                cancellation: None,
+            },
+        )
+        .expect("earlier page");
+        assert_eq!(
+            all_turns
+                .iter()
+                .map(|turn| turn.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["u1", "a1"]
+        );
+        assert!(!earlier.has_more);
+        assert!(earlier.next_cursor.is_none());
+    }
+
     fn pending_text(message_id: &str, text: &str) -> crate::acp::session_state::PendingUserMessage {
         crate::acp::session_state::PendingUserMessage {
             message_id: message_id.into(),
@@ -2648,11 +4299,21 @@ mod tests {
             assistant_text_turn("turn-1", "reply", at(-29), true),
             user_text_turn("turn-2", "hello", at(1)),
         ];
-        let stamped =
-            apply_in_flight_message_id(&mut turns, &pending_text("msg-live", "hello"), Some(turn_started()));
-        assert_eq!(stamped.as_deref(), Some("msg-live"), "reports the stamped id");
+        let stamped = apply_in_flight_message_id(
+            &mut turns,
+            &pending_text("msg-live", "hello"),
+            Some(turn_started()),
+        );
+        assert_eq!(
+            stamped.as_deref(),
+            Some("msg-live"),
+            "reports the stamped id"
+        );
         assert_eq!(turns[2].id, "msg-live");
-        assert_eq!(turns[0].id, "turn-0", "earlier identical-position turn intact");
+        assert_eq!(
+            turns[0].id, "turn-0",
+            "earlier identical-position turn intact"
+        );
         assert_eq!(turns[1].id, "turn-1");
     }
 
@@ -2671,11 +4332,18 @@ mod tests {
             user_text_turn("turn-0", "hello", at(1)),
             assistant_text_turn("turn-1", "partial...", at(2), true),
         ];
-        let stamped =
-            apply_in_flight_message_id(&mut turns, &pending_text("msg-live", "hello"), Some(turn_started()));
+        let stamped = apply_in_flight_message_id(
+            &mut turns,
+            &pending_text("msg-live", "hello"),
+            Some(turn_started()),
+        );
         assert_eq!(stamped.as_deref(), Some("msg-live"));
         assert_eq!(turns[0].id, "msg-live");
-        assert_eq!(turns.len(), 2, "the partial reply is preserved (not dropped)");
+        assert_eq!(
+            turns.len(),
+            2,
+            "the partial reply is preserved (not dropped)"
+        );
         assert_eq!(turns[1].id, "turn-1", "the partial reply is untouched");
     }
 
@@ -2706,10 +4374,16 @@ mod tests {
             assistant_text_turn("turn-1", "reply", at(-29), true),
             user_text_turn("turn-2", "hello", at(1)),
         ];
-        let stamped =
-            apply_in_flight_message_id(&mut turns, &pending_text("turn-0", "hello"), Some(turn_started()));
+        let stamped = apply_in_flight_message_id(
+            &mut turns,
+            &pending_text("turn-0", "hello"),
+            Some(turn_started()),
+        );
         assert_eq!(stamped, None, "colliding broadcast id → no stamp");
-        assert_eq!(turns[2].id, "turn-2", "the in-flight prompt keeps its parser id");
+        assert_eq!(
+            turns[2].id, "turn-2",
+            "the in-flight prompt keeps its parser id"
+        );
         assert_eq!(turns[0].id, "turn-0", "the colliding turn is untouched");
     }
 
@@ -2724,9 +4398,16 @@ mod tests {
             user_text_turn("turn-2", "ok", at(1)),
             assistant_text_turn("turn-3", "b", at(2), false),
         ];
-        apply_in_flight_message_id(&mut turns, &pending_text("msg-live", "hello"), Some(turn_started()));
+        apply_in_flight_message_id(
+            &mut turns,
+            &pending_text("msg-live", "hello"),
+            Some(turn_started()),
+        );
         assert_eq!(turns[0].id, "turn-0");
-        assert_eq!(turns[2].id, "turn-2", "non-matching tail user turn untouched");
+        assert_eq!(
+            turns[2].id, "turn-2",
+            "non-matching tail user turn untouched"
+        );
     }
 
     #[test]
@@ -2738,7 +4419,11 @@ mod tests {
             assistant_text_turn("turn-1", "a", at(2), false),
             assistant_text_turn("turn-2", "b", at(3), false),
         ];
-        apply_in_flight_message_id(&mut turns, &pending_text("msg-live", "hello"), Some(turn_started()));
+        apply_in_flight_message_id(
+            &mut turns,
+            &pending_text("msg-live", "hello"),
+            Some(turn_started()),
+        );
         assert_eq!(turns[0].id, "turn-0", "left untouched");
     }
 
@@ -2759,30 +4444,43 @@ mod tests {
             completed_at: None,
         agent_message_id: None,
         };
-        let pending_image = |message_id: &str, data: &str| {
-            crate::acp::session_state::PendingUserMessage {
+        let pending_image =
+            |message_id: &str, data: &str| crate::acp::session_state::PendingUserMessage {
                 message_id: message_id.into(),
                 blocks: vec![crate::acp::types::UserMessageBlock::Image {
                     data: data.into(),
                     mime_type: "image/png".into(),
                 }],
-            }
-        };
+            };
 
         let mut turns = vec![image_turn("turn-0", "AAAA")];
-        apply_in_flight_message_id(&mut turns, &pending_image("msg-live", "AAAA"), Some(turn_started()));
-        assert_eq!(turns[0].id, "msg-live", "uri difference is ignored, data matches");
+        apply_in_flight_message_id(
+            &mut turns,
+            &pending_image("msg-live", "AAAA"),
+            Some(turn_started()),
+        );
+        assert_eq!(
+            turns[0].id, "msg-live",
+            "uri difference is ignored, data matches"
+        );
 
         let mut turns = vec![image_turn("turn-0", "AAAA")];
-        apply_in_flight_message_id(&mut turns, &pending_image("msg-live", "BBBB"), Some(turn_started()));
+        apply_in_flight_message_id(
+            &mut turns,
+            &pending_image("msg-live", "BBBB"),
+            Some(turn_started()),
+        );
         assert_eq!(turns[0].id, "turn-0", "different image bytes → no stamp");
     }
 
     #[test]
     fn empty_turns_is_a_noop() {
         let mut turns: Vec<MessageTurn> = vec![];
-        let stamped =
-            apply_in_flight_message_id(&mut turns, &pending_text("msg-live", "hello"), Some(turn_started()));
+        let stamped = apply_in_flight_message_id(
+            &mut turns,
+            &pending_text("msg-live", "hello"),
+            Some(turn_started()),
+        );
         assert_eq!(stamped, None);
         assert!(turns.is_empty());
     }
@@ -2800,7 +4498,11 @@ mod tests {
             user_text_turn("turn-0", "continue", at(-60)),
             assistant_text_turn("turn-1", "done", at(-58), true),
         ];
-        apply_in_flight_message_id(&mut turns, &pending_text("msg-live", "continue"), Some(turn_started()));
+        apply_in_flight_message_id(
+            &mut turns,
+            &pending_text("msg-live", "continue"),
+            Some(turn_started()),
+        );
         assert_eq!(turns[0].id, "turn-0", "older identical prompt → untouched");
     }
 
@@ -2819,8 +4521,15 @@ mod tests {
         // backend broadcasts `UserMessage` before issuing the agent request), so
         // a turn exactly at the start qualifies — the boundary is inclusive.
         let mut turns = vec![user_text_turn("turn-0", "hello", at(0))];
-        apply_in_flight_message_id(&mut turns, &pending_text("msg-live", "hello"), Some(turn_started()));
-        assert_eq!(turns[0].id, "msg-live", "persisted exactly at the start is in-flight");
+        apply_in_flight_message_id(
+            &mut turns,
+            &pending_text("msg-live", "hello"),
+            Some(turn_started()),
+        );
+        assert_eq!(
+            turns[0].id, "msg-live",
+            "persisted exactly at the start is in-flight"
+        );
     }
 
     #[test]
@@ -2828,8 +4537,15 @@ mod tests {
         // Strict gate, no backward tolerance: a turn even one second before the
         // start belongs to an earlier turn, never the in-flight prompt.
         let mut turns = vec![user_text_turn("turn-0", "hello", at(-1))];
-        apply_in_flight_message_id(&mut turns, &pending_text("msg-live", "hello"), Some(turn_started()));
-        assert_eq!(turns[0].id, "turn-0", "one second before the start is not in-flight");
+        apply_in_flight_message_id(
+            &mut turns,
+            &pending_text("msg-live", "hello"),
+            Some(turn_started()),
+        );
+        assert_eq!(
+            turns[0].id, "turn-0",
+            "one second before the start is not in-flight"
+        );
     }
 
     #[test]
@@ -2845,10 +4561,19 @@ mod tests {
             user_text_turn("turn-0", "continue", at(-1)),
             assistant_text_turn("turn-1", "done", at(0), true),
         ];
-        let stamped =
-            apply_in_flight_message_id(&mut turns, &pending_text("msg-live", "continue"), Some(turn_started()));
-        assert_eq!(stamped, None, "fast prior identical prompt → nothing reported");
-        assert_eq!(turns[0].id, "turn-0", "fast prior identical prompt → untouched");
+        let stamped = apply_in_flight_message_id(
+            &mut turns,
+            &pending_text("msg-live", "continue"),
+            Some(turn_started()),
+        );
+        assert_eq!(
+            stamped, None,
+            "fast prior identical prompt → nothing reported"
+        );
+        assert_eq!(
+            turns[0].id, "turn-0",
+            "fast prior identical prompt → untouched"
+        );
         assert_eq!(turns.len(), 2, "the prior completed reply is preserved");
     }
 
@@ -2905,7 +4630,11 @@ mod tests {
                  Call get_delegation_status with this id in the task_ids array.",
             ),
         ];
-        let mut child = summary_child(2890, "exec-0fb6db94-3042-4cc4-b492-2edd1804c1fa", "completed");
+        let mut child = summary_child(
+            2890,
+            "exec-0fb6db94-3042-4cc4-b492-2edd1804c1fa",
+            "completed",
+        );
         child.delegation_call_id = Some("8ff4c14c-740c-4482-b758-8f2091f97063".into());
 
         inject_delegation_meta(&mut turns, &[child]);
@@ -3525,7 +5254,10 @@ mod tests {
         .await
         .expect("gc");
 
-        assert_eq!(removed, 0, "a fresh dir below the staleness threshold is spared");
+        assert_eq!(
+            removed, 0,
+            "a fresh dir below the staleness threshold is spared"
+        );
         assert!(
             std::path::Path::new(&fresh).is_dir(),
             "fresh dir retained (anti-race)"
@@ -3605,13 +5337,10 @@ mod tests {
         symlink(real.path(), &link).expect("symlink");
 
         // GC runs under the symlinked spelling; the live dir must still be spared.
-        let removed = gc_orphan_chat_dirs_core_with_threshold(
-            &db.conn,
-            &link,
-            std::time::Duration::ZERO,
-        )
-        .await
-        .expect("gc");
+        let removed =
+            gc_orphan_chat_dirs_core_with_threshold(&db.conn, &link, std::time::Duration::ZERO)
+                .await
+                .expect("gc");
 
         assert_eq!(
             removed, 0,
@@ -4132,15 +5861,10 @@ mod tests {
         )
         .await;
 
-        notify_conversation_title_updates(
-            &db.conn,
-            &emitter,
-            &chat_channel_manager,
-            vec![row.id],
-        )
-        .await
-        .await
-        .expect("detached title sync task");
+        notify_conversation_title_updates(&db.conn, &emitter, &chat_channel_manager, vec![row.id])
+            .await
+            .await
+            .expect("detached title sync task");
 
         let recorded = title_edits.recorded().await;
         let current = conversation_service::get_by_id(&db.conn, row.id)
@@ -4299,7 +6023,9 @@ mod tests {
 
         let (broadcaster, emitter) = sync_test_emitter();
         let mut rx = broadcaster.subscribe();
-        delete_conversation_core(&db.conn, c1).await.expect("delete");
+        delete_conversation_core(&db.conn, c1)
+            .await
+            .expect("delete");
         cleanup_tabs_for_deleted_conversation(&emitter, &db.conn, c1).await;
 
         let snap = list_opened_tabs_core(&db.conn).await.expect("list");
@@ -4314,7 +6040,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_tabs_for_deleted_conversation_bumps_barrier_without_emitting_when_no_open_tab() {
+    async fn cleanup_tabs_for_deleted_conversation_bumps_barrier_without_emitting_when_no_open_tab()
+    {
         let db = fresh_in_memory_db().await;
         let folder_id = seed_folder(&db, "/tmp/codeg-tab-conv-del-noop").await;
         let c1 = create_conversation_core(&db.conn, folder_id, AgentType::ClaudeCode, None)
@@ -4395,7 +6122,9 @@ mod tests {
         assert_eq!(saved.version, 1);
 
         // Server deletes c1 and atomically cleans its tab → v2 (only c2 remains).
-        delete_conversation_core(&db.conn, c1).await.expect("delete c1");
+        delete_conversation_core(&db.conn, c1)
+            .await
+            .expect("delete c1");
         cleanup_tabs_for_deleted_conversation(&EventEmitter::Noop, &db.conn, c1).await;
 
         // A client still on the pre-cleanup version re-saves the OLD set (with c1
@@ -4461,7 +6190,10 @@ mod tests {
         )
         .await
         .expect("stale save returns Ok");
-        assert!(!stale.accepted, "save on the pre-removal version must be rejected");
+        assert!(
+            !stale.accepted,
+            "save on the pre-removal version must be rejected"
+        );
 
         let snap = list_opened_tabs_core(&db.conn).await.expect("list");
         assert!(
@@ -4500,11 +6232,16 @@ mod tests {
 
         // c1 deleted with no persisted c1 tab → zero rows removed, but the
         // version barrier still advances (v1 → v2) and nothing is broadcast.
-        delete_conversation_core(&db.conn, c1).await.expect("delete c1");
+        delete_conversation_core(&db.conn, c1)
+            .await
+            .expect("delete c1");
         let (broadcaster, emitter) = sync_test_emitter();
         let mut rx = broadcaster.subscribe();
         cleanup_tabs_for_deleted_conversation(&emitter, &db.conn, c1).await;
-        assert!(rx.try_recv().is_err(), "zero-row cleanup must not broadcast");
+        assert!(
+            rx.try_recv().is_err(),
+            "zero-row cleanup must not broadcast"
+        );
 
         // A's debounced save (built on v1, still including the now-deleted c1) is
         // rejected by the barrier — c1 must not be persisted as a ghost.
@@ -4543,8 +6280,8 @@ mod tests {
             &crate::chat_channel::manager::ChatChannelManager::new(),
             999_999,
         )
-            .await
-            .expect_err("missing folder must surface as error");
+        .await
+        .expect_err("missing folder must surface as error");
         let msg = format!("{err:?}");
         assert!(
             msg.to_lowercase().contains("not found") || msg.to_lowercase().contains("999999"),
@@ -5292,7 +7029,10 @@ mod tests {
             .unwrap();
         assert_eq!(folder_rows.len(), 1);
         assert_eq!(folder_rows[0].path, "/tmp/proj-a");
-        assert!(folder_rows[0].is_open, "created folder must open in sidebar");
+        assert!(
+            folder_rows[0].is_open,
+            "created folder must open in sidebar"
+        );
 
         let convs = conversation::Entity::find().all(&db.conn).await.unwrap();
         assert_eq!(convs.len(), 2);
@@ -5421,9 +7161,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn batch_import_restores_a_deleted_conversation_in_place() {
-        use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel, QueryFilter,
-            Set};
+    async fn batch_import_never_resurrects_a_deleted_conversation() {
+        use sea_orm::{
+            ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel, QueryFilter, Set,
+        };
         let db = fresh_in_memory_db().await;
 
         let make = || {
@@ -5639,8 +7380,8 @@ mod tests {
             &crate::chat_channel::manager::ChatChannelManager::new(),
             folder_id,
         )
-            .await
-            .expect_err("legacy import must be rejected while an import is in progress");
+        .await
+        .expect_err("legacy import must be rejected while an import is in progress");
         let msg = format!("{err:?}").to_lowercase();
         assert!(
             msg.contains("already in progress"),
@@ -5745,6 +7486,11 @@ mod tests {
             session_stats: None,
             transcript_watermark: Some(123),
             in_flight_user_turn_id: None,
+            artifact_runs: Vec::new(),
+            deliverables: Vec::new(),
+            deliverable_runs: Vec::new(),
+            history_page: None,
+            branch_history: None,
             turns_offset: None,
             turns_total: None,
             assistant_turns_before_offset: None,
@@ -5784,7 +7530,11 @@ mod tests {
         assert_eq!(detail.turns_total, Some(4));
         assert_eq!(detail.assistant_turns_before_offset, Some(1));
         assert_eq!(
-            detail.turns.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            detail
+                .turns
+                .iter()
+                .map(|t| t.id.as_str())
+                .collect::<Vec<_>>(),
             vec!["turn-2", "turn-3"]
         );
         // The windowed turns are the same objects the full response carries.
@@ -5868,10 +7618,206 @@ mod tests {
         assert_eq!((start, end), (0, 2));
         let own = crate::commands::turn_window::window_meta(&turns, start);
         let seam = crate::commands::turn_window::window_meta(&turns, 2);
-        assert_eq!(own.prefix_hash, crate::commands::turn_window::prefix_fingerprint(&[]));
+        assert_eq!(
+            own.prefix_hash,
+            crate::commands::turn_window::prefix_fingerprint(&[])
+        );
         assert_eq!(
             seam.prefix_hash,
             crate::commands::turn_window::prefix_fingerprint(&turns[..2])
+        );
+    }
+
+    #[test]
+    fn bounded_history_defers_large_tool_output_but_keeps_a_load_reference() {
+        let full = "工具输出".repeat(20_000);
+        let mut turns = vec![MessageTurn {
+            id: "assistant-1".into(),
+            agent_message_id: None,
+            role: TurnRole::Assistant,
+            blocks: vec![
+                ContentBlock::ToolUse {
+                    tool_use_id: Some("call-1".into()),
+                    tool_name: "exec_command".into(),
+                    input_preview: Some("echo test".into()),
+                    status: Some("completed".into()),
+                    meta: None,
+                },
+                ContentBlock::ToolResult {
+                    tool_use_id: Some("call-1".into()),
+                    output_preview: Some(full.clone()),
+                    is_error: false,
+                    agent_stats: None,
+                    images: Vec::new(),
+                },
+            ],
+            timestamp: at(0),
+            usage: None,
+            duration_ms: None,
+            model: None,
+            completed_at: Some(at(1)),
+        }];
+        defer_heavy_tool_outputs(
+            &mut turns,
+            26,
+            HistoryReadMetrics {
+                start_offset: 100,
+                end_offset: 200,
+                ..HistoryReadMetrics::default()
+            },
+        );
+        let ContentBlock::ToolUse { meta, .. } = &turns[0].blocks[0] else {
+            panic!("tool use")
+        };
+        let reference = meta
+            .as_ref()
+            .and_then(|meta| meta.pointer("/codeg.historyOutput/ref"))
+            .and_then(serde_json::Value::as_str)
+            .expect("deferred reference");
+        let decoded = URL_SAFE_NO_PAD.decode(reference).expect("decode ref");
+        let parsed: DeferredHistoryContentRef =
+            serde_json::from_slice(&decoded).expect("parse ref");
+        assert_eq!(parsed.conversation_id, 26);
+        assert_eq!(parsed.start_offset, 100);
+        assert_eq!(parsed.end_offset, 200);
+        assert_eq!(parsed.content_sha256, sha256_hex(&full));
+        let ContentBlock::ToolResult {
+            output_preview: Some(preview),
+            ..
+        } = &turns[0].blocks[1]
+        else {
+            panic!("tool result")
+        };
+        assert!(preview.len() < full.len() / 2);
+        assert!(preview.contains("deferred"));
+    }
+
+    #[test]
+    fn bounded_history_defers_large_images_without_losing_a_load_reference() {
+        let full = "a".repeat(HISTORY_IMAGE_DEFER_THRESHOLD_BYTES + 1);
+        let mut turns = vec![MessageTurn {
+            id: "user-1".into(),
+            agent_message_id: None,
+            role: TurnRole::User,
+            blocks: vec![ContentBlock::Image {
+                data: full.clone(),
+                mime_type: "image/png".into(),
+                uri: Some("clipboard://original.png".into()),
+            }],
+            timestamp: at(0),
+            usage: None,
+            duration_ms: None,
+            model: None,
+            completed_at: Some(at(1)),
+        }];
+        defer_heavy_tool_outputs(
+            &mut turns,
+            26,
+            HistoryReadMetrics {
+                start_offset: 100,
+                end_offset: 200,
+                ..HistoryReadMetrics::default()
+            },
+        );
+        let ContentBlock::Image { data, uri, .. } = &turns[0].blocks[0] else {
+            panic!("image")
+        };
+        assert!(data.is_empty());
+        let reference = uri
+            .as_deref()
+            .and_then(|uri| uri.strip_prefix(HISTORY_DEFERRED_IMAGE_URI_PREFIX))
+            .expect("deferred reference");
+        let decoded = URL_SAFE_NO_PAD.decode(reference).expect("decode ref");
+        let parsed: DeferredHistoryContentRef =
+            serde_json::from_slice(&decoded).expect("parse ref");
+        assert_eq!(parsed.kind, "image");
+        assert_eq!(parsed.conversation_id, 26);
+        assert_eq!(parsed.content_sha256, sha256_hex(&full));
+    }
+
+    #[test]
+    fn bounded_history_defers_large_reasoning_without_exposing_the_reference() {
+        let full = "分析过程".repeat(20_000);
+        let mut turns = vec![MessageTurn {
+            id: "assistant-reasoning".into(),
+            agent_message_id: None,
+            role: TurnRole::Assistant,
+            blocks: vec![ContentBlock::Thinking { text: full.clone() }],
+            timestamp: at(0),
+            usage: None,
+            duration_ms: None,
+            model: None,
+            completed_at: Some(at(1)),
+        }];
+        defer_heavy_tool_outputs(
+            &mut turns,
+            26,
+            HistoryReadMetrics {
+                start_offset: 100,
+                end_offset: 200,
+                ..HistoryReadMetrics::default()
+            },
+        );
+        let ContentBlock::Thinking { text } = &turns[0].blocks[0] else {
+            panic!("reasoning")
+        };
+        let encoded = text
+            .split_once(HISTORY_DEFERRED_REASONING_MARKER_PREFIX)
+            .and_then(|(_, marker)| marker.strip_suffix("-->"))
+            .expect("deferred reasoning reference");
+        let decoded = URL_SAFE_NO_PAD.decode(encoded).expect("decode ref");
+        let parsed: DeferredHistoryContentRef =
+            serde_json::from_slice(&decoded).expect("parse ref");
+        assert_eq!(parsed.kind, "reasoning");
+        assert_eq!(parsed.conversation_id, 26);
+        assert_eq!(parsed.content_sha256, sha256_hex(&full));
+        assert!(text.len() < full.len() / 2);
+    }
+
+    #[test]
+    fn bounded_history_payload_stays_small_with_tool_heavy_recent_rounds() {
+        let mut turns = (0..6)
+            .map(|index| MessageTurn {
+                id: format!("assistant-{index}"),
+                agent_message_id: None,
+                role: TurnRole::Assistant,
+                blocks: vec![
+                    ContentBlock::ToolUse {
+                        tool_use_id: Some(format!("call-{index}")),
+                        tool_name: "exec_command".into(),
+                        input_preview: Some("large command".into()),
+                        status: Some("completed".into()),
+                        meta: None,
+                    },
+                    ContentBlock::ToolResult {
+                        tool_use_id: Some(format!("call-{index}")),
+                        output_preview: Some("x".repeat(512_000)),
+                        is_error: false,
+                        agent_stats: None,
+                        images: Vec::new(),
+                    },
+                ],
+                timestamp: at(index),
+                usage: None,
+                duration_ms: None,
+                model: None,
+                completed_at: Some(at(index + 1)),
+            })
+            .collect::<Vec<_>>();
+        defer_heavy_tool_outputs(
+            &mut turns,
+            26,
+            HistoryReadMetrics {
+                start_offset: 100,
+                end_offset: 4_000_000,
+                ..HistoryReadMetrics::default()
+            },
+        );
+        let bytes = serde_json::to_vec(&turns).expect("serialize bounded turns");
+        assert!(
+            bytes.len() < 128 * 1024,
+            "deferred page stayed unexpectedly large: {} bytes",
+            bytes.len()
         );
     }
 }
