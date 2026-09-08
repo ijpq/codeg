@@ -101,23 +101,19 @@ vi.mock("@/lib/platform", () => ({
 vi.mock("@/lib/transport", () => ({
   isDesktop: () => false,
   getActiveRemoteConnectionId: () => null,
-  isDesktop: () => false,
 }))
 // A local-file link target routes to the workspace file column, whose provider
 // this suite deliberately renders without.
 vi.mock("@/hooks/use-open-file-target", () => ({
   useOpenFileTarget: () => async () => {},
 }))
-// The right-click menu refreshes the quick-message list as it opens; keep that
-// off the backend so the menu tests exercise only the menu.
-vi.mock("@/lib/api", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/lib/api")>()),
-  quickMessagesList: vi.fn(async () => []),
-}))
 vi.mock("@/lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/api")>()
   return {
     ...actual,
+    // The right-click menu refreshes this list as it opens; keep that request
+    // off the backend so the menu tests exercise only menu behavior.
+    quickMessagesList: vi.fn(async () => []),
     uploadAttachment: vi.fn(async (file: File) => ({
       path: `/tmp/${file.name}`,
       name: file.name,

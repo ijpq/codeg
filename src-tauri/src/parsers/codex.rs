@@ -1831,6 +1831,11 @@ fn current_history_index_status(
 }
 
 fn is_codex_user_boundary(line: &[u8]) -> bool {
+    if json_object_string_field(line, b"type")
+        .is_some_and(|record_type| !matches!(record_type, "event_msg" | "response_item"))
+    {
+        return false;
+    }
     // Most JSONL records are tool/output traffic. Avoid feeding their often
     // multi-megabyte payloads to serde just to discover they cannot start a
     // user round.
@@ -1877,6 +1882,76 @@ fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
             .any(|window| window == needle)
 }
 
+/// Read an unescaped top-level string field without deserializing the complete
+/// record. The depth-aware scan cannot mistake a nested payload `type` for the
+/// record type, including serde_json fixtures that sort `payload` before it.
+fn json_object_string_field<'a>(line: &'a [u8], field: &[u8]) -> Option<&'a str> {
+    let mut cursor = 0usize;
+    let mut depth = 0usize;
+    while cursor < line.len() {
+        match line[cursor] {
+            b'{' | b'[' => {
+                depth += 1;
+                cursor += 1;
+            }
+            b'}' | b']' => {
+                depth = depth.saturating_sub(1);
+                cursor += 1;
+            }
+            b'"' => {
+                let key_start = cursor + 1;
+                cursor = key_start;
+                let mut escaped = false;
+                while cursor < line.len() {
+                    match line[cursor] {
+                        b'\\' => {
+                            escaped = true;
+                            cursor = cursor.saturating_add(2);
+                        }
+                        b'"' => break,
+                        _ => cursor += 1,
+                    }
+                }
+                if cursor >= line.len() {
+                    return None;
+                }
+                let key_end = cursor;
+                cursor += 1;
+                if depth != 1 || escaped || &line[key_start..key_end] != field {
+                    continue;
+                }
+                while line.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+                    cursor += 1;
+                }
+                if line.get(cursor) != Some(&b':') {
+                    continue;
+                }
+                cursor += 1;
+                while line.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+                    cursor += 1;
+                }
+                if line.get(cursor) != Some(&b'"') {
+                    return None;
+                }
+                let value_start = cursor + 1;
+                cursor = value_start;
+                while cursor < line.len() {
+                    match line[cursor] {
+                        b'\\' => return None,
+                        b'"' => {
+                            return std::str::from_utf8(&line[value_start..cursor]).ok();
+                        }
+                        _ => cursor += 1,
+                    }
+                }
+                return None;
+            }
+            _ => cursor += 1,
+        }
+    }
+    None
+}
+
 /// Walk JSONL records backwards until `user_turn_limit` user-round boundaries
 /// have been found. Memory is bounded by the selected page (plus one JSONL
 /// record), not by the complete rollout; this is the critical difference for
@@ -1893,7 +1968,12 @@ fn find_codex_page_start(
     }
 
     let mut position = end_offset;
-    let mut suffix = Vec::<u8>::new();
+    // Chunks belonging to one cross-chunk JSONL record are retained as
+    // separate pieces and joined only once its preceding newline is found.
+    // Prepending each new chunk into one growing Vec made a 20 MiB record copy
+    // roughly 210 MiB and repeatedly scan the same suffix.
+    let mut suffix_chunks = Vec::<Vec<u8>>::new();
+    let mut suffix_bytes = 0usize;
     let mut boundaries = 0usize;
     let mut include_preceding_record = false;
     let scan_floor = max_scan_bytes
@@ -1914,10 +1994,9 @@ fn find_codex_page_start(
         let mut chunk = vec![0u8; read_len];
         file.seek(SeekFrom::Start(read_start))?;
         file.read_exact(&mut chunk)?;
-        chunk.extend_from_slice(&suffix);
-
         let mut line_end = chunk.len();
         let mut first_newline = None;
+        let mut joins_suffix = true;
         for newline in (0..chunk.len())
             .rev()
             .filter(|index| chunk[*index] == b'\n')
@@ -1935,18 +2014,37 @@ fn find_codex_page_start(
                     true,
                 ));
             }
-            if line_start < line_end && is_codex_user_boundary(&chunk[line_start..line_end]) {
+            let is_boundary = if joins_suffix && suffix_bytes > 0 {
+                let mut record = Vec::with_capacity(line_end - line_start + suffix_bytes);
+                record.extend_from_slice(&chunk[line_start..line_end]);
+                for piece in suffix_chunks.iter().rev() {
+                    record.extend_from_slice(piece);
+                }
+                is_codex_user_boundary(&record)
+            } else {
+                line_start < line_end && is_codex_user_boundary(&chunk[line_start..line_end])
+            };
+            if is_boundary {
                 boundaries += 1;
                 if boundaries >= user_turn_limit {
                     include_preceding_record = true;
                 }
             }
+            joins_suffix = false;
             line_end = newline;
         }
 
         let prefix_end = first_newline.unwrap_or(chunk.len());
-        suffix.clear();
-        suffix.extend_from_slice(&chunk[..prefix_end]);
+        if first_newline.is_some() {
+            suffix_chunks.clear();
+            suffix_bytes = prefix_end;
+            if prefix_end > 0 {
+                suffix_chunks.push(chunk[..prefix_end].to_vec());
+            }
+        } else {
+            suffix_bytes = suffix_bytes.saturating_add(chunk.len());
+            suffix_chunks.push(chunk);
+        }
         position = read_start;
 
         if position == scan_floor && scan_floor > 0 {
@@ -4399,6 +4497,33 @@ impl CodexParser {
             };
             if line.trim().is_empty() {
                 continue;
+            }
+
+            // Unknown records have no renderable content, but serde would
+            // still allocate and walk their complete payload. Preserve their
+            // positional ordinal and timestamp while bypassing that work for
+            // oversized records. If the header is non-standard or ambiguous,
+            // fall through to the full parser for correctness.
+            if line.len() > CODEX_HISTORY_SCAN_CHUNK_BYTES {
+                if let Some(record_type) = json_object_string_field(line.as_bytes(), b"type") {
+                    if !matches!(
+                        record_type,
+                        "session_meta" | "turn_context" | "event_msg" | "response_item"
+                    ) {
+                        promotion.note_record(record_type, "");
+                        if let Some(ts_str) =
+                            json_object_string_field(line.as_bytes(), b"timestamp")
+                        {
+                            if let Ok(ts) = ts_str.parse::<DateTime<Utc>>() {
+                                if first_timestamp.is_none() {
+                                    first_timestamp = Some(ts);
+                                }
+                                last_timestamp = Some(ts);
+                            }
+                        }
+                        continue;
+                    }
+                }
             }
 
             let value: serde_json::Value = match serde_json::from_str(&line) {
@@ -10380,9 +10505,9 @@ mod tests {
             )
         )
         .unwrap();
-        // Sparse expansion models a 1+ GiB inherited prefix without consuming
+        // Sparse expansion models a 2 GB inherited prefix without consuming
         // disk or making the test slow. The exact fork offset begins after it.
-        file.set_len(1_100_000_000)
+        file.set_len(2_000_000_000)
             .expect("make sparse inherited prefix");
         file.seek(SeekFrom::End(0)).unwrap();
         let delta_start = file.stream_position().unwrap();
@@ -10412,7 +10537,7 @@ mod tests {
             )
             .expect("only the post-fork range is parsed");
         assert_eq!(range.start_offset, delta_start);
-        assert!(range.end_offset > 1_100_000_000);
+        assert!(range.end_offset > 2_000_000_000);
         assert_eq!(user_texts(&range.detail), vec!["branch-only"]);
         assert!(range
             .detail
@@ -10423,7 +10548,7 @@ mod tests {
     }
 
     /// Regression for the reported multi-gigabyte rollout shape. A sparse
-    /// prefix models the old history without consuming 2 GB of test disk; the
+    /// prefix models the old history without consuming 3.5 GB of test disk; the
     /// valid tail is real JSONL and must be reached without touching the sparse
     /// prefix.
     #[test]
@@ -10447,8 +10572,8 @@ mod tests {
             )
         )
         .expect("write metadata");
-        file.set_len(3_300_000_000)
-            .expect("create sparse 3+ GB prefix");
+        file.set_len(3_500_000_000)
+            .expect("create sparse 3.5 GB prefix");
         file.seek(SeekFrom::End(0)).expect("seek sparse tail");
         let mut writer = BufWriter::new(file);
         let output = "x".repeat(TOOL_OUTPUT_BYTES);
@@ -10507,7 +10632,7 @@ mod tests {
         writer.flush().expect("flush rollout");
 
         let source_bytes = fs::metadata(&path).expect("rollout metadata").len();
-        assert!(source_bytes > 3_000_000_000);
+        assert!(source_bytes > 3_500_000_000);
         let parser = CodexParser::with_base_dir(dir.path().to_path_buf());
         let started = Instant::now();
         let page = parser
@@ -10520,7 +10645,8 @@ mod tests {
         gzip.write_all(&response).expect("compress first page");
         let gzip_bytes = gzip.finish().expect("finish first-page compression").len();
         eprintln!(
-            "large_history_benchmark source_bytes={source_bytes} page_bytes={response_bytes} gzip_bytes={gzip_bytes} elapsed_ms={}",
+            "large_history_benchmark source_bytes={source_bytes} page_bytes={response_bytes} gzip_bytes={gzip_bytes} scan_bytes={} elapsed_ms={}",
+            page.scan_bytes,
             elapsed.as_millis()
         );
         assert_eq!(user_texts(&page.detail).len(), 6);
@@ -10531,9 +10657,11 @@ mod tests {
                 <= super::CODEX_HISTORY_FIRST_PAGE_MAX_BYTES
         );
         assert!(elapsed.as_secs() < 10, "tail page parse took {elapsed:?}");
+        let cached_started = Instant::now();
         let cached = parser
             .get_conversation_page(conversation_id, None, 6, Some("/tmp/large".into()))
             .expect("reuse first page");
+        let cached_elapsed = cached_started.elapsed();
         assert!(cached.cache_hit);
         assert_eq!(cached.scan_bytes, page.scan_bytes);
 
@@ -10545,11 +10673,19 @@ mod tests {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clear();
+        let indexed_started = Instant::now();
         let indexed = parser
             .get_conversation_page(conversation_id, None, 6, Some("/tmp/large".into()))
             .expect("reuse persisted page index after memory-cache reset");
+        let indexed_elapsed = indexed_started.elapsed();
         assert!(indexed.index_hit);
         assert_eq!(indexed.scan_bytes, 0);
+        eprintln!(
+            "large_history_reopen cached_ms={} indexed_ms={} indexed_scan_bytes={}",
+            cached_elapsed.as_millis(),
+            indexed_elapsed.as_millis(),
+            indexed.scan_bytes
+        );
         remove_history_index_fixture(&path);
     }
 
@@ -10634,6 +10770,12 @@ mod tests {
             .get_conversation_page(conversation_id, None, 25, Some("/tmp/giant".into()))
             .expect("adaptive bounded tail");
         let elapsed = started.elapsed();
+        let source_bytes = fs::metadata(&path).expect("rollout metadata").len();
+        eprintln!(
+            "giant_record_benchmark source_bytes={source_bytes} scan_bytes={} elapsed_ms={}",
+            page.scan_bytes,
+            elapsed.as_millis()
+        );
         assert_eq!(user_texts(&page.detail).len(), 25);
         assert!(page.scan_bytes > super::CODEX_HISTORY_FIRST_PAGE_INITIAL_BYTES);
         assert!(page.scan_bytes <= super::CODEX_HISTORY_FIRST_PAGE_MAX_BYTES);

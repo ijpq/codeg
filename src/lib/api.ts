@@ -3708,7 +3708,8 @@ export async function createConversationBranch(
   request: CreateConversationBranchRequest
 ): Promise<CreateConversationBranchResult> {
   const requestId = request.operationId ?? request.requestId
-  if (!requestId) throw new Error("Branch creation requires a stable request id")
+  if (!requestId)
+    throw new Error("Branch creation requires a stable request id")
   let task = await getTransport().call<ConversationBranchCreationTask>(
     "queue_conversation_branch_creation",
     { request },
@@ -3720,11 +3721,12 @@ export async function createConversationBranch(
   while (task.status === "queued" || task.status === "running") {
     await new Promise((resolve) => setTimeout(resolve, 1_000))
     try {
-      const refreshed = await getTransport().call<ConversationBranchCreationTask | null>(
-        "get_conversation_branch_creation_task",
-        { requestId },
-        { timeoutMs: 30_000 }
-      )
+      const refreshed =
+        await getTransport().call<ConversationBranchCreationTask | null>(
+          "get_conversation_branch_creation_task",
+          { requestId },
+          { timeoutMs: 30_000 }
+        )
       if (refreshed) task = refreshed
     } catch {
       // A browser/network interruption says nothing about the durable task.
@@ -3733,7 +3735,8 @@ export async function createConversationBranch(
     }
   }
   if (task.status === "succeeded" && task.result) return task.result
-  if (task.status === "cancelled") throw new Error("Branch creation was cancelled")
+  if (task.status === "cancelled")
+    throw new Error("Branch creation was cancelled")
   throw new Error(
     task.error
       ? `Branch creation failed: ${task.error}. Retry with the same request id after resolving the reported cause.`

@@ -669,6 +669,14 @@ mod tests {
             );
         }
         assert_eq!(fallback_base_slug(&models).as_deref(), Some("gpt-6-astra"));
+        assert_eq!(
+            models
+                .iter()
+                .find(|model| slug_of(model) == Some("gpt-6-astra"))
+                .and_then(|model| model.get("default_reasoning_level"))
+                .and_then(Value::as_str),
+            Some("high")
+        );
     }
 
     #[test]

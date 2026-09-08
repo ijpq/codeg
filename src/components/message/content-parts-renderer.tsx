@@ -2266,9 +2266,8 @@ const TextPart = memo(function TextPart({
         mode={isStreaming ? "streaming" : "static"}
         parseIncompleteMarkdown={isStreaming}
       >
-        {text}
+        {renderedText}
       </MessageResponse>
-      <MessageResponse>{renderedText}</MessageResponse>
     </div>
   )
 })

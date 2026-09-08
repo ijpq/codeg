@@ -236,8 +236,9 @@ export function StatusBarMcp() {
     } finally {
       if (!aliveRef.current) return
       setPending((prev) => {
-        const { [key]: _dropped, ...rest } = prev
-        return rest
+        const next = { ...prev }
+        delete next[key]
+        return next
       })
     }
   }

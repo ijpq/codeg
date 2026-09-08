@@ -41,6 +41,7 @@ import type { DbConversationDetail, MessageTurn } from "@/lib/types"
 vi.mock("@/lib/api", () => ({
   getFolderConversation: vi.fn(),
   getFolderConversationTurns: vi.fn(),
+  invalidateFolderConversationCache: vi.fn(),
 }))
 
 const { getFolderConversation } = await import("@/lib/api")

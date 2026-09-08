@@ -41,6 +41,7 @@ impl MigrationTrait for Migration {
                             .not_null()
                             .default(false),
                     )
+                    .col(ColumnDef::new(ConversationBranchCreationTask::WorkerInstanceId).string())
                     .col(
                         ColumnDef::new(ConversationBranchCreationTask::CreatedAt)
                             .timestamp_with_time_zone()
@@ -87,6 +88,7 @@ enum ConversationBranchCreationTask {
     ResultJson,
     Error,
     CancelRequested,
+    WorkerInstanceId,
     CreatedAt,
     UpdatedAt,
 }

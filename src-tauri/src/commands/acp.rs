@@ -8626,13 +8626,21 @@ pub(crate) fn scoped_skill_dirs(
 /// (which codeg creates routinely) it is a FILE, and upstream's `pathExists`
 /// accepts that too.
 fn project_skill_base(agent_type: AgentType, workspace: &str) -> PathBuf {
+    project_skill_base_with_probe(agent_type, workspace, Path::exists)
+}
+
+fn project_skill_base_with_probe(
+    agent_type: AgentType,
+    workspace: &str,
+    path_exists: impl Fn(&Path) -> bool,
+) -> PathBuf {
     let workspace = PathBuf::from(workspace);
     if agent_type != AgentType::DeepSeek {
         return workspace;
     }
     let mut current = workspace.as_path();
     loop {
-        if current.join(".git").exists() {
+        if path_exists(&current.join(".git")) {
             return current.to_path_buf();
         }
         match current.parent() {
@@ -16750,13 +16758,12 @@ wire_api = "chat"
         // No `.git` anywhere above ⇒ fall back to the workspace itself.
         let bare = tmp.path().join("bare");
         std::fs::create_dir_all(&bare).expect("create bare");
-        let fallback = scoped_skill_dirs(
+        let fallback = project_skill_base_with_probe(
             AgentType::DeepSeek,
-            AgentSkillScope::Project,
-            Some(bare.to_str().expect("utf-8 path")),
-        )
-        .expect("fallback dirs");
-        assert_eq!(fallback[0], bare.join(".dsh/skills"));
+            bare.to_str().expect("utf-8 path"),
+            |_| false,
+        );
+        assert_eq!(fallback, bare);
 
         // Every other agent keeps the plain workspace-relative layout.
         let codex = scoped_skill_dirs(
