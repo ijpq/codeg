@@ -200,9 +200,9 @@ jobs:
 
   build-tauri:
     needs: create-draft-release
-    # v0.30.5-fix2 is the server-only maintenance release requested by the
+    # v0.30.5-fix3 is the server-only maintenance release requested by the
     # operator. Keep the normal desktop matrix for later tags.
-    if: github.event_name == 'push' && github.ref_name != 'v0.30.5-fix2'
+    if: github.event_name == 'push' && github.ref_name != 'v0.30.5-fix3'
     name: Build ${{ matrix.name }}
     permissions:
       contents: write
@@ -901,7 +901,7 @@ jobs:
       needs.build-server.result == 'success' &&
       (github.event_name == 'workflow_dispatch' ||
        needs.build-tauri.result == 'success' ||
-       (github.ref_name == 'v0.30.5-fix2' && needs.build-tauri.result == 'skipped'))
+       (github.ref_name == 'v0.30.5-fix3' && needs.build-tauri.result == 'skipped'))
     name: Upload complete server asset set
     runs-on: ubuntu-22.04
     permissions:
@@ -1001,7 +1001,7 @@ jobs:
       github.event_name == 'push' &&
       needs.create-draft-release.result == 'success' &&
       (needs.build-tauri.result == 'success' ||
-       (github.ref_name == 'v0.30.5-fix2' && needs.build-tauri.result == 'skipped')) &&
+       (github.ref_name == 'v0.30.5-fix3' && needs.build-tauri.result == 'skipped')) &&
       needs.build-server.result == 'success' &&
       needs.upload-server-assets.result == 'success'
     runs-on: ubuntu-22.04
@@ -1046,7 +1046,7 @@ jobs:
 
           expected_setup=1
           expected_count=3
-          if [ "$RELEASE_TAG" = "v0.30.5-fix2" ]; then
+          if [ "$RELEASE_TAG" = "v0.30.5-fix3" ]; then
             expected_setup=0
             expected_count=2
           fi
@@ -1079,7 +1079,11 @@ jobs:
 
   verify-server-only-release:
     needs: publish-release
-    if: github.event_name == 'push' && github.ref_name == 'v0.30.5-fix2'
+    if: >-
+      always() &&
+      github.event_name == 'push' &&
+      github.ref_name == 'v0.30.5-fix3' &&
+      needs.publish-release.result == 'success'
     name: Re-download and verify Windows Server release
     runs-on: windows-2022
     permissions:
