@@ -25,6 +25,39 @@ const NATIVE_FORK_ADAPTER_VERSION: &str = "1.6.2";
 const NATIVE_STEERING_MIN_VERSION: (u64, u64, u64) = (1, 1, 6);
 const PATCH_REVISION: &str = "codeg-steer-v1";
 const NATIVE_FORK_PATCH_REVISION: &str = "codeg-native-thread-fork-citations-terminal-v4";
+const AIR_PATCH_REVISION: &str = "codeg-detached-air-v1";
+
+fn supports_detached_air(version: &str) -> bool {
+    matches!(version, "1.10.0" | "1.11.0")
+}
+
+/// Verified against the published bundles, independently of the old fork and
+/// citation patches. Keep all notification/native-subagent cleanup in prompt.
+pub(crate) fn patch_air_bundle(source: &str) -> Result<String, String> {
+    let before = include_str!("codex_air_before.txt");
+    if source.matches(before).count() != 1 {
+        return Err("AIR prompt cleanup anchor must match exactly once".into());
+    }
+    let observed = "      await this.codexAcpClient.waitForSessionNotifications(params.sessionId);\n      if (turnCompleted.turn.status === \"completed\") {";
+    if source.matches(observed).count() != 1 {
+        return Err("Codex terminal observation anchor must match exactly once".into());
+    }
+    let cleanup_end = "      activePrompt.complete();\n    }\n  }\n";
+    if source.matches(cleanup_end).count() != 1 {
+        return Err("Codex prompt cleanup end must match exactly once".into());
+    }
+    let patched = source.replacen(before, "", 1).replacen(
+        cleanup_end,
+        &format!(
+            "      activePrompt.complete();\n{}    }}\n  }}\n",
+            include_str!("codex_air_after.txt")
+        ),
+        1,
+    );
+    Ok(patched.replacen(observed, &format!(
+        "      logger.log(\"Codex root turn terminal observed before notification drain\", {{ sessionId: params.sessionId, turnId: turnCompleted.turn.id, status: turnCompleted.turn.status, receivedAtMs: Date.now() }});\n{observed}"
+    ), 1))
+}
 
 #[derive(Debug, Clone)]
 pub struct PreparedCodexSteerAdapter {
@@ -455,8 +488,8 @@ fn module_search_path(bundle: &Path, prefix: Option<&Path>) -> String {
 }
 
 /// Prepare the derived adapter in Codeg's cache. `Ok(None)` means the installed
-/// adapter launches unchanged because it does not match one of the two exact
-/// versions this compatibility layer understands.
+/// adapter launches unchanged because it does not match an exact verified
+/// version. Current AIR patches are independent of legacy fork patches.
 pub async fn prepare(
     resolved_launcher: &Path,
 ) -> Result<Option<PreparedCodexSteerAdapter>, AcpError> {
@@ -493,6 +526,7 @@ pub async fn prepare(
 
     let version = adapter_version(&bundle);
     let patch_kind = match version.as_deref() {
+        Some(version) if supports_detached_air(version) => "detached_air",
         Some(NATIVE_FORK_ADAPTER_VERSION) => "native_fork",
         Some(SUPPORTED_ADAPTER_VERSION) => "legacy_steer",
         _ => {
@@ -521,7 +555,9 @@ pub async fn prepare(
     let source = std::fs::read_to_string(&bundle).map_err(|error| {
         AcpError::SpawnFailed(format!("failed to read codex-acp adapter: {error}"))
     })?;
-    let patched = match if patch_kind == "native_fork" {
+    let patched = match if patch_kind == "detached_air" {
+        patch_air_bundle(&source)
+    } else if patch_kind == "native_fork" {
         patch_native_fork_bundle(&source)
     } else {
         patch_bundle(&source)
@@ -538,7 +574,9 @@ pub async fn prepare(
         }
     };
 
-    let (patch_revision, cache_version) = if patch_kind == "native_fork" {
+    let (patch_revision, cache_version) = if patch_kind == "detached_air" {
+        (AIR_PATCH_REVISION, version.as_deref().unwrap_or_default())
+    } else if patch_kind == "native_fork" {
         (NATIVE_FORK_PATCH_REVISION, NATIVE_FORK_ADAPTER_VERSION)
     } else {
         (PATCH_REVISION, SUPPORTED_ADAPTER_VERSION)
@@ -604,6 +642,28 @@ pub async fn prepare(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn current_published_prompt_bodies_detach_air_without_replacing_protocol_cleanup() {
+        for source in [
+            include_str!("fixtures/codex-acp-1.10.0-prompt.json"),
+            include_str!("fixtures/codex-acp-1.11.0-prompt.json"),
+        ] {
+            let fixture: serde_json::Value = serde_json::from_str(source).unwrap();
+            assert!(supports_detached_air(fixture["version"].as_str().unwrap()));
+            let prompt = fixture["prompt"].as_str().unwrap();
+            let patched = patch_air_bundle(prompt).unwrap();
+            assert!(
+                patched.contains("await eventHandler.waitForNativeSubagents(activePrompt.signal)")
+            );
+            assert!(patched.contains("activePrompt.complete()"));
+            assert!(!patched.contains("await this.publishAgentFileChangeReport("));
+            assert!(patch_air_bundle(&patched).is_err());
+            assert!(patch_air_bundle(&format!("{prompt}{prompt}")).is_err());
+        }
+        assert!(!supports_detached_air("1.11.1"));
+        assert!(patch_air_bundle("unknown").is_err());
+    }
 
     fn fixture_bundle() -> String {
         REPLACEMENTS

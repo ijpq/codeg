@@ -439,6 +439,11 @@ pub(crate) fn emit_artifacts_changed(
 }
 
 impl ArtifactTracker {
+    #[cfg(test)]
+    pub(crate) async fn hold_report_writes_for_test(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.write_gate.clone().lock_owned().await
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -663,70 +668,81 @@ impl ArtifactTracker {
             return Ok(0);
         }
 
-        let root = PathBuf::from(&run.root_path);
-        let mut seen = std::collections::HashSet::new();
-        let mut changes = Vec::new();
-        for raw_path in paths {
-            let Some(path) = normalize_reported_path(&root, raw_path) else {
-                continue;
-            };
-            if !seen.insert(path.clone()) || !should_track_path(&path) {
-                continue;
-            }
-            let absolute = root.join(&path);
-            match std::fs::metadata(&absolute) {
-                Ok(metadata) if metadata.is_file() => {
-                    let modified_at = metadata.modified().ok().map(DateTime::<Utc>::from);
-                    // AIR v1 is a model-audited path list rather than an OS
-                    // change journal. Refuse a report-only existing file when
-                    // its filesystem timestamp proves it predates this turn.
-                    // The small tolerance accommodates coarse timestamp
-                    // resolution; watcher evidence remains authoritative and
-                    // does not depend on this check.
-                    if modified_at.is_some_and(|modified_at| {
-                        modified_at < run.started_at - chrono::Duration::seconds(2)
-                    }) {
+        let root_path = run.root_path.clone();
+        let run_started_at = run.started_at;
+        let report_paths = paths.to_vec();
+        let report_request_id = request_id.to_string();
+        let changes = tokio::task::spawn_blocking(move || {
+            let paths = &report_paths;
+            let request_id = report_request_id.as_str();
+            let root = PathBuf::from(&root_path);
+            let mut seen = std::collections::HashSet::new();
+            let mut changes = Vec::new();
+            for raw_path in paths {
+                let Some(path) = normalize_reported_path(&root, raw_path) else {
+                    continue;
+                };
+                if !seen.insert(path.clone()) || !should_track_path(&path) {
+                    continue;
+                }
+                let absolute = root.join(&path);
+                match std::fs::metadata(&absolute) {
+                    Ok(metadata) if metadata.is_file() => {
+                        let modified_at = metadata.modified().ok().map(DateTime::<Utc>::from);
+                        // AIR v1 is a model-audited path list rather than an OS
+                        // change journal. Refuse a report-only existing file when
+                        // its filesystem timestamp proves it predates this turn.
+                        // The small tolerance accommodates coarse timestamp
+                        // resolution; watcher evidence remains authoritative and
+                        // does not depend on this check.
+                        if modified_at.is_some_and(|modified_at| {
+                            modified_at < run_started_at - chrono::Duration::seconds(2)
+                        }) {
+                            tracing::debug!(
+                                request_id,
+                                path,
+                                run_started_at = %run_started_at,
+                                modified_at = ?modified_at,
+                                "[artifact-tracker] ignored stale AIR-reported existing file"
+                            );
+                            continue;
+                        }
+                        changes.push(ReportedFileChange {
+                            path,
+                            // AIR v1 reports paths, not operation kinds. Preserve a
+                            // watcher's Created/Renamed evidence when present;
+                            // otherwise Modified is the only non-invented kind for
+                            // a path that exists at audit time.
+                            kind: ConversationTurnFileChangeKind::Modified,
+                            final_exists: true,
+                            size_bytes: i64::try_from(metadata.len()).ok(),
+                            modified_at,
+                        });
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        changes.push(ReportedFileChange {
+                            path,
+                            kind: ConversationTurnFileChangeKind::Deleted,
+                            final_exists: false,
+                            size_bytes: None,
+                            modified_at: None,
+                        });
+                    }
+                    Err(error) => {
                         tracing::debug!(
                             request_id,
                             path,
-                            run_started_at = %run.started_at,
-                            modified_at = ?modified_at,
-                            "[artifact-tracker] ignored stale AIR-reported existing file"
+                            error = %error,
+                            "[artifact-tracker] could not verify AIR-reported path"
                         );
-                        continue;
                     }
-                    changes.push(ReportedFileChange {
-                        path,
-                        // AIR v1 reports paths, not operation kinds. Preserve a
-                        // watcher's Created/Renamed evidence when present;
-                        // otherwise Modified is the only non-invented kind for
-                        // a path that exists at audit time.
-                        kind: ConversationTurnFileChangeKind::Modified,
-                        final_exists: true,
-                        size_bytes: i64::try_from(metadata.len()).ok(),
-                        modified_at,
-                    });
-                }
-                Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    changes.push(ReportedFileChange {
-                        path,
-                        kind: ConversationTurnFileChangeKind::Deleted,
-                        final_exists: false,
-                        size_bytes: None,
-                        modified_at: None,
-                    });
-                }
-                Err(error) => {
-                    tracing::debug!(
-                        request_id,
-                        path,
-                        error = %error,
-                        "[artifact-tracker] could not verify AIR-reported path"
-                    );
                 }
             }
-        }
+            changes
+        })
+        .await
+        .map_err(|error| std::io::Error::other(format!("AIR file verification failed: {error}")))?;
         let accepted = changes.len();
         if accepted == 0 {
             return Ok(0);
@@ -736,9 +752,8 @@ impl ArtifactTracker {
             artifact_service::upsert_reported_changes(db, &run.id, changes).await?;
         }
 
-        // Normally the report precedes the prompt response and TurnComplete,
-        // so the ordinary settlement path sees these rows. If transport
-        // scheduling delivers it after the run was already closed, append the
+        // Reports can precede TurnComplete, but detached AIR normally arrives
+        // after it. If the run was already closed, append the
         // newly eligible inferred outputs now. Explicit declarations remain
         // authoritative inside infer_for_turn and suppress this entire source.
         let terminal_status = conversation_turn_run::Entity::find_by_id(run.id.clone())
@@ -869,7 +884,11 @@ impl ArtifactTracker {
 
 fn normalize_reported_path(root: &Path, raw: &str) -> Option<String> {
     let raw = raw.trim();
-    if raw.is_empty() || raw.chars().any(|character| matches!(character, '\0' | '\n' | '\r')) {
+    if raw.is_empty()
+        || raw
+            .chars()
+            .any(|character| matches!(character, '\0' | '\n' | '\r'))
+    {
         return None;
     }
     let supplied = PathBuf::from(raw);
@@ -1348,7 +1367,9 @@ mod tests {
                 root_path: root.to_string_lossy().to_string(),
                 capture_incomplete: false,
                 input_paths_json: "[]".into(),
-                expectation_json: r#"{"publish_required":true,"expects_code_changes":false,"requested_paths":[]}"#.into(),
+                expectation_json:
+                    r#"{"publish_required":true,"expects_code_changes":false,"requested_paths":[]}"#
+                        .into(),
             },
         )
         .await
@@ -1536,13 +1557,10 @@ mod tests {
         )
         .await
         .unwrap();
-        let inferred = deliverable_service::infer_for_turn(
-            &db.conn,
-            conversation_id,
-            "run-report-1",
-        )
-        .await
-        .unwrap();
+        let inferred =
+            deliverable_service::infer_for_turn(&db.conn, conversation_id, "run-report-1")
+                .await
+                .unwrap();
         assert_eq!(
             inferred
                 .iter()
@@ -1552,13 +1570,10 @@ mod tests {
             "QA preview must stay in the internal change ledger only"
         );
         assert_eq!(inferred[0].role, "primary");
-        let restored = deliverable_service::list_for_turn(
-            &db.conn,
-            conversation_id,
-            "run-report-1",
-        )
-        .await
-        .unwrap();
+        let restored =
+            deliverable_service::list_for_turn(&db.conn, conversation_id, "run-report-1")
+                .await
+                .unwrap();
         assert_eq!(
             restored
                 .iter()
@@ -1567,10 +1582,12 @@ mod tests {
             vec!["result.pdf"],
             "persisted history reload must keep the original turn association"
         );
-        assert!(artifact_service::list_changes_for_run(&db.conn, "run-report-2")
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            artifact_service::list_changes_for_run(&db.conn, "run-report-2")
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
         let rejected = tracker
             .ingest_agent_file_change_report(
@@ -1680,10 +1697,12 @@ mod tests {
                 .unwrap(),
             0
         );
-        assert!(artifact_service::list_changes_for_run(&db.conn, "run-read-only")
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            artifact_service::list_changes_for_run(&db.conn, "run-read-only")
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -1713,29 +1732,62 @@ mod tests {
         .await
         .unwrap();
 
-        let tracker = ArtifactTracker::new();
-        tracker
-            .ingest_agent_file_change_report(
-                &db.conn,
-                "conn-late-report",
-                "run-late-report",
-                &[workspace
-                    .path()
-                    .join("late.pdf")
-                    .to_string_lossy()
-                    .to_string()],
-                &EventEmitter::Noop,
-            )
-            .await
-            .unwrap();
-
-        let restored = deliverable_service::list_for_turn(
-            &db.conn,
+        seed_report_run(
+            &db,
             conversation_id,
-            "run-late-report",
+            folder_id,
+            workspace.path(),
+            "run-next-report",
+            "conn-late-report",
         )
-        .await
-        .unwrap();
+        .await;
+
+        let tracker = ArtifactTracker::new();
+        for _ in 0..2 {
+            tracker
+                .ingest_agent_file_change_report(
+                    &db.conn,
+                    "conn-late-report",
+                    "run-late-report",
+                    &[workspace
+                        .path()
+                        .join("late.pdf")
+                        .to_string_lossy()
+                        .to_string()],
+                    &EventEmitter::Noop,
+                )
+                .await
+                .unwrap();
+        }
+
+        use crate::db::entities::conversation_turn_run;
+        let old = conversation_turn_run::Entity::find_by_id("run-late-report")
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let next = conversation_turn_run::Entity::find_by_id("run-next-report")
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(old.status, ConversationTurnRunStatus::Completed);
+        assert_eq!(next.status, ConversationTurnRunStatus::Running);
+        assert!(artifact_service::list_changes_for_run(&db.conn, &next.id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(
+            deliverable_service::list_for_turn(&db.conn, conversation_id, &next.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let restored =
+            deliverable_service::list_for_turn(&db.conn, conversation_id, "run-late-report")
+                .await
+                .unwrap();
         assert_eq!(
             restored
                 .iter()
