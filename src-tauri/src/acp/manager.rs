@@ -847,6 +847,11 @@ impl ConnectionManager {
             .await
     }
 
+    #[cfg(test)]
+    pub(crate) async fn hold_report_writes_for_test(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.artifact_tracker.hold_report_writes_for_test().await
+    }
+
     /// Insert a synthetic `AgentConnection` for tests that need to exercise
     /// downstream code (attach, event broadcast, conversation linking)
     /// without spawning a real agent process. The returned connection is

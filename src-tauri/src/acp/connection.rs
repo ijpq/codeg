@@ -1801,8 +1801,8 @@ async fn build_agent(
 
             // Codex's ACP adapter owns the app-server connection and active
             // thread ids. The compatibility preparer leaves normal installs
-            // untouched except for two exact, anchor-verified bundles: legacy
-            // 1.1.2 steering and pinned 1.6.2's ACP-to-native thread/fork bridge.
+            // untouched except for exact, anchor-verified bundles: legacy
+            // steering/fork bridges and current versions' detached AIR audit.
             let prepared_steer = if meta.supports_steer {
                 match crate::acp::codex_steer_adapter::prepare(&resolved_launcher).await {
                     Ok(prepared) => prepared,

@@ -45,6 +45,9 @@ jobs:
       - name: Unit tests (vitest)
         run: pnpm test
 
+      - name: Published Codex ACP terminal and AIR regression
+        run: node --test scripts/test-codex-air-terminal.mjs
+
       - name: Static export build
         run: pnpm build
 

@@ -2846,6 +2846,28 @@ mod tests {
     }
 
     #[test]
+    fn late_air_reports_do_not_change_reconnect_snapshot_or_the_next_turn() {
+        let mut state = fresh_state();
+        for status in [ConnectionStatus::Connected, ConnectionStatus::Prompting] {
+            state.status = status.clone();
+            for report_status in ["reported", "unavailable"] {
+                state.apply_event(&AcpEvent::AgentFileChangeReport {
+                    report: crate::acp::types::AgentFileChangeReport {
+                        request_id: "previous-run".into(),
+                        status: report_status.into(),
+                        paths: vec!["previous.pdf".into()],
+                        declared_complete: true,
+                        truncated: false,
+                        reason: None,
+                    },
+                });
+                assert_eq!(state.status, status);
+                assert_eq!(state.to_snapshot().status, status);
+            }
+        }
+    }
+
+    #[test]
     fn user_message_supersedes_stale_pending_plan_approval() {
         // A new turn starting without a clean TurnComplete (fork/resume re-prompt,
         // queued prompt sent instead of answering) must not leave a dead approval

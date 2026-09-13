@@ -1663,6 +1663,18 @@ async fn connection_worker_loop(
     broker: Option<Arc<DelegationBroker>>,
     mut rx: mpsc::Receiver<Arc<EventEnvelope>>,
 ) {
+    // AIR paths may require slow network-filesystem metadata reads. A bounded,
+    // independent worker preserves report ordering without putting terminal
+    // persistence behind those auxiliary reads. Requests carry their original
+    // durable run id; no current-turn lookup is permitted in this worker.
+    let (report_tx, mut report_rx) = mpsc::channel::<Arc<EventEnvelope>>(WORKER_QUEUE_CAPACITY);
+    let report_db = db.clone();
+    let report_manager = manager.clone_ref();
+    tokio::spawn(async move {
+        while let Some(report) = report_rx.recv().await {
+            handle_event_with_retry(&report_db, &report_manager, &report, None).await;
+        }
+    });
     // 1-entry HashMap so we can reuse `handle_terminal_event` (also keeps the
     // existing test surface intact — tests still drive a `&mut HashMap`).
     let mut cache: HashMap<String, CachedConn> = HashMap::new();
@@ -1680,6 +1692,16 @@ async fn connection_worker_loop(
     while let Some(envelope_arc) = rx.recv().await {
         let envelope: &EventEnvelope = envelope_arc.as_ref();
         match &envelope.payload {
+            AcpEvent::AgentFileChangeReport { report } => {
+                if report_tx.try_send(envelope_arc.clone()).is_err() {
+                    tracing::warn!(
+                        connection_id,
+                        request_id = %report.request_id,
+                        artifact_status = "watcher_fallback",
+                        "[artifact-tracker] AIR worker overloaded; retaining watcher evidence"
+                    );
+                }
+            }
             AcpEvent::ConversationLinked {
                 conversation_id, ..
             } => {
@@ -2306,6 +2328,112 @@ mod tests {
             read_row_status(&db, conv.id).await,
             ConversationStatus::PendingReview
         );
+    }
+
+    #[tokio::test]
+    async fn terminal_persists_while_air_worker_is_blocked_then_report_backfills() {
+        use crate::db::entities::conversation_turn_run::{self, ConversationTurnRunStatus};
+        use sea_orm::EntityTrait;
+        let db = test_helpers::fresh_in_memory_db().await;
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path().to_string_lossy().into_owned();
+        let folder_id = test_helpers::seed_folder(&db, &root).await;
+        let cid = test_helpers::seed_conversation(&db, folder_id, AgentType::Codex).await;
+        artifact_service::create_run(
+            &db.conn,
+            artifact_service::NewTurnRun {
+                id: "air-held-run".into(),
+                conversation_id: cid,
+                connection_id: "air-held".into(),
+                client_message_id: None,
+                prompt_fingerprint: None,
+                folder_id: Some(folder_id),
+                root_path: root,
+                capture_incomplete: false,
+                input_paths_json: "[]".into(),
+                expectation_json: "{}".into(),
+            },
+        )
+        .await
+        .unwrap();
+        std::fs::write(workspace.path().join("report.pdf"), b"result").unwrap();
+        let manager = ConnectionManager::new();
+        manager.connections.lock().await.insert(
+            "air-held".into(),
+            fake_connection_with_state("air-held", Some(cid)),
+        );
+        let guard = manager.hold_report_writes_for_test().await;
+        let (tx, rx) = mpsc::channel(4);
+        let worker = tokio::spawn(connection_worker_loop(
+            "air-held".into(),
+            db.conn.clone(),
+            manager.clone_ref(),
+            None,
+            rx,
+        ));
+        tx.send(Arc::new(EventEnvelope {
+            seq: 1,
+            connection_id: "air-held".into(),
+            payload: AcpEvent::AgentFileChangeReport {
+                report: crate::acp::types::AgentFileChangeReport {
+                    request_id: "air-held-run".into(),
+                    status: "reported".into(),
+                    paths: vec!["report.pdf".into()],
+                    declared_complete: true,
+                    truncated: false,
+                    reason: None,
+                },
+            },
+        }))
+        .await
+        .unwrap();
+        for seq in [2, 3] {
+            tx.send(Arc::new(EventEnvelope {
+                seq,
+                connection_id: "air-held".into(),
+                payload: AcpEvent::TurnComplete {
+                    session_id: "session".into(),
+                    stop_reason: "end_turn".into(),
+                    agent_type: "codex".into(),
+                },
+            }))
+            .await
+            .unwrap();
+        }
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(2), worker)
+            .await
+            .expect("terminal worker must drain while AIR is still blocked")
+            .unwrap();
+        let run = conversation_turn_run::Entity::find_by_id("air-held-run")
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.status, ConversationTurnRunStatus::Completed);
+        assert_eq!(
+            read_row_status(&db, cid).await,
+            ConversationStatus::PendingReview
+        );
+        assert!(artifact_service::list_changes_for_run(&db.conn, &run.id)
+            .await
+            .unwrap()
+            .is_empty());
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !artifact_service::list_changes_for_run(&db.conn, &run.id)
+                    .await
+                    .unwrap()
+                    .is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("late report must remain available after terminal worker closes");
     }
 
     #[tokio::test]

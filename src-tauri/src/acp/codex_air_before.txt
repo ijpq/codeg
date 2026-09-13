@@ -1,0 +1,10 @@
+      if (agentFileChangeReportRequest !== null) {
+        await this.publishAgentFileChangeReport(
+          sessionState,
+          agentFileChangeReportTurnId,
+          agentFileChangeReportRequest,
+          agentFileChangeReportUnavailableReason,
+          activePrompt.signal
+        );
+      }
+      logger.log("Prompt completed", { sessionId: params.sessionId });
