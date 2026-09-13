@@ -1,0 +1,2 @@
+# ACP patches match the published npm bundle byte-for-byte, including newlines.
+src-tauri/src/acp/codex_air_*.txt text eol=lf
