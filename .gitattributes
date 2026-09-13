@@ -3,3 +3,5 @@
 # and must equal what src/lib/json-render/skill.ts generates, which is LF.
 # Windows checkouts convert text to CRLF by default (core.autocrlf), so pin it.
 src-tauri/genui/** text eol=lf
+# ACP patches match the published npm bundle byte-for-byte, including newlines.
+src-tauri/src/acp/codex_air_*.txt text eol=lf
