@@ -199,3 +199,18 @@ Release CI 结果和 GitHub Release 地址。
   不得把旧 release 的存在当成修复 commit 已经发布。
 - `workflow_dispatch` 在当前仓库只用于修复既有 tag 的 server assets，不等价于一次新的完整
   Release，也不能用它证明新 commit 已发布。
+
+## 补充既有正式版的 Windows Setup
+
+用户明确要求为已发布版本补充 Setup 时，使用独立的
+`supplement-windows-setup.yml` 手动流程，输入既有 `release_tag`。
+这只增加安装包和独立 SHA256，不替换已有 Server 资产、不移动 tag，
+也不把流程维护提交作为新的应用版本发布。
+
+该流程检出 tag 原始 commit，要求它被 origin/main 包含且已有同 SHA 的普通 CI 成功，
+然后构建 NSIS 安装包并在隔离 Windows runner 中静默安装，验证主程序、MCP、Web
+资源和安装后文件哈希。验证成功才追加资产，禁止覆盖已有 Setup；上传后重新下载，
+验证哈希、大小、tag 未移动及原资产 ID/大小/digest 均未改变。
+
+补发时必须分别记录“工作流维护 commit”与“安装包源码 commit”，不能将两者混同。
+完成后更新 Release 说明中的实际资产范围，并提供安装包下载链接和 SHA256。
