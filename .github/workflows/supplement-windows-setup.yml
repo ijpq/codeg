@@ -8,6 +8,10 @@ on:
         required: true
         default: v0.30.7-fix1
         type: string
+      reuse_diagnostic_build:
+        description: Reverify the retained v0.30.7-fix1 build from run 34814858821
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -49,28 +53,67 @@ jobs:
           "SOURCE_SHA=$sha" >> $env:GITHUB_ENV
           "APP_VERSION=$($config.version)" >> $env:GITHUB_ENV
           $release.assets | ConvertTo-Json -Depth 10 | Set-Content "$env:RUNNER_TEMP/assets-before.json"
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: .setup-tools
+          sparse-checkout: scripts
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Test strict NSIS payload verification
+        run: python -B .setup-tools/scripts/test-verify-setup-binaries.py
+      - name: Restore pinned diagnostic build without recompiling
+        if: inputs.reuse_diagnostic_build
+        shell: pwsh
+        run: |
+          if ($env:RELEASE_TAG -ne 'v0.30.7-fix1' -or $env:SOURCE_SHA -ne '683fedde78288cd75a640512ecb651c82aa38fd7') { throw 'Diagnostic build source mismatch' }
+          $run = gh run view 34814858821 --repo $env:GITHUB_REPOSITORY --json headSha,workflowName,jobs | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $run.headSha -ne '2335c99118fbf9569c6d84036828726e12edca4c' -or $run.workflowName -ne 'Supplement Windows Setup') { throw 'Unexpected evidence provenance' }
+          foreach ($step in @('Verify published source and successful ordinary CI','Published ACP regression','Stage matching MCP companion','Build unsigned Windows NSIS setup')) {
+            $matches = @($run.jobs[0].steps | Where-Object name -EQ $step)
+            if ($matches.Count -ne 1 -or $matches[0].conclusion -ne 'success') { throw "Unverified build step: $step" }
+          }
+          $evidence = Join-Path $env:RUNNER_TEMP 'setup-build-evidence'
+          gh run download 34814858821 --repo $env:GITHUB_REPOSITORY -n setup-binary-evidence -D $evidence
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot retrieve evidence' }
+          $source = Join-Path $evidence 'codeg/codeg/src-tauri/target/x86_64-pc-windows-msvc/release'
+          $installer = Join-Path $source 'bundle/nsis/codeg_0.30.7-fix1_x64-setup.exe'
+          if ((Get-FileHash $installer).Hash.ToLower() -ne 'dcb3e7a061879b193a6d1362537a4cd33349170651036c2277429b5eecb9da4c') { throw 'Retained installer digest mismatch' }
+          if ((Get-FileHash (Join-Path $source 'codeg.exe')).Hash.ToLower() -ne 'fca4cc8aaa7ab85dceac29373d59c71e163a2c36e46aa25cf96763be3b7ac811') { throw 'Retained build digest mismatch' }
+          $target = 'src-tauri/target/x86_64-pc-windows-msvc/release'
+          New-Item -ItemType Directory -Force $target | Out-Null
+          Copy-Item "$source/*" $target -Recurse -Force
       - uses: pnpm/action-setup@v4
+        if: ${{ !inputs.reuse_diagnostic_build }}
         with:
           run_install: false
       - uses: actions/setup-node@v4
+        if: ${{ !inputs.reuse_diagnostic_build }}
         with:
           node-version: 24
           cache: pnpm
       - uses: dtolnay/rust-toolchain@stable
+        if: ${{ !inputs.reuse_diagnostic_build }}
         with:
           targets: x86_64-pc-windows-msvc
       - uses: swatinem/rust-cache@v2
+        if: ${{ !inputs.reuse_diagnostic_build }}
         with:
           workspaces: './src-tauri -> target'
           shared-key: x86_64-pc-windows-msvc
           cache-on-failure: true
       - name: Install locked dependencies
+        if: ${{ !inputs.reuse_diagnostic_build }}
         run: pnpm install --frozen-lockfile
       - name: Published ACP regression
+        if: ${{ !inputs.reuse_diagnostic_build }}
         run: node --test scripts/test-codex-air-terminal.mjs
       - name: Stage matching MCP companion
+        if: ${{ !inputs.reuse_diagnostic_build }}
         run: pnpm tauri:prepare-sidecars --target x86_64-pc-windows-msvc
       - name: Build unsigned Windows NSIS setup
+        if: ${{ !inputs.reuse_diagnostic_build }}
         env:
           CODEG_SKIP_SIDECAR: '1'
         shell: pwsh
@@ -96,11 +139,8 @@ jobs:
           foreach ($file in @($app, $mcp, (Join-Path $dest 'web/index.html'))) {
             if (-not (Test-Path $file -PathType Leaf)) { throw "Missing installed file: $file" }
           }
-          foreach ($name in @('codeg.exe','codeg-mcp.exe')) {
-            $built = Get-FileHash "src-tauri/target/x86_64-pc-windows-msvc/release/$name" -Algorithm SHA256
-            $installed = Get-FileHash (Join-Path $dest $name) -Algorithm SHA256
-            if ($built.Hash -ne $installed.Hash) { throw "Installed binary mismatch: $name" }
-          }
+          python -B .setup-tools/scripts/verify-setup-binaries.py src-tauri/target/x86_64-pc-windows-msvc/release $dest
+          if ($LASTEXITCODE -ne 0) { throw 'Installed payload verification failed' }
           $info = (Get-Item $app).VersionInfo
           $numericVersion = ($env:APP_VERSION -split '-')[0]
           if ($info.ProductVersion -notin @($env:APP_VERSION, $numericVersion, "$numericVersion.0")) { throw "Unexpected executable version $($info.ProductVersion)" }

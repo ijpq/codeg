@@ -214,3 +214,10 @@ Release CI 结果和 GitHub Release 地址。
 
 补发时必须分别记录“工作流维护 commit”与“安装包源码 commit”，不能将两者混同。
 完成后更新 Release 说明中的实际资产范围，并提供安装包下载链接和 SHA256。
+
+主程序校验按 Tauri CLI 2.10.0 的 `patch_binary` 行为，将构建文件中唯一的
+`__TAURI_BUNDLE_TYPE_VAR_UNK` 标记替换为 `__TAURI_BUNDLE_TYPE_VAR_NSS` 后计算完整
+SHA256，与安装文件比较。任何其他字节差异仍失败；MCP 必须逐字节一致。
+`reuse_diagnostic_build` 仅允许复核固定运行 34814858821 的 v0.30.7-fix1 安装包，
+核对来源工作流 SHA、已通过的构建步骤和固定安装包摘要后，在全新 runner 重新试装；
+它不修改或重新打包二进制。
