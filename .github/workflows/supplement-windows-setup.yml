@@ -63,6 +63,7 @@ jobs:
         with:
           workspaces: './src-tauri -> target'
           shared-key: x86_64-pc-windows-msvc
+          cache-on-failure: true
       - name: Install locked dependencies
         run: pnpm install --frozen-lockfile
       - name: Published ACP regression
@@ -85,8 +86,11 @@ jobs:
           $setup = $setups[0]
           if ($setup.Name -ne "codeg_$($env:APP_VERSION)_x64-setup.exe") { throw 'Setup filename version mismatch' }
           $dest = Join-Path $env:RUNNER_TEMP 'codeg-setup-test'
+          Get-ChildItem src-tauri/target/x86_64-pc-windows-msvc/release -Filter '*.exe' | Get-FileHash -Algorithm SHA256 | Format-List
           $process = Start-Process $setup.FullName -ArgumentList '/S',"/D=$dest" -Wait -PassThru
           if ($process.ExitCode -ne 0) { throw "Setup exit: $($process.ExitCode)" }
+          Get-ChildItem $dest -Filter '*.exe' | Get-FileHash -Algorithm SHA256 | Format-List
+          Get-ChildItem $dest -Filter '*.exe' | ForEach-Object { $_.VersionInfo | Format-List FileName,ProductVersion,FileVersion,OriginalFilename }
           $app = Join-Path $dest 'codeg.exe'
           $mcp = Join-Path $dest 'codeg-mcp.exe'
           foreach ($file in @($app, $mcp, (Join-Path $dest 'web/index.html'))) {
@@ -139,6 +143,19 @@ jobs:
           $tagCommit = (git ls-remote origin "refs/tags/$($env:RELEASE_TAG)^{}" | ForEach-Object { ($_ -split '\s+')[0] })
           if ($LASTEXITCODE -ne 0 -or $tagCommit -ne $env:SOURCE_SHA) { throw 'Published tag moved during build' }
           Get-Content "$env:RUNNER_TEMP/setup-verification.json"
+      - name: Retain package and binary evidence even on verification failure
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: setup-binary-evidence
+          retention-days: 7
+          path: |
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+            src-tauri/target/x86_64-pc-windows-msvc/release/codeg.exe
+            src-tauri/target/x86_64-pc-windows-msvc/release/codeg-mcp.exe
+            src-tauri/target/x86_64-pc-windows-msvc/release/nsis/**/*.nsi
+            src-tauri/binaries/*.exe
+            ${{ runner.temp }}/codeg-setup-test/*.exe
       - uses: actions/upload-artifact@v4
         if: always()
         with:
