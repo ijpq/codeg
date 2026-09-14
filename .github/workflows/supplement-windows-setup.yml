@@ -8,6 +8,10 @@ on:
         required: true
         default: v0.30.7-fix1
         type: string
+      notes_only:
+        description: Finalize notes for the already verified v0.30.7-fix1 Setup
+        type: boolean
+        default: false
       reuse_diagnostic_build:
         description: Reverify the retained v0.30.7-fix1 build from run 34814858821
         type: boolean
@@ -23,6 +27,7 @@ concurrency:
 
 jobs:
   setup:
+    if: ${{ !inputs.notes_only }}
     runs-on: windows-2022
     permissions:
       contents: write
@@ -202,3 +207,38 @@ jobs:
           name: setup-verification
           path: ${{ runner.temp }}/setup-verification.json
           if-no-files-found: warn
+  notes:
+    if: inputs.notes_only
+    permissions:
+      contents: write
+      actions: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const repo = context.repo;
+            const {data: run} = await github.rest.actions.getWorkflowRun({...repo, run_id: 34819012298});
+            if (run.conclusion !== 'success' || run.head_sha !== 'cecea8f790da245fb681319123b0e7b7cd57bfef') {
+              throw new Error('Verified supplemental workflow required');
+            }
+            const {data: release} = await github.rest.repos.getReleaseByTag({...repo, tag: 'v0.30.7-fix1'});
+            if (release.draft || release.prerelease || release.assets.length !== 4) throw new Error('Unexpected release state');
+            const asset = release.assets.find(a => a.name === 'codeg_0.30.7-fix1_x64-setup.exe');
+            if (!asset || asset.size !== 63679765 || asset.digest !== 'sha256:dcb3e7a061879b193a6d1362537a4cd33349170651036c2277429b5eecb9da4c') {
+              throw new Error('Setup asset mismatch');
+            }
+            const appendix = fs.readFileSync('docs/releases/v0.30.7-fix1-setup.md', 'utf8').trim();
+            const heading = '## Windows Setup 补发验证（2026-09-14）';
+            let body = release.body || '';
+            if (body.includes(heading)) {
+              if (!body.endsWith(appendix)) throw new Error('Existing supplemental notes differ');
+              return;
+            }
+            body = body.replace('- Windows x64 Server ZIP 与独立 SHA256；包含匹配版本的 Server、codeg-mcp、Web',
+              '- Windows x64 Setup 与独立 SHA256（2026-09-14 补发），以及原有 Server ZIP 与独立 SHA256；Server ZIP 包含匹配版本的 Server、codeg-mcp、Web');
+            await github.rest.repos.updateRelease({...repo, release_id: release.id, body: body.trim() + '\n\n' + appendix});
+            const {data: updated} = await github.rest.repos.getRelease({...repo, release_id: release.id});
+            if (updated.body !== body.trim() + '\n\n' + appendix || updated.draft || updated.prerelease) throw new Error('Notes update verification failed');
