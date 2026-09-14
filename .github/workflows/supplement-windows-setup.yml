@@ -1,0 +1,147 @@
+name: Supplement Windows Setup
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing stable release to supplement without changing its source
+        required: true
+        default: v0.30.7-fix1
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: supplement-setup-${{ inputs.release_tag }}
+  cancel-in-progress: false
+
+jobs:
+  setup:
+    runs-on: windows-2022
+    permissions:
+      contents: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag }}
+          fetch-depth: 0
+      - name: Verify published source and successful ordinary CI
+        shell: pwsh
+        run: |
+          if ($env:RELEASE_TAG -notmatch '^v\d+\.\d+\.\d+-fix\d+$') { throw 'Invalid stable fork tag' }
+          $sha = (git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve source' }
+          git merge-base --is-ancestor $sha origin/main
+          if ($LASTEXITCODE -ne 0) { throw 'Release source is not on main' }
+          $config = Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
+          if ("v$($config.version)" -ne $env:RELEASE_TAG) { throw 'Version mismatch' }
+          $release = gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --json isDraft,isPrerelease,assets | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $release.isDraft -or $release.isPrerelease) { throw 'Stable published release required' }
+          if (@($release.assets | Where-Object name -Like '*setup.exe*').Count -ne 0) { throw 'Setup assets already exist; refusing overwrite' }
+          $runs = gh run list --repo $env:GITHUB_REPOSITORY --workflow test.yml --commit $sha --status success --json headSha,conclusion | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or @($runs | Where-Object headSha -EQ $sha).Count -eq 0) { throw 'No successful ordinary CI for source' }
+          "SOURCE_SHA=$sha" >> $env:GITHUB_ENV
+          "APP_VERSION=$($config.version)" >> $env:GITHUB_ENV
+          $release.assets | ConvertTo-Json -Depth 10 | Set-Content "$env:RUNNER_TEMP/assets-before.json"
+      - uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+          shared-key: x86_64-pc-windows-msvc
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Published ACP regression
+        run: node --test scripts/test-codex-air-terminal.mjs
+      - name: Stage matching MCP companion
+        run: pnpm tauri:prepare-sidecars --target x86_64-pc-windows-msvc
+      - name: Build unsigned Windows NSIS setup
+        env:
+          CODEG_SKIP_SIDECAR: '1'
+        shell: pwsh
+        run: |
+          '{"bundle":{"createUpdaterArtifacts":false}}' | Set-Content setup-build-config.json
+          pnpm tauri build --target x86_64-pc-windows-msvc --bundles nsis --config setup-build-config.json
+          if ($LASTEXITCODE -ne 0) { throw 'Setup build failed' }
+      - name: Install and verify package in isolated runner
+        shell: pwsh
+        run: |
+          $setups = @(Get-ChildItem src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*_x64-setup.exe)
+          if ($setups.Count -ne 1) { throw 'Expected exactly one Setup' }
+          $setup = $setups[0]
+          if ($setup.Name -ne "codeg_$($env:APP_VERSION)_x64-setup.exe") { throw 'Setup filename version mismatch' }
+          $dest = Join-Path $env:RUNNER_TEMP 'codeg-setup-test'
+          $process = Start-Process $setup.FullName -ArgumentList '/S',"/D=$dest" -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Setup exit: $($process.ExitCode)" }
+          $app = Join-Path $dest 'codeg.exe'
+          $mcp = Join-Path $dest 'codeg-mcp.exe'
+          foreach ($file in @($app, $mcp, (Join-Path $dest 'web/index.html'))) {
+            if (-not (Test-Path $file -PathType Leaf)) { throw "Missing installed file: $file" }
+          }
+          foreach ($name in @('codeg.exe','codeg-mcp.exe')) {
+            $built = Get-FileHash "src-tauri/target/x86_64-pc-windows-msvc/release/$name" -Algorithm SHA256
+            $installed = Get-FileHash (Join-Path $dest $name) -Algorithm SHA256
+            if ($built.Hash -ne $installed.Hash) { throw "Installed binary mismatch: $name" }
+          }
+          $info = (Get-Item $app).VersionInfo
+          $numericVersion = ($env:APP_VERSION -split '-')[0]
+          if ($info.ProductVersion -notin @($env:APP_VERSION, $numericVersion, "$numericVersion.0")) { throw "Unexpected executable version $($info.ProductVersion)" }
+          $help = (& $mcp --help | Out-String)
+          if ($LASTEXITCODE -ne 0 -or $help -notlike '*codeg-mcp --parent-connection-id*') { throw 'Installed MCP failed' }
+          $files = @(Get-ChildItem $dest -Recurse -File)
+          if ($files | Where-Object { $_.Name -in @('auth.json','tokens.json','config.toml') -or $_.Extension -in @('.db','.sqlite','.pdb') }) { throw 'Unexpected private/build file in installed package' }
+          $hash = (Get-FileHash $setup.FullName -Algorithm SHA256).Hash.ToLower()
+          "$hash  $($setup.Name)" | Set-Content -Encoding ascii "$($setup.FullName).sha256"
+          @{ source_sha=$env:SOURCE_SHA; version=$env:APP_VERSION; file=$setup.Name; size=$setup.Length; sha256=$hash; installed_files=$files.Count; product_version=$info.ProductVersion; installation='passed'; mcp='passed' } | ConvertTo-Json | Set-Content "$env:RUNNER_TEMP/setup-verification.json"
+          "SETUP_PATH=$($setup.FullName)" >> $env:GITHUB_ENV
+          "SETUP_NAME=$($setup.Name)" >> $env:GITHUB_ENV
+      - name: Upload verified supplemental assets without replacing existing files
+        shell: pwsh
+        run: |
+          gh release upload $env:RELEASE_TAG $env:SETUP_PATH "$env:SETUP_PATH.sha256" --repo $env:GITHUB_REPOSITORY
+          if ($LASTEXITCODE -ne 0) { throw 'Setup upload failed' }
+      - name: Re-download and verify published Setup and unchanged Server assets
+        shell: pwsh
+        run: |
+          $dest = Join-Path $env:RUNNER_TEMP 'setup-redownload'
+          gh release download $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --pattern $env:SETUP_NAME --pattern "$env:SETUP_NAME.sha256" --dir $dest
+          if ($LASTEXITCODE -ne 0) { throw 'Download failed' }
+          $file = Join-Path $dest $env:SETUP_NAME
+          $expected = ((Get-Content "$file.sha256" -Raw).Trim() -split '\s+')[0]
+          if ((Get-FileHash $file -Algorithm SHA256).Hash.ToLower() -ne $expected) { throw 'Downloaded checksum mismatch' }
+          if ((Get-FileHash $file).Hash -ne (Get-FileHash $env:SETUP_PATH).Hash) { throw 'Downloaded installer differs from tested installer' }
+          $release = gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --json assets,isDraft,isPrerelease | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $release.isDraft -or $release.isPrerelease) { throw 'Release invalid' }
+          $before = @(Get-Content "$env:RUNNER_TEMP/assets-before.json" -Raw | ConvertFrom-Json)
+          if ($release.assets.Count -ne ($before.Count + 2)) { throw 'Unexpected asset count' }
+          foreach ($old in $before) {
+            $current = @($release.assets | Where-Object name -EQ $old.name)
+            if ($current.Count -ne 1 -or $current[0].id -ne $old.id -or $current[0].size -ne $old.size -or $current[0].digest -ne $old.digest) { throw "Existing asset changed: $($old.name)" }
+          }
+          foreach ($name in @($env:SETUP_NAME, "$env:SETUP_NAME.sha256")) {
+            $asset = @($release.assets | Where-Object name -EQ $name)
+            if ($asset.Count -ne 1 -or $asset[0].size -ne (Get-Item (Join-Path $dest $name)).Length) { throw "Published size mismatch: $name" }
+          }
+          $tagCommit = (git ls-remote origin "refs/tags/$($env:RELEASE_TAG)^{}" | ForEach-Object { ($_ -split '\s+')[0] })
+          if ($LASTEXITCODE -ne 0 -or $tagCommit -ne $env:SOURCE_SHA) { throw 'Published tag moved during build' }
+          Get-Content "$env:RUNNER_TEMP/setup-verification.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: setup-verification
+          path: ${{ runner.temp }}/setup-verification.json
+          if-no-files-found: warn
