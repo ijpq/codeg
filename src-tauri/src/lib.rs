@@ -115,7 +115,7 @@ mod tauri_app {
         session_info as session_info_commands,
         system_settings, terminal as terminal_commands,
         token_usage as token_usage_commands,
-        forge as forge_commands, version_control, windows, work_task as work_task_commands,
+        version_control, windows, work_task as work_task_commands,
         workspace_state as workspace_state_commands, workspace_windows,
     };
     use crate::terminal::manager::TerminalManager;
