@@ -9,9 +9,10 @@ $ErrorActionPreference = 'Stop'
 $version = $ReleaseTag.TrimStart('v')
 $setupName = "codeg_${version}_x64-setup.exe"
 $expectedNames = @($setupName, "$setupName.sha256", 'codeg-server-windows-x64.zip', 'codeg-server-windows-x64.zip.sha256') | Sort-Object
-$release = gh api "repos/$Repository/releases/tags/$ReleaseTag" | ConvertFrom-Json
+# gh release view resolves both published releases and pending draft tags.
+$release = gh release view $ReleaseTag --repo $Repository --json tagName,isDraft,isPrerelease,assets | ConvertFrom-Json
 if ($LASTEXITCODE -ne 0) { throw 'Cannot read release metadata' }
-if ($release.tag_name -ne $ReleaseTag -or ($RequirePublished -and $release.draft) -or $release.prerelease) {
+if ($release.tagName -ne $ReleaseTag -or ($RequirePublished -and $release.isDraft) -or $release.isPrerelease) {
   throw 'Release tag or publication state does not match'
 }
 if (Compare-Object @($release.assets.name | Sort-Object) $expectedNames) { throw 'Unexpected asset set' }
@@ -48,5 +49,5 @@ foreach ($file in $manifest.files) {
 }
 $mcpVersion = (& (Join-Path $installed 'codeg-mcp.exe') --version | Out-String).Trim()
 if ($LASTEXITCODE -ne 0 -or $mcpVersion -ne $version) { throw 'Installed MCP version mismatch' }
-@{ tag=$ReleaseTag; commit=$env:GITHUB_SHA; published=(-not $release.draft); assets=$evidence; installation='passed'; server_startup='passed'; installed_files=$manifest.files.Count } | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $Destination 'verification.json')
+@{ tag=$ReleaseTag; commit=$env:GITHUB_SHA; published=(-not $release.isDraft); assets=$evidence; installation='passed'; server_startup='passed'; installed_files=$manifest.files.Count } | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $Destination 'verification.json')
 Get-Content (Join-Path $Destination 'verification.json')
