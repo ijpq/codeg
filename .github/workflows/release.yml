@@ -132,14 +132,17 @@ jobs:
             }
             let release;
 
-            try {
-              const existing = await github.rest.repos.getReleaseByTag({
-                owner,
-                repo,
-                tag,
-              });
-
-              release = existing.data;
+            // REST tag lookup only returns published releases. A token with
+            // push access can list drafts, including ones from a prior attempt.
+            const releases = await github.paginate(
+              github.rest.repos.listReleases,
+              { owner, repo, per_page: 100 },
+            );
+            const existing = releases.find(
+              (candidate) => candidate.tag_name === tag,
+            );
+            if (existing) {
+              release = existing;
               if (!release.draft) {
                 if (!serverOnly) {
                   core.setFailed(
@@ -168,11 +171,7 @@ jobs:
                 }
                 core.info(`Reusing existing draft release #${release.id}`);
               }
-            } catch (error) {
-              if (error.status !== 404) {
-                throw error;
-              }
-
+            } else {
               if (serverOnly) {
                 core.setFailed(
                   `Release for tag ${tag} does not exist; server-only mode only repairs an existing release.`,
@@ -1209,7 +1208,8 @@ jobs:
     runs-on: windows-2022
     permissions:
       actions: read
-      contents: read
+      # GitHub only exposes draft releases to tokens with push access.
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4

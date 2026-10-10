@@ -1,7 +1,10 @@
 # Changelog
 
-## 0.34.0-fix1 — 2026-10-10
+## 0.34.0-fix2 — 2026-10-10
 
+- Resolve draft releases with the draft-aware GitHub CLI and push-scoped
+  verification token; reuse existing drafts by listing releases. The fix1 tag
+  remains an unpublished attempt after the draft verification gate rejected it.
 - Rebase the custom fork onto the published upstream v0.34.0 commit.
 - Isolate history refresh generations and prevent invalidated pending reads from
   repopulating the recent-history cache.
@@ -14,4 +17,4 @@
 - Verify Windows Setup and Server ZIP versions, hashes, installation and isolated
   startup before publishing, and independently download and verify them afterwards.
 
-See [release notes](docs/releases/v0.34.0-fix1.md) for scope, validation and limits.
+See [release notes](docs/releases/v0.34.0-fix2.md) for scope, validation and limits.
