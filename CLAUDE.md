@@ -1,8 +1,8 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to coding agents when working with code in this repository.
 
-> **同步提醒**：本文件与根目录 `AGENTS.md` 除首行标题外内容完全一致。修改其中一份时务必同步另一份，避免两套代理指令漂移。
+> **同步提醒**：根目录 `AGENTS.md` 与 `CLAUDE.md` 除首行标题外内容完全一致。修改其中一份时务必同步另一份，避免两套代理指令漂移。
 
 ## 项目概述
 

@@ -2,7 +2,15 @@
 
 import { useCallback, useRef, useState, type PointerEvent } from "react"
 import { Reorder, useDragControls } from "motion/react"
-import { ArrowRight, Clock, GripVertical, Pencil, RotateCcw, X, Zap } from "lucide-react"
+import {
+  ArrowRight,
+  Clock,
+  GripVertical,
+  Pencil,
+  RotateCcw,
+  X,
+  Zap,
+} from "lucide-react"
 import { useTranslations } from "next-intl"
 import { cn } from "@/lib/utils"
 import { draftRidesBlocks } from "@/lib/prompt-draft"

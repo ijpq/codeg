@@ -3265,48 +3265,127 @@ function resolveViewerRuntimeId(
   return null
 }
 
-// A "pure viewer" holds none of the in-memory copies of a reply that a transcript
-// refetch could race and clobber: no in-flight prompt (`awaiting_persist`), no
-// live stream (`liveMessage`), and no just-PROMOTED reply that persistence may
-// still lag. Only such a session may be refetched from the transcript.
-//
-// `localTurns` alone is NOT disqualifying: a viewer that streamed an EARLIER turn
-// promotes it into `localTurns` too, and that reply is already persisted (it
-// completed on the owner before this client observed the edge), so folding it
-// from disk is safe. Excluding every `localTurns` would permanently strand such
-// a viewer after its first captured turn — reproducing the very bug this sync
-// fixes. Only a PROMOTED reply that may still be mid-flush (`completeTurn`'s ~8ms
-// write race) must be protected, i.e. `localTurns.length > 0` AND either:
-//   - `lastTurnOwned` — this client DROVE the promoted turn (an owner send); its
-//     reply lives only in `localTurns` until the transcript catches up; or
-//   - `liveOwnsActiveTurn` — a delegation-child dialog adopted its reply from the
-//     wire ahead of persistence (see `sub-agent-session-dialog.tsx`, which then
-//     deliberately does NOT refetch) and owns its promotion/dedup path.
-// Both are gated on `localTurns.length > 0`: the pre-promotion streaming phase is
-// already covered by `liveMessage`, and a MARKER-ONLY delegation child (the no-
-// child-connection fallback that never streams or promotes) has nothing to guard,
-// so it must stay eligible to sync on a later completion nudge. The synthesized
-// viewer user turn lives in `optimisticTurns` WITHOUT `awaiting_persist`, so it
-// never blocks a detail load from replacing it.
-//
-// Known limitation: a client that DROVE a turn and then passively MISSES every
-// later turn (no live stream at all — a co-controlling client drove them) keeps
-// `lastTurnOwned` set and stays excluded until a settled fetch (tab switch /
-// reopen) clears its `localTurns`. This is deliberate: the alternative — admitting
-// a session whose `localTurns` may hold an unflushed reply — reintroduces the
-// hardware-evidenced content-drop `completeTurn` documents. The failure is safe
-// (stale, never wrong) and self-heals on any refetch or the next observed turn
-// (whose promotion re-stamps `lastTurnOwned` false). The common viewer — one that
-// never drove a turn — is unaffected.
+// Passive history reads require no in-flight prompt or live stream. A former
+// owner can also observe remote turns; localBatchCoveredByDetail protects any
+// promoted reply that is not yet persisted. Delegation-child surfaces retain
+// their dedicated promotion and dedup path while holding local turns.
 function isPureViewerSession(session: ConversationRuntimeSession): boolean {
   return (
     session.syncState !== "awaiting_persist" &&
     session.liveMessage === null &&
-    !(
-      session.localTurns.length > 0 &&
-      (session.lastTurnOwned || session.liveOwnsActiveTurn)
-    )
+    !(session.localTurns.length > 0 && session.liveOwnsActiveTurn)
   )
+}
+
+// A settled response is not proof that an owner's promoted reply is on disk:
+// the previous reply can be a perfectly settled tail too. Match a batch to its
+// durable prompt/run identity, then require all displayed blocks in that reply
+// region. No completion is inferred from prose, counts, or a newer timestamp.
+function localBatchCoveredByDetail(
+  session: ConversationRuntimeSession,
+  detail: DbConversationDetail
+): boolean {
+  if (
+    detail.in_flight_user_turn_id != null ||
+    detail.history_page?.page_complete === false
+  )
+    return false
+  let anchor = -1
+  for (const local of session.localTurns) {
+    const id = local.source_turn_id ?? local.id
+    const exact = detail.turns.findIndex(
+      (turn) => turn.role === local.role && turn.id === id
+    )
+    if (local.role === "user") {
+      const run = detail.artifact_runs?.find(
+        (candidate) =>
+          candidate.client_message_id === local.id &&
+          candidate.status !== "running"
+      )
+      const userId = detail.deliverable_runs?.find(
+        (candidate) => candidate.turn_run_id === run?.id
+      )?.user_turn_id
+      anchor =
+        exact >= 0
+          ? exact
+          : detail.turns.findIndex(
+              (turn) => turn.role === "user" && turn.id === userId
+            )
+      if (
+        anchor < 0 ||
+        userTurnContentKey(local) !== userTurnContentKey(detail.turns[anchor]!)
+      )
+        return false
+      continue
+    }
+    const start = exact >= 0 ? exact : anchor + 1
+    if (exact < 0 && anchor < 0) return false
+    let end = exact >= 0 ? exact + 1 : detail.turns.length
+    if (exact < 0) {
+      const nextPrompt = detail.turns.findIndex(
+        (turn, index) => index > anchor && turn.role === "user"
+      )
+      if (nextPrompt >= 0) end = nextPrompt
+    }
+    const blocks = detail.turns
+      .slice(start, end)
+      .filter((turn) => turn.role === local.role)
+      .flatMap((turn) => turn.blocks)
+    if (
+      !local.blocks.every((block) => {
+        if (block.type === "plan") return true // live-only; never written by parsers
+        if (block.type === "text" || block.type === "thinking") {
+          const text = blocks
+            .filter((candidate) => candidate.type === block.type)
+            .map((candidate) => ("text" in candidate ? candidate.text : ""))
+            .join("")
+          return text.includes(block.text)
+        }
+        return blocks.some((candidate) => {
+          if (candidate.type !== block.type) return false
+          if (block.type === "tool_use" && candidate.type === "tool_use") {
+            return (
+              block.tool_use_id != null &&
+              candidate.tool_use_id === block.tool_use_id
+            )
+          }
+          if (
+            block.type === "tool_result" &&
+            candidate.type === "tool_result"
+          ) {
+            return (
+              block.tool_use_id != null &&
+              candidate.tool_use_id === block.tool_use_id &&
+              candidate.is_error === block.is_error &&
+              candidate.output_preview === block.output_preview
+            )
+          }
+          if (block.type === "image" && candidate.type === "image") {
+            return (
+              (block.uri != null && block.uri === candidate.uri) ||
+              (block.data.length > 0 && block.data === candidate.data)
+            )
+          }
+          if (
+            block.type === "image_generation" &&
+            candidate.type === "image_generation"
+          ) {
+            return (
+              block.image != null &&
+              candidate.image != null &&
+              ((block.image.uri != null &&
+                block.image.uri === candidate.image.uri) ||
+                (block.image.data.length > 0 &&
+                  block.image.data === candidate.image.data))
+            )
+          }
+          return false
+        })
+      })
+    )
+      return false
+  }
+  return true
 }
 
 /**
@@ -4388,6 +4467,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       }
     }
     viewerDetailSyncCancels.set(conversationId, cancel)
+    let sourceAdvanced = false
 
     const attempt = (n: number): void => {
       if (cancelled) return
@@ -4441,8 +4521,6 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
           // Any other settled tail (assistant reply, or no turns) means there is
           // nothing more to wait for.
           const lastTurn = detail.turns[detail.turns.length - 1]
-          const replyPending =
-            detail.in_flight_user_turn_id != null || lastTurn?.role === "user"
           // Skip a no-op dispatch (identical transcript) so a multi-tick poll
           // doesn't re-render the message list on every attempt. Compare the
           // cheap byte watermark + FULL-transcript turn count rather than
@@ -4458,7 +4536,22 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
             !prev ||
             (prev.transcript_watermark ?? null) !==
               (detail.transcript_watermark ?? null) ||
-            turnsTotalOf(prev) !== turnsTotalOf(detail)
+            turnsTotalOf(prev) !== turnsTotalOf(detail) ||
+            (prev.history_page?.source_version ?? null) !==
+              (detail.history_page?.source_version ?? null) ||
+            (prev.in_flight_user_turn_id != null &&
+              detail.in_flight_user_turn_id == null)
+          sourceAdvanced ||= changed
+          const protectLocal =
+            cur2.lastTurnOwned &&
+            cur2.localTurns.length > 0 &&
+            !localBatchCoveredByDetail(cur2, detail)
+          const replyPending =
+            detail.in_flight_user_turn_id != null ||
+            lastTurn?.role === "user" ||
+            protectLocal ||
+            detail.history_page?.page_complete === false ||
+            !sourceAdvanced
           // Commit when the transcript advanced (`changed`) OR when the reply
           // just settled (`!replyPending`). The settle case lands the FINAL
           // content for a no-watermark agent that grows its partial assistant
@@ -4470,7 +4563,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
               type: "FETCH_DETAIL_SUCCESS",
               conversationId,
               detail,
-              preserveLive: false,
+              preserveLive: protectLocal,
             })
           }
           if (replyPending && n + 1 < VIEWER_DETAIL_SYNC_DELAYS_MS.length) {
@@ -4548,9 +4641,11 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
           return
         }
 
+        const generation = bumpFetchGeneration(runtimeId)
         getFolderConversation(dbConversationId, {
           userTurnLimit: HISTORY_PAGE_USER_TURNS,
           cacheMode: "reload",
+          requestGeneration: generation,
         })
           .then((detail) => {
             if (cancelled) return
@@ -4601,6 +4696,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
                 .slice(persistedUserIndex + 1)
                 .some((turn) => turn.role === "assistant")
             const finalReplyPersisted =
+              detail.history_page?.page_complete !== false &&
               detail.in_flight_user_turn_id == null &&
               lastTurn?.role === "assistant" &&
               (assistantCount > assistantBaseline ||
@@ -4612,12 +4708,16 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
                 // for its own and disappear.
                 (clientMessageId == null && current.localTurns.length === 0))
             const terminalWithoutReply =
+              detail.history_page?.page_complete !== false &&
               runSettled &&
               attempt === COMPLETED_TURN_RECONCILE_DELAYS_MS.length - 1 &&
               detail.in_flight_user_turn_id == null &&
               lastTurn?.role !== "user"
 
-            if (finalReplyPersisted || terminalWithoutReply) {
+            if (
+              isLatestGeneration(runtimeId, generation) &&
+              (finalReplyPersisted || terminalWithoutReply)
+            ) {
               dispatch({
                 type: "FETCH_DETAIL_SUCCESS",
                 conversationId: runtimeId,
@@ -4730,6 +4830,15 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
               (t) => t.role === "assistant"
             )
             const responseWindowed = isWindowedDetail(parsed)
+            const windowVerified =
+              boundaryIndex != null &&
+              cur.batchBoundaryPrefixHash != null &&
+              boundaryIndex >= turnsOffsetOf(parsed) &&
+              boundaryIndex <= turnsOffsetOf(parsed) + parsed.turns.length &&
+              extendPrefixFingerprint(
+                parsed.prefix_hash ?? FNV_SEED_HEX,
+                parsed.turns.slice(0, boundaryIndex - turnsOffsetOf(parsed))
+              ) === cur.batchBoundaryPrefixHash
             const persistedAssistantCount = responseWindowed
               ? Math.max(
                   0,

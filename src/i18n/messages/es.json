@@ -3540,6 +3540,7 @@
         "showMore": "Mostrar más",
         "showLess": "Mostrar menos",
         "loadEarlierHistory": "Cargar mensajes anteriores",
+        "partialHistory": "El historial reciente se cargó parcialmente por el límite de lectura. Los mensajes se conservan. Recarga o carga mensajes anteriores para recuperar más.",
         "retryEarlierHistory": "Reintentar mensajes anteriores",
         "delivery": {
           "submitting": "Enviando…",

@@ -943,9 +943,8 @@ pub(crate) async fn import_selected_from_summaries(
         let target_row = folder_index.get(&norm_key).copied();
         let target_folder_id = target_row.map(|row| row.id);
         let existing_parent_id = target_row.and_then(|row| row.parent_id);
-        let target_has_children = target_folder_id.is_some_and(|folder_id| {
-            folder_child_counts.get(&folder_id).copied().unwrap_or(0) > 0
-        });
+        let target_has_children = target_folder_id
+            .is_some_and(|folder_id| folder_child_counts.get(&folder_id).copied().unwrap_or(0) > 0);
         let parent_id = root_key
             .as_ref()
             .and_then(|key| worktree_parents.get(key).copied())
@@ -1156,7 +1155,12 @@ fn build_historical_delegation_meta(child: &DbConversationSummary) -> serde_json
     }
     // The child row's title was seeded from the original task text — the same
     // substitute the broker uses for `task_preview` when it resumes a task.
-    if let Some(title) = child.title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+    if let Some(title) = child
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
         obj.insert(
             "task_preview".into(),
             serde_json::Value::String(title.into()),
@@ -1321,26 +1325,25 @@ fn inject_delegation_meta(turns: &mut [MessageTurn], children: &[DbConversationS
             if meta.is_some() {
                 continue;
             }
-            let child: Option<&DbConversationSummary> =
-                if tool_name.contains("delegate_to_agent") {
-                    tool_use_id.as_deref().and_then(|tu| {
-                        by_parent_tool_use_id
-                            .get(tu)
-                            .or_else(|| {
-                                task_id_by_call
-                                    .get(tu)
-                                    .and_then(|task_id| by_task_id.get(task_id.as_str()))
-                            })
-                            .copied()
-                    })
-                } else if tool_name.contains("resume_delegation") {
-                    input_preview
-                        .as_deref()
-                        .and_then(parse_resume_task_id)
-                        .and_then(|task_id| by_task_id.get(task_id.as_str()).copied())
-                } else {
-                    continue;
-                };
+            let child: Option<&DbConversationSummary> = if tool_name.contains("delegate_to_agent") {
+                tool_use_id.as_deref().and_then(|tu| {
+                    by_parent_tool_use_id
+                        .get(tu)
+                        .or_else(|| {
+                            task_id_by_call
+                                .get(tu)
+                                .and_then(|task_id| by_task_id.get(task_id.as_str()))
+                        })
+                        .copied()
+                })
+            } else if tool_name.contains("resume_delegation") {
+                input_preview
+                    .as_deref()
+                    .and_then(parse_resume_task_id)
+                    .and_then(|task_id| by_task_id.get(task_id.as_str()).copied())
+            } else {
+                continue;
+            };
             if let Some(child) = child {
                 *meta = Some(serde_json::json!({
                     "codeg.delegation": build_historical_delegation_meta(child),
@@ -1544,6 +1547,7 @@ async fn get_snapshot_branch_page(
                 .map(|cursor| format!("{SOURCE_CURSOR_PREFIX}{cursor}")),
             has_more: source_page.as_ref().is_some_and(|page| page.has_more),
             loaded_turns: branch_detail.turns.len() as u32,
+            page_complete: source_page.as_ref().and_then(|page| page.page_complete),
             source_version: source_page
                 .as_ref()
                 .and_then(|page| page.source_version.clone()),
@@ -2447,6 +2451,7 @@ async fn get_folder_conversation_raw_impl(
                                 .then(|| format!("codex:{}", page.start_offset)),
                             has_more: page.has_more,
                             loaded_turns,
+                            page_complete: Some(page.page_complete),
                             source_version: Some(page.source_version.clone()),
                             read_start_offset: Some(page.start_offset),
                             read_end_offset: Some(page.end_offset),
@@ -4205,8 +4210,12 @@ pub async fn delete_conversation_with_cleanup_core(
     // Canvas references (pinned cards, custom-region memberships) survive the
     // soft delete for the same reason tabs do — no FK cascade ever fires — so
     // they get the same explicit scrub, at the same funnel.
-    crate::commands::canvas::cleanup_canvas_for_deleted_conversation(emitter, conn, conversation_id)
-        .await;
+    crate::commands::canvas::cleanup_canvas_for_deleted_conversation(
+        emitter,
+        conn,
+        conversation_id,
+    )
+    .await;
     if let Some(folder_id) = folder_id {
         cleanup_chat_folder_for_deleted_conversation(conn, folder_id).await;
     }
@@ -4470,7 +4479,7 @@ mod tests {
             duration_ms: None,
             model: None,
             completed_at: None,
-        agent_message_id: None,
+            agent_message_id: None,
         }
     }
 
@@ -4509,7 +4518,7 @@ mod tests {
             duration_ms: None,
             model: None,
             completed_at: None,
-        agent_message_id: None,
+            agent_message_id: None,
         }
     }
 
@@ -4528,7 +4537,7 @@ mod tests {
             duration_ms: None,
             model: None,
             completed_at: completed.then_some(ts),
-        agent_message_id: None,
+            agent_message_id: None,
         }
     }
 
@@ -4706,8 +4715,11 @@ mod tests {
             user_text_turn("turn-2", "ok", at(1)),
             assistant_text_turn("turn-3", "b", at(2), false),
         ];
-        let stamped =
-            apply_in_flight_message_id(&mut turns, &pending_text("msg-live", "hello"), Some(turn_started()));
+        let stamped = apply_in_flight_message_id(
+            &mut turns,
+            &pending_text("msg-live", "hello"),
+            Some(turn_started()),
+        );
         assert_eq!(stamped, None, "nothing in the running turn matches");
         assert_eq!(turns[0].id, "turn-0");
         assert_eq!(
@@ -4778,15 +4790,13 @@ mod tests {
             user_text_turn("turn-0", "hello", at(1)),
         ];
         for i in 0..400 {
-            turns.push(assistant_text_turn(
-                &format!("a-{i}"),
-                "step",
-                at(2),
-                false,
-            ));
+            turns.push(assistant_text_turn(&format!("a-{i}"), "step", at(2), false));
         }
-        let stamped =
-            apply_in_flight_message_id(&mut turns, &pending_text("msg-live", "hello"), Some(turn_started()));
+        let stamped = apply_in_flight_message_id(
+            &mut turns,
+            &pending_text("msg-live", "hello"),
+            Some(turn_started()),
+        );
         assert_eq!(stamped.as_deref(), Some("msg-live"));
         assert_eq!(turns[2].id, "msg-live");
     }
@@ -4803,16 +4813,22 @@ mod tests {
         for i in 0..MAX_IN_FLIGHT_WALK_USER_TURNS {
             turns.push(user_text_turn(&format!("u-{i}"), "filler", parsed_at));
         }
-        let stamped =
-            apply_in_flight_message_id(&mut turns, &pending_text("msg-live", "hello"), Some(turn_started()));
+        let stamped = apply_in_flight_message_id(
+            &mut turns,
+            &pending_text("msg-live", "hello"),
+            Some(turn_started()),
+        );
         assert_eq!(stamped, None, "past the cost bound, stamp nothing");
         assert_eq!(turns[0].id, "wanted", "untouched");
 
         // One fewer and the same transcript is inside the bound, so it is the
         // bound that refused above and not some other gate.
         turns.pop();
-        let stamped =
-            apply_in_flight_message_id(&mut turns, &pending_text("msg-live", "hello"), Some(turn_started()));
+        let stamped = apply_in_flight_message_id(
+            &mut turns,
+            &pending_text("msg-live", "hello"),
+            Some(turn_started()),
+        );
         assert_eq!(stamped.as_deref(), Some("msg-live"));
     }
 
@@ -4833,8 +4849,11 @@ mod tests {
             assistant_text_turn("turn-1", "a", at(2), false),
             assistant_text_turn("turn-2", "b", at(3), false),
         ];
-        let stamped =
-            apply_in_flight_message_id(&mut turns, &pending_text("msg-live", "hello"), Some(turn_started()));
+        let stamped = apply_in_flight_message_id(
+            &mut turns,
+            &pending_text("msg-live", "hello"),
+            Some(turn_started()),
+        );
         assert_eq!(stamped.as_deref(), Some("msg-live"));
         assert_eq!(turns[0].id, "msg-live");
     }
@@ -4850,8 +4869,11 @@ mod tests {
             assistant_text_turn("turn-1", "first half", at(2), false),
             user_text_turn("turn-2", "also check the tests", at(3)),
         ];
-        let stamped =
-            apply_in_flight_message_id(&mut turns, &pending_text("msg-live", "hello"), Some(turn_started()));
+        let stamped = apply_in_flight_message_id(
+            &mut turns,
+            &pending_text("msg-live", "hello"),
+            Some(turn_started()),
+        );
         assert_eq!(stamped.as_deref(), Some("msg-live"));
         assert_eq!(turns[0].id, "msg-live", "the prompt keeps the stamp");
         assert_eq!(turns[2].id, "turn-2", "the mid-turn message is untouched");
@@ -4903,7 +4925,7 @@ mod tests {
             duration_ms: None,
             model: None,
             completed_at: None,
-        agent_message_id: None,
+            agent_message_id: None,
         };
         let pending_image =
             |message_id: &str, data: &str| crate::acp::session_state::PendingUserMessage {
@@ -5073,7 +5095,7 @@ mod tests {
             duration_ms: None,
             model: None,
             completed_at: None,
-        agent_message_id: None,
+            agent_message_id: None,
         }
     }
 
@@ -5336,7 +5358,7 @@ mod tests {
             duration_ms: None,
             model: None,
             completed_at: None,
-        agent_message_id: None,
+            agent_message_id: None,
         }];
         let children = vec![summary_child(42, "tu-1", "completed")];
         inject_delegation_meta(&mut turns, &children);
@@ -8122,8 +8144,9 @@ mod tests {
 
     #[tokio::test]
     async fn whole_folder_import_still_never_resurrects_a_deleted_conversation() {
-        use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel, QueryFilter,
-            Set};
+        use sea_orm::{
+            ActiveModelTrait, ColumnTrait, EntityTrait, IntoActiveModel, QueryFilter, Set,
+        };
         let db = fresh_in_memory_db().await;
         let folder_id = seed_folder(&db, "/tmp/proj-sweep").await;
         let items = vec![scan_summary(
@@ -8303,14 +8326,13 @@ mod tests {
             scan_summary("s2", AgentType::Codex, Some("/tmp/x"), at(1)),
         ];
 
-        let (tally, updated_ids, failed) =
-            import_service::import_summaries_resilient(
-                &db.conn,
-                999_999,
-                &items,
-                import_service::DeletedPolicy::Skip,
-            )
-            .await;
+        let (tally, updated_ids, failed) = import_service::import_summaries_resilient(
+            &db.conn,
+            999_999,
+            &items,
+            import_service::DeletedPolicy::Skip,
+        )
+        .await;
         assert_eq!(failed, 2, "both rows fail the folder FK and are counted");
         assert_eq!(tally.imported, 0);
         assert_eq!(tally.updated, 0);
@@ -8319,14 +8341,13 @@ mod tests {
         // Same items into a real folder import cleanly — the resilient loop did
         // not corrupt state or leave a half-open transaction.
         let folder_id = seed_folder(&db, "/tmp/x").await;
-        let (tally2, _ids, failed2) =
-            import_service::import_summaries_resilient(
-                &db.conn,
-                folder_id,
-                &items,
-                import_service::DeletedPolicy::Skip,
-            )
-            .await;
+        let (tally2, _ids, failed2) = import_service::import_summaries_resilient(
+            &db.conn,
+            folder_id,
+            &items,
+            import_service::DeletedPolicy::Skip,
+        )
+        .await;
         assert_eq!(failed2, 0);
         assert_eq!(tally2.imported, 2);
     }

@@ -120,6 +120,7 @@ function seed(
     olderTurnsPrependEpoch: 0,
     pendingOutOfTurnContent: false,
     pendingCleanup: false,
+    promptDeliveries: {},
   })
   useConversationRuntimeStore.setState({ byConversationId: next })
 }

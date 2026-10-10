@@ -260,10 +260,18 @@ export const ConversationDetailHeader = memo(function ConversationDetailHeader({
       }
       setMergeStage(progress.stage)
       setMergeError(progress.error ?? null)
-    }).then((dispose) => {
-      if (cancelled) dispose()
-      else unlisten = dispose
     })
+      .then((dispose) => {
+        if (cancelled) dispose()
+        else unlisten = dispose
+      })
+      .catch((error) => {
+        if (!cancelled)
+          console.warn(
+            "[ConversationDetailHeader] branch progress subscription:",
+            error
+          )
+      })
     return () => {
       cancelled = true
       unlisten?.()

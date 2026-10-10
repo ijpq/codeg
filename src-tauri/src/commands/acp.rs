@@ -54,9 +54,8 @@ struct ManagedRestoreFlightKey {
 
 struct ManagedRestoreFlight {
     generation: String,
-    result: tokio::sync::watch::Sender<
-        Option<Result<RestoredConversationConnectionInfo, AcpError>>,
-    >,
+    result:
+        tokio::sync::watch::Sender<Option<Result<RestoredConversationConnectionInfo, AcpError>>>,
 }
 
 fn managed_restore_flights(
@@ -370,10 +369,12 @@ pub(crate) fn resolve_system_agent_binary_for(agent_type: AgentType, cmd: &str) 
         cmd.to_string()
     };
     let home = home_dir_or_default();
-    registry::binary_system_dirs(agent_type).iter().find_map(|dir| {
-        let cand = home.join(dir).join(&exe);
-        cand.is_file().then_some(cand)
-    })
+    registry::binary_system_dirs(agent_type)
+        .iter()
+        .find_map(|dir| {
+            let cand = home.join(dir).join(&exe);
+            cand.is_file().then_some(cand)
+        })
 }
 
 /// Resolve the VENDOR CLI wrapped by an ACP adapter agent (`claude`, `codex`
@@ -3175,7 +3176,9 @@ fn cline_model_id_keys_for_provider(provider: &str) -> (&'static str, &'static s
 /// written by `cline auth` reads back correctly. With several entries and no
 /// usable `lastUsedProvider` there is no defensible "current" provider, so this
 /// reports none rather than guessing one and overwriting it on the next save.
-fn load_cline_provider_settings_at(path: &Path) -> Option<serde_json::Map<String, serde_json::Value>> {
+fn load_cline_provider_settings_at(
+    path: &Path,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
     let root = fs::read_to_string(path)
         .ok()
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())?;
@@ -3198,14 +3201,21 @@ fn load_cline_provider_settings_at(path: &Path) -> Option<serde_json::Map<String
         "apiProvider".to_string(),
         serde_json::Value::String(normalize_cline_provider_id(&selected)),
     );
-    for (source, target) in [("apiKey", "apiKey"), ("model", "model"), ("baseUrl", "apiBaseUrl")] {
+    for (source, target) in [
+        ("apiKey", "apiKey"),
+        ("model", "model"),
+        ("baseUrl", "apiBaseUrl"),
+    ] {
         if let Some(value) = settings
             .get(source)
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|v| !v.is_empty())
         {
-            merged.insert(target.to_string(), serde_json::Value::String(value.to_string()));
+            merged.insert(
+                target.to_string(),
+                serde_json::Value::String(value.to_string()),
+            );
         }
     }
     Some(merged)
@@ -3373,7 +3383,10 @@ fn persist_cline_provider_settings_at(
         .ok_or_else(|| AcpError::protocol("cline providers.json root must be an object"))?;
     // `version` is a zod literal — anything else and cline reads the file as empty.
     root_obj.insert("version".to_string(), serde_json::json!(1));
-    if !root_obj.get("modes").is_some_and(serde_json::Value::is_object) {
+    if !root_obj
+        .get("modes")
+        .is_some_and(serde_json::Value::is_object)
+    {
         root_obj.insert("modes".to_string(), serde_json::json!({}));
     }
     root_obj.insert(
@@ -3418,18 +3431,17 @@ fn persist_cline_provider_settings_at(
     // not otherwise recognize, and is honoured for the same reason.
     let agent_managed_credential =
         cline_provider_is_agent_managed(provider) || token_source == "oauth";
-    for (key, value) in [
-        ("apiKey", api_key),
-        ("model", model),
-        ("baseUrl", base_url),
-    ] {
+    for (key, value) in [("apiKey", api_key), ("model", model), ("baseUrl", base_url)] {
         let credential = key != "model";
         match value {
             Some(value) => {
                 if credential && agent_managed_credential {
                     continue;
                 }
-                settings.insert(key.to_string(), serde_json::Value::String(value.to_string()));
+                settings.insert(
+                    key.to_string(),
+                    serde_json::Value::String(value.to_string()),
+                );
             }
             None => {
                 if credential && agent_managed_credential {
@@ -7601,7 +7613,9 @@ pub(crate) fn load_pi_config_core() -> PiConfigProjection {
     load_pi_config_at(&pi_agent_dir())
 }
 
-pub(crate) async fn load_pi_config_for_db(db: &AppDatabase) -> Result<PiConfigProjection, AcpError> {
+pub(crate) async fn load_pi_config_for_db(
+    db: &AppDatabase,
+) -> Result<PiConfigProjection, AcpError> {
     Ok(load_pi_config_at(&pi_settings_dir_from_db(db).await?))
 }
 
@@ -8922,9 +8936,9 @@ fn agent_local_config_path(agent_type: AgentType) -> Option<PathBuf> {
         // `acp::connection::sync_antigravity_settings_file` at launch, which
         // merges only `auth.type` and the `gcp` block and leaves every other
         // key the user put there alone.
-        AgentType::Antigravity => Some(
-            crate::parsers::antigravity::resolve_antigravity_acp_dir().join("settings.json"),
-        ),
+        AgentType::Antigravity => {
+            Some(crate::parsers::antigravity::resolve_antigravity_acp_dir().join("settings.json"))
+        }
         AgentType::OpenCode => Some(resolve_opencode_config_path()),
         // The CLI's live credential store, NOT the legacy `globalState.json`
         // it migrates from once and then ignores — so "open config file" shows
@@ -9336,8 +9350,7 @@ pub(crate) fn skill_storage_spec(agent_type: AgentType) -> Option<SkillStorageSp
         AgentType::Antigravity => Some(SkillStorageSpec {
             kind: SkillStorageKind::SkillDirectoryOnly,
             global_dirs: vec![
-                crate::parsers::antigravity::resolve_antigravity_shared_config_dir()
-                    .join("skills"),
+                crate::parsers::antigravity::resolve_antigravity_shared_config_dir().join("skills"),
                 crate::parsers::antigravity::resolve_antigravity_cli_dir().join("skills"),
             ],
             project_rel_dirs: vec![".gemini/skills", ".agents/skills"],
@@ -10543,11 +10556,7 @@ fn agent_env_keys(agent_type: AgentType) -> (&'static str, &'static str, &'stati
         // the base-url slot stays an inert `AGY_BASE_URL` placeholder for the
         // same reason `CURSOR_MODEL`/`QODER_BASE_URL` above are: it keeps the
         // generic cascade off the `OPENAI_*` keys.
-        AgentType::Antigravity => (
-            "AGY_BASE_URL",
-            "GEMINI_API_KEY",
-            "AGY_ACP_DEFAULT_MODEL",
-        ),
+        AgentType::Antigravity => ("AGY_BASE_URL", "GEMINI_API_KEY", "AGY_ACP_DEFAULT_MODEL"),
         // `CLINE_API_KEY` is not just a convenience: it is one of only two ways
         // past cline's ACP auth gate (`isSessionReady`), and the only one a BYO
         // provider can take — see [`apply_cline_launch_env`]. `CLINE_MODEL`
@@ -10595,7 +10604,8 @@ fn agent_env_keys(agent_type: AgentType) -> (&'static str, &'static str, &'stati
 /// [`build_runtime_env_from_setting`] (see [`agent_env_keys`]); this only fills
 /// what is still missing, so an explicit `env_json` row keeps winning.
 fn apply_cline_launch_env(config_json: Option<&str>, merged: &mut BTreeMap<String, String>) {
-    let Some(config) = config_json.and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+    let Some(config) =
+        config_json.and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
     else {
         return;
     };
@@ -13193,8 +13203,7 @@ pub async fn acp_clear_binary_cache(agent_type: AgentType) -> Result<(), AcpErro
 /// Scan the system temp directory for artifacts leaked by agent launches from
 /// BEFORE per-launch temp isolation shipped. Read-only.
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
-pub async fn acp_scan_leaked_temp(
-) -> Result<crate::acp::temp_reclaim::LeakedTempScan, AcpError> {
+pub async fn acp_scan_leaked_temp() -> Result<crate::acp::temp_reclaim::LeakedTempScan, AcpError> {
     tokio::task::spawn_blocking(crate::acp::temp_reclaim::scan)
         .await
         .map_err(|e| AcpError::protocol(e.to_string()))
@@ -14014,7 +14023,9 @@ pub async fn acp_update_pi_config(
 /// directory resolution.
 #[cfg(feature = "tauri-runtime")]
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
-pub async fn acp_load_pi_config(db: State<'_, AppDatabase>) -> Result<PiConfigProjection, AcpError> {
+pub async fn acp_load_pi_config(
+    db: State<'_, AppDatabase>,
+) -> Result<PiConfigProjection, AcpError> {
     load_pi_config_for_db(&db).await
 }
 
@@ -15937,9 +15948,7 @@ mod tests {
         // No approvals wanted: no preset says exactly that without widening the
         // sandbox, and the model-screened default is the nearest.
         assert_eq!(
-            initial_mode_for(
-                "approval_policy = \"never\"\nsandbox_mode = \"workspace-write\"\n"
-            ),
+            initial_mode_for("approval_policy = \"never\"\nsandbox_mode = \"workspace-write\"\n"),
             Some("agent")
         );
     }
@@ -16658,9 +16667,8 @@ base_url = \"https://example.test/v1\"
 
         // Other `[features]` keys are not projected, and must not be mistaken
         // for this one.
-        let other = codex_config_projection_from_toml(
-            "model = \"gpt-5\"\n\n[features]\nskills = true\n",
-        );
+        let other =
+            codex_config_projection_from_toml("model = \"gpt-5\"\n\n[features]\nskills = true\n");
         assert_eq!(plain, other);
     }
 
@@ -17469,7 +17477,11 @@ base_url = \"https://example.test/v1\"
             "reasoning-model",
             Some(&pi_reasoning_spec(
                 true,
-                &[("minimal", Some("minimal")), ("max", Some("max")), ("ultra", Some("ultra"))],
+                &[
+                    ("minimal", Some("minimal")),
+                    ("max", Some("max")),
+                    ("ultra", Some("ultra")),
+                ],
             )),
         );
 
@@ -17724,8 +17736,16 @@ base_url = \"https://example.test/v1\"
     fn pi_config_projection_reads_selected_agent_directory() {
         let default = tempfile::tempdir().unwrap();
         let custom = tempfile::tempdir().unwrap();
-        fs::write(default.path().join("settings.json"), r#"{"defaultModel":"wrong"}"#).unwrap();
-        fs::write(custom.path().join("settings.json"), r#"{"defaultModel":"right","defaultThinkingLevel":"max"}"#).unwrap();
+        fs::write(
+            default.path().join("settings.json"),
+            r#"{"defaultModel":"wrong"}"#,
+        )
+        .unwrap();
+        fs::write(
+            custom.path().join("settings.json"),
+            r#"{"defaultModel":"right","defaultThinkingLevel":"max"}"#,
+        )
+        .unwrap();
         let loaded = load_pi_config_at(custom.path());
         assert_eq!(loaded.default_model.as_deref(), Some("right"));
         assert_eq!(loaded.default_thinking_level.as_deref(), Some("max"));
@@ -17767,8 +17787,14 @@ esac
 "#,
         );
         let mut env = BTreeMap::new();
-        env.insert("PI_ACP_PI_COMMAND".into(), script.to_string_lossy().into_owned());
-        env.insert("PI_CODING_AGENT_DIR".into(), temp.path().to_string_lossy().into_owned());
+        env.insert(
+            "PI_ACP_PI_COMMAND".into(),
+            script.to_string_lossy().into_owned(),
+        );
+        env.insert(
+            "PI_CODING_AGENT_DIR".into(),
+            temp.path().to_string_lossy().into_owned(),
+        );
         let catalog = query_pi_model_catalog(&env, PI_ANSWER_DEADLINE).await;
         assert_eq!(catalog.status, PiCatalogStatus::Ok);
         assert_eq!(catalog.models.len(), 1);
@@ -17876,7 +17902,10 @@ echo {"id":"codeg-models","type":"response","command":"get_available_models","su
 "#.replace('\n', "\r\n"),
         ).unwrap();
         let mut env = BTreeMap::new();
-        env.insert("PI_ACP_PI_COMMAND".into(), script.to_string_lossy().into_owned());
+        env.insert(
+            "PI_ACP_PI_COMMAND".into(),
+            script.to_string_lossy().into_owned(),
+        );
         let catalog = query_pi_model_catalog(&env, PI_ANSWER_DEADLINE).await;
         assert_eq!(catalog.status, PiCatalogStatus::Ok);
         assert_eq!(catalog.models.len(), 1);
@@ -18523,13 +18552,19 @@ wire_api = "chat"
         // root.
         let bare = tmp.path().join("bare");
         std::fs::create_dir_all(&bare).expect("create bare");
-        let fallback = scoped_skill_dirs(
+        // Constrain the no-git probe to this fixture. An ambient /tmp/.git (or
+        // a developer's checkout above TMPDIR) is a real repo to the production
+        // resolver, and must not turn this fallback test into an environment test.
+        let fallback = project_skill_base_with_probe(
             AgentType::KimiCode,
-            AgentSkillScope::Project,
-            Some(bare.to_str().expect("utf-8 path")),
-        )
-        .expect("fallback dirs");
-        assert_eq!(fallback[0], bare.join(".kimi-code/skills"));
+            bare.to_str().expect("utf-8 path"),
+            |path| path.starts_with(tmp.path()) && path.exists(),
+        );
+        assert_eq!(fallback, bare);
+        assert_eq!(
+            fallback.join(".kimi-code/skills"),
+            bare.join(".kimi-code/skills")
+        );
 
         // The LIST path must resolve the same base as the WRITE path.
         let saved = repo.join(".kimi-code/skills").join("demo");
@@ -21768,7 +21803,11 @@ model = "gpt"
     /// each of these assertions is the difference between a working agent and a
     /// user whose every provider silently vanished.
     fn assert_valid_cline_provider_store(root: &serde_json::Value) {
-        assert_eq!(root["version"], serde_json::json!(1), "version is a zod literal");
+        assert_eq!(
+            root["version"],
+            serde_json::json!(1),
+            "version is a zod literal"
+        );
         assert!(root["modes"].is_object(), "`modes` must be an object");
         for (id, entry) in root["providers"].as_object().expect("providers object") {
             let token_source = entry["tokenSource"].as_str().unwrap_or_default();
@@ -21905,7 +21944,10 @@ model = "gpt"
             root["providers"]["deepseek"]["settings"]["reasoning"]["effort"],
             "high"
         );
-        assert_eq!(root["providers"]["deepseek"]["settings"]["apiKey"], "sk-rotated");
+        assert_eq!(
+            root["providers"]["deepseek"]["settings"]["apiKey"],
+            "sk-rotated"
+        );
         assert_eq!(root["lastUsedProvider"], "deepseek");
     }
 
@@ -21913,13 +21955,27 @@ model = "gpt"
     fn cline_save_clears_a_field_the_panel_emptied() {
         let store = ClineStore::new();
         store
-            .save("openai-native", Some("sk-a"), Some("gpt-5.4"), Some("https://a.example/v1"))
+            .save(
+                "openai-native",
+                Some("sk-a"),
+                Some("gpt-5.4"),
+                Some("https://a.example/v1"),
+            )
             .expect("save");
-        store.save("openai-native", Some("sk-a"), None, None).expect("save 2");
+        store
+            .save("openai-native", Some("sk-a"), None, None)
+            .expect("save 2");
 
-        let settings = read_cline_json(&store.providers)["providers"]["openai-native"]["settings"].clone();
-        assert!(settings.get("model").is_none(), "cleared model must be removed");
-        assert!(settings.get("baseUrl").is_none(), "cleared base URL must be removed");
+        let settings =
+            read_cline_json(&store.providers)["providers"]["openai-native"]["settings"].clone();
+        assert!(
+            settings.get("model").is_none(),
+            "cleared model must be removed"
+        );
+        assert!(
+            settings.get("baseUrl").is_none(),
+            "cleared base URL must be removed"
+        );
     }
 
     #[test]
@@ -21943,7 +21999,9 @@ model = "gpt"
         )
         .expect("seed");
 
-        store.save("openai-codex", Some("sk-x"), None, None).expect("save");
+        store
+            .save("openai-codex", Some("sk-x"), None, None)
+            .expect("save");
         assert_eq!(
             read_cline_json(&store.providers)["providers"]["openai-codex"]["tokenSource"],
             "oauth",
@@ -21972,7 +22030,9 @@ model = "gpt"
         )
         .expect("seed");
 
-        store.save("deepseek", Some("sk-x"), None, None).expect("save");
+        store
+            .save("deepseek", Some("sk-x"), None, None)
+            .expect("save");
         // Round-tripping the out-of-enum value would hand cline a file it reads
         // as empty — every provider gone, endpoint and key with it.
         assert_valid_cline_provider_store(&read_cline_json(&store.providers));
@@ -22014,16 +22074,29 @@ model = "gpt"
     fn cline_models_catalog_keeps_models_registered_elsewhere() {
         let store = ClineStore::new();
         store
-            .save("openai-compatible", Some("sk"), Some("first"), Some("https://a.example/v1"))
+            .save(
+                "openai-compatible",
+                Some("sk"),
+                Some("first"),
+                Some("https://a.example/v1"),
+            )
             .expect("save");
         store
-            .save("openai-compatible", Some("sk"), Some("second"), Some("https://b.example/v1"))
+            .save(
+                "openai-compatible",
+                Some("sk"),
+                Some("second"),
+                Some("https://b.example/v1"),
+            )
             .expect("save 2");
 
         let entry = read_cline_json(&store.models)["providers"]["openai-compatible"].clone();
         assert_eq!(entry["provider"]["defaultModelId"], "second");
         assert_eq!(entry["provider"]["baseUrl"], "https://b.example/v1");
-        assert!(entry["models"]["first"].is_object(), "earlier model stays selectable");
+        assert!(
+            entry["models"]["first"].is_object(),
+            "earlier model stays selectable"
+        );
         assert!(entry["models"]["second"].is_object());
     }
 
@@ -22045,16 +22118,28 @@ model = "gpt"
         );
 
         store
-            .save("openai-compatible", Some("sk"), Some("m"), Some("http://127.0.0.1:11434/v1"))
+            .save(
+                "openai-compatible",
+                Some("sk"),
+                Some("m"),
+                Some("http://127.0.0.1:11434/v1"),
+            )
             .expect("a plain-http loopback endpoint is legitimate");
     }
 
     #[test]
     fn cline_reader_picks_the_last_used_provider() {
         let store = ClineStore::new();
-        store.save("deepseek", Some("sk-deep"), Some("deepseek-chat"), None).expect("save");
         store
-            .save("openai-compatible", Some("sk-compat"), Some("m"), Some("https://a.example/v1"))
+            .save("deepseek", Some("sk-deep"), Some("deepseek-chat"), None)
+            .expect("save");
+        store
+            .save(
+                "openai-compatible",
+                Some("sk-compat"),
+                Some("m"),
+                Some("https://a.example/v1"),
+            )
             .expect("save 2");
 
         let loaded = load_cline_provider_settings_at(&store.providers).expect("load");
@@ -22127,7 +22212,10 @@ model = "gpt"
             "model": "my-model",
             "apiBaseUrl": "https://proxy.example/v1",
         }));
-        assert_eq!(env.get("CLINE_API_KEY").map(String::as_str), Some("sk-test"));
+        assert_eq!(
+            env.get("CLINE_API_KEY").map(String::as_str),
+            Some("sk-test")
+        );
         assert_eq!(
             env.get("CLINE_PROVIDER").map(String::as_str),
             Some("openai-compatible"),
@@ -22137,7 +22225,10 @@ model = "gpt"
         // The endpoint travels in providers.json — `CLINE_API_BASE_URL` is
         // cline's ACCOUNT service and must never receive an LLM endpoint.
         assert!(!env.contains_key("CLINE_API_BASE_URL"));
-        assert!(!env.contains_key("OPENAI_API_KEY"), "the cline key must not leak into OPENAI_*");
+        assert!(
+            !env.contains_key("OPENAI_API_KEY"),
+            "the cline key must not leak into OPENAI_*"
+        );
     }
 
     #[test]
@@ -22330,7 +22421,10 @@ model = "gpt"
         }));
         // Ollama has no API key, but the gate only tests the var for emptiness.
         assert_eq!(env.get("CLINE_API_KEY").map(String::as_str), Some("local"));
-        assert_eq!(env.get("CLINE_PROVIDER").map(String::as_str), Some("ollama"));
+        assert_eq!(
+            env.get("CLINE_PROVIDER").map(String::as_str),
+            Some("ollama")
+        );
     }
 
     #[test]
@@ -22353,6 +22447,9 @@ model = "gpt"
             Some(&setting),
             Some(&serde_json::json!({ "apiProvider": "deepseek", "apiKey": "sk" }).to_string()),
         );
-        assert_eq!(env.get("CLINE_PROVIDER").map(String::as_str), Some("cline-pass"));
+        assert_eq!(
+            env.get("CLINE_PROVIDER").map(String::as_str),
+            Some("cline-pass")
+        );
     }
 }

@@ -2,12 +2,12 @@
 
 import { useCallback, useEffect, useRef, useState } from "react"
 import { useTranslations } from "next-intl"
+import { toast } from "sonner"
 import { useAcpActions } from "@/contexts/acp-connections-context"
 import { useTaskContext } from "@/contexts/task-context"
 import { useConnection, type UseConnectionReturn } from "@/hooks/use-connection"
 import { extractAppCommandError } from "@/lib/app-error"
 import { notify } from "@/lib/notify"
-import { isConnectionBusy } from "@/lib/connection-teardown"
 import { isNetworkOrOfflineError } from "@/lib/network-error"
 import { isSessionRestorePendingError } from "@/lib/session-restore"
 import { TurnBusyError } from "@/lib/turn-busy"
@@ -325,7 +325,11 @@ export function useConnectionLifecycle({
   const taskPhaseRef = useRef<"preparing" | "connecting" | null>(null)
   useEffect(() => {
     const phase =
-      status === "connecting" ? "connecting" : (preparing || restorePending) ? "preparing" : null
+      status === "connecting"
+        ? "connecting"
+        : preparing || restorePending
+          ? "preparing"
+          : null
     if (phase !== null && phase === taskPhaseRef.current) return
     taskPhaseRef.current = phase
     if (taskIdRef.current) {
@@ -359,7 +363,16 @@ export function useConnectionLifecycle({
         : t("tasks.preparingDescription")
     )
     updateTask(id, { status: "running" })
-  }, [status, preparing, restorePending, addTask, updateTask, removeTask, agentType, t])
+  }, [
+    status,
+    preparing,
+    restorePending,
+    addTask,
+    updateTask,
+    removeTask,
+    agentType,
+    t,
+  ])
 
   const clearSelectorTask = useCallback(() => {
     if (selectorTaskIdRef.current) {

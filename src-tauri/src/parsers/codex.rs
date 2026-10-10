@@ -535,10 +535,7 @@ impl CodexParser {
         titles
     }
 
-    fn parse_jsonl_summary(
-        &self,
-        path: &Path,
-    ) -> Result<Option<ConversationSummary>, ParseError> {
+    fn parse_jsonl_summary(&self, path: &Path) -> Result<Option<ConversationSummary>, ParseError> {
         let lines = self.rollout_lines(path)?;
 
         let mut conversation_id: Option<String> = None;
@@ -1081,6 +1078,7 @@ pub(crate) struct CodexConversationPage {
     pub start_offset: u64,
     pub end_offset: u64,
     pub has_more: bool,
+    pub page_complete: bool,
     /// Bytes inspected while locating the page boundary. Zero means the
     /// persistent offset index answered the lookup without scanning JSONL.
     pub scan_bytes: u64,
@@ -1121,16 +1119,15 @@ pub struct CodexRolloutSizeDiagnostics {
 }
 
 const CODEX_HISTORY_SCAN_CHUNK_BYTES: usize = 1024 * 1024;
-/// The first probe preserves the historical 16 MiB fast path. When that tail
-/// cannot contain the requested rounds (most often because one tool result is
-/// itself larger than the window), the scanner may grow geometrically to this
-/// hard ceiling. This keeps first-open I/O and memory bounded while avoiding a
-/// false empty latest page for large individual JSONL records.
+/// Historical fast-path budget, also used for incremental index slices. The
+/// tail scanner stops as soon as it finds the requested rounds, extending past
+/// this threshold when needed, with no reread and a strict 64 MiB ceiling.
 pub(crate) const CODEX_HISTORY_FIRST_PAGE_INITIAL_BYTES: u64 = 16 * 1024 * 1024;
 pub(crate) const CODEX_HISTORY_FIRST_PAGE_MAX_BYTES: u64 = 64 * 1024 * 1024;
-const CODEX_HISTORY_INDEX_VERSION: u8 = 2;
+// v2 could persist a partial scan's offset as a complete page boundary.
+const CODEX_HISTORY_INDEX_VERSION: u8 = 3;
 #[cfg(not(test))]
-const CODEX_HISTORY_INDEX_SLICE_BYTES: u64 = 16 * 1024 * 1024;
+const CODEX_HISTORY_INDEX_SLICE_BYTES: u64 = CODEX_HISTORY_FIRST_PAGE_INITIAL_BYTES;
 #[cfg(not(test))]
 const CODEX_HISTORY_INDEX_PROGRESS_BYTES: u64 = 256 * 1024 * 1024;
 const CODEX_HISTORY_INDEX_ENTRY_BYTES: usize = 17;
@@ -2169,6 +2166,7 @@ fn find_codex_page_start(
     let mut suffix_bytes = 0usize;
     let mut boundaries = 0usize;
     let mut include_preceding_record = false;
+    let mut oldest_complete_start = end_offset;
     let scan_floor = max_scan_bytes
         .map(|limit| end_offset.saturating_sub(limit))
         .unwrap_or(0);
@@ -2227,6 +2225,9 @@ fn find_codex_page_start(
             line_end = newline;
         }
 
+        if let Some(newline) = first_newline {
+            oldest_complete_start = read_start + newline as u64 + 1;
+        }
         let prefix_end = first_newline.unwrap_or(chunk.len());
         if first_newline.is_some() {
             suffix_chunks.clear();
@@ -2244,12 +2245,13 @@ fn find_codex_page_start(
             // The bounded tail did not contain enough user rounds. Return the
             // first complete JSONL record inside the budget instead of either
             // failing the open or crossing the hard read ceiling. A single
-            // record larger than the ceiling yields an empty page until the
-            // background record index reaches it; the original rollout is
-            // never rewritten or partially parsed.
-            let start = first_newline
-                .map(|newline| scan_floor + newline as u64 + 1)
-                .unwrap_or(end_offset);
+            // record larger than the ceiling can leave fewer than the requested
+            // rounds. Keep subsequent complete records and mark the page partial;
+            // the original rollout is never rewritten or partially parsed.
+            // The scan floor may sit inside a giant record, with no newline
+            // in the final chunk. Keep the complete records already found
+            // after it, rather than incorrectly returning an empty latest page.
+            let start = oldest_complete_start;
             return Ok((
                 start.min(end_offset),
                 end_offset.saturating_sub(scan_floor),
@@ -3111,13 +3113,12 @@ fn completed_mcp_call(payload: &serde_json::Value) -> Option<CompletedMcpCall> {
     let stated_is_error = result
         .and_then(|result| result.get("isError"))
         .and_then(serde_json::Value::as_bool);
-    let claimed_failed =
-        stated_is_error == Some(true)
-            || stated_error.is_some()
-            || item
-                .get("status")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(is_failed_status);
+    let claimed_failed = stated_is_error == Some(true)
+        || stated_error.is_some()
+        || item
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(is_failed_status);
     let claimed_ok = stated_is_error == Some(false)
         || item.get("status").and_then(serde_json::Value::as_str) == Some("completed");
     Some(CompletedMcpCall {
@@ -4719,47 +4720,44 @@ impl CodexParser {
         }
 
         let mut file = fs::File::open(&path)?;
-        let (start_offset, scan_bytes, index_hit) = if max_bytes.is_none() {
+        let (start_offset, scan_bytes, index_hit, selection_complete) = if max_bytes.is_none() {
             if let Some(start) =
                 indexed_page_start(&path, file_len, modified_ns, end_offset, user_turn_limit)
             {
-                (start, 0, true)
+                (start, 0, true, true)
             } else {
-                let (mut start, mut scanned, complete) = find_codex_page_start(
+                // The scanner already walks backwards in bounded chunks. Keep
+                // its state across the 16 MiB boundary rather than rescanning
+                // those bytes, so boundary scanning obeys the 64 MiB ceiling.
+                // Parsing reads the selected page once (also at most 64 MiB).
+                let (start, scanned, complete) = find_codex_page_start(
                     &mut file,
                     end_offset,
                     user_turn_limit,
-                    Some(CODEX_HISTORY_FIRST_PAGE_INITIAL_BYTES),
+                    Some(CODEX_HISTORY_FIRST_PAGE_MAX_BYTES),
                     cancelled.as_deref(),
                 )?;
-                if !complete && CODEX_HISTORY_FIRST_PAGE_MAX_BYTES > scanned {
-                    (start, scanned, _) = find_codex_page_start(
-                        &mut file,
+                if complete {
+                    remember_page_start(
+                        &path,
+                        file_len,
+                        modified_ns,
                         end_offset,
                         user_turn_limit,
-                        Some(CODEX_HISTORY_FIRST_PAGE_MAX_BYTES),
-                        cancelled.as_deref(),
-                    )?;
+                        start,
+                    );
                 }
-                remember_page_start(
-                    &path,
-                    file_len,
-                    modified_ns,
-                    end_offset,
-                    user_turn_limit,
-                    start,
-                );
-                (start, scanned, false)
+                (start, scanned, false, complete)
             }
         } else {
-            let (start, scanned, _) = find_codex_page_start(
+            let (start, scanned, complete) = find_codex_page_start(
                 &mut file,
                 end_offset,
                 user_turn_limit,
                 max_bytes,
                 cancelled.as_deref(),
             )?;
-            (start, scanned, false)
+            (start, scanned, false, complete)
         };
         let page_bytes = end_offset.saturating_sub(start_offset);
         if max_bytes.is_some_and(|limit| page_bytes > limit) {
@@ -4792,6 +4790,7 @@ impl CodexParser {
             start_offset,
             end_offset,
             has_more: start_offset > 0,
+            page_complete: selection_complete,
             scan_bytes,
             cache_hit: false,
             index_hit,
@@ -4799,7 +4798,10 @@ impl CodexParser {
             indexed_through_offset,
             source_version: format!("{file_len}:{modified_ns}"),
         };
-        if max_bytes.is_none() && page_bytes <= CODEX_HISTORY_PAGE_CACHE_MAX_ENTRY_BYTES {
+        if selection_complete
+            && max_bytes.is_none()
+            && page_bytes <= CODEX_HISTORY_PAGE_CACHE_MAX_ENTRY_BYTES
+        {
             let mut cache = HISTORY_PAGE_CACHE
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
@@ -5435,7 +5437,7 @@ impl CodexParser {
                                     duration_ms: None,
                                     model: None,
                                     completed_at: Some(timestamp),
-                                agent_message_id: None,
+                                    agent_message_id: None,
                                 });
                             }
                             "agent_message" => {
@@ -5473,7 +5475,7 @@ impl CodexParser {
                                     duration_ms: None,
                                     model: None,
                                     completed_at: Some(timestamp),
-                                agent_message_id: None,
+                                    agent_message_id: None,
                                 });
                             }
                             "thread_goal_updated" => {
@@ -5554,7 +5556,7 @@ impl CodexParser {
                                         duration_ms: None,
                                         model: None,
                                         completed_at: Some(timestamp),
-                                    agent_message_id: None,
+                                        agent_message_id: None,
                                     });
                                 }
                             }
@@ -5620,10 +5622,7 @@ impl CodexParser {
                                     } else {
                                         continue;
                                     };
-                                    completed_mcp_by_exec
-                                        .entry(exec_id)
-                                        .or_default()
-                                        .push(call);
+                                    completed_mcp_by_exec.entry(exec_id).or_default().push(call);
                                     continue;
                                 }
                                 // Plan mode's finished plan document. This is the
@@ -5673,10 +5672,8 @@ impl CodexParser {
                                 // ONE 思考 card (live parity) instead of one card per
                                 // section, and if no grouped summary arrives
                                 // (interrupted/older rollouts) nothing is lost.
-                                let text = payload
-                                    .get("text")
-                                    .and_then(|t| t.as_str())
-                                    .unwrap_or("");
+                                let text =
+                                    payload.get("text").and_then(|t| t.as_str()).unwrap_or("");
                                 if !text.trim().is_empty() {
                                     pending_reasoning.push(text.to_string());
                                     pending_reasoning_ts = Some(timestamp);
@@ -5729,7 +5726,7 @@ impl CodexParser {
                                     duration_ms: None,
                                     model: None,
                                     completed_at: Some(timestamp),
-                                agent_message_id: None,
+                                    agent_message_id: None,
                                 });
                                 if !call_id.is_empty() {
                                     emitted_image_ids.insert(call_id);
@@ -5995,12 +5992,12 @@ impl CodexParser {
                                     codex_inter_agent_final_answer(payload)
                                 {
                                     if let Some(thread_id) = agent_path_to_thread_id.get(author) {
-                                        agent_fallback_results
-                                            .insert(thread_id.clone(), body);
+                                        agent_fallback_results.insert(thread_id.clone(), body);
                                     }
                                 }
                             }
                             "web_search_call" => {
+                                context_readings.web_search_ran();
                                 // Some Codex/app-server builds retain an exact
                                 // citation id + open-page URL only on the raw
                                 // Responses item. codex-acp 1.6.2 ignored this
@@ -6206,7 +6203,7 @@ impl CodexParser {
                                             duration_ms: None,
                                             model: None,
                                             completed_at: Some(timestamp),
-                                        agent_message_id: None,
+                                            agent_message_id: None,
                                         });
                                     }
                                     "wait_agent" => {
@@ -6274,7 +6271,7 @@ impl CodexParser {
                                             duration_ms: None,
                                             model: None,
                                             completed_at: Some(timestamp),
-                                        agent_message_id: None,
+                                            agent_message_id: None,
                                         });
                                     }
                                     _ => {
@@ -6348,7 +6345,7 @@ impl CodexParser {
                                             duration_ms: None,
                                             model: None,
                                             completed_at: Some(timestamp),
-                                        agent_message_id: None,
+                                            agent_message_id: None,
                                         });
                                     }
                                 }
@@ -6400,9 +6397,7 @@ impl CodexParser {
                                         note: collected.note,
                                     };
                                     let semantic = (parsed.status == ScriptStatus::Completed)
-                                        .then(|| {
-                                            completed_mcp_by_exec.remove(&deferred.call_id)
-                                        })
+                                        .then(|| completed_mcp_by_exec.remove(&deferred.call_id))
                                         .flatten();
                                     let (uses, results) = semantic
                                         .and_then(|calls| {
@@ -6483,7 +6478,7 @@ impl CodexParser {
                                         duration_ms: None,
                                         model: None,
                                         completed_at: Some(timestamp),
-                                    agent_message_id: None,
+                                        agent_message_id: None,
                                     });
                                 } else if is_spawn {
                                     if let Some(output_obj) = parse_codex_json_output(payload) {
@@ -6510,7 +6505,7 @@ impl CodexParser {
                                         duration_ms: None,
                                         model: None,
                                         completed_at: Some(timestamp),
-                                    agent_message_id: None,
+                                        agent_message_id: None,
                                     });
                                 } else if is_wait || is_list {
                                     // Emit one `collab_agent` capsule per wait or
@@ -6525,12 +6520,14 @@ impl CodexParser {
                                     // spawn capsule's own result on the strength
                                     // of a `list_agents` the model happened to
                                     // call would lose the report entirely.
-                                    let capsule = parse_codex_json_output(payload).and_then(
-                                        |output_obj| {
+                                    let capsule =
+                                        parse_codex_json_output(payload).and_then(|output_obj| {
                                             if is_list {
                                                 return build_collab_list_input(&output_obj);
                                             }
-                                            match output_obj.get("status").and_then(|s| s.as_object())
+                                            match output_obj
+                                                .get("status")
+                                                .and_then(|s| s.as_object())
                                             {
                                                 Some(status) => {
                                                     // Mark returned agents so the spawn
@@ -6551,8 +6548,7 @@ impl CodexParser {
                                                 }
                                                 None => native_team_wait_input(&output_obj),
                                             }
-                                        },
-                                    );
+                                        });
                                     if let Some((collab_input, is_error)) = capsule {
                                         messages.push(UnifiedMessage {
                                             id: format!("tool-{}", messages.len()),
@@ -6569,7 +6565,7 @@ impl CodexParser {
                                             duration_ms: None,
                                             model: None,
                                             completed_at: Some(timestamp),
-                                        agent_message_id: None,
+                                            agent_message_id: None,
                                         });
                                         messages.push(UnifiedMessage {
                                             id: format!("tool-result-{}", messages.len()),
@@ -6586,7 +6582,7 @@ impl CodexParser {
                                             duration_ms: None,
                                             model: None,
                                             completed_at: Some(timestamp),
-                                        agent_message_id: None,
+                                            agent_message_id: None,
                                         });
                                     }
                                 } else if is_close {
@@ -6705,7 +6701,7 @@ impl CodexParser {
                                         duration_ms: None,
                                         model: None,
                                         completed_at: Some(timestamp),
-                                    agent_message_id: None,
+                                        agent_message_id: None,
                                     });
                                 }
                             }
@@ -6744,7 +6740,7 @@ impl CodexParser {
                                             duration_ms: None,
                                             model: None,
                                             completed_at: Some(timestamp),
-                                        agent_message_id: None,
+                                            agent_message_id: None,
                                         });
                                         continue;
                                     }
@@ -6805,7 +6801,10 @@ impl CodexParser {
                                             Some(existing) => existing.content = blocks,
                                             None => {
                                                 messages.push(UnifiedMessage {
-                                                    id: format!("assistant-plan-{}", messages.len()),
+                                                    id: format!(
+                                                        "assistant-plan-{}",
+                                                        messages.len()
+                                                    ),
                                                     role: MessageRole::Assistant,
                                                     content: blocks,
                                                     timestamp,
@@ -6901,7 +6900,7 @@ impl CodexParser {
                                     duration_ms: None,
                                     model: None,
                                     completed_at: Some(timestamp),
-                                agent_message_id: None,
+                                    agent_message_id: None,
                                 });
                                 if !id.is_empty() {
                                     emitted_image_ids.insert(id);
@@ -6910,7 +6909,6 @@ impl CodexParser {
                             // Not rendered; it only marks the request whose
                             // `token_count` will cover the provider's search
                             // loop rather than the context.
-                            "web_search_call" => context_readings.web_search_ran(),
                             _ => {}
                         }
                     }
@@ -7138,7 +7136,7 @@ impl CodexParser {
                     duration_ms: None,
                     model: None,
                     completed_at: Some(pending.timestamp),
-                agent_message_id: None,
+                    agent_message_id: None,
                 })
                 .collect();
             messages.splice(insert_at..insert_at, group);
@@ -7194,7 +7192,7 @@ impl CodexParser {
                         duration_ms: None,
                         model: None,
                         completed_at: first_timestamp,
-                    agent_message_id: None,
+                        agent_message_id: None,
                     },
                 );
             }
@@ -7451,14 +7449,11 @@ fn reconcile_turn_usage(turns: &mut [MessageTurn], recorded: &TurnUsage) {
     // Prefer a turn that already reports usage — it is one the transcript
     // itself tied to a model call, so the recovered tokens land beside spend
     // that really happened rather than on an unrelated bubble.
-    let target = turns
-        .iter()
-        .rposition(|t| t.usage.is_some())
-        .or_else(|| {
-            turns.iter().rposition(|t| {
-                matches!(t.role, TurnRole::Assistant) && !is_codex_compaction_divider(&t.blocks)
-            })
-        });
+    let target = turns.iter().rposition(|t| t.usage.is_some()).or_else(|| {
+        turns.iter().rposition(|t| {
+            matches!(t.role, TurnRole::Assistant) && !is_codex_compaction_divider(&t.blocks)
+        })
+    });
     if let Some(turn) = target.and_then(|i| turns.get_mut(i)) {
         turn.usage = Some(match turn.usage {
             Some(ref existing) => codex_usage_add(existing, &missing),
@@ -7658,7 +7653,7 @@ fn flush_pending_reasoning(
         duration_ms: None,
         model: None,
         completed_at: Some(timestamp),
-    agent_message_id: None,
+        agent_message_id: None,
     });
 }
 
@@ -8737,7 +8732,7 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
                 duration_ms: None,
                 model: None,
                 completed_at: msg.completed_at,
-            agent_message_id: None,
+                agent_message_id: None,
             });
             i += 1;
         } else if matches!(msg.role, MessageRole::System) {
@@ -8750,7 +8745,7 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
                 duration_ms: None,
                 model: None,
                 completed_at: msg.completed_at,
-            agent_message_id: None,
+                agent_message_id: None,
             });
             i += 1;
         } else {
@@ -8791,7 +8786,7 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
                 duration_ms,
                 model: turn_model,
                 completed_at,
-            agent_message_id: None,
+                agent_message_id: None,
             });
         }
     }
@@ -9738,21 +9733,16 @@ mod tests {
         }
     }
 
-    use std::collections::HashMap;
     use std::collections::{HashMap, HashSet};
 
+    use super::codex_compacted_summary;
+    use super::codex_line_ordinal;
     use super::codex_parent_thread_id;
+    use super::completed_mcp_call;
     use super::extract_codex_title_candidate;
     use super::extract_context_window_used_tokens_from_token_count_info;
     use super::extract_response_item_user_image_blocks;
     use super::extract_turn_usage_from_codex_usage;
-    use super::codex_line_ordinal;
-    use super::codex_parent_thread_id;
-    use super::completed_mcp_call;
-    use super::serialize_preview;
-    use super::truncate_str;
-    use super::BudgetedSink;
-    use super::MCP_RESULT_FALLBACK_CAP;
     use super::is_encrypted_envelope;
     use super::is_promotable_user_text;
     use super::merge_codex_context_window_stats;
@@ -9763,21 +9753,24 @@ mod tests {
     use super::recover_current_turn_citation_sources_from_path;
     use super::redact_encrypted_args;
     use super::resolve_codex_home_dir_from;
+    use super::serialize_preview;
+    use super::should_skip_duplicate_user_message;
+    use super::strip_blocked_resource_mentions;
     use super::trim_subagent_replay_prefix;
+    use super::truncate_str;
+    use super::AgentParser;
+    use super::BudgetedSink;
+    use super::CodexParser;
     use super::RolloutFileName;
-    use super::codex_compacted_summary;
     use super::CODEX_COMPACTION_SUMMARY_PREFIX;
     use super::CODEX_COMPACTION_TOOL_NAME;
     use super::CODEX_PLAN_APPROVAL_PROMPT;
     use super::CODEX_PLAN_APPROVED_OUTPUT;
+    use super::CODEX_SCRIPT_TOOL_NAME;
     use super::CODEX_SUBAGENT_LAUNCH_KEY;
     use super::CODEX_SUBAGENT_STATE_KEY;
     use super::COLLAB_OP_KEY;
-    use super::should_skip_duplicate_user_message;
-    use super::strip_blocked_resource_mentions;
-    use super::AgentParser;
-    use super::CodexParser;
-    use super::CODEX_SCRIPT_TOOL_NAME;
+    use super::MCP_RESULT_FALLBACK_CAP;
     use super::{
         build_history_index_slice, history_index_entries_path, history_index_path,
         HISTORY_INDEX_CACHE, HISTORY_PAGE_CACHE,
@@ -9789,21 +9782,26 @@ mod tests {
     use chrono::{DateTime, Duration, Utc};
     use sha2::{Digest, Sha256};
     use std::env;
-    use std::fs;
-    use std::path::{Path, PathBuf};
-    use std::time::{SystemTime, UNIX_EPOCH};
     use std::fs::{self, OpenOptions};
     use std::io::{BufWriter, Seek, SeekFrom, Write};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-    fn remove_history_index_fixture(path: &std::path::Path) {
+    fn evict_history_fixture_caches(path: &std::path::Path) {
+        HISTORY_PAGE_CACHE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .retain(|key, _| key.path != path);
         HISTORY_INDEX_CACHE
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .remove(path);
+    }
+
+    fn remove_history_index_fixture(path: &std::path::Path) {
+        evict_history_fixture_caches(path);
         if let Some(index_path) = history_index_path(path) {
             let _ = fs::remove_file(index_path);
         }
@@ -10577,7 +10575,7 @@ mod tests {
             duration_ms: None,
             model: None,
             completed_at: Some(now),
-        agent_message_id: None,
+            agent_message_id: None,
         }];
 
         assert!(should_skip_duplicate_user_message(
@@ -10891,7 +10889,12 @@ mod tests {
             )
         };
         let searched_report = |ts: &str| {
-            usage_count_line(ts, [522_480, 450_432, 7_798], [579_422, 501_952, 8_158], WINDOW)
+            usage_count_line(
+                ts,
+                [522_480, 450_432, 7_798],
+                [579_422, 501_952, 8_158],
+                WINDOW,
+            )
         };
         let first_turn = vec![
             rollout_line(
@@ -10927,14 +10930,22 @@ mod tests {
             ),
         ];
         let reading = |lines: &[String], tag: &str| {
-            let stats = parse_lines(lines, tag).session_stats.expect("session stats");
-            (stats.context_window_used_tokens, stats.context_window_usage_percent)
+            let stats = parse_lines(lines, tag)
+                .session_stats
+                .expect("session stats");
+            (
+                stats.context_window_used_tokens,
+                stats.context_window_usage_percent,
+            )
         };
 
         let (used, percent) = reading(&first_turn, "ws-846-searched");
         assert_eq!(used, Some(57_302), "the reading before the search stands");
         let percent = percent.expect("percent");
-        assert!((percent - 57_302.0 / WINDOW as f64 * 100.0).abs() < 1e-9, "{percent}");
+        assert!(
+            (percent - 57_302.0 / WINDOW as f64 * 100.0).abs() < 1e-9,
+            "{percent}"
+        );
 
         // Older codex restates the latest report as the next request opens; a
         // restatement of the report set aside is set aside with it.
@@ -13008,7 +13019,17 @@ mod tests {
     /// prefix.
     #[test]
     fn large_rollout_first_page_reads_only_the_tail() {
-        const ROUNDS: usize = 12;
+        check_large_rollout_tail(3_500_000_000);
+    }
+
+    #[test]
+    fn two_gigabyte_rollout_recovers_the_latest_25_rounds() {
+        check_large_rollout_tail(2_000_000_000);
+    }
+
+    fn check_large_rollout_tail(prefix_bytes: u64) {
+        const ROUNDS: usize = 35;
+        const PAGE_ROUNDS: usize = 25;
         const TOOL_OUTPUT_BYTES: usize = 512_000;
 
         let dir = tempfile::tempdir().expect("temp sessions dir");
@@ -13027,8 +13048,8 @@ mod tests {
             )
         )
         .expect("write metadata");
-        file.set_len(3_500_000_000)
-            .expect("create sparse 3.5 GB prefix");
+        file.set_len(prefix_bytes)
+            .expect("create sparse multi-GB prefix");
         file.seek(SeekFrom::End(0)).expect("seek sparse tail");
         let mut writer = BufWriter::new(file);
         let output = "x".repeat(TOOL_OUTPUT_BYTES);
@@ -13087,11 +13108,16 @@ mod tests {
         writer.flush().expect("flush rollout");
 
         let source_bytes = fs::metadata(&path).expect("rollout metadata").len();
-        assert!(source_bytes > 3_500_000_000);
+        assert!(source_bytes > prefix_bytes);
         let parser = CodexParser::with_base_dir(dir.path().to_path_buf());
         let started = Instant::now();
         let page = parser
-            .get_conversation_page(conversation_id, None, 6, Some("/tmp/large".into()))
+            .get_conversation_page(
+                conversation_id,
+                None,
+                PAGE_ROUNDS,
+                Some("/tmp/large".into()),
+            )
             .expect("load bounded tail");
         let elapsed = started.elapsed();
         let response = serde_json::to_vec(&page.detail).expect("serialize page");
@@ -13100,11 +13126,18 @@ mod tests {
         gzip.write_all(&response).expect("compress first page");
         let gzip_bytes = gzip.finish().expect("finish first-page compression").len();
         eprintln!(
-            "large_history_benchmark source_bytes={source_bytes} page_bytes={response_bytes} gzip_bytes={gzip_bytes} scan_bytes={} elapsed_ms={}",
+            "large_history_benchmark source_bytes={source_bytes} page_bytes={response_bytes} gzip_bytes={gzip_bytes} scan_bytes={} rollout_read_bytes={} elapsed_ms={}",
             page.scan_bytes,
+            page.scan_bytes + page.end_offset.saturating_sub(page.start_offset),
             elapsed.as_millis()
         );
-        assert_eq!(user_texts(&page.detail).len(), 6);
+        assert_eq!(
+            user_texts(&page.detail),
+            (ROUNDS - PAGE_ROUNDS..ROUNDS)
+                .map(|index| format!("prompt-{index}"))
+                .collect::<Vec<_>>()
+        );
+        assert!(page.page_complete);
         assert!(page.has_more);
         assert!(page.scan_bytes <= super::CODEX_HISTORY_FIRST_PAGE_MAX_BYTES);
         assert!(
@@ -13114,32 +13147,36 @@ mod tests {
         assert!(elapsed.as_secs() < 10, "tail page parse took {elapsed:?}");
         let cached_started = Instant::now();
         let cached = parser
-            .get_conversation_page(conversation_id, None, 6, Some("/tmp/large".into()))
+            .get_conversation_page(
+                conversation_id,
+                None,
+                PAGE_ROUNDS,
+                Some("/tmp/large".into()),
+            )
             .expect("reuse first page");
         let cached_elapsed = cached_started.elapsed();
         assert!(cached.cache_hit);
         assert_eq!(cached.scan_bytes, page.scan_bytes);
 
-        HISTORY_PAGE_CACHE
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clear();
-        HISTORY_INDEX_CACHE
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clear();
+        evict_history_fixture_caches(&path);
         let indexed_started = Instant::now();
         let indexed = parser
-            .get_conversation_page(conversation_id, None, 6, Some("/tmp/large".into()))
+            .get_conversation_page(
+                conversation_id,
+                None,
+                PAGE_ROUNDS,
+                Some("/tmp/large".into()),
+            )
             .expect("reuse persisted page index after memory-cache reset");
         let indexed_elapsed = indexed_started.elapsed();
         assert!(indexed.index_hit);
         assert_eq!(indexed.scan_bytes, 0);
         eprintln!(
-            "large_history_reopen cached_ms={} indexed_ms={} indexed_scan_bytes={}",
+            "large_history_reopen cached_ms={} indexed_ms={} indexed_scan_bytes={} indexed_read_bytes={}",
             cached_elapsed.as_millis(),
             indexed_elapsed.as_millis(),
-            indexed.scan_bytes
+            indexed.scan_bytes,
+            indexed.end_offset.saturating_sub(indexed.start_offset)
         );
         remove_history_index_fixture(&path);
     }
@@ -13239,6 +13276,88 @@ mod tests {
     }
 
     #[test]
+    fn bounded_tail_keeps_recent_records_after_a_record_larger_than_the_ceiling() {
+        let dir = tempfile::tempdir().expect("temp sessions dir");
+        let conversation_id = "ceiling-sized-tail";
+        let path = dir.path().join(format!("rollout-{conversation_id}.jsonl"));
+        let mut file = BufWriter::new(fs::File::create(&path).unwrap());
+        writeln!(
+            file,
+            "{}",
+            rollout_line(
+                "2026-10-10T00:00:00Z",
+                "session_meta",
+                serde_json::json!({"id":conversation_id,"cwd":"/tmp/ceiling"})
+            )
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{}",
+            rollout_line(
+                "2026-10-10T00:00:01Z",
+                "event_msg",
+                serde_json::json!({"type":"user_message","message":"large tool output"})
+            )
+        )
+        .unwrap();
+        file.write_all(b"{\"type\":\"ignored_large_record\",\"padding\":\"")
+            .unwrap();
+        let block = vec![b'x'; 1024 * 1024];
+        for _ in 0..65 {
+            file.write_all(&block).unwrap();
+        }
+        file.write_all(b"\"}\n").unwrap();
+        writeln!(
+            file,
+            "{}",
+            rollout_line(
+                "2026-10-10T00:00:02Z",
+                "event_msg",
+                serde_json::json!({"type":"agent_message","message":"latest final remains visible"})
+            )
+        )
+        .unwrap();
+        file.flush().unwrap();
+        let parser = CodexParser::with_base_dir(dir.path().to_path_buf());
+
+        for attempt in 0..2 {
+            let started = Instant::now();
+            let page = parser
+                .get_conversation_page(conversation_id, None, 25, Some("/tmp/ceiling".into()))
+                .unwrap();
+            let elapsed = started.elapsed();
+            eprintln!("partial_tail_benchmark attempt={attempt} scan_bytes={} rollout_read_bytes={} elapsed_ms={}", page.scan_bytes, page.scan_bytes + page.end_offset - page.start_offset, elapsed.as_millis());
+            assert!(
+                elapsed.as_secs() < 10,
+                "partial tail exceeded bounded-load budget: {elapsed:?}"
+            );
+            assert!(!page.page_complete);
+            assert!(!page.cache_hit, "partial pages must be retried, not cached");
+            assert!(
+                !page.index_hit,
+                "partial scan offsets must not become authoritative boundaries"
+            );
+            assert_eq!(page.scan_bytes, super::CODEX_HISTORY_FIRST_PAGE_MAX_BYTES);
+            assert!(page.end_offset - page.start_offset < 1024);
+            assert!(page.detail.turns.iter().flat_map(|turn| &turn.blocks).any(|block| matches!(block, ContentBlock::Text { text } if text == "latest final remains visible")));
+        }
+        let metadata = fs::metadata(&path).unwrap();
+        let mut indexes = HISTORY_INDEX_CACHE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let index = indexes
+            .entry(path.clone())
+            .or_insert_with(|| super::load_history_index(&path, &metadata));
+        assert!(
+            index.meta.pages.is_empty(),
+            "incomplete boundaries are never persisted"
+        );
+        drop(indexes);
+        remove_history_index_fixture(&path);
+    }
+
+    #[test]
     fn history_index_resumes_at_the_append_boundary_and_survives_restart() {
         let dir = tempfile::tempdir().expect("temp sessions dir");
         let conversation_id = "incremental-index";
@@ -13278,7 +13397,7 @@ mod tests {
         HISTORY_INDEX_CACHE
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .clear();
+            .remove(&path);
         let appended = [
             rollout_line(
                 "2026-08-06T00:00:03Z",
@@ -13343,7 +13462,7 @@ mod tests {
         HISTORY_INDEX_CACHE
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .clear();
+            .remove(&path);
 
         build_history_index_slice(&path, 64 * 1024).expect("rebuild corrupt index");
         assert_eq!(fs::metadata(&path).unwrap().len(), original_len);
@@ -13972,7 +14091,10 @@ mod tests {
         lines.extend(announced_reasoning(
             "2026-09-24T07:21:02Z",
             "rs_1",
-            &["**Checking directory usage**", "**Checking repository changes**"],
+            &[
+                "**Checking directory usage**",
+                "**Checking repository changes**",
+            ],
         ));
         lines.extend(announced_reasoning(
             "2026-09-24T07:21:12Z",
@@ -13984,7 +14106,10 @@ mod tests {
         lines.extend(announced_reasoning(
             "2026-09-24T07:21:20Z",
             "rs_4",
-            &["**Reviewing disk usage snapshot**", "**Measuring temporary storage usage**"],
+            &[
+                "**Reviewing disk usage snapshot**",
+                "**Measuring temporary storage usage**",
+            ],
         ));
         // A tool call is visible and ends the run; its own announcement follows.
         lines.extend([
@@ -14141,7 +14266,9 @@ mod tests {
 
         assert_eq!(
             thinking_texts(&detail),
-            vec!["**Assessing execution capabilities**\n\n**Determining the next step**".to_string()]
+            vec![
+                "**Assessing execution capabilities**\n\n**Determining the next step**".to_string()
+            ]
         );
 
         let _ = fs::remove_file(path);
@@ -14901,7 +15028,10 @@ mod tests {
         // stream showed vanished on reload and nothing could resolve the
         // child's own rollout.
         let sealed = format!("gAAAAAB{}", "qgWsi0g7gOInVU3UTzqL".repeat(30));
-        let path = write_temp_rollout("nativeteam0153", &native_team_0153_lines("MESSAGE", &sealed));
+        let path = write_temp_rollout(
+            "nativeteam0153",
+            &native_team_0153_lines("MESSAGE", &sealed),
+        );
         let detail = CodexParser::new()
             .parse_conversation_detail(&path, "parent")
             .expect("parse ok");
@@ -15057,7 +15187,10 @@ mod tests {
             })
             .expect("roster renders as a collab capsule, not a generic tool card");
         let parsed: serde_json::Value = serde_json::from_str(input).expect("collab input is JSON");
-        assert_eq!(parsed.get(COLLAB_OP_KEY).and_then(|v| v.as_str()), Some("list"));
+        assert_eq!(
+            parsed.get(COLLAB_OP_KEY).and_then(|v| v.as_str()),
+            Some("list")
+        );
         let states = parsed
             .get("agentsStates")
             .and_then(|v| v.as_object())
@@ -15707,12 +15840,9 @@ mod tests {
                 {"type":"input_text","text":"{\"a\":{},\"b\":{}}"},
             ]),
         );
-        for (offset, (id, task_id, task)) in [
-            ("exec-b", "task-b", "B"),
-            ("exec-a", "task-a", "A"),
-        ]
-        .into_iter()
-        .enumerate()
+        for (offset, (id, task_id, task)) in [("exec-b", "task-b", "B"), ("exec-a", "task-a", "A")]
+            .into_iter()
+            .enumerate()
         {
             lines.insert(
                 2 + offset,
@@ -15767,8 +15897,14 @@ mod tests {
                 .map(|(id, output, _)| (id, output))
                 .collect::<Vec<_>>(),
             vec![
-                ("exec-b".into(), Some("Delegation successful. task_id=task-b.".into())),
-                ("exec-a".into(), Some("Delegation successful. task_id=task-a.".into())),
+                (
+                    "exec-b".into(),
+                    Some("Delegation successful. task_id=task-b.".into())
+                ),
+                (
+                    "exec-a".into(),
+                    Some("Delegation successful. task_id=task-a.".into())
+                ),
             ]
         );
     }
@@ -15976,7 +16112,9 @@ mod tests {
 
         let (native_input, native_result) = spawn_capsule(&detail);
         assert_eq!(
-            native_input.get("agent_id").and_then(|value| value.as_str()),
+            native_input
+                .get("agent_id")
+                .and_then(|value| value.as_str()),
             Some("01a07fc2-db62-78b3-9762-9cb2540216c2"),
             "native activity must keep its own child session id"
         );
@@ -16153,7 +16291,8 @@ mod tests {
     /// the script card used to show the run.
     #[test]
     fn a_textless_semantic_result_still_says_something() {
-        let script = "const shot=await tools.mcp__shot_srv__capture({url:target});text(\"captured\");";
+        let script =
+            "const shot=await tools.mcp__shot_srv__capture({url:target});text(\"captured\");";
         let mut lines = code_mode_rollout(
             script,
             serde_json::json!([
@@ -16240,7 +16379,11 @@ mod tests {
             }
             let detail = parse_lines(
                 &lines,
-                if item { "mixed-with-item" } else { "mixed-baseline" },
+                if item {
+                    "mixed-with-item"
+                } else {
+                    "mixed-baseline"
+                },
             );
             (tool_uses(&detail), tool_results(&detail))
         };
@@ -16326,7 +16469,10 @@ mod tests {
             buf: Vec::new(),
             budget: 8,
         };
-        assert!(sink.write_all(&[b'x'; 5]).is_ok(), "room for the first write");
+        assert!(
+            sink.write_all(&[b'x'; 5]).is_ok(),
+            "room for the first write"
+        );
         assert!(
             sink.write_all(&[b'x'; 100]).is_err(),
             "a write past the budget must fail so serialization aborts"
@@ -16343,7 +16489,10 @@ mod tests {
     #[test]
     fn a_budgeted_preview_reads_exactly_like_an_unbounded_one() {
         for (name, value) in [
-            ("a small object", serde_json::json!({"a": 1, "b": [true, null]})),
+            (
+                "a small object",
+                serde_json::json!({"a": 1, "b": [true, null]}),
+            ),
             ("empty", serde_json::json!({})),
             ("exactly the cap", serde_json::json!("x".repeat(3998))),
             ("one past the cap", serde_json::json!("x".repeat(3999))),
@@ -17641,11 +17790,11 @@ mod tests {
         let detail = parse_lines(&lines, "deferred-semantic-mcp");
         assert_eq!(
             tool_uses(&detail),
-            vec![ (
+            vec![(
                 "mcp-deferred-status".into(),
                 "mcp__codeg_mcp__get_delegation_status".into(),
                 Some(r#"{"task_ids":["t1"],"wait_ms":60000}"#.into()),
-            ) ],
+            )],
             "the completed semantic item replaces the parked script card"
         );
         assert_eq!(
@@ -18389,22 +18538,58 @@ mod tests {
     #[test]
     fn a_compaction_draws_the_live_divider_and_opens_onto_its_handoff() {
         let content = jsonl(&[
-            record("2026-09-29T00:00:00Z", "session_meta", serde_json::json!({"id": "cmp-2", "cwd": "/tmp/demo", "cli_version": "0.156.1"})),
-            record("2026-09-29T00:00:01Z", "event_msg", serde_json::json!({"type": "task_started", "turn_id": "t1"})),
-            record("2026-09-29T00:00:02Z", "response_item", serde_json::json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "look at /private/tmp"}]})),
+            record(
+                "2026-09-29T00:00:00Z",
+                "session_meta",
+                serde_json::json!({"id": "cmp-2", "cwd": "/tmp/demo", "cli_version": "0.156.1"}),
+            ),
+            record(
+                "2026-09-29T00:00:01Z",
+                "event_msg",
+                serde_json::json!({"type": "task_started", "turn_id": "t1"}),
+            ),
+            record(
+                "2026-09-29T00:00:02Z",
+                "response_item",
+                serde_json::json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "look at /private/tmp"}]}),
+            ),
             assistant_item("2026-09-29T00:00:03Z", "It holds 40 stale folders."),
             token_count("2026-09-29T00:00:04Z", 1000, 100),
-            record("2026-09-29T00:00:05Z", "event_msg", serde_json::json!({"type": "task_complete", "turn_id": "t1"})),
-            record("2026-09-29T00:01:00Z", "event_msg", serde_json::json!({"type": "task_started", "turn_id": "t2"})),
+            record(
+                "2026-09-29T00:00:05Z",
+                "event_msg",
+                serde_json::json!({"type": "task_complete", "turn_id": "t1"}),
+            ),
+            record(
+                "2026-09-29T00:01:00Z",
+                "event_msg",
+                serde_json::json!({"type": "task_started", "turn_id": "t2"}),
+            ),
             token_count("2026-09-29T00:01:01Z", 1000, 100),
             assistant_item("2026-09-29T00:01:40Z", HANDOFF),
-            record("2026-09-29T00:01:40.100Z", "token_usage_record", serde_json::json!({"thread_id": "cmp-2", "turn_id": "t2"})),
+            record(
+                "2026-09-29T00:01:40.100Z",
+                "token_usage_record",
+                serde_json::json!({"thread_id": "cmp-2", "turn_id": "t2"}),
+            ),
             token_count("2026-09-29T00:01:40.200Z", 2400, 180),
             compacted("2026-09-29T00:01:40.300Z", HANDOFF),
-            record("2026-09-29T00:01:40.400Z", "event_msg", serde_json::json!({"type": "thread_settings_applied"})),
+            record(
+                "2026-09-29T00:01:40.400Z",
+                "event_msg",
+                serde_json::json!({"type": "thread_settings_applied"}),
+            ),
             token_count("2026-09-29T00:01:40.500Z", 2400, 180),
-            record("2026-09-29T00:01:40.600Z", "event_msg", serde_json::json!({"type": "item_completed", "turn_id": "t2", "item": {"type": "ContextCompaction", "id": "01a0eaed-d00a-7480"}})),
-            record("2026-09-29T00:01:41Z", "event_msg", serde_json::json!({"type": "task_complete", "turn_id": "t2"})),
+            record(
+                "2026-09-29T00:01:40.600Z",
+                "event_msg",
+                serde_json::json!({"type": "item_completed", "turn_id": "t2", "item": {"type": "ContextCompaction", "id": "01a0eaed-d00a-7480"}}),
+            ),
+            record(
+                "2026-09-29T00:01:41Z",
+                "event_msg",
+                serde_json::json!({"type": "task_complete", "turn_id": "t2"}),
+            ),
         ]);
         let detail = parse_rollout("compaction-handoff", &content, "cmp-2");
 
@@ -18427,7 +18612,10 @@ mod tests {
         assert_eq!(turn_usage_total(&detail), 2580);
         // The sidebar entry counts what the conversation renders: the prompt
         // and the reply, not the handoff.
-        assert_eq!(summary_of("compaction-handoff-sum", &content).message_count, 2);
+        assert_eq!(
+            summary_of("compaction-handoff-sum", &content).message_count,
+            2
+        );
     }
 
     /// An automatic compaction mid-turn. The compaction's own model call thinks
@@ -18438,29 +18626,93 @@ mod tests {
     #[test]
     fn a_mid_turn_compaction_keeps_its_own_thinking_out_of_the_reply() {
         let content = jsonl(&[
-            record("2026-09-29T00:00:00Z", "session_meta", serde_json::json!({"id": "cmp-3", "cwd": "/tmp/demo", "cli_version": "0.153.4"})),
-            record("2026-09-29T00:00:01Z", "event_msg", serde_json::json!({"type": "task_started", "turn_id": "t1"})),
-            record("2026-09-29T00:00:02Z", "response_item", serde_json::json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "fix the race"}]})),
-            record("2026-09-29T00:00:03Z", "event_msg", serde_json::json!({"type": "item_completed", "item": {"type": "Reasoning", "id": "rs_1", "summary_text": ["**Looking at the lock**"]}})),
-            record("2026-09-29T00:00:03.100Z", "response_item", serde_json::json!({"type": "reasoning", "id": "rs_1", "summary": [{"type": "summary_text", "text": "**Looking at the lock**"}]})),
-            record("2026-09-29T00:00:04Z", "response_item", serde_json::json!({"type": "function_call", "name": "shell", "call_id": "c1", "arguments": "{\"command\":[\"rg\",\"lock\"]}"})),
-            record("2026-09-29T00:00:05Z", "response_item", serde_json::json!({"type": "function_call_output", "call_id": "c1", "output": "src/lock.rs:1"})),
-            record("2026-09-29T00:00:05.100Z", "token_usage_record", serde_json::json!({"turn_id": "t1"})),
+            record(
+                "2026-09-29T00:00:00Z",
+                "session_meta",
+                serde_json::json!({"id": "cmp-3", "cwd": "/tmp/demo", "cli_version": "0.153.4"}),
+            ),
+            record(
+                "2026-09-29T00:00:01Z",
+                "event_msg",
+                serde_json::json!({"type": "task_started", "turn_id": "t1"}),
+            ),
+            record(
+                "2026-09-29T00:00:02Z",
+                "response_item",
+                serde_json::json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "fix the race"}]}),
+            ),
+            record(
+                "2026-09-29T00:00:03Z",
+                "event_msg",
+                serde_json::json!({"type": "item_completed", "item": {"type": "Reasoning", "id": "rs_1", "summary_text": ["**Looking at the lock**"]}}),
+            ),
+            record(
+                "2026-09-29T00:00:03.100Z",
+                "response_item",
+                serde_json::json!({"type": "reasoning", "id": "rs_1", "summary": [{"type": "summary_text", "text": "**Looking at the lock**"}]}),
+            ),
+            record(
+                "2026-09-29T00:00:04Z",
+                "response_item",
+                serde_json::json!({"type": "function_call", "name": "shell", "call_id": "c1", "arguments": "{\"command\":[\"rg\",\"lock\"]}"}),
+            ),
+            record(
+                "2026-09-29T00:00:05Z",
+                "response_item",
+                serde_json::json!({"type": "function_call_output", "call_id": "c1", "output": "src/lock.rs:1"}),
+            ),
+            record(
+                "2026-09-29T00:00:05.100Z",
+                "token_usage_record",
+                serde_json::json!({"turn_id": "t1"}),
+            ),
             token_count("2026-09-29T00:00:05.200Z", 1000, 100),
             // The compaction's model call: its thinking, then its handoff.
-            record("2026-09-29T00:00:30Z", "response_item", serde_json::json!({"type": "reasoning", "id": "rs_c", "summary": [{"type": "summary_text", "text": "**Preparing concise handoff summary**"}]})),
+            record(
+                "2026-09-29T00:00:30Z",
+                "response_item",
+                serde_json::json!({"type": "reasoning", "id": "rs_c", "summary": [{"type": "summary_text", "text": "**Preparing concise handoff summary**"}]}),
+            ),
             assistant_item("2026-09-29T00:00:40Z", HANDOFF),
-            record("2026-09-29T00:00:40.100Z", "token_usage_record", serde_json::json!({"turn_id": "t1"})),
+            record(
+                "2026-09-29T00:00:40.100Z",
+                "token_usage_record",
+                serde_json::json!({"turn_id": "t1"}),
+            ),
             token_count("2026-09-29T00:00:40.200Z", 2400, 180),
             compacted("2026-09-29T00:00:40.300Z", HANDOFF),
-            record("2026-09-29T00:00:40.400Z", "world_state", serde_json::json!({"full": true})),
-            record("2026-09-29T00:00:40.500Z", "turn_context", serde_json::json!({"turn_id": "t1", "model": "gpt-6"})),
-            record("2026-09-29T00:00:40.700Z", "event_msg", serde_json::json!({"type": "item_completed", "item": {"type": "ContextCompaction", "id": "cmp-item"}})),
-            record("2026-09-29T00:00:50Z", "event_msg", serde_json::json!({"type": "item_completed", "item": {"type": "Reasoning", "id": "rs_2", "summary_text": ["**Resuming the fix**"]}})),
-            record("2026-09-29T00:00:50.100Z", "response_item", serde_json::json!({"type": "reasoning", "id": "rs_2", "summary": [{"type": "summary_text", "text": "**Resuming the fix**"}]})),
+            record(
+                "2026-09-29T00:00:40.400Z",
+                "world_state",
+                serde_json::json!({"full": true}),
+            ),
+            record(
+                "2026-09-29T00:00:40.500Z",
+                "turn_context",
+                serde_json::json!({"turn_id": "t1", "model": "gpt-6"}),
+            ),
+            record(
+                "2026-09-29T00:00:40.700Z",
+                "event_msg",
+                serde_json::json!({"type": "item_completed", "item": {"type": "ContextCompaction", "id": "cmp-item"}}),
+            ),
+            record(
+                "2026-09-29T00:00:50Z",
+                "event_msg",
+                serde_json::json!({"type": "item_completed", "item": {"type": "Reasoning", "id": "rs_2", "summary_text": ["**Resuming the fix**"]}}),
+            ),
+            record(
+                "2026-09-29T00:00:50.100Z",
+                "response_item",
+                serde_json::json!({"type": "reasoning", "id": "rs_2", "summary": [{"type": "summary_text", "text": "**Resuming the fix**"}]}),
+            ),
             assistant_item("2026-09-29T00:01:00Z", "Fixed the race."),
             token_count("2026-09-29T00:01:00.100Z", 3500, 260),
-            record("2026-09-29T00:01:01Z", "event_msg", serde_json::json!({"type": "task_complete", "turn_id": "t1"})),
+            record(
+                "2026-09-29T00:01:01Z",
+                "event_msg",
+                serde_json::json!({"type": "task_complete", "turn_id": "t1"}),
+            ),
         ]);
         let detail = parse_rollout("compaction-midturn", &content, "cmp-3");
 
@@ -18496,8 +18748,13 @@ mod tests {
             .blocks
             .iter()
             .any(|block| matches!(block, ContentBlock::ToolUse { tool_use_id: Some(id), .. } if id == "c1"))));
-        assert_eq!(texts.last(), Some(&("assistant", Some("Fixed the race.".into()))));
-        assert!(!texts.iter().any(|(_, text)| text.as_deref() == Some(HANDOFF)));
+        assert_eq!(
+            texts.last(),
+            Some(&("assistant", Some("Fixed the race.".into())))
+        );
+        assert!(!texts
+            .iter()
+            .any(|(_, text)| text.as_deref() == Some(HANDOFF)));
         // The thinking card that went away had the compaction's round billed
         // to it; that spend stays in the conversation, on the reply before.
         assert_eq!(turn_usage_total(&detail), 3760);
@@ -18506,7 +18763,10 @@ mod tests {
             .filter_map(|turn| turn.usage.as_ref())
             .map(|usage| usage.input_tokens + usage.output_tokens)
             .sum();
-        assert_eq!(before_divider, 2580, "both rounds before the divider stay there");
+        assert_eq!(
+            before_divider, 2580,
+            "both rounds before the divider stay there"
+        );
     }
 
     /// Codex before ~0.137 wrote no handoff record at all: the summary exists
@@ -18515,14 +18775,42 @@ mod tests {
     #[test]
     fn an_older_compaction_opens_onto_the_summary_its_record_restates() {
         let content = jsonl(&[
-            record("2026-05-31T10:00:00Z", "session_meta", serde_json::json!({"id": "cmp-4", "cwd": "/tmp/demo", "cli_version": "0.133.0"})),
-            record("2026-05-31T10:00:01Z", "event_msg", serde_json::json!({"type": "user_message", "message": "run the tests"})),
-            record("2026-05-31T10:00:02Z", "event_msg", serde_json::json!({"type": "agent_message", "message": "Running them."})),
-            record("2026-05-31T10:00:03Z", "response_item", serde_json::json!({"type": "function_call", "name": "shell", "call_id": "c1", "arguments": "{\"command\":[\"make\",\"test\"]}"})),
-            record("2026-05-31T10:00:04Z", "response_item", serde_json::json!({"type": "function_call_output", "call_id": "c1", "output": "ok"})),
+            record(
+                "2026-05-31T10:00:00Z",
+                "session_meta",
+                serde_json::json!({"id": "cmp-4", "cwd": "/tmp/demo", "cli_version": "0.133.0"}),
+            ),
+            record(
+                "2026-05-31T10:00:01Z",
+                "event_msg",
+                serde_json::json!({"type": "user_message", "message": "run the tests"}),
+            ),
+            record(
+                "2026-05-31T10:00:02Z",
+                "event_msg",
+                serde_json::json!({"type": "agent_message", "message": "Running them."}),
+            ),
+            record(
+                "2026-05-31T10:00:03Z",
+                "response_item",
+                serde_json::json!({"type": "function_call", "name": "shell", "call_id": "c1", "arguments": "{\"command\":[\"make\",\"test\"]}"}),
+            ),
+            record(
+                "2026-05-31T10:00:04Z",
+                "response_item",
+                serde_json::json!({"type": "function_call_output", "call_id": "c1", "output": "ok"}),
+            ),
             compacted("2026-05-31T10:00:05Z", HANDOFF),
-            record("2026-05-31T10:00:06Z", "event_msg", serde_json::json!({"type": "context_compacted"})),
-            record("2026-05-31T10:00:07Z", "event_msg", serde_json::json!({"type": "agent_message", "message": "All green."})),
+            record(
+                "2026-05-31T10:00:06Z",
+                "event_msg",
+                serde_json::json!({"type": "context_compacted"}),
+            ),
+            record(
+                "2026-05-31T10:00:07Z",
+                "event_msg",
+                serde_json::json!({"type": "agent_message", "message": "All green."}),
+            ),
         ]);
         let detail = parse_rollout("compaction-legacy", &content, "cmp-4");
 
@@ -18532,7 +18820,10 @@ mod tests {
         );
         let texts = turn_texts(&detail);
         assert_eq!(texts.first(), Some(&("user", Some("run the tests".into()))));
-        assert_eq!(texts.last(), Some(&("assistant", Some("All green.".into()))));
+        assert_eq!(
+            texts.last(),
+            Some(&("assistant", Some("All green.".into())))
+        );
     }
 
     /// The text fallback only looks at what was written since the previous
@@ -18542,14 +18833,34 @@ mod tests {
     fn the_text_fallback_never_reaches_past_the_previous_compaction() {
         let call = |ts: &str, id: &str| {
             [
-                record(ts, "response_item", serde_json::json!({"type": "function_call", "name": "shell", "call_id": id, "arguments": "{\"command\":[\"ls\"]}"})),
-                record(ts, "response_item", serde_json::json!({"type": "function_call_output", "call_id": id, "output": "ok"})),
+                record(
+                    ts,
+                    "response_item",
+                    serde_json::json!({"type": "function_call", "name": "shell", "call_id": id, "arguments": "{\"command\":[\"ls\"]}"}),
+                ),
+                record(
+                    ts,
+                    "response_item",
+                    serde_json::json!({"type": "function_call_output", "call_id": id, "output": "ok"}),
+                ),
             ]
         };
         let mut records = vec![
-            record("2026-09-29T00:00:00Z", "session_meta", serde_json::json!({"id": "cmp-6", "cwd": "/tmp/demo"})),
-            record("2026-09-29T00:00:01Z", "event_msg", serde_json::json!({"type": "task_started", "turn_id": "t1"})),
-            record("2026-09-29T00:00:02Z", "response_item", serde_json::json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "q1"}]})),
+            record(
+                "2026-09-29T00:00:00Z",
+                "session_meta",
+                serde_json::json!({"id": "cmp-6", "cwd": "/tmp/demo"}),
+            ),
+            record(
+                "2026-09-29T00:00:01Z",
+                "event_msg",
+                serde_json::json!({"type": "task_started", "turn_id": "t1"}),
+            ),
+            record(
+                "2026-09-29T00:00:02Z",
+                "response_item",
+                serde_json::json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "q1"}]}),
+            ),
             // A real reply that happens to read exactly like a later summary.
             assistant_item("2026-09-29T00:00:03Z", HANDOFF),
         ];
@@ -18593,14 +18904,38 @@ mod tests {
     #[test]
     fn the_handoff_is_recognized_by_its_text_when_adjacency_breaks() {
         let content = jsonl(&[
-            record("2026-09-29T00:00:00Z", "session_meta", serde_json::json!({"id": "cmp-5", "cwd": "/tmp/demo"})),
-            record("2026-09-29T00:00:01Z", "event_msg", serde_json::json!({"type": "task_started", "turn_id": "t1"})),
-            record("2026-09-29T00:00:02Z", "response_item", serde_json::json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]})),
+            record(
+                "2026-09-29T00:00:00Z",
+                "session_meta",
+                serde_json::json!({"id": "cmp-5", "cwd": "/tmp/demo"}),
+            ),
+            record(
+                "2026-09-29T00:00:01Z",
+                "event_msg",
+                serde_json::json!({"type": "task_started", "turn_id": "t1"}),
+            ),
+            record(
+                "2026-09-29T00:00:02Z",
+                "response_item",
+                serde_json::json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}),
+            ),
             assistant_item("2026-09-29T00:00:03Z", "Hello."),
-            record("2026-09-29T00:00:04Z", "event_msg", serde_json::json!({"type": "task_complete", "turn_id": "t1"})),
-            record("2026-09-29T00:01:00Z", "event_msg", serde_json::json!({"type": "task_started", "turn_id": "t2"})),
+            record(
+                "2026-09-29T00:00:04Z",
+                "event_msg",
+                serde_json::json!({"type": "task_complete", "turn_id": "t1"}),
+            ),
+            record(
+                "2026-09-29T00:01:00Z",
+                "event_msg",
+                serde_json::json!({"type": "task_started", "turn_id": "t2"}),
+            ),
             assistant_item("2026-09-29T00:01:40Z", HANDOFF),
-            record("2026-09-29T00:01:40.100Z", "some_future_accounting", serde_json::json!({"turn_id": "t2"})),
+            record(
+                "2026-09-29T00:01:40.100Z",
+                "some_future_accounting",
+                serde_json::json!({"turn_id": "t2"}),
+            ),
             compacted("2026-09-29T00:01:40.300Z", HANDOFF),
         ]);
         let detail = parse_rollout("compaction-text", &content, "cmp-5");
@@ -18748,7 +19083,8 @@ mod tests {
         // ("如果你希望调整…" is codex's habit). Rendering the announcement and
         // dropping the record would silently lose that prose, so the record
         // takes the announcement's message over rather than adding a second.
-        let record = "<proposed_plan>\n# Plan\n\n- step one\n</proposed_plan>\n\n如果你希望调整，告诉我。";
+        let record =
+            "<proposed_plan>\n# Plan\n\n- step one\n</proposed_plan>\n\n如果你希望调整，告诉我。";
         let content = plan_turn(true, Some(record));
         let detail = parse_rollout("plan-prose", &content, "plan-1");
 

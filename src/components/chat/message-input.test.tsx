@@ -30,10 +30,6 @@ import {
   emitAttachSessionToSession,
 } from "@/lib/session-attachment-events"
 import type { DbConversationSummary } from "@/lib/types"
-import {
-  clearMessageInputDraftV2,
-  loadMessageInputDraftV2,
-} from "@/lib/message-input-draft"
 
 // MessageInput holds its RichComposer handle internally and does not forward a
 // ref, so capture that handle through a partial mock that still renders the real
@@ -116,7 +112,6 @@ vi.mock("@/lib/platform", () => ({
 vi.mock("@/lib/transport", () => ({
   isDesktop: () => false,
   getActiveRemoteConnectionId: () => null,
-  isDesktop: () => false,
   isRemoteDesktopMode: () => false,
 }))
 // A local-file link target routes to the workspace file column, whose provider

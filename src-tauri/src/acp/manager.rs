@@ -11,10 +11,10 @@ use sea_orm::{
     TransactionTrait,
 };
 
+use crate::acp::agent_mentions::strip_route_separator_from_prompt;
 use crate::acp::connection::{
     spawn_agent_connection, AgentConnection, ConnectionCommand, GoalControlAction, SteerOutcome,
 };
-use crate::acp::agent_mentions::strip_route_separator_from_prompt;
 use crate::acp::error::AcpError;
 use crate::acp::feedback::{
     bounded_feedback_batch, FeedbackItem, FeedbackStatus, PendingFeedback, SessionFeedbackAccess,
@@ -487,8 +487,7 @@ const DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 /// ago that it cannot be a spawn still in flight.
 fn prune_reaped(draining: &mut DrainingChildren) {
     draining.retain(|c| {
-        c.pid.load(std::sync::atomic::Ordering::SeqCst) != 0
-            || c.parked_at.elapsed() < DRAIN_GRACE
+        c.pid.load(std::sync::atomic::Ordering::SeqCst) != 0 || c.parked_at.elapsed() < DRAIN_GRACE
     });
 }
 
@@ -760,16 +759,11 @@ impl ConnectionManager {
     /// Install the chat-channel manager exactly once during bootstrap so
     /// live title writes can sync bound forum topics. Calling twice is a
     /// no-op. Tests leave this unset and skip the remote sync.
-    pub fn install_chat_channel(
-        &self,
-        manager: crate::chat_channel::manager::ChatChannelManager,
-    ) {
+    pub fn install_chat_channel(&self, manager: crate::chat_channel::manager::ChatChannelManager) {
         let _ = self.chat_channel.set(manager);
     }
 
-    pub(crate) fn chat_channel(
-        &self,
-    ) -> Option<crate::chat_channel::manager::ChatChannelManager> {
+    pub(crate) fn chat_channel(&self) -> Option<crate::chat_channel::manager::ChatChannelManager> {
         self.chat_channel.get().map(|c| c.clone_ref())
     }
 
@@ -1457,9 +1451,7 @@ impl ConnectionManager {
                 elapsed.as_millis(),
                 timeout.as_millis(),
             );
-            if target_conversation_id.is_some()
-                && !matches!(outcome, HandshakeWaitOutcome::Ready)
-            {
+            if target_conversation_id.is_some() && !matches!(outcome, HandshakeWaitOutcome::Ready) {
                 let _ = self.disconnect_and_wait(&connection_id).await;
                 return Err(AcpError::protocol(format!(
                     "persisted ACP session did not finish resume/load within {} seconds ({})",
@@ -1889,12 +1881,8 @@ impl ConnectionManager {
             let connection_id = old_id.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(DISCONNECT_ALL_GRACE).await;
-                hard_kill_process_cell(
-                    child_pid,
-                    "restore_binding_replaced",
-                    Some(connection_id),
-                )
-                .await;
+                hard_kill_process_cell(child_pid, "restore_binding_replaced", Some(connection_id))
+                    .await;
             });
         }
         drop(prompt_guards);
@@ -2980,11 +2968,8 @@ impl ConnectionManager {
                     )
                     .await;
                 }
-                if let (Some(cid), Some(title)) =
-                    (conversation_id_for_status, first_prompt_title)
-                {
-                    match conversation_service::seed_auto_title_if_empty(&db.conn, cid, title)
-                        .await
+                if let (Some(cid), Some(title)) = (conversation_id_for_status, first_prompt_title) {
+                    match conversation_service::seed_auto_title_if_empty(&db.conn, cid, title).await
                     {
                         Ok(true) => {
                             crate::commands::conversations::emit_conversation_upsert(
@@ -3784,9 +3769,7 @@ impl ConnectionManager {
                             first_seen_at: now,
                             connection_id: run.connection_id.clone(),
                             connection_generation,
-                            heartbeat_at: live
-                                .as_ref()
-                                .map(|observation| observation.heartbeat_at),
+                            heartbeat_at: live.as_ref().map(|observation| observation.heartbeat_at),
                             output_at: live.as_ref().map(|observation| observation.output_at),
                             reason: "superseded_active_row".to_string(),
                         },
@@ -3847,12 +3830,11 @@ impl ConnectionManager {
                 .is_some_and(|observation| observation.restore_in_progress);
             let active_interaction = owns_current_generation
                 && live
-                .as_ref()
-                .is_some_and(|observation| observation.has_interaction);
+                    .as_ref()
+                    .is_some_and(|observation| observation.has_interaction);
             let prompting = owns_current_generation
                 && live.as_ref().is_some_and(|observation| {
-                    observation.status == ConnectionStatus::Prompting
-                        && observation.turn_in_flight
+                    observation.status == ConnectionStatus::Prompting && observation.turn_in_flight
                 });
             let stalled_terminal_tools = live.as_ref().is_some_and(|observation| {
                 prompting
@@ -3969,9 +3951,8 @@ impl ConnectionManager {
                         continue;
                     };
 
-                    let observed_heartbeat = live
-                        .as_ref()
-                        .map(|observation| observation.heartbeat_at);
+                    let observed_heartbeat =
+                        live.as_ref().map(|observation| observation.heartbeat_at);
                     let observed_output = live.as_ref().map(|observation| observation.output_at);
                     let (confirmed, attempt) = self
                         .confirm_stale_observation(
@@ -4022,9 +4003,10 @@ impl ConnectionManager {
                         Some(lock) => Some(lock.lock().await),
                         None => None,
                     };
-                    let latest = artifact_service::active_runs_for_conversation(db, conversation_id)
-                        .await
-                        .map_err(|error| AcpError::protocol(error.to_string()))?;
+                    let latest =
+                        artifact_service::active_runs_for_conversation(db, conversation_id)
+                            .await
+                            .map_err(|error| AcpError::protocol(error.to_string()))?;
                     if latest.first().map(|active| active.id.as_str()) != Some(run.id.as_str()) {
                         self.clear_stale_suspicion(&run.id).await;
                         tracing::info!(
@@ -4052,14 +4034,21 @@ impl ConnectionManager {
                                 .map(|capture| capture.generation)
                         });
                     let changed_activity = generation_after != connection_generation
-                        || live_after.as_ref().map(|observation| observation.heartbeat_at)
+                        || live_after
+                            .as_ref()
+                            .map(|observation| observation.heartbeat_at)
                             != observed_heartbeat
                         || live_after.as_ref().map(|observation| observation.output_at)
                             != observed_output;
                     let newer_owner = live_after.as_ref().is_some_and(|observation| {
                         observation.conversation_id != Some(conversation_id)
-                            || observation.active_turn_run_id.as_deref().is_some_and(|active| active != run.id)
-                    }) || capture_after.as_ref().is_some_and(|capture| capture.run_id != run.id);
+                            || observation
+                                .active_turn_run_id
+                                .as_deref()
+                                .is_some_and(|active| active != run.id)
+                    }) || capture_after
+                        .as_ref()
+                        .is_some_and(|capture| capture.run_id != run.id);
                     if changed_activity || newer_owner {
                         self.clear_stale_suspicion(&run.id).await;
                         tracing::info!(
@@ -4067,7 +4056,11 @@ impl ConnectionManager {
                             turn_run_id = run.id,
                             connection_id = run.connection_id,
                             connection_generation = generation_after,
-                            veto_reason = if newer_owner { "newer_run_detected" } else { "fresh_activity_during_confirmation" },
+                            veto_reason = if newer_owner {
+                                "newer_run_detected"
+                            } else {
+                                "fresh_activity_during_confirmation"
+                            },
                             state_changed = false,
                             "[ACP][reconcile] confirmed stale observation invalidated"
                         );
@@ -4828,12 +4821,9 @@ impl ConnectionManager {
                         last_merged_at: Set(None),
                         last_merge_key: Set(None),
                         merge_target_conversation_id: Set(None),
-                        updated_at: Set(now),
-                        deleted_at: Set(None),
-                        pinned_at: Set(None),
-                        origin_cwd: Set(None),
-                    };
-                    let inserted = sibling.insert(txn).await?;
+                    }
+                    .insert(txn)
+                    .await?;
                     // The sibling keeps the pre-fork history under the
                     // original's name, so it keeps the original's tags too —
                     // without them the user's tagging would appear to have
@@ -4841,10 +4831,10 @@ impl ConnectionManager {
                     crate::db::service::conversation_tag_service::copy_conversation_tags(
                         txn,
                         conversation_id,
-                        inserted.id,
+                        sibling.id,
                     )
                     .await?;
-                    Ok(inserted.id)
+                    Ok(sibling.id)
                 })
             })
             .await
@@ -5380,7 +5370,8 @@ impl ConnectionManager {
         }
         tracing::info!(
             "[ACP] disconnect by agent type agent={:?} count={}",
-            agent_type, disconnected
+            agent_type,
+            disconnected
         );
 
         // Every child that could still be running as this agent: the ones just
@@ -5531,9 +5522,7 @@ impl ConnectionManager {
     /// Block new connections from being established until the returned guard
     /// is dropped. The caller must enumerate live connections only AFTER
     /// holding this, never before.
-    pub async fn lock_out_new_connections(
-        &self,
-    ) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+    pub async fn lock_out_new_connections(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
         self.external_restore_lock.clone().write_owned().await
     }
 
@@ -6644,8 +6633,10 @@ impl crate::acp::delegation::spawner::ConnectionSpawner for ConnectionManagerSpa
         external_session_id: &str,
         preferred_mode_id: Option<String>,
         preferred_config_values: BTreeMap<String, String>,
-    ) -> Result<crate::acp::delegation::spawner::ResumedSpawn, crate::acp::delegation::spawner::SpawnerError>
-    {
+    ) -> Result<
+        crate::acp::delegation::spawner::ResumedSpawn,
+        crate::acp::delegation::spawner::SpawnerError,
+    > {
         use crate::acp::delegation::spawner::{ResumedSpawn, SpawnerError};
         // Same parent inheritance as `spawn` — a resumed child whose emitter is
         // wired to a different broadcaster would stream to nobody.
@@ -7187,10 +7178,10 @@ mod tests {
             .lock()
             .await
             .insert("restore-victim".to_string(), victim);
-        mgr.connections.lock().await.insert(
-            "unrelated".to_string(),
-            fake_connection("unrelated", None),
-        );
+        mgr.connections
+            .lock()
+            .await
+            .insert("unrelated".to_string(), fake_connection("unrelated", None));
 
         mgr.disconnect("restore-victim").await.unwrap();
         assert!(
@@ -7896,8 +7887,7 @@ mod tests {
         mgr.stale_run_timeout = Duration::ZERO;
         mgr.stale_confirmation = Duration::ZERO;
         let _rx = insert_live_connection(&mgr, "generation-race", AgentType::Codex, None).await;
-        let (conversation_id, old_run_id) =
-            seed_live_turn_run(&db, &mgr, "generation-race").await;
+        let (conversation_id, old_run_id) = seed_live_turn_run(&db, &mgr, "generation-race").await;
         let state = mgr.get_state("generation-race").await.unwrap();
         {
             let mut state = state.write().await;
@@ -8684,7 +8674,9 @@ mod tests {
             blocks,
             user_message,
             ..
-        } = cmd_rx.try_recv().expect("the prompt still reaches the agent")
+        } = cmd_rx
+            .try_recv()
+            .expect("the prompt still reaches the agent")
         else {
             panic!("expected prompt command");
         };
@@ -11077,8 +11069,7 @@ mod tests {
 
     #[tokio::test]
     async fn persisted_prompt_readiness_uses_restore_not_spawn_timeout() {
-        let mut mgr =
-            ConnectionManager::with_spawn_handshake_timeout(Duration::from_millis(20));
+        let mut mgr = ConnectionManager::with_spawn_handshake_timeout(Duration::from_millis(20));
         // Keep the semantic gap large while leaving enough wall-clock margin
         // for saturated macOS CI runners. The assertion is that readiness may
         // arrive after the 20 ms spawn deadline but before the restore lease,
@@ -11770,9 +11761,10 @@ mod tests {
         let global = conversation_tag_service::create_tag(&db.conn, None, "bug", "#d73a4a")
             .await
             .unwrap();
-        let owned = conversation_tag_service::create_tag(&db.conn, Some(folder_id), "ui", "#0e8a16")
-            .await
-            .unwrap();
+        let owned =
+            conversation_tag_service::create_tag(&db.conn, Some(folder_id), "ui", "#0e8a16")
+                .await
+                .unwrap();
         conversation_tag_service::update_conversation_tags(
             &db.conn,
             pre.id,
@@ -11795,7 +11787,10 @@ mod tests {
         let sibling = conversation_service::get_by_id(&db.conn, result.sibling_conversation_id)
             .await
             .unwrap();
-        assert_eq!(sibling.tag_ids, expected, "the pre-fork history keeps its tags");
+        assert_eq!(
+            sibling.tag_ids, expected,
+            "the pre-fork history keeps its tags"
+        );
         let current = conversation_service::get_by_id(&db.conn, pre.id)
             .await
             .unwrap();
@@ -11931,7 +11926,9 @@ mod tests {
         .unwrap();
         let (mgr, join) =
             manager_with_fake_fork("c-nosp", pre.id, "session-S2", "session-S1").await;
-        mgr.fork_session(&db, "c-nosp", None, None, None).await.unwrap();
+        mgr.fork_session(&db, "c-nosp", None, None, None)
+            .await
+            .unwrap();
         let _ = join.await;
 
         let current = conversation_service::get_by_id(&db.conn, pre.id)
@@ -11977,7 +11974,10 @@ mod tests {
 
         let (mgr, join) =
             manager_with_fake_fork("c-latest", pre.id, "session-S2", "session-S1").await;
-        let result = mgr.fork_session(&db, "c-latest", None, None, None).await.unwrap();
+        let result = mgr
+            .fork_session(&db, "c-latest", None, None, None)
+            .await
+            .unwrap();
         let _ = join.await;
 
         let current = conversation_service::get_by_id(&db.conn, pre.id)
@@ -12681,7 +12681,10 @@ mod tests {
         // (e.g. its session started before the feature was enabled), even mid-turn.
         let state = mgr.get_state("c1").await.unwrap();
         state.write().await.turn_in_flight = true;
-        let err = mgr.submit_feedback("c1", "note".into(), None).await.unwrap_err();
+        let err = mgr
+            .submit_feedback("c1", "note".into(), None)
+            .await
+            .unwrap_err();
         assert!(matches!(err, AcpError::FeedbackDisabled));
         assert!(state.read().await.feedback.is_empty());
     }
@@ -12693,7 +12696,10 @@ mod tests {
             .await;
         // Tool available but no turn in flight → nothing to steer.
         set_feedback_tool_available(&mgr, "c1").await;
-        let err = mgr.submit_feedback("c1", "note".into(), None).await.unwrap_err();
+        let err = mgr
+            .submit_feedback("c1", "note".into(), None)
+            .await
+            .unwrap_err();
         assert!(matches!(err, AcpError::NoActiveTurn));
         // And nothing was appended.
         let state = mgr.get_state("c1").await.unwrap();
@@ -12737,7 +12743,10 @@ mod tests {
         mark_feedback_ready(&mgr, "c1").await;
         // Empty / whitespace-only → rejected, nothing appended.
         for empty in ["", "   ", "\n\t "] {
-            let err = mgr.submit_feedback("c1", empty.into(), None).await.unwrap_err();
+            let err = mgr
+                .submit_feedback("c1", empty.into(), None)
+                .await
+                .unwrap_err();
             assert!(matches!(err, AcpError::InvalidFeedback(_)));
         }
         // Oversized → rejected.
@@ -13190,7 +13199,10 @@ mod tests {
         mark_native_steering_ready(&mgr, "c1").await;
         let fake_loop = answer_steer(rx, Ok(SteerOutcome::PromptRequired));
 
-        let err = mgr.submit_feedback("c1", "note".into(), None).await.unwrap_err();
+        let err = mgr
+            .submit_feedback("c1", "note".into(), None)
+            .await
+            .unwrap_err();
         assert!(matches!(err, AcpError::NoActiveTurn));
         let _ = fake_loop.await;
 
@@ -13214,7 +13226,10 @@ mod tests {
 
         // The adapter ignored the opt-in: content consumed → recorded
         // Delivered (never resent), and the session downgrades to pull.
-        let item = mgr.submit_feedback("c1", "note one".into(), None).await.unwrap();
+        let item = mgr
+            .submit_feedback("c1", "note one".into(), None)
+            .await
+            .unwrap();
         assert_eq!(item.status, FeedbackStatus::Delivered);
         let _ = fake_loop.await;
         let state = mgr.get_state("c1").await.unwrap();
@@ -13226,7 +13241,10 @@ mod tests {
         // The NEXT note rides the pull path: lands Pending, no Steer command
         // (the loop receiver was consumed above — a native attempt would fail
         // on the dead channel, so an Ok(Pending) proves the pull branch ran).
-        let second = mgr.submit_feedback("c1", "note two".into(), None).await.unwrap();
+        let second = mgr
+            .submit_feedback("c1", "note two".into(), None)
+            .await
+            .unwrap();
         assert_eq!(second.status, FeedbackStatus::Pending);
         let pending = mgr.read_pending_feedback("c1").await;
         assert_eq!(pending.len(), 1);
@@ -13259,7 +13277,10 @@ mod tests {
             }
         });
 
-        let item = mgr.submit_feedback("c1", "late note".into(), None).await.unwrap();
+        let item = mgr
+            .submit_feedback("c1", "late note".into(), None)
+            .await
+            .unwrap();
         assert_eq!(item.status, FeedbackStatus::Delivered);
         let _ = fake_loop.await;
         assert_eq!(state.read().await.feedback.len(), 1);

@@ -3540,6 +3540,7 @@
         "showMore": "Show more",
         "showLess": "Show less",
         "loadEarlierHistory": "Load earlier messages",
+        "partialHistory": "Only part of the recent history could be loaded within the read limit. Your messages are preserved; reload or load earlier messages to recover more.",
         "retryEarlierHistory": "Retry earlier messages",
         "delivery": {
           "submitting": "Sending…",

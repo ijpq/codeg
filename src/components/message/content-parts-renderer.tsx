@@ -2272,7 +2272,12 @@ const TextPart = memo(function TextPart({
       </div>
     )
   }
-  return <AssistantText text={renderCitationMarkdown(text, citationSources)} isStreaming={isStreaming} />
+  return (
+    <AssistantText
+      text={renderCitationMarkdown(text, citationSources)}
+      isStreaming={isStreaming}
+    />
+  )
 })
 
 /**
@@ -2339,18 +2344,17 @@ function MarkdownText({
   text: string
   isStreaming: boolean
 }) {
-  const renderedText = text
   return (
     <div className='break-words text-sm prose prose-sm dark:prose-invert max-w-none [&_ul]:list-inside [&_ol]:list-inside [&_[data-streamdown="code-block-body"]]:max-h-96 [&_[data-streamdown="code-block-body"]]:overflow-auto'>
       <MessageResponse
         mode={isStreaming ? "streaming" : "static"}
         parseIncompleteMarkdown={isStreaming}
       >
-        {renderedText}
+        {text}
       </MessageResponse>
     </div>
   )
-})
+}
 
 const DeferredTextPart = memo(function DeferredTextPart({
   part,
@@ -2392,7 +2396,7 @@ const DeferredTextPart = memo(function DeferredTextPart({
       )}
     </div>
   )
-}
+})
 
 const ToolCallPart = memo(function ToolCallPart({
   part,

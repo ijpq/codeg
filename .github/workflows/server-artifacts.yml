@@ -127,7 +127,7 @@ jobs:
       # ubuntu runner). Both bins land in the target-specific release folder.
       - name: Build server binaries
         working-directory: src-tauri
-        run: cargo build --release --bin codeg-server --bin codeg-mcp --no-default-features --target ${{ matrix.target }}
+        run: cargo build --release --bin codeg-server --bin codeg-mcp --no-default-features --features server-bin,mcp-bin --target ${{ matrix.target }}
 
       # Bundle a runnable server: the two binaries side-by-side (codeg-mcp must
       # sit next to codeg-server for its exe-sibling lookup) + the static export

@@ -2485,6 +2485,8 @@ interface FolderConversationFlight {
   controller: AbortController
   consumers: number
   settled: boolean
+  generation: number | null
+  reload: boolean
 }
 
 interface FolderConversationCacheEntry {
@@ -2547,15 +2549,20 @@ export function invalidateFolderConversationCache(
 ): void {
   if (conversationId === undefined) {
     folderConversationCache.clear()
+    // Detached readers may still finish for their existing consumers, but
+    // cannot satisfy a new refresh or refill the invalidated cache.
+    folderConversationFlights.clear()
     return
   }
-  for (const [key] of folderConversationCache) {
-    try {
-      if (JSON.parse(key).conversationId === conversationId) {
-        folderConversationCache.delete(key)
+  for (const entries of [folderConversationCache, folderConversationFlights]) {
+    for (const [key] of entries) {
+      try {
+        if (JSON.parse(key).conversationId === conversationId) {
+          entries.delete(key)
+        }
+      } catch {
+        entries.delete(key)
       }
-    } catch {
-      folderConversationCache.delete(key)
     }
   }
 }
@@ -2584,6 +2591,8 @@ export async function getFolderConversation(
       : {}),
   }
   const key = JSON.stringify(requestKey)
+  const generation = options?.requestGeneration ?? null
+  const reload = options?.cacheMode === "reload"
   if (options?.signal?.aborted) throw cancelledRequestError()
   if (process.env.NODE_ENV !== "test" && options?.cacheMode !== "reload") {
     const cached = folderConversationCache.get(key)
@@ -2602,7 +2611,12 @@ export async function getFolderConversation(
     if (cached) folderConversationCache.delete(key)
   }
   const existing = folderConversationFlights.get(key)
-  if (existing && !existing.controller.signal.aborted) {
+  if (
+    existing &&
+    !existing.controller.signal.aborted &&
+    existing.generation === generation &&
+    (!reload || existing.reload)
+  ) {
     if (process.env.NODE_ENV !== "test") {
       console.debug("[conversation][perf] duplicate detail request reused", {
         conversationId,
@@ -2636,6 +2650,8 @@ export async function getFolderConversation(
     controller,
     consumers: 0,
     settled: false,
+    generation,
+    reload,
     promise: Promise.resolve(null as unknown as DbConversationDetail),
   }
   flight.promise = getTransport()
@@ -2643,7 +2659,12 @@ export async function getFolderConversation(
       signal: controller.signal,
     })
     .then((detail) => {
-      if (process.env.NODE_ENV !== "test") {
+      if (
+        process.env.NODE_ENV !== "test" &&
+        detail.history_page?.page_complete !== false &&
+        !controller.signal.aborted &&
+        folderConversationFlights.get(key) === flight
+      ) {
         const now = Date.now()
         folderConversationCache.set(key, {
           detail,

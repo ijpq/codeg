@@ -3540,6 +3540,7 @@
         "showMore": "더보기",
         "showLess": "접기",
         "loadEarlierHistory": "이전 메시지 불러오기",
+        "partialHistory": "읽기 한도에 도달하여 최근 기록의 일부만 표시됩니다. 메시지는 보존됩니다. 다시 로드하거나 이전 메시지를 불러오세요.",
         "retryEarlierHistory": "이전 메시지 다시 불러오기",
         "delivery": {
           "submitting": "전송 중…",

@@ -1049,6 +1049,7 @@ export interface ConversationHistoryPage {
   next_cursor?: string | null
   has_more: boolean
   loaded_turns: number
+  page_complete?: boolean | null
   source_version?: string | null
   read_start_offset?: number | null
   read_end_offset?: number | null
