@@ -3561,6 +3561,7 @@
         "showLess": "收起",
         "resizeWidth": "拖动调整聊天区域宽度 · 双击恢复默认",
         "loadEarlierHistory": "加载更早消息",
+        "partialHistory": "近期消息尚未完整载入，读取已达到安全上限。原消息仍保留，可重新加载或加载更早消息补齐。",
         "retryEarlierHistory": "重试加载更早消息",
         "delivery": {
           "submitting": "发送中…",

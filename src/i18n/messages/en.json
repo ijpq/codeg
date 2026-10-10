@@ -3561,6 +3561,7 @@
         "showLess": "Show less",
         "resizeWidth": "Drag to resize the chat width · double-click to reset",
         "loadEarlierHistory": "Load earlier messages",
+        "partialHistory": "Only part of the recent history could be loaded within the read limit. Your messages are preserved; reload or load earlier messages to recover more.",
         "retryEarlierHistory": "Retry earlier messages",
         "delivery": {
           "submitting": "Sending…",

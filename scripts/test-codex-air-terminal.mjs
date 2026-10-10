@@ -21,6 +21,12 @@ const deferred = () => {
 const drain = () => new Promise((resolve) => setImmediate(resolve))
 
 function harness(fixture, patched = true) {
+  const modern = fixture.version === "2.1.1"
+  const patchBefore = modern ? read("codex_air_v2_before.txt") : before
+  const patchCapture = modern ? read("codex_air_v2_capture.txt") : ""
+  const patchAfter = modern ? read("codex_air_v2_after.txt") : after
+  let publicationGate = null
+  let reportError = null
   const timers = [],
     reports = [],
     audits = [],
@@ -43,6 +49,8 @@ function harness(fixture, patched = true) {
       waitForNativeSubagents: () => children.promise,
       getFailure: () => null,
       takeCompletedPlan: () => null,
+      isTurnDiffOversized: () => false,
+      getTurnDiff: () => "original-diff",
     },
     { get: (target, key) => target[key] ?? (async () => {}) }
   )
@@ -52,6 +60,20 @@ function harness(fixture, patched = true) {
       error: () => {},
     },
     setTimeout: (callback) => timers.push(callback),
+    captureAgentFileChangeWorkspace: (cwd, additionalDirectories) => ({
+      cwd,
+      additionalDirectories: [...additionalDirectories],
+      diffRoot: cwd,
+    }),
+    createReportedAgentFileChangeReport: (requestId, diff, workspace) => {
+      audits.push({ params: { requestId, diff, workspace } })
+      if (reportError) throw reportError
+      return { requestId, status: "reported", paths: ["result.pdf"] }
+    },
+    AgentFileChangeReportError: class extends Error {},
+    AcpToolCallRenderer: class {},
+    clientSupportsCompaction: () => false,
+    clientSupportsNotices: () => false,
     clientSupportsAgentFileChangeReports: () => true,
     parseAgentFileChangeReportRequest: (meta) => meta?.request ?? null,
     clientSupportsPlanUpdates: () => false,
@@ -71,6 +93,7 @@ function harness(fixture, patched = true) {
     ACPSessionConnection: class {
       async update(update) {
         reports.push(update._meta.air.payload.report)
+        if (publicationGate) await publicationGate.promise
       }
     },
     JETBRAINS_META_KEY: "air",
@@ -86,13 +109,13 @@ function harness(fixture, patched = true) {
   })
   const prompt = patched
     ? fixture.prompt
-        .replace(before, "")
+        .replace(patchBefore, patchCapture)
         .replace(
           "      activePrompt.complete();\n    }\n  }\n",
-          `      activePrompt.complete();\n${after}    }\n  }\n`
+          `      activePrompt.complete();\n${patchAfter}    }\n  }\n`
         )
     : fixture.prompt
-  assert.equal(fixture.prompt.split(before).length, 2)
+  assert.equal(fixture.prompt.split(patchBefore).length, 2)
   const methods = vm.runInContext(`({${prompt},${fixture.publish}})`, context)
   const agent = {
     ...methods,
@@ -120,7 +143,10 @@ function harness(fixture, patched = true) {
     observePromptRequestCancellation: () => () => {},
     createPendingTurnStart: deferred,
     permissionLifecycleContext: () => ({ beginPrompt: () => ({}) }),
-    availableCommands: { tryHandleCommand: async () => ({ handled: false }) },
+    availableCommands: {
+      tryHandleCommand: async () => ({ handled: false }),
+      publish: async () => {},
+    },
     runWithProcessCheck: (fn) => fn(),
     cancelBeforeTurnStarted: () => new Promise(() => {}),
     sessionIsClosing: () => false,
@@ -165,6 +191,8 @@ function harness(fixture, patched = true) {
     children,
     activePrompts,
     handler,
+    delayPublication: () => (publicationGate = deferred()),
+    failReport: () => (reportError = new Error("file verification failed")),
   }
 }
 
@@ -351,3 +379,96 @@ for (const version of ["1.10.0", "1.11.0"]) {
     )
   })
 }
+
+// 2.1.1's AIR is derived from the native diff; a delayed notification or local
+// verification must still never hold the prompt response or reuse new-turn data.
+const modernFixture = JSON.parse(read("fixtures/codex-acp-2.1.1-prompt.json"))
+for (const outcome of ["immediate", "delayed", "missing", "failed"]) {
+  test(`2.1.1: ${outcome} AIR cannot block completion or the next prompt`, async () => {
+    const h = harness(modernFixture)
+    const gate =
+      outcome === "delayed" || outcome === "missing"
+        ? h.delayPublication()
+        : null
+    if (outcome === "failed") h.failReport()
+    const prompt = h.start()
+    h.completeRoot()
+    h.children.resolve()
+    assert.equal((await prompt).stopReason, "end_turn")
+    assert.equal(h.activePrompts.size, 0)
+    assert.equal(h.audits.length, 0)
+    assert.equal(h.timers.length, 1)
+    // Change the shared session and diff before the old callback executes.
+    h.state.cwd = "/next"
+    h.state.additionalDirectories.push("/next-extra")
+    h.handler.getTurnDiff = () => "next-diff"
+    assert.equal((await h.start("run-next", false)).stopReason, "end_turn")
+    h.timers.shift()()
+    await drain()
+    assert.equal(h.audits.length, 1)
+    assert.equal(h.audits[0].params.requestId, "run-old")
+    assert.equal(h.audits[0].params.diff, "original-diff")
+    assert.equal(h.audits[0].params.workspace.cwd, "/original")
+    assert.deepEqual(
+      [...h.audits[0].params.workspace.additionalDirectories],
+      ["/extra"]
+    )
+    assert.equal(h.reports.length, 1)
+    assert.equal(h.reports[0].requestId, "run-old")
+    assert.equal(
+      h.reports[0].status,
+      outcome === "failed" ? "unavailable" : "reported"
+    )
+    if (outcome === "delayed") gate.resolve()
+    await drain()
+    assert.equal(h.activePrompts.size, 0)
+  })
+}
+test("2.1.1: cancelling preserves the original request's unavailable report", async () => {
+  const h = harness(modernFixture)
+  const prompt = h.start()
+  await drain()
+  h.activePrompts.get("session").abort()
+  h.completeRoot("interrupted")
+  h.children.resolve()
+  assert.equal((await prompt).stopReason, "cancelled")
+  assert.equal(h.activePrompts.size, 0)
+  h.timers.shift()()
+  await drain()
+  assert.equal(h.audits.length, 0)
+  assert.equal(h.reports[0].requestId, "run-old")
+  assert.equal(h.reports[0].reason, "cancelled")
+})
+test("2.1.1: a final answer cannot bypass outstanding native child tasks", async () => {
+  const h = harness(modernFixture)
+  let terminal = false
+  const prompt = h.start().then((r) => {
+    terminal = true
+    return r
+  })
+  h.completeRoot()
+  await drain()
+  assert.equal(terminal, false)
+  assert.equal(h.timers.length, 0)
+  h.children.resolve()
+  assert.equal((await prompt).stopReason, "end_turn")
+})
+test("2.1.1: disposal finishes before asynchronous AIR begins", async () => {
+  const h = harness(modernFixture)
+  const disposal = deferred()
+  h.handler.dispose = () => disposal.promise
+  let terminal = false
+  const prompt = h.start().then((r) => {
+    terminal = true
+    return r
+  })
+  h.completeRoot()
+  h.children.resolve()
+  await drain()
+  assert.equal(terminal, false)
+  assert.equal(h.timers.length, 0)
+  disposal.resolve()
+  assert.equal((await prompt).stopReason, "end_turn")
+  assert.equal(h.activePrompts.size, 0)
+  assert.equal(h.timers.length, 1)
+})

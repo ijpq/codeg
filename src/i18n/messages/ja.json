@@ -3561,6 +3561,7 @@
         "showLess": "折りたたむ",
         "resizeWidth": "ドラッグでチャット幅を調整 · ダブルクリックで元に戻す",
         "loadEarlierHistory": "以前のメッセージを読み込む",
+        "partialHistory": "読み取り上限に達したため、最近の履歴は一部のみ表示されています。メッセージは保存されています。再読み込みするか、以前のメッセージを読み込んでください。",
         "retryEarlierHistory": "以前のメッセージを再読み込み",
         "delivery": {
           "submitting": "送信中…",

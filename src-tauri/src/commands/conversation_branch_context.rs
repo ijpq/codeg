@@ -336,8 +336,7 @@ fn visible_entries(turns: &[MessageTurn]) -> Vec<VisibleEntry> {
                 }
                 ContentBlock::ToolUse { meta, .. } => {
                     citation_sources.extend(crate::citations::sources_from_meta(meta.as_ref()));
-                    citation_sources =
-                        crate::citations::merge_sources(citation_sources.iter());
+                    citation_sources = crate::citations::merge_sources(citation_sources.iter());
                 }
                 ContentBlock::Image { mime_type, uri, .. } => parts.push(format!(
                     "[Attached image: {}]",
@@ -502,6 +501,7 @@ mod tests {
     fn detail(turns: Vec<MessageTurn>) -> DbConversationDetail {
         DbConversationDetail {
             summary: DbConversationSummary {
+                tag_ids: vec![],
                 id: 7,
                 folder_id: 1,
                 title: Some("Long source".into()),

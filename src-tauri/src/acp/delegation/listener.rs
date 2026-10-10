@@ -15,33 +15,33 @@ use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
 
-use crate::acp::delegation::broker::{DelegationBroker, StatusWait};
 use crate::acp::browser_tools::{
     BrowserActOutcome, BrowserCaptureOutcome, BrowserConsoleOutcome, BrowserEvalOutcome,
     BrowserSnapshotOutcome, BrowserTabOutcome, BrowserTabsOutcome, BrowserToolAccess,
     ERROR_NO_SUCH_TAB,
 };
+use crate::acp::chat_authoring::{AuthoringContext, AuthoringOutcome, ChatAuthoringAccess};
 use crate::acp::computer_tools::{
     ComputerActOutcome, ComputerAppsOutcome, ComputerCaptureOutcome, ComputerSnapshotOutcome,
     ComputerToolAccess, ComputerVerifyOutcome, ComputerWindowsOutcome, ERROR_NO_SUCH_TARGET,
 };
+use crate::acp::delegation::broker::{DelegationBroker, StatusWait};
+use crate::acp::delegation::transport::BrokerDeliverablesRequest;
 use crate::acp::delegation::transport::{
     read_frame, write_frame, BrokerAskRequest, BrokerBrowserActRequest,
     BrokerBrowserCaptureRequest, BrokerBrowserConsoleRequest, BrokerBrowserEvalRequest,
     BrokerBrowserSnapshotRequest, BrokerBrowserTabOpRequest, BrokerBrowserTabsRequest,
-    BrokerCancelRequest, BrokerCancelTaskRequest, BrokerComputerActRequest,
-    BrokerComputerAppsRequest, BrokerComputerCaptureRequest, BrokerComputerLaunchRequest,
-    BrokerComputerSnapshotRequest,
-    BrokerComputerVerifyRequest, BrokerComputerWindowsRequest, BrokerCommitFeedbackRequest,
-    BrokerFeedbackRequest, BrokerMessage, BrokerRequest,
-    BrokerCreateAutomationRequest, BrokerCreateWorkTaskRequest, BrokerResponse,
-    BrokerResumeTaskRequest, BrokerSessionRequest, BrokerStatusRequest,
-    BrokerTaskCompleteRequest, BrokerTaskProgressRequest,
+    BrokerCancelRequest, BrokerCancelTaskRequest, BrokerCommitFeedbackRequest,
+    BrokerComputerActRequest, BrokerComputerAppsRequest, BrokerComputerCaptureRequest,
+    BrokerComputerLaunchRequest, BrokerComputerSnapshotRequest, BrokerComputerVerifyRequest,
+    BrokerComputerWindowsRequest, BrokerCreateAutomationRequest, BrokerCreateWorkTaskRequest,
+    BrokerFeedbackRequest, BrokerMessage, BrokerRequest, BrokerResponse, BrokerResumeTaskRequest,
+    BrokerSessionRequest, BrokerStatusRequest, BrokerTaskCompleteRequest,
+    BrokerTaskProgressRequest,
 };
 use crate::acp::delegation::types::{
     DelegationRequest, DelegationTaskReport, ResumeDelegationRequest, TaskStatus,
 };
-use crate::acp::delegation::transport::BrokerDeliverablesRequest;
 use crate::acp::deliverables::{
     PublishDeliverablesArgs, PublishDeliverablesOutcome, RejectedDeliverable,
     SessionDeliverableAccess,
@@ -50,7 +50,6 @@ use crate::acp::feedback::{PendingFeedback, SessionFeedbackAccess};
 use crate::acp::question::{QuestionOutcome, SessionQuestionAccess};
 #[cfg(unix)]
 use crate::acp::scratch_dir::SUN_PATH_CAP;
-use crate::acp::chat_authoring::{AuthoringContext, AuthoringOutcome, ChatAuthoringAccess};
 use crate::acp::session_info::{SessionInfo, SessionInfoAccess};
 use crate::acp::work_task_tools::{TaskReportAck, WorkTaskToolAccess};
 use crate::models::AgentType;
@@ -350,11 +349,7 @@ impl DelegationListener {
     #[cfg(unix)]
     fn staging_socket_path(socket_path: &Path) -> PathBuf {
         let salt = uuid::Uuid::new_v4().simple().to_string();
-        socket_path.with_file_name(format!(
-            ".stg-{}-{}",
-            std::process::id(),
-            &salt[..8]
-        ))
+        socket_path.with_file_name(format!(".stg-{}-{}", std::process::id(), &salt[..8]))
     }
 
     #[cfg(windows)]
@@ -1053,7 +1048,9 @@ impl DelegationListener {
                 crate::acp::computer_tools::no_such_target_note(&req.target_id),
             );
         }
-        self.computer.capture(&req.target_id, req.max_dimension).await
+        self.computer
+            .capture(&req.target_id, req.max_dimension)
+            .await
     }
 
     async fn process_computer_snapshot(
@@ -1372,9 +1369,7 @@ fn browser_tabs_response(outcome: BrowserTabsOutcome) -> std::io::Result<BrokerR
 /// Serialize a [`BrowserSnapshotOutcome`] into a [`BrokerResponse`] for the
 /// `BrowserSnapshot` arm — the companion renders it into the `browser_snapshot`
 /// tool result.
-fn browser_snapshot_response(
-    outcome: BrowserSnapshotOutcome,
-) -> std::io::Result<BrokerResponse> {
+fn browser_snapshot_response(outcome: BrowserSnapshotOutcome) -> std::io::Result<BrokerResponse> {
     Ok(BrokerResponse {
         outcome: serde_json::to_value(&outcome).map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, format!("encode: {e}"))
@@ -1700,12 +1695,12 @@ pub fn default_socket_path(_temp_dir: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acp::browser_tools::{NoBrowserTabs, ERROR_GRANT_REQUIRED};
+    use crate::acp::computer_tools::NoComputerDesktop;
     use crate::acp::delegation::broker::{ConversationDepthLookup, DelegationConfig};
     use crate::acp::delegation::spawner::{
         mock::MockSpawner, ConnectionSpawner, ResumedSpawn, SpawnerError,
     };
-    use crate::acp::browser_tools::{NoBrowserTabs, ERROR_GRANT_REQUIRED};
-    use crate::acp::computer_tools::NoComputerDesktop;
     use crate::acp::delegation::types::{DelegationError, DelegationOutcome, DelegationSuccess};
     use serde_json::json;
     use std::time::Duration;
@@ -1845,11 +1840,7 @@ mod tests {
                 note: None,
             }
         }
-        async fn snapshot(
-            &self,
-            tab_id: &str,
-            max_chars: Option<usize>,
-        ) -> BrowserSnapshotOutcome {
+        async fn snapshot(&self, tab_id: &str, max_chars: Option<usize>) -> BrowserSnapshotOutcome {
             self.calls
                 .lock()
                 .await
@@ -1903,10 +1894,7 @@ mod tests {
             ));
             BrowserActOutcome::control_required(tab_id)
         }
-        async fn tab_op(
-            &self,
-            op: crate::acp::browser_tools::BrowserTabOp,
-        ) -> BrowserTabOutcome {
+        async fn tab_op(&self, op: crate::acp::browser_tools::BrowserTabOp) -> BrowserTabOutcome {
             self.calls
                 .lock()
                 .await
@@ -2747,7 +2735,8 @@ mod tests {
         }
 
         let mock = Arc::new(MockSpawner::new());
-        mock.queue_resume_spawn(Ok(ResumedSpawn::fresh("child-conn-2"))).await;
+        mock.queue_resume_spawn(Ok(ResumedSpawn::fresh("child-conn-2")))
+            .await;
         mock.queue_resume_send(Ok(())).await;
         let broker = Arc::new(
             DelegationBroker::new(
@@ -3506,7 +3495,9 @@ mod tests {
 
         let listed = browser_round_trip(
             listener.clone(),
-            BrokerMessage::BrowserTabs(BrokerBrowserTabsRequest { token: "tok".into() }),
+            BrokerMessage::BrowserTabs(BrokerBrowserTabsRequest {
+                token: "tok".into(),
+            }),
         )
         .await;
         assert_eq!(listed.outcome["tabs"][0]["tabId"], "t1");
@@ -3661,7 +3652,10 @@ mod tests {
             },
         );
         let response = browser_capture_response(huge).unwrap();
-        assert_eq!(response.outcome["error"], crate::acp::browser_tools::ERROR_READ_FAILED);
+        assert_eq!(
+            response.outcome["error"],
+            crate::acp::browser_tools::ERROR_READ_FAILED
+        );
         assert_eq!(response.outcome["tabId"], "t1");
         assert!(response.outcome.get("capture").is_none());
         assert!(serde_json::to_vec(&response.outcome).unwrap().len() < 4096);
@@ -3683,7 +3677,10 @@ mod tests {
                 clipped: false,
             },
         );
-        assert_eq!(browser_capture_response(small).unwrap().outcome["capture"]["data"], "AAAA");
+        assert_eq!(
+            browser_capture_response(small).unwrap().outcome["capture"]["data"],
+            "AAAA"
+        );
     }
 
     /// A caller who cannot prove it is a companion is told the same thing a
@@ -3804,7 +3801,9 @@ mod tests {
             fits_sun_path(&socket),
             "the real path must fit, or this tests the wrong check"
         );
-        assert!(!fits_sun_path(&DelegationListener::staging_socket_path(&socket)));
+        assert!(!fits_sun_path(&DelegationListener::staging_socket_path(
+            &socket
+        )));
 
         let err = DelegationListener::bind(&socket).await.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
@@ -3972,6 +3971,7 @@ mod tests {
             Arc::new(StubAuthoring::default()),
             Arc::new(NoBrowserTabs),
             computer,
+            Arc::new(StubDeliverables),
         )
     }
 

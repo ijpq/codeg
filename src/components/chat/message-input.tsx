@@ -842,25 +842,33 @@ export function MessageInput({
     return () => cancelAnimationFrame(raf)
   }, [skillPrefix, composerReady])
 
-  const handleComposerChange = useCallback((text: string) => {
-    // The history's own writes are not edits. They must not end navigation, and
-    // they must not be saved as the draft: overwriting the stored draft with a
-    // recalled prompt would lose what the user had typed if they closed the tab
-    // without stepping back down. An actual edit falls into the branch below
-    // and saves normally.
-    if (!applyingHistoryRef.current) {
-      if (historyIndexRef.current !== null) {
-        historyIndexRef.current = null
-        historyDraftRef.current = null
+  const handleComposerChange = useCallback(
+    (text: string) => {
+      // The history's own writes are not edits. They must not end navigation, and
+      // they must not be saved as the draft: overwriting the stored draft with a
+      // recalled prompt would lose what the user had typed if they closed the tab
+      // without stepping back down. An actual edit falls into the branch below
+      // and saves normally.
+      if (!applyingHistoryRef.current) {
+        if (historyIndexRef.current !== null) {
+          historyIndexRef.current = null
+          historyDraftRef.current = null
+        }
+        if (effectiveDraftStorageKey && !isEditingQueueItem) {
+          saveMessageInputDraft(effectiveDraftStorageKey, text)
+        }
+        scheduleDraftSave()
       }
-      if (effectiveDraftStorageKey && !isEditingQueueItem) {
-        saveMessageInputDraft(effectiveDraftStorageKey, text)
-      }
-      scheduleDraftSave()
-    }
-    syncComposerEmpty()
-    detectSlashTriggerRef.current?.()
-  }, [effectiveDraftStorageKey, isEditingQueueItem, syncComposerEmpty, scheduleDraftSave])
+      syncComposerEmpty()
+      detectSlashTriggerRef.current?.()
+    },
+    [
+      effectiveDraftStorageKey,
+      isEditingQueueItem,
+      syncComposerEmpty,
+      scheduleDraftSave,
+    ]
+  )
 
   // Arrow-key prompt history. RichComposer only calls this from the document
   // edge, so the caret keeps moving line by line inside a multi-line entry. A

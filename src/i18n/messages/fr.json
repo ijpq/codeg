@@ -3561,6 +3561,7 @@
         "showLess": "Afficher moins",
         "resizeWidth": "Faites glisser pour ajuster la largeur du chat · double-clic pour réinitialiser",
         "loadEarlierHistory": "Charger les messages précédents",
+        "partialHistory": "L’historique récent n’a été chargé qu’en partie en raison de la limite de lecture. Les messages sont conservés. Rechargez ou chargez les messages précédents.",
         "retryEarlierHistory": "Réessayer les messages précédents",
         "delivery": {
           "submitting": "Envoi…",

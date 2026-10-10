@@ -549,13 +549,13 @@ describe("ConversationDetailPanel send-path hardening", () => {
     )
     expect(effectWithDeps).toContain("if (queueSteerInFlight) return")
     // …and as a dependency, so releasing the hold re-runs the flush.
-    expect(effectWithDeps).toContain("queueSteerInFlight])")
+    expect(effectWithDeps).toMatch(/queueSteerInFlight,?\s*\]\)/)
 
     const steerStart = source.indexOf("const handleQueueSteer = useCallback")
     expect(steerStart).toBeGreaterThan(-1)
     const steerHandler = source.slice(
       steerStart,
-      source.indexOf("\n  return (", steerStart)
+      source.indexOf("\n  // Deferred native guides", steerStart)
     )
     // Set BEFORE the first await, cleared in a finally. Both must be found: a
     // missing setter's -1 would otherwise pass the ordering check.

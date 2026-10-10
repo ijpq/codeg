@@ -134,7 +134,6 @@ import {
   shouldQueueDirectSend,
   shouldRejectDuplicateCreate,
 } from "@/lib/queue-flush"
-import { TurnBusyError } from "@/lib/turn-busy"
 import { deliverQueuedSteer } from "@/lib/queued-steer"
 import { notify } from "@/lib/notify"
 import {
@@ -370,10 +369,8 @@ const ConversationTabView = memo(function ConversationTabView({
     completeTurn,
     markOutOfTurnContent,
     refetchDetail,
-    syncTurnMetadata,
     refreshVisibleOutputs,
     reconcileCompletedTurn,
-    removeConversation,
     setAcpLoadError,
     setDbConversationId,
     setExternalId,
@@ -1194,7 +1191,14 @@ const ConversationTabView = memo(function ConversationTabView({
       }
     }, wait)
     return () => clearTimeout(timer)
-  }, [connectionReady, webConnState, runtimeSyncState, msgQueue, mqPeekNext, queueSteerInFlight])
+  }, [
+    connectionReady,
+    webConnState,
+    runtimeSyncState,
+    msgQueue,
+    mqPeekNext,
+    queueSteerInFlight,
+  ])
 
   // Mirror the connection's liveMessage into the runtime session OUTSIDE React.
   // The connection dispatch invokes this sink synchronously whenever liveMessage

@@ -2226,6 +2226,14 @@ export function MessageListView({
         className="chat-motion-scope relative flex h-full min-h-0 flex-col"
       >
         <MessageThread className="flex-1 min-h-0" resize={messageThreadResize}>
+          {session?.detail?.history_page?.page_complete === false ? (
+            <p
+              role="status"
+              className="shrink-0 border-b border-border/40 px-3 py-2 text-xs text-muted-foreground"
+            >
+              {t("partialHistory")}
+            </p>
+          ) : null}
           <AutoScrollOnSend signal={sendSignal} />
           <MessageBottomFollowGuard
             layoutSignal={bottomLayoutSignal}

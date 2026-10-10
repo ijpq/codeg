@@ -3561,6 +3561,7 @@
         "showLess": "收合",
         "resizeWidth": "拖曳調整聊天區域寬度 · 雙擊恢復預設",
         "loadEarlierHistory": "載入更早訊息",
+        "partialHistory": "近期訊息尚未完整載入，讀取已達安全上限。原訊息仍保留，可重新載入或載入更早訊息補齊。",
         "retryEarlierHistory": "重試載入更早訊息",
         "delivery": {
           "submitting": "傳送中…",

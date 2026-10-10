@@ -19,7 +19,7 @@
 - Release workflow 由 `v*.*.*` tag push 触发；tag 必须与
   `src-tauri/tauri.conf.json` 中的版本一致，而且 tag commit 必须属于 `origin` 默认分支。
 - 默认 Release 只构建并发布以下两类 Windows x64 产物：
-  - Windows x64 客户端 NSIS 安装包（`*_x64-setup.exe`）
+  - Windows x64 客户端 NSIS 安装包（`*_x64-setup.exe`）及独立 SHA-256 校验文件
   - Windows x64 Server 压缩包及 SHA-256 校验文件
 - 默认不发布 macOS、Linux、arm64 或 Docker 镜像。只有用户在当次发版中明确要求扩大发
   布范围时，
@@ -215,7 +215,7 @@ Release CI 结果和 GitHub Release 地址。
 补发时必须分别记录“工作流维护 commit”与“安装包源码 commit”，不能将两者混同。
 完成后更新 Release 说明中的实际资产范围，并提供安装包下载链接和 SHA256。
 
-主程序校验按 Tauri CLI 2.10.0 的 `patch_binary` 行为，将构建文件中唯一的
+主程序校验按已验证的 Tauri CLI 2.10.0 / 2.11.4 的 `patch_binary` 行为，将构建文件中唯一的
 `__TAURI_BUNDLE_TYPE_VAR_UNK` 标记替换为 `__TAURI_BUNDLE_TYPE_VAR_NSS` 后计算完整
 SHA256，与安装文件比较。任何其他字节差异仍失败；MCP 必须逐字节一致。
 `reuse_diagnostic_build` 仅允许复核固定运行 34814858821 的 v0.30.7-fix1 安装包，

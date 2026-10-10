@@ -3561,6 +3561,7 @@
         "showLess": "Mostrar menos",
         "resizeWidth": "Arraste para ajustar a largura do chat · clique duas vezes para redefinir",
         "loadEarlierHistory": "Carregar mensagens anteriores",
+        "partialHistory": "O histórico recente foi carregado parcialmente devido ao limite de leitura. As mensagens estão preservadas. Recarregue ou carregue mensagens anteriores.",
         "retryEarlierHistory": "Tentar mensagens anteriores novamente",
         "delivery": {
           "submitting": "Enviando…",

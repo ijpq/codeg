@@ -1,8 +1,8 @@
 """Verify unsigned Tauri NSIS payloads, including its documented bundle marker.
 
-Tauri CLI 2.10.0 patches UNK to NSS before packaging and restores the build
+Tauri CLI 2.10.0 and 2.11.4 patch UNK to NSS before packaging and restore the build
 output afterwards. Only that exact replacement is allowed; hash all bytes.
-https://github.com/tauri-apps/tauri/blob/tauri-cli-v2.10.0/crates/tauri-bundler/src/bundle.rs
+https://github.com/tauri-apps/tauri/blob/tauri-cli-v2.11.4/crates/tauri-bundler/src/bundle.rs
 """
 
 import hashlib
@@ -25,7 +25,11 @@ def verify_binary(built: bytes, installed: bytes, *, main: bool) -> str:
 
 if __name__ == "__main__":
     build_dir, install_dir = map(Path, sys.argv[1:])
-    for name in ("codeg.exe", "codeg-mcp.exe"):
+    names = ["codeg.exe", "codeg-mcp.exe"]
+    helper = "codeg-computer-helper.exe"
+    if (build_dir / helper).exists() or (install_dir / helper).exists():
+        names.append(helper)
+    for name in names:
         digest = verify_binary(
             (build_dir / name).read_bytes(),
             (install_dir / name).read_bytes(),

@@ -236,12 +236,168 @@ describe("syncViewerDetail — owner/guard no-ops", () => {
     expect(mockGet).not.toHaveBeenCalled()
   })
 
-  it("no-ops for an owner that just promoted its reply (localTurns + lastTurnOwned)", () => {
-    // An OWNER's promoted reply may not be flushed to the transcript yet, so it
-    // is protected — `lastTurnOwned` marks it as owner-driven.
-    seed({ localTurns: [assistantTurn("a", "done")], lastTurnOwned: true })
+  it("reads for a former owner while protecting an unflushed promoted reply", async () => {
+    vi.useFakeTimers()
+    const previous = detail(
+      [userTurn("u0", "previous"), assistantTurn("a0", "previous reply")],
+      20
+    )
+    const promoted = assistantTurn("a", "done")
+    seed({ detail: previous, localTurns: [promoted], lastTurnOwned: true })
+    mockGet.mockResolvedValue(previous)
     sync()
-    expect(mockGet).not.toHaveBeenCalled()
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(mockGet).toHaveBeenCalledTimes(5)
+    expect(session()?.localTurns).toEqual([promoted])
+    expect(session()?.detail).toEqual(previous)
+  })
+
+  it("recovers a later turn missed by a former owner and retires only a covered local batch", async () => {
+    vi.useFakeTimers()
+    const original = [userTurn("u1", "hi"), assistantTurn("a1", "hello")]
+    const previous = detail(original, 20)
+    seed({ detail: previous, localTurns: original, lastTurnOwned: true })
+    const latest = detail(
+      [
+        ...original,
+        userTurn("u2", "remote request"),
+        assistantTurn("a2", "remote final"),
+      ],
+      60
+    )
+    mockGet.mockResolvedValueOnce(previous).mockResolvedValue(latest)
+
+    sync()
+    await vi.advanceTimersByTimeAsync(10_000)
+
+    expect(mockGet).toHaveBeenCalledTimes(2)
+    expect(session()?.localTurns).toEqual([])
+    expect(session()?.detail?.turns.map((turn) => turn.id)).toEqual([
+      "u1",
+      "a1",
+      "u2",
+      "a2",
+    ])
+    for (const [, options] of mockGet.mock.calls) {
+      expect(options).toMatchObject({
+        userTurnLimit: HISTORY_PAGE_USER_TURNS,
+        cacheMode: "reload",
+      })
+      expect(options).not.toHaveProperty("fromIndex")
+    }
+  })
+
+  it("uses durable run identity when promoted and parsed turn ids differ", async () => {
+    vi.useFakeTimers()
+    seed({
+      detail: detail([]),
+      localTurns: [
+        userTurn("client-prompt", "hi"),
+        assistantTurn("live-reply", "hello"),
+      ],
+      lastTurnOwned: true,
+    })
+    const latest = {
+      ...detail(
+        [
+          userTurn("parser-prompt", "hi"),
+          assistantTurn("parser-reply", "hello"),
+          userTurn("remote-prompt", "later"),
+          assistantTurn("remote-reply", "latest"),
+        ],
+        60
+      ),
+      artifact_runs: [
+        {
+          id: "owner-run",
+          conversation_id: CID,
+          connection_id: "owner-connection",
+          client_message_id: "client-prompt",
+          folder_id: 1,
+          root_path: "/tmp/test",
+          status: "completed" as const,
+          capture_incomplete: false,
+          stop_reason: "end_turn",
+          started_at: "2026-10-10T00:00:00Z",
+          completed_at: "2026-10-10T00:00:01Z",
+          changes: [],
+        },
+      ],
+      deliverable_runs: [
+        {
+          turn_run_id: "owner-run",
+          conversation_id: CID,
+          client_message_id: "client-prompt",
+          user_turn_id: "parser-prompt",
+          started_at: "2026-10-10T00:00:00Z",
+          completed_at: "2026-10-10T00:00:01Z",
+          deliverables: [],
+        },
+      ],
+    }
+    mockGet.mockResolvedValue(latest)
+
+    sync()
+    await vi.advanceTimersByTimeAsync(10_000)
+
+    expect(session()?.localTurns).toEqual([])
+    expect(session()?.detail?.turns.slice(-1)[0]?.id).toBe("remote-reply")
+    expect(mockGet).toHaveBeenCalledTimes(1)
+  })
+
+  it("keeps an unflushed owner final while adding a newer remote tail", async () => {
+    vi.useFakeTimers()
+    const local = assistantTurn(
+      "local-final",
+      "complete local answer still not on disk"
+    )
+    seed({
+      detail: detail([assistantTurn("old", "old")], 20),
+      localTurns: [local],
+      lastTurnOwned: true,
+    })
+    const remote = detail(
+      [
+        userTurn("remote-user", "new request"),
+        assistantTurn("remote-answer", "new reply"),
+      ],
+      60
+    )
+    mockGet.mockResolvedValue(remote)
+
+    sync()
+    await vi.advanceTimersByTimeAsync(10_000)
+
+    expect(session()?.localTurns).toEqual([local])
+    expect(session()?.detail?.turns).toEqual(remote.turns)
+    expect(mockGet).toHaveBeenCalledTimes(5)
+  })
+
+  it("does not converge on a previous complete tail while the new transcript is still flushing", async () => {
+    vi.useFakeTimers()
+    const previous = detail(
+      [userTurn("u1", "old prompt"), assistantTurn("a1", "old final")],
+      20
+    )
+    seed({ detail: previous })
+    const latest = detail(
+      [
+        ...previous.turns,
+        userTurn("u2", "new prompt"),
+        assistantTurn("a2", "new final"),
+      ],
+      60
+    )
+    mockGet
+      .mockResolvedValueOnce(previous)
+      .mockResolvedValueOnce(previous)
+      .mockResolvedValue(latest)
+
+    sync()
+    await vi.advanceTimersByTimeAsync(10_000)
+
+    expect(mockGet).toHaveBeenCalledTimes(3)
+    expect(session()?.detail?.turns.slice(-1)[0]?.id).toBe("a2")
   })
 
   it("no-ops for a delegation-child dialog that adopted its reply (liveOwnsActiveTurn + localTurns)", async () => {
@@ -329,6 +485,33 @@ describe("syncViewerDetail — owner/guard no-ops", () => {
 })
 
 describe("reconcileCompletedTurn — lost stream recovery", () => {
+  it("does not replace a promoted final with a partial bounded page", async () => {
+    vi.useFakeTimers()
+    const user = userTurn("u", "request")
+    const reply = assistantTurn("a", "complete local final")
+    const partial = {
+      ...detail([user, assistantTurn("partial-a", "partial answer")]),
+      history_page: { has_more: true, loaded_turns: 2, page_complete: false },
+    }
+    seed({
+      detail: detail([user]),
+      localTurns: [reply],
+      lastTurnOwned: true,
+      historyAssistantBaseline: 0,
+    })
+    mockGet.mockResolvedValue(partial)
+    const reconciled = vi.fn()
+
+    useConversationRuntimeStore
+      .getState()
+      .actions.reconcileCompletedTurn(CID, CID, "u", reconciled)
+    await vi.advanceTimersByTimeAsync(10_000)
+
+    expect(session()?.localTurns).toEqual([reply])
+    expect(reconciled).not.toHaveBeenCalled()
+    expect(mockGet).toHaveBeenCalledTimes(6)
+  })
+
   it("polls past a trailing user record and folds the persisted final reply", async () => {
     vi.useFakeTimers()
     const stale = detail([userTurn("u", "image + text")])

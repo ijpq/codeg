@@ -2244,13 +2244,9 @@ function connectionsReducer(
         // `plan_approval_resolved` normally; this is the turn-end safety net.
         updated.pendingPlanApproval = null
         updated.steerMessages = []
-        if (action.status === "disconnected" || action.status === "error") {
-          // A terminal transport state has no live turn to resume locally.
-          // The next authoritative restore snapshot will create a new live
-          // message if a real prompt is active; retaining this one binds the UI
-          // forever to a dead connection id.
-          updated.liveMessage = null
-        }
+        // Keep the flushed reply on the connection for history reconciliation.
+        // Terminal transports are mirrored as inactive below, so retaining the
+        // text cannot keep a dead task running in the runtime store.
       }
       next.set(action.contextKey, updated)
       return next
@@ -4216,8 +4212,13 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         const sink = liveMessageSinksRef.current.get(key)
         if (!sink) return
         const nextConn = next.get(key)
-        const nextLiveMessage = nextConn?.liveMessage ?? null
-        if (nextLiveMessage === (prev.get(key)?.liveMessage ?? null)) return
+        const previousConn = prev.get(key)
+        const mirrorMessage = (conn: ConnectionState | undefined) =>
+          conn?.status === "disconnected" || conn?.status === "error"
+            ? null
+            : (conn?.liveMessage ?? null)
+        const nextLiveMessage = mirrorMessage(nextConn)
+        if (nextLiveMessage === mirrorMessage(previousConn)) return
         sink(nextLiveMessage, nextConn?.status === "prompting")
       }
 
@@ -4352,7 +4353,12 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       // arrive to trigger the sink. Without this replay the runtime store, and
       // thus the message list, would stay blank/stale until the next change.
       const conn = storeRef.current.connections.get(contextKey)
-      sink(conn?.liveMessage ?? null, conn?.status === "prompting")
+      sink(
+        conn?.status === "disconnected" || conn?.status === "error"
+          ? null
+          : (conn?.liveMessage ?? null),
+        conn?.status === "prompting"
+      )
       return () => {
         // Idempotent: only drop the entry if it still points at this sink (a
         // remount may have already replaced it).
@@ -5537,7 +5543,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           })
           break
         case "steer_supported":
-          flushStreamingQueue()
+          flushStreamingQueue(contextKey)
           dispatch({
             type: "STEER_SUPPORTED",
             contextKey,
@@ -5545,7 +5551,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           })
           break
         case "steer_message":
-          flushStreamingQueue()
+          flushStreamingQueue(contextKey)
           dispatch({
             type: "STEER_MESSAGE",
             contextKey,
@@ -8403,9 +8409,11 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       ) {
         return null
       }
-      const patch = denormalizeSnapshot(snapshot)
+      const patch = presentSnapshotPatchRef.current(
+        contextKey,
+        denormalizeSnapshot(snapshot)
+      )
       dispatch({ type: "HYDRATE_FROM_SNAPSHOT", contextKey, patch })
-      surfaceSnapshotErrorDetailsRef.current(contextKey, patch)
       lastActivityRef.current.set(contextKey, Date.now())
       return patch.status
     },

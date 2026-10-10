@@ -3561,6 +3561,7 @@
         "showLess": "Weniger anzeigen",
         "resizeWidth": "Ziehen, um die Chat-Breite zu ändern · Doppelklick zum Zurücksetzen",
         "loadEarlierHistory": "Frühere Nachrichten laden",
+        "partialHistory": "Die jüngsten Nachrichten wurden wegen des Leselimits nur teilweise geladen. Sie bleiben gespeichert. Neu laden oder ältere Nachrichten laden, um mehr anzuzeigen.",
         "retryEarlierHistory": "Frühere Nachrichten erneut laden",
         "delivery": {
           "submitting": "Wird gesendet…",

@@ -25,16 +25,23 @@ const NATIVE_FORK_ADAPTER_VERSION: &str = "1.6.2";
 const NATIVE_STEERING_MIN_VERSION: (u64, u64, u64) = (1, 1, 6);
 const PATCH_REVISION: &str = "codeg-steer-v1";
 const NATIVE_FORK_PATCH_REVISION: &str = "codeg-native-thread-fork-citations-terminal-v4";
-const AIR_PATCH_REVISION: &str = "codeg-detached-air-v1";
+const AIR_PATCH_REVISION: &str = "codeg-detached-air-v2";
 
 fn supports_detached_air(version: &str) -> bool {
-    matches!(version, "1.10.0" | "1.11.0")
+    matches!(version, "1.10.0" | "1.11.0" | "2.1.1")
 }
 
 /// Verified against the published bundles, independently of the old fork and
 /// citation patches. Keep all notification/native-subagent cleanup in prompt.
 pub(crate) fn patch_air_bundle(source: &str) -> Result<String, String> {
-    let before = include_str!("codex_air_before.txt");
+    // 2.1.1 reports the native bounded turn diff instead of running an auxiliary
+    // model turn. Its report notification still belongs outside prompt cleanup.
+    let modern = source.contains(include_str!("codex_air_v2_before.txt"));
+    let before = if modern {
+        include_str!("codex_air_v2_before.txt")
+    } else {
+        include_str!("codex_air_before.txt")
+    };
     if source.matches(before).count() != 1 {
         return Err("AIR prompt cleanup anchor must match exactly once".into());
     }
@@ -46,12 +53,19 @@ pub(crate) fn patch_air_bundle(source: &str) -> Result<String, String> {
     if source.matches(cleanup_end).count() != 1 {
         return Err("Codex prompt cleanup end must match exactly once".into());
     }
-    let patched = source.replacen(before, "", 1).replacen(
+    let captured = if modern {
+        include_str!("codex_air_v2_capture.txt")
+    } else {
+        ""
+    };
+    let after = if modern {
+        include_str!("codex_air_v2_after.txt")
+    } else {
+        include_str!("codex_air_after.txt")
+    };
+    let patched = source.replacen(before, captured, 1).replacen(
         cleanup_end,
-        &format!(
-            "      activePrompt.complete();\n{}    }}\n  }}\n",
-            include_str!("codex_air_after.txt")
-        ),
+        &format!("      activePrompt.complete();\n{}    }}\n  }}\n", after),
         1,
     );
     Ok(patched.replacen(observed, &format!(
@@ -648,6 +662,7 @@ mod tests {
         for source in [
             include_str!("fixtures/codex-acp-1.10.0-prompt.json"),
             include_str!("fixtures/codex-acp-1.11.0-prompt.json"),
+            include_str!("fixtures/codex-acp-2.1.1-prompt.json"),
         ] {
             let fixture: serde_json::Value = serde_json::from_str(source).unwrap();
             assert!(supports_detached_air(fixture["version"].as_str().unwrap()));

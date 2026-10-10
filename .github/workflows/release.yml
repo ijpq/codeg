@@ -758,6 +758,58 @@ jobs:
           includeUpdaterJson: false
           retryAttempts: 2
 
+      - name: Install and verify Windows fork Setup, then upload checksum
+        if: runner.os == 'Windows' && github.event.repository.fork == true
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = $env:RELEASE_TAG.TrimStart('v')
+          $built = "src-tauri/target/${{ matrix.target }}/release"
+          $setups = @(Get-ChildItem "$built/bundle/nsis/*_x64-setup.exe")
+          if ($setups.Count -ne 1 -or $setups[0].Name -ne "codeg_${version}_x64-setup.exe") { throw 'Unexpected Setup filename or count' }
+          $setup = $setups[0]
+          $dest = Join-Path $env:RUNNER_TEMP 'codeg-setup-verified'
+          $process = Start-Process $setup.FullName -ArgumentList '/S',"/D=$dest" -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Setup installation failed: $($process.ExitCode)" }
+          python -B scripts/verify-setup-binaries.py $built $dest
+          if ($LASTEXITCODE -ne 0) { throw 'Setup binary verification failed' }
+          $info = (Get-Item (Join-Path $dest 'codeg.exe')).VersionInfo
+          $numeric = ($version -split '-')[0]
+          if ($info.ProductVersion -notin @($version, $numeric, "$numeric.0")) { throw 'Setup executable version mismatch' }
+          $mcpVersion = (& (Join-Path $dest 'codeg-mcp.exe') --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $mcpVersion -ne $version) { throw 'Setup MCP version mismatch' }
+          $files = @()
+          foreach ($name in @('codeg.exe','codeg-mcp.exe','codeg-computer-helper.exe')) {
+            $files += @{ path=$name; sha256=(Get-FileHash (Join-Path $dest $name) -Algorithm SHA256).Hash.ToLower() }
+          }
+          $out = (Resolve-Path out).Path
+          foreach ($file in (Get-ChildItem out -Recurse -File)) {
+            $relative = $file.FullName.Substring($out.Length + 1)
+            $installed = Join-Path $dest "web/$relative"
+            $hash = (Get-FileHash $file.FullName -Algorithm SHA256).Hash.ToLower()
+            if (-not (Test-Path $installed -PathType Leaf) -or (Get-FileHash $installed -Algorithm SHA256).Hash.ToLower() -ne $hash) { throw "Setup static resource mismatch: $relative" }
+            $files += @{ path="web/$relative"; sha256=$hash }
+          }
+          if (-not (Test-Path (Join-Path $dest 'web/index.html') -PathType Leaf)) { throw 'Setup web entry missing' }
+          if (Get-ChildItem $dest -Recurse -File | Where-Object { $_.Name -in @('auth.json','tokens.json','config.toml','.env') -or $_.Extension -in @('.db','.sqlite','.sqlite3','.pdb','.key') }) { throw 'Unexpected data/build files in Setup' }
+          New-Item -ItemType Directory -Force setup-evidence | Out-Null
+          @{ version=$version; commit=$env:GITHUB_SHA; files=$files } | ConvertTo-Json -Depth 5 | Set-Content setup-evidence/payload.json
+          $hash = (Get-FileHash $setup.FullName -Algorithm SHA256).Hash.ToLower()
+          "$hash  $($setup.Name)" | Set-Content -Encoding ascii "$($setup.FullName).sha256"
+          gh release upload $env:RELEASE_TAG "$($setup.FullName).sha256" --repo $env:GITHUB_REPOSITORY
+          if ($LASTEXITCODE -ne 0) { throw 'Setup checksum upload failed' }
+
+      - name: Retain Setup verification manifest
+        if: runner.os == 'Windows' && github.event.repository.fork == true
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-windows-setup-evidence
+          path: setup-evidence/payload.json
+          if-no-files-found: error
+          retention-days: 14
+
       - name: Build and upload unsigned fork bundle (macOS)
         if: contains(matrix.target, 'apple-darwin') && github.event.repository.fork == true
         uses: tauri-apps/tauri-action@v0.6.1
@@ -966,6 +1018,13 @@ jobs:
             throw "codeg-mcp --help output unexpected: $help"
           }
 
+      - name: Start isolated packaged Windows server
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          python -B scripts/smoke-server-package.py "dist/${{ matrix.artifact }}" "$($env:RELEASE_TAG.TrimStart('v'))" --log-dir package-smoke
+          if ($LASTEXITCODE -ne 0) { throw 'Packaged Server startup failed' }
+
       - name: Upload artifact for Docker build (Linux only)
         if: startsWith(matrix.target, 'x86_64-unknown-linux') || startsWith(matrix.target, 'aarch64-unknown-linux')
         uses: actions/upload-artifact@v4
@@ -1139,12 +1198,46 @@ jobs:
             fi
           done
 
+  verify-draft-assets:
+    needs: [create-draft-release, build-tauri, upload-server-assets]
+    if: >-
+      always() && github.event_name == 'push' &&
+      github.event.repository.fork == true && github.ref_name != 'v0.30.7-fix1' &&
+      needs.create-draft-release.result == 'success' &&
+      needs.build-tauri.result == 'success' && needs.upload-server-assets.result == 'success'
+    name: Verify downloaded Windows assets before publishing
+    runs-on: windows-2022
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-windows-setup-evidence
+          path: setup-evidence
+      - name: Download, verify, install, and start packages
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ./scripts/verify-windows-release.ps1 -ReleaseTag $env:RELEASE_TAG -Repository $env:GITHUB_REPOSITORY -Destination "$env:RUNNER_TEMP/draft-verification" -SetupManifest setup-evidence/payload.json
+      - name: Retain package diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-draft-verification
+          path: ${{ runner.temp }}/draft-verification/**/verification.json
+          if-no-files-found: warn
+          retention-days: 14
+
   publish-release:
     needs:
       - create-draft-release
       - build-tauri
       - build-server
       - upload-server-assets
+      - verify-draft-assets
     if: >-
       always() &&
       github.event_name == 'push' &&
@@ -1152,7 +1245,9 @@ jobs:
       (needs.build-tauri.result == 'success' ||
        (github.ref_name == 'v0.30.7-fix1' && needs.build-tauri.result == 'skipped')) &&
       needs.build-server.result == 'success' &&
-      needs.upload-server-assets.result == 'success'
+      needs.upload-server-assets.result == 'success' &&
+      (needs.verify-draft-assets.result == 'success' ||
+       github.ref_name == 'v0.30.7-fix1' || github.event.repository.fork == false)
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -1179,10 +1274,14 @@ jobs:
             | grep -Fqx 'codeg-server-windows-x64.zip.sha256'
 
           setup_count=0
+          setup_checksum_count=0
           for asset in "${remote_assets[@]}"; do
             case "$asset" in
               codeg_*_x64-setup.exe)
                 setup_count=$((setup_count + 1))
+                ;;
+              codeg_*_x64-setup.exe.sha256)
+                setup_checksum_count=$((setup_checksum_count + 1))
                 ;;
               codeg-server-windows-x64.zip|codeg-server-windows-x64.zip.sha256)
                 ;;
@@ -1194,12 +1293,13 @@ jobs:
           done
 
           expected_setup=1
-          expected_count=3
+          expected_count=4
           if [ "$RELEASE_TAG" = "v0.30.7-fix1" ]; then
             expected_setup=0
             expected_count=2
           fi
           if [ "$setup_count" -ne "$expected_setup" ] || \
+             [ "$setup_checksum_count" -ne "$expected_setup" ] || \
              [ "${#remote_assets[@]}" -ne "$expected_count" ]; then
             echo "Expected $expected_setup setup and two Windows Server files"
             exit 1
@@ -1300,3 +1400,35 @@ jobs:
           if ($LASTEXITCODE -ne 0 -or $help -notlike "*codeg-mcp --parent-connection-id*") {
             throw "Packaged codeg-mcp executable did not return the expected help text"
           }
+
+  verify-published-assets:
+    needs: publish-release
+    if: >-
+      always() && github.event_name == 'push' &&
+      github.event.repository.fork == true && github.ref_name != 'v0.30.7-fix1' &&
+      needs.publish-release.result == 'success'
+    name: Verify published Windows release
+    runs-on: windows-2022
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-windows-setup-evidence
+          path: setup-evidence
+      - name: Verify official assets after publication
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ./scripts/verify-windows-release.ps1 -ReleaseTag $env:RELEASE_TAG -Repository $env:GITHUB_REPOSITORY -Destination "$env:RUNNER_TEMP/published-verification" -SetupManifest setup-evidence/payload.json -RequirePublished
+      - name: Retain published verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-published-verification
+          path: ${{ runner.temp }}/published-verification/**/verification.json
+          if-no-files-found: warn
+          retention-days: 14
