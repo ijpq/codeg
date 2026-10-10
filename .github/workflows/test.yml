@@ -108,6 +108,20 @@ jobs:
         with:
           components: clippy
 
+      # The standard ARM macOS runner has 7 GB RAM. The workspace library
+      # and its test binary otherwise compile at the same time, each using
+      # several GB. Keep the exact test/clippy scope while reducing compiler
+      # concurrency and debug-info generation; test threads are unchanged.
+      - name: Fit macOS Rust compilation within runner memory
+        if: matrix.os == 'macos-latest'
+        shell: bash
+        run: |
+          {
+            echo "CARGO_BUILD_JOBS=1"
+            echo "CARGO_PROFILE_DEV_DEBUG=0"
+            echo "CARGO_PROFILE_TEST_DEBUG=0"
+          } >> "$GITHUB_ENV"
+
       - name: Rust cache
         uses: swatinem/rust-cache@v2
         with:
