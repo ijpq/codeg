@@ -3382,7 +3382,7 @@ export interface AcpActionsValue {
   /**
    * Release a connection whose SURFACE went away on its own (a preview tab
    * replaced by the next single-click in the sidebar) — never a user-intent
-   * teardown. Disconnects viewers and idle owners; a busy owner (prompting
+   * teardown. Detaches viewers and idle owners; a busy owner (prompting
    * turn, or unresolved background tasks) is left running for the idle sweep,
    * because `acpDisconnect` kills the agent CLI mid-turn and the agent records
    * that as an interrupted request. Use `disconnect` when the user asked to
@@ -7903,9 +7903,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   )
 
   // Lifecycle release for a preview surface replaced by the next single-click
-  // in the sidebar. Idle owners can be reclaimed immediately; busy owners stay
-  // alive. Ordinary component unmount uses `releaseSurface` above, which is
-  // intentionally even more conservative because its local status may be
+  // in the sidebar. Idle owners remain warm on the server; busy owners stay
+  // attached. Page navigation must not turn the next visit into a cold resume.
+  // Ordinary component unmount uses `releaseSurface` above, which is more
+  // conservative because its local status may be
   // stale when a WebSocket/React lifecycle transition caused the unmount.
   const disconnectIfIdle = useCallback(
     async (contextKey: string) => {
@@ -7914,9 +7915,9 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       // acpDisconnects), and leaving one attached would leak its subscription
       // — the idle sweep skips viewers.
       if (conn && !conn.isViewer && isConnectionBusy(conn)) return
-      await disconnect(contextKey)
+      await releaseSurface(contextKey)
     },
-    [disconnect]
+    [releaseSurface]
   )
 
   const reapplyConfig = useCallback(

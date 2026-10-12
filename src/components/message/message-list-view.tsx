@@ -1649,10 +1649,10 @@ export function MessageListView({
   const messageThreadResize = !chatAnimations
     ? "instant"
     : resolveMessageThreadResizeBehavior(
-    isActive,
-    detailLoading,
-    timelineTurns.length > 0
-  )
+        isActive,
+        detailLoading,
+        timelineTurns.length > 0
+      )
 
   const adapterText = useMemo(
     () => ({

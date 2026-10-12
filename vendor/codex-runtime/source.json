@@ -1,0 +1,11 @@
+{
+  "repository": "https://github.com/openai/codex.git",
+  "tag": "rust-v0.162.1",
+  "commit": "092d3acd6bec3e3a14bdc7e7a2810ab628ab759d",
+  "upstream_version": "0.162.1",
+  "version": "0.162.1-codeg.1",
+  "rust_toolchain": "1.95.0",
+  "patch": "checkpoint-resume.patch",
+  "patch_sha256": "68e54e23068b9d904800663ebcadb5bd63a822e6c84a1b4922ae00c530859362",
+  "scan_limit_bytes": 67108864
+}

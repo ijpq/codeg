@@ -183,3 +183,67 @@ jobs:
             echo "::error::Web handlers must call commands/*_core, not services directly."
             exit 1
           fi
+
+  codex-recovery:
+    name: Codex recovery on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-2022]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_TARGET_DIR: ${{ runner.temp }}/codeg-codex-target
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: clippy
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install native build prerequisites
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev libcap-dev pkg-config cmake clang strace
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install isolated reference CLI
+        run: npm install --prefix "$RUNNER_TEMP/codeg-codex-reference" --ignore-scripts --no-audit --no-fund @openai/codex@0.162.1
+      - name: Test and build pinned recovery runtime
+        run: python -B scripts/build-codex-runtime.py --source-dir "$RUNNER_TEMP/codeg-codex-source" --output-dir "$RUNNER_TEMP/codeg-codex-runtime"
+      - name: Verify model context, tools, images, restart and invalidation
+        run: |
+          python - <<'PY'
+          import os, subprocess, sys
+          from pathlib import Path
+          scratch=Path(os.environ['RUNNER_TEMP'])
+          suffix='.exe' if os.name=='nt' else ''
+          reference=next((scratch/'codeg-codex-reference/node_modules/@openai').rglob('codex'+suffix))
+          subprocess.run([sys.executable,'-B','scripts/test-codex-resume.py',
+            '--cli',str(scratch/'codeg-codex-runtime'/('codex'+suffix)),
+            '--baseline-cli',str(reference),'--output',str(scratch/'codeg-codex-evidence'),
+            '--size-mib','64','--trace'],check=True)
+          PY
+      - name: Verify one full read for old checkpoint fallback
+        if: runner.os == 'Linux'
+        run: python3 -B scripts/test-codex-resume.py --cli "$RUNNER_TEMP/codeg-codex-runtime/codex" --output "$RUNNER_TEMP/codeg-codex-evidence/legacy" --size-mib 64 --checkpoint-mode legacy --trace
+      - name: Verify current and newer ACP adapters on the pinned runtime
+        if: runner.os == 'Linux'
+        run: |
+          npm install --prefix "$RUNNER_TEMP/codeg-acp-211" --ignore-scripts --no-audit --no-fund @agentclientprotocol/codex-acp@2.1.1
+          npm install --prefix "$RUNNER_TEMP/codeg-acp-222" --ignore-scripts --no-audit --no-fund @agentclientprotocol/codex-acp@2.2.2
+          python3 -B scripts/diagnose-codex-resume-layers.py --cli "$RUNNER_TEMP/codeg-codex-runtime/codex" --acp "$RUNNER_TEMP/codeg-acp-211/node_modules/.bin/codex-acp" --output "$RUNNER_TEMP/codeg-codex-evidence/acp-211" --size-mib 64 --fast --verify-prompt
+          python3 -B scripts/diagnose-codex-resume-layers.py --cli "$RUNNER_TEMP/codeg-codex-runtime/codex" --acp "$RUNNER_TEMP/codeg-acp-222/node_modules/.bin/codex-acp" --output "$RUNNER_TEMP/codeg-codex-evidence/acp-222" --size-mib 64 --fast --verify-prompt
+      - name: Retain recovery diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-recovery-evidence-${{ runner.os }}
+          path: ${{ runner.temp }}/codeg-codex-evidence
+          if-no-files-found: warn

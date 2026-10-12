@@ -5,3 +5,5 @@
 src-tauri/genui/** text eol=lf
 # ACP patches match the published npm bundle byte-for-byte, including newlines.
 src-tauri/src/acp/codex_air_*.txt text eol=lf
+# The pinned native CLI patch SHA256 must survive Windows checkout unchanged.
+vendor/codex-runtime/checkpoint-resume.patch text eol=lf

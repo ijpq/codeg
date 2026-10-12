@@ -207,7 +207,7 @@ describe("ConversationDetailPanel new conversation layout", () => {
   it("loads persisted history only for visible keep-alive tabs", () => {
     expect(source).toContain("shouldLoadDetail={visible}")
     expect(source).toContain(
-      "useConversationDetail(effectiveConversationId, {\n    enabled: shouldLoadDetail,"
+      "useConversationDetail(effectiveConversationId, {\n    enabled: shouldLoadDetail || isActive || heldDetail,"
     )
     expect(source).toContain(
       "preserveLiveOnInitialFetch: usesPersistedDetailIdentity"

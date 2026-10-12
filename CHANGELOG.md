@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.35.1-fix1 — 2026-10-12
+
+- Rebase the custom fork onto the latest published upstream v0.35.1 commit.
+- Retain ready server connections when a sidebar preview is replaced, avoiding
+  unnecessary cold Codex recovery while preserving explicit disconnect/cancel.
+- Ship a pinned private Codex 0.162.1 runtime in Windows Server ZIP. Recover
+  eligible legacy histories from a validated native checkpoint and its suffix;
+  preserve the original session, context, tools, images and complete history.
+- Revalidate and reuse history inside a single resume request after asynchronous
+  configuration loading; carry revisions into the native writer lock to avoid
+  duplicate full reads, including when old checkpoints require full fallback.
+- Fall back safely for ambiguous runtime/settings/turn state, corrupt/oversized
+  tails, missing checkpoints, append/replacement and unavailable file identity.
+- Add real CLI/ACP/CodeG stage diagnostics and protocol/context regressions;
+  require the pinned runtime in independent Windows release verification.
+- Preserve bounded recent-history paging, lifecycle generations, nonblocking AIR,
+  native forks, MCP and other existing custom fixes across the upstream rebase.
+
+See [release notes](docs/releases/v0.35.1-fix1.md) and
+[recovery diagnosis](docs/codex-long-session-resume.md) for evidence and limits.
+
 ## 0.34.0-fix2 — 2026-10-10
 
 - Resolve draft releases with the draft-aware GitHub CLI and push-scoped

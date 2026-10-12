@@ -11369,6 +11369,9 @@ async fn build_runtime_env_for_agent(
     let local_config_json = load_agent_local_config_json(agent_type);
     let mut runtime_env =
         build_runtime_env_from_setting(agent_type, setting.as_ref(), local_config_json.as_deref());
+    if agent_type == AgentType::Codex {
+        crate::acp::codex_runtime::apply(&mut runtime_env);
+    }
     apply_model_provider_env(agent_type, setting.as_ref(), &mut runtime_env, &db.conn).await;
     // `apply_model_provider_env` writes this agent's generic credential trio —
     // for cline that is `CLINE_BASE_URL`/`CLINE_API_KEY`/`CLINE_MODEL` — so a

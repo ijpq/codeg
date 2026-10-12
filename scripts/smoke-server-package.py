@@ -17,6 +17,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("root", type=Path)
     parser.add_argument("version")
+    parser.add_argument("--require-runtime", action="store_true")
     parser.add_argument("--log-dir", type=Path, required=True)
     args = parser.parse_args()
     root = args.root.resolve(strict=True)
@@ -37,6 +38,51 @@ def main():
         version = subprocess.check_output([str(binary), "--version"], text=True).strip()
         if version != args.version:
             raise RuntimeError(f"{binary.name} version {version!r} differs from {args.version!r}")
+
+    runtime = root / "runtime" / ("codex" + suffix)
+    if args.require_runtime and not runtime.is_file():
+        raise RuntimeError("The release is missing its pinned Codex recovery runtime")
+    if runtime.is_file():
+        manifest = json.loads((runtime.parent / "source.json").read_text())
+        if args.require_runtime:
+            pinned = Path(__file__).resolve().parents[1] / "vendor/codex-runtime/source.json"
+            if manifest != json.loads(pinned.read_text()):
+                raise RuntimeError("Private Codex runtime source differs from the release pin")
+        version = subprocess.check_output([str(runtime), "--version"], text=True).strip()
+        if version != "codex-cli " + manifest["version"]:
+            raise RuntimeError(f"Private Codex runtime version mismatch: {version}")
+        import hashlib
+        actual = hashlib.sha256(runtime.read_bytes()).hexdigest()
+        expected = (runtime.parent / "codex.sha256").read_text().split()[0]
+        if actual != expected:
+            raise RuntimeError("Private Codex runtime checksum mismatch")
+        if args.require_runtime and os.name == "nt":
+            required = {"codex.exe", "codex-code-mode-host.exe",
+                        "codex-resources/codex-command-runner.exe",
+                        "codex-resources/codex-windows-sandbox-setup.exe", "codex-path/rg.exe"}
+            entries = {}
+            for line in (runtime.parent / "runtime.sha256").read_text().splitlines():
+                digest, name = line.split(maxsplit=1)
+                if name in entries:
+                    raise RuntimeError("Duplicate private runtime checksum entry")
+                entries[name] = digest
+            if set(entries) != required:
+                raise RuntimeError("Private runtime helpers are missing or unexpected")
+            for name, digest in entries.items():
+                binary = (runtime.parent / name).resolve(strict=True)
+                if not binary.is_relative_to(runtime.parent.resolve()):
+                    raise RuntimeError("Private runtime checksum escaped its directory")
+                if hashlib.sha256(binary.read_bytes()).hexdigest() != digest:
+                    raise RuntimeError("Private runtime helper checksum mismatch: " + name)
+            layout = json.loads((runtime.parent / "codex-package.json").read_text())
+            if layout != {"layoutVersion": 1, "version": manifest["version"],
+                          "target": "x86_64-pc-windows-msvc", "variant": "codex",
+                          "entrypoint": "codex.exe", "resourcesDir": "codex-resources",
+                          "pathDir": "codex-path"}:
+                raise RuntimeError("Private runtime package layout mismatch")
+            rg_version = subprocess.check_output([str(runtime.parent / "codex-path/rg.exe"), "--version"], text=True)
+            if not rg_version.startswith("ripgrep "):
+                raise RuntimeError("Packaged ripgrep could not run")
 
     with socket.socket() as reservation:
         reservation.bind(("127.0.0.1", 0))

@@ -315,7 +315,6 @@ const ConversationTabView = memo(function ConversationTabView({
   showActiveFlow,
   reloadSignal,
   groupId,
-  isVisible,
 }: ConversationTabViewProps) {
   const t = useTranslations("Folder.conversation")
   // Composer-namespace copy for the queue row's click-to-insert outcomes
@@ -661,7 +660,7 @@ const ConversationTabView = memo(function ConversationTabView({
     earlierHistoryError,
     loadEarlierHistory,
   } = useConversationDetail(effectiveConversationId, {
-    enabled: shouldLoadDetail || heldDetail,
+    enabled: shouldLoadDetail || isActive || heldDetail,
     // The DB detail owns the external session identity used by historical ACP
     // restore. Do not let existing optimistic/live runtime data suppress this
     // first read; retain those buffers while the detail is folded in.
@@ -3558,8 +3557,8 @@ export function ConversationDetailPanel() {
 
   const exportLabels = useExportLabels()
 
-  // Release the old connection as soon as a preview tab is replaced (the next
-  // single-click in the sidebar takes its slot) instead of waiting for a sweep.
+  // Detach a replaced preview surface while keeping its server connection warm.
+  // A subsequent visit can attach without replaying a multi-GB Codex rollout.
   // Idle-gated on purpose: the replaced tab may hold a session that is still
   // working — often one the user only clicked in to watch — and disconnecting
   // an owner mid-turn kills the agent CLI, which lands in the transcript as an

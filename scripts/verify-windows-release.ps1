@@ -36,7 +36,7 @@ $root = Join-Path $expanded 'codeg-server-windows-x64'
 foreach ($name in @('codeg-server.exe','codeg-mcp.exe','codeg-computer-helper.exe','web/index.html')) {
   if (-not (Test-Path (Join-Path $root $name) -PathType Leaf)) { throw "Server package missing $name" }
 }
-python -B scripts/smoke-server-package.py $root $version --log-dir (Join-Path $Destination 'server-smoke')
+python -B scripts/smoke-server-package.py $root $version --require-runtime --log-dir (Join-Path $Destination 'server-smoke')
 if ($LASTEXITCODE -ne 0) { throw 'Downloaded Server ZIP startup failed' }
 $installed = Join-Path $Destination 'installed'
 $process = Start-Process (Join-Path $Destination $setupName) -ArgumentList '/S',"/D=$installed" -Wait -PassThru

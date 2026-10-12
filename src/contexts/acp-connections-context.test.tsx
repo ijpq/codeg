@@ -834,7 +834,7 @@ describe("AcpConnectionsProvider preview-tab release (disconnectIfIdle)", () => 
     expect(h.acpDisconnect).not.toHaveBeenCalled()
   })
 
-  it("disconnects an IDLE owner right away (the reclaim this release exists for)", async () => {
+  it("detaches an idle preview and preserves its ready server process", async () => {
     const handlers = await connectOwner()
     emitAcpEvent(handlers, {
       seq: 1,
@@ -847,8 +847,41 @@ describe("AcpConnectionsProvider preview-tab release (disconnectIfIdle)", () => 
       await h.actions!.disconnectIfIdle(TAB)
     })
 
-    expect(h.acpDisconnect).toHaveBeenCalledWith("spawned-conn")
+    expect(h.acpDisconnect).not.toHaveBeenCalled()
     expect(h.store!.getConnection(TAB)).toBeUndefined()
+  })
+
+  it("reopens a replaced preview on the same ready server connection", async () => {
+    await connectOwner()
+    await act(async () => {
+      await h.actions!.disconnectIfIdle(TAB)
+    })
+    h.acpFindConnectionForConversation.mockResolvedValue({
+      connection_id: "spawned-conn",
+      event_seq: 0,
+    })
+    h.acpGetSessionSnapshot.mockResolvedValue({
+      connection_id: "spawned-conn",
+      session_id: "sess-1",
+      event_seq: 0,
+    })
+    h.denormalizeSnapshot.mockReturnValue({
+      ...snapshotBase(),
+      sessionId: "sess-1",
+      selectorsReady: true,
+    })
+    await act(async () => {
+      await h.actions!.connect(TAB, "claude_code", "/tmp/x", "sess-1", 42)
+    })
+    hydrateSnapshot(latestAttachHandlers(), {
+      connection_id: "spawned-conn",
+      external_id: "sess-1",
+      event_seq: 0,
+    } as unknown as LiveSessionSnapshot)
+    expect(h.acpDisconnect).not.toHaveBeenCalled()
+    expect(h.acpConnect).toHaveBeenCalledTimes(1)
+    expect(h.store!.getConnection(TAB)?.connectionId).toBe("spawned-conn")
+    expect(h.store!.getConnection(TAB)?.sessionId).toBe("sess-1")
   })
 
   it("detaches a mid-turn VIEWER without killing the owner's agent", async () => {

@@ -351,6 +351,7 @@ fn visible_entries(turns: &[MessageTurn]) -> Vec<VisibleEntry> {
                 // Deliberately exclude hidden reasoning and raw tool traffic.
                 ContentBlock::Thinking { .. }
                 | ContentBlock::ToolResult { .. }
+                | ContentBlock::TurnError { .. }
                 | ContentBlock::ImageGeneration { image: None, .. } => {}
                 ContentBlock::Text { .. } => {}
             }

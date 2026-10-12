@@ -2363,7 +2363,7 @@ function MarkdownText({
           mode={isStreaming ? "streaming" : "static"}
           parseIncompleteMarkdown={isStreaming}
         >
-          {renderedText}
+          {text}
         </MessageResponse>
       </JsonRenderScope>
     </div>

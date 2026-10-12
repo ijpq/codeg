@@ -121,6 +121,12 @@ vi.mock("@/hooks/use-is-coarse-pointer", () => ({
   useIsCoarsePointer: () => false,
 }))
 
+vi.mock("@/contexts/workspace-context", () => ({
+  useWorkspaceView: () => ({ mode: "fusion", conversationMaximized: false }),
+  useWorkspaceActions: () => ({ toggleConversationMaximized: vi.fn() }),
+}))
+vi.mock("@/hooks/use-mobile", () => ({ useIsMobile: () => false }))
+
 import { TabBar } from "./tab-bar"
 
 function tab(id: string, conversationId: number) {

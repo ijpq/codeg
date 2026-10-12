@@ -12,6 +12,7 @@ pub mod codex_context;
 pub mod codex_goal;
 pub mod codex_model_catalog;
 pub mod computer_tools;
+pub(crate) mod codex_runtime;
 pub mod codex_steer_adapter;
 pub mod connection;
 pub mod cursor_acp_retry_compat;

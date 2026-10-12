@@ -346,7 +346,9 @@ export function ConversationShell({
           )}
 
           {!hideInput && feedbackList && (
-            <div className="mx-auto w-full chat-content-w px-4">{feedbackList}</div>
+            <div className="mx-auto w-full chat-content-w px-4">
+              {feedbackList}
+            </div>
           )}
 
           {!hideInput && (

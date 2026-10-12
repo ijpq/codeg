@@ -151,7 +151,13 @@ export function useConversationDetail(
       return
     }
     fetchDetail(conversationId)
-  }, [fetchPending, conversationId, fetchDetail, preserveLiveOnInitialFetch, refetchDetail])
+  }, [
+    fetchPending,
+    conversationId,
+    fetchDetail,
+    preserveLiveOnInitialFetch,
+    refetchDetail,
+  ])
 
   // Automatic retries spent on the current run of failures. A loaded detail or
   // another conversation starts a new run. A hidden view's pending retry is
@@ -177,7 +183,13 @@ export function useConversationDetail(
       }
     }, delay)
     return () => clearTimeout(timer)
-  }, [retryPending, conversationId, fetchDetail, preserveLiveOnInitialFetch, refetchDetail])
+  }, [
+    retryPending,
+    conversationId,
+    fetchDetail,
+    preserveLiveOnInitialFetch,
+    refetchDetail,
+  ])
 
   return {
     detail,

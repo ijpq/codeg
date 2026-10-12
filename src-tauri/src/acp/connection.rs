@@ -35697,6 +35697,7 @@ mod tests {
                             Arc::new(TerminalRuntime::with_base_env(BTreeMap::new())),
                             "/tmp",
                             false,
+                            None,
                             &ledger,
                             None,
                             &stderr_tail,
@@ -35742,6 +35743,7 @@ mod tests {
                         text: prompt.into(),
                     }],
                     user_message: None,
+                    agent_file_change_report_request_id: None,
                 })
                 .await
                 .expect("the loop is running");

@@ -944,6 +944,16 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm build
 
+      - name: Build pinned Codex recovery runtime
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        env:
+          CARGO_BUILD_JOBS: 2
+          CARGO_TARGET_DIR: ${{ runner.temp }}/codeg-codex-target
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --component clippy
+          python -B scripts/build-codex-runtime.py --source-dir "$env:RUNNER_TEMP/codeg-codex-source" --output-dir "dist/codex-runtime"
+
       - name: Build server + codeg-mcp companion + computer-use helper
         working-directory: src-tauri
         # `codeg-mcp` is the stdio MCP companion the runtime injects per
@@ -977,6 +987,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist/${{ matrix.artifact }}
           Copy-Item src-tauri/target/${{ matrix.target }}/release/codeg-server.exe dist/${{ matrix.artifact }}/
           Copy-Item src-tauri/target/${{ matrix.target }}/release/codeg-mcp.exe dist/${{ matrix.artifact }}/
+          Copy-Item -Recurse dist/codex-runtime "dist/${{ matrix.artifact }}/runtime"
           Copy-Item src-tauri/target/${{ matrix.target }}/release/codeg-computer-helper.exe dist/${{ matrix.artifact }}/
           Copy-Item -Recurse out dist/${{ matrix.artifact }}/web
           Compress-Archive -Path dist/${{ matrix.artifact }} -DestinationPath dist/${{ matrix.artifact }}.zip
@@ -1021,7 +1032,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          python -B scripts/smoke-server-package.py "dist/${{ matrix.artifact }}" "$($env:RELEASE_TAG.TrimStart('v'))" --log-dir package-smoke
+          python -B scripts/smoke-server-package.py "dist/${{ matrix.artifact }}" "$($env:RELEASE_TAG.TrimStart('v'))" --require-runtime --log-dir package-smoke
           if ($LASTEXITCODE -ne 0) { throw 'Packaged Server startup failed' }
 
       - name: Upload artifact for Docker build (Linux only)
