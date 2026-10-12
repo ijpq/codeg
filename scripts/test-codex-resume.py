@@ -306,7 +306,7 @@ def main():
                     with sqlite3.connect(database) as db:
                         db.execute('UPDATE threads SET rollout_path=? WHERE id=?',(str(case_path),tid))
                 result=measure(cli,case_home,case_path,tid,workspace,root,mode+'-'+label,fast,args.trace,prompt=True)
-                context=json.loads(json.dumps(provider.requests[-1]['input']).replace(str(case_home),'<ISOLATED_CODEX_HOME>'))
+                context=normalize_fixture_home(provider.requests[-1]['input'], case_home)
                 for message in context:
                     if message.get('type')=='message':message.pop('id',None)
                 if mode=='checkpoint-turn-not-closed' and fast and args.trace and os.name!='nt':
