@@ -2269,6 +2269,200 @@ index ad241a4..883ffad 100644
 +        );
 +    }
 +}
+diff --git a/codex-rs/thread-store/src/local/legacy_checkpoint.rs b/codex-rs/thread-store/src/local/legacy_checkpoint.rs
+new file mode 100644
+index 0000000..9843240
+--- /dev/null
++++ b/codex-rs/thread-store/src/local/legacy_checkpoint.rs
+@@ -0,0 +1,188 @@
++//! Opt-in resume of legacy files at a native, state-complete compaction.
++//! Never used for UI history. No cache or original file is written here.
++use codex_protocol::protocol::{EventMsg, SessionMetaLine};
++use codex_rollout::{ReverseJsonlScanner, RolloutItem, ScanOutcome};
++use std::fs::File;
++use std::io::{self, Read, Seek, SeekFrom};
++use std::path::Path;
++
++const SCAN_LIMIT: u64 = 64 * 1024 * 1024;
++
++struct BudgetedFile {
++    file: File,
++    remaining: u64,
++}
++impl Read for BudgetedFile {
++    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
++        if self.remaining == 0 {
++            return Err(io::Error::other("checkpoint scan budget exhausted"));
++        }
++        let limit = bytes.len().min(self.remaining as usize);
++        let read = self.file.read(&mut bytes[..limit])?;
++        self.remaining -= read as u64;
++        Ok(read)
++    }
++}
++impl Seek for BudgetedFile {
++    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
++        self.file.seek(pos)
++    }
++}
++
++pub(super) fn try_load(path: &Path, meta: SessionMetaLine) -> io::Result<Option<Vec<RolloutItem>>> {
++    let reader = BudgetedFile {
++        file: File::open(path)?,
++        remaining: SCAN_LIMIT,
++    };
++    let mut scanner = ReverseJsonlScanner::new(reader)?;
++    let mut newest_first = Vec::new();
++    let mut companion_context = false;
++    let mut companion_world = false;
++    while let Some(line) = scanner.scan_next_rollout_line()? {
++        let ScanOutcome::Parsed(line) = line else {
++            return Ok(None);
++        };
++        match &line.item {
++            // Rollback may refer to an older turn. Let canonical full replay decide.
++            RolloutItem::EventMsg(EventMsg::ThreadRolledBack(_)) => return Ok(None),
++            RolloutItem::SessionMeta(_) => return Ok(None),
++            RolloutItem::TurnContext(_) => companion_context = true,
++            RolloutItem::WorldState(world) if world.full => companion_world = true,
++            RolloutItem::Compacted(compacted) => {
++                // Only the newest compaction is eligible. In particular an old summary
++                // cannot reconstruct window, attribution or previous-turn settings.
++                if compacted.replacement_history.is_none()
++                    || compacted.window_number.is_none()
++                    || compacted.resume_metadata.is_none()
++                    || !companion_context
++                    || !companion_world
++                {
++                    return Ok(None);
++                }
++                newest_first.push(line.item);
++                newest_first.push(RolloutItem::SessionMeta(meta));
++                newest_first.reverse();
++                tracing::info!(
++                    items = newest_first.len(),
++                    "CodeG legacy resume: validated native checkpoint"
++                );
++                return Ok(Some(newest_first));
++            }
++            _ => {}
++        }
++        newest_first.push(line.item);
++    }
++    Ok(None)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use codex_rollout::RolloutLine;
++    use std::io::Write;
++    fn fixture(
++        checkpoint: serde_json::Value,
++        tail: &[serde_json::Value],
++    ) -> (tempfile::NamedTempFile, SessionMetaLine) {
++        let mut file = tempfile::NamedTempFile::new().unwrap();
++        let meta: RolloutLine = codex_rollout::parse_rollout_line(
++            &serde_json::json!({
++                "timestamp":"2026-10-12T00:00:00Z","type":"session_meta", "payload": {
++                    "id":"12345678-1234-1234-1234-123456789012", "timestamp":"2026-10-12T00:00:00Z",
++                    "cwd":std::env::temp_dir(),"originator":"test","cli_version":"0.162.1","source":"cli"
++                }
++            })
++            .to_string(),
++        )
++        .unwrap();
++        writeln!(file, "{}", serde_json::to_string(&meta).unwrap()).unwrap();
++        for payload in std::iter::once(&checkpoint).chain(tail.iter()) {
++            writeln!(file, "{}", payload).unwrap();
++        }
++        let RolloutItem::SessionMeta(meta) = meta.item else {
++            panic!("meta");
++        };
++        (file, meta)
++    }
++    fn cp() -> serde_json::Value {
++        serde_json::json!({"timestamp":"2026-10-12T00:00:00Z","type":"compacted","payload":{
++            "message":"summary","replacement_history":[],"window_number":1,"resume_metadata":{}
++        }})
++    }
++    fn companions() -> Vec<serde_json::Value> {
++        vec![
++            serde_json::json!({"timestamp":"2026-10-12T00:00:00Z","type":"world_state","payload":{"full":true,"state":{}}}),
++            serde_json::json!({"timestamp":"2026-10-12T00:00:00Z","type":"turn_context","payload":{
++                "cwd":std::env::temp_dir(),"approval_policy":"never","sandbox_policy":{"type":"read-only"},
++                "model":"gpt-6-astra","summary":"auto"
++            }}),
++        ]
++    }
++    #[test]
++    fn complete_native_checkpoint_preserves_identity_and_order() {
++        let (file, meta) = fixture(cp(), &companions());
++        let id = meta.meta.id;
++        let items = try_load(file.path(), meta).unwrap().expect("checkpoint");
++        assert!(matches!(&items[0], RolloutItem::SessionMeta(meta) if meta.meta.id==id));
++        assert!(matches!(&items[1], RolloutItem::Compacted(_)));
++        assert!(matches!(&items[2], RolloutItem::WorldState(_)));
++        assert!(matches!(&items[3], RolloutItem::TurnContext(_)));
++    }
++    #[test]
++    fn legacy_summary_never_bounds_replay() {
++        let mut checkpoint = cp();
++        checkpoint["payload"]
++            .as_object_mut()
++            .unwrap()
++            .remove("resume_metadata");
++        let (file, meta) = fixture(checkpoint, &companions());
++        assert!(try_load(file.path(), meta).unwrap().is_none());
++    }
++    #[test]
++    fn incomplete_companions_fall_back() {
++        let (file, meta) = fixture(cp(), &[]);
++        assert!(try_load(file.path(), meta).unwrap().is_none());
++    }
++    #[test]
++    fn malformed_tail_falls_back() {
++        let (mut file, meta) = fixture(cp(), &companions());
++        writeln!(file, "{{broken").unwrap();
++        assert!(try_load(file.path(), meta).unwrap().is_none());
++    }
++
++    #[test]
++    fn rollback_suffix_never_uses_an_older_checkpoint() {
++        let mut tail = companions();
++        tail.push(
++            serde_json::json!({"timestamp":"2026-10-12T00:00:00Z","type":"event_msg",
++            "payload":{"type":"thread_rolled_back","num_turns":1}}),
++        );
++        let (file, meta) = fixture(cp(), &tail);
++        assert!(try_load(file.path(), meta).unwrap().is_none());
++    }
++    #[test]
++    fn newest_incomplete_checkpoint_never_reuses_an_older_one() {
++        let mut tail = companions();
++        let mut incomplete = cp();
++        incomplete["payload"]
++            .as_object_mut()
++            .unwrap()
++            .remove("resume_metadata");
++        tail.push(incomplete);
++        tail.extend(companions());
++        let (file, meta) = fixture(cp(), &tail);
++        assert!(try_load(file.path(), meta).unwrap().is_none());
++    }
++    #[test]
++    fn probe_has_strict_byte_budget() {
++        let fixture = tempfile::NamedTempFile::new().unwrap();
++        std::fs::write(fixture.path(), b"bounded bytes").unwrap();
++        let mut reader = BudgetedFile {
++            file: File::open(fixture.path()).unwrap(),
++            remaining: 3,
++        };
++        let mut bytes = [0; 20];
++        assert_eq!(reader.read(&mut bytes).unwrap(), 3);
++        assert!(reader.read(&mut bytes).is_err());
++    }
++}
 diff --git a/codex-rs/thread-store/src/local/live_writer.rs b/codex-rs/thread-store/src/local/live_writer.rs
 index e1b49e8..37682f2 100644
 --- a/codex-rs/thread-store/src/local/live_writer.rs
@@ -2519,197 +2713,3 @@ index 1dd5b4e..8ff8dc0 100644
      /// Thread id represented by the model context.
      pub thread_id: ThreadId,
      /// Persisted rollout items in replay order.
-diff --git a/codex-rs/thread-store/src/local/legacy_checkpoint.rs b/codex-rs/thread-store/src/local/legacy_checkpoint.rs
-new file mode 100644
-index 0000000..6b24e37
---- /dev/null
-+++ b/codex-rs/thread-store/src/local/legacy_checkpoint.rs
-@@ -0,0 +1,188 @@
-+//! Opt-in resume of legacy files at a native, state-complete compaction.
-+//! Never used for UI history. No cache or original file is written here.
-+use codex_protocol::protocol::{EventMsg, SessionMetaLine};
-+use codex_rollout::{ReverseJsonlScanner, RolloutItem, ScanOutcome};
-+use std::fs::File;
-+use std::io::{self, Read, Seek, SeekFrom};
-+use std::path::Path;
-+
-+const SCAN_LIMIT: u64 = 64 * 1024 * 1024;
-+
-+struct BudgetedFile {
-+    file: File,
-+    remaining: u64,
-+}
-+impl Read for BudgetedFile {
-+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-+        if self.remaining == 0 {
-+            return Err(io::Error::other("checkpoint scan budget exhausted"));
-+        }
-+        let limit = bytes.len().min(self.remaining as usize);
-+        let read = self.file.read(&mut bytes[..limit])?;
-+        self.remaining -= read as u64;
-+        Ok(read)
-+    }
-+}
-+impl Seek for BudgetedFile {
-+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-+        self.file.seek(pos)
-+    }
-+}
-+
-+pub(super) fn try_load(path: &Path, meta: SessionMetaLine) -> io::Result<Option<Vec<RolloutItem>>> {
-+    let reader = BudgetedFile {
-+        file: File::open(path)?,
-+        remaining: SCAN_LIMIT,
-+    };
-+    let mut scanner = ReverseJsonlScanner::new(reader)?;
-+    let mut newest_first = Vec::new();
-+    let mut companion_context = false;
-+    let mut companion_world = false;
-+    while let Some(line) = scanner.scan_next_rollout_line()? {
-+        let ScanOutcome::Parsed(line) = line else {
-+            return Ok(None);
-+        };
-+        match &line.item {
-+            // Rollback may refer to an older turn. Let canonical full replay decide.
-+            RolloutItem::EventMsg(EventMsg::ThreadRolledBack(_)) => return Ok(None),
-+            RolloutItem::SessionMeta(_) => return Ok(None),
-+            RolloutItem::TurnContext(_) => companion_context = true,
-+            RolloutItem::WorldState(world) if world.full => companion_world = true,
-+            RolloutItem::Compacted(compacted) => {
-+                // Only the newest compaction is eligible. In particular an old summary
-+                // cannot reconstruct window, attribution or previous-turn settings.
-+                if compacted.replacement_history.is_none()
-+                    || compacted.window_number.is_none()
-+                    || compacted.resume_metadata.is_none()
-+                    || !companion_context
-+                    || !companion_world
-+                {
-+                    return Ok(None);
-+                }
-+                newest_first.push(line.item);
-+                newest_first.push(RolloutItem::SessionMeta(meta));
-+                newest_first.reverse();
-+                tracing::info!(
-+                    items = newest_first.len(),
-+                    "CodeG legacy resume: validated native checkpoint"
-+                );
-+                return Ok(Some(newest_first));
-+            }
-+            _ => {}
-+        }
-+        newest_first.push(line.item);
-+    }
-+    Ok(None)
-+}
-+
-+#[cfg(test)]
-+mod tests {
-+    use super::*;
-+    use codex_rollout::RolloutLine;
-+    use std::io::Write;
-+    fn fixture(
-+        checkpoint: serde_json::Value,
-+        tail: &[serde_json::Value],
-+    ) -> (tempfile::NamedTempFile, SessionMetaLine) {
-+        let mut file = tempfile::NamedTempFile::new().unwrap();
-+        let meta: RolloutLine = codex_rollout::parse_rollout_line(
-+            &serde_json::json!({
-+                "timestamp":"2026-10-12T00:00:00Z","type":"session_meta", "payload": {
-+                    "id":"12345678-1234-1234-1234-123456789012", "timestamp":"2026-10-12T00:00:00Z",
-+                    "cwd":"/tmp","originator":"test","cli_version":"0.162.1","source":"cli"
-+                }
-+            })
-+            .to_string(),
-+        )
-+        .unwrap();
-+        writeln!(file, "{}", serde_json::to_string(&meta).unwrap()).unwrap();
-+        for payload in std::iter::once(&checkpoint).chain(tail.iter()) {
-+            writeln!(file, "{}", payload).unwrap();
-+        }
-+        let RolloutItem::SessionMeta(meta) = meta.item else {
-+            panic!("meta");
-+        };
-+        (file, meta)
-+    }
-+    fn cp() -> serde_json::Value {
-+        serde_json::json!({"timestamp":"2026-10-12T00:00:00Z","type":"compacted","payload":{
-+            "message":"summary","replacement_history":[],"window_number":1,"resume_metadata":{}
-+        }})
-+    }
-+    fn companions() -> Vec<serde_json::Value> {
-+        vec![
-+            serde_json::json!({"timestamp":"2026-10-12T00:00:00Z","type":"world_state","payload":{"full":true,"state":{}}}),
-+            serde_json::json!({"timestamp":"2026-10-12T00:00:00Z","type":"turn_context","payload":{
-+                "cwd":"/tmp","approval_policy":"never","sandbox_policy":{"type":"read-only"},
-+                "model":"gpt-6-astra","summary":"auto"
-+            }}),
-+        ]
-+    }
-+    #[test]
-+    fn complete_native_checkpoint_preserves_identity_and_order() {
-+        let (file, meta) = fixture(cp(), &companions());
-+        let id = meta.meta.id;
-+        let items = try_load(file.path(), meta).unwrap().expect("checkpoint");
-+        assert!(matches!(&items[0], RolloutItem::SessionMeta(meta) if meta.meta.id==id));
-+        assert!(matches!(&items[1], RolloutItem::Compacted(_)));
-+        assert!(matches!(&items[2], RolloutItem::WorldState(_)));
-+        assert!(matches!(&items[3], RolloutItem::TurnContext(_)));
-+    }
-+    #[test]
-+    fn legacy_summary_never_bounds_replay() {
-+        let mut checkpoint = cp();
-+        checkpoint["payload"]
-+            .as_object_mut()
-+            .unwrap()
-+            .remove("resume_metadata");
-+        let (file, meta) = fixture(checkpoint, &companions());
-+        assert!(try_load(file.path(), meta).unwrap().is_none());
-+    }
-+    #[test]
-+    fn incomplete_companions_fall_back() {
-+        let (file, meta) = fixture(cp(), &[]);
-+        assert!(try_load(file.path(), meta).unwrap().is_none());
-+    }
-+    #[test]
-+    fn malformed_tail_falls_back() {
-+        let (mut file, meta) = fixture(cp(), &companions());
-+        writeln!(file, "{{broken").unwrap();
-+        assert!(try_load(file.path(), meta).unwrap().is_none());
-+    }
-+
-+    #[test]
-+    fn rollback_suffix_never_uses_an_older_checkpoint() {
-+        let mut tail = companions();
-+        tail.push(
-+            serde_json::json!({"timestamp":"2026-10-12T00:00:00Z","type":"event_msg",
-+            "payload":{"type":"thread_rolled_back","num_turns":1}}),
-+        );
-+        let (file, meta) = fixture(cp(), &tail);
-+        assert!(try_load(file.path(), meta).unwrap().is_none());
-+    }
-+    #[test]
-+    fn newest_incomplete_checkpoint_never_reuses_an_older_one() {
-+        let mut tail = companions();
-+        let mut incomplete = cp();
-+        incomplete["payload"]
-+            .as_object_mut()
-+            .unwrap()
-+            .remove("resume_metadata");
-+        tail.push(incomplete);
-+        tail.extend(companions());
-+        let (file, meta) = fixture(cp(), &tail);
-+        assert!(try_load(file.path(), meta).unwrap().is_none());
-+    }
-+    #[test]
-+    fn probe_has_strict_byte_budget() {
-+        let fixture = tempfile::NamedTempFile::new().unwrap();
-+        std::fs::write(fixture.path(), b"bounded bytes").unwrap();
-+        let mut reader = BudgetedFile {
-+            file: File::open(fixture.path()).unwrap(),
-+            remaining: 3,
-+        };
-+        let mut bytes = [0; 20];
-+        assert_eq!(reader.read(&mut bytes).unwrap(), 3);
-+        assert!(reader.read(&mut bytes).is_err());
-+    }
-+}

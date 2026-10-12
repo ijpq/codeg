@@ -6,6 +6,6 @@
   "version": "0.162.1-codeg.1",
   "rust_toolchain": "1.95.0",
   "patch": "checkpoint-resume.patch",
-  "patch_sha256": "68e54e23068b9d904800663ebcadb5bd63a822e6c84a1b4922ae00c530859362",
+  "patch_sha256": "9e16a4a3a9791620d569a6559ac8049db181248437ca70f3164d85dc6f777ae9",
   "scan_limit_bytes": 67108864
 }
