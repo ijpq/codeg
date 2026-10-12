@@ -944,6 +944,10 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm build
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Build pinned Codex recovery runtime
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: pwsh

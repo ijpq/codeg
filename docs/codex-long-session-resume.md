@@ -41,6 +41,8 @@ CodeG 修复非必要断开；历史读取优化在 CLI 内实施，不以减少
 改变 external_id、注入 `thread/resume.history`、创建影子 session 或加长超时替代。
 Windows Server ZIP 携带私有、可复现 CLI `0.162.1-codeg.1`。其官方源 tag、精确 commit、
 补丁 SHA256、许可证和严格 64 MiB 探测上限记录于 `vendor/codex-runtime/`。
+Windows 构建沿用原生包脚本校验并获取 Codex 自建的 sandbox-enabled V8，与 code-mode
+host、sandbox setup/service/runner 和 ripgrep 一起发布，未改动 V8 特性或依赖版本。
 默认 Setup 保留上游的 CLI 打包机制，连接复用修复适用于两种运行模式；私有 CLI
 恢复优化由 Server ZIP 的 `runtime/` 提供。
 

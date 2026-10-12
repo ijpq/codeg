@@ -45,10 +45,19 @@ def main():
                  '--remap-path-prefix=' + str(Path.home()) + '=/codeg-build-home']
         os.environ['CARGO_ENCODED_RUSTFLAGS'] = '\x1f'.join(flags)
     os.environ['CARGO_PROFILE_RELEASE_STRIP'] = 'symbols'
-    test_env = dict(os.environ, RUST_MIN_STACK='8388608', CODEG_LEGACY_CHECKPOINT_RESUME='1')
     target = Path(os.environ.get('CARGO_TARGET_DIR', workspace / 'target')).resolve()
     if os.name == 'nt':
-        run(cargo + ['build', '--locked', '--release', '--package', 'codex-code-mode-host', '--package', 'codex-windows-sandbox', '--bin', 'codex-code-mode-host', '--bin', 'codex-command-runner', '--bin', 'codex-windows-sandbox-setup'], workspace)
+        # Upstream builds the sandbox-enabled V8 pair itself; the crate's
+        # default denoland URL does not publish the required Windows variant.
+        # Reuse the exact checkout's checksum-pinned artifact resolver.
+        os.environ['CODEX_REPO_ROOT'] = str(source)
+        sys.path.insert(0, str(source / 'scripts'))
+        from codex_package.targets import TARGET_SPECS
+        from codex_package.v8 import resolve_codex_v8_cargo_env
+        os.environ.update(resolve_codex_v8_cargo_env(TARGET_SPECS['x86_64-pc-windows-msvc'], environ={}))
+        run(cargo + ['build', '--locked', '--release', '--package', 'codex-code-mode-host', '--package', 'codex-windows-sandbox', '--package', 'codex-windows-sandbox-service', '--bin', 'codex-code-mode-host', '--bin', 'codex-command-runner', '--bin', 'codex-windows-sandbox-setup', '--bin', 'codex-windows-sandbox-service'], workspace)
+    test_env = dict(os.environ, RUST_MIN_STACK='8388608', CODEG_LEGACY_CHECKPOINT_RESUME='1')
+    if os.name == 'nt':
         for name in ['codex-command-runner', 'codex-windows-sandbox-setup']:
             test_env['CARGO_BIN_EXE_' + name.replace('-', '_')] = str(target / 'release' / (name + '.exe'))
     run(cargo + ['test', '--locked', '--package', 'codex-thread-store', '--lib'], workspace)
@@ -75,7 +84,7 @@ def main():
         path_dir.mkdir(exist_ok=True)
         shutil.copy2(target / 'release/codex-code-mode-host.exe', output / 'codex-code-mode-host.exe')
         files.append('codex-code-mode-host.exe')
-        for name in ['codex-command-runner.exe', 'codex-windows-sandbox-setup.exe']:
+        for name in ['codex-command-runner.exe', 'codex-windows-sandbox-setup.exe', 'codex-windows-sandbox-service.exe']:
             shutil.copy2(target / 'release' / name, resources / name)
             files.append('codex-resources/' + name)
         os.environ['CODEX_REPO_ROOT'] = str(source)

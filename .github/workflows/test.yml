@@ -214,6 +214,13 @@ jobs:
           node-version: 24
       - name: Install isolated reference CLI
         run: npm install --prefix "$RUNNER_TEMP/codeg-codex-reference" --ignore-scripts --no-audit --no-fund @openai/codex@0.162.1
+      - name: Prepare exact pinned runtime source
+        run: python -B scripts/build-codex-runtime.py --source-dir "$RUNNER_TEMP/codeg-codex-source" --output-dir "$RUNNER_TEMP/codeg-codex-runtime" --prepare-only
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "${{ runner.temp }}/codeg-codex-source/codex-rs -> ${{ runner.temp }}/codeg-codex-target"
+          shared-key: codex-recovery-${{ matrix.os }}
+          cache-on-failure: true
       - name: Test and build pinned recovery runtime
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/codeg-codex-target

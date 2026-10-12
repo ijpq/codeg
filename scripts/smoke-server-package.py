@@ -59,7 +59,8 @@ def main():
         if args.require_runtime and os.name == "nt":
             required = {"codex.exe", "codex-code-mode-host.exe",
                         "codex-resources/codex-command-runner.exe",
-                        "codex-resources/codex-windows-sandbox-setup.exe", "codex-path/rg.exe"}
+                        "codex-resources/codex-windows-sandbox-setup.exe",
+                        "codex-resources/codex-windows-sandbox-service.exe", "codex-path/rg.exe"}
             entries = {}
             for line in (runtime.parent / "runtime.sha256").read_text().splitlines():
                 digest, name = line.split(maxsplit=1)
