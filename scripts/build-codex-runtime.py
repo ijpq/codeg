@@ -21,7 +21,8 @@ def prepare_windows_checkout_resources(source, protected_paths):
     # Reproduce Git's official Windows checkout conversion for unchanged
     # resources, honoring attributes/binary detection. Keep patched sources
     # byte-exact so patch validation remains independent of platform EOLs.
-    git = ['git', '-c', 'core.autocrlf=true', '-c', 'core.safecrlf=false']
+    git = ['git', '-c', 'core.autocrlf=true', '-c', 'core.safecrlf=false',
+           '-c', 'core.longpaths=true']
     modified = subprocess.check_output(git + ['diff', '--name-only', '-z'], cwd=source)
     unexpected = {p.decode() for p in modified.split(b'\0') if p} - set(protected_paths)
     if unexpected:
@@ -37,7 +38,8 @@ def prepare_windows_checkout_resources(source, protected_paths):
     if selected:
         # Checkout to a fresh prefix: checkout-index may retain an unchanged
         # working file's LF bytes when its existing index stat cache is valid.
-        with tempfile.TemporaryDirectory(prefix='codeg-windows-resources-') as scratch:
+        # A short sibling prefix also avoids Windows' legacy path-length limit.
+        with tempfile.TemporaryDirectory(prefix='.wr-', dir=source.parent) as scratch:
             prefix = Path(scratch).as_posix() + '/'
             subprocess.run(git + ['checkout-index', '--prefix=' + prefix, '--stdin', '-z'], cwd=source,
                            input=('\0'.join(selected) + '\0').encode(), check=True)
