@@ -131,6 +131,10 @@ ACP 单独恢复耗时受同时进行的大文件测试影响，记录握手 316
 
 ## 已执行检查及限制
 
+模型输入比较先归一化实际字符串值，再编码 JSON；Windows 目录中的反斜杠不会因 JSON
+转义导致假差异。3 项跨平台比较测试保留旧逻辑失败的负对照，图片、工具与上下文变化
+断言保持完整。已有 6 份实际模型输入的 Linux 对照结果完全相同。
+
 前端 625 个文件、9100 项测试通过；CodeG Rust 5106 项 library 与 2 项 server
 测试通过，保留 1 项既有 ignored。TypeScript、lint、静态导出、浏览器 bundle/type
 检查、CodeG cargo check 和严格 clippy 通过。CLI thread-store 278 项、core 专项

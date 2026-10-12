@@ -17,6 +17,8 @@
   V8 artifacts, without disabling features or changing dependency versions.
 - Add real CLI/ACP/CodeG stage diagnostics and protocol/context regressions;
   require the pinned runtime in independent Windows release verification.
+- Normalize fixture paths before JSON encoding in model-context comparisons,
+  retaining full assertions across Windows/Linux and adding three regressions.
 - Preserve bounded recent-history paging, lifecycle generations, nonblocking AIR,
   native forks, MCP and other existing custom fixes across the upstream rebase.
 

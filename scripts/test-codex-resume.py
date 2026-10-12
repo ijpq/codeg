@@ -208,6 +208,18 @@ def measure(cli,home,path,tid,workspace,logs,name,fast=False,trace=False,prompt=
     (logs/(name+'.json')).write_text(json.dumps(result,indent=2)+'\n')
     return result
 
+def normalize_fixture_home(value, home):
+    # Normalize actual string values, before JSON encoding. In serialized JSON
+    # Windows backslashes are escaped, so replacing the native path misses it.
+    if isinstance(value, str):
+        return value.replace(str(home), '<ISOLATED_CODEX_HOME>')
+    if isinstance(value, list):
+        return [normalize_fixture_home(item, home) for item in value]
+    if isinstance(value, dict):
+        return {key: normalize_fixture_home(item, home) for key, item in value.items()}
+    return value
+
+
 def prefix_hash(path, length):
     digest=hashlib.sha256()
     with path.open('rb') as file:
@@ -243,7 +255,7 @@ def main():
             count=len(provider.requests)
             result=measure(cli,home,case_path,tid,workspace,root,label,fast,args.trace,prompt=True)
             assert len(provider.requests)==count+1,'Unexpected repeated model request'
-            snapshots[label]=json.loads(json.dumps(provider.requests[-1]['input']).replace(str(home),'<ISOLATED_CODEX_HOME>'))
+            snapshots[label]=normalize_fixture_home(provider.requests[-1]['input'], home)
             # New turn messages receive random protocol IDs; they do not change
             # model context. Historic tool call IDs and image data stay exact.
             for message in snapshots[label]:
