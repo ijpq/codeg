@@ -3,6 +3,7 @@ import hashlib
 import importlib.util
 from pathlib import Path
 import sqlite3
+import subprocess
 import tempfile
 import unittest
 
@@ -61,6 +62,53 @@ class MigrationSourceTests(unittest.TestCase):
         self.paths[0].write_bytes(b"SELECT 'unexpected\rcontent';\n")
         with self.assertRaisesRegex(RuntimeError, "Unexpected migration line endings"):
             builder.prepare_migration_sources(self.source, windows=True)
+
+
+class WindowsCheckoutResourceTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="codeg-windows-checkout-test-")
+        self.addCleanup(self.temp.cleanup)
+        self.source = Path(self.temp.name)
+        def git(*args):
+            return subprocess.check_output(["git", *args], cwd=self.source, stderr=subprocess.DEVNULL)
+        self.git = git
+        git("init", "--quiet")
+        git("config", "core.autocrlf", "false")
+        git("config", "user.name", "Fixture")
+        git("config", "user.email", "fixture@example.invalid")
+        (self.source / ".gitattributes").write_bytes(b"* text=auto\nkeep-lf.txt text eol=lf\nopaque.bin -text\nraw-fixture.txt -text\n")
+        (self.source / "never.md").write_bytes(b"Approval policy is currently never.\n")
+        (self.source / "keep-lf.txt").write_bytes(b"Preserve attribute-enforced LF.\n")
+        (self.source / "opaque.bin").write_bytes(b"binary\0\n")
+        (self.source / "raw-fixture.txt").write_bytes(b"Fixture LF must remain unchanged.\n")
+        (self.source / "patched.rs").write_bytes(b"const ENABLED: bool = false;\n")
+        git("add", ".")
+        git("commit", "--quiet", "-m", "fixture")
+        (self.source / "patched.rs").write_bytes(b"const ENABLED: bool = true;\n")
+
+    def test_windows_matches_git_filters_and_preserves_private_patch_and_binary(self):
+        expected = self.git("-c", "core.autocrlf=true", "cat-file", "--filters", "HEAD:never.md")
+        selected = builder.prepare_windows_checkout_resources(self.source, {"patched.rs"})
+        self.assertIn("never.md", selected)
+        self.assertEqual((self.source / "never.md").read_bytes(), expected)
+        self.assertIn(b"\r\n", expected)
+        self.assertEqual((self.source / "keep-lf.txt").read_bytes(), b"Preserve attribute-enforced LF.\n")
+        self.assertEqual((self.source / "opaque.bin").read_bytes(), b"binary\0\n")
+        self.assertNotIn("raw-fixture.txt", selected)
+        self.assertEqual((self.source / "raw-fixture.txt").read_bytes(), b"Fixture LF must remain unchanged.\n")
+        self.assertEqual((self.source / "patched.rs").read_bytes(), b"const ENABLED: bool = true;\n")
+
+    def test_preparation_is_idempotent(self):
+        builder.prepare_windows_checkout_resources(self.source, {"patched.rs"})
+        stamp = (self.source / "never.md").stat().st_mtime_ns
+        self.assertEqual(builder.prepare_windows_checkout_resources(self.source, {"patched.rs"}), [])
+        self.assertEqual((self.source / "never.md").stat().st_mtime_ns, stamp)
+
+    def test_unexpected_resource_modification_is_not_overwritten(self):
+        (self.source / "never.md").write_bytes(b"Uncommitted resource change.\n")
+        with self.assertRaisesRegex(RuntimeError, "Unexpected resource source changes"):
+            builder.prepare_windows_checkout_resources(self.source, {"patched.rs"})
+        self.assertEqual((self.source / "never.md").read_bytes(), b"Uncommitted resource change.\n")
 
 
 if __name__ == "__main__":

@@ -14,13 +14,14 @@
 - Fall back safely for ambiguous runtime/settings/turn state, corrupt/oversized
   tails, missing checkpoints, append/replacement and unavailable file identity.
 - Preserve official Windows SQL migration bytes during runtime builds so existing
-  SQLite state passes unchanged checksum validation; add five regressions.
+  SQLite state passes unchanged checksum validation. Match Git Windows resource
+  checkout bytes without touching patched sources; add eight regressions.
 - Build complete Windows helpers using upstream checksum-pinned sandbox-enabled
   V8 artifacts, without disabling features or changing dependency versions.
 - Add real CLI/ACP/CodeG stage diagnostics and protocol/context regressions;
   require the pinned runtime in independent Windows release verification.
 - Normalize fixture paths before JSON encoding in model-context comparisons,
-  retaining full assertions across Windows/Linux and adding three regressions.
+  retaining full assertions across Windows/Linux and adding four regressions.
 - Preserve bounded recent-history paging, lifecycle generations, nonblocking AIR,
   native forks, MCP and other existing custom fixes across the upstream rebase.
 

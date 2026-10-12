@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import os
 import sys
+import tempfile
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -15,6 +16,37 @@ MIGRATION_DIRECTORIES = (
     'migrations', 'logs_migrations', 'goals_migrations', 'memory_migrations',
     'queue_migrations', 'thread_history_migrations',
 )
+
+def prepare_windows_checkout_resources(source, protected_paths):
+    # Reproduce Git's official Windows checkout conversion for unchanged
+    # resources, honoring attributes/binary detection. Keep patched sources
+    # byte-exact so patch validation remains independent of platform EOLs.
+    git = ['git', '-c', 'core.autocrlf=true', '-c', 'core.safecrlf=false']
+    modified = subprocess.check_output(git + ['diff', '--name-only', '-z'], cwd=source)
+    unexpected = {p.decode() for p in modified.split(b'\0') if p} - set(protected_paths)
+    if unexpected:
+        raise RuntimeError(f'Unexpected resource source changes: {sorted(unexpected)}')
+    entries = subprocess.check_output(git + ['ls-files', '--eol', '-z'], cwd=source)
+    selected = []
+    for entry in entries.split(b'\0'):
+        if not entry:
+            continue
+        info, name = entry.decode().split('\t', 1)
+        if name not in protected_paths and 'eol=lf' not in info and 'attr/-text' not in info and 'i/lf' in info and 'w/lf' in info:
+            selected.append(name)
+    if selected:
+        # Checkout to a fresh prefix: checkout-index may retain an unchanged
+        # working file's LF bytes when its existing index stat cache is valid.
+        with tempfile.TemporaryDirectory(prefix='codeg-windows-resources-') as scratch:
+            prefix = Path(scratch).as_posix() + '/'
+            subprocess.run(git + ['checkout-index', '--prefix=' + prefix, '--stdin', '-z'], cwd=source,
+                           input=('\0'.join(selected) + '\0').encode(), check=True)
+            for name in selected:
+                expected = (Path(scratch) / name).read_bytes()
+                target = source / name
+                if target.read_bytes() != expected:
+                    target.write_bytes(expected)
+    return selected
 
 def prepare_migration_sources(source, windows):
     # SQLx hashes the embedded SQL bytes. The official Windows CLI embeds
@@ -57,6 +89,10 @@ def main():
     if subprocess.run(['git', 'apply', '--reverse', '--check', str(patch)], cwd=source, capture_output=True).returncode:
         run(['git', 'apply', '--check', str(patch)], source)
         run(['git', 'apply', str(patch)], source)
+    if os.name == 'nt':
+        protected = {line.split(' b/', 1)[1] for line in patch.read_text().splitlines()
+                     if line.startswith('diff --git ')}
+        prepare_windows_checkout_resources(source, protected)
     migration_checksums = prepare_migration_sources(source, windows=os.name == 'nt')
     if args.prepare_only:
         return

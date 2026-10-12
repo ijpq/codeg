@@ -212,7 +212,9 @@ def normalize_fixture_home(value, home):
     # Normalize actual string values, before JSON encoding. In serialized JSON
     # Windows backslashes are escaped, so replacing the native path misses it.
     if isinstance(value, str):
-        return value.replace(str(home), '<ISOLATED_CODEX_HOME>')
+        for prefix in {str(home), str(home).replace('\\', '/')}:
+            value = value.replace(prefix, '<ISOLATED_CODEX_HOME>')
+        return value
     if isinstance(value, list):
         return [normalize_fixture_home(item, home) for item in value]
     if isinstance(value, dict):

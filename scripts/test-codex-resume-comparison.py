@@ -27,6 +27,17 @@ class ModelContextComparisonTests(unittest.TestCase):
         self.assertNotEqual(old_left, old_right)
         self.assertEqual(fixture.normalize_fixture_home(left, baseline), fixture.normalize_fixture_home(right, candidate))
 
+    def test_windows_forward_slash_skill_roots_match_without_hiding_real_changes(self):
+        baseline = r"D:\fixtures\baseline\home"
+        candidate = r"D:\fixtures\candidate\home"
+        left = self.context(baseline.replace("\\", "/"))
+        right = self.context(candidate.replace("\\", "/"))
+        normalized = fixture.normalize_fixture_home(left, baseline)
+        self.assertEqual(normalized, fixture.normalize_fixture_home(right, candidate))
+        self.assertEqual(normalized[0]["content"][1]["image_url"], fixture.IMAGE)
+        right[0]["content"][0]["text"] += " CHANGED INSTRUCTION"
+        self.assertNotEqual(normalized, fixture.normalize_fixture_home(right, candidate))
+
     def test_linux_comparison_is_unchanged_and_preserves_images_and_ids(self):
         home = "/fixture/baseline/home"
         actual = fixture.normalize_fixture_home(self.context(home), home)
