@@ -225,7 +225,8 @@ jobs:
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: "${{ runner.temp }}/codeg-codex-source/codex-rs -> ../../codeg-codex-target"
-          shared-key: codex-recovery-target-v2-${{ matrix.os }}
+          shared-key: codex-recovery-target-v3-${{ matrix.os }}-${{ hashFiles('vendor/codex-runtime/**', 'scripts/build-codex-runtime.py', '.github/workflows/test.yml') }}
+          cache-workspace-crates: true
           cache-on-failure: true
       - name: Test and build pinned recovery runtime
         env:
@@ -251,7 +252,7 @@ jobs:
           PY
       - name: Verify one full read for old checkpoint fallback
         if: runner.os == 'Linux'
-        run: python3 -B scripts/test-codex-resume.py --cli "$RUNNER_TEMP/codeg-codex-runtime/codex" --output "$RUNNER_TEMP/codeg-codex-evidence/legacy" --size-mib 64 --checkpoint-mode legacy --trace
+        run: python3 -B scripts/test-codex-resume.py --cli "$RUNNER_TEMP/codeg-codex-runtime/codex" --output "$RUNNER_TEMP/codeg-codex-evidence/legacy-full-read" --size-mib 64 --checkpoint-mode legacy --trace
       - name: Verify current and newer ACP adapters on the pinned runtime
         if: runner.os == 'Linux'
         run: |

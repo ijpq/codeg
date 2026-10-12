@@ -967,7 +967,8 @@ jobs:
           CARGO_PROFILE_TEST_DEBUG: "0"
         with:
           workspaces: "${{ runner.temp }}/codeg-codex-source/codex-rs -> ../../codeg-codex-target"
-          shared-key: codex-recovery-target-v2-${{ matrix.runner }}
+          shared-key: codex-recovery-target-v3-${{ matrix.runner }}-${{ hashFiles('vendor/codex-runtime/**', 'scripts/build-codex-runtime.py', '.github/workflows/test.yml') }}
+          cache-workspace-crates: true
           cache-on-failure: true
 
       - name: Build pinned Codex recovery runtime
