@@ -222,7 +222,7 @@ jobs:
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: "${{ runner.temp }}/codeg-codex-source/codex-rs -> ../../codeg-codex-target"
-          shared-key: codex-recovery-${{ matrix.os }}
+          shared-key: codex-recovery-target-v2-${{ matrix.os }}
           cache-on-failure: true
       - name: Test and build pinned recovery runtime
         env:
