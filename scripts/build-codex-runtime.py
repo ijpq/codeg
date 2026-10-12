@@ -11,6 +11,30 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 VENDOR = ROOT / 'vendor/codex-runtime'
+MIGRATION_DIRECTORIES = (
+    'migrations', 'logs_migrations', 'goals_migrations', 'memory_migrations',
+    'queue_migrations', 'thread_history_migrations',
+)
+
+def prepare_migration_sources(source, windows):
+    # SQLx hashes the embedded SQL bytes. The official Windows CLI embeds
+    # CRLF migrations; matching its checkout format preserves existing DBs.
+    # Normalize only build sources, never databases or their stored checksums.
+    checksums = {}
+    for directory in MIGRATION_DIRECTORIES:
+        files = sorted((source / 'codex-rs' / 'state' / directory).glob('*.sql'))
+        if not files:
+            raise RuntimeError(f'Missing pinned migration sources: {directory}')
+        for path in files:
+            data = path.read_bytes()
+            canonical = data.replace(b'\r\n', b'\n')
+            if b'\r' in canonical:
+                raise RuntimeError(f'Unexpected migration line endings: {path}')
+            expected = canonical.replace(b'\n', b'\r\n') if windows else data
+            if data != expected:
+                path.write_bytes(expected)
+            checksums[path.relative_to(source).as_posix()] = hashlib.sha384(expected).hexdigest()
+    return checksums
 
 def run(command, cwd, env=None):
     subprocess.run(command, cwd=cwd, env=env, check=True)
@@ -33,6 +57,7 @@ def main():
     if subprocess.run(['git', 'apply', '--reverse', '--check', str(patch)], cwd=source, capture_output=True).returncode:
         run(['git', 'apply', '--check', str(patch)], source)
         run(['git', 'apply', str(patch)], source)
+    migration_checksums = prepare_migration_sources(source, windows=os.name == 'nt')
     if args.prepare_only:
         return
     cargo = ['cargo', '+' + manifest['rust_toolchain']]
@@ -110,6 +135,9 @@ def main():
     for name in ['source.json', 'LICENSE', 'NOTICE']:
         if (VENDOR / name).exists():
             shutil.copy2(VENDOR / name, output / name)
+    (output / 'migration-sources.json').write_text(json.dumps({
+        'line_endings': 'CRLF' if os.name == 'nt' else 'LF',
+        'sha384': migration_checksums}, indent=2) + '\n')
     (output / 'codex.sha256').write_text(hashlib.sha256(binary.read_bytes()).hexdigest() + '  ' + binary.name + '\n')
     (output / 'runtime.sha256').write_text(''.join(hashlib.sha256((output / name).read_bytes()).hexdigest() + '  ' + name + '\n' for name in files))
 

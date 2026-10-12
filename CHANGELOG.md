@@ -13,6 +13,8 @@
   duplicate full reads, including when old checkpoints require full fallback.
 - Fall back safely for ambiguous runtime/settings/turn state, corrupt/oversized
   tails, missing checkpoints, append/replacement and unavailable file identity.
+- Preserve official Windows SQL migration bytes during runtime builds so existing
+  SQLite state passes unchanged checksum validation; add five regressions.
 - Build complete Windows helpers using upstream checksum-pinned sandbox-enabled
   V8 artifacts, without disabling features or changing dependency versions.
 - Add real CLI/ACP/CodeG stage diagnostics and protocol/context regressions;

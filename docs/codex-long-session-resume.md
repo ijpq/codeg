@@ -43,6 +43,10 @@ Windows Server ZIP 携带私有、可复现 CLI `0.162.1-codeg.1`。其官方源
 补丁 SHA256、许可证和严格 64 MiB 探测上限记录于 `vendor/codex-runtime/`。
 Windows 构建沿用原生包脚本校验并获取 Codex 自建的 sandbox-enabled V8，与 code-mode
 host、sandbox setup/service/runner 和 ripgrep 一起发布，未改动 V8 特性或依赖版本。
+Windows 编译时将 SQLx 迁移源保留为官方 Windows CLI 使用的 CRLF 字节格式，
+确保已有数据库的迁移 SHA384 一致；Linux 源保持原样。随包记录全部迁移源校验值。
+只处理独立编译目录，不修改数据库、迁移记录或原始上游仓库，未关闭迁移校验。
+
 默认 Setup 保留上游的 CLI 打包机制，连接复用修复适用于两种运行模式；私有 CLI
 恢复优化由 Server ZIP 的 `runtime/` 提供。
 
