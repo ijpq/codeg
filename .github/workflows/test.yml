@@ -221,7 +221,7 @@ jobs:
         run: python -B scripts/build-codex-runtime.py --source-dir "$RUNNER_TEMP/codeg-codex-source" --output-dir "$RUNNER_TEMP/codeg-codex-runtime" --prepare-only
       - uses: swatinem/rust-cache@v2
         with:
-          workspaces: "${{ runner.temp }}/codeg-codex-source/codex-rs -> ${{ runner.temp }}/codeg-codex-target"
+          workspaces: "${{ runner.temp }}/codeg-codex-source/codex-rs -> ../../codeg-codex-target"
           shared-key: codex-recovery-${{ matrix.os }}
           cache-on-failure: true
       - name: Test and build pinned recovery runtime
@@ -235,7 +235,12 @@ jobs:
           from pathlib import Path
           scratch=Path(os.environ['RUNNER_TEMP'])
           suffix='.exe' if os.name=='nt' else ''
-          reference=next((scratch/'codeg-codex-reference/node_modules/@openai').rglob('codex'+suffix))
+          references=[p for p in (scratch/'codeg-codex-reference/node_modules/@openai').rglob('codex'+suffix) if p.is_file()]
+          if len(references)!=1:
+            raise RuntimeError(f'Expected one installed reference CLI, found {references}')
+          reference=references[0]
+          if subprocess.check_output([str(reference),'--version'],text=True).strip()!='codex-cli 0.162.1':
+            raise RuntimeError('Reference CLI version does not match the pin')
           subprocess.run([sys.executable,'-B','scripts/test-codex-resume.py',
             '--cli',str(scratch/'codeg-codex-runtime'/('codex'+suffix)),
             '--baseline-cli',str(reference),'--output',str(scratch/'codeg-codex-evidence'),
