@@ -1,4 +1,5 @@
 """Check official Windows SQLx compatibility without changing runtime databases."""
+from contextlib import closing
 import hashlib
 import importlib.util
 from pathlib import Path
@@ -30,12 +31,12 @@ class MigrationSourceTests(unittest.TestCase):
         official_checksum = hashlib.sha384(expected_sql).digest()
         self.assertNotEqual(hashlib.sha384(self.sql).digest(), official_checksum)
         database = self.source / "state_5.sqlite"
-        with sqlite3.connect(database) as connection:
+        with closing(sqlite3.connect(database)) as connection, connection:
             connection.execute("CREATE TABLE _sqlx_migrations (version INTEGER, checksum BLOB)")
             connection.execute("INSERT INTO _sqlx_migrations VALUES (1, ?)", (official_checksum,))
         database_before = database.read_bytes()
         checksums = builder.prepare_migration_sources(self.source, windows=True)
-        with sqlite3.connect(database.as_uri() + "?mode=ro", uri=True) as connection:
+        with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as connection:
             stored = connection.execute("SELECT checksum FROM _sqlx_migrations WHERE version = 1").fetchone()[0]
         for path in self.paths:
             self.assertEqual(path.read_bytes(), expected_sql)
