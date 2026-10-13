@@ -73,6 +73,21 @@ def prepare_migration_sources(source, windows):
 def run(command, cwd, env=None):
     subprocess.run(command, cwd=cwd, env=env, check=True)
 
+def repair_windows_v8_cache(cargo, workspace, target):
+    # rusty_v8 stores its native library outside Cargo's build-script OUT_DIR.
+    # A restored cache can retain the script output while omitting gn_out, so
+    # Cargo considers the script fresh and the next link fails. Invalidate only
+    # this package; its original build script restores the checksum-pinned lib.
+    profile = target / 'release'
+    library = profile / 'gn_out' / 'obj' / 'rusty_v8.lib'
+    if any((profile / 'build').glob('v8-*/output')) and (
+        not library.is_file() or library.stat().st_size == 0
+    ):
+        print('Repairing restored V8 cache: native Windows library is missing.', flush=True)
+        run(cargo + ['clean', '--release', '--package', 'v8'], workspace)
+        return True
+    return False
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source-dir', type=Path, required=True)
@@ -118,6 +133,7 @@ def main():
         from codex_package.targets import TARGET_SPECS
         from codex_package.v8 import resolve_codex_v8_cargo_env
         os.environ.update(resolve_codex_v8_cargo_env(TARGET_SPECS['x86_64-pc-windows-msvc'], environ={}))
+        repair_windows_v8_cache(cargo, workspace, target)
         run(cargo + ['build', '--locked', '--release', '--package', 'codex-code-mode-host', '--package', 'codex-windows-sandbox', '--package', 'codex-windows-sandbox-service', '--bin', 'codex-code-mode-host', '--bin', 'codex-command-runner', '--bin', 'codex-windows-sandbox-setup', '--bin', 'codex-windows-sandbox-service'], workspace)
     test_env = dict(os.environ, RUST_MIN_STACK='8388608', CODEG_LEGACY_CHECKPOINT_RESUME='1')
     if os.name == 'nt':

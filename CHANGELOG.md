@@ -1,7 +1,11 @@
 # Changelog
 
-## 0.35.1-fix1 — 2026-10-12
+## 0.35.1-fix2 — 2026-10-13
 
+- Repair restored Windows runtime caches that retain V8 build-script output but
+  omit its native static library. Rebuild only V8 with the original pinned source;
+  add four regressions including a real Cargo cache reproduction.
+- Keep the failed fix1 tag unpublished; publish these complete changes as fix2.
 - Rebase the custom fork onto the latest published upstream v0.35.1 commit.
 - Retain ready server connections when a sidebar preview is replaced, avoiding
   unnecessary cold Codex recovery while preserving explicit disconnect/cancel.
@@ -25,7 +29,7 @@
 - Preserve bounded recent-history paging, lifecycle generations, nonblocking AIR,
   native forks, MCP and other existing custom fixes across the upstream rebase.
 
-See [release notes](docs/releases/v0.35.1-fix1.md) and
+See [release notes](docs/releases/v0.35.1-fix2.md) and
 [recovery diagnosis](docs/codex-long-session-resume.md) for evidence and limits.
 
 ## 0.34.0-fix2 — 2026-10-10

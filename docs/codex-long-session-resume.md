@@ -157,3 +157,12 @@ Windows CI 必须执行原生恢复回归、正常 release 构建、完整 helpe
 恢复；首次元数据回填和 180 秒 idle GC 之后的真正冷恢复仍可能慢。显式 `CODEX_PATH`
 覆盖也会让 Server 不使用随包的优化 CLI。旧图片保留在原 rollout，通过现有历史按需
 读取；有效压缩后的模型上下文与原生完整 replay 一致，不把压缩前旧图片重新塞入模型。
+
+## Windows 构建缓存完整性
+
+V8 构建脚本把静态库写在 `release/gn_out/obj`，位于自身 `OUT_DIR` 外。缓存恢复可能
+保留脚本结果但漏掉该库；Cargo 判断脚本无需重跑，随后链接报告 `rusty_v8` 缺失。
+构建入口只在有既存 V8 构建输出且库缺失或为空时，执行该包的 release 缓存失效，
+再由原始脚本生成 checksum-pinned 库。保留其它包缓存和全部验收，不修改 CLI 补丁。
+`scripts/test-codex-runtime-cache.py` 使用真实 Cargo 最小包复现并验证修复；Linux 和
+Windows 原生 CI 都运行该回归以及已有迁移/资源、模型输入比较回归。

@@ -212,6 +212,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Verify runtime build regressions
+        run: |
+          python -B scripts/test-codex-runtime-migrations.py
+          python -B scripts/test-codex-runtime-cache.py
+          python -B scripts/test-codex-resume-comparison.py
       - name: Install native build prerequisites
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libssl-dev libcap-dev pkg-config cmake clang strace
