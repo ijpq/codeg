@@ -72,14 +72,24 @@ function ExecutionModeSession({
   const [objective, setObjective] = useState("")
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [stateUnavailable, setStateUnavailable] = useState(false)
   const mounted = useRef(true)
   const readSequence = useRef(0)
   const refresh = useCallback(async () => {
     if (!connectionId) return null
     const sequence = ++readSequence.current
-    const next = await acpGetGoalState(connectionId)
-    if (mounted.current && sequence === readSequence.current) setSnapshot(next)
-    return next
+    try {
+      const next = await acpGetGoalState(connectionId)
+      if (mounted.current && sequence === readSequence.current) {
+        setSnapshot(next)
+        setStateUnavailable(false)
+      }
+      return next
+    } catch (error) {
+      if (mounted.current && sequence === readSequence.current)
+        setStateUnavailable(true)
+      throw error
+    }
   }, [connectionId])
 
   useEffect(() => {
@@ -99,7 +109,7 @@ function ExecutionModeSession({
       try {
         if (document.visibilityState !== "hidden") await refresh()
       } catch {
-        if (!cancelled && mounted.current) setSnapshot(null)
+        // Keep the last known goal visible; a failed read never means cleared.
       }
       if (!cancelled) timer = setTimeout(read, 1500)
     }
@@ -123,7 +133,7 @@ function ExecutionModeSession({
       : nativeMode === "plan"
         ? "plan"
         : "direct"
-  const disabled = busy || readOnly || !connectionId
+  const disabled = busy || readOnly || !connectionId || stateUnavailable
 
   const run = async (action: "set" | "pause" | "resume" | "clear") => {
     if (!connectionId || disabled) return
@@ -207,6 +217,11 @@ function ExecutionModeSession({
           ))}
         </div>
         <p className="text-xs text-muted-foreground">{t("switchHint")}</p>
+        {stateUnavailable && (
+          <p role="status" className="text-xs text-destructive">
+            {t("stateUnavailable")}
+          </p>
+        )}
         {!supported && (
           <p role="status" className="text-xs text-muted-foreground">
             {t("unsupported")}
