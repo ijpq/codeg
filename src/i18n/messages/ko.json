@@ -3359,6 +3359,31 @@
       "diffDescriptionConflict": "{path} · 디스크 vs 저장되지 않음"
     },
     "chat": {
+      "execution": {
+        "label": "Execution",
+        "direct": "Execute directly",
+        "plan": "Plan first",
+        "goal": "Execute goal",
+        "switchHint": "Switching to Direct or Plan pauses an active goal first. Returning here does not resume it; use Resume explicitly. End clears the native goal and stops its work.",
+        "unsupported": "Goal execution needs an adapter advertising set, pause, resume and clear. Connect or update Codex ACP to enable it.",
+        "stateUnavailable": "Cannot read the current goal. The execution mode was not changed.",
+        "objective": "Goal objective",
+        "status": "Status",
+        "tokens": "Tokens",
+        "start": "Start goal",
+        "pause": "Pause",
+        "resume": "Resume",
+        "end": "End goal",
+        "statuses": {
+          "active": "Active",
+          "paused": "Paused",
+          "blocked": "Blocked",
+          "complete": "Complete",
+          "limited": "Limited",
+          "budgetLimited": "Budget limited",
+          "usageLimited": "Usage limited"
+        }
+      },
       "acpConnections": {
         "actions": {
           "openAgentsSettings": "에이전트 설정 열기",

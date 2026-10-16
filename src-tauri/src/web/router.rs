@@ -1117,6 +1117,7 @@ pub fn build_router_with_proxy_auth(
             post(handlers::acp::acp_set_config_option),
         )
         .route("/acp_goal_control", post(handlers::acp::acp_goal_control))
+        .route("/acp_get_goal_state", post(handlers::acp::acp_get_goal_state))
         .route(
             "/acp_describe_agent_options",
             post(handlers::acp::acp_describe_agent_options),

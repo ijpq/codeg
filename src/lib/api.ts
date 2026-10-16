@@ -428,9 +428,32 @@ export async function acpSetConfigOption(
  *  are needed here. */
 export async function acpGoalControl(
   connectionId: string,
-  action: "pause" | "clear"
+  action: "set" | "pause" | "resume" | "clear",
+  objective?: string
 ): Promise<void> {
-  return getTransport().call("acp_goal_control", { connectionId, action })
+  return getTransport().call("acp_goal_control", {
+    connectionId,
+    action,
+    objective,
+  })
+}
+
+export interface SessionGoalState {
+  goal: {
+    objective: string
+    status: string
+    tokensUsed?: number
+    tokenBudget?: number | null
+    timeUsedSeconds?: number
+  } | null
+  actions: string[] | null
+}
+
+/** Reads only the adapter's authoritative goal, without cloning history. */
+export async function acpGetGoalState(
+  connectionId: string
+): Promise<SessionGoalState> {
+  return getTransport().call("acp_get_goal_state", { connectionId })
 }
 
 export interface AcpCancelResult {
