@@ -1145,12 +1145,9 @@ fn prepend_own_cli_path(env: &mut BTreeMap<String, String>) {
     }
 }
 
-/// The two actions codex's bespoke `_codex/session/goal_control` request
-/// accepts (codex-acp #293, v1.1.4). Start / resume / re-objective are NOT part
-/// of this method — those go through the `/goal` prompt (a real slash command;
-/// only `/plan`, a config-option state toggle, is suppressed). Serializes to the
-/// lowercase wire value codex expects (`"pause"` / `"clear"`) and deserializes
-/// from the same string coming off the tauri command / HTTP endpoint.
+/// Native Goal controls advertised by the current ACP AIR extension. Older
+/// adapters may expose only pause/clear; callers must check advertised actions
+/// before offering creation or resumption. These are RPCs, never prompt text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum GoalControlAction {
