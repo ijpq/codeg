@@ -73,33 +73,39 @@ function ExecutionModeSession({
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const mounted = useRef(true)
+  const readSequence = useRef(0)
   const refresh = useCallback(async () => {
     if (!connectionId) return null
+    const sequence = ++readSequence.current
     const next = await acpGetGoalState(connectionId)
-    if (mounted.current) setSnapshot(next)
+    if (mounted.current && sequence === readSequence.current) setSnapshot(next)
     return next
   }, [connectionId])
 
   useEffect(() => {
     mounted.current = true
-    if (!active)
-      return () => {
-        mounted.current = false
-      }
+    return () => {
+      mounted.current = false
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!active) return
+    let cancelled = false
     let timer: ReturnType<typeof setTimeout>
     // A small projection also recovers externally-created/restored goals.
-    // No transcript polling, overlapping requests, or background-tab traffic.
+    // No transcript polling, overlapping polls, or background-tab traffic.
     const read = async () => {
       try {
         if (document.visibilityState !== "hidden") await refresh()
       } catch {
-        if (mounted.current) setSnapshot(null)
+        if (!cancelled && mounted.current) setSnapshot(null)
       }
-      if (mounted.current) timer = setTimeout(read, 1500)
+      if (!cancelled) timer = setTimeout(read, 1500)
     }
     void read()
     return () => {
-      mounted.current = false
+      cancelled = true
       clearTimeout(timer)
     }
   }, [refresh, active])
