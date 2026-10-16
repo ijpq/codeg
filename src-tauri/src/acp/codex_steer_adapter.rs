@@ -26,6 +26,43 @@ const NATIVE_STEERING_MIN_VERSION: (u64, u64, u64) = (1, 1, 6);
 const PATCH_REVISION: &str = "codeg-steer-v1";
 const NATIVE_FORK_PATCH_REVISION: &str = "codeg-native-thread-fork-citations-terminal-v4";
 const AIR_PATCH_REVISION: &str = "codeg-detached-air-v2";
+const GOAL_METADATA_ADAPTER_VERSION: &str = "2.2.2";
+const GOAL_METADATA_PATCH_REVISION: &str = "codeg-native-goal-snapshot-v1";
+
+// The published set extension starts real work but omits the initial AIR goal
+// snapshot. Read the CLI's authoritative thread/goal/get before acknowledging
+// creation; do not invent a goal from the requested objective.
+const GOAL_SET_ANCHOR: &str = r#"          const turnCompleted = await this.runWithProcessCheck(() => this.codexAcpClient.setGoal(
+            sessionState.sessionId,
+            objective,
+            void 0,
+            (goal) => {
+              updatedGoal = goal;
+            }
+          ));"#;
+const GOAL_SET_SUFFIX: &str = r#"
+          // codegNativeGoalSnapshot: native thread/goal/get, no prompt simulation.
+          await this.publishCurrentGoal(sessionState, sessionGeneration, true);"#;
+const GOAL_CAPABILITY_ANCHOR: &str = r#"      actions: [...GOAL_CONTROL_ACTIONS]"#;
+const GOAL_CAPABILITY_REPLACEMENT: &str = r#"      actions: [...GOAL_CONTROL_ACTIONS],
+      codegNativeGoalSnapshot: 1"#;
+
+pub(crate) fn patch_goal_metadata_bundle(source: &str) -> Result<String, String> {
+    if source.matches(GOAL_SET_ANCHOR).count() != 1
+        || source.matches(GOAL_CAPABILITY_ANCHOR).count() != 1
+        || source.contains("codegNativeGoalSnapshot")
+        || !source.contains("async publishCurrentGoal(sessionState, sessionGeneration, force)")
+    {
+        return Err("Native Goal snapshot anchors must match exactly once".into());
+    }
+    Ok(source
+        .replacen(
+            GOAL_SET_ANCHOR,
+            &format!("{GOAL_SET_ANCHOR}{GOAL_SET_SUFFIX}"),
+            1,
+        )
+        .replacen(GOAL_CAPABILITY_ANCHOR, GOAL_CAPABILITY_REPLACEMENT, 1))
+}
 
 fn supports_detached_air(version: &str) -> bool {
     matches!(version, "1.10.0" | "1.11.0" | "2.1.1")
@@ -540,6 +577,7 @@ pub async fn prepare(
 
     let version = adapter_version(&bundle);
     let patch_kind = match version.as_deref() {
+        Some(GOAL_METADATA_ADAPTER_VERSION) => "goal_metadata",
         Some(version) if supports_detached_air(version) => "detached_air",
         Some(NATIVE_FORK_ADAPTER_VERSION) => "native_fork",
         Some(SUPPORTED_ADAPTER_VERSION) => "legacy_steer",
@@ -569,7 +607,9 @@ pub async fn prepare(
     let source = std::fs::read_to_string(&bundle).map_err(|error| {
         AcpError::SpawnFailed(format!("failed to read codex-acp adapter: {error}"))
     })?;
-    let patched = match if patch_kind == "detached_air" {
+    let patched = match if patch_kind == "goal_metadata" {
+        patch_goal_metadata_bundle(&source)
+    } else if patch_kind == "detached_air" {
         patch_air_bundle(&source)
     } else if patch_kind == "native_fork" {
         patch_native_fork_bundle(&source)
@@ -588,7 +628,9 @@ pub async fn prepare(
         }
     };
 
-    let (patch_revision, cache_version) = if patch_kind == "detached_air" {
+    let (patch_revision, cache_version) = if patch_kind == "goal_metadata" {
+        (GOAL_METADATA_PATCH_REVISION, GOAL_METADATA_ADAPTER_VERSION)
+    } else if patch_kind == "detached_air" {
         (AIR_PATCH_REVISION, version.as_deref().unwrap_or_default())
     } else if patch_kind == "native_fork" {
         (NATIVE_FORK_PATCH_REVISION, NATIVE_FORK_ADAPTER_VERSION)
@@ -656,6 +698,17 @@ pub async fn prepare(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_goal_snapshot_patch_is_exact_and_idempotence_is_refused() {
+        let source = format!("{GOAL_SET_ANCHOR}\n{GOAL_CAPABILITY_ANCHOR}\nasync publishCurrentGoal(sessionState, sessionGeneration, force)");
+        let patched = patch_goal_metadata_bundle(&source).unwrap();
+        assert!(patched.contains(GOAL_SET_SUFFIX));
+        assert!(patched.contains(GOAL_CAPABILITY_REPLACEMENT));
+        assert!(patch_goal_metadata_bundle(&patched).is_err());
+        assert!(patch_goal_metadata_bundle(&format!("{source}{source}")).is_err());
+        assert!(patch_goal_metadata_bundle("unknown adapter").is_err());
+    }
 
     #[test]
     fn current_published_prompt_bodies_detach_air_without_replacing_protocol_cleanup() {

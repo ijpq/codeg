@@ -7969,6 +7969,8 @@ async fn run_connection(
                 // see `None` rather than a legacy pair it would latch (a claude
                 // session offering a Pause the adapter rejects).
                 let (goal_method, goal_actions) = resolve_goal_control(goal_control);
+                let goal_actions =
+                    verified_goal_start_actions(agent_type, init_resp.meta.as_ref(), goal_actions);
                 if let Some(method) = goal_method {
                     s.goal_control_method = method;
                 }
@@ -16869,6 +16871,23 @@ fn resolve_goal_control(
     }
 }
 
+/// Creating work requires an adapter whose initial native snapshot is verified.
+/// ACP 2.2.2 otherwise starts a goal without publishing it. Unknown/drifted
+/// bundles retain pause/clear, but must not create work the UI cannot observe.
+fn verified_goal_start_actions(
+    agent_type: AgentType,
+    meta: Option<&serde_json::Map<String, serde_json::Value>>,
+    mut actions: Vec<String>,
+) -> Vec<String> {
+    let verified = crate::acp::air_contract::legacy_or_air(meta, "goal")
+        .and_then(|goal| goal.get("codegNativeGoalSnapshot"))
+        .and_then(serde_json::Value::as_u64) == Some(1);
+    if agent_type == AgentType::Codex && !verified {
+        actions.retain(|action| !matches!(action.as_str(), "set" | "resume"));
+    }
+    actions
+}
+
 /// Pick the goal payload out of a `session_info_update`'s `_meta` according to
 /// the channel pinned at initialize (see [`init_advertises_goal`]): the
 /// neutral `_meta.goal` (or its AIR home `_meta.jetbrains.air.goal`) for
@@ -23565,6 +23584,24 @@ mod tests {
         }}));
         assert_eq!(goal_advertised_control(Some(&blank_method)), None);
         assert_eq!(goal_advertised_control(None), None);
+    }
+
+    #[test]
+    fn codex_goal_start_requires_verified_snapshot_but_stop_remains_available() {
+        let actions = vec!["set".into(), "pause".into(), "resume".into(), "clear".into()];
+        assert_eq!(
+            verified_goal_start_actions(AgentType::Codex, None, actions.clone()),
+            vec!["pause", "clear"]
+        );
+        let verified = meta_map(serde_json::json!({"jetbrains":{"air":{"goal":{"version":1,"codegNativeGoalSnapshot":1}}}}));
+        assert_eq!(
+            verified_goal_start_actions(AgentType::Codex, Some(&verified), actions.clone()),
+            actions
+        );
+        assert_eq!(
+            verified_goal_start_actions(AgentType::ClaudeCode, None, actions.clone()),
+            actions
+        );
     }
 
     #[test]

@@ -8,6 +8,7 @@ from pathlib import Path
 import socket
 import secrets
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.error
@@ -28,6 +29,9 @@ def main():
     resources = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(resources)
     inventory = resources.verify(root / "web", args.version)
+    if os.name == "nt":
+        subprocess.run([sys.executable, "-B", str(Path(__file__).with_name("verify-windows-dependencies.py")),
+                        str(root), "--report", str(logs / "windows-dependencies.json")], check=True)
     suffix = ".exe" if os.name == "nt" else ""
     server = root / ("codeg-server" + suffix)
     companion = root / ("codeg-mcp" + suffix)

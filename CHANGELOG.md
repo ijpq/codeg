@@ -16,6 +16,8 @@
 - Inventory every packaged frontend resource and verify all compiled database
   migrations execute; download and verify both Windows packages before and after
   publication. Server includes the same-version codeg-mcp and pinned Codex runtime.
+- Statically link the Windows C runtime and check ordinary/delayed PE imports in
+  both packages, rejecting missing external redistributables before publication.
 
 See [release notes](docs/releases/v0.35.2-fix1.md) for native protocol behavior
   and validation details.

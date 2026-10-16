@@ -32,6 +32,113 @@ async function reservePort() {
   await new Promise((done) => server.close(done))
   return port
 }
+async function startGoalModel() {
+  let requests = 0
+  const server = createServer(async (request, response) => {
+    if (request.method !== "POST") {
+      response.writeHead(404).end()
+      return
+    }
+    const chunks = []
+    for await (const chunk of request) chunks.push(chunk)
+    const body = JSON.parse(Buffer.concat(chunks).toString())
+    requests++
+    const text = "SYNTHETIC NATIVE GOAL RESPONSE"
+    const item = {
+      id: `msg_${requests}`,
+      type: "message",
+      role: "assistant",
+      status: "completed",
+      content: [{ type: "output_text", text, annotations: [] }],
+    }
+    const result = {
+      id: `resp_${requests}`,
+      object: "response",
+      created_at: 1791763200,
+      status: "completed",
+      model: body.model,
+      output: [item],
+      usage: {
+        input_tokens: 42,
+        output_tokens: 3,
+        total_tokens: 45,
+        input_tokens_details: { cached_tokens: 0 },
+        output_tokens_details: { reasoning_tokens: 0 },
+      },
+    }
+    const events = [
+      {
+        type: "response.created",
+        response: { ...result, status: "in_progress", output: [] },
+      },
+      {
+        type: "response.output_item.added",
+        output_index: 0,
+        item: { ...item, status: "in_progress", content: [] },
+      },
+      {
+        type: "response.content_part.added",
+        item_id: item.id,
+        output_index: 0,
+        content_index: 0,
+        part: { type: "output_text", text: "", annotations: [] },
+      },
+      {
+        type: "response.output_text.delta",
+        item_id: item.id,
+        output_index: 0,
+        content_index: 0,
+        delta: text,
+      },
+      {
+        type: "response.output_text.done",
+        item_id: item.id,
+        output_index: 0,
+        content_index: 0,
+        text,
+      },
+      { type: "response.output_item.done", output_index: 0, item },
+      { type: "response.completed", response: result },
+    ]
+    await delay(100)
+    if (!response.destroyed) {
+      response.writeHead(200, { "Content-Type": "text/event-stream" })
+      response.end(
+        events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("")
+      )
+    }
+  })
+  await new Promise((done) => server.listen(0, "127.0.0.1", done))
+  return {
+    url: `http://127.0.0.1:${server.address().port}/v1`,
+    count: () => requests,
+    close: async () => {
+      server.closeAllConnections()
+      await new Promise((done) => server.close(done))
+    },
+  }
+}
+const goalModel = options["native-tools"] ? await startGoalModel() : null
+async function enableNativeAgent(f) {
+  if (!goalModel) return
+  const pathKey =
+    Object.keys(f.env).find((key) => key.toLowerCase() === "path") ?? "PATH"
+  f.env[pathKey] = `${resolve(options["native-tools"])};${f.env[pathKey] ?? ""}`
+  f.env.CODEX_PATH = join(resolve(options.server), "runtime", "codex.exe")
+  await writeFile(
+    join(f.env.CODEX_HOME, "config.toml"),
+    `model = "gpt-6-astra"
+model_provider = "fixture"
+approval_policy = "never"
+sandbox_mode = "read-only"
+[model_providers.fixture]
+name = "Isolated release Goal model"
+base_url = "${goalModel.url}"
+wire_api = "responses"
+requires_openai_auth = false
+`
+  )
+}
 async function fixture(name) {
   const root = join(output, name)
   const data = join(root, "data"),
@@ -54,6 +161,21 @@ async function fixture(name) {
         originator: "codeg-release-verification",
         cli_version: "0.162.1",
         source: "cli",
+        model_provider: "fixture",
+      },
+    },
+    {
+      timestamp,
+      type: "turn_context",
+      payload: {
+        turn_id: randomUUID(),
+        cwd,
+        approval_policy: "never",
+        sandbox_policy: { type: "read-only" },
+        model: "gpt-6-astra",
+        effort: "medium",
+        summary: "auto",
+        multi_agent_version: "v1",
       },
     },
   ]
@@ -71,12 +193,31 @@ async function fixture(name) {
       },
       { type: "agent_message", message: text, phase: "final_answer" },
       { type: "task_complete", turn_id: `turn-${i}`, last_agent_message: text },
-    ])
+    ]) {
       entries.push({
         timestamp: new Date(Date.parse(timestamp) + i * 1000).toISOString(),
         type: "event_msg",
         payload,
       })
+      if (payload.type === "user_message" || payload.type === "agent_message") {
+        const user = payload.type === "user_message"
+        entries.push({
+          timestamp,
+          type: "response_item",
+          payload: {
+            type: "message",
+            role: user ? "user" : "assistant",
+            ...(!user ? { phase: "final_answer" } : {}),
+            content: [
+              {
+                type: user ? "input_text" : "output_text",
+                text: user ? payload.message : text,
+              },
+            ],
+          },
+        })
+      }
+    }
   }
   const rollout = join(sessions, `rollout-2026-10-12T00-00-00-${id}.jsonl`)
   await writeFile(
@@ -325,6 +466,159 @@ async function actualPage(page, name, verifyScroll = true) {
   assert.deepEqual(errors, [], `${name}: frontend runtime errors`)
   report.checks.push({ name, samples, errors })
 }
+async function nativeGoalPage(page, api, f, conversation, name) {
+  if (!goalModel) return
+  const until = async (read, accepts, label) => {
+    let value
+    for (let i = 0; i < 600; i++) {
+      value = await read()
+      if (accepts(value)) return value
+      await delay(100)
+    }
+    throw Error(`${name}: ${label}: ${JSON.stringify(value)}`)
+  }
+  const find = () =>
+    api("acp_find_connection_for_conversation", {
+      conversationId: conversation.id,
+      sessionId: f.id,
+      agentType: "codex",
+    })
+  try {
+    const trigger = page.getByRole("button", {
+      name: /^(Execution|执行方式|執行方式):/,
+    })
+    await trigger.waitFor({ timeout: 90_000 })
+    const connection = await until(
+      find,
+      (value) => value?.connection_id,
+      "live connection"
+    )
+    const connectionId = connection.connection_id
+    const goal = () => api("acp_get_goal_state", { connectionId })
+    const mode = async () =>
+      (
+        await api("acp_get_session_snapshot", { connectionId })
+      )?.config_options?.find((option) => option.id === "collaboration_mode")
+        ?.kind.current_value
+    await until(
+      goal,
+      (value) =>
+        ["set", "pause", "resume", "clear"].every((a) =>
+          value.actions?.includes(a)
+        ),
+      "verified native Goal capability"
+    )
+    await trigger.click()
+    const dialog = page.getByRole("dialog").filter({
+      has: page.getByRole("radiogroup", {
+        name: /^(Execution|执行方式|執行方式)$/,
+      }),
+    })
+    const choose = async (name) => {
+      const radio = dialog.getByRole("radio", { name })
+      await until(
+        () => radio.isEnabled(),
+        Boolean,
+        "execution selector enabled"
+      )
+      await radio.click()
+    }
+    const status = (expected) =>
+      until(goal, (value) => value.goal?.status === expected, expected)
+    const quiet = async () => {
+      await delay(600)
+      const count = goalModel.count()
+      await delay(1500)
+      assert.equal(
+        goalModel.count(),
+        count,
+        `${name}: stopped Goal kept requesting work`
+      )
+      return count
+    }
+    const work = (count) =>
+      until(
+        () => goalModel.count(),
+        (value) => value > count,
+        "native model work"
+      )
+    await choose(/^(Plan first|先规划|先規劃)$/)
+    await until(mode, (value) => value === "plan", "native Plan selected")
+    await choose(/^(Execute goal|目标执行|目標執行)$/)
+    const objective = `${name}: native Goal ${f.id}`
+    await dialog.locator("textarea").fill(objective)
+    let count = goalModel.count()
+    await dialog
+      .getByRole("button", { name: /^(Start goal|开始目标|開始目標)$/ })
+      .click()
+    assert.equal((await status("active")).goal.objective, objective)
+    await until(
+      mode,
+      (value) => value === "default",
+      "Goal uses native execution mode"
+    )
+    await work(count)
+    await page.screenshot({ path: join(output, `${name}-goal-active.png`) })
+    await choose(/^(Execute directly|直接执行|直接執行)$/)
+    await status("paused")
+    await until(
+      mode,
+      (value) => value === "default",
+      "switch pauses before Direct"
+    )
+    count = await quiet()
+    await choose(/^(Execute goal|目标执行|目標執行)$/)
+    await delay(1000)
+    assert.equal(
+      goalModel.count(),
+      count,
+      "Selecting Goal resumed it implicitly"
+    )
+    await status("paused")
+    const resume = () =>
+      dialog.getByRole("button", { name: /^(Resume|继续|繼續)$/ }).click()
+    await resume()
+    await status("active")
+    await work(count)
+    await dialog.getByRole("button", { name: /^(Pause|暂停|暫停)$/ }).click()
+    await status("paused")
+    count = await quiet()
+    await resume()
+    await status("active")
+    await work(count)
+    await dialog
+      .getByRole("button", { name: /^(End goal|结束目标|結束目標)$/ })
+      .click()
+    await until(goal, (value) => value.goal === null, "native Goal cleared")
+    await quiet()
+    await page.screenshot({ path: join(output, `${name}-goal-ended.png`) })
+    await page.keyboard.press("Escape")
+    report.checks.push({
+      name: `${name}-native-goal-controls`,
+      passed: true,
+      nativePlan: true,
+      startsRealWork: true,
+      switchPauses: true,
+      explicitResume: true,
+      pauseAndEndStopWork: true,
+      modelRequests: goalModel.count(),
+    })
+  } catch (error) {
+    await page
+      .screenshot({ path: join(output, `${name}-goal-failure.png`) })
+      .catch(() => {})
+    report.checks.push({
+      name: `${name}-native-goal-failure`,
+      page: (
+        await page
+          .locator("body")
+          .innerText()
+          .catch(() => "unavailable")
+      ).slice(-12000),
+    })
+    throw error
+  }
+}
 try {
   const f = await fixture("setup-upgrade")
   const installation = join(output, "upgraded-installation")
@@ -351,6 +645,7 @@ try {
       .digest("hex"),
     original
   )
+  await enableNativeAgent(f)
   app = await startDesktop(installation, f, "upgraded-startup")
   try {
     const conversations = await desktopApi(app.page)("list_all_conversations")
@@ -359,6 +654,7 @@ try {
       "Upgrade lost existing conversation"
     )
     await actualPage(app.page, "upgraded-frontend", options.baseline !== "true")
+    await nativeGoalPage(app.page, desktopApi(app.page), f, saved, "setup")
     if (options.baseline !== "true") {
       const migration = JSON.parse(
         execFileSync(
@@ -382,6 +678,7 @@ try {
     passed: true,
   })
   const s = await fixture("server-web")
+  await enableNativeAgent(s)
   const port = await reservePort(),
     token = randomBytes(24).toString("hex")
   const env = {
@@ -422,7 +719,7 @@ try {
       } catch {}
       await delay(500)
     }
-    await importAndOpen(api, s)
+    const conversation = await importAndOpen(api, s)
     browser = await chromium.launch({ channel: "msedge", headless: true })
     const context = await browser.newContext({
       viewport: { width: 1200, height: 900 },
@@ -434,6 +731,7 @@ try {
     const page = await context.newPage()
     await page.goto(`http://127.0.0.1:${port}/workspace`)
     await actualPage(page, "server-web-frontend", options.baseline !== "true")
+    await nativeGoalPage(page, api, s, conversation, "server-web")
     if (options.baseline !== "true")
       report.checks.push({
         name: "server-migrations",
@@ -447,10 +745,7 @@ try {
       })
   } finally {
     await browser?.close()
-    child.kill()
-    await new Promise((done) =>
-      child.exitCode !== null ? done() : child.once("exit", done)
-    )
+    await stopOwnedProcess(child)
     serverLog.end()
   }
   report.passed = true
@@ -458,6 +753,7 @@ try {
   report.errors.push(String(error.stack ?? error))
   throw error
 } finally {
+  await goalModel?.close()
   await writeFile(
     join(output, "verification.json"),
     JSON.stringify(report, null, 2)
