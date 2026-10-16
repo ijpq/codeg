@@ -39,7 +39,7 @@ export function ExecutionModeControl({
   option: SessionConfigOptionInfo
   onSelect?: (configId: string, value: string) => void
 }) {
-  const { connectionId, readOnly, startGoal } = useGoalControl()
+  const { connectionId, readOnly, startGoal, onGoalSnapshot } = useGoalControl()
   // Keying the inner component makes connection changes discard pending UI.
   return (
     <ExecutionModeSession
@@ -48,6 +48,7 @@ export function ExecutionModeControl({
       connectionId={connectionId ?? null}
       readOnly={Boolean(readOnly)}
       startGoal={startGoal}
+      onGoalSnapshot={onGoalSnapshot}
       onSelect={onSelect}
       active={active}
     />
@@ -59,6 +60,7 @@ function ExecutionModeSession({
   connectionId,
   readOnly,
   startGoal,
+  onGoalSnapshot,
   onSelect,
   active,
 }: {
@@ -67,6 +69,7 @@ function ExecutionModeSession({
   connectionId: string | null
   readOnly: boolean
   startGoal?: (objective: string) => Promise<void>
+  onGoalSnapshot?: (snapshot: SessionGoalState) => void
   onSelect?: (configId: string, value: string) => void
 }) {
   const t = useTranslations("Folder.chat.execution")
@@ -86,6 +89,7 @@ function ExecutionModeSession({
       if (mounted.current && sequence === readSequence.current) {
         setSnapshot(next)
         setStateUnavailable(false)
+        onGoalSnapshot?.(next)
       }
       return next
     } catch (error) {
@@ -93,7 +97,7 @@ function ExecutionModeSession({
         setStateUnavailable(true)
       throw error
     }
-  }, [connectionId])
+  }, [connectionId, onGoalSnapshot])
 
   useEffect(() => {
     mounted.current = true

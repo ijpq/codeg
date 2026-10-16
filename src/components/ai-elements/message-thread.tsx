@@ -197,8 +197,12 @@ const EscapeLockOnUserScroll = () => {
     }
 
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.defaultPrevented || event.altKey || event.ctrlKey) return
-      if (event.metaKey && event.key !== "ArrowUp") return
+      if (event.defaultPrevented || event.altKey) return
+      // Document-start shortcuts are reader input too; editor targets are
+      // filtered below, before releasing the transcript's lock.
+      if (event.ctrlKey && event.key !== "Home") return
+      if (event.metaKey && event.key !== "ArrowUp" && event.key !== "Home")
+        return
       const upward =
         SCROLL_UP_KEYS.has(event.key) || (event.key === " " && event.shiftKey)
       if (!upward || isEditableTarget(event.target)) return

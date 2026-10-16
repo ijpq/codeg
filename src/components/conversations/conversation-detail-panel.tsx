@@ -73,6 +73,7 @@ import {
   type GoalControlValue,
 } from "@/components/message/goal-control-context"
 import { useAdvertisedGoalActions } from "@/hooks/use-goal-actions"
+import { useNativeGoalTranscript } from "@/hooks/use-native-goal-transcript"
 import { ConversationShell } from "@/components/chat/conversation-shell"
 import { SessionConfigStaleBanner } from "@/components/chat/session-config-stale-banner"
 import { PiProjectTrustBanner } from "@/components/chat/pi-project-trust-banner"
@@ -2617,6 +2618,11 @@ const ConversationTabView = memo(function ConversationTabView({
   // connection id while `initialize` is still in flight, and the vocabulary
   // isn't decided until that response lands.
   const goalActions = useAdvertisedGoalActions(conn.connectionId, connStatus)
+  const observeGoal = useNativeGoalTranscript(
+    conn.connectionId,
+    effectiveConversationId,
+    isActive
+  )
 
   const handleStartGoal = useCallback(
     async (objective: string) => {
@@ -2702,6 +2708,7 @@ const ConversationTabView = memo(function ConversationTabView({
       connectionId: connIsForOtherAgent ? null : conn.connectionId,
       readOnly: !live,
       startGoal: handleStartGoal,
+      onGoalSnapshot: observeGoal,
       onGoalControl: live
         ? (action) => {
             void acpActions.goalControl(tabId, action)
@@ -2717,6 +2724,7 @@ const ConversationTabView = memo(function ConversationTabView({
     tabId,
     goalActions,
     handleStartGoal,
+    observeGoal,
   ])
 
   // AIR session-failure recovery actions — the buttons on a failed turn's

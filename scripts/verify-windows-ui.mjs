@@ -564,6 +564,38 @@ async function nativeGoalPage(page, api, f, conversation, name) {
     )
     await work(count)
     await page.screenshot({ path: join(output, `${name}-goal-active.png`) })
+    await page.keyboard.press("Escape")
+    await page
+      .locator(".chat-scroll-port:visible")
+      .last()
+      .getByText("SYNTHETIC NATIVE GOAL RESPONSE", { exact: true })
+      .first()
+      .waitFor({ timeout: 60_000 })
+    const viewport = page.locator(".chat-scroll-port:visible").last()
+    await viewport.evaluate((element) => {
+      element.tabIndex = 0
+      element.focus({ preventScroll: true })
+    })
+    await page.keyboard.press("Control+Home")
+    await delay(300)
+    const readerGap = () =>
+      viewport.evaluate(
+        (element) =>
+          element.scrollHeight - element.clientHeight - element.scrollTop
+      )
+    assert.ok((await readerGap()) > 100, `${name}: Ctrl+Home did not escape`)
+    // Goal continuations and their bounded transcript refreshes keep arriving.
+    // Older-page prepends may compensate scrollTop, so assert distance from
+    // the end instead of mistaking that compensation for an unwanted jump.
+    await delay(3500)
+    assert.ok(
+      (await readerGap()) > 100,
+      `${name}: Goal pulled reader to bottom`
+    )
+    await page.screenshot({
+      path: join(output, `${name}-goal-reader-escape.png`),
+    })
+    await trigger.click()
     await choose(/^(Execute directly|直接执行|直接執行)$/)
     await status("paused")
     await until(
@@ -606,6 +638,8 @@ async function nativeGoalPage(page, api, f, conversation, name) {
       switchPauses: true,
       explicitResume: true,
       pauseAndEndStopWork: true,
+      nativeOutputVisible: true,
+      readerEscape: true,
       modelRequests: goalModel.count(),
     })
   } catch (error) {
@@ -693,6 +727,8 @@ async function nativeDraftGoalPage(page, api, name) {
       "native objective"
     )
     await page
+      .locator(".chat-scroll-port:visible")
+      .last()
       .getByText("SYNTHETIC NATIVE GOAL RESPONSE", { exact: true })
       .first()
       .waitFor({ timeout: 60_000 })
@@ -705,6 +741,8 @@ async function nativeDraftGoalPage(page, api, name) {
     await until(goal, (value) => value.goal?.status === "paused", "pause")
     await page.keyboard.press("Escape")
     await page
+      .locator(".chat-scroll-port:visible")
+      .last()
       .getByText("SYNTHETIC NATIVE GOAL RESPONSE", { exact: true })
       .first()
       .waitFor({ timeout: 60_000 })
@@ -732,6 +770,8 @@ async function nativeDraftGoalPage(page, api, name) {
     await restoredTab.waitFor({ timeout: 30_000 })
     await restoredTab.click()
     await page
+      .locator(".chat-scroll-port:visible")
+      .last()
       .getByText("SYNTHETIC NATIVE GOAL RESPONSE", { exact: true })
       .first()
       .waitFor({ timeout: 60_000 })
@@ -750,6 +790,15 @@ async function nativeDraftGoalPage(page, api, name) {
     await page
       .screenshot({ path: join(output, `${name}-draft-goal-failure.png`) })
       .catch(() => {})
+    report.checks.push({
+      name: `${name}-draft-native-goal-failure`,
+      page: (
+        await page
+          .locator("body")
+          .innerText()
+          .catch(() => "unavailable")
+      ).slice(-12000),
+    })
     throw error
   }
 }

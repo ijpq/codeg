@@ -1002,6 +1002,7 @@ async fn end_to_end_uds_assistant_delegation() {
         Arc::new(codeg_lib::acp::computer_tools::NoComputerDesktop)
             as Arc<dyn codeg_lib::acp::computer_tools::ComputerToolAccess>,
         Arc::new(codeg_lib::acp::result_tool::NoResultTool),
+        Arc::new(NoDeliverables) as Arc<dyn codeg_lib::acp::deliverables::SessionDeliverableAccess>,
     );
     let dir = socket_dir();
     let socket = dir.path().join("codeg-e2e-assistant.sock");
@@ -1048,10 +1049,12 @@ async fn end_to_end_uds_assistant_delegation() {
         .unwrap()
         .clone();
     assert_eq!(delegate["inputSchema"]["required"], json!(["task"]));
-    assert!(delegate["inputSchema"]["properties"]["assistant_id"]["description"]
-        .as_str()
-        .unwrap()
-        .contains("3: Reviewer [Codex CLI] — Reviews diffs"));
+    assert!(
+        delegate["inputSchema"]["properties"]["assistant_id"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("3: Reviewer [Codex CLI] — Reviews diffs")
+    );
 
     // tools/call naming the assistant (the host also passed a stray agent).
     let call = json!({
@@ -1074,7 +1077,11 @@ async fn end_to_end_uds_assistant_delegation() {
     assert_eq!(report["assistant_name"], "Reviewer");
 
     let spawn = mock.spawn_args.lock().await[0].clone();
-    assert_eq!(spawn.agent_type, AgentType::Codex, "the assistant's agent, not the stray one");
+    assert_eq!(
+        spawn.agent_type,
+        AgentType::Codex,
+        "the assistant's agent, not the stray one"
+    );
     assert_eq!(spawn.preferred_mode_id.as_deref(), Some("read-only"));
     assert_eq!(
         spawn.preferred_config_values,
@@ -1089,5 +1096,11 @@ async fn end_to_end_uds_assistant_delegation() {
     assert_eq!(send.task, "review the diff");
     let brief = send.brief.expect("the brief rides the first prompt");
     assert!(brief.contains("Cite file and line for every finding."));
-    assert_eq!(send.link.assistant.expect("the child row learns its assistant").id, 3);
+    assert_eq!(
+        send.link
+            .assistant
+            .expect("the child row learns its assistant")
+            .id,
+        3
+    );
 }

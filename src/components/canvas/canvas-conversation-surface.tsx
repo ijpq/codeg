@@ -17,6 +17,7 @@ import {
   type GoalControlValue,
 } from "@/components/message/goal-control-context"
 import { useAdvertisedGoalActions } from "@/hooks/use-goal-actions"
+import { useNativeGoalTranscript } from "@/hooks/use-native-goal-transcript"
 import { MessageListView } from "@/components/message/message-list-view"
 import {
   getCachedSelectors,
@@ -807,6 +808,11 @@ export function CanvasConversationSurface({
   const isDraft = dbConversationId == null
 
   const goalActions = useAdvertisedGoalActions(conn.connectionId, connStatus)
+  const observeGoal = useNativeGoalTranscript(
+    conn.connectionId,
+    effectiveConversationId,
+    isActive
+  )
   const handleStartGoal = useCallback(
     async (objective: string) => {
       if (
@@ -887,6 +893,7 @@ export function CanvasConversationSurface({
       connectionId: connIsForOtherAgent ? null : conn.connectionId,
       readOnly: !live,
       startGoal: handleStartGoal,
+      onGoalSnapshot: observeGoal,
       actions: goalActions,
       onGoalControl: live
         ? (action) => {
@@ -899,6 +906,7 @@ export function CanvasConversationSurface({
     connStatus,
     connIsForOtherAgent,
     goalActions,
+    observeGoal,
     acpActions,
     contextKey,
     handleStartGoal,
