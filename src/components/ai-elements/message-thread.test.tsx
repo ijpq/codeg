@@ -472,12 +472,13 @@ describe("fractional virtual-row scroll compensation", () => {
     expect(testState.stopScroll).not.toHaveBeenCalled()
   })
 
-  it("does not shield a larger upward scroll or rearm an escaped reader", () => {
+  it("shields programmatic remeasurement but never rearms an escaped reader", () => {
     mountThreadAt(400)
     testState.state.lastScrollTop = 650
     testState.scrollRef.current!.scrollTop = 600
     testState.scrollRef.current!.dispatchEvent(new Event("scroll"))
-    expect(testState.state.ignoreScrollToTop).toBeUndefined()
+    expect(testState.state.ignoreScrollToTop).toBe(600)
+    testState.state.ignoreScrollToTop = undefined
     testState.state.escapedFromLock = true
     testState.state.lastScrollTop = 600.73
     testState.scrollRef.current!.dispatchEvent(new Event("scroll"))
@@ -493,4 +494,32 @@ it("shields a stale overshoot target after virtual row remeasurement at the tail
   testState.scrollRef.current!.scrollTop = 600
   testState.scrollRef.current!.dispatchEvent(new Event("scroll"))
   expect(testState.state.ignoreScrollToTop).toBe(600)
+})
+
+it("releases the lock when a text selection drags the transcript upwards", () => {
+  const row = document.createElement("p")
+  row.textContent = "Select this transcript text"
+  const viewport = testState.scrollRef.current!
+  viewport.append(row)
+  document.body.append(viewport)
+  Object.defineProperty(viewport, "scrollHeight", {
+    configurable: true,
+    value: 2000,
+  })
+  Object.defineProperty(viewport, "clientHeight", {
+    configurable: true,
+    value: 400,
+  })
+  viewport.scrollTop = 1600
+  mountThreadAt(400)
+  row.dispatchEvent(new MouseEvent("pointerdown", { button: 0, bubbles: true }))
+  const selection = document.getSelection()!
+  const range = document.createRange()
+  range.selectNodeContents(row)
+  selection.addRange(range)
+  viewport.scrollTop = 1500
+  viewport.dispatchEvent(new Event("scroll"))
+  expect(testState.stopScroll).toHaveBeenCalledTimes(1)
+  selection.removeAllRanges()
+  viewport.remove()
 })
