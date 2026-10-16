@@ -412,18 +412,19 @@ export async function acpSetConfigOption(
   })
 }
 
-/** Pause or clear the session's active Codex goal (codex-acp #293). The backend
- *  sources the sessionId from the live session, so only the connection + action
- *  are needed here. */
+/** Native Goal control. A draft's first Goal binds its pre-created history row
+ * before sending the native RPC; it never sends an ordinary prompt. */
 export async function acpGoalControl(
   connectionId: string,
   action: "set" | "pause" | "resume" | "clear",
-  objective?: string
+  objective?: string,
+  conversationId?: number
 ): Promise<void> {
   return getTransport().call("acp_goal_control", {
     connectionId,
     action,
     objective,
+    conversationId,
   })
 }
 

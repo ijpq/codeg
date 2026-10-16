@@ -3162,6 +3162,18 @@ impl ConnectionManager {
         action: GoalControlAction,
         objective: Option<String>,
     ) -> Result<(), AcpError> {
+        self.goal_control_for_conversation(db, conn_id, action, objective, None)
+            .await
+    }
+
+    pub async fn goal_control_for_conversation(
+        &self,
+        db: &DatabaseConnection,
+        conn_id: &str,
+        action: GoalControlAction,
+        objective: Option<String>,
+        conversation_id: Option<i32>,
+    ) -> Result<(), AcpError> {
         let (cmd_tx, agent_type, state_arc) = {
             let connections = self.connections.lock().await;
             let conn = connections
@@ -3175,16 +3187,76 @@ impl ConnectionManager {
         }
         if let Some(actions) = state_arc.read().await.goal_actions.as_ref() {
             let wire_action = serde_json::to_value(action).unwrap();
-            if !actions.iter().any(|item| Some(item.as_str()) == wire_action.as_str()) {
-                return Err(AcpError::protocol("Goal action is not supported by this adapter"));
+            if !actions
+                .iter()
+                .any(|item| Some(item.as_str()) == wire_action.as_str())
+            {
+                return Err(AcpError::protocol(
+                    "Goal action is not supported by this adapter",
+                ));
             }
         } else if matches!(action, GoalControlAction::Set | GoalControlAction::Resume) {
             return Err(AcpError::protocol("Goal capabilities are not known yet"));
         }
+        // Share the prompt/fork lock only for starts. Pause/clear must remain
+        // out of band so they can stop work while another request owns it.
+        let _start_guard = if matches!(action, GoalControlAction::Set | GoalControlAction::Resume) {
+            Some(self.clone_prompt_lock(conn_id).await?.lock_owned().await)
+        } else {
+            None
+        };
         if matches!(action, GoalControlAction::Set | GoalControlAction::Resume) {
             let state = state_arc.read().await;
             if state.goal_active || state.turn_in_flight {
-                return Err(AcpError::protocol("Stop the current work before starting or resuming a goal"));
+                return Err(AcpError::protocol(
+                    "Stop the current work before starting or resuming a goal",
+                ));
+            }
+            if let Some(cid) = conversation_id {
+                if state.conversation_id.is_some_and(|bound| bound != cid) {
+                    return Err(AcpError::protocol(
+                        "Goal connection belongs to another conversation",
+                    ));
+                }
+                if state.conversation_id.is_none() {
+                    let sid = state
+                        .external_id
+                        .clone()
+                        .ok_or_else(|| AcpError::protocol("Goal session is not ready"))?;
+                    drop(state);
+                    let row = conversation_service::get_by_id(db, cid)
+                        .await
+                        .map_err(|error| AcpError::protocol(error.to_string()))?;
+                    if row.agent_type != agent_type {
+                        return Err(AcpError::protocol(
+                            "Goal conversation is not available for this agent",
+                        ));
+                    }
+                    if row
+                        .external_id
+                        .as_deref()
+                        .is_some_and(|existing| existing != sid)
+                    {
+                        return Err(AcpError::protocol(
+                            "Goal conversation belongs to another native session",
+                        ));
+                    }
+                    conversation_service::bind_external_id(db, cid, &sid, &[])
+                        .await
+                        .map_err(|error| AcpError::protocol(error.to_string()))?;
+                    self.bind_connection_to_conversation(conn_id, cid, row.folder_id)
+                        .await?;
+                    let emitter = {
+                        let connections = self.connections.lock().await;
+                        connections
+                            .get(conn_id)
+                            .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?
+                            .emitter
+                            .clone()
+                    };
+                    crate::commands::conversations::emit_conversation_upsert(&emitter, db, cid)
+                        .await;
+                }
             }
         }
         // Read the goal state as it was when the user clicked — reading it after
@@ -3212,9 +3284,13 @@ impl ConnectionManager {
             return Ok(());
         };
         if !matches!(reply_rx.await, Ok(true)) {
-            return Err(AcpError::protocol("The adapter did not confirm the goal action"));
+            return Err(AcpError::protocol(
+                "The adapter did not confirm the goal action",
+            ));
         }
-        if !interrupts { return Ok(()); }
+        if !interrupts {
+            return Ok(());
+        }
         tracing::info!(
             "[ACP] goal {:?} landed; interrupting so the work stops now connection={}",
             action,
@@ -8738,6 +8814,95 @@ mod tests {
         mgr.goal_control_with_objective(&db.conn, "goal-create", GoalControlAction::Set, Some("  ship  ".into())).await.unwrap();
         let mut rx = responder.await.unwrap();
         assert!(rx.try_recv().is_err(), "creating a goal must not cancel it");
+    }
+
+    #[tokio::test]
+    async fn first_goal_binds_durable_history_before_native_work_without_a_prompt() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let folder = crate::db::test_helpers::seed_folder(&db, "/tmp/goal-draft").await;
+        let row = conversation_service::create(&db.conn, folder, AgentType::Codex, None, None)
+            .await
+            .unwrap();
+        let cid = row.id;
+        let mgr = ConnectionManager::new();
+        let mut rx = insert_live_connection(&mgr, "goal-draft", AgentType::Codex, None).await;
+        let state = mgr.get_state("goal-draft").await.unwrap();
+        {
+            let mut state = state.write().await;
+            state.goal_actions = Some(vec!["set".into()]);
+            state.external_id = Some("native-goal-draft".into());
+        }
+        let db_copy = db.conn.clone();
+        let responder = tokio::spawn(async move {
+            let Some(ConnectionCommand::GoalControl { action, reply, .. }) = rx.recv().await else {
+                panic!("native Goal command, never a prompt")
+            };
+            assert_eq!(action, GoalControlAction::Set);
+            assert_eq!(state.read().await.conversation_id, Some(cid));
+            assert_eq!(state.read().await.folder_id, Some(folder));
+            assert_eq!(
+                conversation_service::get_by_id(&db_copy, cid)
+                    .await
+                    .unwrap()
+                    .external_id
+                    .as_deref(),
+                Some("native-goal-draft")
+            );
+            reply.unwrap().send(true).unwrap();
+            rx
+        });
+        mgr.goal_control_for_conversation(
+            &db.conn,
+            "goal-draft",
+            GoalControlAction::Set,
+            Some("ship".into()),
+            Some(cid),
+        )
+        .await
+        .unwrap();
+        assert!(responder.await.unwrap().try_recv().is_err());
+        assert_eq!(count_conversation_rows(&db).await, 1);
+    }
+
+    #[tokio::test]
+    async fn first_goal_cannot_repoint_another_sessions_history() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let folder = crate::db::test_helpers::seed_folder(&db, "/tmp/goal-owner").await;
+        let row = conversation_service::create(&db.conn, folder, AgentType::Codex, None, None)
+            .await
+            .unwrap();
+        conversation_service::bind_external_id(&db.conn, row.id, "previous-session", &[])
+            .await
+            .unwrap();
+        let mgr = ConnectionManager::new();
+        let mut rx = insert_live_connection(&mgr, "goal-owner", AgentType::Codex, None).await;
+        let state = mgr.get_state("goal-owner").await.unwrap();
+        {
+            let mut state = state.write().await;
+            state.goal_actions = Some(vec!["set".into()]);
+            state.external_id = Some("different-session".into());
+        }
+        let error = mgr
+            .goal_control_for_conversation(
+                &db.conn,
+                "goal-owner",
+                GoalControlAction::Set,
+                Some("ship".into()),
+                Some(row.id),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("another native session"));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(state.read().await.conversation_id, None);
+        assert_eq!(
+            conversation_service::get_by_id(&db.conn, row.id)
+                .await
+                .unwrap()
+                .external_id
+                .as_deref(),
+            Some("previous-session")
+        );
     }
 
     #[tokio::test]

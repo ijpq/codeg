@@ -8,6 +8,8 @@
   collaboration mode and Goal RPCs, with an objective, status, pause, resume
   and end controls. Leaving an active Goal awaits a confirmed pause and stops
   its current work; selecting Goal alone never starts or resumes it.
+- Bind a draft's first Goal to durable conversation history before native
+  work starts, and isolate read-only child transcripts from parent controls.
 - Share the transcript scroll target, prevent virtual row compensation from
   falsely escaping the follow lock, and terminate unreachable-sentinel retries.
   Preserve virtualization, delayed-content following and deliberate reader escape.
@@ -20,7 +22,7 @@
   both packages, rejecting missing external redistributables before publication.
 
 See [release notes](docs/releases/v0.35.2-fix1.md) for native protocol behavior
-  and validation details.
+and validation details.
 
 ## 0.35.1-fix2 — 2026-10-13
 

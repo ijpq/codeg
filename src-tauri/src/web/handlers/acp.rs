@@ -493,6 +493,7 @@ pub struct AcpGoalControlParams {
     pub connection_id: String,
     pub action: crate::acp::connection::GoalControlAction,
     pub objective: Option<String>,
+    pub conversation_id: Option<i32>,
 }
 
 pub async fn acp_goal_control(
@@ -501,7 +502,13 @@ pub async fn acp_goal_control(
 ) -> Result<Json<()>, AppCommandError> {
     let manager = &state.connection_manager;
     manager
-        .goal_control_with_objective(&state.db.conn, &params.connection_id, params.action, params.objective)
+        .goal_control_for_conversation(
+            &state.db.conn,
+            &params.connection_id,
+            params.action,
+            params.objective,
+            params.conversation_id,
+        )
         .await
         .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
     Ok(Json(()))

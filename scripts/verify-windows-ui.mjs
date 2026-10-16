@@ -355,6 +355,11 @@ async function importAndOpen(api, f) {
   const conversations = await api("list_all_conversations")
   const conversation = conversations.find((c) => c.external_id === f.id)
   assert.ok(conversation, "Fixture session was not imported")
+  if (goalModel)
+    await api("update_folder_default_agent", {
+      folderId: conversation.folder_id,
+      defaultAgentType: "codex",
+    })
   const tabs = await api("list_opened_tabs")
   const saved = await api("save_opened_tabs", {
     expectedVersion: tabs.version,
@@ -619,6 +624,130 @@ async function nativeGoalPage(page, api, f, conversation, name) {
     throw error
   }
 }
+
+async function nativeDraftGoalPage(page, api, name) {
+  if (!goalModel) return
+  const before = new Set(
+    (await api("list_all_conversations")).map((row) => row.id)
+  )
+  const until = async (read, accepts, label) => {
+    let value
+    for (let i = 0; i < 600; i++) {
+      value = await read()
+      if (accepts(value)) return value
+      await delay(100)
+    }
+    throw Error(`${name}: draft ${label}: ${JSON.stringify(value)}`)
+  }
+  try {
+    await page
+      .locator(".tab-strip-tail")
+      .getByRole("button", {
+        name: /^(New Conversation|新建会话|新增會話)$/,
+      })
+      .first()
+      .click()
+    const trigger = () =>
+      page
+        .getByRole("button", {
+          name: /^(Execution|执行方式|執行方式):/,
+        })
+        .last()
+    await trigger().waitFor({ timeout: 90_000 })
+    await trigger().click()
+    const dialog = () =>
+      page.getByRole("dialog").filter({
+        has: page.getByRole("radiogroup", {
+          name: /^(Execution|执行方式|執行方式)$/,
+        }),
+      })
+    const goalChoice = dialog().getByRole("radio", {
+      name: /^(Execute goal|目标执行|目標執行)$/,
+    })
+    await until(() => goalChoice.isEnabled(), Boolean, "Goal capability")
+    await goalChoice.click()
+    const objective = `${name}: first Goal ${randomUUID()}`
+    await dialog().locator("textarea").fill(objective)
+    await dialog()
+      .getByRole("button", { name: /^(Start goal|开始目标|開始目標)$/ })
+      .click()
+    const row = await until(
+      () => api("list_all_conversations"),
+      (rows) => rows.some((row) => !before.has(row.id) && row.external_id),
+      "durable conversation"
+    ).then((rows) => rows.find((row) => !before.has(row.id) && row.external_id))
+    const connection = await until(
+      () =>
+        api("acp_find_connection_for_conversation", {
+          conversationId: row.id,
+          agentType: "codex",
+        }),
+      (value) => value?.connection_id,
+      "bound live connection"
+    )
+    const goal = () =>
+      api("acp_get_goal_state", { connectionId: connection.connection_id })
+    await until(
+      goal,
+      (value) => value.goal?.objective === objective,
+      "native objective"
+    )
+    await page
+      .getByText("SYNTHETIC NATIVE GOAL RESPONSE", { exact: true })
+      .first()
+      .waitFor({ timeout: 60_000 })
+    // The welcome composer hands off to the transcript's dock after binding.
+    // That replacement may close its popover; use the new real composer.
+    if (!(await dialog().isVisible())) await trigger().click()
+    await dialog()
+      .getByRole("button", { name: /^(Pause|暂停|暫停)$/ })
+      .click()
+    await until(goal, (value) => value.goal?.status === "paused", "pause")
+    await page.keyboard.press("Escape")
+    await page
+      .getByText("SYNTHETIC NATIVE GOAL RESPONSE", { exact: true })
+      .first()
+      .waitFor({ timeout: 60_000 })
+    const detail = await until(
+      () =>
+        api("get_folder_conversation", {
+          conversationId: row.id,
+          userTurnLimit: 25,
+        }),
+      (value) =>
+        JSON.stringify(value).includes("SYNTHETIC NATIVE GOAL RESPONSE"),
+      "persisted native output"
+    )
+    assert.equal(detail.summary.external_id, row.external_id)
+    await trigger().click()
+    await dialog()
+      .getByRole("button", { name: /^(End goal|结束目标|結束目標)$/ })
+      .click()
+    await until(goal, (value) => value.goal === null, "ended")
+    await page.keyboard.press("Escape")
+    await page.reload()
+    await page
+      .getByText("SYNTHETIC NATIVE GOAL RESPONSE", { exact: true })
+      .first()
+      .waitFor({ timeout: 60_000 })
+    await page.screenshot({
+      path: join(output, `${name}-draft-goal-restored.png`),
+    })
+    report.checks.push({
+      name: `${name}-draft-native-goal-history`,
+      passed: true,
+      conversationId: row.id,
+      nativeSessionId: row.external_id,
+      outputVisible: true,
+      restoredAfterReload: true,
+    })
+  } catch (error) {
+    await page
+      .screenshot({ path: join(output, `${name}-draft-goal-failure.png`) })
+      .catch(() => {})
+    throw error
+  }
+}
 try {
   const f = await fixture("setup-upgrade")
   const installation = join(output, "upgraded-installation")
@@ -655,6 +784,7 @@ try {
     )
     await actualPage(app.page, "upgraded-frontend", options.baseline !== "true")
     await nativeGoalPage(app.page, desktopApi(app.page), f, saved, "setup")
+    await nativeDraftGoalPage(app.page, desktopApi(app.page), "setup")
     if (options.baseline !== "true") {
       const migration = JSON.parse(
         execFileSync(
@@ -732,6 +862,7 @@ try {
     await page.goto(`http://127.0.0.1:${port}/workspace`)
     await actualPage(page, "server-web-frontend", options.baseline !== "true")
     await nativeGoalPage(page, api, s, conversation, "server-web")
+    await nativeDraftGoalPage(page, api, "server-web")
     if (options.baseline !== "true")
       report.checks.push({
         name: "server-migrations",

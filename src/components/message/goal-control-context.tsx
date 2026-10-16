@@ -22,6 +22,8 @@ export const NO_GOAL_ACTIONS: readonly string[] = []
 export interface GoalControlValue {
   connectionId?: string | null
   readOnly?: boolean
+  /** Bind a draft to durable history before its first native Goal can work. */
+  startGoal?: (objective: string) => Promise<void>
   /**
    * Fire a pause/clear on the session's currently active goal, or `null`
    * when goal control isn't available for this surface — a history reload with
