@@ -4,6 +4,7 @@ import { NextIntlClientProvider } from "next-intl"
 import { MessageThread } from "../../src/components/ai-elements/message-thread"
 import { VirtualizedMessageThread } from "../../src/components/message/virtualized-message-thread"
 import { MessageBottomFollowGuard } from "../../src/components/message/message-bottom-follow-guard"
+import { useStickToBottomContext } from "use-stick-to-bottom"
 import messages from "../../src/i18n/messages/en.json"
 import "../../src/app/globals.css"
 
@@ -12,6 +13,7 @@ declare global {
     scrollFixture: {
       change: (state: Partial<State>) => void
       writes: Array<{ top: number; stack: string }>
+      debug?: () => unknown
     }
   }
 }
@@ -24,6 +26,11 @@ type State = {
   scale: number
   smooth: boolean
 }
+function Probe() {
+  const { state } = useStickToBottomContext()
+  useEffect(() => { if (window.scrollFixture) window.scrollFixture.debug = () => ({isAtBottom: state.isAtBottom, escaped: state.escapedFromLock, target: state.targetScrollTop, resize: state.resizeDifference, animation: state.animation?.behavior}) })
+  return null
+}
 function Fixture() {
   const [state, set] = useState<State>({
     count: 2000,
@@ -35,7 +42,8 @@ function Fixture() {
     smooth: false,
   })
   useEffect(() => {
-    const writes: Array<{ top: number; stack: string }> = []
+    const writes: Array<{ top: number; stack: string }>
+      debug?: () => unknown = []
     window.scrollFixture = {
       change: (next) => set((current) => ({ ...current, ...next })),
       writes,
@@ -75,7 +83,8 @@ function Fixture() {
           className="min-h-0 flex-1"
           resize={state.smooth ? "smooth" : "instant"}
         >
-          <MessageBottomFollowGuard
+          <Probe />
+        <MessageBottomFollowGuard
             scopeKey="browser-fixture"
             layoutSignal={JSON.stringify(state)}
           />

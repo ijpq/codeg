@@ -99,6 +99,8 @@ const browser = remote
       headless: true,
     })
 const results = []
+const failures = []
+let testPage
 try {
   const context = remote
     ? browser.contexts()[0]
@@ -107,6 +109,7 @@ try {
         deviceScaleFactor: 1.25,
       })
   const page = await context.newPage()
+  testPage = page
   const errors = []
   page.on("pageerror", (error) => errors.push(String(error)))
   await page.goto(`http://127.0.0.1:${port}`)
@@ -123,6 +126,8 @@ try {
       const vr = v.getBoundingClientRect(),
         lr = line?.getBoundingClientRect()
       return {
+        debug: window.scrollFixture.debug?.(),
+        following: v.dataset.bottomFollowing,
         top: v.scrollTop,
         height: v.scrollHeight,
         viewport: v.clientHeight,
@@ -146,16 +151,20 @@ try {
       Math.min(...samples.map((x) => x.top))
     const last = samples.at(-1)
     results.push({ name, spread, samples })
-    assert.ok(spread <= 1, `${name}: unstable scroll ${spread}px`)
-    assert.ok(last.remaining <= 2, `${name}: tail gap ${last.remaining}px`)
-    assert.ok(
-      last.lineBottom <= last.viewportBottom + 1,
-      `${name}: final line clipped`
-    )
-    assert.ok(
-      last.rendered < 80,
-      `${name}: virtualization lost (${last.rendered})`
-    )
+    try {
+      assert.ok(spread <= 1, `${name}: unstable scroll ${spread}px`)
+      assert.ok(last.remaining <= 2, `${name}: tail gap ${last.remaining}px`)
+      assert.ok(
+        last.lineBottom <= last.viewportBottom + 1,
+        `${name}: final line clipped`
+      )
+      assert.ok(
+        last.rendered < 80,
+        `${name}: virtualization lost (${last.rendered})`
+      )
+    } catch (error) {
+      failures.push(String(error))
+    }
   }
   for (const scale of [1, 1.25, 1.5, 1.75, 2]) {
     await change({ scale, lines: 50, smooth: false })
@@ -182,11 +191,15 @@ try {
     await change({ lines: 85, dock: 200 })
     const after = await geometry()
     results.push({ name: `reader-escape-${scale}`, before, after })
-    assert.ok(after.remaining > 100, "reader was pulled back to the bottom")
-    assert.ok(
-      Math.abs(after.top - before.top) < 3,
-      "reader's position was changed"
-    )
+    try {
+      assert.ok(after.remaining > 100, "reader was pulled back to the bottom")
+      assert.ok(
+        Math.abs(after.top - before.top) < 3,
+        "reader's position was changed"
+      )
+    } catch (error) {
+      failures.push(String(error))
+    }
     // Re-arm using the same explicit action as the scroll-to-bottom button.
     await page.evaluate(() => {
       const v = document.querySelector(".chat-scroll-port")
@@ -204,11 +217,23 @@ try {
   }
   assert.deepEqual(errors, [])
   await page.screenshot({ path: join(output, "transcript.png") })
+  if (failures.length) throw new Error(failures.join("\n"))
   await page.close()
 } finally {
   await writeFile(
     join(output, "scroll-results.json"),
-    JSON.stringify({ baseline, results }, null, 2)
+    JSON.stringify(
+      {
+        baseline,
+        failures,
+        results,
+        writes: await testPage
+          ?.evaluate(() => window.scrollFixture?.writes)
+          .catch(() => null),
+      },
+      null,
+      2
+    )
   )
   await browser.close()
   server.close()
