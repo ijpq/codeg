@@ -27,6 +27,7 @@ import { useConnectionLifecycle } from "@/hooks/use-connection-lifecycle"
 import { useConversationDetail } from "@/hooks/use-conversation-detail"
 import {
   acpStopAsyncTask,
+  acpGoalControl,
   createChatConversation,
   createConversation,
   createChatDir,
@@ -796,6 +797,79 @@ export function CanvasConversationSurface({
   const isDraft = dbConversationId == null
 
   const goalActions = useAdvertisedGoalActions(conn.connectionId, connStatus)
+  const handleStartGoal = useCallback(
+    async (objective: string) => {
+      if (
+        !conn.connectionId ||
+        !conn.promptReady ||
+        connIsForOtherAgent ||
+        conn.isViewer ||
+        connStatus !== "connected"
+      )
+        throw new Error("Goal session is not ready")
+      const existingId = dbConversationIdRef.current
+      if (existingId != null) {
+        await acpGoalControl(conn.connectionId, "set", objective, existingId)
+        return
+      }
+      if (!draftTarget || creatingRef.current)
+        throw new Error("Conversation creation is not ready")
+      creatingRef.current = true
+      setCreating(true)
+      try {
+        const title = objective.slice(0, 120)
+        let newId: number
+        let goalFolderId: number
+        if (draftTarget.kind === "chat") {
+          const created = await createChatConversation(
+            agentType,
+            title,
+            chatDirRef.current ?? undefined
+          )
+          newId = created.conversationId
+          goalFolderId = created.folderId
+          upsertFolder(created.folder)
+        } else {
+          newId = await createConversation(
+            draftTarget.folderId,
+            agentType,
+            title
+          )
+          goalFolderId = draftTarget.folderId
+        }
+        try {
+          await acpGoalControl(conn.connectionId, "set", objective, newId)
+        } finally {
+          dbConversationIdRef.current = newId
+          setExternalId(effectiveConversationId, connSessionId ?? null)
+          setDbConversationId(effectiveConversationId, newId)
+          setCreatedConversationId(newId)
+          setSendSignal((previous) => previous + 1)
+          refreshConversations()
+          onConversationCreated?.(newId, goalFolderId)
+        }
+      } finally {
+        creatingRef.current = false
+        setCreating(false)
+      }
+    },
+    [
+      conn.connectionId,
+      conn.promptReady,
+      conn.isViewer,
+      connIsForOtherAgent,
+      connStatus,
+      draftTarget,
+      agentType,
+      upsertFolder,
+      effectiveConversationId,
+      connSessionId,
+      setExternalId,
+      setDbConversationId,
+      refreshConversations,
+      onConversationCreated,
+    ]
+  )
   const goalControlValue = useMemo<GoalControlValue>(() => {
     const live =
       Boolean(conn.connectionId) &&
@@ -805,6 +879,7 @@ export function CanvasConversationSurface({
     return {
       connectionId: connIsForOtherAgent ? null : conn.connectionId,
       readOnly: !live,
+      startGoal: handleStartGoal,
       actions: goalActions,
       onGoalControl: live
         ? (action) => {
@@ -820,6 +895,7 @@ export function CanvasConversationSurface({
     goalActions,
     acpActions,
     contextKey,
+    handleStartGoal,
   ])
 
   return (
