@@ -1,6 +1,7 @@
 "use client"
 
 import { createContext, useContext } from "react"
+import type { SessionGoalState } from "@/lib/api"
 
 export type GoalControlAction = "pause" | "clear"
 
@@ -24,6 +25,8 @@ export interface GoalControlValue {
   readOnly?: boolean
   /** Bind a draft to durable history before its first native Goal can work. */
   startGoal?: (objective: string) => Promise<void>
+  /** Observe authoritative native state for the out-of-prompt transcript. */
+  onGoalSnapshot?: (snapshot: SessionGoalState) => void
   /**
    * Fire a pause/clear on the session's currently active goal, or `null`
    * when goal control isn't available for this surface — a history reload with
