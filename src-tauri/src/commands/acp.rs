@@ -12823,10 +12823,19 @@ pub async fn acp_goal_control(
     connection_id: String,
     action: crate::acp::connection::GoalControlAction,
     objective: Option<String>,
+    conversation_id: Option<i32>,
     db: State<'_, AppDatabase>,
     manager: State<'_, ConnectionManager>,
 ) -> Result<(), AcpError> {
-    manager.goal_control_with_objective(&db.conn, &connection_id, action, objective).await
+    manager
+        .goal_control_for_conversation(
+            &db.conn,
+            &connection_id,
+            action,
+            objective,
+            conversation_id,
+        )
+        .await
 }
 
 /// Spawn a transient ACP connection for `agent_type` with a silent emitter,

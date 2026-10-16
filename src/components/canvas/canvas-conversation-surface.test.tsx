@@ -15,6 +15,10 @@
 import { act, cleanup, render } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import type { AcpAgentInfo, PromptDraft } from "@/lib/types"
+import {
+  useGoalControl,
+  type GoalControlValue,
+} from "@/components/message/goal-control-context"
 
 vi.mock("next-intl", () => ({
   useTranslations: () => (key: string) => key,
@@ -22,10 +26,12 @@ vi.mock("next-intl", () => ({
 
 const shell = vi.hoisted(() => ({
   props: null as Record<string, unknown> | null,
+  goal: null as GoalControlValue | null,
 }))
 vi.mock("@/components/chat/conversation-shell", () => ({
   ConversationShell: (props: Record<string, unknown>) => {
     shell.props = props
+    shell.goal = useGoalControl()
     return <>{props.children as React.ReactNode}</>
   },
 }))
@@ -106,6 +112,7 @@ vi.mock("@/hooks/use-acp-agents", () => ({
 }))
 
 const api = vi.hoisted(() => ({
+  acpGoalControl: vi.fn(),
   acpStopAsyncTask: vi.fn(),
   acpGetSessionSnapshot: vi.fn().mockResolvedValue({ goal_actions: [] }),
   createChatConversation: vi.fn(),
@@ -173,6 +180,7 @@ function agent(
 function connection(agentType: string, status: string) {
   return {
     connectionId: `${agentType}-conn`,
+    promptReady: status === "connected" || status === "prompting",
     agentType,
     status,
     sessionId: `${agentType}-session`,
@@ -210,6 +218,7 @@ describe("a draft card whose connection still belongs to the previous agent", ()
     lifecycle.handleSend.mockReset()
     api.createConversation.mockReset()
     api.createChatConversation.mockReset()
+    api.acpGoalControl.mockReset()
     prefs.saveModePreference.mockReset()
   })
   afterEach(() => cleanup())
@@ -270,6 +279,57 @@ describe("a draft card whose connection still belongs to the previous agent", ()
 
     expect(api.createConversation).not.toHaveBeenCalled()
     expect(api.createChatConversation).not.toHaveBeenCalled()
+    expect(lifecycle.handleSend).not.toHaveBeenCalled()
+  })
+
+  it("refuses to start a Goal on the previous agent's connection", async () => {
+    lifecycle.conn = connection("claude_code", "connected")
+    renderDraftCard()
+    expect(shell.goal?.connectionId).toBeNull()
+    expect(shell.goal?.readOnly).toBe(true)
+    await expect(shell.goal!.startGoal!("ship")).rejects.toThrow("not ready")
+    expect(api.createConversation).not.toHaveBeenCalled()
+    expect(api.acpGoalControl).not.toHaveBeenCalled()
+  })
+
+  it("binds a first Goal to durable history before handing off the draft, without a prompt", async () => {
+    api.createConversation.mockResolvedValue(42)
+    lifecycle.conn = connection("codex", "connected")
+    let confirm!: () => void
+    api.acpGoalControl.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          confirm = resolve
+        })
+    )
+    const created = vi.fn()
+    render(
+      <CanvasConversationSurface
+        contextKey="canvas-goal-draft"
+        conversationId={null}
+        agentType="codex"
+        draftTarget={{ kind: "folder", folderId: 7, workingDir: "/tmp/proj" }}
+        onConversationCreated={created}
+        isActive
+      />
+    )
+    let starting!: Promise<void>
+    await act(async () => {
+      starting = shell.goal!.startGoal!("ship verified changes")
+      await Promise.resolve()
+    })
+    expect(api.acpGoalControl).toHaveBeenCalledWith(
+      "codex-conn",
+      "set",
+      "ship verified changes",
+      42
+    )
+    expect(created).not.toHaveBeenCalled()
+    await act(async () => {
+      confirm()
+      await starting
+    })
+    expect(created).toHaveBeenCalledWith(42, 7)
     expect(lifecycle.handleSend).not.toHaveBeenCalled()
   })
 

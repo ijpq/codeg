@@ -104,6 +104,7 @@ import { ChromeReserve } from "@/components/layout/chrome-reserve"
 import { leftChromeReserve, rightChromeReserve } from "@/lib/window-chrome"
 import {
   acpFork,
+  acpGoalControl,
   acpStopAsyncTask,
   createConversationBranch,
   createChatConversation,
@@ -2617,14 +2618,92 @@ const ConversationTabView = memo(function ConversationTabView({
   // isn't decided until that response lands.
   const goalActions = useAdvertisedGoalActions(conn.connectionId, connStatus)
 
+  const handleStartGoal = useCallback(
+    async (objective: string) => {
+      if (!conn.connectionId || !connectionReady || conn.isViewer)
+        throw new Error("Goal session is not ready")
+      if (createConversationPendingRef.current)
+        throw new Error("Conversation creation is already in progress")
+      const existingId = dbConvIdRef.current
+      if (existingId != null) {
+        await acpGoalControl(conn.connectionId, "set", objective, existingId)
+        return
+      }
+      createConversationPendingRef.current = true
+      try {
+        const title = objective.slice(0, 120)
+        const tab = ownTab
+        let newId: number
+        let createdFolder: Awaited<
+          ReturnType<typeof createChatConversation>
+        > | null = null
+        if (tab?.isChat) {
+          createdFolder = await createChatConversation(
+            selectedAgent,
+            title,
+            tab.workingDir
+          )
+          newId = createdFolder.conversationId
+          upsertFolder(createdFolder.folder)
+        } else {
+          newId = await createConversation(folderId, selectedAgent, title)
+        }
+        // Bind the native session before publishing the new tab identity. A
+        // reconnect between row creation and binding could otherwise orphan it.
+        try {
+          await acpGoalControl(conn.connectionId, "set", objective, newId)
+        } finally {
+          dbConvIdRef.current = newId
+          setExternalId(effectiveConversationId, sessionIdRef.current ?? null)
+          setDbConversationId(effectiveConversationId, newId)
+          if (mountedRef.current) {
+            setCreatedConversationId(newId)
+            setHasSentMessage(true)
+            setSendSignal((previous) => previous + 1)
+            bindConversationTab(
+              tabId,
+              newId,
+              selectedAgent,
+              title,
+              effectiveConversationId,
+              createdFolder?.folderId,
+              createdFolder?.folder.path
+            )
+          } else setPendingCleanup(effectiveConversationId, true)
+          refreshConversations()
+        }
+      } finally {
+        createConversationPendingRef.current = false
+      }
+    },
+    [
+      conn.connectionId,
+      conn.isViewer,
+      connectionReady,
+      tabId,
+      ownTab,
+      selectedAgent,
+      folderId,
+      upsertFolder,
+      effectiveConversationId,
+      setExternalId,
+      setDbConversationId,
+      bindConversationTab,
+      setPendingCleanup,
+      refreshConversations,
+    ]
+  )
+
   const goalControlValue = useMemo<GoalControlValue>(() => {
     const live =
       conn.connectionId !== null &&
       (connStatus === "connected" || connStatus === "prompting") &&
-      !conn.isViewer
+      !conn.isViewer &&
+      !connIsForOtherAgent
     return {
-      connectionId: conn.connectionId,
+      connectionId: connIsForOtherAgent ? null : conn.connectionId,
       readOnly: !live,
+      startGoal: handleStartGoal,
       onGoalControl: live
         ? (action) => {
             void acpActions.goalControl(tabId, action)
@@ -2635,10 +2714,12 @@ const ConversationTabView = memo(function ConversationTabView({
   }, [
     conn.connectionId,
     conn.isViewer,
+    connIsForOtherAgent,
     connStatus,
     acpActions,
     tabId,
     goalActions,
+    handleStartGoal,
   ])
 
   // AIR session-failure recovery actions — the buttons on a failed turn's
