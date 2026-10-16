@@ -221,11 +221,13 @@ const EscapeLockOnUserScroll = () => {
     const onPointerEnd = () => {
       draggingScrollbar = false
     }
-    // virtua preserves the visible row with fractional scroll offsets. The
-    // library's rounded max - 1 target can then move up by less than a CSS
-    // pixel, which its direction-only detector mistakes for a reader escape.
-    // Shield just this rounding correction before that listener runs. Real
-    // wheel/touch/key/scrollbar intent above still releases the lock directly.
+    // virtua's measured offsets and the library's rounded target can differ.
+    // A pending programmatic target may even exceed the new physical end after
+    // row remeasurement. The library compares that stale target in a timeout
+    // and falsely escapes although the viewport has already reached the tail.
+    // Shield geometry corrections within its existing near-bottom lock (and
+    // subpixel compensation). Explicit input above still escapes immediately,
+    // including a scrollbar drag whose scroll listener calls stopScroll below.
     const onScrollCapture = () => {
       const { scrollTop } = viewport
       const delta =
