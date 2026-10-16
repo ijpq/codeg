@@ -726,6 +726,11 @@ async function nativeDraftGoalPage(page, api, name) {
     await until(goal, (value) => value.goal === null, "ended")
     await page.keyboard.press("Escape")
     await page.reload()
+    const restoredTab = page.locator(
+      `[data-tab-id="conv-${row.folder_id}-codex-${row.id}"] [role="tab"]`
+    )
+    await restoredTab.waitFor({ timeout: 30_000 })
+    await restoredTab.click()
     await page
       .getByText("SYNTHETIC NATIVE GOAL RESPONSE", { exact: true })
       .first()
