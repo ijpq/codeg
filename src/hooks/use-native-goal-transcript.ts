@@ -47,11 +47,7 @@ export function useNativeGoalTranscript(
   )
 
   useEffect(() => {
-    if (
-      !active ||
-      !connectionId ||
-      observed?.connectionId !== connectionId
-    )
+    if (!active || !connectionId || observed?.connectionId !== connectionId)
       return
     const key = `${connectionId}:${conversationId}`
     const last = previous.current
