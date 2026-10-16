@@ -212,6 +212,31 @@ try {
     } catch (error) {
       failures.push(String(error))
     }
+    for (const [index, key] of ["PageUp", "Control+Home"].entries()) {
+      await page.evaluate(() => {
+        const viewport = document.querySelector(".chat-scroll-port")
+        viewport.scrollTop = viewport.scrollHeight
+        viewport.tabIndex = 0
+        viewport.focus({ preventScroll: true })
+      })
+      await page.waitForTimeout(200)
+      await page.keyboard.press(key)
+      await page.waitForTimeout(250)
+      const before = await geometry()
+      await change({ lines: 95 + index * 10, dock: 220 + index * 20 })
+      const after = await geometry()
+      results.push({ name: `keyboard-${key}-${scale}`, before, after })
+      try {
+        assert.ok(before.remaining > 100, `${key}: did not scroll up`)
+        assert.ok(after.remaining > 100, `${key}: reader pulled to bottom`)
+        assert.ok(
+          Math.abs(after.top - before.top) < 3,
+          `${key}: reader's position changed after resize`
+        )
+      } catch (error) {
+        failures.push(String(error))
+      }
+    }
     // Re-arm using the same explicit action as the scroll-to-bottom button.
     await page.evaluate(() => {
       const v = document.querySelector(".chat-scroll-port")
