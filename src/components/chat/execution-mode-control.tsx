@@ -111,7 +111,7 @@ function ExecutionModeSession({
     let cancelled = false
     let timer: ReturnType<typeof setTimeout>
     // A small projection also recovers externally-created/restored goals.
-    // No transcript polling, overlapping polls, or background-tab traffic.
+    // Status reads do not overlap or run in background tabs.
     const read = async () => {
       try {
         if (document.visibilityState !== "hidden") await refresh()
