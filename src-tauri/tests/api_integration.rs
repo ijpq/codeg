@@ -517,6 +517,7 @@ async fn get_folder_conversation_accepts_turn_window_params() {
     assert_eq!(body["user_turns_before_offset"], 0);
     assert!(body["prefix_hash"].is_string());
     assert!(body["prefix_hash_before_index"].is_string());
+    let window_prefix_hash = body["prefix_hash"].clone();
 
     // The navigator's outline of the history above the window: the prefix it
     // covers fingerprints like the window's own prefix hash.

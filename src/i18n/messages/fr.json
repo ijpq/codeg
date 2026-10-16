@@ -3300,7 +3300,7 @@
         "plan": "Plan first",
         "goal": "Execute goal",
         "switchHint": "Switching to Direct or Plan pauses an active goal first. Returning here does not resume it; use Resume explicitly. End clears the native goal and stops its work.",
-        "unsupported": "Goal execution needs an adapter advertising set, pause, resume and clear. Connect or update Codex ACP to enable it.",
+        "unsupported": "Goal execution requires verified native controls and status reporting. Connect a supported Codex ACP adapter to enable it.",
         "stateUnavailable": "Cannot read the current goal. The execution mode was not changed.",
         "objective": "Goal objective",
         "status": "Status",

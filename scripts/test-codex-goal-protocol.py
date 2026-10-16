@@ -7,6 +7,7 @@ and a newer CLI so capability drift is observable in CI.
 import argparse
 import importlib.util
 import json
+import re
 from pathlib import Path
 import time
 
@@ -33,15 +34,26 @@ def main():
     if args.enable_goals:
         with (home / "config.toml").open("a") as config:
             config.write("\n[features]\ngoals = true\n")
-    command = [str(args.acp.resolve())]
-    if args.acp.suffix == ".js":
-        command.insert(0, "node")
-    rpc = h.RPC(command, home, workspace, root / "acp.stderr.log", {"CODEX_PATH": str(args.cli.resolve())})
+    # Exercise the same anchor-verified derived copy as CodeG, leaving the
+    # installed package untouched. Raw ACP 2.2.2 omits the initial Goal snapshot.
+    rust = (Path(__file__).resolve().parents[1] / "src-tauri/src/acp/codex_steer_adapter.rs").read_text()
+    def constant(name):
+        return re.search(r'const ' + name + r': &str = r#"(.*?)"#;', rust, re.S).group(1)
+    source = args.acp.resolve().read_text()
+    for before, after in [(constant("GOAL_SET_ANCHOR"), constant("GOAL_SET_ANCHOR") + constant("GOAL_SET_SUFFIX")),
+                          (constant("GOAL_CAPABILITY_ANCHOR"), constant("GOAL_CAPABILITY_REPLACEMENT"))]:
+        assert source.count(before) == 1, "Published Goal anchor drifted"
+        source = source.replace(before, after, 1)
+    derived = root / "adapter.mjs"
+    derived.write_text(source)
+    rpc = h.RPC(["node", str(derived)], home, workspace, root / "acp.stderr.log",
+                {"CODEX_PATH": str(args.cli.resolve()), "NODE_PATH": str(args.acp.resolve().parents[3])})
     evidence = {}
     try:
         init, _ = rpc.rpc("initialize", {"protocolVersion": 1, "clientInfo": {"name": "codeg-goal-regression", "version": "1"}, "clientCapabilities": {"_meta": {"jetbrains": {"air": {"version": 1}}}}})
         advertised = init.get("_meta", {}).get("jetbrains", {}).get("air", {}).get("goal", {})
         assert set(advertised["actions"]) == {"set", "pause", "resume", "clear"}, advertised
+        assert advertised["codegNativeGoalSnapshot"] == 1
         session, _ = rpc.rpc("session/new", {"cwd": str(workspace), "mcpServers": []})
         sid = session["sessionId"]
         plan, _ = rpc.rpc("session/set_config_option", {"sessionId": sid, "configId": "collaboration_mode", "value": "plan"})
@@ -54,6 +66,9 @@ def main():
                 params["objective"] = "Exercise native goal controls on synthetic data"
             reply, _ = rpc.rpc(method, params, timeout=45)
             assert reply == {}, reply
+            if action == "set":
+                assert any((entry.get("params", {}).get("update", {}).get("_meta", {}).get("jetbrains", {}).get("air", {}).get("goal") or {}).get("status") == "active"
+                           for entry in rpc.notifications), "Creation must publish its native goal before acknowledgement"
             # Pause/clear changes metadata; CodeG must also cancel the native
             # turn. This order is part of the application contract under test.
             if action in ("pause", "clear"):
