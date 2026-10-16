@@ -11,9 +11,14 @@
 - Bind a draft's first Goal to durable conversation history before native
   work starts. Keep restored/shared sessions controllable and isolate
   read-only child transcripts from parent controls.
+- Display native Goal continuations through the bounded transcript reader,
+  coalescing out-of-prompt activity on visible surfaces and draining final
+  records after pause/end. Preserve existing history pages and reader position.
 - Share the transcript scroll target, prevent virtual row compensation from
   falsely escaping the follow lock, and terminate unreachable-sentinel retries.
   Preserve virtualization, delayed-content following and deliberate reader escape.
+- Retain Ctrl/Cmd+Home navigation outside editors while shielding programmatic
+  measurement corrections; cover the shortcuts in real browser regressions.
 - Add native CLI/ACP, browser and Windows WebView2 regressions; verify actual
   packaged Server Web and installed desktop pages plus isolated Setup upgrades.
 - Inventory every packaged frontend resource and verify all compiled database
