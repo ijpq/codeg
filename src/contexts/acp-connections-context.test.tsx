@@ -66,6 +66,8 @@ const h = vi.hoisted(() => {
     acpTouchConnection: vi.fn(),
     acpGetSessionSnapshot: vi.fn(),
     acpCancel: vi.fn(),
+    acpSetConfigOption: vi.fn(),
+    acpGoalControl: vi.fn(),
     buildDelegationSeedEnvelopes: vi.fn(() => []),
     denormalizeSnapshot: vi.fn(),
     // Stable across renders so tests can assert on what the error handler
@@ -157,7 +159,8 @@ vi.mock("@/lib/api", () => ({
   acpGetSessionSnapshot: h.acpGetSessionSnapshot,
   acpPrompt: h.acpPrompt,
   acpSetMode: vi.fn(),
-  acpSetConfigOption: vi.fn(),
+  acpSetConfigOption: h.acpSetConfigOption,
+  acpGoalControl: h.acpGoalControl,
   acpCancel: h.acpCancel,
   acpRespondPermission: vi.fn(),
   acpTouchConnection: h.acpTouchConnection,
@@ -2686,6 +2689,34 @@ describe("AcpConnectionsProvider persisted Codex restore lifecycle", () => {
       await h.actions!.disconnect(CODEX_TAB)
     })
     expect(h.acpDisconnect).not.toHaveBeenCalledWith("other-client-codex")
+  })
+
+  it("co-controls native execution after restore without owning process teardown", async () => {
+    h.acpRestoreConversation.mockResolvedValueOnce({
+      connectionId: "shared-codex-goal",
+      externalSessionId: "sess-1",
+      reusedExisting: true,
+      codegMcpAvailable: true,
+      mcpServerCount: 1,
+      replacedConnectionIds: [],
+    })
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(CODEX_TAB, "codex", "/tmp/x", "sess-1", 42)
+      await h.actions!.setConfigOption(CODEX_TAB, "collaboration_mode", "plan")
+      await h.actions!.goalControl(CODEX_TAB, "pause")
+    })
+    expect(h.store!.getConnection(CODEX_TAB)?.isViewer).toBe(true)
+    expect(h.acpSetConfigOption).toHaveBeenCalledWith(
+      "shared-codex-goal",
+      "collaboration_mode",
+      "plan"
+    )
+    expect(h.acpGoalControl).toHaveBeenCalledWith("shared-codex-goal", "pause")
+    await act(async () => {
+      await h.actions!.disconnect(CODEX_TAB)
+    })
+    expect(h.acpDisconnect).not.toHaveBeenCalledWith("shared-codex-goal")
   })
 
   it("restores distinct conversations to distinct connection ids", async () => {

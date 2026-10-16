@@ -2593,10 +2593,10 @@ const ConversationTabView = memo(function ConversationTabView({
       </div>
     ) : null
 
-  // Goal pause/clear is a live, owner-only action, so decide availability once
-  // here (where the connection is owned) rather than in the deep goal card.
-  // `null` when the session isn't live or the user is a viewer → the card hides
-  // its buttons. Codex is the only agent that produces goal cards, so no
+  // Goal control needs a live conversation surface. A connection's `isViewer`
+  // tracks process teardown ownership, not read-only access: restored/shared
+  // clients co-control the same native session, just like Send and Stop.
+  // Codex is the only agent that produces goal cards, so no
   // agent-type gate is needed. The provider covers both the transcript and
   // composer, including the welcome input. Read-only transcript viewers reset
   // this context so they cannot control the parent conversation's Goal.
@@ -2610,7 +2610,7 @@ const ConversationTabView = memo(function ConversationTabView({
 
   const handleStartGoal = useCallback(
     async (objective: string) => {
-      if (!conn.connectionId || !connectionReady || conn.isViewer)
+      if (!conn.connectionId || !connectionReady)
         throw new Error("Goal session is not ready")
       if (createConversationPendingRef.current)
         throw new Error("Conversation creation is already in progress")
@@ -2668,7 +2668,6 @@ const ConversationTabView = memo(function ConversationTabView({
     },
     [
       conn.connectionId,
-      conn.isViewer,
       connectionReady,
       tabId,
       ownTab,
@@ -2688,7 +2687,6 @@ const ConversationTabView = memo(function ConversationTabView({
     const live =
       conn.connectionId !== null &&
       (connStatus === "connected" || connStatus === "prompting") &&
-      !conn.isViewer &&
       !connIsForOtherAgent
     return {
       connectionId: connIsForOtherAgent ? null : conn.connectionId,
@@ -2703,7 +2701,6 @@ const ConversationTabView = memo(function ConversationTabView({
     }
   }, [
     conn.connectionId,
-    conn.isViewer,
     connIsForOtherAgent,
     connStatus,
     acpActions,

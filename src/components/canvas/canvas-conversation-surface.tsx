@@ -803,7 +803,6 @@ export function CanvasConversationSurface({
         !conn.connectionId ||
         !conn.promptReady ||
         connIsForOtherAgent ||
-        conn.isViewer ||
         connStatus !== "connected"
       )
         throw new Error("Goal session is not ready")
@@ -856,7 +855,6 @@ export function CanvasConversationSurface({
     [
       conn.connectionId,
       conn.promptReady,
-      conn.isViewer,
       connIsForOtherAgent,
       connStatus,
       draftTarget,
@@ -874,7 +872,6 @@ export function CanvasConversationSurface({
     const live =
       Boolean(conn.connectionId) &&
       (connStatus === "connected" || connStatus === "prompting") &&
-      !conn.isViewer &&
       !connIsForOtherAgent
     return {
       connectionId: connIsForOtherAgent ? null : conn.connectionId,
@@ -889,7 +886,6 @@ export function CanvasConversationSurface({
     }
   }, [
     conn.connectionId,
-    conn.isViewer,
     connStatus,
     connIsForOtherAgent,
     goalActions,
