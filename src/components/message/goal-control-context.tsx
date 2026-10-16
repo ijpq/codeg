@@ -26,7 +26,7 @@ export interface GoalControlValue {
    * Fire a pause/clear on the session's currently active goal, or `null`
    * when goal control isn't available for this surface — a history reload with
    * no live connection, a read-only viewer, or the read-only sub-agent dialog
-   * (which renders its own `MessageListView` with no provider). The goal card
+   * (which resets this context around its `MessageListView`). The goal card
    * hides its control buttons whenever this is `null`, so liveness/ownership are
    * decided once at the panel where the connection is owned, not in the card.
    */
