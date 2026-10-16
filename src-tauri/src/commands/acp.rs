@@ -12822,10 +12822,11 @@ pub async fn acp_set_config_option(
 pub async fn acp_goal_control(
     connection_id: String,
     action: crate::acp::connection::GoalControlAction,
+    objective: Option<String>,
     db: State<'_, AppDatabase>,
     manager: State<'_, ConnectionManager>,
 ) -> Result<(), AcpError> {
-    manager.goal_control(&db.conn, &connection_id, action).await
+    manager.goal_control_with_objective(&db.conn, &connection_id, action, objective).await
 }
 
 /// Spawn a transient ACP connection for `agent_type` with a silent emitter,
@@ -23067,4 +23068,17 @@ model = "gpt"
             Some("cline-pass")
         );
     }
+}
+
+/// Small read-only projection: goal polling must not clone the transcript.
+pub async fn acp_get_goal_state_core(manager: &ConnectionManager, connection_id: &str) -> Result<serde_json::Value, AcpError> {
+    let state = manager.get_state(connection_id).await.ok_or_else(|| AcpError::ConnectionNotFound(connection_id.into()))?;
+    let state = state.read().await;
+    Ok(serde_json::json!({ "goal": state.goal, "actions": state.goal_actions }))
+}
+
+#[cfg(feature = "tauri-runtime")]
+#[tauri::command]
+pub async fn acp_get_goal_state(connection_id: String, manager: State<'_, ConnectionManager>) -> Result<serde_json::Value, AcpError> {
+    acp_get_goal_state_core(&manager, &connection_id).await
 }

@@ -20,6 +20,8 @@ export const LEGACY_GOAL_ACTIONS: readonly string[] = ["pause", "clear"]
 export const NO_GOAL_ACTIONS: readonly string[] = []
 
 export interface GoalControlValue {
+  connectionId?: string | null
+  readOnly?: boolean
   /**
    * Fire a pause/clear on the session's currently active goal, or `null`
    * when goal control isn't available for this surface — a history reload with

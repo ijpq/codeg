@@ -331,7 +331,11 @@ export function useConnectionLifecycle({
   const taskLabelKeyRef = useRef<string | null>(null)
   useEffect(() => {
     const phase =
-      status === "connecting" ? "connecting" : preparing || restorePending ? "preparing" : null
+      status === "connecting"
+        ? "connecting"
+        : preparing || restorePending
+          ? "preparing"
+          : null
     const taskAgentType = connAgentType ?? agentType
     const labelKey = phase === null ? null : `${phase}:${taskAgentType}`
     if (labelKey !== null && labelKey === taskLabelKeyRef.current) return
