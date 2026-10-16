@@ -5,7 +5,6 @@ import { useStickToBottomContext } from "use-stick-to-bottom"
 
 /** Fractional scroll/DOM geometry is normal at browser zoom and Windows DPI. */
 const GEOMETRY_EPSILON_PX = 1
-const NEAR_BOTTOM_THRESHOLD_PX = 80
 const SENTINEL_VISUAL_GAP_PX = 12
 
 export interface MessageBottomGeometry {
@@ -79,22 +78,21 @@ export function measureMessageBottomGeometry(
   }
 }
 
-export function pinViewportToExactBottom(viewport: HTMLElement): boolean {
-  const target = Math.max(0, viewport.scrollHeight - viewport.clientHeight)
-  if (Math.abs(target - viewport.scrollTop) <= GEOMETRY_EPSILON_PX) {
-    return false
-  }
-  viewport.scrollTop = target
-  return true
-}
-
 function setPixelCustomProperty(
   target: HTMLElement,
   name: string,
   value: number
 ): boolean {
-  const next = `${finiteNonNegative(value)}px`
-  if (target.style.getPropertyValue(name) === next) return false
+  const nextValue = finiteNonNegative(value)
+  const previous = Number.parseFloat(target.style.getPropertyValue(name))
+  // Fractional row measurement must not churn margins/ResizeObserver forever.
+  if (
+    Number.isFinite(previous) &&
+    Math.abs(previous - nextValue) <= GEOMETRY_EPSILON_PX
+  ) {
+    return false
+  }
+  const next = `${nextValue}px`
   target.style.setProperty(name, next)
   return true
 }
@@ -116,11 +114,10 @@ export const MessageBottomFollowGuard = memo(function MessageBottomFollowGuard({
   /** Conversation generation; delayed work from another conversation is stale. */
   scopeKey?: string | number
 }) {
-  const { scrollRef, contentRef, state } = useStickToBottomContext()
+  const { scrollRef, contentRef, scrollToBottom, state } =
+    useStickToBottomContext()
   const frameRef = useRef<number | null>(null)
   const generationRef = useRef(0)
-  const followingRef = useRef(true)
-  const previousScrollTopRef = useRef(0)
   const lastRowRef = useRef<HTMLElement | null>(null)
   const scheduleRef = useRef<() => void>(() => undefined)
 
@@ -153,7 +150,6 @@ export const MessageBottomFollowGuard = memo(function MessageBottomFollowGuard({
       const lastRow = content.querySelector<HTMLElement>(
         '[data-message-thread-last="true"]'
       )
-      lastRowRef.current = lastRow
 
       const geometry = measureMessageBottomGeometry(
         viewport,
@@ -174,7 +170,9 @@ export const MessageBottomFollowGuard = memo(function MessageBottomFollowGuard({
       )
       const geometryChanged = overflowChanged || overlapChanged
 
-      viewport.dataset.bottomFollowing = String(followingRef.current)
+      viewport.dataset.bottomFollowing = String(
+        state.isAtBottom && !state.escapedFromLock
+      )
       viewport.dataset.bottomSentinelVisible = String(
         geometry.sentinelFullyVisible
       )
@@ -187,15 +185,20 @@ export const MessageBottomFollowGuard = memo(function MessageBottomFollowGuard({
         return
       }
 
-      if (!followingRef.current || state.escapedFromLock) return
-      const moved = pinViewportToExactBottom(viewport)
-      if (moved || !geometry.sentinelFullyVisible) {
-        // One converging follow-up handles fractional layout, virtua's row
-        // remeasurement and browser font/image layout without fixed delays.
-        scheduleRef.current()
+      if (!state.isAtBottom || state.escapedFromLock) return
+      // The library owns the target, animation and programmatic-scroll shield.
+      // Directly pinning to the physical end disagreed with its max - 1 target
+      // and virtua's fractional compensation, which falsely escaped the lock.
+      // Never self-schedule just because the sentinel is unreachable: observers
+      // will notify us when real geometry changes.
+      if (state.scrollDifference > GEOMETRY_EPSILON_PX) {
+        void scrollToBottom({
+          animation: "instant",
+          preserveScrollPosition: true,
+        })
       }
     })
-  }, [contentRef, scrollRef, state])
+  }, [contentRef, scrollRef, scrollToBottom, state])
 
   useEffect(() => {
     scheduleRef.current = scheduleCorrection
@@ -209,14 +212,12 @@ export const MessageBottomFollowGuard = memo(function MessageBottomFollowGuard({
   useEffect(() => {
     generationRef.current += 1
     const generation = generationRef.current
-    followingRef.current = true
     cancelScheduled()
 
     const viewport = scrollRef.current
     const content = contentRef.current
     if (!viewport || !content) return
 
-    previousScrollTopRef.current = viewport.scrollTop
     const shell = viewport.closest<HTMLElement>("[data-conversation-shell]")
     const bottomDock =
       shell?.querySelector<HTMLElement>(
@@ -238,7 +239,6 @@ export const MessageBottomFollowGuard = memo(function MessageBottomFollowGuard({
       if (sentinel) resizeObserver.observe(sentinel)
       if (lastRow && lastRow !== lastRowRef.current) {
         if (lastRowRef.current) resizeObserver.unobserve(lastRowRef.current)
-        lastRowRef.current = lastRow
         resizeObserver.observe(lastRow)
       }
       scheduleCorrection()
@@ -247,25 +247,6 @@ export const MessageBottomFollowGuard = memo(function MessageBottomFollowGuard({
     const mutationObserver = new MutationObserver(bindDynamicTargets)
     mutationObserver.observe(content, { childList: true, subtree: true })
     bindDynamicTargets()
-
-    const onScroll = () => {
-      const current = viewport.scrollTop
-      const remaining = Math.max(
-        0,
-        viewport.scrollHeight - viewport.clientHeight - current
-      )
-      if (
-        current < previousScrollTopRef.current - GEOMETRY_EPSILON_PX &&
-        remaining > NEAR_BOTTOM_THRESHOLD_PX
-      ) {
-        followingRef.current = false
-      } else if (remaining <= NEAR_BOTTOM_THRESHOLD_PX) {
-        followingRef.current = true
-      }
-      previousScrollTopRef.current = current
-      viewport.dataset.bottomFollowing = String(followingRef.current)
-    }
-    viewport.addEventListener("scroll", onScroll, { passive: true })
 
     const onViewportResize = () => scheduleCorrection()
     window.addEventListener("resize", onViewportResize)
@@ -279,7 +260,6 @@ export const MessageBottomFollowGuard = memo(function MessageBottomFollowGuard({
       generationRef.current += 1
       mutationObserver.disconnect()
       resizeObserver.disconnect()
-      viewport.removeEventListener("scroll", onScroll)
       window.removeEventListener("resize", onViewportResize)
       window.visualViewport?.removeEventListener("resize", onViewportResize)
       content.style.removeProperty(

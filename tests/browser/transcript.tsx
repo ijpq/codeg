@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react"
+import { useEffect, useState } from "react"
 import { createRoot } from "react-dom/client"
 import { NextIntlClientProvider } from "next-intl"
 import { MessageThread } from "../../src/components/ai-elements/message-thread"
@@ -13,6 +13,7 @@ declare global {
     scrollFixture: {
       change: (state: Partial<State>) => void
       writes: Array<{ top: number; stack: string }>
+      frames: number
       debug?: () => unknown
     }
   }
@@ -55,6 +56,12 @@ function Fixture() {
     window.scrollFixture = {
       change: (next) => set((current) => ({ ...current, ...next })),
       writes,
+      frames: 0,
+    }
+    const requestFrame = window.requestAnimationFrame
+    window.requestAnimationFrame = (callback) => {
+      window.scrollFixture.frames++
+      return requestFrame.call(window, callback)
     }
     const proto = Element.prototype
     const original = Object.getOwnPropertyDescriptor(proto, "scrollTop")!
@@ -72,6 +79,7 @@ function Fixture() {
       },
     })
     return () => {
+      window.requestAnimationFrame = requestFrame
       Object.defineProperty(proto, "scrollTop", original)
     }
   }, [])

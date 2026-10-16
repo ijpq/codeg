@@ -3,13 +3,13 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 import {
   MessageBottomFollowGuard,
   measureMessageBottomGeometry,
-  pinViewportToExactBottom,
 } from "./message-bottom-follow-guard"
 
 const h = vi.hoisted(() => ({
   viewport: null as HTMLElement | null,
   content: null as HTMLElement | null,
-  state: { escapedFromLock: false },
+  state: { escapedFromLock: false, isAtBottom: true, scrollDifference: 0 },
+  scrollToBottom: vi.fn(),
   observers: [] as Array<{
     callback: ResizeObserverCallback
     observe: ReturnType<typeof vi.fn>
@@ -23,6 +23,7 @@ vi.mock("use-stick-to-bottom", () => ({
     scrollRef: { current: h.viewport },
     contentRef: { current: h.content },
     state: h.state,
+    scrollToBottom: h.scrollToBottom,
   }),
 }))
 
@@ -96,6 +97,9 @@ beforeEach(() => {
   setRect(row, { top: 300, bottom: 375 })
   setRect(sentinel, { top: 375, bottom: 376, height: 1 })
   h.state.escapedFromLock = false
+  h.state.isAtBottom = true
+  h.state.scrollDifference = 0
+  h.scrollToBottom.mockReset()
   h.observers.length = 0
   vi.stubGlobal("ResizeObserver", ResizeObserverStub)
 })
@@ -162,31 +166,6 @@ describe("measureMessageBottomGeometry", () => {
   })
 })
 
-describe("pinViewportToExactBottom", () => {
-  it("eliminates a fractional/rounded final-line gap", () => {
-    const viewport = document.createElement("div")
-    setGeometry(viewport, {
-      scrollHeight: 700.75,
-      clientHeight: 300.25,
-      scrollTop: 399,
-    })
-
-    expect(pinViewportToExactBottom(viewport)).toBe(true)
-    expect(viewport.scrollTop).toBe(400.5)
-  })
-
-  it("does not rewrite an already exact viewport", () => {
-    const viewport = document.createElement("div")
-    setGeometry(viewport, {
-      scrollHeight: 700,
-      clientHeight: 300,
-      scrollTop: 400,
-    })
-
-    expect(pinViewportToExactBottom(viewport)).toBe(false)
-  })
-})
-
 describe("MessageBottomFollowGuard", () => {
   it("re-pins when the composer changes the viewport height", async () => {
     setGeometry(h.viewport!, {
@@ -202,12 +181,18 @@ describe("MessageBottomFollowGuard", () => {
       clientHeight: 360,
       scrollTop: 600,
     })
+    h.state.scrollDifference = 40
     act(() => {
       h.observers[0]!.callback([], h.observers[0] as unknown as ResizeObserver)
     })
     await flushFrames()
 
-    expect(h.viewport!.scrollTop).toBe(640)
+    expect(h.scrollToBottom).toHaveBeenCalledWith({
+      animation: "instant",
+      preserveScrollPosition: true,
+    })
+    // The guard must never become another scrollTop writer.
+    expect(h.viewport!.scrollTop).toBe(600)
     view.unmount()
     expect(h.observers[0]!.disconnect).toHaveBeenCalledTimes(1)
   })
@@ -227,5 +212,45 @@ describe("MessageBottomFollowGuard", () => {
     await flushFrames()
 
     expect(h.viewport!.scrollTop).toBe(250)
+    expect(h.scrollToBottom).not.toHaveBeenCalled()
   })
+})
+
+// An unreachable sentinel (e.g. rounded viewport metrics) used to schedule
+// itself forever, even after all streaming/resize notifications had stopped.
+it("does not spin animation frames at a settled, rounded target", async () => {
+  setGeometry(h.viewport!, {
+    scrollHeight: 1000,
+    clientHeight: 400,
+    scrollTop: 599,
+  })
+  setRect(h.content!.querySelector("[data-message-end-sentinel]")!, {
+    top: 410,
+    bottom: 411,
+  })
+  const frames = vi.spyOn(window, "requestAnimationFrame")
+  const view = render(<MessageBottomFollowGuard layoutSignal="complete:3" />)
+  await flushFrames(3)
+  const before = frames.mock.calls.length
+  await new Promise((resolve) => setTimeout(resolve, 80))
+  expect(frames.mock.calls.length).toBe(before)
+  expect(h.scrollToBottom).not.toHaveBeenCalled()
+  view.unmount()
+  frames.mockRestore()
+})
+
+it("observes a replacement last row after an earlier measurement", async () => {
+  const view = render(<MessageBottomFollowGuard layoutSignal="complete:4" />)
+  await flushFrames()
+  const row = document.createElement("div")
+  row.dataset.messageThreadLast = "true"
+  setRect(row, { top: 300, bottom: 375 })
+  await act(async () => {
+    h.content!.querySelector('[data-message-thread-last="true"]')!.replaceWith(
+      row
+    )
+    await Promise.resolve()
+  })
+  expect(h.observers[0]!.observe).toHaveBeenCalledWith(row)
+  view.unmount()
 })
