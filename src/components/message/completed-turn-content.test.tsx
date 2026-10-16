@@ -4,7 +4,11 @@ import { NextIntlClientProvider } from "next-intl"
 import { describe, expect, it } from "vitest"
 
 import enMessages from "@/i18n/messages/en.json"
-import type { AdaptedContentPart } from "@/lib/adapters/ai-elements-adapter"
+import {
+  adaptMessageTurn,
+  type AdaptedContentPart,
+} from "@/lib/adapters/ai-elements-adapter"
+import type { ContentBlock } from "@/lib/types"
 import {
   CompletedTurnContent,
   splitAssistantTurnParts,
@@ -140,6 +144,66 @@ describe("CompletedTurnContent with nothing left to show", () => {
 })
 
 describe("CompletedTurnContent", () => {
+  it.each(["paused", "complete", "budget_limited"])(
+    "keeps native Goal output visible when a trailing %s snapshot settles it",
+    (status) => {
+      // Native thread_goal_updated snapshots arrive after the model's answer,
+      // including an out-of-prompt pause. They are status, not more model work.
+      const marker = (state: string, sequence: number): ContentBlock[] => {
+        const objective = "Read README"
+        const id = `codex-goal-${sequence}`
+        return [
+          {
+            type: "tool_use",
+            tool_use_id: id,
+            tool_name: state === "active" ? "create_goal" : "update_goal",
+            input_preview: JSON.stringify({ objective, status: state }),
+          },
+          {
+            type: "tool_result",
+            tool_use_id: id,
+            output_preview: JSON.stringify({
+              goal: { objective, status: state },
+            }),
+            is_error: false,
+          },
+        ]
+      }
+      const blocks: ContentBlock[] = [
+        ...marker("active", 1),
+        { type: "text", text: "SYNTHETIC NATIVE GOAL RESPONSE" },
+      ]
+      const adapt = (settled: boolean) =>
+        adaptMessageTurn(
+          {
+            id: "native-goal",
+            role: "assistant",
+            timestamp: "2026-10-16T20:54:00Z",
+            blocks: settled ? [...blocks, ...marker(status, 2)] : blocks,
+          },
+          {
+            attachedResources: "Attached resources",
+            toolCallFailed: "Tool failed",
+            pageHandoffName: () => "Page handoff",
+          },
+          !settled
+        ).content
+      const view = renderWithIntl(
+        <CompletedTurnContent parts={adapt(false)} completed={false} />
+      )
+      expect(screen.getByText("SYNTHETIC NATIVE GOAL RESPONSE")).toBeVisible()
+      view.rerender(
+        <NextIntlClientProvider locale="en" messages={enMessages}>
+          <CompletedTurnContent parts={adapt(true)} completed />
+        </NextIntlClientProvider>
+      )
+      expect(screen.getByText("SYNTHETIC NATIVE GOAL RESPONSE")).toBeVisible()
+      view.unmount()
+      renderWithIntl(<CompletedTurnContent parts={adapt(true)} completed />)
+      expect(screen.getByText("SYNTHETIC NATIVE GOAL RESPONSE")).toBeVisible()
+    }
+  )
+
   it("collapses completed progress by default and keeps the answer visible", () => {
     renderWithIntl(
       <CompletedTurnContent
