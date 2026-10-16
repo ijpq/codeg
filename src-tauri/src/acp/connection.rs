@@ -27457,6 +27457,7 @@ mod tests {
                 .send(ConnectionCommand::Prompt {
                     blocks: vec![PromptInputBlock::Text { text: text.into() }],
                     user_message: None,
+                    agent_file_change_report_request_id: None,
                 })
                 .await
                 .expect("the connection is running");

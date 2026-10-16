@@ -8,6 +8,7 @@ on:
 
 env:
   RUST_BACKTRACE: short
+  CARGO_BUILD_JOBS: 1
   # Refuse to silently regenerate snapshots in CI — any drift must be
   # accepted locally with `cargo insta review` and committed.
   INSTA_UPDATE: "no"
@@ -201,7 +202,7 @@ jobs:
       run:
         shell: bash
     env:
-      CARGO_BUILD_JOBS: 2
+      CARGO_BUILD_JOBS: 1
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
@@ -265,6 +266,9 @@ jobs:
           npm install --prefix "$RUNNER_TEMP/codeg-acp-222" --ignore-scripts --no-audit --no-fund @agentclientprotocol/codex-acp@2.2.2
           python3 -B scripts/diagnose-codex-resume-layers.py --cli "$RUNNER_TEMP/codeg-codex-runtime/codex" --acp "$RUNNER_TEMP/codeg-acp-211/node_modules/.bin/codex-acp" --output "$RUNNER_TEMP/codeg-codex-evidence/acp-211" --size-mib 64 --fast --verify-prompt
           python3 -B scripts/diagnose-codex-resume-layers.py --cli "$RUNNER_TEMP/codeg-codex-runtime/codex" --acp "$RUNNER_TEMP/codeg-acp-222/node_modules/.bin/codex-acp" --output "$RUNNER_TEMP/codeg-codex-evidence/acp-222" --size-mib 64 --fast --verify-prompt
+      - name: Verify native Plan and Goal on the shipped runtime
+        if: runner.os == 'Linux'
+        run: python3 -B scripts/test-codex-goal-protocol.py --cli "$RUNNER_TEMP/codeg-codex-runtime/codex" --acp "$RUNNER_TEMP/codeg-acp-222/node_modules/@agentclientprotocol/codex-acp/dist/index.js" --output "$RUNNER_TEMP/codeg-codex-evidence/native-goal"
       - name: Retain recovery diagnostics
         if: always()
         uses: actions/upload-artifact@v4
