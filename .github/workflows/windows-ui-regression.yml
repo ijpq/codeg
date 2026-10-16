@@ -10,6 +10,16 @@ on:
       - "scripts/browser-scroll-regression.mjs"
       - ".github/workflows/windows-ui-regression.yml"
   workflow_dispatch:
+    inputs:
+      candidate:
+        description: Build current Windows packages and verify native Goal UI before tagging
+        type: boolean
+        default: false
+env:
+  CARGO_BUILD_JOBS: 1
+  RUST_BACKTRACE: short
+  CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: "-C target-feature=+crt-static"
+  HUSKY: 0
 jobs:
   setup-ui:
     runs-on: windows-2022
@@ -26,10 +36,31 @@ jobs:
         with:
           python-version: "3.12"
       - run: pnpm install --frozen-lockfile
+      - uses: dtolnay/rust-toolchain@stable
+        if: inputs.candidate
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: swatinem/rust-cache@v2
+        if: inputs.candidate
+        with:
+          workspaces: "./src-tauri -> target"
+          shared-key: x86_64-pc-windows-msvc
+      - name: Build isolated candidate Setup and Server
+        if: inputs.candidate
+        shell: pwsh
+        run: |
+          pnpm tauri:prepare-sidecars --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw 'Candidate sidecar build failed' }
+          $env:CODEG_SKIP_SIDECAR='1'
+          pnpm tauri build --target x86_64-pc-windows-msvc --bundles nsis --config '{"bundle":{"createUpdaterArtifacts":false}}'
+          if ($LASTEXITCODE -ne 0) { throw 'Candidate Setup build failed' }
+          cargo build --manifest-path src-tauri/Cargo.toml --release --no-default-features --features server-bin --bin codeg-server --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw 'Candidate Server build failed' }
       - name: Download verified published baseline into the runner
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          CANDIDATE_UI: ${{ inputs.candidate }}
         run: |
           $ErrorActionPreference='Stop'
           $root=Join-Path $env:RUNNER_TEMP 'ui-baseline'
@@ -42,8 +73,36 @@ jobs:
           }
           Expand-Archive (Join-Path $root 'codeg-server-windows-x64.zip') (Join-Path $root 'server')
           $setup=Join-Path $root 'codeg_0.35.1-fix2_x64-setup.exe'
-          node scripts/verify-windows-ui.mjs --setup $setup --previous $setup --server (Join-Path $root 'server/codeg-server-windows-x64') --output (Join-Path $env:RUNNER_TEMP 'ui-evidence') --version 0.35.1-fix2 --baseline true
+          $previous=$setup
+          $server=Join-Path $root 'server/codeg-server-windows-x64'
+          $extra=@('--baseline','true')
+          $version='0.35.1-fix2'
+          if ($env:CANDIDATE_UI -eq 'true') {
+            $version=(Get-Content package.json -Raw | ConvertFrom-Json).version
+            $setup=(Get-Item "src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/codeg_${version}_x64-setup.exe").FullName
+            $candidate=Join-Path $env:RUNNER_TEMP 'candidate-server'
+            New-Item -ItemType Directory -Force $candidate | Out-Null
+            Copy-Item -Recurse out (Join-Path $candidate 'web')
+            Copy-Item -Recurse (Join-Path $server 'runtime') (Join-Path $candidate 'runtime')
+            foreach ($binary in @('codeg-server','codeg-mcp','codeg-computer-helper')) {
+              Copy-Item "src-tauri/target/x86_64-pc-windows-msvc/release/$binary.exe" $candidate
+            }
+            # The unchanged private CLI is a test input from the checksum-verified
+            # baseline, never substituted for a candidate CodeG/MCP executable.
+            python -B scripts/smoke-server-package.py $candidate $version --require-runtime --log-dir (Join-Path $env:RUNNER_TEMP 'ui-evidence/candidate-smoke')
+            if ($LASTEXITCODE -ne 0) { throw 'Candidate package resources/dependencies failed' }
+            $tools=Join-Path $env:RUNNER_TEMP 'candidate-native-tools'
+            npm install --prefix $tools --global --ignore-scripts --no-audit --no-fund '@agentclientprotocol/codex-acp@2.2.2'
+            if ($LASTEXITCODE -ne 0) { throw 'Isolated native ACP installation failed' }
+            $server=$candidate
+            $extra=@('--native-tools',$tools)
+          }
+          node scripts/verify-windows-ui.mjs --setup $setup --previous $previous --server $server --output (Join-Path $env:RUNNER_TEMP 'ui-evidence') --version $version @extra
           if ($LASTEXITCODE -ne 0) { throw 'Isolated UI verification failed' }
+          if ($env:CANDIDATE_UI -eq 'true') {
+            python -B scripts/verify-windows-dependencies.py (Join-Path $env:RUNNER_TEMP 'ui-evidence/upgraded-installation') --report (Join-Path $env:RUNNER_TEMP 'ui-evidence/setup-windows-dependencies.json')
+            if ($LASTEXITCODE -ne 0) { throw 'Candidate Setup runtime dependencies failed' }
+          }
       - uses: actions/upload-artifact@v4
         if: always()
         with:
