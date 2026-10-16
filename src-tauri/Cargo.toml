@@ -234,6 +234,7 @@ notify = "6"
 base64 = "0.22"
 kill_tree = { version = "0.2", features = ["tokio"] }
 which = "7"
+open = { version = "5", features = ["shellexecute-on-windows"] }
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"], optional = true }
 axum = { version = "0.8", features = ["ws", "multipart"] }
 async_zip = { version = "0.0.18", features = ["tokio", "deflate"] }
@@ -274,6 +275,7 @@ semver = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt", "registry", "std"] }
 tracing-appender = "0.2"
+mime_guess = "2"
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-window-state = { version = "2", optional = true }
@@ -310,51 +312,3 @@ core-foundation = "0.10"
 core-foundation-sys = "0.8"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_System_Threading", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Ole", "Win32_System_StationsAndDesktops", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Console", "Win32_System_Registry"] }
-junction = "1"
-# Built-in browser Windows shim (isolated world over CDP, world-scoped eval,
-# snapshots, find, history, the sign-in identity, the subframe fence, and the
-# workspace window's own resize hook — see `shim::windows::hold_resize_hook`,
-# which is why `Win32_UI_Shell` carries window subclassing here as well as the
-# stream helper).
-# Versions track the ones wry 0.57 uses so the types line up with the handles
-# wry hands out — a second copy of either crate would make them distinct types.
-webview2-com = { version = "0.39", optional = true }
-windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"], optional = true }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-# Built-in browser Linux shim (isolated world, world-scoped eval, snapshots,
-# find, history, typed load failures, the subframe fence). Pinned to the exact
-# versions wry 0.57 resolves: these types are the ones tauri's `with_webview`
-# hands out, and a second copy of either crate would make them distinct types.
-#
-# Optional, and carried by `tauri-runtime` alone, because `src/browser` is
-# gated on that feature: a plain target dependency is unconditional on
-# features, so `--no-default-features` would still run the gtk-sys / gdk-sys /
-# atk-sys pkg-config probes while compiling none of the code that needs them.
-# Neither the codeg-server CI cell nor the Docker backend stage installs GTK.
-#
-# `v2_40` is not an independent floor we are choosing: tauri-runtime-wry turns
-# on wry's `linux-body`, which enables it already. Declaring it states the API
-# level this crate compiles against instead of borrowing another crate's
-# feature — if wry ever stops asking for it, the failure is a version error
-# here rather than a missing symbol somewhere in the shim.
-webkit2gtk = { version = "=2.0.2", features = ["v2_40"], optional = true }
-# The computer-use helper asks the X11 window manager what the driver's
-# listing leaves unsaid — which windows are minimized, which on another
-# desktop — and which modifier keys are held. The helper's alone, so only
-# with `computer-helper`. Pure Rust; the version the driver itself uses.
-x11rb = { version = "0.13", optional = true }
-gtk = { version = "0.18", optional = true }
-javascriptcore-rs = { version = "=1.1.2", optional = true }
-
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
-
-[dev-dependencies]
-tempfile = "3"
-temp-env = { version = "0.3", features = ["async_closure"] }
-tokio = { version = "1", features = ["test-util", "macros", "rt", "sync", "time"] }
-insta = { version = "1", features = ["json", "redactions"] }
-axum-test = { version = "17", features = ["ws"] }
-

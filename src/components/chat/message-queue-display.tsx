@@ -2,7 +2,15 @@
 
 import { useCallback, useRef, useState, type PointerEvent } from "react"
 import { Reorder, useDragControls } from "motion/react"
-import { Clock, GripVertical, Pencil, X, Zap } from "lucide-react"
+import {
+  ArrowRight,
+  Clock,
+  GripVertical,
+  Pencil,
+  RotateCcw,
+  X,
+  Zap,
+} from "lucide-react"
 import { useTranslations } from "next-intl"
 import { cn } from "@/lib/utils"
 import { draftRidesBlocks } from "@/lib/prompt-draft"
@@ -13,6 +21,8 @@ interface MessageQueueDisplayProps {
   onReorder: (items: QueuedMessage[]) => void
   onEdit: (id: string) => void
   onDelete: (id: string) => void
+  onRetry?: (id: string) => void
+  onConvertGuideToPrompt?: (id: string) => void
   editingItemId: string | null
   /**
    * Send one queued item straight into the RUNNING turn over the session's
@@ -40,6 +50,8 @@ interface QueueItemProps {
    *  disabled for the duration, so two rows can't race the one channel. */
   steering: boolean
   onSteerStart: (id: string) => Promise<void>
+  onRetry?: (id: string) => void
+  onConvertGuideToPrompt?: (id: string) => void
 }
 
 function QueueItem({
@@ -52,6 +64,8 @@ function QueueItem({
   steerChannel,
   steering,
   onSteerStart,
+  onRetry,
+  onConvertGuideToPrompt,
 }: QueueItemProps) {
   const t = useTranslations("Folder.chat.messageQueue")
   const dragControls = useDragControls()
@@ -122,14 +136,42 @@ function QueueItem({
           )}
         </button>
       )}
-      <button
-        type="button"
-        onClick={() => onEdit(item.id)}
-        className="shrink-0 rounded-sm p-0.5 hover:bg-muted-foreground/15 text-muted-foreground"
-        title={t("editItem")}
+      <span
+        className="shrink-0 text-[9px] text-muted-foreground"
+        title={item.error ?? undefined}
       >
-        <Pencil className="h-2.5 w-2.5" />
-      </button>
+        {t(item.state)}
+      </span>
+      {item.state === "failed" && onRetry ? (
+        <button
+          type="button"
+          onClick={() => onRetry(item.id)}
+          className="shrink-0 rounded-sm p-0.5 text-muted-foreground hover:bg-muted-foreground/15"
+          title={t("retry")}
+        >
+          <RotateCcw className="h-2.5 w-2.5" />
+        </button>
+      ) : null}
+      {item.state === "expired_guide" && onConvertGuideToPrompt ? (
+        <button
+          type="button"
+          onClick={() => onConvertGuideToPrompt(item.id)}
+          className="shrink-0 rounded-sm p-0.5 text-muted-foreground hover:bg-muted-foreground/15"
+          title={t("sendAsPrompt")}
+        >
+          <ArrowRight className="h-2.5 w-2.5" />
+        </button>
+      ) : null}
+      {item.intent !== "branch" ? (
+        <button
+          type="button"
+          onClick={() => onEdit(item.id)}
+          className="shrink-0 rounded-sm p-0.5 hover:bg-muted-foreground/15 text-muted-foreground"
+          title={t("editItem")}
+        >
+          <Pencil className="h-2.5 w-2.5" />
+        </button>
+      ) : null}
       <button
         type="button"
         onClick={() => onDelete(item.id)}
@@ -147,6 +189,8 @@ export function MessageQueueDisplay({
   onReorder,
   onEdit,
   onDelete,
+  onRetry,
+  onConvertGuideToPrompt,
   editingItemId,
   onSteerItem,
   steerChannel = "pull",
@@ -200,6 +244,8 @@ export function MessageQueueDisplay({
             steerChannel={steerChannel}
             steering={steeringId !== null}
             onSteerStart={handleSteerStart}
+            onRetry={onRetry}
+            onConvertGuideToPrompt={onConvertGuideToPrompt}
           />
         ))}
       </Reorder.Group>

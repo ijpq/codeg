@@ -19,7 +19,7 @@ import {
 // off the screen — a page keeps it a glance-able "where was I" list. Lives here
 // (not in the list component) because `buildRows` needs it to tell an untouched
 // first page from an expanded one.
-export const RECENT_PAGE_SIZE = 10
+export const RECENT_PAGE_SIZE = 5
 
 export function parseTimestamp(value: string): number {
   const timestamp = Date.parse(value)
@@ -1214,7 +1214,7 @@ function pushConversationRow(
  *
  * Structure (top to bottom): the "Pinned" section (when present) is always
  * first; the "Folders", "Chat" and "Recent" sections follow in the order set by
- * `sectionOrder` (default Folders → Chat → Recent). Each section's own
+ * `sectionOrder` (default Recent → Folders → Chat). Each section's own
  * presence/expansion rules are unchanged by that order:
  * - The "Pinned" section header + its conversations appear only when `pinned`
  *   is non-empty, and its rows only when `pinnedExpanded`.

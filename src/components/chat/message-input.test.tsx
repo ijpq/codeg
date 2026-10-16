@@ -110,8 +110,8 @@ vi.mock("@/lib/platform", () => ({
   openUrl: platform.openUrl,
 }))
 vi.mock("@/lib/transport", () => ({
-  getActiveRemoteConnectionId: () => null,
   isDesktop: () => false,
+  getActiveRemoteConnectionId: () => null,
   isRemoteDesktopMode: () => false,
 }))
 // A local-file link target routes to the workspace file column, whose provider
@@ -119,12 +119,21 @@ vi.mock("@/lib/transport", () => ({
 vi.mock("@/hooks/use-open-file-target", () => ({
   useOpenFileTarget: () => async () => {},
 }))
-// The right-click menu refreshes the quick-message list as it opens; keep that
-// off the backend so the menu tests exercise only the menu.
-vi.mock("@/lib/api", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/lib/api")>()),
-  quickMessagesList: vi.fn(async () => []),
-}))
+vi.mock("@/lib/api", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/api")>()
+  return {
+    ...actual,
+    // The right-click menu refreshes this list as it opens; keep that request
+    // off the backend so the menu tests exercise only menu behavior.
+    quickMessagesList: vi.fn(async () => []),
+    uploadAttachment: vi.fn(async (file: File) => ({
+      path: `/tmp/${file.name}`,
+      name: file.name,
+      size: file.size,
+      mimeType: file.type || null,
+    })),
+  }
+})
 // Real classifier only recognizes actual backend NoActiveTurn payloads; the
 // steering tests flip this per-case to drive the enqueue fallback.
 vi.mock("@/lib/turn-busy", () => ({
@@ -271,6 +280,30 @@ describe("MessageInput (RichComposer integration)", () => {
     )
     expect(sendButton).not.toBeNull()
     expect(sendButton).toBeDisabled()
+  })
+
+  it("keeps the latest draft when the visible composer is suspended immediately", async () => {
+    const draftKey = "suspend-visible-composer"
+    clearMessageInputDraftV2(draftKey)
+    const user = userEvent.setup()
+    const { container, unmount } = renderInput({ draftStorageKey: draftKey })
+    const textbox = await waitFor(() => {
+      const element = container.querySelector('[role="textbox"]')
+      expect(element).not.toBeNull()
+      return element as HTMLElement
+    })
+
+    await user.type(textbox, "survives tab suspension")
+    unmount()
+
+    const saved = loadMessageInputDraftV2(draftKey)
+    expect(saved).not.toBeNull()
+    if (saved?.kind === "legacyMarkdown") {
+      expect(saved.markdown).toContain("survives tab suspension")
+    } else {
+      expect(JSON.stringify(saved?.doc)).toContain("survives tab suspension")
+    }
+    clearMessageInputDraftV2(draftKey)
   })
 
   it("claims a mouse press on the input's empty chrome (P8d focus wiring)", async () => {
@@ -502,6 +535,116 @@ describe("MessageInput (RichComposer integration)", () => {
     const editor = container.querySelector('[role="textbox"]') as HTMLElement
     firePointer(stop, "click", "touch")
     expect(document.activeElement).not.toBe(editor)
+  })
+
+  it("uses native guide mode while prompting instead of enqueueing a new turn", async () => {
+    const user = userEvent.setup()
+    const onSend = vi.fn()
+    const onEnqueue = vi.fn()
+    const onGuide = vi.fn().mockResolvedValue(undefined)
+    const { container } = renderInput({
+      onSend,
+      onEnqueue,
+      onGuide,
+      supportsSteer: true,
+      isPrompting: true,
+      onCancel: vi.fn(),
+    })
+    const textbox = await waitFor(() => {
+      const element = container.querySelector('[role="textbox"]')
+      expect(element).not.toBeNull()
+      return element as HTMLElement
+    })
+    await user.type(textbox, "check B instead")
+    await user.click(
+      screen.getByRole("button", {
+        name: enMessages.Folder.chat.messageInput.steer,
+      })
+    )
+
+    await waitFor(() => expect(onGuide).toHaveBeenCalledTimes(1))
+    expect(onGuide.mock.calls[0][0].blocks).toEqual([
+      { type: "text", text: "check B instead" },
+    ])
+    expect(onSend).not.toHaveBeenCalled()
+    expect(onEnqueue).not.toHaveBeenCalled()
+  })
+
+  it("uses Enter to guide and keeps Shift+Enter as a newline", async () => {
+    const user = userEvent.setup()
+    const onGuide = vi.fn().mockResolvedValue(undefined)
+    const { container } = renderInput({
+      onGuide,
+      supportsSteer: true,
+      isPrompting: true,
+      onCancel: vi.fn(),
+    })
+    const textbox = await waitFor(() => {
+      const element = container.querySelector('[role="textbox"]')
+      expect(element).not.toBeNull()
+      return element as HTMLElement
+    })
+    await user.type(textbox, "first line")
+
+    fireEvent.keyDown(textbox, {
+      key: "Enter",
+      code: "Enter",
+      shiftKey: true,
+    })
+    expect(onGuide).not.toHaveBeenCalled()
+
+    fireEvent.keyDown(textbox, { key: "Enter", code: "Enter" })
+    await waitFor(() => expect(onGuide).toHaveBeenCalledTimes(1))
+    expect(onGuide.mock.calls[0][0].displayText).toContain("first line")
+  })
+
+  it("queues image + text during a running turn instead of steering it", async () => {
+    const user = userEvent.setup()
+    const onSend = vi.fn()
+    const onEnqueue = vi.fn()
+    const onGuide = vi.fn().mockResolvedValue(undefined)
+    const { container } = renderInput({
+      onSend,
+      onEnqueue,
+      onGuide,
+      supportsSteer: true,
+      isPrompting: true,
+      onCancel: vi.fn(),
+    })
+    const textbox = await waitFor(() => {
+      const element = container.querySelector('[role="textbox"]')
+      expect(element).not.toBeNull()
+      return element as HTMLElement
+    })
+    await user.type(textbox, "inspect this screenshot")
+    const image = new File([new Uint8Array([137, 80, 78, 71])], "shot.png", {
+      type: "image/png",
+    })
+    fireEvent.paste(textbox, {
+      clipboardData: {
+        files: [image],
+        items: [],
+        getData: () => "",
+      },
+    })
+    await waitFor(() =>
+      expect(screen.getByAltText("shot.png")).toBeInTheDocument()
+    )
+
+    await user.click(
+      screen.getByRole("button", {
+        name: enMessages.Folder.chat.messageInput.steer,
+      })
+    )
+
+    await waitFor(() => expect(onEnqueue).toHaveBeenCalledTimes(1))
+    const queued = onEnqueue.mock.calls[0][0]
+    expect(queued.blocks.map((block: { type: string }) => block.type)).toEqual([
+      "text",
+      "image",
+    ])
+    expect(onGuide).not.toHaveBeenCalled()
+    expect(onSend).not.toHaveBeenCalled()
   })
 })
 
@@ -2260,6 +2403,23 @@ describe("MessageInput mid-turn send (live-feedback channel)", () => {
       editor.commands.insertContent(text)
     })
   }
+
+  it("disables Stop and shows an explicit stopping state while cancellation is pending", async () => {
+    const onCancel = vi.fn()
+    renderInput({
+      isCancelling: true,
+      disabled: true,
+      onCancel,
+    })
+    await waitFor(
+      () => expect(composerHandle.current?.getEditor()).toBeTruthy(),
+      { timeout: 5000 }
+    )
+    const button = screen.getByTitle(MI.stopping)
+    expect(button).toBeDisabled()
+    await userEvent.setup().click(button)
+    expect(onCancel).not.toHaveBeenCalled()
+  })
 
   it("keeps the historical Stop-only form when onSteer is absent", async () => {
     const editor = await mountPrompting()

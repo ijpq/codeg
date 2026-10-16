@@ -22,6 +22,7 @@ import { singleGroupLayout, splitGroup } from "@/lib/tab-group-layout"
 
 vi.mock("@/lib/api", () => ({
   getFolderConversation: vi.fn(),
+  invalidateFolderConversationCache: vi.fn(),
 }))
 
 const { getFolderConversation } = await import("@/lib/api")

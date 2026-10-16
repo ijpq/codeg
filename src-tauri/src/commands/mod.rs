@@ -30,6 +30,9 @@ pub mod computer;
 pub mod computer_tools;
 pub mod config_sync;
 pub mod conversation_tags;
+mod conversation_branch_context;
+pub mod codex_quota;
+pub mod conversation_branches;
 pub mod conversations;
 /// "New folder" in the directory browser (both runtimes).
 pub mod create_directory;
@@ -37,6 +40,7 @@ pub mod custom_agents;
 pub mod custom_skills;
 pub mod deepseek_settings;
 pub mod delegation;
+pub mod deliverables;
 pub mod experts;
 pub mod feedback;
 #[cfg(feature = "tauri-runtime")]
