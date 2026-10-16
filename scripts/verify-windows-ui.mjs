@@ -232,6 +232,11 @@ async function actualPage(page, name, verifyScroll = true) {
   const errors = []
   page.on("pageerror", (error) => errors.push(String(error)))
   await page.reload()
+  // A device-local draft may retain focus across reloads. Select the imported
+  // conversation through its real tab, as a reader would, before inspecting it.
+  const tab = page.locator('[data-tab-id^="conv-"] [role="tab"]').first()
+  await tab.waitFor({ timeout: 30_000 })
+  await tab.click()
   try {
     await page
       .getByText("RELEASE_FINAL_LINE", { exact: true })
