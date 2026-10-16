@@ -13,6 +13,8 @@ const testState = vi.hoisted(() => ({
     isAtBottom: true,
     escapedFromLock: false,
     resizeDifference: 0,
+    lastScrollTop: undefined as number | undefined,
+    ignoreScrollToTop: undefined as number | undefined,
     animation: undefined as { ignoreEscapes: boolean } | undefined,
   },
 }))
@@ -73,6 +75,8 @@ beforeEach(() => {
   testState.state.escapedFromLock = false
   testState.state.resizeDifference = 0
   testState.state.animation = undefined
+  testState.state.lastScrollTop = undefined
+  testState.state.ignoreScrollToTop = undefined
   vi.stubGlobal(
     "ResizeObserver",
     class {
@@ -453,5 +457,28 @@ describe("MessageThread escape on user scroll", () => {
     wheel(row, -40)
 
     expect(testState.stopScroll).not.toHaveBeenCalled()
+  })
+})
+
+describe("fractional virtual-row scroll compensation", () => {
+  it("shields subpixel upward corrections from the library escape detector", () => {
+    mountThreadAt(400)
+    testState.state.lastScrollTop = 600.73
+    testState.scrollRef.current!.scrollTop = 600
+    testState.scrollRef.current!.dispatchEvent(new Event("scroll"))
+    expect(testState.state.ignoreScrollToTop).toBe(600)
+    expect(testState.stopScroll).not.toHaveBeenCalled()
+  })
+
+  it("does not shield a larger upward scroll or rearm an escaped reader", () => {
+    mountThreadAt(400)
+    testState.state.lastScrollTop = 650
+    testState.scrollRef.current!.scrollTop = 600
+    testState.scrollRef.current!.dispatchEvent(new Event("scroll"))
+    expect(testState.state.ignoreScrollToTop).toBeUndefined()
+    testState.state.escapedFromLock = true
+    testState.state.lastScrollTop = 600.73
+    testState.scrollRef.current!.dispatchEvent(new Event("scroll"))
+    expect(testState.state.ignoreScrollToTop).toBeUndefined()
   })
 })
