@@ -215,8 +215,14 @@ function ExecutionModeSession({
                 </p>
                 <p role="status" className="text-xs">
                   {t("status")}:{" "}
-                  {t.has(`statuses.${goal.status}`)
-                    ? t(`statuses.${goal.status}`)
+                  {GOAL_STATUS_KEYS[
+                    goal.status as keyof typeof GOAL_STATUS_KEYS
+                  ]
+                    ? t(
+                        GOAL_STATUS_KEYS[
+                          goal.status as keyof typeof GOAL_STATUS_KEYS
+                        ]
+                      )
                     : goal.status}
                 </p>
                 {goal.tokensUsed != null && (
