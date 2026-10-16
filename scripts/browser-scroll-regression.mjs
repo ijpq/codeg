@@ -141,6 +141,13 @@ try {
       }
     })
   const stable = async (name) => {
+    // A deliberately requested spring is allowed to finish; a loop that never
+    // converges still fails the bounded wait and subsequent stationary samples.
+    await page.waitForFunction(
+      () => !window.scrollFixture.debug?.()?.animation,
+      undefined,
+      { timeout: 5000 }
+    )
     await page.waitForTimeout(700)
     const samples = []
     for (let i = 0; i < 12; i++) {

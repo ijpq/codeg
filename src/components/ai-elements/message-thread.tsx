@@ -213,40 +213,33 @@ const EscapeLockOnUserScroll = () => {
     // by target rather than position because an overlay scrollbar (the macOS
     // default) takes no layout space: it is drawn inside the client box.
     let draggingScrollbar = false
+    let selectingText = false
     let lastScrollTop = viewport.scrollTop
     const onPointerDown = (event: PointerEvent) => {
       draggingScrollbar = event.target === viewport && event.button === 0
+      selectingText = event.target !== viewport && event.button === 0
       lastScrollTop = viewport.scrollTop
     }
     const onPointerEnd = () => {
       draggingScrollbar = false
+      selectingText = false
     }
-    // virtua's measured offsets and the library's rounded target can differ.
-    // A pending programmatic target may even exceed the new physical end after
-    // row remeasurement. The library compares that stale target in a timeout
-    // and falsely escapes although the viewport has already reached the tail.
-    // Shield geometry corrections within its existing near-bottom lock (and
-    // subpixel compensation). Explicit input above still escapes immediately,
-    // including a scrollbar drag whose scroll listener calls stopScroll below.
+    // A DOM scroll event cannot distinguish user input from virtua's measured
+    // offset or a browser clamp. Even the library's pending target can exceed
+    // the new end, and its delayed direction check then falsely escapes. While
+    // locked, shield programmatic scrolls through the library's own mechanism;
+    // actual wheel/touch/keyboard intent above, scrollbar drags and selection
+    // autoscroll below release the SAME lock before that check runs.
     const onScrollCapture = () => {
       const { scrollTop } = viewport
-      const delta =
-        Math.max(
-          state.lastScrollTop ?? scrollTop,
-          state.ignoreScrollToTop ?? scrollTop
-        ) - scrollTop
-      if (
-        state.isAtBottom &&
-        !state.escapedFromLock &&
-        (state.isNearBottom || (delta > 0 && delta <= 1))
-      ) {
+      const selectionDrag =
+        selectingText && document.getSelection()?.isCollapsed === false
+      if ((draggingScrollbar || selectionDrag) && scrollTop < lastScrollTop)
+        escape()
+      lastScrollTop = scrollTop
+      if (state.isAtBottom && !state.escapedFromLock) {
         state.ignoreScrollToTop = scrollTop
       }
-    }
-    const onScroll = () => {
-      const { scrollTop } = viewport
-      if (draggingScrollbar && scrollTop < lastScrollTop) escape()
-      lastScrollTop = scrollTop
     }
 
     viewport.addEventListener("wheel", onWheel, { passive: true })
@@ -260,7 +253,6 @@ const EscapeLockOnUserScroll = () => {
       capture: true,
       passive: true,
     })
-    viewport.addEventListener("scroll", onScroll, { passive: true })
     window.addEventListener("pointerup", onPointerEnd)
     window.addEventListener("pointercancel", onPointerEnd)
     return () => {
@@ -272,7 +264,6 @@ const EscapeLockOnUserScroll = () => {
       viewport.removeEventListener("keydown", onKeyDown)
       viewport.removeEventListener("pointerdown", onPointerDown)
       viewport.removeEventListener("scroll", onScrollCapture, true)
-      viewport.removeEventListener("scroll", onScroll)
       window.removeEventListener("pointerup", onPointerEnd)
       window.removeEventListener("pointercancel", onPointerEnd)
     }

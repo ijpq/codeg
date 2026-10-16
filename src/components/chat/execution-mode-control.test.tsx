@@ -152,3 +152,34 @@ describe("ExecutionModeControl", () => {
     expect(acpGoalControl).not.toHaveBeenCalled()
   })
 })
+
+it("does not restart background polling when an inactive surface's pending read finishes", async () => {
+  let finish!: (value: SessionGoalState) => void
+  vi.mocked(acpGetGoalState).mockImplementationOnce(
+    () =>
+      new Promise((resolve) => {
+        finish = resolve
+      })
+  )
+  const fixture = (active: boolean) => (
+    <NextIntlClientProvider locale="en" messages={messages}>
+      <GoalControlProvider
+        value={{ connectionId: "c1", onGoalControl: null, actions: [] }}
+      >
+        <ExecutionModeControl option={option} active={active} />
+      </GoalControlProvider>
+    </NextIntlClientProvider>
+  )
+  const view = render(fixture(true))
+  await waitFor(() => expect(acpGetGoalState).toHaveBeenCalledTimes(1))
+  view.rerender(fixture(false))
+  await act(async () => {
+    finish(state)
+    await Promise.resolve()
+  })
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 1600))
+  })
+  expect(acpGetGoalState).toHaveBeenCalledTimes(1)
+  view.unmount()
+})
