@@ -107,6 +107,7 @@ vi.mock("@/hooks/use-acp-agents", () => ({
 
 const api = vi.hoisted(() => ({
   acpStopAsyncTask: vi.fn(),
+  acpGetSessionSnapshot: vi.fn().mockResolvedValue({ goal_actions: [] }),
   createChatConversation: vi.fn(),
   createConversation: vi.fn(),
   createChatDir: vi.fn(),
