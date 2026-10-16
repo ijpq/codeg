@@ -617,7 +617,13 @@ describe("loadOlderTurnsThrough", () => {
     mockGet.mockResolvedValue(windowedDetail(4))
     await expect(actions().loadOlderTurnsThrough(CID, 0)).resolves.toBe(false)
     expect(mockGetTurns).toHaveBeenCalledTimes(1)
-    expect(mockGet).toHaveBeenCalledWith(CID, { fromIndex: 4 })
+    expect(mockGet).toHaveBeenCalledWith(
+      CID,
+      expect.objectContaining({
+        userTurnLimit: HISTORY_PAGE_USER_TURNS,
+        cacheMode: "reload",
+      })
+    )
   })
 
   it("gives up on a failed page", async () => {
