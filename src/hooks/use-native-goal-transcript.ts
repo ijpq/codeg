@@ -50,7 +50,6 @@ export function useNativeGoalTranscript(
     if (
       !active ||
       !connectionId ||
-      conversationId <= 0 ||
       observed?.connectionId !== connectionId
     )
       return
@@ -81,8 +80,11 @@ export function useNativeGoalTranscript(
       if (cancelled || document.visibilityState === "hidden") return
       const runtime = useConversationRuntimeStore.getState()
       const session = runtime.byConversationId.get(conversationId)
-      if (!session) return
       if (
+        session &&
+        // A draft keeps its negative runtime key after binding. The reader
+        // resolves its persisted id; do not move the session to a new key.
+        (session.dbConversationId ?? conversationId) > 0 &&
         !session.detailLoading &&
         !session.loadingOlderTurns &&
         !session.activeTurnToken &&
