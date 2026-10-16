@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.35.2-fix1 — 2026-10-16
+
+- Rebase the fork onto upstream v0.35.2 while preserving existing recovery,
+  bounded history, deliverables, native fork and collaboration fixes.
+- Unify Codex execution into Direct / Plan first / Execute goal. Use native
+  collaboration mode and Goal RPCs, with an objective, status, pause, resume
+  and end controls. Leaving an active Goal awaits a confirmed pause and stops
+  its current work; selecting Goal alone never starts or resumes it.
+- Share the transcript scroll target, prevent virtual row compensation from
+  falsely escaping the follow lock, and terminate unreachable-sentinel retries.
+  Preserve virtualization, delayed-content following and deliberate reader escape.
+- Add native CLI/ACP, browser and Windows WebView2 regressions; verify actual
+  packaged Server Web and installed desktop pages plus isolated Setup upgrades.
+- Inventory every packaged frontend resource and verify all compiled database
+  migrations execute; download and verify both Windows packages before and after
+  publication. Server includes the same-version codeg-mcp and pinned Codex runtime.
+
+See [release notes](docs/releases/v0.35.2-fix1.md) for native protocol behavior
+  and validation details.
+
 ## 0.35.1-fix2 — 2026-10-13
 
 - Repair restored Windows runtime caches that retain V8 build-script output but
