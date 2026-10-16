@@ -565,17 +565,30 @@ async function nativeGoalPage(page, api, f, conversation, name) {
     await work(count)
     await page.screenshot({ path: join(output, `${name}-goal-active.png`) })
     await page.keyboard.press("Escape")
-    await page
-      .locator(".chat-scroll-port:visible")
-      .last()
-      .getByText("SYNTHETIC NATIVE GOAL RESPONSE", { exact: true })
-      .first()
-      .waitFor({ timeout: 60_000 })
     const viewport = page.locator(".chat-scroll-port:visible").last()
     await viewport.evaluate((element) => {
       element.tabIndex = 0
       element.focus({ preventScroll: true })
     })
+    // The preceding reader-escape case deliberately leaves history scrolled
+    // up. Explicitly return to the end before checking native output following.
+    await page.keyboard.press("Control+End")
+    const response = viewport
+      .getByText("SYNTHETIC NATIVE GOAL RESPONSE", { exact: true })
+      .last()
+    await response.waitFor({ timeout: 60_000 })
+    await until(
+      async () => ({
+        line: await response.boundingBox(),
+        box: await viewport.boundingBox(),
+      }),
+      ({ line, box }) =>
+        line &&
+        box &&
+        line.y >= box.y - 1 &&
+        line.y + line.height <= box.y + box.height + 1,
+      "native Goal output inside viewport"
+    )
     await page.keyboard.press("Control+Home")
     await delay(300)
     const readerGap = () =>

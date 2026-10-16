@@ -14,6 +14,7 @@
 - Display native Goal continuations through the bounded transcript reader,
   coalescing out-of-prompt activity on visible surfaces and draining final
   records after pause/end. Preserve existing history pages and reader position.
+  Back off asynchronous read failures without dropping pending output.
 - Share the transcript scroll target, prevent virtual row compensation from
   falsely escaping the follow lock, and terminate unreachable-sentinel retries.
   Preserve virtualization, delayed-content following and deliberate reader escape.
