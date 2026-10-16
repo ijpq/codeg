@@ -11,6 +11,7 @@ const testState = vi.hoisted(() => ({
   stopScroll: vi.fn(),
   state: {
     isAtBottom: true,
+    isNearBottom: false,
     escapedFromLock: false,
     resizeDifference: 0,
     lastScrollTop: undefined as number | undefined,
@@ -72,6 +73,7 @@ beforeEach(() => {
   testState.scrollToBottom.mockReset()
   testState.stopScroll.mockReset()
   testState.state.isAtBottom = true
+  testState.state.isNearBottom = false
   testState.state.escapedFromLock = false
   testState.state.resizeDifference = 0
   testState.state.animation = undefined
@@ -481,4 +483,14 @@ describe("fractional virtual-row scroll compensation", () => {
     testState.scrollRef.current!.dispatchEvent(new Event("scroll"))
     expect(testState.state.ignoreScrollToTop).toBeUndefined()
   })
+})
+
+it("shields a stale overshoot target after virtual row remeasurement at the tail", () => {
+  mountThreadAt(400)
+  testState.state.lastScrollTop = 599
+  testState.state.ignoreScrollToTop = 632
+  testState.state.isNearBottom = true
+  testState.scrollRef.current!.scrollTop = 600
+  testState.scrollRef.current!.dispatchEvent(new Event("scroll"))
+  expect(testState.state.ignoreScrollToTop).toBe(600)
 })
