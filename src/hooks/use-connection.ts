@@ -27,12 +27,14 @@ import type {
   SessionModeStateInfo,
   PromptInputBlock,
 } from "@/lib/types"
+import type { AcpCancelResult } from "@/lib/api"
 
 const DEFAULT_PROMPT_CAPABILITIES: PromptCapabilitiesInfo = {
   image: false,
   audio: false,
   embedded_context: false,
 }
+const EMPTY_STEER_MESSAGES: PendingUserMessage[] = []
 
 /** Stable empty table so the no-failures common case never re-renders. */
 const EMPTY_SESSION_FAILURES: SessionFailureRecord[] = []
@@ -43,6 +45,7 @@ const EMPTY_ASYNC_TASKS: AsyncTaskRecord[] = []
 
 export interface UseConnectionReturn {
   connectionId: string | null
+  conversationId: number | null
   /** The agent type of the live connection at this contextKey (null when no
    *  connection exists yet). Lets callers detect a connection still bound to a
    *  PREVIOUS agent — e.g. a draft mid-switch, or a switch the not-installed
@@ -65,9 +68,14 @@ export interface UseConnectionReturn {
   connectError: ConnectErrorInfo | null
   promptCapabilities: PromptCapabilitiesInfo
   supportsFork: boolean
+  supportsSteer: boolean
   selectorsReady: boolean
+  /** Exact connection snapshot/attach has completed and prompts may be sent. */
+  promptReady: boolean
   hasCachedSelectors: boolean
   sessionId: string | null
+  codegMcpAvailable: boolean
+  mcpServerCount: number
   /** The working directory the live connection was established with (null when
    *  not connected). Lets callers detect a connection that is mid-reconnect to a
    *  different cwd and avoid acting on the stale one. */
@@ -81,6 +89,7 @@ export interface UseConnectionReturn {
    *  (native steering). The notes list drops their strips so one message shows
    *  in exactly one place. `[]` when nothing was steered. */
   steeredMessageIds: string[]
+  steerMessages: PendingUserMessage[]
   pendingQuestion: PendingQuestion | null
   pendingAskQuestion: PendingQuestionState | null
   pendingPlanApproval: PendingPlanApprovalState | null
@@ -137,7 +146,9 @@ export interface UseConnectionReturn {
   ) => Promise<void>
   setMode: (modeId: string) => Promise<void>
   setConfigOption: (configId: string, valueId: string) => Promise<void>
-  cancel: () => Promise<void>
+  cancel: () => Promise<AcpCancelResult | null>
+  refreshSnapshot: () => Promise<ConnectionStatus | null>
+  reconnect: () => Promise<boolean>
   respondPermission: (requestId: string, optionId: string) => Promise<void>
   answerQuestion: (questionId: string, answer: QuestionAnswer) => Promise<void>
 }
@@ -240,6 +251,7 @@ export function useConnection(contextKey: string): UseConnectionReturn {
   )
 
   const connectionId = connection?.connectionId ?? null
+  const conversationId = connection?.conversationId ?? null
   const agentType = connection?.agentType ?? null
   const isViewer = connection?.isViewer ?? false
   // An in-flight `connect()` IS "connecting", even though the store has no
@@ -263,8 +275,12 @@ export function useConnection(contextKey: string): UseConnectionReturn {
   const promptCapabilities =
     connection?.promptCapabilities ?? DEFAULT_PROMPT_CAPABILITIES
   const supportsFork = connection?.supportsFork ?? false
+  const supportsSteer = connection?.supportsSteer ?? false
   const selectorsReady = connection?.selectorsReady ?? false
+  const promptReady = connection?.promptReady ?? false
   const sessionId = connection?.sessionId ?? null
+  const codegMcpAvailable = connection?.codegMcpAvailable ?? false
+  const mcpServerCount = connection?.mcpServerCount ?? 0
   const cached = connection?.agentType
     ? getCachedSelectors(connection.agentType)
     : null
@@ -278,6 +294,7 @@ export function useConnection(contextKey: string): UseConnectionReturn {
   const pendingUserMessage = connection?.pendingUserMessage ?? null
   const steeredMessageIds =
     connection?.steeredMessageIds ?? EMPTY_STEERED_MESSAGE_IDS
+  const steerMessages = connection?.steerMessages ?? EMPTY_STEER_MESSAGES
   const pendingQuestion = connection?.pendingQuestion ?? null
   const pendingAskQuestion = connection?.pendingAskQuestion ?? null
   const pendingPlanApproval = connection?.pendingPlanApproval ?? null
@@ -345,6 +362,16 @@ export function useConnection(contextKey: string): UseConnectionReturn {
     [actions, contextKey]
   )
 
+  const refreshSnapshot = useCallback(
+    () => actions.refreshSnapshot(contextKey),
+    [actions, contextKey]
+  )
+
+  const reconnect = useCallback(
+    () => actions.reconnect(contextKey),
+    [actions, contextKey]
+  )
+
   const respondPermission = useCallback(
     (requestId: string, optionId: string) =>
       actions.respondPermission(contextKey, requestId, optionId),
@@ -370,15 +397,20 @@ export function useConnection(contextKey: string): UseConnectionReturn {
   return useMemo(
     () => ({
       connectionId,
+      conversationId,
       agentType,
       isViewer,
       status,
       connectError,
       promptCapabilities,
       supportsFork,
+      supportsSteer,
       selectorsReady,
+      promptReady,
       hasCachedSelectors,
       sessionId,
+      codegMcpAvailable,
+      mcpServerCount,
       connectedWorkingDir,
       modes,
       configOptions,
@@ -386,6 +418,7 @@ export function useConnection(contextKey: string): UseConnectionReturn {
       pendingPermission,
       pendingUserMessage,
       steeredMessageIds,
+      steerMessages,
       pendingQuestion,
       pendingAskQuestion,
       pendingPlanApproval,
@@ -408,20 +441,27 @@ export function useConnection(contextKey: string): UseConnectionReturn {
       setMode,
       setConfigOption,
       cancel,
+      refreshSnapshot,
+      reconnect,
       respondPermission,
       answerQuestion,
     }),
     [
       connectionId,
+      conversationId,
       agentType,
       isViewer,
       status,
       connectError,
       promptCapabilities,
       supportsFork,
+      supportsSteer,
       selectorsReady,
+      promptReady,
       hasCachedSelectors,
       sessionId,
+      codegMcpAvailable,
+      mcpServerCount,
       connectedWorkingDir,
       modes,
       configOptions,
@@ -429,6 +469,7 @@ export function useConnection(contextKey: string): UseConnectionReturn {
       pendingPermission,
       pendingUserMessage,
       steeredMessageIds,
+      steerMessages,
       pendingQuestion,
       pendingAskQuestion,
       pendingPlanApproval,
@@ -451,6 +492,8 @@ export function useConnection(contextKey: string): UseConnectionReturn {
       setMode,
       setConfigOption,
       cancel,
+      refreshSnapshot,
+      reconnect,
       respondPermission,
       answerQuestion,
     ]

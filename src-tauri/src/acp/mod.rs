@@ -12,11 +12,14 @@ pub mod codex_context;
 pub mod codex_goal;
 pub mod codex_model_catalog;
 pub mod computer_tools;
+pub(crate) mod codex_runtime;
+pub mod codex_steer_adapter;
 pub mod connection;
 pub mod cursor_acp_retry_compat;
 pub mod cursor_ext;
 pub mod custom_registry;
 pub mod delegation;
+pub mod deliverables;
 pub mod error;
 pub mod event_stream;
 pub mod feedback;
@@ -50,7 +53,10 @@ pub mod types;
 pub mod work_task_tools;
 pub mod zcode;
 
-pub use idle_sweep::{idle_sweep_task, idle_timeout_from_env, SWEEP_INTERVAL_SECS};
+pub use idle_sweep::{
+    idle_sweep_task, idle_timeout_from_env, turn_reconciliation_task, SWEEP_INTERVAL_SECS,
+    TURN_RECONCILIATION_INTERVAL_SECS,
+};
 pub use internal_bus::{EventBusMetrics, EventBusMetricsSnapshot, InternalEventBus};
 pub use lifecycle::lifecycle_subscriber_task;
 pub use session_state::{LiveSessionSnapshot, SessionState};

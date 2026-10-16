@@ -1482,6 +1482,24 @@ pub fn message_sent(lang: Lang) -> &'static str {
     }
 }
 
+/// Provider-facing receipt: input is durably accepted and may still be queued
+/// while ACP restores. Deliberately distinct from `message_sent`, which sounds
+/// like the model has already completed its work.
+pub fn message_received(lang: Lang) -> &'static str {
+    match lang {
+        Lang::ZhCn => "已收到，正在处理。",
+        Lang::ZhTw => "已收到，正在處理。",
+        Lang::Ja => "受け付けました。処理しています。",
+        Lang::Ko => "접수했습니다. 처리 중입니다.",
+        Lang::Es => "Recibido; procesando.",
+        Lang::De => "Empfangen; wird verarbeitet.",
+        Lang::Fr => "Reçu, traitement en cours.",
+        Lang::Pt => "Recebido; processando.",
+        Lang::Ar => "تم الاستلام، جارٍ المعالجة.",
+        Lang::En => "Received — processing.",
+    }
+}
+
 /// Shown when a prompt is rejected because the agent is still processing the
 /// previous turn. Transient — the session stays alive; the user retries.
 pub fn agent_busy_retry(lang: Lang) -> &'static str {

@@ -18,6 +18,7 @@ import {
 
 vi.mock("@/lib/api", () => ({
   getFolderConversation: vi.fn(),
+  invalidateFolderConversationCache: vi.fn(),
   getFolderConversationTurns: vi.fn(),
 }))
 
@@ -92,6 +93,7 @@ function emptySession(conversationId: number): ConversationRuntimeSession {
     olderTurnsPrependEpoch: 0,
     pendingOutOfTurnContent: false,
     pendingCleanup: false,
+    promptDeliveries: {},
   }
 }
 

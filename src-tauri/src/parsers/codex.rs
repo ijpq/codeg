@@ -1,11 +1,20 @@
 use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::io::{BufRead, BufReader};
+use std::fs::{self, OpenOptions};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+#[cfg(not(test))]
+use std::thread;
+#[cfg(not(test))]
+use std::time::Duration as StdDuration;
+use std::time::{Instant, SystemTime};
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, Utc};
 use regex::Regex;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 use crate::acp::agent_mentions::{contains_only_internal_frames, strip_internal_frames};
@@ -13,14 +22,15 @@ use crate::acp::js_text::is_js_whitespace;
 use crate::models::*;
 use crate::parsers::codex_code_mode::{
     extract_chunk_ids, extract_shell_session_ids, is_code_mode_call, parse_code_mode_script,
-    script_card_input,
-    split_code_mode_output, with_note, CodeModeCall, CodeModeOutput, CodeModeScript, ScriptStatus,
-    Separator, CODEX_SCRIPT_TOOL_NAME,
+    script_card_input, split_code_mode_output, with_note, CodeModeCall, CodeModeOutput,
+    CodeModeScript, ScriptStatus, Separator, CODEX_SCRIPT_TOOL_NAME,
 };
 use crate::parsers::{
     codex_desktop_attachments, folder_name_from_path, title_from_user_text, truncate_str, AgentEnv,
     AgentParser, ParseError,
 };
+
+const CITATION_RECOVERY_TAIL_BYTES: u64 = 64 * 1024 * 1024;
 
 pub struct CodexParser {
     base_dir: PathBuf,
@@ -194,6 +204,123 @@ fn trim_subagent_replay_prefix(own: Vec<String>) -> Vec<String> {
     kept.push(own[header_idx].clone());
     kept.extend(own.into_iter().skip(boundary));
     kept
+}
+
+fn merge_web_search_citation_meta(
+    messages: &mut [UnifiedMessage],
+    tool_id: &str,
+    incoming_meta: Option<&serde_json::Value>,
+) -> bool {
+    let Some(incoming_meta) = incoming_meta else {
+        return false;
+    };
+    for message in messages.iter_mut().rev() {
+        for block in message.content.iter_mut().rev() {
+            let ContentBlock::ToolUse {
+                tool_use_id, meta, ..
+            } = block
+            else {
+                continue;
+            };
+            if tool_use_id.as_deref() != Some(tool_id) {
+                continue;
+            }
+            *meta = Some(crate::citations::merge_citations_in_meta(
+                meta.as_ref(),
+                incoming_meta,
+            ));
+            return true;
+        }
+    }
+    false
+}
+
+/// Recover sources for the current Codex turn from its append-only rollout.
+/// This is a terminal-path fallback for providers whose live `WebSearchItem`
+/// reports `results: null` even though `web_search_end` persists the exact
+/// ref-id/URL pairs. The read is bounded and must observe a current-turn
+/// `task_started` boundary; otherwise it fails closed instead of mixing an old
+/// turn's same-shaped citation id into the new answer.
+pub(crate) fn recover_current_turn_citation_sources(
+    session_id: &str,
+    wanted_ids: &HashSet<String>,
+) -> Result<Vec<crate::citations::CitationSource>, String> {
+    if wanted_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let parser = CodexParser::new();
+    let path = parser
+        .rollout_path(session_id)
+        .map_err(|_| "rollout_not_found".to_string())?;
+    recover_current_turn_citation_sources_from_path(&path, wanted_ids)
+}
+
+fn recover_current_turn_citation_sources_from_path(
+    path: &Path,
+    wanted_ids: &HashSet<String>,
+) -> Result<Vec<crate::citations::CitationSource>, String> {
+    if wanted_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut file = fs::File::open(path).map_err(|_| "rollout_open_failed".to_string())?;
+    let file_len = file
+        .metadata()
+        .map_err(|_| "rollout_metadata_failed".to_string())?
+        .len();
+    let start = file_len.saturating_sub(CITATION_RECOVERY_TAIL_BYTES);
+    file.seek(SeekFrom::Start(start))
+        .map_err(|_| "rollout_seek_failed".to_string())?;
+    let mut reader = BufReader::new(file);
+    if start > 0 {
+        let mut partial = String::new();
+        reader
+            .read_line(&mut partial)
+            .map_err(|_| "rollout_partial_line_failed".to_string())?;
+    }
+
+    let mut saw_stable_boundary = false;
+    let mut sources = Vec::new();
+    for line in reader.lines() {
+        let line = line.map_err(|_| "rollout_read_failed".to_string())?;
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let record_type = value
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let Some(payload) = value.get("payload") else {
+            continue;
+        };
+        let payload_type = payload
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if record_type == "event_msg" && payload_type == "task_started" {
+            saw_stable_boundary = true;
+            sources.clear();
+            continue;
+        }
+        if !saw_stable_boundary {
+            continue;
+        }
+        let citation_payload = (record_type == "event_msg" && payload_type == "web_search_end")
+            || (record_type == "response_item" && payload_type == "web_search_call");
+        if !citation_payload {
+            continue;
+        }
+        sources.extend(crate::citations::extract_sources_from_web_search_input(
+            &payload.to_string(),
+        ));
+    }
+    if !saw_stable_boundary {
+        return Err("stable_turn_boundary_outside_bounded_tail".to_string());
+    }
+    let merged = crate::citations::merge_sources(sources.iter())
+        .into_iter()
+        .filter(|source| wanted_ids.contains(&source.reference_id))
+        .collect::<Vec<_>>();
+    Ok(merged)
 }
 
 impl Default for CodexParser {
@@ -413,10 +540,7 @@ impl CodexParser {
         titles
     }
 
-    fn parse_jsonl_summary(
-        &self,
-        path: &Path,
-    ) -> Result<Option<ConversationSummary>, ParseError> {
+    fn parse_jsonl_summary(&self, path: &Path) -> Result<Option<ConversationSummary>, ParseError> {
         let lines = self.rollout_lines(path)?;
 
         let mut conversation_id: Option<String> = None;
@@ -473,6 +597,26 @@ impl CodexParser {
         for line in lines {
             if line.trim().is_empty() {
                 continue;
+            }
+
+            // Unknown records are ignored by the match below. Avoid asking
+            // serde_json to allocate/copy a multi-megabyte payload merely to
+            // reach that default arm. Codex writes the top-level type near the
+            // start of every record; supported records still take the exact
+            // parser path regardless of size.
+            if line.len() > CODEX_HISTORY_SCAN_CHUNK_BYTES {
+                let prefix = &line.as_bytes()[..line.len().min(4096)];
+                let supported = [
+                    b"session_meta".as_slice(),
+                    b"turn_context".as_slice(),
+                    b"event_msg".as_slice(),
+                    b"response_item".as_slice(),
+                ]
+                .iter()
+                .any(|needle| bytes_contain(prefix, needle));
+                if !supported {
+                    continue;
+                }
             }
 
             let value: serde_json::Value = match serde_json::from_str(&line) {
@@ -749,9 +893,7 @@ impl CodexParser {
                                         pending_promotions.push((
                                             is_user,
                                             is_user
-                                                .then(|| {
-                                                    extract_codex_title_candidate(&text, true)
-                                                })
+                                                .then(|| extract_codex_title_candidate(&text, true))
                                                 .flatten(),
                                         ));
                                     }
@@ -868,6 +1010,1267 @@ fn resolve_codex_home_dir_from(
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| home_dir.unwrap_or_default().join(".codex"))
+}
+
+/// Resolve the parent session recorded by a native Codex fork. This is used
+/// only to repair fork-send conversations created by older CodeG builds, which
+/// persisted the two conversation rows but not their `conversation_branch`
+/// relation. Reading only the opening `session_meta` avoids parsing or exposing
+/// the copied transcript.
+pub(crate) fn native_fork_parent_session_id(session_id: &str) -> Option<String> {
+    native_fork_parent_session_id_in(&resolve_codex_home_dir().join("sessions"), session_id)
+}
+
+fn native_fork_parent_session_id_in(sessions_dir: &Path, session_id: &str) -> Option<String> {
+    let session_id = session_id.trim();
+    if session_id.is_empty()
+        || session_id.len() > 64
+        || !session_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return None;
+    }
+    let suffix = format!("-{session_id}.jsonl");
+    let mut candidates = WalkDir::new(sessions_dir)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+        .map(|entry| entry.into_path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(&suffix))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort();
+    for path in candidates.into_iter().rev() {
+        let Ok(file) = fs::File::open(path) else {
+            continue;
+        };
+        let mut opening = String::new();
+        if BufReader::new(file.take(64 * 1024))
+            .read_line(&mut opening)
+            .is_err()
+        {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&opening) else {
+            continue;
+        };
+        if value.get("type").and_then(serde_json::Value::as_str) != Some("session_meta")
+            || value
+                .pointer("/payload/id")
+                .and_then(serde_json::Value::as_str)
+                != Some(session_id)
+        {
+            continue;
+        }
+        let Some(parent) = value
+            .pointer("/payload/parent_thread_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|parent| !parent.is_empty() && *parent != session_id)
+        else {
+            continue;
+        };
+        return Some(parent.to_string());
+    }
+    None
+}
+
+/// A directly-seekable page from a Codex rollout. `start_offset` is also the
+/// cursor for the next (older) page; callers never need to know how the JSONL
+/// was split into render turns.
+#[derive(Clone)]
+pub(crate) struct CodexConversationPage {
+    pub detail: ConversationDetail,
+    pub start_offset: u64,
+    pub end_offset: u64,
+    pub has_more: bool,
+    pub page_complete: bool,
+    /// Bytes inspected while locating the page boundary. Zero means the
+    /// persistent offset index answered the lookup without scanning JSONL.
+    pub scan_bytes: u64,
+    /// Whether the parsed page itself came from the bounded in-process cache.
+    pub cache_hit: bool,
+    /// Whether the page boundary came from the persistent offset index.
+    pub index_hit: bool,
+    /// `missing`, `building`, `ready`, `limited`, `stale`, or `corrupt` at read time.
+    pub index_status: &'static str,
+    /// Last source byte durably covered by the persistent record index.
+    pub indexed_through_offset: u64,
+    /// Opaque append-version used by the frontend's bounded LRU cache.
+    pub source_version: String,
+}
+
+/// A byte-bounded slice of an append-only Codex rollout. Branch merge uses
+/// this instead of reparsing the native fork's inherited prefix (which can be
+/// gigabytes) once the exact child offset captured at fork time is known.
+pub(crate) struct CodexConversationRange {
+    pub detail: ConversationDetail,
+    pub start_offset: u64,
+    pub end_offset: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct CodexRolloutSizeDiagnostics {
+    pub file_bytes: u64,
+    pub record_count: u64,
+    pub ordinary_text_bytes: u64,
+    pub reasoning_bytes: u64,
+    pub tool_call_bytes: u64,
+    pub tool_result_bytes: u64,
+    pub image_or_data_url_bytes: u64,
+    pub snapshot_or_compaction_bytes: u64,
+    pub duplicate_record_bytes: u64,
+    pub duplicate_record_count: u64,
+    pub other_bytes: u64,
+}
+
+const CODEX_HISTORY_SCAN_CHUNK_BYTES: usize = 1024 * 1024;
+/// Historical fast-path budget, also used for incremental index slices. The
+/// tail scanner stops as soon as it finds the requested rounds, extending past
+/// this threshold when needed, with no reread and a strict 64 MiB ceiling.
+pub(crate) const CODEX_HISTORY_FIRST_PAGE_INITIAL_BYTES: u64 = 16 * 1024 * 1024;
+pub(crate) const CODEX_HISTORY_FIRST_PAGE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+// v2 could persist a partial scan's offset as a complete page boundary.
+const CODEX_HISTORY_INDEX_VERSION: u8 = 3;
+#[cfg(not(test))]
+const CODEX_HISTORY_INDEX_SLICE_BYTES: u64 = CODEX_HISTORY_FIRST_PAGE_INITIAL_BYTES;
+#[cfg(not(test))]
+const CODEX_HISTORY_INDEX_PROGRESS_BYTES: u64 = 256 * 1024 * 1024;
+const CODEX_HISTORY_INDEX_ENTRY_BYTES: usize = 17;
+const CODEX_HISTORY_INDEX_MAX_ENTRIES: usize = 4_000_000;
+#[cfg(not(test))]
+const CODEX_HISTORY_INDEX_CACHE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+const CODEX_HISTORY_PAGE_CACHE_ENTRIES: usize = 16;
+const CODEX_HISTORY_PAGE_CACHE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const CODEX_HISTORY_PAGE_CACHE_MAX_ENTRY_BYTES: u64 = 32 * 1024 * 1024;
+
+const INDEX_MARK_USER: u16 = 1 << 0;
+const INDEX_MARK_MESSAGE: u16 = 1 << 1;
+const INDEX_MARK_TURN: u16 = 1 << 2;
+const INDEX_MARK_TOOL: u16 = 1 << 3;
+const INDEX_MARK_COMPACTION: u16 = 1 << 4;
+const INDEX_MARKER_TAIL_BYTES: usize = 96;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum CodexHistoryEntryKind {
+    User = 1,
+    Message = 2,
+    Turn = 3,
+    Tool = 4,
+    Compaction = 5,
+}
+
+impl CodexHistoryEntryKind {
+    fn from_byte(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::User),
+            2 => Some(Self::Message),
+            3 => Some(Self::Turn),
+            4 => Some(Self::Tool),
+            5 => Some(Self::Compaction),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CodexHistoryIndexEntry {
+    start_offset: u64,
+    end_offset: u64,
+    kind: CodexHistoryEntryKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CodexHistoryIndexMeta {
+    version: u8,
+    canonical_path: String,
+    file_identity: String,
+    observed_len: u64,
+    observed_mtime_ns: u128,
+    indexed_through_offset: u64,
+    entry_count: usize,
+    /// Persisted integrity/progress state for diagnostics after restart.
+    /// Readers still validate every identity and watermark before trusting it.
+    #[serde(default = "default_history_index_completeness")]
+    completeness: String,
+    /// The fixed-size sidecar reached its configured space cap.  Scanning can
+    /// continue to checkpoint source progress, but record-based lookup beyond
+    /// the last retained entry must fall back to the bounded tail scanner.
+    #[serde(default)]
+    entries_saturated: bool,
+    #[serde(default)]
+    pending_record_start: u64,
+    #[serde(default)]
+    pending_record_markers: u16,
+    #[serde(default)]
+    pending_record_tail: Vec<u8>,
+    /// Exact `(end offset, requested user rounds) -> start offset` pages.
+    /// This small compatibility cache makes the first reopen fast while the
+    /// richer record index is still building in the background.
+    #[serde(default)]
+    pages: HashMap<String, u64>,
+}
+
+fn default_history_index_completeness() -> String {
+    "building".to_string()
+}
+
+#[derive(Debug, Clone)]
+struct CodexHistoryIndex {
+    meta: CodexHistoryIndexMeta,
+    entries: Vec<CodexHistoryIndexEntry>,
+    load_status: &'static str,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct CodexPageCacheKey {
+    path: PathBuf,
+    file_len: u64,
+    modified_ns: u128,
+    end_offset: u64,
+    user_turn_limit: usize,
+    cwd_hint: Option<String>,
+}
+
+#[derive(Clone)]
+struct CachedCodexPage {
+    page: Arc<CodexConversationPage>,
+    used_at: Instant,
+    source_bytes: u64,
+}
+
+static ROLLOUT_PATH_CACHE: LazyLock<Mutex<HashMap<(PathBuf, String), PathBuf>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static HISTORY_INDEX_CACHE: LazyLock<Mutex<HashMap<PathBuf, CodexHistoryIndex>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static HISTORY_PAGE_CACHE: LazyLock<Mutex<HashMap<CodexPageCacheKey, CachedCodexPage>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static HISTORY_PAGE_FLIGHTS: LazyLock<Mutex<HashMap<CodexPageCacheKey, Arc<Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+#[cfg(not(test))]
+static HISTORY_INDEX_BUILDS: LazyLock<Mutex<HashSet<PathBuf>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+struct HistoryPageFlightRegistration {
+    key: CodexPageCacheKey,
+}
+
+impl Drop for HistoryPageFlightRegistration {
+    fn drop(&mut self) {
+        HISTORY_PAGE_FLIGHTS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.key);
+    }
+}
+
+fn system_time_ns(value: SystemTime) -> u128 {
+    value
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+}
+
+fn history_page_index_key(end_offset: u64, user_turn_limit: usize) -> String {
+    format!("{end_offset}:{user_turn_limit}")
+}
+
+fn history_index_base_path(rollout_path: &Path) -> Option<PathBuf> {
+    let cache_root = history_index_cache_root()?;
+    let canonical = rollout_path
+        .canonicalize()
+        .unwrap_or_else(|_| rollout_path.to_path_buf());
+    let digest = Sha256::digest(canonical.to_string_lossy().as_bytes());
+    Some(cache_root.join(URL_SAFE_NO_PAD.encode(digest)))
+}
+
+fn history_index_cache_root() -> Option<PathBuf> {
+    Some(
+        dirs::cache_dir()?
+            .join("codeg")
+            .join("codex-history-index-v2"),
+    )
+}
+
+#[cfg(not(test))]
+fn enforce_history_index_cache_limit(current_rollout: &Path) {
+    #[derive(Default)]
+    struct CacheGroup {
+        bytes: u64,
+        modified: Option<SystemTime>,
+        paths: Vec<PathBuf>,
+    }
+
+    let Some(root) = history_index_cache_root() else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(&root) else {
+        return;
+    };
+    let current_rollout = current_rollout.to_path_buf();
+    let builds = HISTORY_INDEX_BUILDS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let protected = builds
+        .iter()
+        .chain(std::iter::once(&current_rollout))
+        .filter_map(|path| history_index_base_path(path))
+        .filter_map(|path| path.file_name().map(|name| name.to_owned()))
+        .collect::<HashSet<_>>();
+    drop(builds);
+    let mut groups = HashMap::<String, CacheGroup>::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let base = name
+            .strip_suffix(".meta.json")
+            .or_else(|| name.strip_suffix(".entries"));
+        let Some(base) = base else {
+            continue;
+        };
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let group = groups.entry(base.to_string()).or_default();
+        group.bytes = group.bytes.saturating_add(metadata.len());
+        let modified = metadata.modified().ok();
+        if modified > group.modified {
+            group.modified = modified;
+        }
+        group.paths.push(path);
+    }
+    let mut total = groups.values().map(|group| group.bytes).sum::<u64>();
+    if total <= CODEX_HISTORY_INDEX_CACHE_MAX_BYTES {
+        return;
+    }
+    let mut groups = groups.into_iter().collect::<Vec<_>>();
+    groups.sort_by_key(|(_, group)| group.modified);
+    let mut released = 0u64;
+    for (base, group) in groups {
+        if total <= CODEX_HISTORY_INDEX_CACHE_MAX_BYTES
+            || protected.contains(std::ffi::OsStr::new(&base))
+        {
+            continue;
+        }
+        for path in group.paths {
+            let _ = fs::remove_file(path);
+        }
+        total = total.saturating_sub(group.bytes);
+        released = released.saturating_add(group.bytes);
+    }
+    if released > 0 {
+        tracing::info!(
+            released_bytes = released,
+            remaining_bytes = total,
+            cache_limit_bytes = CODEX_HISTORY_INDEX_CACHE_MAX_BYTES,
+            "[conversation][perf] evicted old Codex history indexes"
+        );
+    }
+}
+
+fn history_index_path(rollout_path: &Path) -> Option<PathBuf> {
+    history_index_base_path(rollout_path).map(|path| path.with_extension("meta.json"))
+}
+
+fn history_index_entries_path(rollout_path: &Path) -> Option<PathBuf> {
+    history_index_base_path(rollout_path).map(|path| path.with_extension("entries"))
+}
+
+fn canonical_history_path(rollout_path: &Path) -> String {
+    rollout_path
+        .canonicalize()
+        .unwrap_or_else(|_| rollout_path.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[cfg(unix)]
+fn history_file_identity(_rollout_path: &Path, metadata: &fs::Metadata) -> String {
+    use std::os::unix::fs::MetadataExt;
+    format!("unix:{}:{}", metadata.dev(), metadata.ino())
+}
+
+#[cfg(windows)]
+fn history_file_identity(rollout_path: &Path, metadata: &fs::Metadata) -> String {
+    use std::os::windows::fs::MetadataExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+
+    if let Ok(file) = fs::File::open(rollout_path) {
+        // SAFETY: the handle stays owned by `file` for the duration of the
+        // call, and `info` points to a writable structure of the exact type the
+        // Win32 API expects.
+        let mut info = unsafe { std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };
+        let succeeded = unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) };
+        if succeeded != 0 {
+            let file_index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+            return format!("windows:{}:{}", info.dwVolumeSerialNumber, file_index);
+        }
+    }
+
+    // Opening a file can fail transiently (for example while an antivirus
+    // scanner owns it). Creation time plus attributes is stable across normal
+    // appends and still gives the index a conservative fallback identity.
+    format!(
+        "windows-fallback:{}:{}",
+        metadata.creation_time(),
+        metadata.file_attributes()
+    )
+}
+
+#[cfg(not(any(unix, windows)))]
+fn history_file_identity(_rollout_path: &Path, _metadata: &fs::Metadata) -> String {
+    "path".to_string()
+}
+
+fn empty_history_index(rollout_path: &Path, metadata: &fs::Metadata) -> CodexHistoryIndex {
+    CodexHistoryIndex {
+        meta: CodexHistoryIndexMeta {
+            version: CODEX_HISTORY_INDEX_VERSION,
+            canonical_path: canonical_history_path(rollout_path),
+            file_identity: history_file_identity(rollout_path, metadata),
+            observed_len: metadata.len(),
+            observed_mtime_ns: metadata.modified().map(system_time_ns).unwrap_or_default(),
+            indexed_through_offset: 0,
+            entry_count: 0,
+            completeness: "missing".to_string(),
+            entries_saturated: false,
+            pending_record_start: 0,
+            pending_record_markers: 0,
+            pending_record_tail: Vec::new(),
+            pages: HashMap::new(),
+        },
+        entries: Vec::new(),
+        load_status: "missing",
+    }
+}
+
+fn decode_history_entries(
+    rollout_path: &Path,
+    entry_count: usize,
+) -> Option<Vec<CodexHistoryIndexEntry>> {
+    if entry_count > CODEX_HISTORY_INDEX_MAX_ENTRIES {
+        return None;
+    }
+    let entries_path = history_index_entries_path(rollout_path)?;
+    if entry_count == 0 {
+        return Some(Vec::new());
+    }
+    let bytes = fs::read(entries_path).ok()?;
+    let expected = entry_count.checked_mul(CODEX_HISTORY_INDEX_ENTRY_BYTES)?;
+    if bytes.len() < expected {
+        return None;
+    }
+    let mut entries = Vec::with_capacity(entry_count);
+    let mut previous_end = 0u64;
+    let (records, remainder) = bytes[..expected].as_chunks::<CODEX_HISTORY_INDEX_ENTRY_BYTES>();
+    if !remainder.is_empty() {
+        return None;
+    }
+    for record in records {
+        let start_offset = u64::from_le_bytes(record[..8].try_into().ok()?);
+        let end_offset = u64::from_le_bytes(record[8..16].try_into().ok()?);
+        let kind = CodexHistoryEntryKind::from_byte(record[16])?;
+        if end_offset <= start_offset || start_offset < previous_end {
+            return None;
+        }
+        previous_end = end_offset;
+        entries.push(CodexHistoryIndexEntry {
+            start_offset,
+            end_offset,
+            kind,
+        });
+    }
+    Some(entries)
+}
+
+fn load_history_index(rollout_path: &Path, metadata: &fs::Metadata) -> CodexHistoryIndex {
+    let mut empty = empty_history_index(rollout_path, metadata);
+    let Some(index_path) = history_index_path(rollout_path) else {
+        return empty;
+    };
+    let Some(meta) = fs::read(&index_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<CodexHistoryIndexMeta>(&bytes).ok())
+    else {
+        if index_path.exists() {
+            empty.load_status = "corrupt";
+        }
+        return empty;
+    };
+    if meta.version != CODEX_HISTORY_INDEX_VERSION
+        || meta.canonical_path != canonical_history_path(rollout_path)
+        || meta.file_identity != history_file_identity(rollout_path, metadata)
+        || meta.indexed_through_offset > metadata.len()
+    {
+        empty.load_status = "stale";
+        return empty;
+    }
+    let Some(entries) = decode_history_entries(rollout_path, meta.entry_count) else {
+        empty.load_status = "corrupt";
+        return empty;
+    };
+    CodexHistoryIndex {
+        meta,
+        entries,
+        load_status: "ready",
+    }
+}
+
+fn save_history_index_meta(rollout_path: &Path, meta: &CodexHistoryIndexMeta) {
+    let Some(index_path) = history_index_path(rollout_path) else {
+        return;
+    };
+    let Some(parent) = index_path.parent() else {
+        return;
+    };
+    if fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let Ok(bytes) = serde_json::to_vec(meta) else {
+        return;
+    };
+    let temporary = index_path.with_extension(format!("json.tmp-{}", std::process::id()));
+    if fs::write(&temporary, bytes).is_ok() {
+        let _ = fs::rename(&temporary, &index_path);
+    }
+    let _ = fs::remove_file(temporary);
+}
+
+fn reset_history_index_files(rollout_path: &Path, index: &CodexHistoryIndex) {
+    if let Some(entries_path) = history_index_entries_path(rollout_path) {
+        if let Some(parent) = entries_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::File::create(entries_path);
+    }
+    save_history_index_meta(rollout_path, &index.meta);
+}
+
+fn validate_history_index_source(
+    rollout_path: &Path,
+    metadata: &fs::Metadata,
+    index: &CodexHistoryIndex,
+) -> bool {
+    index.meta.version == CODEX_HISTORY_INDEX_VERSION
+        && index.meta.canonical_path == canonical_history_path(rollout_path)
+        && index.meta.file_identity == history_file_identity(rollout_path, metadata)
+        && metadata.len() >= index.meta.observed_len
+        && index.meta.indexed_through_offset <= metadata.len()
+        && !(metadata.len() == index.meta.observed_len
+            && index.meta.observed_mtime_ns != 0
+            && metadata.modified().map(system_time_ns).unwrap_or_default()
+                != index.meta.observed_mtime_ns)
+}
+
+fn history_index_status(index: &CodexHistoryIndex, file_len: u64) -> (&'static str, u64) {
+    if index.load_status == "corrupt" || index.load_status == "stale" {
+        return (index.load_status, index.meta.indexed_through_offset);
+    }
+    if index.meta.entries_saturated {
+        return ("limited", index.meta.indexed_through_offset);
+    }
+    if index.meta.indexed_through_offset >= file_len && index.meta.pending_record_start >= file_len
+    {
+        ("ready", index.meta.indexed_through_offset)
+    } else if index.meta.indexed_through_offset > 0 {
+        ("building", index.meta.indexed_through_offset)
+    } else {
+        (index.load_status, 0)
+    }
+}
+
+fn indexed_page_start(
+    rollout_path: &Path,
+    file_len: u64,
+    modified_ns: u128,
+    end_offset: u64,
+    user_turn_limit: usize,
+) -> Option<u64> {
+    let metadata = fs::metadata(rollout_path).ok()?;
+    let mut indexes = HISTORY_INDEX_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let index = indexes
+        .entry(rollout_path.to_path_buf())
+        .or_insert_with(|| load_history_index(rollout_path, &metadata));
+    // Rollouts are append-only. Preserve offsets across growth; a shrink or a
+    // same-length rewrite invalidates them and is safely rebuilt on demand.
+    if !validate_history_index_source(rollout_path, &metadata, index) {
+        *index = empty_history_index(rollout_path, &metadata);
+        index.load_status = "stale";
+        reset_history_index_files(rollout_path, index);
+    }
+    index.meta.observed_len = file_len;
+    index.meta.observed_mtime_ns = modified_ns;
+    if let Some(start) = index
+        .meta
+        .pages
+        .get(&history_page_index_key(end_offset, user_turn_limit))
+        .copied()
+        .filter(|start| {
+            *start <= end_offset
+                && end_offset.saturating_sub(*start) <= CODEX_HISTORY_FIRST_PAGE_MAX_BYTES
+        })
+    {
+        return Some(start);
+    }
+    if index.meta.indexed_through_offset < end_offset {
+        return None;
+    }
+    if index.meta.entries_saturated
+        && index
+            .entries
+            .last()
+            .is_none_or(|entry| entry.end_offset < end_offset)
+    {
+        return None;
+    }
+    let mut users = index
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == CodexHistoryEntryKind::User && entry.end_offset <= end_offset)
+        .rev();
+    let user = users.nth(user_turn_limit.saturating_sub(1));
+    match user {
+        Some(user) => {
+            let preceding_turn = index.entries.iter().rev().find(|entry| {
+                entry.end_offset <= user.start_offset && entry.kind == CodexHistoryEntryKind::Turn
+            });
+            let start = preceding_turn
+                .map(|entry| entry.start_offset)
+                .unwrap_or(user.start_offset);
+            (end_offset.saturating_sub(start) <= CODEX_HISTORY_FIRST_PAGE_MAX_BYTES)
+                .then_some(start)
+        }
+        None if index.meta.indexed_through_offset >= end_offset
+            && end_offset <= CODEX_HISTORY_FIRST_PAGE_MAX_BYTES =>
+        {
+            Some(0)
+        }
+        None => None,
+    }
+}
+
+fn remember_page_start(
+    rollout_path: &Path,
+    file_len: u64,
+    modified_ns: u128,
+    end_offset: u64,
+    user_turn_limit: usize,
+    start_offset: u64,
+) {
+    let Ok(metadata) = fs::metadata(rollout_path) else {
+        return;
+    };
+    let snapshot = {
+        let mut indexes = HISTORY_INDEX_CACHE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let index = indexes
+            .entry(rollout_path.to_path_buf())
+            .or_insert_with(|| load_history_index(rollout_path, &metadata));
+        index.meta.version = CODEX_HISTORY_INDEX_VERSION;
+        index.meta.observed_len = file_len;
+        index.meta.observed_mtime_ns = modified_ns;
+        index.meta.pages.insert(
+            history_page_index_key(end_offset, user_turn_limit),
+            start_offset,
+        );
+        // A corrupt client cannot grow this sidecar without bound by asking
+        // thousands of different page sizes/cursors.
+        if index.meta.pages.len() > 4096 {
+            let mut keys = index.meta.pages.keys().cloned().collect::<Vec<_>>();
+            keys.sort();
+            for key in keys
+                .into_iter()
+                .take(index.meta.pages.len().saturating_sub(4096))
+            {
+                index.meta.pages.remove(&key);
+            }
+        }
+        index.meta.clone()
+    };
+    save_history_index_meta(rollout_path, &snapshot);
+}
+
+fn contains_any(haystack: &[u8], needles: &[&[u8]]) -> bool {
+    needles.iter().any(|needle| bytes_contain(haystack, needle))
+}
+
+fn update_index_record_markers(markers: &mut u16, tail: &mut Vec<u8>, bytes: &[u8]) {
+    let mut searchable = Vec::with_capacity(tail.len() + bytes.len());
+    searchable.extend_from_slice(tail);
+    searchable.extend_from_slice(bytes);
+    if contains_any(
+        &searchable,
+        &[
+            br#""type":"user_message""#,
+            br#""type": "user_message""#,
+            br#""thread_goal_updated""#,
+        ],
+    ) {
+        *markers |= INDEX_MARK_USER;
+    }
+    if contains_any(
+        &searchable,
+        &[
+            br#""type":"agent_message""#,
+            br#""type": "agent_message""#,
+            br#""role":"assistant""#,
+            br#""role": "assistant""#,
+        ],
+    ) {
+        *markers |= INDEX_MARK_MESSAGE;
+    }
+    if contains_any(
+        &searchable,
+        &[
+            br#""type":"turn_context""#,
+            br#""type": "turn_context""#,
+            br#""type":"task_started""#,
+            br#""type": "task_started""#,
+            br#""type":"task_complete""#,
+            br#""type": "task_complete""#,
+        ],
+    ) {
+        *markers |= INDEX_MARK_TURN;
+    }
+    if contains_any(
+        &searchable,
+        &[
+            br#""function_call""#,
+            br#""function_call_output""#,
+            br#""custom_tool_call""#,
+            br#""custom_tool_call_output""#,
+            br#""tool_call""#,
+            br#""web_search""#,
+        ],
+    ) {
+        *markers |= INDEX_MARK_TOOL;
+    }
+    if contains_any(
+        &searchable,
+        &[
+            br#""context_compacted""#,
+            br#""contextCompaction""#,
+            br#""compaction_update""#,
+            br#""compaction_summary""#,
+        ],
+    ) {
+        *markers |= INDEX_MARK_COMPACTION;
+    }
+    let keep = searchable.len().min(INDEX_MARKER_TAIL_BYTES);
+    tail.clear();
+    tail.extend_from_slice(&searchable[searchable.len().saturating_sub(keep)..]);
+}
+
+fn index_entry_kind(markers: u16) -> Option<CodexHistoryEntryKind> {
+    if markers & INDEX_MARK_USER != 0 {
+        Some(CodexHistoryEntryKind::User)
+    } else if markers & INDEX_MARK_COMPACTION != 0 {
+        Some(CodexHistoryEntryKind::Compaction)
+    } else if markers & INDEX_MARK_TOOL != 0 {
+        Some(CodexHistoryEntryKind::Tool)
+    } else if markers & INDEX_MARK_MESSAGE != 0 {
+        Some(CodexHistoryEntryKind::Message)
+    } else if markers & INDEX_MARK_TURN != 0 {
+        Some(CodexHistoryEntryKind::Turn)
+    } else {
+        None
+    }
+}
+
+fn encode_history_entries(entries: &[CodexHistoryIndexEntry]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(entries.len() * CODEX_HISTORY_INDEX_ENTRY_BYTES);
+    for entry in entries {
+        bytes.extend_from_slice(&entry.start_offset.to_le_bytes());
+        bytes.extend_from_slice(&entry.end_offset.to_le_bytes());
+        bytes.push(entry.kind as u8);
+    }
+    bytes
+}
+
+fn append_history_entries(
+    rollout_path: &Path,
+    existing_count: usize,
+    entries: &[CodexHistoryIndexEntry],
+) -> std::io::Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let entries_path = history_index_entries_path(rollout_path)
+        .ok_or_else(|| std::io::Error::other("history index cache directory unavailable"))?;
+    if let Some(parent) = entries_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let expected_len = existing_count
+        .checked_mul(CODEX_HISTORY_INDEX_ENTRY_BYTES)
+        .and_then(|value| u64::try_from(value).ok())
+        .ok_or_else(|| std::io::Error::other("history index entry count overflow"))?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(entries_path)?;
+    if file.metadata()?.len() != expected_len {
+        file.set_len(expected_len)?;
+    }
+    file.seek(SeekFrom::Start(expected_len))?;
+    file.write_all(&encode_history_entries(entries))?;
+    file.flush()?;
+    Ok(())
+}
+
+fn build_history_index_slice(
+    rollout_path: &Path,
+    byte_budget: u64,
+) -> Result<(bool, u64, u64, usize), ParseError> {
+    let metadata = fs::metadata(rollout_path)?;
+    let file_len = metadata.len();
+    let mut index = {
+        let mut indexes = HISTORY_INDEX_CACHE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        indexes
+            .remove(rollout_path)
+            .unwrap_or_else(|| load_history_index(rollout_path, &metadata))
+    };
+    if !validate_history_index_source(rollout_path, &metadata, &index) {
+        index = empty_history_index(rollout_path, &metadata);
+        index.load_status = "stale";
+        reset_history_index_files(rollout_path, &index);
+    }
+
+    let start_offset = index.meta.indexed_through_offset.min(file_len);
+    if start_offset >= file_len {
+        index.meta.observed_len = file_len;
+        index.meta.observed_mtime_ns = metadata.modified().map(system_time_ns).unwrap_or_default();
+        index.load_status = "ready";
+        index.meta.completeness = "ready".to_string();
+        save_history_index_meta(rollout_path, &index.meta);
+        HISTORY_INDEX_CACHE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(rollout_path.to_path_buf(), index);
+        return Ok((true, start_offset, file_len, 0));
+    }
+
+    let read_len = file_len
+        .saturating_sub(start_offset)
+        .min(byte_budget.max(1));
+    let mut file = fs::File::open(rollout_path)?;
+    file.seek(SeekFrom::Start(start_offset))?;
+    let mut reader = file.take(read_len);
+    let mut buffer = vec![0u8; CODEX_HISTORY_SCAN_CHUNK_BYTES];
+    let mut absolute = start_offset;
+    let mut record_start = index.meta.pending_record_start.min(start_offset);
+    if index.meta.pending_record_tail.is_empty() && record_start < start_offset {
+        record_start = start_offset;
+    }
+    let mut markers = index.meta.pending_record_markers;
+    let mut marker_tail = std::mem::take(&mut index.meta.pending_record_tail);
+    let mut appended = Vec::new();
+
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let chunk = &buffer[..read];
+        let mut segment_start = 0usize;
+        for (position, byte) in chunk.iter().enumerate() {
+            if *byte != b'\n' {
+                continue;
+            }
+            update_index_record_markers(
+                &mut markers,
+                &mut marker_tail,
+                &chunk[segment_start..=position],
+            );
+            let record_end = absolute + position as u64 + 1;
+            if let Some(kind) = index_entry_kind(markers) {
+                if index.entries.len() + appended.len() < CODEX_HISTORY_INDEX_MAX_ENTRIES {
+                    appended.push(CodexHistoryIndexEntry {
+                        start_offset: record_start,
+                        end_offset: record_end,
+                        kind,
+                    });
+                } else {
+                    index.meta.entries_saturated = true;
+                }
+            }
+            record_start = record_end;
+            markers = 0;
+            marker_tail.clear();
+            segment_start = position + 1;
+        }
+        if segment_start < chunk.len() {
+            update_index_record_markers(&mut markers, &mut marker_tail, &chunk[segment_start..]);
+        }
+        absolute += read as u64;
+    }
+
+    let existing_count = index.entries.len();
+    append_history_entries(rollout_path, existing_count, &appended)?;
+    index.entries.extend_from_slice(&appended);
+    index.meta.indexed_through_offset = absolute;
+    index.meta.entry_count = index.entries.len();
+    index.meta.pending_record_start = record_start;
+    index.meta.pending_record_markers = markers;
+    index.meta.pending_record_tail = marker_tail;
+    index.meta.observed_len = file_len;
+    index.meta.observed_mtime_ns = metadata.modified().map(system_time_ns).unwrap_or_default();
+    index.load_status = "ready";
+
+    // Merge any exact-page boundaries learned while this I/O slice ran.
+    let mut indexes = HISTORY_INDEX_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(current) = indexes.get(rollout_path) {
+        index.meta.pages.extend(current.meta.pages.clone());
+    }
+    let complete = absolute >= file_len && record_start >= file_len;
+    index.meta.completeness = if complete {
+        "ready"
+    } else if index.meta.entries_saturated {
+        "limited"
+    } else {
+        "building"
+    }
+    .to_string();
+    save_history_index_meta(rollout_path, &index.meta);
+    let entry_count = index.entries.len();
+    indexes.insert(rollout_path.to_path_buf(), index);
+    Ok((complete, absolute, file_len, entry_count))
+}
+
+#[cfg(not(test))]
+fn schedule_history_index_build(rollout_path: PathBuf) {
+    {
+        let mut builds = HISTORY_INDEX_BUILDS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !builds.insert(rollout_path.clone()) {
+            return;
+        }
+    }
+    let build_path = rollout_path.clone();
+    let spawn = thread::Builder::new()
+        .name("codeg-history-index".to_string())
+        .spawn(move || {
+            let started = Instant::now();
+            let mut next_progress = CODEX_HISTORY_INDEX_PROGRESS_BYTES;
+            loop {
+                match build_history_index_slice(&build_path, CODEX_HISTORY_INDEX_SLICE_BYTES) {
+                    Ok((complete, indexed, total, entries)) => {
+                        if indexed >= next_progress || complete {
+                            tracing::info!(
+                                index_version = CODEX_HISTORY_INDEX_VERSION,
+                                indexed_through_offset = indexed,
+                                source_bytes = total,
+                                index_entries = entries,
+                                complete,
+                                elapsed_ms = started.elapsed().as_millis() as u64,
+                                "[conversation][perf] Codex history index progress"
+                            );
+                            next_progress =
+                                indexed.saturating_add(CODEX_HISTORY_INDEX_PROGRESS_BYTES);
+                        }
+                        if complete || indexed >= total {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            "[conversation][perf] Codex history index paused after an error"
+                        );
+                        break;
+                    }
+                }
+                // Cooperative throttling: indexing never runs on the request
+                // thread and yields between durable, restart-safe slices.
+                thread::sleep(StdDuration::from_millis(5));
+            }
+            enforce_history_index_cache_limit(&build_path);
+            HISTORY_INDEX_BUILDS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&build_path);
+        });
+    if spawn.is_err() {
+        HISTORY_INDEX_BUILDS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&rollout_path);
+    }
+}
+
+fn current_history_index_status(
+    rollout_path: &Path,
+    metadata: &fs::Metadata,
+) -> (&'static str, u64) {
+    let mut indexes = HISTORY_INDEX_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let index = indexes
+        .entry(rollout_path.to_path_buf())
+        .or_insert_with(|| load_history_index(rollout_path, metadata));
+    history_index_status(index, metadata.len())
+}
+
+fn is_codex_user_boundary(line: &[u8]) -> bool {
+    if json_object_string_field(line, b"type")
+        .is_some_and(|record_type| !matches!(record_type, "event_msg" | "response_item"))
+    {
+        return false;
+    }
+    // Most JSONL records are tool/output traffic. Avoid feeding their often
+    // multi-megabyte payloads to serde just to discover they cannot start a
+    // user round.
+    if !line
+        .windows(b"user_message".len())
+        .any(|w| w == b"user_message")
+        && !line
+            .windows(b"thread_goal_updated".len())
+            .any(|w| w == b"thread_goal_updated")
+        && !line.windows(b"\"role\"".len()).any(|w| w == b"\"role\"")
+    {
+        return false;
+    }
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) else {
+        return false;
+    };
+    match value.get("type").and_then(|value| value.as_str()) {
+        Some("event_msg") => {
+            let Some(payload) = value.get("payload") else {
+                return false;
+            };
+            match payload.get("type").and_then(|value| value.as_str()) {
+                Some("user_message") => true,
+                Some("thread_goal_updated") => payload
+                    .get("goal")
+                    .and_then(crate::acp::codex_goal::goal_marker)
+                    .is_some_and(|marker| marker.tool_name == "create_goal"),
+                _ => false,
+            }
+        }
+        Some("response_item") => value.get("payload").is_some_and(|payload| {
+            payload.get("type").and_then(|value| value.as_str()) == Some("message")
+                && payload.get("role").and_then(|value| value.as_str()) == Some("user")
+                && response_item_user_has_image(payload)
+        }),
+        _ => false,
+    }
+}
+
+fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+}
+
+/// Read an unescaped top-level string field without deserializing the complete
+/// record. The depth-aware scan cannot mistake a nested payload `type` for the
+/// record type, including serde_json fixtures that sort `payload` before it.
+fn json_object_string_field<'a>(line: &'a [u8], field: &[u8]) -> Option<&'a str> {
+    let mut cursor = 0usize;
+    let mut depth = 0usize;
+    while cursor < line.len() {
+        match line[cursor] {
+            b'{' | b'[' => {
+                depth += 1;
+                cursor += 1;
+            }
+            b'}' | b']' => {
+                depth = depth.saturating_sub(1);
+                cursor += 1;
+            }
+            b'"' => {
+                let key_start = cursor + 1;
+                cursor = key_start;
+                let mut escaped = false;
+                while cursor < line.len() {
+                    match line[cursor] {
+                        b'\\' => {
+                            escaped = true;
+                            cursor = cursor.saturating_add(2);
+                        }
+                        b'"' => break,
+                        _ => cursor += 1,
+                    }
+                }
+                if cursor >= line.len() {
+                    return None;
+                }
+                let key_end = cursor;
+                cursor += 1;
+                if depth != 1 || escaped || &line[key_start..key_end] != field {
+                    continue;
+                }
+                while line.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+                    cursor += 1;
+                }
+                if line.get(cursor) != Some(&b':') {
+                    continue;
+                }
+                cursor += 1;
+                while line.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+                    cursor += 1;
+                }
+                if line.get(cursor) != Some(&b'"') {
+                    return None;
+                }
+                let value_start = cursor + 1;
+                cursor = value_start;
+                while cursor < line.len() {
+                    match line[cursor] {
+                        b'\\' => return None,
+                        b'"' => {
+                            return std::str::from_utf8(&line[value_start..cursor]).ok();
+                        }
+                        _ => cursor += 1,
+                    }
+                }
+                return None;
+            }
+            _ => cursor += 1,
+        }
+    }
+    None
+}
+
+/// Walk JSONL records backwards until `user_turn_limit` user-round boundaries
+/// have been found. Memory is bounded by the selected page (plus one JSONL
+/// record), not by the complete rollout; this is the critical difference for
+/// 300+ MB Codex sessions.
+fn find_codex_page_start(
+    file: &mut fs::File,
+    end_offset: u64,
+    user_turn_limit: usize,
+    max_scan_bytes: Option<u64>,
+    cancelled: Option<&AtomicBool>,
+) -> Result<(u64, u64, bool), ParseError> {
+    if end_offset == 0 || user_turn_limit == 0 {
+        return Ok((end_offset, 0, true));
+    }
+
+    let mut position = end_offset;
+    // Chunks belonging to one cross-chunk JSONL record are retained as
+    // separate pieces and joined only once its preceding newline is found.
+    // Prepending each new chunk into one growing Vec made a 20 MiB record copy
+    // roughly 210 MiB and repeatedly scan the same suffix.
+    let mut suffix_chunks = Vec::<Vec<u8>>::new();
+    let mut suffix_bytes = 0usize;
+    let mut boundaries = 0usize;
+    let mut include_preceding_record = false;
+    let mut oldest_complete_start = end_offset;
+    let scan_floor = max_scan_bytes
+        .map(|limit| end_offset.saturating_sub(limit))
+        .unwrap_or(0);
+
+    while position > scan_floor {
+        if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err(ParseError::InvalidData(
+                "Codex history page read was cancelled".into(),
+            ));
+        }
+        let read_start = position
+            .saturating_sub(CODEX_HISTORY_SCAN_CHUNK_BYTES as u64)
+            .max(scan_floor);
+        let read_len =
+            usize::try_from(position - read_start).unwrap_or(CODEX_HISTORY_SCAN_CHUNK_BYTES);
+        let mut chunk = vec![0u8; read_len];
+        file.seek(SeekFrom::Start(read_start))?;
+        file.read_exact(&mut chunk)?;
+        let mut line_end = chunk.len();
+        let mut first_newline = None;
+        let mut joins_suffix = true;
+        for newline in (0..chunk.len())
+            .rev()
+            .filter(|index| chunk[*index] == b'\n')
+        {
+            first_newline = Some(newline);
+            let line_start = newline + 1;
+            if include_preceding_record {
+                // Codex writes `turn_context` immediately before the user
+                // event. Include that one record so the page keeps the turn's
+                // model and cumulative context/token metadata, while the next
+                // cursor still ends cleanly before this round.
+                return Ok((
+                    read_start + line_start as u64,
+                    end_offset.saturating_sub(read_start),
+                    true,
+                ));
+            }
+            let is_boundary = if joins_suffix && suffix_bytes > 0 {
+                let mut record = Vec::with_capacity(line_end - line_start + suffix_bytes);
+                record.extend_from_slice(&chunk[line_start..line_end]);
+                for piece in suffix_chunks.iter().rev() {
+                    record.extend_from_slice(piece);
+                }
+                is_codex_user_boundary(&record)
+            } else {
+                line_start < line_end && is_codex_user_boundary(&chunk[line_start..line_end])
+            };
+            if is_boundary {
+                boundaries += 1;
+                if boundaries >= user_turn_limit {
+                    include_preceding_record = true;
+                }
+            }
+            joins_suffix = false;
+            line_end = newline;
+        }
+
+        if let Some(newline) = first_newline {
+            oldest_complete_start = read_start + newline as u64 + 1;
+        }
+        let prefix_end = first_newline.unwrap_or(chunk.len());
+        if first_newline.is_some() {
+            suffix_chunks.clear();
+            suffix_bytes = prefix_end;
+            if prefix_end > 0 {
+                suffix_chunks.push(chunk[..prefix_end].to_vec());
+            }
+        } else {
+            suffix_bytes = suffix_bytes.saturating_add(chunk.len());
+            suffix_chunks.push(chunk);
+        }
+        position = read_start;
+
+        if position == scan_floor && scan_floor > 0 {
+            // The bounded tail did not contain enough user rounds. Return the
+            // first complete JSONL record inside the budget instead of either
+            // failing the open or crossing the hard read ceiling. A single
+            // record larger than the ceiling can leave fewer than the requested
+            // rounds. Keep subsequent complete records and mark the page partial;
+            // the original rollout is never rewritten or partially parsed.
+            // The scan floor may sit inside a giant record, with no newline
+            // in the final chunk. Keep the complete records already found
+            // after it, rather than incorrectly returning an empty latest page.
+            let start = oldest_complete_start;
+            return Ok((
+                start.min(end_offset),
+                end_offset.saturating_sub(scan_floor),
+                false,
+            ));
+        }
+    }
+
+    Ok((0, end_offset, true))
 }
 
 impl AgentParser for CodexParser {
@@ -1720,13 +3123,12 @@ fn completed_mcp_call(payload: &serde_json::Value) -> Option<CompletedMcpCall> {
     let stated_is_error = result
         .and_then(|result| result.get("isError"))
         .and_then(serde_json::Value::as_bool);
-    let claimed_failed =
-        stated_is_error == Some(true)
-            || stated_error.is_some()
-            || item
-                .get("status")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(is_failed_status);
+    let claimed_failed = stated_is_error == Some(true)
+        || stated_error.is_some()
+        || item
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(is_failed_status);
     let claimed_ok = stated_is_error == Some(false)
         || item.get("status").and_then(serde_json::Value::as_str) == Some("completed");
     Some(CompletedMcpCall {
@@ -3073,15 +4475,463 @@ fn parse_codex_subagent_stats(
 }
 
 impl CodexParser {
+    fn rollout_path(&self, conversation_id: &str) -> Result<PathBuf, ParseError> {
+        if !self.base_dir.exists() {
+            return Err(ParseError::ConversationNotFound(
+                conversation_id.to_string(),
+            ));
+        }
+        let cache_key = (self.base_dir.clone(), conversation_id.to_string());
+        if let Some(path) = ROLLOUT_PATH_CACHE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&cache_key)
+            .filter(|path| path.is_file())
+            .cloned()
+        {
+            return Ok(path);
+        }
+        let path = WalkDir::new(&self.base_dir)
+            .into_iter()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path().to_path_buf())
+            .find(|path| {
+                path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+                    && path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .contains(conversation_id)
+            })
+            .ok_or_else(|| ParseError::ConversationNotFound(conversation_id.to_string()))?;
+        ROLLOUT_PATH_CACHE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(cache_key, path.clone());
+        Ok(path)
+    }
+
+    /// Current durable end offset of a Codex rollout. The returned value is a
+    /// stable boundary in the append-only file and contains no transcript data.
+    pub(crate) fn rollout_len(&self, conversation_id: &str) -> Result<u64, ParseError> {
+        Ok(fs::metadata(self.rollout_path(conversation_id)?)?.len())
+    }
+
+    /// Explicit, read-only rollout composition scan. This is never invoked by
+    /// normal conversation loading; it exists to decide whether a separate
+    /// migration/compaction tool would be worthwhile without rewriting the
+    /// user's append-only Codex session.
+    pub fn diagnose_rollout_size(
+        &self,
+        conversation_id: &str,
+    ) -> Result<CodexRolloutSizeDiagnostics, ParseError> {
+        let path = self.rollout_path(conversation_id)?;
+        let file = fs::File::open(path)?;
+        let mut reader = BufReader::new(file);
+        let mut line = Vec::new();
+        let mut diagnostics = CodexRolloutSizeDiagnostics::default();
+        let mut seen = HashSet::<[u8; 32]>::new();
+        loop {
+            line.clear();
+            let bytes = reader.read_until(b'\n', &mut line)?;
+            if bytes == 0 {
+                break;
+            }
+            let bytes = bytes as u64;
+            diagnostics.file_bytes = diagnostics.file_bytes.saturating_add(bytes);
+            diagnostics.record_count = diagnostics.record_count.saturating_add(1);
+            let digest: [u8; 32] = Sha256::digest(&line).into();
+            if !seen.insert(digest) {
+                diagnostics.duplicate_record_count =
+                    diagnostics.duplicate_record_count.saturating_add(1);
+                diagnostics.duplicate_record_bytes =
+                    diagnostics.duplicate_record_bytes.saturating_add(bytes);
+            }
+
+            if bytes_contain(&line, b"data:image")
+                || bytes_contain(&line, b"\"input_image\"")
+                || bytes_contain(&line, b"\"image_url\"")
+                || bytes_contain(&line, b"\"image_generation")
+            {
+                diagnostics.image_or_data_url_bytes =
+                    diagnostics.image_or_data_url_bytes.saturating_add(bytes);
+            } else if bytes_contain(&line, b"compaction")
+                || bytes_contain(&line, b"compact")
+                || bytes_contain(&line, b"snapshot")
+            {
+                diagnostics.snapshot_or_compaction_bytes = diagnostics
+                    .snapshot_or_compaction_bytes
+                    .saturating_add(bytes);
+            } else if bytes_contain(&line, b"reasoning") {
+                diagnostics.reasoning_bytes = diagnostics.reasoning_bytes.saturating_add(bytes);
+            } else if bytes_contain(&line, b"function_call_output")
+                || bytes_contain(&line, b"tool_result")
+                || bytes_contain(&line, b"custom_tool_call_output")
+            {
+                diagnostics.tool_result_bytes = diagnostics.tool_result_bytes.saturating_add(bytes);
+            } else if bytes_contain(&line, b"function_call")
+                || bytes_contain(&line, b"tool_call")
+                || bytes_contain(&line, b"web_search_call")
+            {
+                diagnostics.tool_call_bytes = diagnostics.tool_call_bytes.saturating_add(bytes);
+            } else if bytes_contain(&line, b"user_message")
+                || bytes_contain(&line, b"agent_message")
+                || bytes_contain(&line, b"output_text")
+                || bytes_contain(&line, b"\"type\":\"message\"")
+            {
+                diagnostics.ordinary_text_bytes =
+                    diagnostics.ordinary_text_bytes.saturating_add(bytes);
+            } else {
+                diagnostics.other_bytes = diagnostics.other_bytes.saturating_add(bytes);
+            }
+        }
+        Ok(diagnostics)
+    }
+
+    pub(crate) fn get_conversation_page(
+        &self,
+        conversation_id: &str,
+        before_offset: Option<u64>,
+        user_turn_limit: usize,
+        cwd_hint: Option<String>,
+    ) -> Result<CodexConversationPage, ParseError> {
+        self.get_conversation_page_impl(
+            conversation_id,
+            before_offset,
+            user_turn_limit,
+            cwd_hint,
+            None,
+            None,
+        )
+    }
+
+    pub(crate) fn get_conversation_page_cancellable(
+        &self,
+        conversation_id: &str,
+        before_offset: Option<u64>,
+        user_turn_limit: usize,
+        cwd_hint: Option<String>,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<CodexConversationPage, ParseError> {
+        self.get_conversation_page_impl(
+            conversation_id,
+            before_offset,
+            user_turn_limit,
+            cwd_hint,
+            None,
+            Some(cancelled),
+        )
+    }
+
+    pub(crate) fn get_conversation_page_bounded(
+        &self,
+        conversation_id: &str,
+        before_offset: Option<u64>,
+        user_turn_limit: usize,
+        cwd_hint: Option<String>,
+        max_bytes: u64,
+    ) -> Result<CodexConversationPage, ParseError> {
+        self.get_conversation_page_impl(
+            conversation_id,
+            before_offset,
+            user_turn_limit,
+            cwd_hint,
+            Some(max_bytes),
+            None,
+        )
+    }
+
+    fn get_conversation_page_impl(
+        &self,
+        conversation_id: &str,
+        before_offset: Option<u64>,
+        user_turn_limit: usize,
+        cwd_hint: Option<String>,
+        max_bytes: Option<u64>,
+        cancelled: Option<Arc<AtomicBool>>,
+    ) -> Result<CodexConversationPage, ParseError> {
+        if cancelled
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+        {
+            return Err(ParseError::InvalidData(
+                "Codex history page read was cancelled".into(),
+            ));
+        }
+        let path = self.rollout_path(conversation_id)?;
+        let metadata = fs::metadata(&path)?;
+        let file_len = metadata.len();
+        let modified_ns = metadata.modified().map(system_time_ns).unwrap_or_default();
+        let end_offset = before_offset.unwrap_or(file_len).min(file_len);
+        let user_turn_limit = user_turn_limit.clamp(1, 100);
+        let cache_key = CodexPageCacheKey {
+            path: path.clone(),
+            file_len,
+            modified_ns,
+            end_offset,
+            user_turn_limit,
+            cwd_hint: cwd_hint.clone(),
+        };
+        if max_bytes.is_none() {
+            if let Some(cached) = HISTORY_PAGE_CACHE
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .get_mut(&cache_key)
+            {
+                cached.used_at = Instant::now();
+                let mut page = (*cached.page).clone();
+                page.cache_hit = true;
+                #[cfg(not(test))]
+                schedule_history_index_build(path.clone());
+                return Ok(page);
+            }
+        }
+
+        // Full parse single-flight for an identical immutable page. Seven
+        // browser effects requesting the same tail now share one JSONL parse
+        // instead of starting seven blocking workers.
+        let flight = {
+            let mut flights = HISTORY_PAGE_FLIGHTS
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            flights
+                .entry(cache_key.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let flight_guard = flight.lock().unwrap_or_else(|error| error.into_inner());
+        let _flight_registration = HistoryPageFlightRegistration {
+            key: cache_key.clone(),
+        };
+        if cancelled
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+        {
+            return Err(ParseError::InvalidData(
+                "Codex history page read was cancelled".into(),
+            ));
+        }
+        if max_bytes.is_none() {
+            if let Some(cached) = HISTORY_PAGE_CACHE
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .get_mut(&cache_key)
+            {
+                cached.used_at = Instant::now();
+                let mut page = (*cached.page).clone();
+                page.cache_hit = true;
+                #[cfg(not(test))]
+                schedule_history_index_build(path.clone());
+                drop(flight_guard);
+                HISTORY_PAGE_FLIGHTS
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .remove(&cache_key);
+                return Ok(page);
+            }
+        }
+
+        let mut file = fs::File::open(&path)?;
+        let (start_offset, scan_bytes, index_hit, selection_complete) = if max_bytes.is_none() {
+            if let Some(start) =
+                indexed_page_start(&path, file_len, modified_ns, end_offset, user_turn_limit)
+            {
+                (start, 0, true, true)
+            } else {
+                // The scanner already walks backwards in bounded chunks. Keep
+                // its state across the 16 MiB boundary rather than rescanning
+                // those bytes, so boundary scanning obeys the 64 MiB ceiling.
+                // Parsing reads the selected page once (also at most 64 MiB).
+                let (start, scanned, complete) = find_codex_page_start(
+                    &mut file,
+                    end_offset,
+                    user_turn_limit,
+                    Some(CODEX_HISTORY_FIRST_PAGE_MAX_BYTES),
+                    cancelled.as_deref(),
+                )?;
+                if complete {
+                    remember_page_start(
+                        &path,
+                        file_len,
+                        modified_ns,
+                        end_offset,
+                        user_turn_limit,
+                        start,
+                    );
+                }
+                (start, scanned, false, complete)
+            }
+        } else {
+            let (start, scanned, complete) = find_codex_page_start(
+                &mut file,
+                end_offset,
+                user_turn_limit,
+                max_bytes,
+                cancelled.as_deref(),
+            )?;
+            (start, scanned, false, complete)
+        };
+        let page_bytes = end_offset.saturating_sub(start_offset);
+        if max_bytes.is_some_and(|limit| page_bytes > limit) {
+            return Err(ParseError::InvalidData(format!(
+                "Codex history page is {page_bytes} bytes, exceeding the safe merge limit"
+            )));
+        }
+        file.seek(SeekFrom::Start(start_offset))?;
+        if cancelled
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+        {
+            return Err(ParseError::InvalidData(
+                "Codex history page read was cancelled".into(),
+            ));
+        }
+        let reader = BufReader::new(file.take(end_offset.saturating_sub(start_offset)));
+        let detail = self.parse_conversation_detail_reader(
+            &path,
+            conversation_id,
+            reader,
+            cwd_hint,
+            Some(start_offset),
+        )?;
+        #[cfg(not(test))]
+        schedule_history_index_build(path.clone());
+        let (index_status, indexed_through_offset) = current_history_index_status(&path, &metadata);
+        let page = CodexConversationPage {
+            detail,
+            start_offset,
+            end_offset,
+            has_more: start_offset > 0,
+            page_complete: selection_complete,
+            scan_bytes,
+            cache_hit: false,
+            index_hit,
+            index_status,
+            indexed_through_offset,
+            source_version: format!("{file_len}:{modified_ns}"),
+        };
+        if selection_complete
+            && max_bytes.is_none()
+            && page_bytes <= CODEX_HISTORY_PAGE_CACHE_MAX_ENTRY_BYTES
+        {
+            let mut cache = HISTORY_PAGE_CACHE
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            cache.insert(
+                cache_key.clone(),
+                CachedCodexPage {
+                    page: Arc::new(page.clone()),
+                    used_at: Instant::now(),
+                    source_bytes: page_bytes,
+                },
+            );
+            while cache.len() > CODEX_HISTORY_PAGE_CACHE_ENTRIES
+                || cache.values().map(|entry| entry.source_bytes).sum::<u64>()
+                    > CODEX_HISTORY_PAGE_CACHE_MAX_BYTES
+            {
+                if let Some(oldest) = cache
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.used_at)
+                    .map(|(key, _)| key.clone())
+                {
+                    cache.remove(&oldest);
+                } else {
+                    break;
+                }
+            }
+        }
+        drop(flight_guard);
+        HISTORY_PAGE_FLIGHTS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&cache_key);
+        Ok(page)
+    }
+
+    /// Parse only `[start_offset, EOF)` and reject the request before reading
+    /// when the delta exceeds `max_bytes`. Offsets are captured at a complete
+    /// rollout boundary; legacy inferred offsets may conservatively include a
+    /// few older records, which callers additionally filter by timestamp.
+    pub(crate) fn get_conversation_range(
+        &self,
+        conversation_id: &str,
+        start_offset: u64,
+        max_bytes: u64,
+        cwd_hint: Option<String>,
+    ) -> Result<CodexConversationRange, ParseError> {
+        let path = self.rollout_path(conversation_id)?;
+        let end_offset = fs::metadata(&path)?.len();
+        self.get_conversation_range_between(
+            conversation_id,
+            start_offset,
+            end_offset,
+            max_bytes,
+            cwd_hint,
+        )
+    }
+
+    /// Parse an exact previously-issued history window. Used only when the
+    /// user expands a deferred heavy block; it never scans outside the opaque
+    /// page offsets carried by that block's reference.
+    pub(crate) fn get_conversation_range_between(
+        &self,
+        conversation_id: &str,
+        start_offset: u64,
+        end_offset: u64,
+        max_bytes: u64,
+        cwd_hint: Option<String>,
+    ) -> Result<CodexConversationRange, ParseError> {
+        let path = self.rollout_path(conversation_id)?;
+        let mut file = fs::File::open(&path)?;
+        let file_len = file.metadata()?.len();
+        let end_offset = end_offset.min(file_len);
+        if start_offset > end_offset {
+            return Err(ParseError::InvalidData(format!(
+                "saved branch rollout offset {start_offset} is beyond the current rollout length {end_offset}"
+            )));
+        }
+        let bytes = end_offset.saturating_sub(start_offset);
+        if bytes > max_bytes {
+            return Err(ParseError::InvalidData(format!(
+                "branch delta is {bytes} bytes, exceeding the safe merge limit of {max_bytes} bytes"
+            )));
+        }
+        file.seek(SeekFrom::Start(start_offset))?;
+        let reader = BufReader::new(file.take(bytes));
+        let detail = self.parse_conversation_detail_reader(
+            &path,
+            conversation_id,
+            reader,
+            cwd_hint,
+            Some(start_offset),
+        )?;
+        Ok(CodexConversationRange {
+            detail,
+            start_offset,
+            end_offset,
+        })
+    }
+
     fn parse_conversation_detail(
         &self,
         path: &Path,
         conversation_id: &str,
     ) -> Result<ConversationDetail, ParseError> {
         let lines = self.rollout_lines(path)?;
+        let reader = BufReader::new(std::io::Cursor::new(lines.join("\n")));
+        self.parse_conversation_detail_reader(path, conversation_id, reader, None, None)
+    }
 
+    fn parse_conversation_detail_reader<R: BufRead>(
+        &self,
+        path: &Path,
+        conversation_id: &str,
+        reader: R,
+        cwd_hint: Option<String>,
+        page_start_offset: Option<u64>,
+    ) -> Result<ConversationDetail, ParseError> {
         let mut messages = Vec::new();
-        let mut cwd: Option<String> = None;
+        let mut cwd: Option<String> = cwd_hint;
         let mut parent_id: Option<String> = None;
         let mut session_header_seen = false;
         let mut git_branch: Option<String> = None;
@@ -3257,6 +5107,19 @@ impl CodexParser {
         // summary still keeps its streaming reasoning. `pending_reasoning_ts`
         // stamps that block with the run's last reasoning record.
         let mut grouped_reasoning: Vec<String> = Vec::new();
+        // Standalone web-search results are the only durable Codex record that
+        // maps private citation ids (`turn…search…`) to URLs. Keep one tool
+        // block per call so live ACP, reload, and branch-visible history share
+        // the same structured `codeg.citations` metadata.
+        let mut emitted_web_search_ids: HashSet<String> = HashSet::new();
+        // Streaming reasoning buffer. Codex emits one `event_msg.agent_reasoning`
+        // per reasoning section, then groups the same sections into a single
+        // `response_item.reasoning.summary`. We buffer the per-section events and
+        // let the grouped summary supersede them (one 思考 card per turn, live
+        // parity); the buffer is only flushed on its own — as one joined Thinking
+        // block — when no grouped summary arrives (interrupted/older rollouts),
+        // so streaming reasoning is never lost. `pending_reasoning_ts` stamps the
+        // fallback block with the last buffered section's time.
         let mut pending_reasoning: Vec<String> = Vec::new();
         let mut pending_reasoning_ts: Option<DateTime<Utc>> = None;
 
@@ -3295,9 +5158,40 @@ impl CodexParser {
         // `item_completed.ContextCompaction` names (see the `compacted` arm).
         let mut unnamed_compaction_divider: Option<usize> = None;
 
-        for line in lines {
+        for line in reader.lines() {
+            let line = match line {
+                Ok(line) => line,
+                Err(_) => continue,
+            };
             if line.trim().is_empty() {
                 continue;
+            }
+
+            // Unknown records have no renderable content, but serde would
+            // still allocate and walk their complete payload. Preserve their
+            // positional ordinal and timestamp while bypassing that work for
+            // oversized records. If the header is non-standard or ambiguous,
+            // fall through to the full parser for correctness.
+            if line.len() > CODEX_HISTORY_SCAN_CHUNK_BYTES {
+                if let Some(record_type) = json_object_string_field(line.as_bytes(), b"type") {
+                    if !matches!(
+                        record_type,
+                        "session_meta" | "turn_context" | "event_msg" | "response_item"
+                    ) {
+                        promotion.note_record(record_type, "");
+                        if let Some(ts_str) =
+                            json_object_string_field(line.as_bytes(), b"timestamp")
+                        {
+                            if let Ok(ts) = ts_str.parse::<DateTime<Utc>>() {
+                                if first_timestamp.is_none() {
+                                    first_timestamp = Some(ts);
+                                }
+                                last_timestamp = Some(ts);
+                            }
+                        }
+                        continue;
+                    }
+                }
             }
 
             let value: serde_json::Value = match serde_json::from_str(&line) {
@@ -3555,7 +5449,7 @@ impl CodexParser {
                                     duration_ms: None,
                                     model: None,
                                     completed_at: Some(timestamp),
-                                agent_message_id: None,
+                                    agent_message_id: None,
                                 });
                             }
                             "agent_message" => {
@@ -3593,7 +5487,7 @@ impl CodexParser {
                                     duration_ms: None,
                                     model: None,
                                     completed_at: Some(timestamp),
-                                agent_message_id: None,
+                                    agent_message_id: None,
                                 });
                             }
                             "thread_goal_updated" => {
@@ -3622,9 +5516,10 @@ impl CodexParser {
                                     {
                                         // Positional: the goal opened the session iff no
                                         // real user turn exists yet.
-                                        goal_opens_session = !messages
-                                            .iter()
-                                            .any(|m| matches!(m.role, MessageRole::User));
+                                        goal_opens_session = page_start_offset.unwrap_or(0) == 0
+                                            && !messages
+                                                .iter()
+                                                .any(|m| matches!(m.role, MessageRole::User));
                                         // Claim the title from the objective HERE, in
                                         // stream order, when the goal is the opener — so
                                         // a LATER `user_message` (its own guard is
@@ -3673,7 +5568,7 @@ impl CodexParser {
                                         duration_ms: None,
                                         model: None,
                                         completed_at: Some(timestamp),
-                                    agent_message_id: None,
+                                        agent_message_id: None,
                                     });
                                 }
                             }
@@ -3756,10 +5651,7 @@ impl CodexParser {
                                     } else {
                                         continue;
                                     };
-                                    completed_mcp_by_exec
-                                        .entry(exec_id)
-                                        .or_default()
-                                        .push(call);
+                                    completed_mcp_by_exec.entry(exec_id).or_default().push(call);
                                     continue;
                                 }
                                 // Plan mode's finished plan document. This is the
@@ -3809,10 +5701,8 @@ impl CodexParser {
                                 // ONE 思考 card (live parity) instead of one card per
                                 // section, and if no grouped summary arrives
                                 // (interrupted/older rollouts) nothing is lost.
-                                let text = payload
-                                    .get("text")
-                                    .and_then(|t| t.as_str())
-                                    .unwrap_or("");
+                                let text =
+                                    payload.get("text").and_then(|t| t.as_str()).unwrap_or("");
                                 if !text.trim().is_empty() {
                                     pending_reasoning.push(text.to_string());
                                     pending_reasoning_ts = Some(timestamp);
@@ -3865,11 +5755,75 @@ impl CodexParser {
                                     duration_ms: None,
                                     model: None,
                                     completed_at: Some(timestamp),
-                                agent_message_id: None,
+                                    agent_message_id: None,
                                 });
                                 if !call_id.is_empty() {
                                     emitted_image_ids.insert(call_id);
                                 }
+                            }
+                            "web_search_end" => {
+                                let call_id = payload
+                                    .get("call_id")
+                                    .or_else(|| payload.get("id"))
+                                    .and_then(|value| value.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let raw_input = serde_json::json!({
+                                    "type": "webSearch",
+                                    "id": call_id,
+                                    "query": payload.get("query").cloned().unwrap_or_default(),
+                                    "action": payload.get("action").cloned().unwrap_or_default(),
+                                    "results": payload.get("results").cloned().unwrap_or_default(),
+                                })
+                                .to_string();
+                                let meta = crate::citations::attach_sources_to_meta(
+                                    None,
+                                    Some(&raw_input),
+                                );
+                                // A result-less legacy event carries no useful
+                                // citation mapping; keep the historical UI as-is.
+                                if crate::citations::sources_from_meta(meta.as_ref()).is_empty() {
+                                    continue;
+                                }
+                                let tool_id = if call_id.is_empty() {
+                                    format!("web-search-{}", messages.len())
+                                } else {
+                                    call_id
+                                };
+                                if merge_web_search_citation_meta(
+                                    &mut messages,
+                                    &tool_id,
+                                    meta.as_ref(),
+                                ) {
+                                    continue;
+                                }
+                                emitted_web_search_ids.insert(tool_id.clone());
+                                messages.push(UnifiedMessage {
+                                    id: format!("tool-{}", messages.len()),
+                                    role: MessageRole::Assistant,
+                                    content: vec![
+                                        ContentBlock::ToolUse {
+                                            tool_use_id: Some(tool_id.clone()),
+                                            tool_name: "web_search".to_string(),
+                                            input_preview: Some(raw_input),
+                                            status: Some("completed".to_string()),
+                                            meta,
+                                        },
+                                        ContentBlock::ToolResult {
+                                            tool_use_id: Some(tool_id),
+                                            output_preview: None,
+                                            is_error: false,
+                                            agent_stats: None,
+                                            images: Vec::new(),
+                                        },
+                                    ],
+                                    timestamp,
+                                    usage: None,
+                                    duration_ms: None,
+                                    model: None,
+                                    completed_at: Some(timestamp),
+                                    agent_message_id: None,
+                                });
                             }
                             "token_count" => {
                                 if let Some(info) = payload.get("info") {
@@ -4067,8 +6021,69 @@ impl CodexParser {
                                     codex_inter_agent_final_answer(payload)
                                 {
                                     if let Some(thread_id) = agent_path_to_thread_id.get(author) {
-                                        agent_fallback_results
-                                            .insert(thread_id.clone(), body);
+                                        agent_fallback_results.insert(thread_id.clone(), body);
+                                    }
+                                }
+                            }
+                            "web_search_call" => {
+                                context_readings.web_search_ran();
+                                // Some Codex/app-server builds retain an exact
+                                // citation id + open-page URL only on the raw
+                                // Responses item. codex-acp 1.6.2 ignored this
+                                // event entirely. Recover it on history load,
+                                // but only when the structured object itself
+                                // proves the id↔URL association.
+                                let raw_input = payload.to_string();
+                                let meta = crate::citations::attach_sources_to_meta(
+                                    None,
+                                    Some(&raw_input),
+                                );
+                                if !crate::citations::sources_from_meta(meta.as_ref()).is_empty() {
+                                    let call_id = payload
+                                        .get("call_id")
+                                        .or_else(|| payload.get("id"))
+                                        .and_then(serde_json::Value::as_str)
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let dedup_id = if call_id.is_empty() {
+                                        format!("web-search-response-{}", messages.len())
+                                    } else {
+                                        call_id.clone()
+                                    };
+                                    if merge_web_search_citation_meta(
+                                        &mut messages,
+                                        &dedup_id,
+                                        meta.as_ref(),
+                                    ) {
+                                        continue;
+                                    }
+                                    if emitted_web_search_ids.insert(dedup_id.clone()) {
+                                        messages.push(UnifiedMessage {
+                                            id: format!("tool-{}", messages.len()),
+                                            role: MessageRole::Assistant,
+                                            content: vec![
+                                                ContentBlock::ToolUse {
+                                                    tool_use_id: Some(dedup_id.clone()),
+                                                    tool_name: "web_search".to_string(),
+                                                    input_preview: Some(raw_input),
+                                                    status: Some("completed".to_string()),
+                                                    meta,
+                                                },
+                                                ContentBlock::ToolResult {
+                                                    tool_use_id: Some(dedup_id),
+                                                    output_preview: None,
+                                                    is_error: false,
+                                                    agent_stats: None,
+                                                    images: Vec::new(),
+                                                },
+                                            ],
+                                            timestamp,
+                                            usage: None,
+                                            duration_ms: None,
+                                            model: None,
+                                            completed_at: Some(timestamp),
+                                            agent_message_id: None,
+                                        });
                                     }
                                 }
                             }
@@ -4097,9 +6112,7 @@ impl CodexParser {
                                     .map(|parts| {
                                         parts
                                             .iter()
-                                            .filter_map(|p| {
-                                                p.get("text").and_then(|t| t.as_str())
-                                            })
+                                            .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
                                             .filter(|t| !t.trim().is_empty())
                                             .collect::<Vec<_>>()
                                             .join("\n\n")
@@ -4219,7 +6232,7 @@ impl CodexParser {
                                             duration_ms: None,
                                             model: None,
                                             completed_at: Some(timestamp),
-                                        agent_message_id: None,
+                                            agent_message_id: None,
                                         });
                                     }
                                     "wait_agent" => {
@@ -4287,7 +6300,7 @@ impl CodexParser {
                                             duration_ms: None,
                                             model: None,
                                             completed_at: Some(timestamp),
-                                        agent_message_id: None,
+                                            agent_message_id: None,
                                         });
                                     }
                                     _ => {
@@ -4361,7 +6374,7 @@ impl CodexParser {
                                             duration_ms: None,
                                             model: None,
                                             completed_at: Some(timestamp),
-                                        agent_message_id: None,
+                                            agent_message_id: None,
                                         });
                                     }
                                 }
@@ -4413,9 +6426,7 @@ impl CodexParser {
                                         note: collected.note,
                                     };
                                     let semantic = (parsed.status == ScriptStatus::Completed)
-                                        .then(|| {
-                                            completed_mcp_by_exec.remove(&deferred.call_id)
-                                        })
+                                        .then(|| completed_mcp_by_exec.remove(&deferred.call_id))
                                         .flatten();
                                     let (uses, results) = semantic
                                         .and_then(|calls| {
@@ -4496,7 +6507,7 @@ impl CodexParser {
                                         duration_ms: None,
                                         model: None,
                                         completed_at: Some(timestamp),
-                                    agent_message_id: None,
+                                        agent_message_id: None,
                                     });
                                 } else if is_spawn {
                                     if let Some(output_obj) = parse_codex_json_output(payload) {
@@ -4523,7 +6534,7 @@ impl CodexParser {
                                         duration_ms: None,
                                         model: None,
                                         completed_at: Some(timestamp),
-                                    agent_message_id: None,
+                                        agent_message_id: None,
                                     });
                                 } else if is_wait || is_list {
                                     // Emit one `collab_agent` capsule per wait or
@@ -4538,12 +6549,14 @@ impl CodexParser {
                                     // spawn capsule's own result on the strength
                                     // of a `list_agents` the model happened to
                                     // call would lose the report entirely.
-                                    let capsule = parse_codex_json_output(payload).and_then(
-                                        |output_obj| {
+                                    let capsule =
+                                        parse_codex_json_output(payload).and_then(|output_obj| {
                                             if is_list {
                                                 return build_collab_list_input(&output_obj);
                                             }
-                                            match output_obj.get("status").and_then(|s| s.as_object())
+                                            match output_obj
+                                                .get("status")
+                                                .and_then(|s| s.as_object())
                                             {
                                                 Some(status) => {
                                                     // Mark returned agents so the spawn
@@ -4564,8 +6577,7 @@ impl CodexParser {
                                                 }
                                                 None => native_team_wait_input(&output_obj),
                                             }
-                                        },
-                                    );
+                                        });
                                     if let Some((collab_input, is_error)) = capsule {
                                         messages.push(UnifiedMessage {
                                             id: format!("tool-{}", messages.len()),
@@ -4582,7 +6594,7 @@ impl CodexParser {
                                             duration_ms: None,
                                             model: None,
                                             completed_at: Some(timestamp),
-                                        agent_message_id: None,
+                                            agent_message_id: None,
                                         });
                                         messages.push(UnifiedMessage {
                                             id: format!("tool-result-{}", messages.len()),
@@ -4599,7 +6611,7 @@ impl CodexParser {
                                             duration_ms: None,
                                             model: None,
                                             completed_at: Some(timestamp),
-                                        agent_message_id: None,
+                                            agent_message_id: None,
                                         });
                                     }
                                 } else if is_close {
@@ -4613,11 +6625,8 @@ impl CodexParser {
                                             // just `completed`): an errored/notFound
                                             // close with no wait must not lose its
                                             // message or its error state.
-                                            if let Some(prev) =
-                                                output_obj.get("previous_status")
-                                            {
-                                                let (st, msg) =
-                                                    extract_wait_agent_status(prev);
+                                            if let Some(prev) = output_obj.get("previous_status") {
+                                                let (st, msg) = extract_wait_agent_status(prev);
                                                 if let Some(text) = msg {
                                                     agent_fallback_results
                                                         .entry(agent_id.clone())
@@ -4668,21 +6677,21 @@ impl CodexParser {
                                             &mut shell_sessions,
                                         );
                                     }
-                                    let (raw_output, envelope_error) =
-                                        if envelope.status != ScriptStatus::Unknown
-                                            || output_value.is_some_and(|v| v.is_array())
-                                        {
-                                            (
-                                                with_note(
-                                                    Some(envelope.joined()),
-                                                    envelope.note.as_deref(),
-                                                )
-                                                .filter(|s| !s.is_empty()),
-                                                envelope.is_error(),
+                                    let (raw_output, envelope_error) = if envelope.status
+                                        != ScriptStatus::Unknown
+                                        || output_value.is_some_and(|v| v.is_array())
+                                    {
+                                        (
+                                            with_note(
+                                                Some(envelope.joined()),
+                                                envelope.note.as_deref(),
                                             )
-                                        } else {
-                                            (value_to_preview(output_value), false)
-                                        };
+                                            .filter(|s| !s.is_empty()),
+                                            envelope.is_error(),
+                                        )
+                                    } else {
+                                        (value_to_preview(output_value), false)
+                                    };
                                     // A poll about to be folded into the card of
                                     // the command it is collecting for: its
                                     // envelope has to go, and an envelope that
@@ -4721,7 +6730,7 @@ impl CodexParser {
                                         duration_ms: None,
                                         model: None,
                                         completed_at: Some(timestamp),
-                                    agent_message_id: None,
+                                        agent_message_id: None,
                                     });
                                 }
                             }
@@ -4760,7 +6769,7 @@ impl CodexParser {
                                             duration_ms: None,
                                             model: None,
                                             completed_at: Some(timestamp),
-                                        agent_message_id: None,
+                                            agent_message_id: None,
                                         });
                                         continue;
                                     }
@@ -4821,7 +6830,10 @@ impl CodexParser {
                                             Some(existing) => existing.content = blocks,
                                             None => {
                                                 messages.push(UnifiedMessage {
-                                                    id: format!("assistant-plan-{}", messages.len()),
+                                                    id: format!(
+                                                        "assistant-plan-{}",
+                                                        messages.len()
+                                                    ),
                                                     role: MessageRole::Assistant,
                                                     content: blocks,
                                                     timestamp,
@@ -4917,7 +6929,7 @@ impl CodexParser {
                                     duration_ms: None,
                                     model: None,
                                     completed_at: Some(timestamp),
-                                agent_message_id: None,
+                                    agent_message_id: None,
                                 });
                                 if !id.is_empty() {
                                     emitted_image_ids.insert(id);
@@ -4926,7 +6938,6 @@ impl CodexParser {
                             // Not rendered; it only marks the request whose
                             // `token_count` will cover the provider's search
                             // loop rather than the context.
-                            "web_search_call" => context_readings.web_search_ran(),
                             _ => {}
                         }
                     }
@@ -5065,7 +7076,8 @@ impl CodexParser {
                                     *is_error = true;
                                 }
                                 if let Some(dir) = session_dir {
-                                    let stats = agent_stats_cache.entry(agent_id.to_string())
+                                    let stats = agent_stats_cache
+                                        .entry(agent_id.to_string())
                                         .or_insert_with(|| {
                                             parse_codex_subagent_stats(dir, agent_id)
                                         });
@@ -5153,7 +7165,7 @@ impl CodexParser {
                     duration_ms: None,
                     model: None,
                     completed_at: Some(pending.timestamp),
-                agent_message_id: None,
+                    agent_message_id: None,
                 })
                 .collect();
             messages.splice(insert_at..insert_at, group);
@@ -5209,7 +7221,7 @@ impl CodexParser {
                         duration_ms: None,
                         model: None,
                         completed_at: first_timestamp,
-                    agent_message_id: None,
+                        agent_message_id: None,
                     },
                 );
             }
@@ -5229,6 +7241,15 @@ impl CodexParser {
         merge_touching_thinking_cards(&mut messages, turn_starts);
         let mut turns = group_into_turns(messages);
         reconcile_turn_usage(&mut turns, &recorded_round_usage);
+        if let Some(offset) = page_start_offset {
+            // Page-local `turn-0` ids would collide as older pages are
+            // prepended in the browser. Byte-offset names remain stable while
+            // the append-only rollout grows and require no full-file turn
+            // count just to number a tail page.
+            for (index, turn) in turns.iter_mut().enumerate() {
+                turn.id = format!("codex-{offset}-turn-{index}");
+            }
+        }
         super::relocate_orphaned_tool_results(&mut turns);
         super::structurize_read_tool_output(&mut turns);
         super::resolve_patch_line_numbers(&mut turns, cwd.as_deref());
@@ -5432,7 +7453,9 @@ fn reconcile_turn_usage(turns: &mut [MessageTurn], recorded: &TurnUsage) {
         .fold(TurnUsage::default(), |acc, u| codex_usage_add(&acc, u));
 
     let missing = TurnUsage {
-        input_tokens: recorded.input_tokens.saturating_sub(attributed.input_tokens),
+        input_tokens: recorded
+            .input_tokens
+            .saturating_sub(attributed.input_tokens),
         output_tokens: recorded
             .output_tokens
             .saturating_sub(attributed.output_tokens),
@@ -5450,14 +7473,11 @@ fn reconcile_turn_usage(turns: &mut [MessageTurn], recorded: &TurnUsage) {
     // Prefer a turn that already reports usage — it is one the transcript
     // itself tied to a model call, so the recovered tokens land beside spend
     // that really happened rather than on an unrelated bubble.
-    let target = turns
-        .iter()
-        .rposition(|t| t.usage.is_some())
-        .or_else(|| {
-            turns.iter().rposition(|t| {
-                matches!(t.role, TurnRole::Assistant) && !is_codex_compaction_divider(&t.blocks)
-            })
-        });
+    let target = turns.iter().rposition(|t| t.usage.is_some()).or_else(|| {
+        turns.iter().rposition(|t| {
+            matches!(t.role, TurnRole::Assistant) && !is_codex_compaction_divider(&t.blocks)
+        })
+    });
     if let Some(turn) = target.and_then(|i| turns.get_mut(i)) {
         turn.usage = Some(match turn.usage {
             Some(ref existing) => codex_usage_add(existing, &missing),
@@ -5657,7 +7677,7 @@ fn flush_pending_reasoning(
         duration_ms: None,
         model: None,
         completed_at: Some(timestamp),
-    agent_message_id: None,
+        agent_message_id: None,
     });
 }
 
@@ -6691,9 +8711,9 @@ fn response_item_user_has_image(payload: &serde_json::Value) -> bool {
         .get("content")
         .and_then(|c| c.as_array())
         .is_some_and(|items| {
-            items.iter().any(|item| {
-                item.get("type").and_then(|v| v.as_str()) == Some("input_image")
-            })
+            items
+                .iter()
+                .any(|item| item.get("type").and_then(|v| v.as_str()) == Some("input_image"))
         })
 }
 
@@ -6808,7 +8828,7 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
                 duration_ms: None,
                 model: None,
                 completed_at: msg.completed_at,
-            agent_message_id: None,
+                agent_message_id: None,
             });
             i += 1;
         } else if matches!(msg.role, MessageRole::System) {
@@ -6821,7 +8841,7 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
                 duration_ms: None,
                 model: None,
                 completed_at: msg.completed_at,
-            agent_message_id: None,
+                agent_message_id: None,
             });
             i += 1;
         } else {
@@ -6862,7 +8882,7 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
                 duration_ms,
                 model: turn_model,
                 completed_at,
-            agent_message_id: None,
+                agent_message_id: None,
             });
         }
     }
@@ -7809,16 +9829,17 @@ mod tests {
         }
     }
 
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
+    use super::codex_compacted_summary;
+    use super::codex_line_ordinal;
+    use super::codex_parent_thread_id;
+    use super::completed_mcp_call;
     use super::extract_codex_title_candidate;
     use super::extract_context_window_used_tokens_from_token_count_info;
     use super::extract_response_item_user_image_blocks;
     use super::extract_turn_usage_from_codex_usage;
     use super::codex_usage_counters;
-    use super::codex_line_ordinal;
-    use super::codex_parent_thread_id;
-    use super::completed_mcp_call;
     use super::serialize_preview;
     use super::truncate_str;
     use super::BudgetedSink;
@@ -7826,35 +9847,65 @@ mod tests {
     use super::is_encrypted_envelope;
     use super::is_promotable_user_text;
     use super::merge_codex_context_window_stats;
-    use super::native_team_wait_input;
     use super::merge_codex_total_usage_stats;
+    use super::native_fork_parent_session_id_in;
+    use super::native_team_wait_input;
     use super::parse_codex_subagent_stats;
+    use super::recover_current_turn_citation_sources_from_path;
     use super::redact_encrypted_args;
     use super::resolve_codex_home_dir_from;
+    use super::should_skip_duplicate_user_message;
+    use super::strip_blocked_resource_mentions;
     use super::trim_subagent_replay_prefix;
+    use super::AgentParser;
+    use super::CodexParser;
     use super::RolloutFileName;
-    use super::codex_compacted_summary;
     use super::CODEX_COMPACTION_SUMMARY_PREFIX;
     use super::CODEX_COMPACTION_TOOL_NAME;
     use super::CODEX_PLAN_APPROVAL_PROMPT;
     use super::CODEX_PLAN_APPROVED_OUTPUT;
+    use super::CODEX_SCRIPT_TOOL_NAME;
     use super::CODEX_SUBAGENT_LAUNCH_KEY;
     use super::CODEX_SUBAGENT_STATE_KEY;
     use super::COLLAB_OP_KEY;
-    use super::should_skip_duplicate_user_message;
-    use super::strip_blocked_resource_mentions;
-    use super::AgentParser;
-    use super::CodexParser;
-    use super::CODEX_SCRIPT_TOOL_NAME;
+    use super::{
+        build_history_index_slice, history_index_entries_path, history_index_path,
+        HISTORY_INDEX_CACHE, HISTORY_PAGE_CACHE,
+    };
     use crate::models::{
         ContentBlock, MessageRole, MessageTurn, SessionStats, TurnRole, TurnUsage, UnifiedMessage,
     };
     use crate::parsers::ConversationDetail;
     use chrono::{DateTime, Duration, Utc};
+    use sha2::{Digest, Sha256};
     use std::env;
-    use std::fs;
+    use std::fs::{self, OpenOptions};
+    use std::io::{BufWriter, Seek, SeekFrom, Write};
     use std::path::{Path, PathBuf};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+    fn evict_history_fixture_caches(path: &std::path::Path) {
+        HISTORY_PAGE_CACHE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .retain(|key, _| key.path != path);
+        HISTORY_INDEX_CACHE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(path);
+    }
+
+    fn remove_history_index_fixture(path: &std::path::Path) {
+        evict_history_fixture_caches(path);
+        if let Some(index_path) = history_index_path(path) {
+            let _ = fs::remove_file(index_path);
+        }
+        if let Some(entries_path) = history_index_entries_path(path) {
+            let _ = fs::remove_file(entries_path);
+        }
+    }
 
     fn write_index_title_fixture(
         conversation_id: &str,
@@ -8081,9 +10132,9 @@ mod tests {
                 ),
             ];
             fs::write(
-                temp_dir
-                    .path()
-                    .join(format!("rollout-2026-08-28T10-00-00-{conversation_id}.jsonl")),
+                temp_dir.path().join(format!(
+                    "rollout-2026-08-28T10-00-00-{conversation_id}.jsonl"
+                )),
                 format!("{}\n", lines.join("\n")),
             )
             .expect("write rollout");
@@ -8784,7 +10835,7 @@ mod tests {
             duration_ms: None,
             model: None,
             completed_at: Some(now),
-        agent_message_id: None,
+            agent_message_id: None,
         }];
 
         assert!(should_skip_duplicate_user_message(
@@ -9180,7 +11231,12 @@ mod tests {
             )
         };
         let searched_report = |ts: &str| {
-            usage_count_line(ts, [522_480, 450_432, 7_798], [579_422, 501_952, 8_158], WINDOW)
+            usage_count_line(
+                ts,
+                [522_480, 450_432, 7_798],
+                [579_422, 501_952, 8_158],
+                WINDOW,
+            )
         };
         let first_turn = vec![
             rollout_line(
@@ -9216,14 +11272,22 @@ mod tests {
             ),
         ];
         let reading = |lines: &[String], tag: &str| {
-            let stats = parse_lines(lines, tag).session_stats.expect("session stats");
-            (stats.context_window_used_tokens, stats.context_window_usage_percent)
+            let stats = parse_lines(lines, tag)
+                .session_stats
+                .expect("session stats");
+            (
+                stats.context_window_used_tokens,
+                stats.context_window_usage_percent,
+            )
         };
 
         let (used, percent) = reading(&first_turn, "ws-846-searched");
         assert_eq!(used, Some(57_302), "the reading before the search stands");
         let percent = percent.expect("percent");
-        assert!((percent - 57_302.0 / WINDOW as f64 * 100.0).abs() < 1e-9, "{percent}");
+        assert!(
+            (percent - 57_302.0 / WINDOW as f64 * 100.0).abs() < 1e-9,
+            "{percent}"
+        );
 
         // Older codex restates the latest report as the next request opens; a
         // restatement of the report set aside is set aside with it.
@@ -9339,13 +11403,19 @@ mod tests {
             .iter()
             .filter_map(|t| t.usage.as_ref())
             .map(|u| {
-                u.input_tokens + u.output_tokens + u.cache_creation_input_tokens
+                u.input_tokens
+                    + u.output_tokens
+                    + u.cache_creation_input_tokens
                     + u.cache_read_input_tokens
             })
             .sum()
     }
 
-    fn parse_rollout(label: &str, content: &str, session_id: &str) -> crate::models::ConversationDetail {
+    fn parse_rollout(
+        label: &str,
+        content: &str,
+        session_id: &str,
+    ) -> crate::models::ConversationDetail {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system time ok")
@@ -9465,7 +11535,10 @@ mod tests {
         );
         let detail = parse_rollout("toolonly", content, "toolonly-1");
         assert!(
-            !detail.turns.iter().any(|t| matches!(t.role, TurnRole::Assistant)),
+            !detail
+                .turns
+                .iter()
+                .any(|t| matches!(t.role, TurnRole::Assistant)),
             "precondition: this rollout has no assistant turn"
         );
         let total = detail
@@ -9728,8 +11801,7 @@ mod tests {
 
         // active → create_goal, objective + status carried in the tool_result.
         let create_id = find("create_goal");
-        let create_out: serde_json::Value =
-            serde_json::from_str(&outputs[&create_id]).unwrap();
+        let create_out: serde_json::Value = serde_json::from_str(&outputs[&create_id]).unwrap();
         assert_eq!(create_out["goal"]["status"], "active");
         assert_eq!(create_out["goal"]["objective"], "Refactor the auth module");
         // Distinct goal events get distinct (occurrence-addressed) ids.
@@ -9737,8 +11809,7 @@ mod tests {
 
         // budgetLimited → update_goal with the status normalized to snake_case.
         let update_id = find("update_goal");
-        let update_out: serde_json::Value =
-            serde_json::from_str(&outputs[&update_id]).unwrap();
+        let update_out: serde_json::Value = serde_json::from_str(&outputs[&update_id]).unwrap();
         assert_eq!(update_out["goal"]["status"], "budget_limited");
         assert_eq!(update_out["goal"]["tokensUsed"], 5200);
         let update_in: serde_json::Value = serde_json::from_str(&inputs[&update_id]).unwrap();
@@ -9892,8 +11963,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time ok")
             .as_nanos();
-        let path: PathBuf =
-            env::temp_dir().join(format!("codeg-codex-goaltext-{nanos}.jsonl"));
+        let path: PathBuf = env::temp_dir().join(format!("codeg-codex-goaltext-{nanos}.jsonl"));
         let content = concat!(
             "{\"timestamp\":\"2026-03-01T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"gt-1\",\"cwd\":\"/tmp/demo\"}}\n",
             "{\"timestamp\":\"2026-03-01T10:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"/goal Analyze the README\"}}\n",
@@ -9911,7 +11981,10 @@ mod tests {
             .iter()
             .filter(|t| matches!(t.role, TurnRole::User))
             .count();
-        assert_eq!(user_turns, 1, "real user_message not duplicated by synthesis");
+        assert_eq!(
+            user_turns, 1,
+            "real user_message not duplicated by synthesis"
+        );
         let user_text = detail
             .turns
             .iter()
@@ -9940,8 +12013,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time ok")
             .as_nanos();
-        let path: PathBuf =
-            env::temp_dir().join(format!("codeg-codex-goaldup-{nanos}.jsonl"));
+        let path: PathBuf = env::temp_dir().join(format!("codeg-codex-goaldup-{nanos}.jsonl"));
         let content = concat!(
             "{\"timestamp\":\"2026-03-01T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"gd-1\",\"cwd\":\"/tmp/demo\"}}\n",
             "{\"timestamp\":\"2026-03-01T10:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_goal_updated\",\"goal\":{\"objective\":\"Investigate auth\",\"status\":\"active\"}}}\n",
@@ -9989,8 +12061,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time ok")
             .as_nanos();
-        let path: PathBuf =
-            env::temp_dir().join(format!("codeg-codex-goalconfirm-{nanos}.jsonl"));
+        let path: PathBuf = env::temp_dir().join(format!("codeg-codex-goalconfirm-{nanos}.jsonl"));
         let content = concat!(
             "{\"timestamp\":\"2026-03-01T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"gc-1\",\"cwd\":\"/tmp/demo\"}}\n",
             "{\"timestamp\":\"2026-03-01T10:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_goal_updated\",\"goal\":{\"objective\":\"Build a static page\",\"status\":\"active\"}}}\n",
@@ -10058,8 +12129,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time ok")
             .as_nanos();
-        let path: PathBuf =
-            env::temp_dir().join(format!("codeg-codex-sumconfirm-{nanos}.jsonl"));
+        let path: PathBuf = env::temp_dir().join(format!("codeg-codex-sumconfirm-{nanos}.jsonl"));
         let content = concat!(
             "{\"timestamp\":\"2026-03-01T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"sc-1\",\"cwd\":\"/tmp/demo\"}}\n",
             "{\"timestamp\":\"2026-03-01T10:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_goal_updated\",\"goal\":{\"objective\":\"Build a static page\",\"status\":\"active\"}}}\n",
@@ -10094,8 +12164,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time ok")
             .as_nanos();
-        let path: PathBuf =
-            env::temp_dir().join(format!("codeg-codex-sumgoal-{nanos}.jsonl"));
+        let path: PathBuf = env::temp_dir().join(format!("codeg-codex-sumgoal-{nanos}.jsonl"));
         let content = concat!(
             "{\"timestamp\":\"2026-03-01T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"sg-1\",\"cwd\":\"/tmp/demo\"}}\n",
             "{\"timestamp\":\"2026-03-01T10:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_goal_updated\",\"goal\":{\"objective\":\"Build a static test page\",\"status\":\"active\"}}}\n",
@@ -10111,10 +12180,7 @@ mod tests {
             .expect("summary present");
 
         // Objective wins as title; the internal-context text never leaks in.
-        assert_eq!(
-            summary.title.as_deref(),
-            Some("Build a static test page")
-        );
+        assert_eq!(summary.title.as_deref(), Some("Build a static test page"));
         // The synthesized user turn (+1) plus the agent_message (+1).
         assert_eq!(summary.message_count, 2);
 
@@ -10129,8 +12195,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time ok")
             .as_nanos();
-        let path: PathBuf =
-            env::temp_dir().join(format!("codeg-codex-sumname-{nanos}.jsonl"));
+        let path: PathBuf = env::temp_dir().join(format!("codeg-codex-sumname-{nanos}.jsonl"));
         let content = concat!(
             "{\"timestamp\":\"2026-03-01T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"sn-1\",\"cwd\":\"/tmp/demo\"}}\n",
             "{\"timestamp\":\"2026-03-01T10:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_goal_updated\",\"goal\":{\"objective\":\"Build a static test page\",\"status\":\"active\"}}}\n",
@@ -10161,8 +12226,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time ok")
             .as_nanos();
-        let path: PathBuf =
-            env::temp_dir().join(format!("codeg-codex-sumimg-{nanos}.jsonl"));
+        let path: PathBuf = env::temp_dir().join(format!("codeg-codex-sumimg-{nanos}.jsonl"));
         let content = concat!(
             "{\"timestamp\":\"2026-03-01T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"si-1\",\"cwd\":\"/tmp/demo\"}}\n",
             "{\"timestamp\":\"2026-03-01T10:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_goal_updated\",\"goal\":{\"objective\":\"Do the thing\",\"status\":\"active\"}}}\n",
@@ -10475,8 +12539,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time ok")
             .as_nanos();
-        let path: PathBuf =
-            env::temp_dir().join(format!("codeg-codex-sumnull-{nanos}.jsonl"));
+        let path: PathBuf = env::temp_dir().join(format!("codeg-codex-sumnull-{nanos}.jsonl"));
         let content = concat!(
             "{\"timestamp\":\"2026-03-01T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"snl-1\",\"cwd\":\"/tmp/demo\"}}\n",
             "{\"timestamp\":\"2026-03-01T10:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_goal_updated\",\"goal\":null}}\n",
@@ -10508,8 +12571,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time ok")
             .as_nanos();
-        let path: PathBuf =
-            env::temp_dir().join(format!("codeg-codex-gtxt-{nanos}.jsonl"));
+        let path: PathBuf = env::temp_dir().join(format!("codeg-codex-gtxt-{nanos}.jsonl"));
         let content = concat!(
             "{\"timestamp\":\"2026-03-01T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"gt2-1\",\"cwd\":\"/tmp/demo\"}}\n",
             "{\"timestamp\":\"2026-03-01T10:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_goal_updated\",\"goal\":{\"objective\":\"Do X\",\"status\":\"active\"}}}\n",
@@ -10561,8 +12623,7 @@ mod tests {
             .as_nanos();
 
         // (a) terminal-only goal → no capture, no synthetic count/title.
-        let path_a: PathBuf =
-            env::temp_dir().join(format!("codeg-codex-term-{nanos}.jsonl"));
+        let path_a: PathBuf = env::temp_dir().join(format!("codeg-codex-term-{nanos}.jsonl"));
         fs::write(
             &path_a,
             concat!(
@@ -10578,13 +12639,15 @@ mod tests {
             .expect("ok")
             .expect("present");
         assert_eq!(summary_a.title, None, "terminal goal is not a title");
-        assert_eq!(summary_a.message_count, 1, "no synthetic user for terminal goal");
+        assert_eq!(
+            summary_a.message_count, 1,
+            "no synthetic user for terminal goal"
+        );
         let _ = fs::remove_file(&path_a);
 
         // (b) terminal THEN active → the active objective is captured (not the
         // terminal one), matching the detail parser's first-create_goal capture.
-        let path_b: PathBuf =
-            env::temp_dir().join(format!("codeg-codex-termact-{nanos}.jsonl"));
+        let path_b: PathBuf = env::temp_dir().join(format!("codeg-codex-termact-{nanos}.jsonl"));
         fs::write(
             &path_b,
             concat!(
@@ -10615,6 +12678,28 @@ mod tests {
     fn codex_home_defaults_to_home_dot_codex() {
         let resolved = resolve_codex_home_dir_from(None, Some(PathBuf::from("/Users/default")));
         assert_eq!(resolved, PathBuf::from("/Users/default/.codex"));
+    }
+
+    #[test]
+    fn native_fork_parent_reads_only_the_matching_rollout_header() {
+        let root = tempfile::tempdir().expect("temp codex home");
+        let day = root.path().join("2026/08/22");
+        fs::create_dir_all(&day).expect("session day");
+        let child = "01a-child-session";
+        fs::write(
+            day.join(format!("rollout-2026-08-22T10-00-00-{child}.jsonl")),
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"01a-child-session\",\"parent_thread_id\":\"01a-parent-session\",\"cwd\":\"/tmp/demo\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"private transcript text\"}}\n"
+            ),
+        )
+        .expect("fork rollout");
+
+        assert_eq!(
+            native_fork_parent_session_id_in(root.path(), child).as_deref(),
+            Some("01a-parent-session")
+        );
+        assert!(native_fork_parent_session_id_in(root.path(), "../escape").is_none());
     }
 
     /// codex 0.129+ writes a generated image both as `event_msg.image_generation_end`
@@ -10885,6 +12970,885 @@ mod tests {
         content.push('\n');
         fs::write(&path, content).expect("write test jsonl");
         path
+    }
+
+    fn user_texts(detail: &crate::models::ConversationDetail) -> Vec<String> {
+        detail
+            .turns
+            .iter()
+            .filter(|turn| matches!(turn.role, TurnRole::User))
+            .flat_map(|turn| turn.blocks.iter())
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn reload_preserves_structured_web_search_citations() {
+        let path = write_temp_rollout(
+            "citations",
+            &[
+                serde_json::json!({
+                    "timestamp":"2026-08-24T10:00:00Z",
+                    "type":"session_meta",
+                    "payload":{"id":"citation-session","cwd":"/tmp/project"}
+                })
+                .to_string(),
+                serde_json::json!({
+                    "timestamp":"2026-08-24T10:00:01Z",
+                    "type":"event_msg",
+                    "payload":{"type":"user_message","message":"search"}
+                })
+                .to_string(),
+                serde_json::json!({
+                    "timestamp":"2026-08-24T10:00:02Z",
+                    "type":"event_msg",
+                    "payload":{
+                        "type":"web_search_end",
+                        "call_id":"ws-1",
+                        "query":"source",
+                        "action":{"type":"search","query":"source"},
+                        "results":[{
+                            "type":"text_result",
+                            "ref_id":"turn0search0",
+                            "url":"https://example.com/source?q=1",
+                            "title":"Example source"
+                        }]
+                    }
+                })
+                .to_string(),
+                serde_json::json!({
+                    "timestamp":"2026-08-24T10:00:03Z",
+                    "type":"event_msg",
+                    "payload":{
+                        "type":"agent_message",
+                        "message":"answer \u{e200}cite\u{e202}turn0search0\u{e201}"
+                    }
+                })
+                .to_string(),
+            ],
+        );
+        let detail = CodexParser::new()
+            .parse_conversation_detail(&path, "citation-session")
+            .expect("parse citation rollout");
+        let meta = detail
+            .turns
+            .iter()
+            .flat_map(|turn| turn.blocks.iter())
+            .find_map(|block| match block {
+                ContentBlock::ToolUse { meta, .. } => meta.as_ref(),
+                _ => None,
+            })
+            .expect("web search citation metadata");
+        let sources = crate::citations::sources_from_meta(Some(meta));
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].reference_id, "turn0search0");
+        assert_eq!(sources[0].url, "https://example.com/source?q=1");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn reload_merges_raw_open_page_and_search_result_citations() {
+        let path = write_temp_rollout(
+            "raw-citations",
+            &[
+                serde_json::json!({
+                    "timestamp":"2026-08-24T10:00:00Z",
+                    "type":"session_meta",
+                    "payload":{"id":"raw-citation-session","cwd":"/tmp/project"}
+                })
+                .to_string(),
+                serde_json::json!({
+                    "timestamp":"2026-08-24T10:00:01Z",
+                    "type":"event_msg",
+                    "payload":{"type":"user_message","message":"search"}
+                })
+                .to_string(),
+                serde_json::json!({
+                    "timestamp":"2026-08-24T10:00:02Z",
+                    "type":"response_item",
+                    "payload":{
+                        "type":"web_search_call",
+                        "id":"turn4view0",
+                        "action":{"type":"openPage","url":"https://docs.example.org/open?q=%E4%B8%AD%E6%96%87"}
+                    }
+                })
+                .to_string(),
+                serde_json::json!({
+                    "timestamp":"2026-08-24T10:00:03Z",
+                    "type":"event_msg",
+                    "payload":{
+                        "type":"web_search_end",
+                        "call_id":"turn4view0",
+                        "query":"source",
+                        "results":[{
+                            "ref_id":"turn4search0",
+                            "url":"https://example.com/result",
+                            "title":"Result"
+                        }]
+                    }
+                })
+                .to_string(),
+                serde_json::json!({
+                    "timestamp":"2026-08-24T10:00:04Z",
+                    "type":"event_msg",
+                    "payload":{
+                        "type":"agent_message",
+                        "message":"answer \u{e200}cite\u{e202}turn4view0\u{e202}turn4search0\u{e201}"
+                    }
+                })
+                .to_string(),
+            ],
+        );
+        let detail = CodexParser::new()
+            .parse_conversation_detail(&path, "raw-citation-session")
+            .expect("parse raw citation rollout");
+        let sources = detail
+            .turns
+            .iter()
+            .flat_map(|turn| turn.blocks.iter())
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse { meta, .. } => meta.as_ref(),
+                _ => None,
+            })
+            .flat_map(|meta| crate::citations::sources_from_meta(Some(meta)))
+            .collect::<Vec<_>>();
+        assert_eq!(sources.len(), 2);
+        assert!(sources.iter().any(|source| {
+            source.reference_id == "turn4view0"
+                && source.url.starts_with("https://docs.example.org/open")
+        }));
+        assert!(sources.iter().any(|source| {
+            source.reference_id == "turn4search0" && source.url == "https://example.com/result"
+        }));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn terminal_citation_recovery_is_scoped_to_latest_stable_turn() {
+        let path = write_temp_rollout(
+            "terminal-citation-recovery",
+            &[
+                serde_json::json!({
+                    "timestamp":"2026-08-24T10:00:00Z",
+                    "type":"event_msg",
+                    "payload":{"type":"task_started"}
+                })
+                .to_string(),
+                serde_json::json!({
+                    "timestamp":"2026-08-24T10:00:01Z",
+                    "type":"event_msg",
+                    "payload":{
+                        "type":"web_search_end",
+                        "call_id":"old-call",
+                        "results":[{
+                            "ref_id":"turn8view0",
+                            "url":"https://old.example/wrong",
+                            "title":"Old"
+                        }]
+                    }
+                })
+                .to_string(),
+                serde_json::json!({
+                    "timestamp":"2026-08-24T10:01:00Z",
+                    "type":"event_msg",
+                    "payload":{"type":"task_started"}
+                })
+                .to_string(),
+                serde_json::json!({
+                    "timestamp":"2026-08-24T10:01:01Z",
+                    "type":"event_msg",
+                    "payload":{
+                        "type":"web_search_end",
+                        "call_id":"current-call",
+                        "results":[{
+                            "ref_id":"turn8view0",
+                            "url":"https://current.example/right",
+                            "title":"Current"
+                        },{
+                            "ref_id":"turn8search1",
+                            "url":"https://current.example/unused",
+                            "title":"Unused"
+                        }]
+                    }
+                })
+                .to_string(),
+            ],
+        );
+        let wanted = HashSet::from(["turn8view0".to_string()]);
+        let sources = recover_current_turn_citation_sources_from_path(&path, &wanted)
+            .expect("recover current turn");
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].url, "https://current.example/right");
+        assert_eq!(sources[0].call_id.as_deref(), Some("current-call"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn terminal_citation_recovery_fails_closed_without_turn_boundary() {
+        let path = write_temp_rollout(
+            "terminal-citation-no-boundary",
+            &[serde_json::json!({
+                "timestamp":"2026-08-24T10:00:01Z",
+                "type":"event_msg",
+                "payload":{
+                    "type":"web_search_end",
+                    "call_id":"call",
+                    "results":[{
+                        "ref_id":"turn8view0",
+                        "url":"https://example.com/wrong-turn"
+                    }]
+                }
+            })
+            .to_string()],
+        );
+        let wanted = HashSet::from(["turn8view0".to_string()]);
+        assert_eq!(
+            recover_current_turn_citation_sources_from_path(&path, &wanted).unwrap_err(),
+            "stable_turn_boundary_outside_bounded_tail"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn byte_cursor_pages_codex_history_without_loss_or_duplicate_ids() {
+        let dir = tempfile::tempdir().expect("temp sessions dir");
+        let conversation_id = "paged-history";
+        let path = dir
+            .path()
+            .join(format!("rollout-2026-08-06-{conversation_id}.jsonl"));
+        let mut lines = vec![rollout_line(
+            "2026-08-06T00:00:00Z",
+            "session_meta",
+            serde_json::json!({"id": conversation_id, "cwd": "/tmp/paged"}),
+        )];
+        for index in 0..5 {
+            lines.push(rollout_line(
+                "2026-08-06T00:00:00.500Z",
+                "turn_context",
+                serde_json::json!({"model": format!("gpt-page-{index}")}),
+            ));
+            lines.push(rollout_line(
+                "2026-08-06T00:00:01Z",
+                "event_msg",
+                serde_json::json!({
+                    "type": "user_message",
+                    "message": format!("prompt-{index}"),
+                }),
+            ));
+            lines.push(rollout_line(
+                "2026-08-06T00:00:02Z",
+                "event_msg",
+                serde_json::json!({
+                    "type": "agent_message",
+                    "message": format!("reply-{index}"),
+                }),
+            ));
+        }
+        fs::write(&path, format!("{}\n", lines.join("\n"))).expect("write rollout");
+
+        let parser = CodexParser::with_base_dir(dir.path().to_path_buf());
+        let latest = parser
+            .get_conversation_page(conversation_id, None, 2, Some("/tmp/paged".into()))
+            .expect("latest page");
+        assert_eq!(user_texts(&latest.detail), vec!["prompt-3", "prompt-4"]);
+        assert_eq!(latest.detail.summary.model.as_deref(), Some("gpt-page-3"));
+        assert!(latest.has_more);
+
+        let earlier = parser
+            .get_conversation_page(
+                conversation_id,
+                Some(latest.start_offset),
+                2,
+                Some("/tmp/paged".into()),
+            )
+            .expect("earlier page");
+        assert_eq!(user_texts(&earlier.detail), vec!["prompt-1", "prompt-2"]);
+        let latest_ids = latest
+            .detail
+            .turns
+            .iter()
+            .map(|turn| turn.id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        assert!(earlier
+            .detail
+            .turns
+            .iter()
+            .all(|turn| !latest_ids.contains(turn.id.as_str())));
+
+        let oldest = parser
+            .get_conversation_page(
+                conversation_id,
+                Some(earlier.start_offset),
+                2,
+                Some("/tmp/paged".into()),
+            )
+            .expect("oldest page");
+        assert_eq!(user_texts(&oldest.detail), vec!["prompt-0"]);
+        assert!(!oldest.has_more);
+        assert_eq!(oldest.start_offset, 0);
+    }
+
+    #[test]
+    fn exact_range_reads_tiny_branch_delta_from_sparse_gigabyte_rollout() {
+        let dir = tempfile::tempdir().expect("temp sessions dir");
+        let conversation_id = "gigabyte-native-fork";
+        let path = dir
+            .path()
+            .join(format!("rollout-2026-08-24-{conversation_id}.jsonl"));
+        let mut file = fs::File::create(&path).expect("create rollout");
+        writeln!(
+            file,
+            "{}",
+            rollout_line(
+                "2026-08-24T00:00:00Z",
+                "session_meta",
+                serde_json::json!({
+                    "id": conversation_id,
+                    "parent_thread_id": "source-session",
+                    "cwd": "/tmp/large"
+                }),
+            )
+        )
+        .unwrap();
+        // Sparse expansion models a 2 GB inherited prefix without consuming
+        // disk or making the test slow. The exact fork offset begins after it.
+        file.set_len(2_000_000_000)
+            .expect("make sparse inherited prefix");
+        file.seek(SeekFrom::End(0)).unwrap();
+        let delta_start = file.stream_position().unwrap();
+        for line in [
+            rollout_line(
+                "2026-08-24T00:10:00Z",
+                "event_msg",
+                serde_json::json!({"type":"user_message","message":"branch-only"}),
+            ),
+            rollout_line(
+                "2026-08-24T00:10:01Z",
+                "event_msg",
+                serde_json::json!({"type":"agent_message","message":"branch-result"}),
+            ),
+        ] {
+            writeln!(file, "{line}").unwrap();
+        }
+        file.flush().unwrap();
+
+        let parser = CodexParser::with_base_dir(dir.path().to_path_buf());
+        let range = parser
+            .get_conversation_range(
+                conversation_id,
+                delta_start,
+                1024 * 1024,
+                Some("/tmp/large".into()),
+            )
+            .expect("only the post-fork range is parsed");
+        assert_eq!(range.start_offset, delta_start);
+        assert!(range.end_offset > 2_000_000_000);
+        assert_eq!(user_texts(&range.detail), vec!["branch-only"]);
+        assert!(range
+            .detail
+            .turns
+            .iter()
+            .flat_map(|turn| &turn.blocks)
+            .any(|block| matches!(block, ContentBlock::Text { text } if text == "branch-result")));
+    }
+
+    /// Regression for the reported multi-gigabyte rollout shape. A sparse
+    /// prefix models the old history without consuming 3.5 GB of test disk; the
+    /// valid tail is real JSONL and must be reached without touching the sparse
+    /// prefix.
+    #[test]
+    fn large_rollout_first_page_reads_only_the_tail() {
+        check_large_rollout_tail(3_500_000_000);
+    }
+
+    #[test]
+    fn two_gigabyte_rollout_recovers_the_latest_25_rounds() {
+        check_large_rollout_tail(2_000_000_000);
+    }
+
+    fn check_large_rollout_tail(prefix_bytes: u64) {
+        const ROUNDS: usize = 35;
+        const PAGE_ROUNDS: usize = 25;
+        const TOOL_OUTPUT_BYTES: usize = 512_000;
+
+        let dir = tempfile::tempdir().expect("temp sessions dir");
+        let conversation_id = "large-paged-history";
+        let path = dir
+            .path()
+            .join(format!("rollout-2026-08-06-{conversation_id}.jsonl"));
+        let mut file = fs::File::create(&path).expect("create rollout");
+        writeln!(
+            file,
+            "{}",
+            rollout_line(
+                "2026-08-06T00:00:00Z",
+                "session_meta",
+                serde_json::json!({"id": conversation_id, "cwd": "/tmp/large"}),
+            )
+        )
+        .expect("write metadata");
+        file.set_len(prefix_bytes)
+            .expect("create sparse multi-GB prefix");
+        file.seek(SeekFrom::End(0)).expect("seek sparse tail");
+        let mut writer = BufWriter::new(file);
+        let output = "x".repeat(TOOL_OUTPUT_BYTES);
+        for index in 0..ROUNDS {
+            writeln!(
+                writer,
+                "{}",
+                rollout_line(
+                    "2026-08-06T00:00:00.500Z",
+                    "turn_context",
+                    serde_json::json!({"model": "gpt-5.5"}),
+                )
+            )
+            .expect("write turn context");
+            writeln!(
+                writer,
+                "{}",
+                rollout_line(
+                    "2026-08-06T00:00:01Z",
+                    "event_msg",
+                    serde_json::json!({
+                        "type": "user_message",
+                        "message": format!("prompt-{index}"),
+                    }),
+                )
+            )
+            .expect("write user");
+            writeln!(
+                writer,
+                "{}",
+                rollout_line(
+                    "2026-08-06T00:00:02Z",
+                    "response_item",
+                    serde_json::json!({
+                        "type": "function_call_output",
+                        "call_id": format!("call-{index}"),
+                        "output": output.as_str(),
+                    }),
+                )
+            )
+            .expect("write tool output");
+            writeln!(
+                writer,
+                "{}",
+                rollout_line(
+                    "2026-08-06T00:00:03Z",
+                    "event_msg",
+                    serde_json::json!({
+                        "type": "agent_message",
+                        "message": format!("reply-{index}"),
+                    }),
+                )
+            )
+            .expect("write assistant");
+        }
+        writer.flush().expect("flush rollout");
+
+        let source_bytes = fs::metadata(&path).expect("rollout metadata").len();
+        assert!(source_bytes > prefix_bytes);
+        let parser = CodexParser::with_base_dir(dir.path().to_path_buf());
+        let started = Instant::now();
+        let page = parser
+            .get_conversation_page(
+                conversation_id,
+                None,
+                PAGE_ROUNDS,
+                Some("/tmp/large".into()),
+            )
+            .expect("load bounded tail");
+        let elapsed = started.elapsed();
+        let response = serde_json::to_vec(&page.detail).expect("serialize page");
+        let response_bytes = response.len();
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gzip.write_all(&response).expect("compress first page");
+        let gzip_bytes = gzip.finish().expect("finish first-page compression").len();
+        eprintln!(
+            "large_history_benchmark source_bytes={source_bytes} page_bytes={response_bytes} gzip_bytes={gzip_bytes} scan_bytes={} rollout_read_bytes={} elapsed_ms={}",
+            page.scan_bytes,
+            page.scan_bytes + page.end_offset.saturating_sub(page.start_offset),
+            elapsed.as_millis()
+        );
+        assert_eq!(
+            user_texts(&page.detail),
+            (ROUNDS - PAGE_ROUNDS..ROUNDS)
+                .map(|index| format!("prompt-{index}"))
+                .collect::<Vec<_>>()
+        );
+        assert!(page.page_complete);
+        assert!(page.has_more);
+        assert!(page.scan_bytes <= super::CODEX_HISTORY_FIRST_PAGE_MAX_BYTES);
+        assert!(
+            page.end_offset.saturating_sub(page.start_offset)
+                <= super::CODEX_HISTORY_FIRST_PAGE_MAX_BYTES
+        );
+        assert!(elapsed.as_secs() < 10, "tail page parse took {elapsed:?}");
+        let cached_started = Instant::now();
+        let cached = parser
+            .get_conversation_page(
+                conversation_id,
+                None,
+                PAGE_ROUNDS,
+                Some("/tmp/large".into()),
+            )
+            .expect("reuse first page");
+        let cached_elapsed = cached_started.elapsed();
+        assert!(cached.cache_hit);
+        assert_eq!(cached.scan_bytes, page.scan_bytes);
+
+        evict_history_fixture_caches(&path);
+        let indexed_started = Instant::now();
+        let indexed = parser
+            .get_conversation_page(
+                conversation_id,
+                None,
+                PAGE_ROUNDS,
+                Some("/tmp/large".into()),
+            )
+            .expect("reuse persisted page index after memory-cache reset");
+        let indexed_elapsed = indexed_started.elapsed();
+        assert!(indexed.index_hit);
+        assert_eq!(indexed.scan_bytes, 0);
+        eprintln!(
+            "large_history_reopen cached_ms={} indexed_ms={} indexed_scan_bytes={} indexed_read_bytes={}",
+            cached_elapsed.as_millis(),
+            indexed_elapsed.as_millis(),
+            indexed.scan_bytes,
+            indexed.end_offset.saturating_sub(indexed.start_offset)
+        );
+        remove_history_index_fixture(&path);
+    }
+
+    #[test]
+    fn first_page_adapts_past_a_jsonl_record_larger_than_the_initial_tail() {
+        let dir = tempfile::tempdir().expect("temp sessions dir");
+        let conversation_id = "giant-tail-record";
+        let path = dir
+            .path()
+            .join(format!("rollout-2026-09-08-{conversation_id}.jsonl"));
+        let mut writer = BufWriter::new(fs::File::create(&path).expect("create rollout"));
+        writeln!(
+            writer,
+            "{}",
+            rollout_line(
+                "2026-09-08T00:00:00Z",
+                "session_meta",
+                serde_json::json!({"id": conversation_id, "cwd": "/tmp/giant"}),
+            )
+        )
+        .unwrap();
+        for index in 0..24 {
+            writeln!(
+                writer,
+                "{}",
+                rollout_line(
+                    "2026-09-08T00:00:01Z",
+                    "event_msg",
+                    serde_json::json!({"type":"user_message","message":format!("prompt-{index}")}),
+                )
+            )
+            .unwrap();
+            writeln!(
+                writer,
+                "{}",
+                rollout_line(
+                    "2026-09-08T00:00:02Z",
+                    "event_msg",
+                    serde_json::json!({"type":"agent_message","message":format!("reply-{index}")}),
+                )
+            )
+            .unwrap();
+        }
+        // This ignored record is deliberately larger than the historical
+        // 16 MiB tail window. It models a single enormous tool/event line
+        // without inflating the rendered response.
+        writeln!(
+            writer,
+            "{}",
+            rollout_line(
+                "2026-09-08T00:00:03Z",
+                "ignored_large_record",
+                serde_json::json!({"blob":"x".repeat(20 * 1024 * 1024)}),
+            )
+        )
+        .unwrap();
+        writeln!(
+            writer,
+            "{}",
+            rollout_line(
+                "2026-09-08T00:00:04Z",
+                "event_msg",
+                serde_json::json!({"type":"user_message","message":"prompt-24"}),
+            )
+        )
+        .unwrap();
+        writeln!(
+            writer,
+            "{}",
+            rollout_line(
+                "2026-09-08T00:00:05Z",
+                "event_msg",
+                serde_json::json!({"type":"agent_message","message":"reply-24"}),
+            )
+        )
+        .unwrap();
+        writer.flush().unwrap();
+
+        let parser = CodexParser::with_base_dir(dir.path().to_path_buf());
+        let started = Instant::now();
+        let page = parser
+            .get_conversation_page(conversation_id, None, 25, Some("/tmp/giant".into()))
+            .expect("adaptive bounded tail");
+        let elapsed = started.elapsed();
+        let source_bytes = fs::metadata(&path).expect("rollout metadata").len();
+        eprintln!(
+            "giant_record_benchmark source_bytes={source_bytes} scan_bytes={} elapsed_ms={}",
+            page.scan_bytes,
+            elapsed.as_millis()
+        );
+        assert_eq!(user_texts(&page.detail).len(), 25);
+        assert!(page.scan_bytes > super::CODEX_HISTORY_FIRST_PAGE_INITIAL_BYTES);
+        assert!(page.scan_bytes <= super::CODEX_HISTORY_FIRST_PAGE_MAX_BYTES);
+        assert!(elapsed.as_secs() < 10, "adaptive tail took {elapsed:?}");
+        remove_history_index_fixture(&path);
+    }
+
+    #[test]
+    fn bounded_tail_keeps_recent_records_after_a_record_larger_than_the_ceiling() {
+        let dir = tempfile::tempdir().expect("temp sessions dir");
+        let conversation_id = "ceiling-sized-tail";
+        let path = dir.path().join(format!("rollout-{conversation_id}.jsonl"));
+        let mut file = BufWriter::new(fs::File::create(&path).unwrap());
+        writeln!(
+            file,
+            "{}",
+            rollout_line(
+                "2026-10-10T00:00:00Z",
+                "session_meta",
+                serde_json::json!({"id":conversation_id,"cwd":"/tmp/ceiling"})
+            )
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{}",
+            rollout_line(
+                "2026-10-10T00:00:01Z",
+                "event_msg",
+                serde_json::json!({"type":"user_message","message":"large tool output"})
+            )
+        )
+        .unwrap();
+        file.write_all(b"{\"type\":\"ignored_large_record\",\"padding\":\"")
+            .unwrap();
+        let block = vec![b'x'; 1024 * 1024];
+        for _ in 0..65 {
+            file.write_all(&block).unwrap();
+        }
+        file.write_all(b"\"}\n").unwrap();
+        writeln!(
+            file,
+            "{}",
+            rollout_line(
+                "2026-10-10T00:00:02Z",
+                "event_msg",
+                serde_json::json!({"type":"agent_message","message":"latest final remains visible"})
+            )
+        )
+        .unwrap();
+        file.flush().unwrap();
+        let parser = CodexParser::with_base_dir(dir.path().to_path_buf());
+
+        for attempt in 0..2 {
+            let started = Instant::now();
+            let page = parser
+                .get_conversation_page(conversation_id, None, 25, Some("/tmp/ceiling".into()))
+                .unwrap();
+            let elapsed = started.elapsed();
+            eprintln!("partial_tail_benchmark attempt={attempt} scan_bytes={} rollout_read_bytes={} elapsed_ms={}", page.scan_bytes, page.scan_bytes + page.end_offset - page.start_offset, elapsed.as_millis());
+            assert!(
+                elapsed.as_secs() < 10,
+                "partial tail exceeded bounded-load budget: {elapsed:?}"
+            );
+            assert!(!page.page_complete);
+            assert!(!page.cache_hit, "partial pages must be retried, not cached");
+            assert!(
+                !page.index_hit,
+                "partial scan offsets must not become authoritative boundaries"
+            );
+            assert_eq!(page.scan_bytes, super::CODEX_HISTORY_FIRST_PAGE_MAX_BYTES);
+            assert!(page.end_offset - page.start_offset < 1024);
+            assert!(page.detail.turns.iter().flat_map(|turn| &turn.blocks).any(|block| matches!(block, ContentBlock::Text { text } if text == "latest final remains visible")));
+        }
+        let metadata = fs::metadata(&path).unwrap();
+        let mut indexes = HISTORY_INDEX_CACHE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let index = indexes
+            .entry(path.clone())
+            .or_insert_with(|| super::load_history_index(&path, &metadata));
+        assert!(
+            index.meta.pages.is_empty(),
+            "incomplete boundaries are never persisted"
+        );
+        drop(indexes);
+        remove_history_index_fixture(&path);
+    }
+
+    #[test]
+    fn history_index_resumes_at_the_append_boundary_and_survives_restart() {
+        let dir = tempfile::tempdir().expect("temp sessions dir");
+        let conversation_id = "incremental-index";
+        let path = dir
+            .path()
+            .join(format!("rollout-2026-08-06-{conversation_id}.jsonl"));
+        let first = [
+            rollout_line(
+                "2026-08-06T00:00:00Z",
+                "session_meta",
+                serde_json::json!({"id": conversation_id, "cwd": "/tmp/index"}),
+            ),
+            rollout_line(
+                "2026-08-06T00:00:01Z",
+                "event_msg",
+                serde_json::json!({"type":"user_message","message":"first"}),
+            ),
+            rollout_line(
+                "2026-08-06T00:00:02Z",
+                "event_msg",
+                serde_json::json!({"type":"agent_message","message":"answer"}),
+            ),
+        ]
+        .join("\n")
+            + "\n";
+        fs::write(&path, first).expect("write initial rollout");
+        let original_len = fs::metadata(&path).unwrap().len();
+        let (complete, indexed, total, entries) =
+            build_history_index_slice(&path, 64 * 1024).expect("build initial index");
+        assert!(complete);
+        assert_eq!(indexed, original_len);
+        assert_eq!(total, original_len);
+        assert!(entries >= 2);
+
+        // Simulate a process restart: the next builder must restore the
+        // durable checkpoint rather than scan from byte zero.
+        HISTORY_INDEX_CACHE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&path);
+        let appended = [
+            rollout_line(
+                "2026-08-06T00:00:03Z",
+                "event_msg",
+                serde_json::json!({"type":"user_message","message":"second"}),
+            ),
+            rollout_line(
+                "2026-08-06T00:00:04Z",
+                "event_msg",
+                serde_json::json!({"type":"agent_message","message":"second-answer"}),
+            ),
+        ]
+        .join("\n")
+            + "\n";
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(appended.as_bytes()).unwrap();
+        file.flush().unwrap();
+        let new_len = fs::metadata(&path).unwrap().len();
+        let (complete, indexed, total, new_entries) =
+            build_history_index_slice(&path, 64 * 1024).expect("index appended tail");
+        assert!(complete);
+        assert_eq!(indexed, new_len);
+        assert_eq!(total, new_len);
+        assert!(new_entries > entries);
+        assert_eq!(indexed - original_len, appended.len() as u64);
+
+        remove_history_index_fixture(&path);
+    }
+
+    #[test]
+    fn corrupt_history_index_rebuilds_without_touching_the_rollout() {
+        let dir = tempfile::tempdir().expect("temp sessions dir");
+        let conversation_id = "corrupt-index";
+        let path = dir
+            .path()
+            .join(format!("rollout-2026-08-06-{conversation_id}.jsonl"));
+        let source = [
+            rollout_line(
+                "2026-08-06T00:00:00Z",
+                "session_meta",
+                serde_json::json!({"id": conversation_id, "cwd": "/tmp/index"}),
+            ),
+            rollout_line(
+                "2026-08-06T00:00:01Z",
+                "event_msg",
+                serde_json::json!({"type":"user_message","message":"keep me"}),
+            ),
+            rollout_line(
+                "2026-08-06T00:00:02Z",
+                "event_msg",
+                serde_json::json!({"type":"agent_message","message":"kept"}),
+            ),
+        ]
+        .join("\n")
+            + "\n";
+        fs::write(&path, &source).expect("write rollout");
+        build_history_index_slice(&path, 64 * 1024).expect("build index");
+        let original_digest = Sha256::digest(fs::read(&path).unwrap());
+        let original_len = fs::metadata(&path).unwrap().len();
+        let meta_path = history_index_path(&path).expect("cache path");
+        fs::write(&meta_path, b"{not-json").expect("corrupt sidecar");
+        HISTORY_INDEX_CACHE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&path);
+
+        build_history_index_slice(&path, 64 * 1024).expect("rebuild corrupt index");
+        assert_eq!(fs::metadata(&path).unwrap().len(), original_len);
+        assert_eq!(Sha256::digest(fs::read(&path).unwrap()), original_digest);
+        let parser = CodexParser::with_base_dir(dir.path().to_path_buf());
+        let page = parser
+            .get_conversation_page(conversation_id, None, 1, Some("/tmp/index".into()))
+            .expect("read rebuilt page");
+        assert_eq!(user_texts(&page.detail), vec!["keep me"]);
+        assert!(page.index_hit);
+
+        remove_history_index_fixture(&path);
+    }
+
+    #[test]
+    fn cancelled_history_read_stops_before_parsing_the_page() {
+        let dir = tempfile::tempdir().expect("temp sessions dir");
+        let conversation_id = "cancelled-page";
+        let path = dir
+            .path()
+            .join(format!("rollout-2026-08-06-{conversation_id}.jsonl"));
+        fs::write(
+            &path,
+            rollout_line(
+                "2026-08-06T00:00:00Z",
+                "event_msg",
+                serde_json::json!({"type":"user_message","message":"never parsed"}),
+            ) + "\n",
+        )
+        .unwrap();
+        let parser = CodexParser::with_base_dir(dir.path().to_path_buf());
+        let cancelled = Arc::new(AtomicBool::new(true));
+        let error = parser
+            .get_conversation_page_cancellable(
+                conversation_id,
+                None,
+                25,
+                Some("/tmp/index".into()),
+                cancelled,
+            )
+            .err()
+            .expect("cancelled read must stop");
+        assert!(error.to_string().contains("cancelled"));
+        remove_history_index_fixture(&path);
     }
 
     fn rollout_line(ts: &str, msg_type: &str, payload: serde_json::Value) -> String {
@@ -11469,7 +14433,10 @@ mod tests {
         lines.extend(announced_reasoning(
             "2026-09-24T07:21:02Z",
             "rs_1",
-            &["**Checking directory usage**", "**Checking repository changes**"],
+            &[
+                "**Checking directory usage**",
+                "**Checking repository changes**",
+            ],
         ));
         lines.extend(announced_reasoning(
             "2026-09-24T07:21:12Z",
@@ -11481,7 +14448,10 @@ mod tests {
         lines.extend(announced_reasoning(
             "2026-09-24T07:21:20Z",
             "rs_4",
-            &["**Reviewing disk usage snapshot**", "**Measuring temporary storage usage**"],
+            &[
+                "**Reviewing disk usage snapshot**",
+                "**Measuring temporary storage usage**",
+            ],
         ));
         // A tool call is visible and ends the run; its own announcement follows.
         lines.extend([
@@ -11638,7 +14608,9 @@ mod tests {
 
         assert_eq!(
             thinking_texts(&detail),
-            vec!["**Assessing execution capabilities**\n\n**Determining the next step**".to_string()]
+            vec![
+                "**Assessing execution capabilities**\n\n**Determining the next step**".to_string()
+            ]
         );
 
         let _ = fs::remove_file(path);
@@ -11783,7 +14755,11 @@ mod tests {
                 serde_json::json!({"agent_b":{"completed":"B_RESULT_TOKEN"}}),
             ),
             narration("2026-06-27T10:00:09Z", "NARRATION_MID B back waiting A"),
-            wait("2026-06-27T10:00:10Z", "wait_2", serde_json::json!(["agent_a"])),
+            wait(
+                "2026-06-27T10:00:10Z",
+                "wait_2",
+                serde_json::json!(["agent_a"]),
+            ),
             wait_out(
                 "2026-06-27T10:00:11Z",
                 "wait_2",
@@ -12177,8 +15153,7 @@ mod tests {
                 _ => None,
             })
             .expect("spawn Agent capsule present");
-        let parsed: serde_json::Value =
-            serde_json::from_str(input).expect("spawn input is JSON");
+        let parsed: serde_json::Value = serde_json::from_str(input).expect("spawn input is JSON");
         assert_eq!(
             parsed.get("agent_id").and_then(|v| v.as_str()),
             Some("AGENT_UUID_X"),
@@ -12277,7 +15252,9 @@ mod tests {
         // 0.147 emits no wait/close capsule, so this card stands for the LAUNCH
         // only and must say so rather than read as "the sub-agent finished".
         assert_eq!(
-            parsed.get(CODEX_SUBAGENT_LAUNCH_KEY).and_then(|v| v.as_bool()),
+            parsed
+                .get(CODEX_SUBAGENT_LAUNCH_KEY)
+                .and_then(|v| v.as_bool()),
             Some(true)
         );
 
@@ -12393,7 +15370,10 @@ mod tests {
         // stream showed vanished on reload and nothing could resolve the
         // child's own rollout.
         let sealed = format!("gAAAAAB{}", "qgWsi0g7gOInVU3UTzqL".repeat(30));
-        let path = write_temp_rollout("nativeteam0153", &native_team_0153_lines("MESSAGE", &sealed));
+        let path = write_temp_rollout(
+            "nativeteam0153",
+            &native_team_0153_lines("MESSAGE", &sealed),
+        );
         let detail = CodexParser::new()
             .parse_conversation_detail(&path, "parent")
             .expect("parse ok");
@@ -12549,7 +15529,10 @@ mod tests {
             })
             .expect("roster renders as a collab capsule, not a generic tool card");
         let parsed: serde_json::Value = serde_json::from_str(input).expect("collab input is JSON");
-        assert_eq!(parsed.get(COLLAB_OP_KEY).and_then(|v| v.as_str()), Some("list"));
+        assert_eq!(
+            parsed.get(COLLAB_OP_KEY).and_then(|v| v.as_str()),
+            Some("list")
+        );
         let states = parsed
             .get("agentsStates")
             .and_then(|v| v.as_object())
@@ -12682,7 +15665,10 @@ mod tests {
             })
             .expect("spawn Agent capsule present");
         let parsed: serde_json::Value = serde_json::from_str(input).expect("JSON");
-        assert_eq!(parsed.get("subagent_type").and_then(|v| v.as_str()), Some("worker"));
+        assert_eq!(
+            parsed.get("subagent_type").and_then(|v| v.as_str()),
+            Some("worker")
+        );
         assert_eq!(parsed.get("prompt").and_then(|v| v.as_str()), Some("do it"));
         assert!(parsed.get(CODEX_SUBAGENT_LAUNCH_KEY).is_none());
 
@@ -12745,7 +15731,10 @@ mod tests {
     fn redaction_leaves_ordinary_arguments_untouched() {
         let mut args = serde_json::json!({"cmd":"pnpm build","timeout_ms":3600000});
         assert!(!redact_encrypted_args(&mut args));
-        assert_eq!(args, serde_json::json!({"cmd":"pnpm build","timeout_ms":3600000}));
+        assert_eq!(
+            args,
+            serde_json::json!({"cmd":"pnpm build","timeout_ms":3600000})
+        );
         // Nested and array positions are reached.
         let sealed = format!("gAAAAAB{}", "0g7gOInVU3UTzqL".repeat(10));
         let mut nested = serde_json::json!({"outer":{"list":[sealed.clone(),"keep me"]}});
@@ -12828,14 +15817,17 @@ mod tests {
             })
             .expect("wait capsule present");
         let parsed: serde_json::Value = serde_json::from_str(input).expect("JSON");
-        assert_eq!(parsed.get(COLLAB_OP_KEY).and_then(|v| v.as_str()), Some("wait"));
-        assert_eq!(parsed.get("status").and_then(|v| v.as_str()), Some("completed"));
+        assert_eq!(
+            parsed.get(COLLAB_OP_KEY).and_then(|v| v.as_str()),
+            Some("wait")
+        );
+        assert_eq!(
+            parsed.get("status").and_then(|v| v.as_str()),
+            Some("completed")
+        );
         // No agents and no prompt — the card renders as a bare pill, exactly
         // what the live `collabAgentToolCall` produces for this output.
-        assert_eq!(
-            parsed.get("agentsStates"),
-            Some(&serde_json::json!({}))
-        );
+        assert_eq!(parsed.get("agentsStates"), Some(&serde_json::json!({})));
         let errored = detail
             .turns
             .iter()
@@ -12849,7 +15841,9 @@ mod tests {
     #[test]
     fn native_team_wait_shape_gate_and_timeout() {
         // `timed_out` is the shape gate: only the native-team output has it.
-        assert!(native_team_wait_input(&serde_json::json!({"message":"Wait completed."})).is_none());
+        assert!(
+            native_team_wait_input(&serde_json::json!({"message":"Wait completed."})).is_none()
+        );
         assert!(native_team_wait_input(&serde_json::json!({})).is_none());
         // A timeout is a real outcome — flag the capsule failed.
         let (input, is_error) =
@@ -12857,7 +15851,10 @@ mod tests {
                 .expect("native shape");
         assert!(is_error);
         let parsed: serde_json::Value = serde_json::from_str(&input).expect("JSON");
-        assert_eq!(parsed.get("status").and_then(|v| v.as_str()), Some("failed"));
+        assert_eq!(
+            parsed.get("status").and_then(|v| v.as_str()),
+            Some("failed")
+        );
     }
 
     #[test]
@@ -13185,12 +16182,9 @@ mod tests {
                 {"type":"input_text","text":"{\"a\":{},\"b\":{}}"},
             ]),
         );
-        for (offset, (id, task_id, task)) in [
-            ("exec-b", "task-b", "B"),
-            ("exec-a", "task-a", "A"),
-        ]
-        .into_iter()
-        .enumerate()
+        for (offset, (id, task_id, task)) in [("exec-b", "task-b", "B"), ("exec-a", "task-a", "A")]
+            .into_iter()
+            .enumerate()
         {
             lines.insert(
                 2 + offset,
@@ -13245,8 +16239,14 @@ mod tests {
                 .map(|(id, output, _)| (id, output))
                 .collect::<Vec<_>>(),
             vec![
-                ("exec-b".into(), Some("Delegation successful. task_id=task-b.".into())),
-                ("exec-a".into(), Some("Delegation successful. task_id=task-a.".into())),
+                (
+                    "exec-b".into(),
+                    Some("Delegation successful. task_id=task-b.".into())
+                ),
+                (
+                    "exec-a".into(),
+                    Some("Delegation successful. task_id=task-a.".into())
+                ),
             ]
         );
     }
@@ -13454,7 +16454,9 @@ mod tests {
 
         let (native_input, native_result) = spawn_capsule(&detail);
         assert_eq!(
-            native_input.get("agent_id").and_then(|value| value.as_str()),
+            native_input
+                .get("agent_id")
+                .and_then(|value| value.as_str()),
             Some("01a07fc2-db62-78b3-9762-9cb2540216c2"),
             "native activity must keep its own child session id"
         );
@@ -13631,7 +16633,8 @@ mod tests {
     /// the script card used to show the run.
     #[test]
     fn a_textless_semantic_result_still_says_something() {
-        let script = "const shot=await tools.mcp__shot_srv__capture({url:target});text(\"captured\");";
+        let script =
+            "const shot=await tools.mcp__shot_srv__capture({url:target});text(\"captured\");";
         let mut lines = code_mode_rollout(
             script,
             serde_json::json!([
@@ -13718,7 +16721,11 @@ mod tests {
             }
             let detail = parse_lines(
                 &lines,
-                if item { "mixed-with-item" } else { "mixed-baseline" },
+                if item {
+                    "mixed-with-item"
+                } else {
+                    "mixed-baseline"
+                },
             );
             (tool_uses(&detail), tool_results(&detail))
         };
@@ -13804,7 +16811,10 @@ mod tests {
             buf: Vec::new(),
             budget: 8,
         };
-        assert!(sink.write_all(&[b'x'; 5]).is_ok(), "room for the first write");
+        assert!(
+            sink.write_all(&[b'x'; 5]).is_ok(),
+            "room for the first write"
+        );
         assert!(
             sink.write_all(&[b'x'; 100]).is_err(),
             "a write past the budget must fail so serialization aborts"
@@ -13821,7 +16831,10 @@ mod tests {
     #[test]
     fn a_budgeted_preview_reads_exactly_like_an_unbounded_one() {
         for (name, value) in [
-            ("a small object", serde_json::json!({"a": 1, "b": [true, null]})),
+            (
+                "a small object",
+                serde_json::json!({"a": 1, "b": [true, null]}),
+            ),
             ("empty", serde_json::json!({})),
             ("exactly the cap", serde_json::json!("x".repeat(3998))),
             ("one past the cap", serde_json::json!("x".repeat(3999))),
@@ -15197,11 +18210,11 @@ mod tests {
         let detail = parse_lines(&lines, "deferred-semantic-mcp");
         assert_eq!(
             tool_uses(&detail),
-            vec![ (
+            vec![(
                 "mcp-deferred-status".into(),
                 "mcp__codeg_mcp__get_delegation_status".into(),
                 Some(r#"{"task_ids":["t1"],"wait_ms":60000}"#.into()),
-            ) ],
+            )],
             "the completed semantic item replaces the parked script card"
         );
         assert_eq!(
@@ -15469,20 +18482,35 @@ mod tests {
     fn a_labelled_fanout_splits_a_collapsed_blob_per_command() {
         let detail = code_mode_detail(
             &labelled_fanout(&["query-entry", "formula-service", "factor-full"]),
-            labelled_blob(6, &[
-                ("query-entry", "one"),
-                ("formula-service", "two"),
-                ("factor-full", "three"),
-            ]),
+            labelled_blob(
+                6,
+                &[
+                    ("query-entry", "one"),
+                    ("formula-service", "two"),
+                    ("factor-full", "three"),
+                ],
+            ),
             "code-mode-labelled",
         );
 
         assert_eq!(
             tool_uses(&detail),
             vec![
-                ("call_1#0".into(), "exec_command".into(), Some("echo 0".into())),
-                ("call_1#1".into(), "exec_command".into(), Some("echo 1".into())),
-                ("call_1#2".into(), "exec_command".into(), Some("echo 2".into())),
+                (
+                    "call_1#0".into(),
+                    "exec_command".into(),
+                    Some("echo 0".into())
+                ),
+                (
+                    "call_1#1".into(),
+                    "exec_command".into(),
+                    Some("echo 1".into())
+                ),
+                (
+                    "call_1#2".into(),
+                    "exec_command".into(),
+                    Some("echo 2".into())
+                ),
             ]
         );
         assert_eq!(
@@ -15506,12 +18534,21 @@ mod tests {
     #[test]
     fn a_truncated_separator_leaves_its_command_without_output() {
         let detail = code_mode_detail(
-            &labelled_fanout(&["query-entry", "formula-service", "vo", "formula-splice", "factor-full"]),
-            labelled_blob(20, &[
-                ("query-entry", "first"),
-                ("formula-service", "second\nvo-output\nsplice-output"),
-                ("factor-full", "last"),
+            &labelled_fanout(&[
+                "query-entry",
+                "formula-service",
+                "vo",
+                "formula-splice",
+                "factor-full",
             ]),
+            labelled_blob(
+                20,
+                &[
+                    ("query-entry", "first"),
+                    ("formula-service", "second\nvo-output\nsplice-output"),
+                    ("factor-full", "last"),
+                ],
+            ),
             "code-mode-labelled-partial",
         );
 
@@ -15519,7 +18556,11 @@ mod tests {
             tool_results(&detail),
             vec![
                 ("call_1#0".into(), Some("first".into()), false),
-                ("call_1#1".into(), Some("second\nvo-output\nsplice-output".into()), false),
+                (
+                    "call_1#1".into(),
+                    Some("second\nvo-output\nsplice-output".into()),
+                    false
+                ),
                 ("call_1#2".into(), None, false),
                 ("call_1#3".into(), None, false),
                 ("call_1#4".into(), Some("last".into()), false),
@@ -15527,7 +18568,10 @@ mod tests {
         );
 
         let metas = tool_metas(&detail);
-        assert_eq!(metas[1]["sharedWith"], serde_json::json!(["vo", "formula-splice"]));
+        assert_eq!(
+            metas[1]["sharedWith"],
+            serde_json::json!(["vo", "formula-splice"])
+        );
         assert_eq!(metas[2]["outputMissing"], true);
         assert_eq!(metas[3]["outputMissing"], true);
         assert!(metas[0].get("sharedWith").is_none());
@@ -15541,10 +18585,7 @@ mod tests {
     fn a_repeated_separator_line_keeps_the_script_card() {
         let detail = code_mode_detail(
             &labelled_fanout(&["alpha", "beta"]),
-            labelled_blob(8, &[
-                ("alpha", "one\n===== beta ====="),
-                ("beta", "two"),
-            ]),
+            labelled_blob(8, &[("alpha", "one\n===== beta ====="), ("beta", "two")]),
             "code-mode-labelled-dup",
         );
 
@@ -15560,11 +18601,14 @@ mod tests {
     fn a_repeated_output_line_still_splits() {
         let detail = code_mode_detail(
             &labelled_fanout(&["alpha", "beta", "gamma"]),
-            labelled_blob(8, &[
-                ("alpha", "shared line\none"),
-                ("beta", "shared line\ntwo"),
-                ("gamma", "three"),
-            ]),
+            labelled_blob(
+                8,
+                &[
+                    ("alpha", "shared line\none"),
+                    ("beta", "shared line\ntwo"),
+                    ("gamma", "three"),
+                ],
+            ),
             "code-mode-labelled-repeat",
         );
 
@@ -15649,7 +18693,9 @@ mod tests {
     /// want. Tool-only turns come back with `None`. The role is stringified
     /// because `TurnRole` is not `PartialEq` and a production model should not
     /// grow a derive to serve a test.
-    fn turn_texts(detail: &crate::models::ConversationDetail) -> Vec<(&'static str, Option<String>)> {
+    fn turn_texts(
+        detail: &crate::models::ConversationDetail,
+    ) -> Vec<(&'static str, Option<String>)> {
         detail
             .turns
             .iter()
@@ -16059,22 +19105,58 @@ mod tests {
     #[test]
     fn a_compaction_draws_the_live_divider_and_opens_onto_its_handoff() {
         let content = jsonl(&[
-            record("2026-09-29T00:00:00Z", "session_meta", serde_json::json!({"id": "cmp-2", "cwd": "/tmp/demo", "cli_version": "0.156.1"})),
-            record("2026-09-29T00:00:01Z", "event_msg", serde_json::json!({"type": "task_started", "turn_id": "t1"})),
-            record("2026-09-29T00:00:02Z", "response_item", serde_json::json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "look at /private/tmp"}]})),
+            record(
+                "2026-09-29T00:00:00Z",
+                "session_meta",
+                serde_json::json!({"id": "cmp-2", "cwd": "/tmp/demo", "cli_version": "0.156.1"}),
+            ),
+            record(
+                "2026-09-29T00:00:01Z",
+                "event_msg",
+                serde_json::json!({"type": "task_started", "turn_id": "t1"}),
+            ),
+            record(
+                "2026-09-29T00:00:02Z",
+                "response_item",
+                serde_json::json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "look at /private/tmp"}]}),
+            ),
             assistant_item("2026-09-29T00:00:03Z", "It holds 40 stale folders."),
             token_count("2026-09-29T00:00:04Z", 1000, 100),
-            record("2026-09-29T00:00:05Z", "event_msg", serde_json::json!({"type": "task_complete", "turn_id": "t1"})),
-            record("2026-09-29T00:01:00Z", "event_msg", serde_json::json!({"type": "task_started", "turn_id": "t2"})),
+            record(
+                "2026-09-29T00:00:05Z",
+                "event_msg",
+                serde_json::json!({"type": "task_complete", "turn_id": "t1"}),
+            ),
+            record(
+                "2026-09-29T00:01:00Z",
+                "event_msg",
+                serde_json::json!({"type": "task_started", "turn_id": "t2"}),
+            ),
             token_count("2026-09-29T00:01:01Z", 1000, 100),
             assistant_item("2026-09-29T00:01:40Z", HANDOFF),
-            record("2026-09-29T00:01:40.100Z", "token_usage_record", serde_json::json!({"thread_id": "cmp-2", "turn_id": "t2"})),
+            record(
+                "2026-09-29T00:01:40.100Z",
+                "token_usage_record",
+                serde_json::json!({"thread_id": "cmp-2", "turn_id": "t2"}),
+            ),
             token_count("2026-09-29T00:01:40.200Z", 2400, 180),
             compacted("2026-09-29T00:01:40.300Z", HANDOFF),
-            record("2026-09-29T00:01:40.400Z", "event_msg", serde_json::json!({"type": "thread_settings_applied"})),
+            record(
+                "2026-09-29T00:01:40.400Z",
+                "event_msg",
+                serde_json::json!({"type": "thread_settings_applied"}),
+            ),
             token_count("2026-09-29T00:01:40.500Z", 2400, 180),
-            record("2026-09-29T00:01:40.600Z", "event_msg", serde_json::json!({"type": "item_completed", "turn_id": "t2", "item": {"type": "ContextCompaction", "id": "01a0eaed-d00a-7480"}})),
-            record("2026-09-29T00:01:41Z", "event_msg", serde_json::json!({"type": "task_complete", "turn_id": "t2"})),
+            record(
+                "2026-09-29T00:01:40.600Z",
+                "event_msg",
+                serde_json::json!({"type": "item_completed", "turn_id": "t2", "item": {"type": "ContextCompaction", "id": "01a0eaed-d00a-7480"}}),
+            ),
+            record(
+                "2026-09-29T00:01:41Z",
+                "event_msg",
+                serde_json::json!({"type": "task_complete", "turn_id": "t2"}),
+            ),
         ]);
         let detail = parse_rollout("compaction-handoff", &content, "cmp-2");
 
@@ -16097,7 +19179,10 @@ mod tests {
         assert_eq!(turn_usage_total(&detail), 2580);
         // The sidebar entry counts what the conversation renders: the prompt
         // and the reply, not the handoff.
-        assert_eq!(summary_of("compaction-handoff-sum", &content).message_count, 2);
+        assert_eq!(
+            summary_of("compaction-handoff-sum", &content).message_count,
+            2
+        );
     }
 
     /// An automatic compaction mid-turn. The compaction's own model call thinks
@@ -16108,29 +19193,93 @@ mod tests {
     #[test]
     fn a_mid_turn_compaction_keeps_its_own_thinking_out_of_the_reply() {
         let content = jsonl(&[
-            record("2026-09-29T00:00:00Z", "session_meta", serde_json::json!({"id": "cmp-3", "cwd": "/tmp/demo", "cli_version": "0.153.4"})),
-            record("2026-09-29T00:00:01Z", "event_msg", serde_json::json!({"type": "task_started", "turn_id": "t1"})),
-            record("2026-09-29T00:00:02Z", "response_item", serde_json::json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "fix the race"}]})),
-            record("2026-09-29T00:00:03Z", "event_msg", serde_json::json!({"type": "item_completed", "item": {"type": "Reasoning", "id": "rs_1", "summary_text": ["**Looking at the lock**"]}})),
-            record("2026-09-29T00:00:03.100Z", "response_item", serde_json::json!({"type": "reasoning", "id": "rs_1", "summary": [{"type": "summary_text", "text": "**Looking at the lock**"}]})),
-            record("2026-09-29T00:00:04Z", "response_item", serde_json::json!({"type": "function_call", "name": "shell", "call_id": "c1", "arguments": "{\"command\":[\"rg\",\"lock\"]}"})),
-            record("2026-09-29T00:00:05Z", "response_item", serde_json::json!({"type": "function_call_output", "call_id": "c1", "output": "src/lock.rs:1"})),
-            record("2026-09-29T00:00:05.100Z", "token_usage_record", serde_json::json!({"turn_id": "t1"})),
+            record(
+                "2026-09-29T00:00:00Z",
+                "session_meta",
+                serde_json::json!({"id": "cmp-3", "cwd": "/tmp/demo", "cli_version": "0.153.4"}),
+            ),
+            record(
+                "2026-09-29T00:00:01Z",
+                "event_msg",
+                serde_json::json!({"type": "task_started", "turn_id": "t1"}),
+            ),
+            record(
+                "2026-09-29T00:00:02Z",
+                "response_item",
+                serde_json::json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "fix the race"}]}),
+            ),
+            record(
+                "2026-09-29T00:00:03Z",
+                "event_msg",
+                serde_json::json!({"type": "item_completed", "item": {"type": "Reasoning", "id": "rs_1", "summary_text": ["**Looking at the lock**"]}}),
+            ),
+            record(
+                "2026-09-29T00:00:03.100Z",
+                "response_item",
+                serde_json::json!({"type": "reasoning", "id": "rs_1", "summary": [{"type": "summary_text", "text": "**Looking at the lock**"}]}),
+            ),
+            record(
+                "2026-09-29T00:00:04Z",
+                "response_item",
+                serde_json::json!({"type": "function_call", "name": "shell", "call_id": "c1", "arguments": "{\"command\":[\"rg\",\"lock\"]}"}),
+            ),
+            record(
+                "2026-09-29T00:00:05Z",
+                "response_item",
+                serde_json::json!({"type": "function_call_output", "call_id": "c1", "output": "src/lock.rs:1"}),
+            ),
+            record(
+                "2026-09-29T00:00:05.100Z",
+                "token_usage_record",
+                serde_json::json!({"turn_id": "t1"}),
+            ),
             token_count("2026-09-29T00:00:05.200Z", 1000, 100),
             // The compaction's model call: its thinking, then its handoff.
-            record("2026-09-29T00:00:30Z", "response_item", serde_json::json!({"type": "reasoning", "id": "rs_c", "summary": [{"type": "summary_text", "text": "**Preparing concise handoff summary**"}]})),
+            record(
+                "2026-09-29T00:00:30Z",
+                "response_item",
+                serde_json::json!({"type": "reasoning", "id": "rs_c", "summary": [{"type": "summary_text", "text": "**Preparing concise handoff summary**"}]}),
+            ),
             assistant_item("2026-09-29T00:00:40Z", HANDOFF),
-            record("2026-09-29T00:00:40.100Z", "token_usage_record", serde_json::json!({"turn_id": "t1"})),
+            record(
+                "2026-09-29T00:00:40.100Z",
+                "token_usage_record",
+                serde_json::json!({"turn_id": "t1"}),
+            ),
             token_count("2026-09-29T00:00:40.200Z", 2400, 180),
             compacted("2026-09-29T00:00:40.300Z", HANDOFF),
-            record("2026-09-29T00:00:40.400Z", "world_state", serde_json::json!({"full": true})),
-            record("2026-09-29T00:00:40.500Z", "turn_context", serde_json::json!({"turn_id": "t1", "model": "gpt-6"})),
-            record("2026-09-29T00:00:40.700Z", "event_msg", serde_json::json!({"type": "item_completed", "item": {"type": "ContextCompaction", "id": "cmp-item"}})),
-            record("2026-09-29T00:00:50Z", "event_msg", serde_json::json!({"type": "item_completed", "item": {"type": "Reasoning", "id": "rs_2", "summary_text": ["**Resuming the fix**"]}})),
-            record("2026-09-29T00:00:50.100Z", "response_item", serde_json::json!({"type": "reasoning", "id": "rs_2", "summary": [{"type": "summary_text", "text": "**Resuming the fix**"}]})),
+            record(
+                "2026-09-29T00:00:40.400Z",
+                "world_state",
+                serde_json::json!({"full": true}),
+            ),
+            record(
+                "2026-09-29T00:00:40.500Z",
+                "turn_context",
+                serde_json::json!({"turn_id": "t1", "model": "gpt-6"}),
+            ),
+            record(
+                "2026-09-29T00:00:40.700Z",
+                "event_msg",
+                serde_json::json!({"type": "item_completed", "item": {"type": "ContextCompaction", "id": "cmp-item"}}),
+            ),
+            record(
+                "2026-09-29T00:00:50Z",
+                "event_msg",
+                serde_json::json!({"type": "item_completed", "item": {"type": "Reasoning", "id": "rs_2", "summary_text": ["**Resuming the fix**"]}}),
+            ),
+            record(
+                "2026-09-29T00:00:50.100Z",
+                "response_item",
+                serde_json::json!({"type": "reasoning", "id": "rs_2", "summary": [{"type": "summary_text", "text": "**Resuming the fix**"}]}),
+            ),
             assistant_item("2026-09-29T00:01:00Z", "Fixed the race."),
             token_count("2026-09-29T00:01:00.100Z", 3500, 260),
-            record("2026-09-29T00:01:01Z", "event_msg", serde_json::json!({"type": "task_complete", "turn_id": "t1"})),
+            record(
+                "2026-09-29T00:01:01Z",
+                "event_msg",
+                serde_json::json!({"type": "task_complete", "turn_id": "t1"}),
+            ),
         ]);
         let detail = parse_rollout("compaction-midturn", &content, "cmp-3");
 
@@ -16166,8 +19315,13 @@ mod tests {
             .blocks
             .iter()
             .any(|block| matches!(block, ContentBlock::ToolUse { tool_use_id: Some(id), .. } if id == "c1"))));
-        assert_eq!(texts.last(), Some(&("assistant", Some("Fixed the race.".into()))));
-        assert!(!texts.iter().any(|(_, text)| text.as_deref() == Some(HANDOFF)));
+        assert_eq!(
+            texts.last(),
+            Some(&("assistant", Some("Fixed the race.".into())))
+        );
+        assert!(!texts
+            .iter()
+            .any(|(_, text)| text.as_deref() == Some(HANDOFF)));
         // The thinking card that went away had the compaction's round billed
         // to it; that spend stays in the conversation, on the reply before.
         assert_eq!(turn_usage_total(&detail), 3760);
@@ -16176,7 +19330,10 @@ mod tests {
             .filter_map(|turn| turn.usage.as_ref())
             .map(|usage| usage.input_tokens + usage.output_tokens)
             .sum();
-        assert_eq!(before_divider, 2580, "both rounds before the divider stay there");
+        assert_eq!(
+            before_divider, 2580,
+            "both rounds before the divider stay there"
+        );
     }
 
     /// Codex before ~0.137 wrote no handoff record at all: the summary exists
@@ -16185,14 +19342,42 @@ mod tests {
     #[test]
     fn an_older_compaction_opens_onto_the_summary_its_record_restates() {
         let content = jsonl(&[
-            record("2026-05-31T10:00:00Z", "session_meta", serde_json::json!({"id": "cmp-4", "cwd": "/tmp/demo", "cli_version": "0.133.0"})),
-            record("2026-05-31T10:00:01Z", "event_msg", serde_json::json!({"type": "user_message", "message": "run the tests"})),
-            record("2026-05-31T10:00:02Z", "event_msg", serde_json::json!({"type": "agent_message", "message": "Running them."})),
-            record("2026-05-31T10:00:03Z", "response_item", serde_json::json!({"type": "function_call", "name": "shell", "call_id": "c1", "arguments": "{\"command\":[\"make\",\"test\"]}"})),
-            record("2026-05-31T10:00:04Z", "response_item", serde_json::json!({"type": "function_call_output", "call_id": "c1", "output": "ok"})),
+            record(
+                "2026-05-31T10:00:00Z",
+                "session_meta",
+                serde_json::json!({"id": "cmp-4", "cwd": "/tmp/demo", "cli_version": "0.133.0"}),
+            ),
+            record(
+                "2026-05-31T10:00:01Z",
+                "event_msg",
+                serde_json::json!({"type": "user_message", "message": "run the tests"}),
+            ),
+            record(
+                "2026-05-31T10:00:02Z",
+                "event_msg",
+                serde_json::json!({"type": "agent_message", "message": "Running them."}),
+            ),
+            record(
+                "2026-05-31T10:00:03Z",
+                "response_item",
+                serde_json::json!({"type": "function_call", "name": "shell", "call_id": "c1", "arguments": "{\"command\":[\"make\",\"test\"]}"}),
+            ),
+            record(
+                "2026-05-31T10:00:04Z",
+                "response_item",
+                serde_json::json!({"type": "function_call_output", "call_id": "c1", "output": "ok"}),
+            ),
             compacted("2026-05-31T10:00:05Z", HANDOFF),
-            record("2026-05-31T10:00:06Z", "event_msg", serde_json::json!({"type": "context_compacted"})),
-            record("2026-05-31T10:00:07Z", "event_msg", serde_json::json!({"type": "agent_message", "message": "All green."})),
+            record(
+                "2026-05-31T10:00:06Z",
+                "event_msg",
+                serde_json::json!({"type": "context_compacted"}),
+            ),
+            record(
+                "2026-05-31T10:00:07Z",
+                "event_msg",
+                serde_json::json!({"type": "agent_message", "message": "All green."}),
+            ),
         ]);
         let detail = parse_rollout("compaction-legacy", &content, "cmp-4");
 
@@ -16202,7 +19387,10 @@ mod tests {
         );
         let texts = turn_texts(&detail);
         assert_eq!(texts.first(), Some(&("user", Some("run the tests".into()))));
-        assert_eq!(texts.last(), Some(&("assistant", Some("All green.".into()))));
+        assert_eq!(
+            texts.last(),
+            Some(&("assistant", Some("All green.".into())))
+        );
     }
 
     /// The text fallback only looks at what was written since the previous
@@ -16212,14 +19400,34 @@ mod tests {
     fn the_text_fallback_never_reaches_past_the_previous_compaction() {
         let call = |ts: &str, id: &str| {
             [
-                record(ts, "response_item", serde_json::json!({"type": "function_call", "name": "shell", "call_id": id, "arguments": "{\"command\":[\"ls\"]}"})),
-                record(ts, "response_item", serde_json::json!({"type": "function_call_output", "call_id": id, "output": "ok"})),
+                record(
+                    ts,
+                    "response_item",
+                    serde_json::json!({"type": "function_call", "name": "shell", "call_id": id, "arguments": "{\"command\":[\"ls\"]}"}),
+                ),
+                record(
+                    ts,
+                    "response_item",
+                    serde_json::json!({"type": "function_call_output", "call_id": id, "output": "ok"}),
+                ),
             ]
         };
         let mut records = vec![
-            record("2026-09-29T00:00:00Z", "session_meta", serde_json::json!({"id": "cmp-6", "cwd": "/tmp/demo"})),
-            record("2026-09-29T00:00:01Z", "event_msg", serde_json::json!({"type": "task_started", "turn_id": "t1"})),
-            record("2026-09-29T00:00:02Z", "response_item", serde_json::json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "q1"}]})),
+            record(
+                "2026-09-29T00:00:00Z",
+                "session_meta",
+                serde_json::json!({"id": "cmp-6", "cwd": "/tmp/demo"}),
+            ),
+            record(
+                "2026-09-29T00:00:01Z",
+                "event_msg",
+                serde_json::json!({"type": "task_started", "turn_id": "t1"}),
+            ),
+            record(
+                "2026-09-29T00:00:02Z",
+                "response_item",
+                serde_json::json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "q1"}]}),
+            ),
             // A real reply that happens to read exactly like a later summary.
             assistant_item("2026-09-29T00:00:03Z", HANDOFF),
         ];
@@ -16263,14 +19471,38 @@ mod tests {
     #[test]
     fn the_handoff_is_recognized_by_its_text_when_adjacency_breaks() {
         let content = jsonl(&[
-            record("2026-09-29T00:00:00Z", "session_meta", serde_json::json!({"id": "cmp-5", "cwd": "/tmp/demo"})),
-            record("2026-09-29T00:00:01Z", "event_msg", serde_json::json!({"type": "task_started", "turn_id": "t1"})),
-            record("2026-09-29T00:00:02Z", "response_item", serde_json::json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]})),
+            record(
+                "2026-09-29T00:00:00Z",
+                "session_meta",
+                serde_json::json!({"id": "cmp-5", "cwd": "/tmp/demo"}),
+            ),
+            record(
+                "2026-09-29T00:00:01Z",
+                "event_msg",
+                serde_json::json!({"type": "task_started", "turn_id": "t1"}),
+            ),
+            record(
+                "2026-09-29T00:00:02Z",
+                "response_item",
+                serde_json::json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}),
+            ),
             assistant_item("2026-09-29T00:00:03Z", "Hello."),
-            record("2026-09-29T00:00:04Z", "event_msg", serde_json::json!({"type": "task_complete", "turn_id": "t1"})),
-            record("2026-09-29T00:01:00Z", "event_msg", serde_json::json!({"type": "task_started", "turn_id": "t2"})),
+            record(
+                "2026-09-29T00:00:04Z",
+                "event_msg",
+                serde_json::json!({"type": "task_complete", "turn_id": "t1"}),
+            ),
+            record(
+                "2026-09-29T00:01:00Z",
+                "event_msg",
+                serde_json::json!({"type": "task_started", "turn_id": "t2"}),
+            ),
             assistant_item("2026-09-29T00:01:40Z", HANDOFF),
-            record("2026-09-29T00:01:40.100Z", "some_future_accounting", serde_json::json!({"turn_id": "t2"})),
+            record(
+                "2026-09-29T00:01:40.100Z",
+                "some_future_accounting",
+                serde_json::json!({"turn_id": "t2"}),
+            ),
             compacted("2026-09-29T00:01:40.300Z", HANDOFF),
         ]);
         let detail = parse_rollout("compaction-text", &content, "cmp-5");
@@ -16418,7 +19650,8 @@ mod tests {
         // ("如果你希望调整…" is codex's habit). Rendering the announcement and
         // dropping the record would silently lose that prose, so the record
         // takes the announcement's message over rather than adding a second.
-        let record = "<proposed_plan>\n# Plan\n\n- step one\n</proposed_plan>\n\n如果你希望调整，告诉我。";
+        let record =
+            "<proposed_plan>\n# Plan\n\n- step one\n</proposed_plan>\n\n如果你希望调整，告诉我。";
         let content = plan_turn(true, Some(record));
         let detail = parse_rollout("plan-prose", &content, "plan-1");
 

@@ -1389,6 +1389,11 @@ mod tests {
             user_turns_before_offset: None,
             prefix_hash: None,
             uncovered_prefix_max_ts: None,
+            artifact_runs: Vec::new(),
+            deliverables: Vec::new(),
+            deliverable_runs: Vec::new(),
+            history_page: None,
+            branch_history: None,
         }
     }
 

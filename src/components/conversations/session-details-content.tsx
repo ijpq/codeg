@@ -317,7 +317,7 @@ export function SessionDetailsContent({
     // fill in token usage.
     const id = summaryProp.id
     let cancelled = false
-    getFolderConversation(id)
+    getFolderConversation(id, { userTurnLimit: 1 })
       .then((detail) => {
         if (!cancelled)
           setFetchResult({
