@@ -606,6 +606,8 @@ pub struct SessionState {
     /// drives nothing, so clearing it must not abort a turn the user started
     /// themselves.
     pub goal_active: bool,
+    /// Latest authoritative adapter snapshot; null means no goal.
+    pub goal: serde_json::Value,
 
     /// `None` means NOT YET KNOWN — the initialize response hasn't been
     /// applied. That state is real and observable: `spawn_agent` returns (and
@@ -843,6 +845,7 @@ impl SessionState {
             goal_control_method: crate::acp::codex_goal::LEGACY_GOAL_CONTROL_METHOD.to_string(),
             goal_actions: None,
             goal_active: false,
+            goal: serde_json::Value::Null,
             session_failures: BTreeMap::new(),
             async_tasks: BTreeMap::new(),
             async_task_activity_at: None,

@@ -3245,6 +3245,31 @@
       "diffDescriptionConflict": "{path} · 磁碟與未儲存內容"
     },
     "chat": {
+      "execution": {
+        "label": "執行方式",
+        "direct": "直接執行",
+        "plan": "先規劃",
+        "goal": "目標執行",
+        "switchHint": "切換到直接執行或先規劃會先暫停活動目標。重新選擇目標執行不會自動繼續，需點擊繼續。結束將清除原生目標並停止其工作。",
+        "unsupported": "目標執行需要轉接器宣告支援建立、暫停、繼續和清除。請先連線或更新 Codex ACP。",
+        "stateUnavailable": "無法讀取目前目標，執行方式未切換。",
+        "objective": "填寫目標",
+        "status": "狀態",
+        "tokens": "已用 tokens",
+        "start": "開始目標",
+        "pause": "暫停",
+        "resume": "繼續",
+        "end": "結束目標",
+        "statuses": {
+          "active": "進行中",
+          "paused": "已暫停",
+          "blocked": "受阻",
+          "complete": "已完成",
+          "limited": "已達上限",
+          "budgetLimited": "預算受限",
+          "usageLimited": "用量受限"
+        }
+      },
       "acpConnections": {
         "actions": {
           "openAgentsSettings": "打開 Agents 管理",
