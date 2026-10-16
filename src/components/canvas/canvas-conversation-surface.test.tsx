@@ -292,6 +292,34 @@ describe("a draft card whose connection still belongs to the previous agent", ()
     expect(api.acpGoalControl).not.toHaveBeenCalled()
   })
 
+  it("keeps native execution available on a restored co-controlling connection", async () => {
+    lifecycle.conn = {
+      ...connection("codex", "connected"),
+      isViewer: true,
+    }
+    render(
+      <CanvasConversationSurface
+        contextKey="restored-goal"
+        conversationId={42}
+        agentType="codex"
+        isActive
+      />
+    )
+    expect(shell.goal?.readOnly).toBe(false)
+    expect(shell.goal?.onGoalControl).toBeInstanceOf(Function)
+    await act(async () => {
+      await shell.goal!.startGoal!("ship verified changes")
+    })
+    expect(api.acpGoalControl).toHaveBeenCalledWith(
+      "codex-conn",
+      "set",
+      "ship verified changes",
+      42
+    )
+    expect(api.createConversation).not.toHaveBeenCalled()
+    expect(lifecycle.handleSend).not.toHaveBeenCalled()
+  })
+
   it("binds a first Goal to durable history before handing off the draft, without a prompt", async () => {
     api.createConversation.mockResolvedValue(42)
     lifecycle.conn = connection("codex", "connected")

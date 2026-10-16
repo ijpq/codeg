@@ -304,7 +304,7 @@ describe("GoalCard goal control (codex-acp #293)", () => {
   })
 
   it("hides controls when the session isn't live (no provider callback)", () => {
-    // Reload / viewer / sub-agent dialog → onGoalControl null → no buttons even
+    // Offline history / read-only sub-agent dialog → no buttons even
     // for an active goal.
     renderGoal(goalWith("active"), null)
     fireEvent.click(screen.getByRole("button"))

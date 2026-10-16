@@ -9,7 +9,8 @@
   and end controls. Leaving an active Goal awaits a confirmed pause and stops
   its current work; selecting Goal alone never starts or resumes it.
 - Bind a draft's first Goal to durable conversation history before native
-  work starts, and isolate read-only child transcripts from parent controls.
+  work starts. Keep restored/shared sessions controllable and isolate
+  read-only child transcripts from parent controls.
 - Share the transcript scroll target, prevent virtual row compensation from
   falsely escaping the follow lock, and terminate unreachable-sentinel retries.
   Preserve virtualization, delayed-content following and deliberate reader escape.
