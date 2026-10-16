@@ -183,3 +183,22 @@ it("does not restart background polling when an inactive surface's pending read 
   expect(acpGetGoalState).toHaveBeenCalledTimes(1)
   view.unmount()
 })
+
+it("keeps an observed active goal visible and disables switching when status reads fail", async () => {
+  state.goal = { objective: "keep this visible", status: "active" }
+  mount()
+  await open()
+  vi.mocked(acpGetGoalState).mockRejectedValue(new Error("offline"))
+  await waitFor(
+    () =>
+      expect(
+        screen.getByText(messages.Folder.chat.execution.stateUnavailable)
+      ).toBeInTheDocument(),
+    { timeout: 2500 }
+  )
+  expect(
+    screen.getByRole("button", { name: "Execution: Execute goal" })
+  ).toBeInTheDocument()
+  expect(screen.getByRole("radio", { name: "Plan first" })).toBeDisabled()
+  expect(screen.getByText("keep this visible")).toBeInTheDocument()
+})

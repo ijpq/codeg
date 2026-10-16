@@ -24042,14 +24042,23 @@ model = "gpt"
 }
 
 /// Small read-only projection: goal polling must not clone the transcript.
-pub async fn acp_get_goal_state_core(manager: &ConnectionManager, connection_id: &str) -> Result<serde_json::Value, AcpError> {
-    let state = manager.get_state(connection_id).await.ok_or_else(|| AcpError::ConnectionNotFound(connection_id.into()))?;
+pub async fn acp_get_goal_state_core(
+    manager: &ConnectionManager,
+    connection_id: &str,
+) -> Result<serde_json::Value, AcpError> {
+    let state = manager
+        .get_state(connection_id)
+        .await
+        .ok_or_else(|| AcpError::ConnectionNotFound(connection_id.into()))?;
     let state = state.read().await;
     Ok(serde_json::json!({ "goal": state.goal, "actions": state.goal_actions }))
 }
 
 #[cfg(feature = "tauri-runtime")]
 #[tauri::command]
-pub async fn acp_get_goal_state(connection_id: String, manager: State<'_, ConnectionManager>) -> Result<serde_json::Value, AcpError> {
+pub async fn acp_get_goal_state(
+    connection_id: String,
+    manager: State<'_, ConnectionManager>,
+) -> Result<serde_json::Value, AcpError> {
     acp_get_goal_state_core(&manager, &connection_id).await
 }
