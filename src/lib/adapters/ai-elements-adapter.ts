@@ -2158,7 +2158,7 @@ export function isTurnAnswerPart(part: AdaptedContentPart): boolean {
 }
 
 /**
- * Split a reply (or a settled unfinished goal run's body) at its last process
+ * Split a reply (or a settled goal run's body) at its last process
  * part: everything after it is the answer, in order. Answer parts BEFORE a
  * process part stay in `body` — prose followed by more work is a mid-run note,
  * not a wrap-up, and lifting it would reorder the reply.
@@ -2216,10 +2216,10 @@ export function groupGoalRuns(
     // Keep the live answer inside the running card (it opens while in flight).
     // Once the turn settles, lift the trailing answer so a collapsed chip on
     // reload does not hide it.
-    // Only lift when the run never closed. A completed update_goal already
-    // leaves later prose as siblings; mid-run notes stay in that card.
-    const shouldLiftTrailing = !isRunning && end === null
-    if (!shouldLiftTrailing) {
+    // Native pause/completion snapshots can close the run AFTER its answer.
+    // That status marker must not hide prose which was visible while live.
+    // Notes followed by actual work still stay inside the card.
+    if (isRunning) {
       result.push({
         type: "goal-run",
         start,
@@ -2233,7 +2233,7 @@ export function groupGoalRuns(
     result.push({
       type: "goal-run",
       start,
-      end: null,
+      end,
       items: body,
       isRunning: false,
     })
