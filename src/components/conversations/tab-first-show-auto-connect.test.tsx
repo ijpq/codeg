@@ -38,6 +38,7 @@ import {
 vi.mock("@/lib/api", () => ({
   getFolderConversation: vi.fn(),
   getFolderConversationTurns: vi.fn(),
+  invalidateFolderConversationCache: vi.fn(),
 }))
 
 // Stable across renders: the lifecycle hook's unmount-cleanup effect depends
@@ -286,7 +287,7 @@ describe("TabViewGate mirrors ConversationTabView", () => {
       "const [heldDetail, setHeldDetail] = useState(false)"
     )
     expect(panel).toMatch(
-      /useConversationDetail\(effectiveConversationId, \{\s+enabled: isVisible \|\| isActive \|\| heldDetail,\s+\}\)/
+      /useConversationDetail\(effectiveConversationId, \{\s+enabled: shouldLoadDetail \|\| isActive \|\| heldDetail,/
     )
     expect(panel).toContain(
       "if (detail != null && !heldDetail) setHeldDetail(true)"
@@ -296,7 +297,7 @@ describe("TabViewGate mirrors ConversationTabView", () => {
 
   it("holds the auto-connect on detailLoading", () => {
     expect(panel).toMatch(
-      /const awaitingHistoricalSessionId =\s+hasPersistedConversation && selectedAgent !== "cline" && detailLoading/
+      /const awaitingHistoricalSessionId = shouldAwaitHistoricalSessionDetail\(\{\s+usesPersistedDetailIdentity,\s+agentType: selectedAgent,\s+detailLoaded: detail != null,\s+detailLoading,\s+detailError,/
     )
     expect(panel).toContain("!awaitingHistoricalSessionId &&")
     expect(panel).toContain("isActive: isActive && canAutoConnect,")

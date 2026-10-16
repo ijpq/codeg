@@ -7,6 +7,13 @@ use sea_orm::{
 use crate::db::entities::chat_channel;
 use crate::db::error::DbError;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefaultConversationBinding {
+    pub folder_id: Option<i32>,
+    pub agent_type: Option<String>,
+    pub conversation_id: i32,
+}
+
 pub async fn create(
     conn: &DatabaseConnection,
     name: String,
@@ -81,6 +88,48 @@ pub async fn get_by_id(
     id: i32,
 ) -> Result<Option<chat_channel::Model>, DbError> {
     Ok(chat_channel::Entity::find_by_id(id).one(conn).await?)
+}
+
+/// Read the optional durable default route from a channel's existing JSON
+/// configuration. Keeping this in `config_json` makes the change backwards
+/// compatible with every existing database; no schema migration is needed.
+pub async fn get_default_conversation_binding(
+    conn: &DatabaseConnection,
+    channel_id: i32,
+) -> Result<Option<DefaultConversationBinding>, DbError> {
+    let Some(channel) = get_by_id(conn, channel_id).await? else {
+        return Ok(None);
+    };
+    // Defaults are currently a Weixin channel feature. In particular, do not
+    // alter Telegram's general-topic/forum-topic routing semantics.
+    if channel.channel_type != "weixin" {
+        return Ok(None);
+    }
+    let value: serde_json::Value = serde_json::from_str(&channel.config_json)
+        .map_err(|e| DbError::Migration(format!("invalid chat channel config: {e}")))?;
+    let Some(conversation_id) = value
+        .get("default_conversation_id")
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|id| i32::try_from(id).ok())
+        .filter(|id| *id > 0)
+    else {
+        return Ok(None);
+    };
+    let folder_id = value
+        .get("default_folder_id")
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|id| i32::try_from(id).ok())
+        .filter(|id| *id > 0);
+    let agent_type = value
+        .get("default_agent_type")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .filter(|value| !value.trim().is_empty());
+    Ok(Some(DefaultConversationBinding {
+        folder_id,
+        agent_type,
+        conversation_id,
+    }))
 }
 
 pub async fn list_all(conn: &DatabaseConnection) -> Result<Vec<chat_channel::Model>, DbError> {

@@ -37,6 +37,15 @@ import {
 import { ConnectionBlockingPrompts } from "@/components/chat/connection-blocking-prompts"
 import { blockingPrompts } from "@/lib/blocking-prompts"
 import type { AgentType } from "@/lib/types"
+import {
+  CONVERSATION_ARTIFACTS_CHANGED_EVENT,
+  CONVERSATION_DELIVERABLES_CHANGED_EVENT,
+  type ConversationArtifactsChanged,
+  type ConversationDeliverablesChanged,
+  type PlanApprovalAnswer,
+  type QuestionAnswer,
+} from "@/lib/types"
+import { subscribe } from "@/lib/platform"
 
 export function useConnectionStateById(
   connectionId: string | null
@@ -247,9 +256,39 @@ export function LiveTranscriptView({
     refetchDetail(conversationId, { preserveLive: true })
   }, [conversationId, refetchDetail])
 
-  // Reader only — its built-in auto-fetch is disabled; the effect above is
-  // the sole fetch path.
-  const { loading, error, acpLoadError } = useConversationDetail(
+  // Final outputs may be published before the reply settles. Keep the shared
+  // viewer current without replacing its bridged live turn with a lagging DB
+  // transcript.
+  useEffect(() => {
+    let disposed = false
+    const unlistens: (() => void)[] = []
+    const installSubscription = <T extends { conversation_id: number }>(
+      event: string
+    ) => {
+      void subscribe<T>(event, (change) => {
+        if (change.conversation_id === conversationId) {
+          refetchDetail(conversationId, { preserveLive: true })
+        }
+      }).then((dispose) => {
+        if (disposed) dispose()
+        else unlistens.push(dispose)
+      })
+    }
+    installSubscription<ConversationDeliverablesChanged>(
+      CONVERSATION_DELIVERABLES_CHANGED_EVENT
+    )
+    installSubscription<ConversationArtifactsChanged>(
+      CONVERSATION_ARTIFACTS_CHANGED_EVENT
+    )
+    return () => {
+      disposed = true
+      unlistens.forEach((dispose) => dispose())
+    }
+  }, [conversationId, refetchDetail])
+
+  // Reader only — its built-in auto-fetch is disabled; the effects above own
+  // fetch timing.
+  const { detail, loading, error, acpLoadError } = useConversationDetail(
     conversationId,
     { enabled: false }
   )
@@ -309,6 +348,7 @@ export function LiveTranscriptView({
           acpLoadError={acpLoadError}
           hideEmptyState={false}
           userTurnHeader={userTurnHeader}
+          deliverableRuns={detail?.deliverable_runs}
         />
       </div>
     </div>

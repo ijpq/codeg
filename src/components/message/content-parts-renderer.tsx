@@ -1,4 +1,5 @@
-import { memo, useMemo, useState, type ReactNode } from "react"
+import { memo, useCallback, useMemo, useState, type ReactNode } from "react"
+import { getDeferredHistoryContent } from "@/lib/api"
 import type { AdaptedContentPart } from "@/lib/adapters/ai-elements-adapter"
 import type { MessageRole, PlanEntryInfo } from "@/lib/types"
 import {
@@ -31,6 +32,11 @@ import { JsonTreeView } from "@/components/ai-elements/json-tree"
 import { UnifiedDiffPreview } from "@/components/diff/unified-diff-preview"
 import { generateUnifiedDiff } from "@/lib/unified-diff-generator"
 import { FilePathLink } from "@/components/ai-elements/link-safety"
+import {
+  extractCitationSources,
+  renderCitationMarkdown,
+  type CitationSource,
+} from "@/lib/citations"
 import {
   Reasoning,
   ReasoningTrigger,
@@ -2263,12 +2269,14 @@ const TextPart = memo(function TextPart({
   text,
   isUser = false,
   isStreaming = false,
+  citationSources = [],
 }: {
   text: string
   // User messages render as plain text + inline reference badges (no Markdown),
   // matching the plain-text composer. Assistant / system text keeps full Markdown.
   isUser?: boolean
   isStreaming?: boolean
+  citationSources?: readonly CitationSource[]
 }) {
   if (isUser) {
     return (
@@ -2277,7 +2285,12 @@ const TextPart = memo(function TextPart({
       </div>
     )
   }
-  return <AssistantText text={text} isStreaming={isStreaming} />
+  return (
+    <AssistantText
+      text={renderCitationMarkdown(text, citationSources)}
+      isStreaming={isStreaming}
+    />
+  )
 })
 
 /**
@@ -2360,6 +2373,48 @@ function MarkdownText({
   )
 }
 
+const DeferredTextPart = memo(function DeferredTextPart({
+  part,
+  citationSources,
+}: {
+  part: Extract<AdaptedContentPart, { type: "deferred-text" }>
+  citationSources: readonly CitationSource[]
+}) {
+  const t = useTranslations("Folder.chat.contentParts")
+  const [content, setContent] = useState(part.text)
+  const [loading, setLoading] = useState(false)
+  const [loaded, setLoaded] = useState(false)
+  const load = useCallback(() => {
+    if (loading || loaded) return
+    setLoading(true)
+    void getDeferredHistoryContent(part.deferredRef)
+      .then((result) => {
+        setContent(result.content)
+        setLoaded(true)
+      })
+      .catch(() => undefined)
+      .finally(() => setLoading(false))
+  }, [loaded, loading, part.deferredRef])
+
+  return (
+    <div className="space-y-2">
+      <TextPart text={content} citationSources={citationSources} />
+      {!loaded && (
+        <button
+          type="button"
+          className="text-xs text-muted-foreground underline-offset-4 hover:underline disabled:opacity-50"
+          disabled={loading}
+          onClick={load}
+        >
+          {loading
+            ? t("loadingBranchMergeSummary")
+            : t("loadBranchMergeSummary")}
+        </button>
+      )}
+    </div>
+  )
+})
+
 const ToolCallPart = memo(function ToolCallPart({
   part,
 }: {
@@ -2367,6 +2422,44 @@ const ToolCallPart = memo(function ToolCallPart({
 }) {
   const t = useTranslations("Folder.chat.contentParts")
   const [manualOpen, setManualOpen] = useState(false)
+  const [deferredOutput, setDeferredOutput] = useState<string | null>(null)
+  const [deferredOutputLoading, setDeferredOutputLoading] = useState(false)
+  const historyOutputMeta = useMemo(() => {
+    const value = part.meta?.["codeg.historyOutput"]
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null
+    const reference = (value as Record<string, unknown>).ref
+    return typeof reference === "string" && reference.length > 0
+      ? { reference }
+      : null
+  }, [part.meta])
+  const output = deferredOutput ?? part.output
+  const errorText =
+    deferredOutput != null && part.errorText != null
+      ? deferredOutput
+      : part.errorText
+  const handleOpenChange = useCallback(
+    (open: boolean) => {
+      setManualOpen(open)
+      if (
+        !open ||
+        !historyOutputMeta ||
+        deferredOutput != null ||
+        deferredOutputLoading
+      ) {
+        return
+      }
+      setDeferredOutputLoading(true)
+      void getDeferredHistoryContent(historyOutputMeta.reference)
+        .then((result) => setDeferredOutput(result.content))
+        // Keep the verified preview usable if the transcript changed or the
+        // exact range is temporarily unavailable. The endpoint reports the
+        // diagnostic server-side; an expansion must not create an unhandled
+        // rejection that can destabilize the message renderer.
+        .catch(() => undefined)
+        .finally(() => setDeferredOutputLoading(false))
+    },
+    [deferredOutput, deferredOutputLoading, historyOutputMeta]
+  )
   const normalizedToolName = useMemo(
     () => normalizeToolName(part.toolName),
     [part.toolName]
@@ -2392,10 +2485,8 @@ const ToolCallPart = memo(function ToolCallPart({
   // notice; the actual run surfaces later in a <BackgroundTaskCard>.
   const backgroundLaunch = useMemo(
     () =>
-      isCommandTool
-        ? parseBackgroundLaunch(part.output ?? part.errorText ?? null)
-        : null,
-    [isCommandTool, part.output, part.errorText]
+      isCommandTool ? parseBackgroundLaunch(output ?? errorText ?? null) : null,
+    [isCommandTool, output, errorText]
   )
   // The same statement, told a different way. codex-acp doesn't put a launch
   // notice in the output — it never completes the call at all — and says so on
@@ -2451,7 +2542,7 @@ const ToolCallPart = memo(function ToolCallPart({
       deriveToolTitle(
         normalizedToolName,
         part.input,
-        part.output ?? part.errorText ?? null
+        output ?? errorText ?? null
       ) ??
       sanitizeLiveTitle(part.displayTitle) ??
       null
@@ -2464,8 +2555,8 @@ const ToolCallPart = memo(function ToolCallPart({
     normalizedToolName,
     part.meta,
     part.input,
-    part.output,
-    part.errorText,
+    output,
+    errorText,
     part.displayTitle,
     t,
   ])
@@ -2478,9 +2569,9 @@ const ToolCallPart = memo(function ToolCallPart({
     // Keep error text as last fallback because permission wrappers can include
     // verbose envelopes that inflate +/- counts before approval.
     const prioritizedCandidates = [
-      part.output ?? null,
+      output ?? null,
       part.input,
-      part.errorText ?? null,
+      errorText ?? null,
     ]
     for (const candidate of prioritizedCandidates) {
       const stats = extractEditLineChangeStats(candidate)
@@ -2488,9 +2579,9 @@ const ToolCallPart = memo(function ToolCallPart({
       return stats
     }
     return null
-  }, [toolNameLower, part.input, part.output, part.errorText])
+  }, [toolNameLower, part.input, output, errorText])
   const wallTime = useMemo(() => {
-    const source = part.output ?? part.errorText
+    const source = output ?? errorText
     if (!source) return null
     const normalized = commandOutputFromJsonString(source) ?? source
     const match = normalized.match(/^wall time\s*:\s*(.+)/im)
@@ -2505,7 +2596,7 @@ const ToolCallPart = memo(function ToolCallPart({
     if (sec < 1) return `${Math.round(sec * 1000)}ms`
     if (sec < 60) return `${sec.toFixed(1)}s`
     return `${(sec / 60).toFixed(1)}m`
-  }, [part.output, part.errorText])
+  }, [output, errorText])
   // The background shell this command left running, when its own script echoed
   // the id (see `extractAnnouncedSessionId`). One session is polled by any
   // number of later `wait` cards, and the ones this echo comes with are exactly
@@ -2515,9 +2606,9 @@ const ToolCallPart = memo(function ToolCallPart({
   const announcedSessionId = useMemo(
     () =>
       toolNameLower === "exec_command"
-        ? extractAnnouncedSessionId(part.output ?? part.errorText)
+        ? extractAnnouncedSessionId(output ?? errorText)
         : null,
-    [toolNameLower, part.output, part.errorText]
+    [toolNameLower, output, errorText]
   )
   // One command out of a code-mode script: the row label it was written under,
   // and whether truncation cost this card its output (see `parseCodexScriptMeta`).
@@ -2614,29 +2705,23 @@ const ToolCallPart = memo(function ToolCallPart({
     if (!isCommandTool || isShellSessionTool) return null
     return (
       extractDisplayCommandFromToolInput(part.input) ??
-      extractDisplayCommandFromToolInput(part.output) ??
-      extractDisplayCommandFromToolInput(part.errorText)
+      extractDisplayCommandFromToolInput(output) ??
+      extractDisplayCommandFromToolInput(errorText)
     )
-  }, [
-    isCommandTool,
-    isShellSessionTool,
-    part.input,
-    part.output,
-    part.errorText,
-  ])
+  }, [isCommandTool, isShellSessionTool, part.input, output, errorText])
   const commandOutput = useMemo(() => {
     if (!isCommandLikeTool) return null
     const source =
-      typeof part.output === "string"
-        ? part.output
-        : typeof part.errorText === "string"
-          ? part.errorText
+      typeof output === "string"
+        ? output
+        : typeof errorText === "string"
+          ? errorText
           : null
     if (!source) return null
     const normalized = commandOutputFromJsonString(source) ?? source
     const envelope = parseCliExecutionEnvelope(normalized)
     return stripMarkdownCodeFence(envelope.output)
-  }, [isCommandLikeTool, part.output, part.errorText])
+  }, [isCommandLikeTool, output, errorText])
   const hasLiveOutput =
     isRunning && isCommandTool && typeof commandOutput === "string"
   const liveOutput = useMemo(() => {
@@ -2687,9 +2772,9 @@ const ToolCallPart = memo(function ToolCallPart({
       return isCodexGrepNoMatchEnvelope(part.errorText) ? "" : null
     }
 
-    if (typeof part.output !== "string") return null
-    return parseCodexCommandEnvelope(part.output)?.output ?? part.output
-  }, [isSearchTool, toolNameLower, part.output, part.errorText])
+    if (typeof output !== "string") return null
+    return parseCodexCommandEnvelope(output)?.output ?? output
+  }, [isSearchTool, toolNameLower, output, part.errorText])
   const searchQuery = useMemo(() => {
     if (!isSearchTool || !part.input) return null
     const pattern = tryParseJson(part.input)?.pattern
@@ -2736,7 +2821,35 @@ const ToolCallPart = memo(function ToolCallPart({
       toolNameLower === "exitplanmode" ||
       toolNameLower === "plan_review" ||
       isFileTool) &&
-    !part.errorText
+    !errorText
+  // A large historical result is deliberately represented by a compact,
+  // authenticated preview. Use one uniform expandable shell for that case so
+  // every tool kind — including normally-specialized cards — retains a route
+  // to its complete output without eagerly downloading it into the first
+  // page.
+  if (historyOutputMeta) {
+    return (
+      <Tool open={manualOpen} onOpenChange={handleOpenChange}>
+        <ToolHeader
+          type="dynamic-tool"
+          state={part.state}
+          toolName={title ?? normalizedToolName}
+        />
+        <ToolContent>
+          {part.input && (
+            <StructuredToolInput
+              toolName={normalizedToolName}
+              input={part.input}
+              output={output}
+            />
+          )}
+          {(output || errorText) && (
+            <ToolOutput output={output} errorText={errorText} />
+          )}
+        </ToolContent>
+      </Tool>
+    )
+  }
   // codex-acp #288: the context-compaction lifecycle is a `tool_call` tagged
   // with `_meta.contextCompaction` (not addressed by tool name) → a subtle
   // status card instead of the generic tool shell.
@@ -2777,7 +2890,7 @@ const ToolCallPart = memo(function ToolCallPart({
     return (
       <CollabAgentCard
         input={part.input ?? null}
-        errorText={part.errorText ?? null}
+        errorText={errorText ?? null}
         state={part.state}
       />
     )
@@ -2797,8 +2910,8 @@ const ToolCallPart = memo(function ToolCallPart({
       <DelegatedSubThread
         parentToolUseId={part.toolCallId}
         input={part.input ?? null}
-        output={part.output ?? null}
-        errorText={part.errorText ?? null}
+        output={output ?? null}
+        errorText={errorText ?? null}
         state={part.state}
         meta={part.meta ?? null}
       />
@@ -2814,8 +2927,8 @@ const ToolCallPart = memo(function ToolCallPart({
       <DelegationStatusCard
         kind="status"
         input={part.input ?? null}
-        output={part.output ?? null}
-        errorText={part.errorText ?? null}
+        output={output ?? null}
+        errorText={errorText ?? null}
         state={part.state}
       />
     )
@@ -2825,8 +2938,8 @@ const ToolCallPart = memo(function ToolCallPart({
       <DelegationStatusCard
         kind="cancel"
         input={part.input ?? null}
-        output={part.output ?? null}
-        errorText={part.errorText ?? null}
+        output={output ?? null}
+        errorText={errorText ?? null}
         state={part.state}
       />
     )
@@ -2840,8 +2953,8 @@ const ToolCallPart = memo(function ToolCallPart({
     return (
       <AskQuestionResultCard
         input={part.input ?? null}
-        output={part.output ?? null}
-        errorText={part.errorText ?? null}
+        output={output ?? null}
+        errorText={errorText ?? null}
         state={part.state}
       />
     )
@@ -2854,8 +2967,8 @@ const ToolCallPart = memo(function ToolCallPart({
   if (toolNameLower === "check_user_feedback") {
     return (
       <FeedbackCheckResultCard
-        output={part.output ?? null}
-        errorText={part.errorText ?? null}
+        output={output ?? null}
+        errorText={errorText ?? null}
         state={part.state}
       />
     )
@@ -2900,8 +3013,8 @@ const ToolCallPart = memo(function ToolCallPart({
       <CodegMcpToolCard
         tool={toolNameLower}
         input={part.input ?? null}
-        output={part.output ?? null}
-        errorText={part.errorText ?? null}
+        output={output ?? null}
+        errorText={errorText ?? null}
         state={part.state}
       />
     )
@@ -2915,7 +3028,7 @@ const ToolCallPart = memo(function ToolCallPart({
     const taskProgress =
       (parsedCompletion?.task_progress as string | undefined)?.trim() ?? null
     return (
-      <Tool open onOpenChange={setManualOpen}>
+      <Tool open onOpenChange={handleOpenChange}>
         <ToolHeader
           type="dynamic-tool"
           state={part.state}
@@ -2959,8 +3072,8 @@ const ToolCallPart = memo(function ToolCallPart({
       <PlanModeCard
         toolName={toolNameLower}
         input={part.input ?? null}
-        output={part.output ?? null}
-        errorText={part.errorText ?? null}
+        output={output ?? null}
+        errorText={errorText ?? null}
         state={part.state}
       />
     )
@@ -2969,7 +3082,7 @@ const ToolCallPart = memo(function ToolCallPart({
   const open = (isRunning && (isCommandTool || hasLiveOutput)) || manualOpen
 
   return (
-    <Tool open={open} onOpenChange={setManualOpen}>
+    <Tool open={open} onOpenChange={handleOpenChange}>
       <ToolHeader
         type="dynamic-tool"
         state={part.state}
@@ -2983,7 +3096,7 @@ const ToolCallPart = memo(function ToolCallPart({
           <StructuredToolInput
             toolName={normalizedToolName}
             input={part.input}
-            output={part.output}
+            output={output}
           />
         )}
         {/*
@@ -3005,9 +3118,9 @@ const ToolCallPart = memo(function ToolCallPart({
             {t("codexScript.outputMissing")}
           </div>
         )}
-        {toolNameLower === "task" && part.output ? (
+        {toolNameLower === "task" && output ? (
           <div className="text-sm prose prose-sm dark:prose-invert max-w-none [&_ul]:list-inside [&_ol]:list-inside">
-            <MessageResponse>{part.output}</MessageResponse>
+            <MessageResponse>{output}</MessageResponse>
           </div>
         ) : (
           <>
@@ -3033,8 +3146,8 @@ const ToolCallPart = memo(function ToolCallPart({
               </div>
             ) : (
               !shouldHideDuplicateResult &&
-              (part.output || part.errorText) && (
-                <ToolOutput output={part.output} errorText={part.errorText} />
+              (output || errorText) && (
+                <ToolOutput output={output} errorText={errorText} />
               )
             )}
           </>
@@ -3069,12 +3182,37 @@ const ReasoningPart = memo(function ReasoningPart({
 }: {
   part: Extract<AdaptedContentPart, { type: "reasoning" }>
 }) {
-  const hasContent = part.content.trim().length > 0
+  const [deferredContent, setDeferredContent] = useState<string | null>(null)
+  const [deferredLoading, setDeferredLoading] = useState(false)
+  const content = deferredContent ?? part.content
+  const handleOpenChange = useCallback(
+    (open: boolean) => {
+      if (
+        !open ||
+        !part.deferredRef ||
+        deferredContent != null ||
+        deferredLoading
+      ) {
+        return
+      }
+      setDeferredLoading(true)
+      void getDeferredHistoryContent(part.deferredRef)
+        .then((result) => setDeferredContent(result.content))
+        .catch(() => undefined)
+        .finally(() => setDeferredLoading(false))
+    },
+    [deferredContent, deferredLoading, part.deferredRef]
+  )
+  const hasContent = content.trim().length > 0
   const expandable = hasContent || part.isStreaming
   return (
-    <Reasoning isStreaming={part.isStreaming} expandable={expandable}>
+    <Reasoning
+      isStreaming={part.isStreaming}
+      expandable={expandable}
+      onOpenChange={handleOpenChange}
+    >
       <ReasoningTrigger />
-      {expandable && <ReasoningContent>{part.content}</ReasoningContent>}
+      {expandable && <ReasoningContent>{content}</ReasoningContent>}
     </Reasoning>
   )
 })
@@ -3122,6 +3260,7 @@ export const ContentPartsRenderer = memo(function ContentPartsRenderer({
   role,
   isStreaming = false,
 }: ContentPartsRendererProps) {
+  const citationSources = useMemo(() => extractCitationSources(parts), [parts])
   const renderPart = (part: AdaptedContentPart, keyId: string): ReactNode => {
     if (part.type === "text") {
       // An empty text part renders nothing but still earns a `space-y-4` gap
@@ -3136,6 +3275,17 @@ export const ContentPartsRenderer = memo(function ContentPartsRenderer({
           text={part.text}
           isUser={role === "user"}
           isStreaming={isStreaming}
+          citationSources={citationSources}
+        />
+      )
+    }
+
+    if (part.type === "deferred-text") {
+      return (
+        <DeferredTextPart
+          key={`deferred-text-${keyId}`}
+          part={part}
+          citationSources={citationSources}
         />
       )
     }

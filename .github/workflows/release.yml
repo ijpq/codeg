@@ -4,10 +4,17 @@ on:
   push:
     tags:
       - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing release tag whose server assets should be rebuilt"
+        required: true
+        type: string
 
 env:
   RUST_BACKTRACE: short
   HUSKY: 0
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
 
 concurrency:
   group: release-${{ github.ref }}
@@ -27,12 +34,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ env.RELEASE_TAG }}
 
       - id: meta
         name: Resolve release channel
         shell: bash
         run: |
-          if [[ "${GITHUB_REF_NAME}" == *"-rc"* ]]; then
+          if [[ "${RELEASE_TAG}" == *"-rc"* ]]; then
             echo "prerelease=true" >> "$GITHUB_OUTPUT"
           else
             echo "prerelease=false" >> "$GITHUB_OUTPUT"
@@ -43,12 +51,14 @@ jobs:
         run: |
           DEFAULT_BRANCH="${{ github.event.repository.default_branch }}"
           git fetch origin "${DEFAULT_BRANCH}"
+          git fetch --force origin \
+            "+refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
 
-          TAG_COMMIT=$(git rev-list -n 1 "${GITHUB_REF_NAME}")
+          TAG_COMMIT=$(git rev-list -n 1 "${RELEASE_TAG}")
           if git merge-base --is-ancestor "${TAG_COMMIT}" "origin/${DEFAULT_BRANCH}"; then
-            echo "Tag ${GITHUB_REF_NAME} is based on ${DEFAULT_BRANCH}"
+            echo "Tag ${RELEASE_TAG} is based on ${DEFAULT_BRANCH}"
           else
-            echo "Tag ${GITHUB_REF_NAME} is not based on ${DEFAULT_BRANCH}"
+            echo "Tag ${RELEASE_TAG} is not based on ${DEFAULT_BRANCH}"
             exit 1
           fi
 
@@ -61,8 +71,8 @@ jobs:
         shell: bash
         run: |
           APP_VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
-          if [[ "v$APP_VERSION" != "${GITHUB_REF_NAME}" ]]; then
-            echo "Tag ${GITHUB_REF_NAME} does not match app version v$APP_VERSION"
+          if [[ "v$APP_VERSION" != "${RELEASE_TAG}" ]]; then
+            echo "Tag ${RELEASE_TAG} does not match app version v$APP_VERSION"
             exit 1
           fi
 
@@ -71,11 +81,14 @@ jobs:
         uses: actions/github-script@v7
         env:
           PRERELEASE: ${{ steps.meta.outputs.prerelease }}
+          SERVER_ONLY: ${{ github.event_name == 'workflow_dispatch' }}
         with:
           script: |
-            const tag = context.ref.replace("refs/tags/", "");
+            const fs = require("fs");
+            const tag = process.env.RELEASE_TAG;
             const { owner, repo } = context.repo;
             const prerelease = process.env.PRERELEASE === "true";
+            const serverOnly = process.env.SERVER_ONLY === "true";
             const releaseName = `codeg ${tag}`;
             const { data: tagRef } = await github.rest.git.getRef({
               owner,
@@ -105,44 +118,65 @@ jobs:
               ref: commitSha,
             });
 
-            const releaseBody =
-              commit.commit.message?.trim() || "_No commit message._";
+            const releaseNotesPath = `docs/releases/${tag}.md`;
+            let releaseBody = fs.existsSync(releaseNotesPath)
+              ? fs.readFileSync(releaseNotesPath, "utf8").trim()
+              : commit.commit.message?.trim() || "_No commit message._";
+            if (context.payload.repository?.fork) {
+              releaseBody +=
+                "\n\n> [!WARNING]\n" +
+                "> This fork release is built without the upstream signing and " +
+                "notarization credentials. Desktop installers and server archives " +
+                "are unsigned; server archives include SHA-256 checksums. Use " +
+                "manual installation instead of the signed automatic updater.";
+            }
             let release;
 
-            try {
-              const existing = await github.rest.repos.getReleaseByTag({
-                owner,
-                repo,
-                tag,
-              });
-
-              if (!existing.data.draft) {
+            // REST tag lookup only returns published releases. A token with
+            // push access can list drafts, including ones from a prior attempt.
+            const releases = await github.paginate(
+              github.rest.repos.listReleases,
+              { owner, repo, per_page: 100 },
+            );
+            const existing = releases.find(
+              (candidate) => candidate.tag_name === tag,
+            );
+            if (existing) {
+              release = existing;
+              if (!release.draft) {
+                if (!serverOnly) {
+                  core.setFailed(
+                    `Release for tag ${tag} already exists and is not a draft.`,
+                  );
+                  return;
+                }
+                core.info(
+                  `Reusing published release #${release.id} for server asset repair`,
+                );
+              } else {
+                if (
+                  release.prerelease !== prerelease ||
+                  release.name !== releaseName ||
+                  (release.body ?? "").trim() !== releaseBody
+                ) {
+                  const updated = await github.rest.repos.updateRelease({
+                    owner,
+                    repo,
+                    release_id: release.id,
+                    name: releaseName,
+                    prerelease,
+                    body: releaseBody,
+                  });
+                  release = updated.data;
+                }
+                core.info(`Reusing existing draft release #${release.id}`);
+              }
+            } else {
+              if (serverOnly) {
                 core.setFailed(
-                  `Release for tag ${tag} already exists and is not a draft.`,
+                  `Release for tag ${tag} does not exist; server-only mode only repairs an existing release.`,
                 );
                 return;
-              }
-
-              release = existing.data;
-              if (
-                release.prerelease !== prerelease ||
-                release.name !== releaseName ||
-                (release.body ?? "").trim() !== releaseBody
-              ) {
-                const updated = await github.rest.repos.updateRelease({
-                  owner,
-                  repo,
-                  release_id: release.id,
-                  name: releaseName,
-                  prerelease,
-                  body: releaseBody,
-                });
-                release = updated.data;
-              }
-              core.info(`Reusing existing draft release #${release.id}`);
-            } catch (error) {
-              if (error.status !== 404) {
-                throw error;
               }
 
               const created = await github.rest.repos.createRelease({
@@ -161,10 +195,13 @@ jobs:
 
             core.setOutput("release_id", String(release.id));
             core.setOutput("release_url", release.html_url);
-            core.setOutput("release_body", releaseBody);
+            core.setOutput("release_body", release.body ?? releaseBody);
 
   build-tauri:
     needs: create-draft-release
+    # v0.30.7-fix1 is the server-only maintenance release requested by the
+    # operator. Keep the normal desktop matrix for later tags.
+    if: github.event_name == 'push' && github.ref_name != 'v0.30.7-fix1'
     name: Build ${{ matrix.name }}
     permissions:
       contents: write
@@ -172,28 +209,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: "macOS x64"
-            runner: "macos-latest"
-            target: "x86_64-apple-darwin"
-          - name: "macOS arm64"
-            runner: "macos-latest"
-            target: "aarch64-apple-darwin"
-          - name: "Linux x64"
-            runner: "ubuntu-22.04"
-            target: "x86_64-unknown-linux-gnu"
-          - name: "Linux arm64"
-            runner: "ubuntu-22.04"
-            target: "aarch64-unknown-linux-gnu"
           - name: "Windows x64"
             runner: "windows-2022"
             target: "x86_64-pc-windows-msvc"
-          - name: "Windows arm64"
-            runner: "windows-latest"
-            target: "aarch64-pc-windows-msvc"
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ env.RELEASE_TAG }}
           fetch-depth: 0
 
       - name: Setup pnpm
@@ -326,9 +349,8 @@ jobs:
           echo "CODEG_COMPUTER_HELPER_REQUIREMENT=identifier \"app.codeg.computer-helper\" and ${anchor}" >> "$GITHUB_ENV"
           echo "CODEG_COMPUTER_TEAM_ID=${APPLE_TEAM_ID}" >> "$GITHUB_ENV"
 
-      # Build the sidecars — the `codeg-mcp` companion, the
-      # `codeg-computer-helper` computer-use executor and the `codeg-cli`
-      # command-line client — for the matrix target
+      # Build the sidecars — the `codeg-mcp` companion and the
+      # `codeg-computer-helper` computer-use executor — for the matrix target
       # and stage them at `src-tauri/binaries/<bin>-<triple>{.exe}`.
       # `tauri-action` (below) then bundles them via the `bundle.externalBin`
       # entries in `tauri.conf.json` — Tauri installs them next to the main
@@ -351,7 +373,7 @@ jobs:
           case "${{ matrix.target }}" in
             *windows*) ext=".exe" ;;
           esac
-          for bin in codeg-mcp codeg-computer-helper codeg-cli; do
+          for bin in codeg-mcp codeg-computer-helper; do
             file="src-tauri/binaries/${bin}-${{ matrix.target }}${ext}"
             if [ ! -s "$file" ]; then
               echo "FATAL: sidecar $file missing or empty after prepare-sidecars"
@@ -371,7 +393,7 @@ jobs:
           esac
 
       - name: Import Apple Developer ID certificate
-        if: contains(matrix.target, 'apple-darwin')
+        if: contains(matrix.target, 'apple-darwin') && github.event.repository.fork == false
         shell: bash
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -446,7 +468,7 @@ jobs:
           security find-identity -v -p codesigning "$keychain_path"
 
       - name: Resolve Apple Developer ID identity
-        if: contains(matrix.target, 'apple-darwin')
+        if: contains(matrix.target, 'apple-darwin') && github.event.repository.fork == false
         shell: bash
         run: |
           set -euo pipefail
@@ -484,7 +506,7 @@ jobs:
           codesign -dv "$helper_app" 2>&1 | grep -E '^(Identifier|TeamIdentifier)='
 
       - name: Build and upload to draft release (Linux arm64)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        if: matrix.target == 'aarch64-unknown-linux-gnu' && github.event.repository.fork == false
         uses: tauri-apps/tauri-action@v0.6.1
         env:
           # The matrix-target sidecar is already staged and verified above.
@@ -516,7 +538,7 @@ jobs:
           retryAttempts: 2
 
       - name: Build and upload to draft release (Windows)
-        if: contains(matrix.target, 'windows')
+        if: contains(matrix.target, 'windows') && github.event.repository.fork == false
         uses: tauri-apps/tauri-action@v0.6.1
         env:
           # The matrix-target sidecar is already staged and verified above.
@@ -541,7 +563,7 @@ jobs:
           retryAttempts: 2
 
       - name: Build and upload to draft release (Linux x64)
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        if: matrix.target == 'x86_64-unknown-linux-gnu' && github.event.repository.fork == false
         uses: tauri-apps/tauri-action@v0.6.1
         env:
           # The matrix-target sidecar is already staged and verified above.
@@ -563,7 +585,7 @@ jobs:
           retryAttempts: 2
 
       - name: Build, sign, and upload to draft release (macOS)
-        if: contains(matrix.target, 'apple-darwin')
+        if: contains(matrix.target, 'apple-darwin') && github.event.repository.fork == false
         uses: tauri-apps/tauri-action@v0.6.1
         env:
           # The matrix-target sidecar is already staged and verified above.
@@ -597,8 +619,7 @@ jobs:
       #     codeg-computer-helper.app`, and no bare copy of it is in
       #     `Contents/MacOS/`: macOS charges an executable's permissions to the
       #     app bundle it sits in, so a helper there would hold codeg's;
-      #   * codeg, codeg-mcp, codeg-cli and codeg-computer-helper carry NO
-      #     entitlements —
+      #   * codeg, codeg-mcp and codeg-computer-helper carry NO entitlements —
       #     in particular none that let another process load code into them
       #     (library-validation / dyld / get-task-allow exemptions), and codeg
       #     never Apple Events: every agent's shell runs as codeg for TCC.
@@ -606,8 +627,7 @@ jobs:
       #   * codeg satisfies the requirement compiled into the helper, and the
       #     helper the one compiled into codeg — otherwise the two refuse each
       #     other and computer use cannot start;
-      #   * codeg, codeg-mcp and codeg-cli reference no Accessibility /
-      #     event-posting /
+      #   * codeg and codeg-mcp reference no Accessibility / event-posting /
       #     screen-capture API: holding or using those is the helper's job
       #     alone. `AXIsProcessTrusted` is the one allowed read-only query.
       #     codeg alone may also import `CGEventTapCreate`: global-hotkey,
@@ -615,10 +635,9 @@ jobs:
       #     never asks it to — `StopShortcut` names no media key and no webview
       #     is given the shortcut plugin, both held by tests. Nothing else is
       #     let through.
-      #   * the bundle carries no `codeg-server`, and its `codeg-mcp` and
-      #     `codeg-cli` are the sidecars built without the desktop features (no
-      #     WebKit): the copies `tauri build` compiles itself stay out
-      #     (`server-bin` / `mcp-bin` / `cli-bin`).
+      #   * the bundle carries no `codeg-server`, and its `codeg-mcp` is the
+      #     sidecar built without the desktop features (no WebKit): the copies
+      #     `tauri build` compiles itself stay out (`server-bin` / `mcp-bin`).
       - name: Verify computer-use signing and symbols (macOS)
         if: contains(matrix.target, 'apple-darwin')
         shell: bash
@@ -643,13 +662,11 @@ jobs:
             echo "FATAL: codeg-server is in the desktop bundle; its binary target must need server-bin"
             exit 1
           fi
-          for sidecar in codeg-mcp codeg-cli; do
-            if otool -L "$app/Contents/MacOS/$sidecar" | grep -q 'WebKit'; then
-              echo "FATAL: $sidecar links WebKit: tauri build's own copy replaced the sidecar"
-              exit 1
-            fi
-          done
-          for path in "$app/Contents/MacOS/codeg" "$app/Contents/MacOS/codeg-mcp" "$app/Contents/MacOS/codeg-cli" "$helper_app"; do
+          if otool -L "$app/Contents/MacOS/codeg-mcp" | grep -q 'WebKit'; then
+            echo "FATAL: codeg-mcp links WebKit: tauri build's own copy replaced the sidecar"
+            exit 1
+          fi
+          for path in "$app/Contents/MacOS/codeg" "$app/Contents/MacOS/codeg-mcp" "$helper_app"; do
             name="$(basename "$path")"
             if ! codesign -dv "$path" 2>&1 | grep -q 'flags=0x[0-9a-f]*(runtime)'; then
               echo "FATAL: $name is not signed with the hardened runtime"
@@ -664,7 +681,7 @@ jobs:
           codesign --verify --strict -R="${CODEG_COMPUTER_PEER_REQUIREMENT}" "$app/Contents/MacOS/codeg"
           codesign --verify --strict -R="${CODEG_COMPUTER_HELPER_REQUIREMENT}" "$helper_app"
           deny='^_(CGEventPost|CGEventPostToPid|CGEventPostToPSN|CGEventTapCreate|CGEventTapCreateForPid|CGEventTapCreateForPSN|CGWindowListCreateImage|CGWindowListCreateImageFromArray|CGDisplayCreateImage|CGDisplayCreateImageForRect|CGDisplayStreamCreate|CGDisplayStreamCreateWithDispatchQueue|CGRequestScreenCaptureAccess|CGRequestPostEventAccess|AXIsProcessTrustedWithOptions|AXUIElement[A-Za-z]*|AXObserver[A-Za-z]*)$|^_OBJC_CLASS_\$_SC(ShareableContent|Stream|ScreenshotManager|ContentFilter|ContentSharingPicker)$'
-          for bin in codeg codeg-mcp codeg-cli; do
+          for bin in codeg codeg-mcp; do
             hits="$(nm -u "$app/Contents/MacOS/$bin" | grep -E "$deny" || true)"
             if [ "$bin" = codeg ]; then
               hits="$(printf '%s\n' "$hits" | grep -vx '_CGEventTapCreate' || true)"
@@ -676,9 +693,141 @@ jobs:
             fi
           done
           echo "computer-use signing and symbol checks passed"
+      # Forks do not receive upstream repository secrets. Build ordinary
+      # installable bundles, but explicitly disable updater artifacts: those
+      # must never be published without the updater signing key.
+      - name: Build and upload unsigned fork bundle (Linux arm64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu' && github.event.repository.fork == true
+        uses: tauri-apps/tauri-action@v0.6.1
+        env:
+          CODEG_SKIP_SIDECAR: "1"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PKG_CONFIG_ALLOW_CROSS: 1
+          PKG_CONFIG_PATH: /usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig
+          PKG_CONFIG_LIBDIR: /usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig
+          PKG_CONFIG_SYSROOT_DIR: /usr/aarch64-linux-gnu
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_AR: aarch64-linux-gnu-gcc-ar
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -Clinker=aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc-ar
+        with:
+          releaseId: ${{ needs.create-draft-release.outputs.release_id }}
+          tagName: ${{ github.ref_name }}
+          releaseBody: ${{ needs.create-draft-release.outputs.release_body }}
+          releaseDraft: true
+          prerelease: ${{ needs.create-draft-release.outputs.prerelease }}
+          tauriScript: pnpm tauri
+          args: --target ${{ matrix.target }} --bundles deb,rpm --config '{"bundle":{"createUpdaterArtifacts":false}}'
+          includeUpdaterJson: false
+          retryAttempts: 2
+
+      - name: Build and upload unsigned fork bundle (Linux x64)
+        if: matrix.target == 'x86_64-unknown-linux-gnu' && github.event.repository.fork == true
+        uses: tauri-apps/tauri-action@v0.6.1
+        env:
+          CODEG_SKIP_SIDECAR: "1"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          releaseId: ${{ needs.create-draft-release.outputs.release_id }}
+          tagName: ${{ github.ref_name }}
+          releaseBody: ${{ needs.create-draft-release.outputs.release_body }}
+          releaseDraft: true
+          prerelease: ${{ needs.create-draft-release.outputs.prerelease }}
+          tauriScript: pnpm tauri
+          args: --target ${{ matrix.target }} --config '{"bundle":{"createUpdaterArtifacts":false}}'
+          includeUpdaterJson: false
+          retryAttempts: 2
+
+      - name: Build and upload unsigned fork bundle (Windows)
+        if: contains(matrix.target, 'windows') && github.event.repository.fork == true
+        uses: tauri-apps/tauri-action@v0.6.1
+        env:
+          CODEG_SKIP_SIDECAR: "1"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          releaseId: ${{ needs.create-draft-release.outputs.release_id }}
+          tagName: ${{ github.ref_name }}
+          releaseBody: ${{ needs.create-draft-release.outputs.release_body }}
+          releaseDraft: true
+          prerelease: ${{ needs.create-draft-release.outputs.prerelease }}
+          tauriScript: pnpm tauri
+          args: --target ${{ matrix.target }} --bundles nsis --config '{"bundle":{"createUpdaterArtifacts":false}}'
+          includeUpdaterJson: false
+          retryAttempts: 2
+
+      - name: Install and verify Windows fork Setup, then upload checksum
+        if: runner.os == 'Windows' && github.event.repository.fork == true
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = $env:RELEASE_TAG.TrimStart('v')
+          $built = "src-tauri/target/${{ matrix.target }}/release"
+          $setups = @(Get-ChildItem "$built/bundle/nsis/*_x64-setup.exe")
+          if ($setups.Count -ne 1 -or $setups[0].Name -ne "codeg_${version}_x64-setup.exe") { throw 'Unexpected Setup filename or count' }
+          $setup = $setups[0]
+          $dest = Join-Path $env:RUNNER_TEMP 'codeg-setup-verified'
+          $process = Start-Process $setup.FullName -ArgumentList '/S',"/D=$dest" -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Setup installation failed: $($process.ExitCode)" }
+          python -B scripts/verify-setup-binaries.py $built $dest
+          if ($LASTEXITCODE -ne 0) { throw 'Setup binary verification failed' }
+          $info = (Get-Item (Join-Path $dest 'codeg.exe')).VersionInfo
+          $numeric = ($version -split '-')[0]
+          if ($info.ProductVersion -notin @($version, $numeric, "$numeric.0")) { throw 'Setup executable version mismatch' }
+          $mcpVersion = (& (Join-Path $dest 'codeg-mcp.exe') --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $mcpVersion -ne $version) { throw 'Setup MCP version mismatch' }
+          $files = @()
+          foreach ($name in @('codeg.exe','codeg-mcp.exe','codeg-computer-helper.exe')) {
+            $files += @{ path=$name; sha256=(Get-FileHash (Join-Path $dest $name) -Algorithm SHA256).Hash.ToLower() }
+          }
+          $out = (Resolve-Path out).Path
+          foreach ($file in (Get-ChildItem out -Recurse -File)) {
+            $relative = $file.FullName.Substring($out.Length + 1)
+            $installed = Join-Path $dest "web/$relative"
+            $hash = (Get-FileHash $file.FullName -Algorithm SHA256).Hash.ToLower()
+            if (-not (Test-Path $installed -PathType Leaf) -or (Get-FileHash $installed -Algorithm SHA256).Hash.ToLower() -ne $hash) { throw "Setup static resource mismatch: $relative" }
+            $files += @{ path="web/$relative"; sha256=$hash }
+          }
+          if (-not (Test-Path (Join-Path $dest 'web/index.html') -PathType Leaf)) { throw 'Setup web entry missing' }
+          if (Get-ChildItem $dest -Recurse -File | Where-Object { $_.Name -in @('auth.json','tokens.json','config.toml','.env') -or $_.Extension -in @('.db','.sqlite','.sqlite3','.pdb','.key') }) { throw 'Unexpected data/build files in Setup' }
+          New-Item -ItemType Directory -Force setup-evidence | Out-Null
+          @{ version=$version; commit=$env:GITHUB_SHA; files=$files } | ConvertTo-Json -Depth 5 | Set-Content setup-evidence/payload.json
+          $hash = (Get-FileHash $setup.FullName -Algorithm SHA256).Hash.ToLower()
+          "$hash  $($setup.Name)" | Set-Content -Encoding ascii "$($setup.FullName).sha256"
+          gh release upload $env:RELEASE_TAG "$($setup.FullName).sha256" --repo $env:GITHUB_REPOSITORY
+          if ($LASTEXITCODE -ne 0) { throw 'Setup checksum upload failed' }
+
+      - name: Retain Setup verification manifest
+        if: runner.os == 'Windows' && github.event.repository.fork == true
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-windows-setup-evidence
+          path: setup-evidence/payload.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Build and upload unsigned fork bundle (macOS)
+        if: contains(matrix.target, 'apple-darwin') && github.event.repository.fork == true
+        uses: tauri-apps/tauri-action@v0.6.1
+        env:
+          CODEG_SKIP_SIDECAR: "1"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          releaseId: ${{ needs.create-draft-release.outputs.release_id }}
+          tagName: ${{ github.ref_name }}
+          releaseBody: ${{ needs.create-draft-release.outputs.release_body }}
+          releaseDraft: true
+          prerelease: ${{ needs.create-draft-release.outputs.prerelease }}
+          tauriScript: pnpm tauri
+          args: --target ${{ matrix.target }} --bundles dmg --config '{"bundle":{"createUpdaterArtifacts":false}}'
+          includeUpdaterJson: false
+          retryAttempts: 2
 
       - name: Delete Apple signing keychain
-        if: always() && contains(matrix.target, 'apple-darwin')
+        if: always() && contains(matrix.target, 'apple-darwin') && github.event.repository.fork == false
         shell: bash
         run: |
           if [ -n "${APPLE_ORIGINAL_DEFAULT_KEYCHAIN:-}" ]; then
@@ -720,29 +869,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: "Linux x64"
-            runner: "ubuntu-22.04"
-            target: "x86_64-unknown-linux-gnu"
-            artifact: "codeg-server-linux-x64"
-          - name: "Linux arm64"
-            runner: "ubuntu-22.04"
-            target: "aarch64-unknown-linux-gnu"
-            artifact: "codeg-server-linux-arm64"
-          - name: "macOS x64"
-            runner: "macos-latest"
-            target: "x86_64-apple-darwin"
-            artifact: "codeg-server-darwin-x64"
-          - name: "macOS arm64"
-            runner: "macos-latest"
-            target: "aarch64-apple-darwin"
-            artifact: "codeg-server-darwin-arm64"
           - name: "Windows x64"
             runner: "windows-2022"
             target: "x86_64-pc-windows-msvc"
             artifact: "codeg-server-windows-x64"
+            archive: "codeg-server-windows-x64.zip"
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -808,7 +944,46 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm build
 
-      - name: Build server + codeg-mcp companion + computer-use helper + codeg-cli
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Prepare pinned recovery source for the native build cache
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --component clippy
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned Rust toolchain installation failed' }
+          python -B scripts/build-codex-runtime.py --source-dir "$env:RUNNER_TEMP/codeg-codex-source" --output-dir "dist/codex-runtime" --prepare-only
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned runtime source preparation failed' }
+
+      - name: Cache pinned recovery compilation
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        uses: swatinem/rust-cache@v2
+        env:
+          RUST_BACKTRACE: short
+          CARGO_BUILD_JOBS: 2
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_PROFILE_TEST_DEBUG: "0"
+        with:
+          workspaces: "${{ runner.temp }}/codeg-codex-source/codex-rs -> ../../codeg-codex-target"
+          shared-key: codex-recovery-target-v3-${{ matrix.runner }}-${{ hashFiles('vendor/codex-runtime/**', 'scripts/build-codex-runtime.py', '.github/workflows/test.yml') }}
+          cache-workspace-crates: true
+          cache-on-failure: true
+
+      - name: Build pinned Codex recovery runtime
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        env:
+          RUST_BACKTRACE: short
+          CARGO_BUILD_JOBS: 2
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_PROFILE_TEST_DEBUG: "0"
+          CARGO_TARGET_DIR: ${{ runner.temp }}/codeg-codex-target
+        run: |
+          python -B scripts/build-codex-runtime.py --source-dir "$env:RUNNER_TEMP/codeg-codex-source" --output-dir "dist/codex-runtime"
+
+      - name: Build server + codeg-mcp companion + computer-use helper
         working-directory: src-tauri
         # `codeg-mcp` is the stdio MCP companion the runtime injects per
         # session (see acp/delegation/companion.rs). Built with the same
@@ -818,13 +993,10 @@ jobs:
         # `codeg-computer-helper` serves computer use, which the server
         # offers only when started with CODEG_COMPUTER_USE=1 in a desktop
         # session; it ships beside the server, where the server looks for it.
-        # `codeg-cli` is the command-line client (`codeg-cli run …`), for CI
-        # jobs and scripts on the server's machine or reaching it with --url.
         run: |
           cargo build --release --bin codeg-server --no-default-features --features server-bin --target ${{ matrix.target }}
           cargo build --release --bin codeg-mcp --no-default-features --features mcp-bin --target ${{ matrix.target }}
           cargo build --release --bin codeg-computer-helper --no-default-features --features computer-helper --target ${{ matrix.target }}
-          cargo build --release --bin codeg-cli --no-default-features --features cli-bin --target ${{ matrix.target }}
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
@@ -833,8 +1005,7 @@ jobs:
           cp src-tauri/target/${{ matrix.target }}/release/codeg-server dist/${{ matrix.artifact }}/
           cp src-tauri/target/${{ matrix.target }}/release/codeg-mcp dist/${{ matrix.artifact }}/
           cp src-tauri/target/${{ matrix.target }}/release/codeg-computer-helper dist/${{ matrix.artifact }}/
-          cp src-tauri/target/${{ matrix.target }}/release/codeg-cli dist/${{ matrix.artifact }}/
-          chmod +x dist/${{ matrix.artifact }}/codeg-server dist/${{ matrix.artifact }}/codeg-mcp dist/${{ matrix.artifact }}/codeg-computer-helper dist/${{ matrix.artifact }}/codeg-cli
+          chmod +x dist/${{ matrix.artifact }}/codeg-server dist/${{ matrix.artifact }}/codeg-mcp dist/${{ matrix.artifact }}/codeg-computer-helper
           cp -r out dist/${{ matrix.artifact }}/web
           cd dist && tar czf ${{ matrix.artifact }}.tar.gz ${{ matrix.artifact }}
 
@@ -845,8 +1016,8 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist/${{ matrix.artifact }}
           Copy-Item src-tauri/target/${{ matrix.target }}/release/codeg-server.exe dist/${{ matrix.artifact }}/
           Copy-Item src-tauri/target/${{ matrix.target }}/release/codeg-mcp.exe dist/${{ matrix.artifact }}/
+          Copy-Item -Recurse dist/codex-runtime "dist/${{ matrix.artifact }}/runtime"
           Copy-Item src-tauri/target/${{ matrix.target }}/release/codeg-computer-helper.exe dist/${{ matrix.artifact }}/
-          Copy-Item src-tauri/target/${{ matrix.target }}/release/codeg-cli.exe dist/${{ matrix.artifact }}/
           Copy-Item -Recurse out dist/${{ matrix.artifact }}/web
           Compress-Archive -Path dist/${{ matrix.artifact }} -DestinationPath dist/${{ matrix.artifact }}.zip
 
@@ -857,7 +1028,6 @@ jobs:
           test -x "dist/${{ matrix.artifact }}/codeg-server"
           test -x "dist/${{ matrix.artifact }}/codeg-mcp"
           test -x "dist/${{ matrix.artifact }}/codeg-computer-helper"
-          test -x "dist/${{ matrix.artifact }}/codeg-cli"
           # `codeg-mcp --help` exits 0 without flags and prints the usage
           # line. Only run it for native targets; cross-compiled arm64
           # binaries on x64 runners can't execute.
@@ -865,10 +1035,8 @@ jobs:
              [ "${{ matrix.target }}" = "x86_64-apple-darwin" ] || \
              [ "${{ matrix.target }}" = "aarch64-apple-darwin" ]; then
             "dist/${{ matrix.artifact }}/codeg-mcp" --help | grep -F 'codeg-mcp --parent-connection-id'
-            "dist/${{ matrix.artifact }}/codeg-cli" --version | grep -F 'codeg-cli '
-            "dist/${{ matrix.artifact }}/codeg-cli" --help | grep -F 'Usage: codeg-cli'
           else
-            echo "skipping codeg-mcp --help and codeg-cli --version on cross-target ${{ matrix.target }}"
+            echo "skipping codeg-mcp --help on cross-target ${{ matrix.target }}"
           fi
 
       - name: Smoke test packaged artifact (Windows)
@@ -884,19 +1052,17 @@ jobs:
           if (-not (Test-Path "dist/${{ matrix.artifact }}/codeg-computer-helper.exe")) {
             throw "codeg-computer-helper.exe missing from packaged artifact"
           }
-          if (-not (Test-Path "dist/${{ matrix.artifact }}/codeg-cli.exe")) {
-            throw "codeg-cli.exe missing from packaged artifact"
-          }
           $help = & "dist/${{ matrix.artifact }}/codeg-mcp.exe" --help
           if ($help -notlike "*codeg-mcp --parent-connection-id*") {
             throw "codeg-mcp --help output unexpected: $help"
           }
-          # A console program: its help comes back on stdout, named as the
-          # docs name it (no `.exe`).
-          $cliHelp = (& "dist/${{ matrix.artifact }}/codeg-cli.exe" --help) -join "`n"
-          if ($cliHelp -notlike "*Usage: codeg-cli*") {
-            throw "codeg-cli --help output unexpected: $cliHelp"
-          }
+
+      - name: Start isolated packaged Windows server
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          python -B scripts/smoke-server-package.py "dist/${{ matrix.artifact }}" "$($env:RELEASE_TAG.TrimStart('v'))" --require-runtime --log-dir package-smoke
+          if ($LASTEXITCODE -ne 0) { throw 'Packaged Server startup failed' }
 
       - name: Upload artifact for Docker build (Linux only)
         if: startsWith(matrix.target, 'x86_64-unknown-linux') || startsWith(matrix.target, 'aarch64-unknown-linux')
@@ -915,7 +1081,7 @@ jobs:
       # refuses an archive signed for any other version than latest.json
       # announces, or for none.
       - name: Sign and checksum bundle (Unix)
-        if: runner.os != 'Windows'
+        if: runner.os != 'Windows' && github.event.repository.fork == false
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
@@ -923,10 +1089,15 @@ jobs:
           set -euo pipefail
           pnpm tauri signer sign --app-version "${GITHUB_REF_NAME#v}" "dist/${{ matrix.artifact }}.tar.gz"
           test -f "dist/${{ matrix.artifact }}.tar.gz.sig"
+
+      - name: Checksum bundle (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
           ( cd dist && shasum -a 256 "${{ matrix.artifact }}.tar.gz" > "${{ matrix.artifact }}.tar.gz.sha256" )
 
-      - name: Sign and checksum bundle (Windows)
-        if: runner.os == 'Windows'
+      - name: Sign bundle (Windows)
+        if: runner.os == 'Windows' && github.event.repository.fork == false
         shell: pwsh
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -937,135 +1108,248 @@ jobs:
           if (-not (Test-Path "dist/${{ matrix.artifact }}.zip.sig")) {
             throw "signature not produced for ${{ matrix.artifact }}.zip"
           }
-          $hash = (Get-FileHash -Algorithm SHA256 "dist/${{ matrix.artifact }}.zip").Hash.ToLower()
-          "$hash  ${{ matrix.artifact }}.zip" | Out-File -Encoding ascii "dist/${{ matrix.artifact }}.zip.sha256"
 
-      - name: Upload to release (Unix)
-        if: runner.os != 'Windows'
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release upload "${{ github.ref_name }}" \
-            "dist/${{ matrix.artifact }}.tar.gz" \
-            "dist/${{ matrix.artifact }}.tar.gz.sig" \
-            "dist/${{ matrix.artifact }}.tar.gz.sha256" \
-            --clobber
-
-      - name: Upload to release (Windows)
+      - name: Checksum bundle (Windows)
         if: runner.os == 'Windows'
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${{ github.ref_name }}" "dist/${{ matrix.artifact }}.zip" "dist/${{ matrix.artifact }}.zip.sig" "dist/${{ matrix.artifact }}.zip.sha256" --clobber
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash -Algorithm SHA256 "dist/${{ matrix.artifact }}.zip").Hash.ToLower()
+          "$hash  ${{ matrix.artifact }}.zip`n" | Out-File -Encoding ascii -NoNewline "dist/${{ matrix.artifact }}.zip.sha256"
 
-  build-docker:
+      # Keep release files as immutable workflow artifacts while desktop
+      # matrix jobs are still mutating the draft release. A single collector
+      # uploads the complete server set after every desktop job has finished.
+      - name: Stage signed upstream release assets
+        if: github.event.repository.fork == false
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-server-${{ matrix.artifact }}
+          path: |
+            dist/${{ matrix.archive }}
+            dist/${{ matrix.archive }}.sig
+            dist/${{ matrix.archive }}.sha256
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Stage unsigned fork release assets
+        if: github.event.repository.fork == true
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-server-${{ matrix.artifact }}
+          path: |
+            dist/${{ matrix.archive }}
+            dist/${{ matrix.archive }}.sha256
+          retention-days: 7
+          if-no-files-found: error
+
+  upload-server-assets:
     needs:
       - create-draft-release
+      - build-tauri
       - build-server
-    name: Build Docker image
+    if: >-
+      always() &&
+      needs.create-draft-release.result == 'success' &&
+      needs.build-server.result == 'success' &&
+      (github.event_name == 'workflow_dispatch' ||
+       needs.build-tauri.result == 'success' ||
+       (github.ref_name == 'v0.30.7-fix1' && needs.build-tauri.result == 'skipped'))
+    name: Upload complete server asset set
     runs-on: ubuntu-22.04
     permissions:
-      contents: read
-      packages: write
+      actions: read
+      contents: write
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Download Linux x64 artifact
+      - name: Download server release assets
         uses: actions/download-artifact@v4
         with:
-          name: codeg-server-linux-x64
-          path: artifacts/linux-x64
+          pattern: release-server-*
+          path: server-release-assets
+          merge-multiple: true
 
-      - name: Download Linux arm64 artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: codeg-server-linux-arm64
-          path: artifacts/linux-arm64
-
-      - name: Prepare Docker build context
+      - name: Validate complete server asset set
+        shell: bash
         run: |
           set -euo pipefail
-          mkdir -p dist/amd64 dist/arm64
-          cp artifacts/linux-x64/codeg-server dist/amd64/codeg-server
-          cp artifacts/linux-x64/codeg-mcp dist/amd64/codeg-mcp
-          cp artifacts/linux-x64/codeg-cli dist/amd64/codeg-cli
-          cp artifacts/linux-arm64/codeg-server dist/arm64/codeg-server
-          cp artifacts/linux-arm64/codeg-mcp dist/arm64/codeg-mcp
-          cp artifacts/linux-arm64/codeg-cli dist/arm64/codeg-cli
-          cp -r artifacts/linux-x64/web dist/web
-          chmod +x dist/amd64/codeg-server dist/amd64/codeg-mcp dist/amd64/codeg-cli \
-                   dist/arm64/codeg-server dist/arm64/codeg-mcp dist/arm64/codeg-cli
-          # Fail fast if any companion went missing — Docker would otherwise
-          # produce an image where delegation silently degrades, or without
-          # the codeg-cli its docs promise.
-          for f in dist/amd64/codeg-mcp dist/arm64/codeg-mcp dist/amd64/codeg-cli dist/arm64/codeg-cli; do
-            test -x "$f" || { echo "FATAL: $f missing or non-exec"; exit 1; }
+
+          archives=(
+            codeg-server-windows-x64.zip
+          )
+
+          for archive in "${archives[@]}"; do
+            test -s "server-release-assets/$archive"
+            test -s "server-release-assets/$archive.sha256"
+            if [ "${{ github.event.repository.fork }}" = "false" ]; then
+              test -s "server-release-assets/$archive.sig"
+            fi
           done
 
-      - name: Set up QEMU (for multi-arch manifest)
-        uses: docker/setup-qemu-action@v3
+          expected_count=2
+          if [ "${{ github.event.repository.fork }}" = "false" ]; then
+            expected_count=3
+          fi
+          actual_count="$(find server-release-assets -maxdepth 1 -type f | wc -l)"
+          if [ "$actual_count" -ne "$expected_count" ]; then
+            echo "Expected $expected_count server release files, found $actual_count"
+            find server-release-assets -maxdepth 1 -type f -printf '%f\n' | sort
+            exit 1
+          fi
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+          # PowerShell-produced checksum files from older workflow runs may
+          # use CRLF. Normalize before feeding them to GNU sha256sum so the
+          # trailing CR is not interpreted as part of the archive filename.
+          sed -i 's/\r$//' server-release-assets/*.sha256
 
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          (
+            cd server-release-assets
+            for checksum in *.sha256; do
+              sha256sum --check "$checksum"
+            done
+          )
 
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Upload complete server asset set to release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release upload "$RELEASE_TAG"
+          server-release-assets/*
+          --clobber
+          --repo "$GITHUB_REPOSITORY"
 
-      # The image runs its codeg-cli before it is pushed: an amd64 build loaded
-      # into the runner's daemon, `codeg-cli --version` inside it.
-      - name: Smoke test the image's codeg-cli (amd64)
+      - name: Verify server assets persisted on release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          docker buildx build --platform linux/amd64 --load -t codeg-smoke:local -f Dockerfile.ci .
-          docker run --rm codeg-smoke:local codeg-cli --version | grep -F 'codeg-cli '
-          docker run --rm codeg-smoke:local codeg-cli --help | grep -F 'Usage: codeg-cli'
 
-      - name: Extract version from tag
-        id: version
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          remote_assets="$(
+            gh release view "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json assets \
+              --jq '.assets[].name'
+          )"
+          archives=(
+            codeg-server-windows-x64.zip
+          )
 
-      # `latest` is the newest stable release. A release candidate goes out
-      # under its own version only, so nothing that pulls `latest` is moved
-      # onto it; the line that would name `latest` is left empty, and
-      # build-push-action skips empty lines.
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v6
+          for archive in "${archives[@]}"; do
+            grep -Fqx "$archive" <<< "$remote_assets"
+            grep -Fqx "$archive.sha256" <<< "$remote_assets"
+            if [ "${{ github.event.repository.fork }}" = "false" ]; then
+              grep -Fqx "$archive.sig" <<< "$remote_assets"
+            fi
+          done
+
+  verify-draft-assets:
+    needs: [create-draft-release, build-tauri, upload-server-assets]
+    if: >-
+      always() && github.event_name == 'push' &&
+      github.event.repository.fork == true && github.ref_name != 'v0.30.7-fix1' &&
+      needs.create-draft-release.result == 'success' &&
+      needs.build-tauri.result == 'success' && needs.upload-server-assets.result == 'success'
+    name: Verify downloaded Windows assets before publishing
+    runs-on: windows-2022
+    permissions:
+      actions: read
+      # GitHub only exposes draft releases to tokens with push access.
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
         with:
-          context: .
-          file: Dockerfile.ci
-          platforms: linux/amd64,linux/arm64
-          push: true
-          # The source label is how ghcr.io ties the package to this
-          # repository: the package page links back here and the package
-          # inherits the repository's access permissions.
-          labels: |
-            org.opencontainers.image.source=https://github.com/${{ github.repository }}
-          tags: |
-            ghcr.io/${{ github.repository }}:${{ steps.version.outputs.version }}
-            ${{ secrets.DOCKERHUB_USERNAME }}/codeg:${{ steps.version.outputs.version }}
-            ${{ needs.create-draft-release.outputs.prerelease != 'true' && format('ghcr.io/{0}:latest', github.repository) || '' }}
-            ${{ needs.create-draft-release.outputs.prerelease != 'true' && format('{0}/codeg:latest', secrets.DOCKERHUB_USERNAME) || '' }}
+          name: release-windows-setup-evidence
+          path: setup-evidence
+      - name: Download, verify, install, and start packages
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ./scripts/verify-windows-release.ps1 -ReleaseTag $env:RELEASE_TAG -Repository $env:GITHUB_REPOSITORY -Destination "$env:RUNNER_TEMP/draft-verification" -SetupManifest setup-evidence/payload.json
+      - name: Retain package diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-draft-verification
+          path: ${{ runner.temp }}/draft-verification/**/verification.json
+          if-no-files-found: warn
+          retention-days: 14
 
   publish-release:
     needs:
       - create-draft-release
       - build-tauri
       - build-server
-      - build-docker
-    if: ${{ needs.build-tauri.result == 'success' && needs.build-server.result == 'success' && needs.build-docker.result == 'success' }}
+      - upload-server-assets
+      - verify-draft-assets
+    if: >-
+      always() &&
+      github.event_name == 'push' &&
+      needs.create-draft-release.result == 'success' &&
+      (needs.build-tauri.result == 'success' ||
+       (github.ref_name == 'v0.30.7-fix1' && needs.build-tauri.result == 'skipped')) &&
+      needs.build-server.result == 'success' &&
+      needs.upload-server-assets.result == 'success' &&
+      (needs.verify-draft-assets.result == 'success' ||
+       github.ref_name == 'v0.30.7-fix1' || github.event.repository.fork == false)
     runs-on: ubuntu-22.04
     permissions:
       contents: write
     steps:
+      - name: Validate Windows-only fork release assets
+        if: github.event.repository.fork == true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          mapfile -t remote_assets < <(
+            gh release view "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json assets \
+              --jq '.assets[].name'
+          )
+
+          printf '%s\n' "${remote_assets[@]}"
+          printf '%s\n' "${remote_assets[@]}" \
+            | grep -Fqx 'codeg-server-windows-x64.zip'
+          printf '%s\n' "${remote_assets[@]}" \
+            | grep -Fqx 'codeg-server-windows-x64.zip.sha256'
+
+          setup_count=0
+          setup_checksum_count=0
+          for asset in "${remote_assets[@]}"; do
+            case "$asset" in
+              codeg_*_x64-setup.exe)
+                setup_count=$((setup_count + 1))
+                ;;
+              codeg_*_x64-setup.exe.sha256)
+                setup_checksum_count=$((setup_checksum_count + 1))
+                ;;
+              codeg-server-windows-x64.zip|codeg-server-windows-x64.zip.sha256)
+                ;;
+              *)
+                echo "Unexpected release asset: $asset"
+                exit 1
+                ;;
+            esac
+          done
+
+          expected_setup=1
+          expected_count=4
+          if [ "$RELEASE_TAG" = "v0.30.7-fix1" ]; then
+            expected_setup=0
+            expected_count=2
+          fi
+          if [ "$setup_count" -ne "$expected_setup" ] || \
+             [ "$setup_checksum_count" -ne "$expected_setup" ] || \
+             [ "${#remote_assets[@]}" -ne "$expected_count" ]; then
+            echo "Expected $expected_setup setup and two Windows Server files"
+            exit 1
+          fi
+
       - name: Publish draft release
         uses: actions/github-script@v7
         env:
@@ -1086,3 +1370,110 @@ jobs:
             });
 
             core.info(`Published release #${releaseId}`);
+
+  verify-server-only-release:
+    needs: publish-release
+    if: >-
+      always() &&
+      github.event_name == 'push' &&
+      github.ref_name == 'v0.30.7-fix1' &&
+      needs.publish-release.result == 'success'
+    name: Re-download and verify Windows Server release
+    runs-on: windows-2022
+    permissions:
+      contents: read
+    steps:
+      - name: Verify published release and exact asset set
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $release = gh release view $env:RELEASE_TAG `
+            --repo $env:GITHUB_REPOSITORY `
+            --json tagName,isDraft,isPrerelease,assets | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw "Could not read published release" }
+          if ($release.tagName -ne $env:RELEASE_TAG -or $release.isDraft) {
+            throw "Release is missing, still a draft, or has the wrong tag"
+          }
+          $assetNames = @($release.assets | ForEach-Object { $_.name } | Sort-Object)
+          $expectedNames = @(
+            "codeg-server-windows-x64.zip",
+            "codeg-server-windows-x64.zip.sha256"
+          ) | Sort-Object
+          if (Compare-Object $assetNames $expectedNames) {
+            throw "Published asset set differs from the two expected Server files"
+          }
+
+      - name: Re-download, checksum, extract, and execute
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          New-Item -ItemType Directory -Force downloaded, expanded | Out-Null
+          gh release download $env:RELEASE_TAG `
+            --repo $env:GITHUB_REPOSITORY `
+            --pattern "codeg-server-windows-x64.zip" `
+            --pattern "codeg-server-windows-x64.zip.sha256" `
+            --dir downloaded
+          if ($LASTEXITCODE -ne 0) { throw "Release asset download failed" }
+
+          $archive = "downloaded/codeg-server-windows-x64.zip"
+          $checksum = "downloaded/codeg-server-windows-x64.zip.sha256"
+          $expectedHash = ((Get-Content $checksum -Raw).Trim() -split '\s+')[0].ToLower()
+          $actualHash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLower()
+          if ($actualHash -ne $expectedHash) {
+            throw "Downloaded archive SHA-256 does not match its checksum asset"
+          }
+
+          Expand-Archive -Path $archive -DestinationPath expanded
+          $root = "expanded/codeg-server-windows-x64"
+          $server = Join-Path $root "codeg-server.exe"
+          $companion = Join-Path $root "codeg-mcp.exe"
+          $index = Join-Path $root "web/index.html"
+          foreach ($required in @($server, $companion, $index)) {
+            if (-not (Test-Path $required -PathType Leaf)) {
+              throw "Required packaged file is missing: $required"
+            }
+          }
+
+          $expectedVersion = $env:RELEASE_TAG.TrimStart('v')
+          $actualVersion = (& $server --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $actualVersion -ne $expectedVersion) {
+            throw "Packaged server version '$actualVersion' does not equal '$expectedVersion'"
+          }
+          $help = (& $companion --help | Out-String)
+          if ($LASTEXITCODE -ne 0 -or $help -notlike "*codeg-mcp --parent-connection-id*") {
+            throw "Packaged codeg-mcp executable did not return the expected help text"
+          }
+
+  verify-published-assets:
+    needs: publish-release
+    if: >-
+      always() && github.event_name == 'push' &&
+      github.event.repository.fork == true && github.ref_name != 'v0.30.7-fix1' &&
+      needs.publish-release.result == 'success'
+    name: Verify published Windows release
+    runs-on: windows-2022
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-windows-setup-evidence
+          path: setup-evidence
+      - name: Verify official assets after publication
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ./scripts/verify-windows-release.ps1 -ReleaseTag $env:RELEASE_TAG -Repository $env:GITHUB_REPOSITORY -Destination "$env:RUNNER_TEMP/published-verification" -SetupManifest setup-evidence/payload.json -RequirePublished
+      - name: Retain published verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-published-verification
+          path: ${{ runner.temp }}/published-verification/**/verification.json
+          if-no-files-found: warn
+          retention-days: 14

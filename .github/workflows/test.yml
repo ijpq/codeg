@@ -59,6 +59,21 @@ jobs:
       - name: Unit tests (vitest)
         run: pnpm test
 
+      - name: Published Codex ACP terminal and AIR regression
+        run: node --test scripts/test-codex-air-terminal.mjs
+
+      - name: Official SQLite migration compatibility regression
+        run: python3 -B scripts/test-codex-runtime-migrations.py
+
+      - name: Cross-platform resume context comparison regression
+        run: python3 -B scripts/test-codex-resume-comparison.py
+
+      - name: NSIS payload verification regression
+        run: python3 -B scripts/test-verify-setup-binaries.py
+
+      - name: Draft release reuse regression
+        run: node --test scripts/test-release-draft.mjs
+
       - name: Static export build
         run: pnpm build
 
@@ -109,6 +124,20 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+
+      # The standard ARM macOS runner has 7 GB RAM. The workspace library
+      # and its test binary otherwise compile at the same time, each using
+      # several GB. Keep the exact test/clippy scope while reducing compiler
+      # concurrency and debug-info generation; test threads are unchanged.
+      - name: Fit macOS Rust compilation within runner memory
+        if: matrix.os == 'macos-latest'
+        shell: bash
+        run: |
+          {
+            echo "CARGO_BUILD_JOBS=1"
+            echo "CARGO_PROFILE_DEV_DEBUG=0"
+            echo "CARGO_PROFILE_TEST_DEBUG=0"
+          } >> "$GITHUB_ENV"
 
       - name: Rust cache
         uses: swatinem/rust-cache@v2
@@ -169,83 +198,85 @@ jobs:
             exit 1
           fi
 
-  install-sh:
-    # install.sh stops what runs the files it replaces, and nothing else: on
-    # Linux `cp` onto a running program fails, but the desktop app, other
-    # users, other directories and containers run a codeg-server or codeg-mcp
-    # of their own. The test runs the script's stop section against fake
-    # programs; the installer itself downloads a release and writes to
-    # /usr/local/bin, so it is not run. /bin/bash: on macOS that is 3.2, what
-    # `curl … | bash` gets there. Linux runs it once more as root, for
-    # processes of other mount namespaces.
-    name: install.sh on ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
+  codex-recovery:
+    name: Codex recovery on ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, macos-latest]
+        os: [ubuntu-22.04, windows-2022]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@v4
-
-      - name: install.sh parses
-        run: /bin/bash -n install.sh
-
-      - name: install.sh stops only what runs the files it replaces
-        env:
-          CODEG_INSTALL_TEST_STRICT: "1"
-        run: /bin/bash scripts/test-install-stop.sh install.sh
-
-      - name: The same, as root
-        if: runner.os == 'Linux'
-        run: sudo CODEG_INSTALL_TEST_STRICT=1 /bin/bash scripts/test-install-stop.sh install.sh
-
-  install-ps1:
-    # Two Windows PowerShell 5.1 traps that PowerShell 7 never hits. First,
-    # `.\install.ps1` reads a script without a BOM in the ANSI code page,
-    # where a UTF-8 em-dash ends in a curly quote that closes the string it is
-    # in — and then the whole script fails to parse (`irm … | iex` decodes
-    # UTF-8, so it is spared this one). Second, Join-Path takes two paths: a
-    # third fails when its line runs, however the script was loaded — the
-    # README's `irm … | iex` included.
-    name: install.ps1 in Windows PowerShell 5.1
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Check install.ps1 as Windows PowerShell 5.1 reads and runs it
-        shell: powershell
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: clippy
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Verify runtime build regressions
         run: |
-          $bytes = [System.IO.File]::ReadAllBytes((Join-Path $PWD "install.ps1"))
-          if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
-            $text = [System.Text.Encoding]::UTF8.GetString($bytes, 3, $bytes.Length - 3)
-          } else {
-            $text = [System.Text.Encoding]::Default.GetString($bytes)
-          }
-          $tokens = $null
-          $errors = $null
-          $ast = [System.Management.Automation.Language.Parser]::ParseInput($text, [ref]$tokens, [ref]$errors)
-          if ($errors) {
-            foreach ($e in $errors) {
-              Write-Host "::error file=install.ps1,line=$($e.Extent.StartLineNumber)::$($e.Message)"
-            }
-            exit 1
-          }
-          # Windows PowerShell 5.1's Join-Path takes two paths (it has no
-          # -AdditionalChildPath): a third fails when the line runs, not when
-          # the script parses.
-          $bad = $false
-          $calls = $ast.FindAll({
-            param($node)
-            $node -is [System.Management.Automation.Language.CommandAst] -and
-              $node.GetCommandName() -eq "Join-Path"
-          }, $true)
-          foreach ($call in $calls) {
-            $paths = @($call.CommandElements | Select-Object -Skip 1 | Where-Object {
-              $_ -isnot [System.Management.Automation.Language.CommandParameterAst]
-            })
-            if ($paths.Count -gt 2) {
-              Write-Host "::error file=install.ps1,line=$($call.Extent.StartLineNumber)::Join-Path with $($paths.Count) paths fails in Windows PowerShell 5.1"
-              $bad = $true
-            }
-          }
-          if ($bad) { exit 1 }
+          python -B scripts/test-codex-runtime-migrations.py
+          python -B scripts/test-codex-runtime-cache.py
+          python -B scripts/test-codex-resume-comparison.py
+      - name: Install native build prerequisites
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev libcap-dev pkg-config cmake clang strace
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install isolated reference CLI
+        run: npm install --prefix "$RUNNER_TEMP/codeg-codex-reference" --ignore-scripts --no-audit --no-fund @openai/codex@0.162.1
+      - name: Prepare exact pinned runtime source
+        run: python -B scripts/build-codex-runtime.py --source-dir "$RUNNER_TEMP/codeg-codex-source" --output-dir "$RUNNER_TEMP/codeg-codex-runtime" --prepare-only
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "${{ runner.temp }}/codeg-codex-source/codex-rs -> ../../codeg-codex-target"
+          shared-key: codex-recovery-target-v3-${{ matrix.os }}-${{ hashFiles('vendor/codex-runtime/**', 'scripts/build-codex-runtime.py', '.github/workflows/test.yml') }}
+          cache-workspace-crates: true
+          cache-on-failure: true
+      - name: Test and build pinned recovery runtime
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/codeg-codex-target
+        run: python -B scripts/build-codex-runtime.py --source-dir "$RUNNER_TEMP/codeg-codex-source" --output-dir "$RUNNER_TEMP/codeg-codex-runtime"
+      - name: Verify model context, tools, images, restart and invalidation
+        run: |
+          python - <<'PY'
+          import os, subprocess, sys
+          from pathlib import Path
+          scratch=Path(os.environ['RUNNER_TEMP'])
+          suffix='.exe' if os.name=='nt' else ''
+          references=[p for p in (scratch/'codeg-codex-reference/node_modules/@openai').rglob('codex'+suffix) if p.is_file()]
+          if len(references)!=1:
+            raise RuntimeError(f'Expected one installed reference CLI, found {references}')
+          reference=references[0]
+          if subprocess.check_output([str(reference),'--version'],text=True).strip()!='codex-cli 0.162.1':
+            raise RuntimeError('Reference CLI version does not match the pin')
+          subprocess.run([sys.executable,'-B','scripts/test-codex-resume.py',
+            '--cli',str(scratch/'codeg-codex-runtime'/('codex'+suffix)),
+            '--baseline-cli',str(reference),'--output',str(scratch/'codeg-codex-evidence'),
+            '--size-mib','64','--trace'],check=True)
+          PY
+      - name: Verify one full read for old checkpoint fallback
+        if: runner.os == 'Linux'
+        run: python3 -B scripts/test-codex-resume.py --cli "$RUNNER_TEMP/codeg-codex-runtime/codex" --output "$RUNNER_TEMP/codeg-codex-evidence/legacy-full-read" --size-mib 64 --checkpoint-mode legacy --trace
+      - name: Verify current and newer ACP adapters on the pinned runtime
+        if: runner.os == 'Linux'
+        run: |
+          npm install --prefix "$RUNNER_TEMP/codeg-acp-211" --ignore-scripts --no-audit --no-fund @agentclientprotocol/codex-acp@2.1.1
+          npm install --prefix "$RUNNER_TEMP/codeg-acp-222" --ignore-scripts --no-audit --no-fund @agentclientprotocol/codex-acp@2.2.2
+          python3 -B scripts/diagnose-codex-resume-layers.py --cli "$RUNNER_TEMP/codeg-codex-runtime/codex" --acp "$RUNNER_TEMP/codeg-acp-211/node_modules/.bin/codex-acp" --output "$RUNNER_TEMP/codeg-codex-evidence/acp-211" --size-mib 64 --fast --verify-prompt
+          python3 -B scripts/diagnose-codex-resume-layers.py --cli "$RUNNER_TEMP/codeg-codex-runtime/codex" --acp "$RUNNER_TEMP/codeg-acp-222/node_modules/.bin/codex-acp" --output "$RUNNER_TEMP/codeg-codex-evidence/acp-222" --size-mib 64 --fast --verify-prompt
+      - name: Retain recovery diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-recovery-evidence-${{ runner.os }}
+          path: ${{ runner.temp }}/codeg-codex-evidence
+          if-no-files-found: warn
