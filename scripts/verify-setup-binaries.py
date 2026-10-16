@@ -1,8 +1,8 @@
 """Verify unsigned Tauri NSIS payloads, including its documented bundle marker.
 
-Tauri CLI 2.10.0 and 2.11.4 patch UNK to NSS before packaging and restore the build
+Tauri CLI 2.10.0, 2.11.4 and 2.12.3 patch UNK to NSS before packaging and restore the build
 output afterwards. Only that exact replacement is allowed; hash all bytes.
-https://github.com/tauri-apps/tauri/blob/tauri-cli-v2.11.4/crates/tauri-bundler/src/bundle.rs
+https://github.com/tauri-apps/tauri/blob/tauri-cli-v2.12.3/crates/tauri-bundler/src/bundle.rs
 """
 
 import hashlib

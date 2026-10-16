@@ -4643,6 +4643,7 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
         },
         AgentType::ZCode => AcpAgentMeta {
             agent_type,
+            supports_steer: false,
             supports_mcp: true,
             name: "ZCode",
             description: "Official ZCode runtime via the community ACP bridge",
@@ -5159,6 +5160,7 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
         },
         AgentType::Kiro => AcpAgentMeta {
             agent_type,
+            supports_steer: false,
             supports_mcp: true,
             name: "Kiro CLI",
             description: "Amazon's Kiro agent in the terminal (native ACP via kiro-cli acp)",

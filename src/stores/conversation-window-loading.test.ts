@@ -748,7 +748,44 @@ describe("syncTurnMetadata windowed gate", () => {
     expect(session()?.localTurns[0]?.usage?.input_tokens).toBe(10)
   })
 
-  it("uses the authoritative bounded tail instead of an obsolete prefix fingerprint", async () => {
+  it("cuts verified history before the batch and keeps another client's reply separate", async () => {
+    vi.useFakeTimers()
+    seed({
+      localTurns: local,
+      historyAssistantBaseline: 3,
+      batchBoundaryIndex: 6,
+      batchBoundaryPrefixHash: hashPrefix(6),
+    })
+    const reply = (id: string, secs: number, tokens: number): MessageTurn => ({
+      ...turn(id, "assistant", secs),
+      usage: {
+        input_tokens: tokens,
+        output_tokens: 5,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+      },
+    })
+    mockGet.mockResolvedValue(
+      windowedDetail(2, {
+        turns: [
+          ...FULL.slice(2),
+          reply("turn-6", 6, 10),
+          turn("other-client", "user", 7),
+          reply("other-reply", 8, 99),
+        ],
+        turns_total: 9,
+      })
+    )
+    actions().syncTurnMetadata(CID)
+    await vi.advanceTimersByTimeAsync(1600)
+    expect(session()?.localTurns[0]?.usage?.input_tokens).toBe(10)
+    expect(mockGet).toHaveBeenCalledWith(
+      CID,
+      expect.objectContaining({ userTurnLimit: HISTORY_PAGE_USER_TURNS })
+    )
+  })
+
+  it("refuses metadata from a compacted prefix", async () => {
     vi.useFakeTimers()
     seed({
       localTurns: local,
@@ -765,21 +802,20 @@ describe("syncTurnMetadata windowed gate", () => {
         cache_read_input_tokens: 0,
       },
     }
-    // Compaction between capture and sync: same offset, different prefix.
+    // A bounded tail starts before the batch, but compaction rewrote its prefix.
     mockGet.mockResolvedValue(
-      windowedDetail(6, {
-        turns: [parsedNew],
+      windowedDetail(2, {
+        turns: [...FULL.slice(2), parsedNew],
         turns_total: 7,
         prefix_hash: "00000000000000ff",
       })
     )
     actions().syncTurnMetadata(CID)
     await vi.advanceTimersByTimeAsync(1600)
-    // The poll keeps retrying (the metadata never lands), but usage must
-    // never be pinned from an unverified window — however many rounds it
-    // takes.
+    // Re-reading a compacted fingerprint cannot verify the old batch.
     await vi.advanceTimersByTimeAsync(120_000)
     expect(session()?.localTurns[0]?.usage).toBeUndefined()
+    expect(mockGet).toHaveBeenCalledTimes(1)
   })
 
   it("legacy full response uses the global baseline math", async () => {
@@ -880,7 +916,10 @@ describe("syncTurnMetadata round anchoring", () => {
     )
     actions().syncTurnMetadata(CID)
     await vi.advanceTimersByTimeAsync(1600)
-    expect(mockGet).toHaveBeenCalledWith(CID, { fromIndex: 3 })
+    expect(mockGet).toHaveBeenCalledWith(
+      CID,
+      expect.objectContaining({ userTurnLimit: HISTORY_PAGE_USER_TURNS })
+    )
     expect(session()?.localTurns[0]?.duration_ms).toBe(600_000)
     // Not the first reply's 10 minutes — first-write-wins would keep them.
     expect(session()?.localTurns[2]?.duration_ms).toBeUndefined()
@@ -1179,7 +1218,10 @@ describe("syncTurnMetadata round anchoring", () => {
     )
     actions().syncTurnMetadata(CID)
     await vi.advanceTimersByTimeAsync(1600)
-    expect(mockGet).toHaveBeenCalledWith(CID, undefined)
+    expect(mockGet).toHaveBeenCalledWith(
+      CID,
+      expect.objectContaining({ userTurnLimit: HISTORY_PAGE_USER_TURNS })
+    )
     expect(session()?.localTurns[1]?.duration_ms).toBe(1_234)
   })
 })
