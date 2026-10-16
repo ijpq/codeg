@@ -524,7 +524,7 @@ mod tests {
                 origin_cwd: Some("/workspace/project".into()),
             },
             turns,
-            user_turns_before_offset: 0,
+            user_turns_before_offset: Some(0),
             session_stats: Some(SessionStats {
                 total_usage: None,
                 total_tokens: None,

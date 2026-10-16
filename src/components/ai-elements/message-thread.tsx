@@ -221,6 +221,23 @@ const EscapeLockOnUserScroll = () => {
     const onPointerEnd = () => {
       draggingScrollbar = false
     }
+    // virtua preserves the visible row with fractional scroll offsets. The
+    // library's rounded max - 1 target can then move up by less than a CSS
+    // pixel, which its direction-only detector mistakes for a reader escape.
+    // Shield just this rounding correction before that listener runs. Real
+    // wheel/touch/key/scrollbar intent above still releases the lock directly.
+    const onScrollCapture = () => {
+      const { scrollTop } = viewport
+      const delta = (state.lastScrollTop ?? scrollTop) - scrollTop
+      if (
+        state.isAtBottom &&
+        !state.escapedFromLock &&
+        delta > 0 &&
+        delta <= 1
+      ) {
+        state.ignoreScrollToTop = scrollTop
+      }
+    }
     const onScroll = () => {
       const { scrollTop } = viewport
       if (draggingScrollbar && scrollTop < lastScrollTop) escape()
@@ -234,6 +251,10 @@ const EscapeLockOnUserScroll = () => {
     viewport.addEventListener("touchcancel", onTouchEnd, { passive: true })
     viewport.addEventListener("keydown", onKeyDown)
     viewport.addEventListener("pointerdown", onPointerDown)
+    viewport.addEventListener("scroll", onScrollCapture, {
+      capture: true,
+      passive: true,
+    })
     viewport.addEventListener("scroll", onScroll, { passive: true })
     window.addEventListener("pointerup", onPointerEnd)
     window.addEventListener("pointercancel", onPointerEnd)
@@ -245,6 +266,7 @@ const EscapeLockOnUserScroll = () => {
       viewport.removeEventListener("touchcancel", onTouchEnd)
       viewport.removeEventListener("keydown", onKeyDown)
       viewport.removeEventListener("pointerdown", onPointerDown)
+      viewport.removeEventListener("scroll", onScrollCapture, true)
       viewport.removeEventListener("scroll", onScroll)
       window.removeEventListener("pointerup", onPointerEnd)
       window.removeEventListener("pointercancel", onPointerEnd)
