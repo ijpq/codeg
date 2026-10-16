@@ -31,7 +31,13 @@ use crate::acp::delegation::transport::{
     read_frame, write_frame, BrokerAskRequest, BrokerBrowserActRequest,
     BrokerBrowserCaptureRequest, BrokerBrowserConsoleRequest, BrokerBrowserEvalRequest,
     BrokerBrowserSnapshotRequest, BrokerBrowserTabOpRequest, BrokerBrowserTabsRequest,
-    BrokerCancelRequest, BrokerCancelTaskRequest, BrokerComputerActRequest, BrokerComputerAppsRequest, BrokerComputerCaptureRequest, BrokerComputerLaunchRequest, BrokerComputerSnapshotRequest, BrokerComputerVerifyRequest, BrokerComputerWindowsRequest, BrokerCommitFeedbackRequest, BrokerFeedbackRequest, BrokerListAssistantsRequest, BrokerMessage, BrokerRequest, BrokerCreateAutomationRequest, BrokerCreateWorkTaskRequest, BrokerResponse, BrokerResumeTaskRequest, BrokerSessionRequest, BrokerStatusRequest, BrokerTaskCompleteRequest, BrokerTaskProgressRequest,
+    BrokerCancelRequest, BrokerCancelTaskRequest, BrokerCommitFeedbackRequest,
+    BrokerComputerActRequest, BrokerComputerAppsRequest, BrokerComputerCaptureRequest,
+    BrokerComputerLaunchRequest, BrokerComputerSnapshotRequest, BrokerComputerVerifyRequest,
+    BrokerComputerWindowsRequest, BrokerCreateAutomationRequest, BrokerCreateWorkTaskRequest,
+    BrokerFeedbackRequest, BrokerListAssistantsRequest, BrokerMessage, BrokerRequest,
+    BrokerResponse, BrokerResumeTaskRequest, BrokerSessionRequest, BrokerStatusRequest,
+    BrokerTaskCompleteRequest, BrokerTaskProgressRequest,
 };
 use crate::acp::delegation::assistants::assistant_not_found_message;
 use crate::acp::delegation::types::{
@@ -46,7 +52,6 @@ use crate::acp::feedback::{PendingFeedback, SessionFeedbackAccess};
 use crate::acp::question::{QuestionOutcome, SessionQuestionAccess};
 #[cfg(unix)]
 use crate::acp::scratch_dir::{is_inside_sweep_scope, SUN_PATH_CAP};
-use crate::acp::chat_authoring::{AuthoringContext, AuthoringOutcome, ChatAuthoringAccess};
 use crate::acp::session_info::{SessionInfo, SessionInfoAccess};
 use crate::acp::work_task_tools::{TaskReportAck, WorkTaskToolAccess};
 use serde_json::Value;

@@ -55,7 +55,13 @@ use crate::acp::terminal_runtime::{
     TerminalRuntime, TerminalRuntimeError, TerminalShellRuntimeConfig,
 };
 use crate::acp::types::{
-    AcpEvent, AsyncTaskDelta, AsyncTaskUsage, AvailableCommandInfo, ConnectionInfo, ConnectionStatus, GrokModelCatalog, GrokModelSpec, KiroReasoning, PermissionOptionInfo, PlanEntryInfo, PluginLoadFailure, PromptCapabilitiesInfo, PromptInputBlock, SessionConfigBooleanInfo, SessionConfigKindInfo, SessionConfigOptionInfo, SessionConfigSelectGroupInfo, SessionConfigSelectInfo, SessionConfigSelectOptionInfo, SessionFailureRecord, SessionModeInfo, SessionModeStateInfo, SessionNotice, ToolCallImageInfo, UserMessageBlock, AgentFileChangeReport, SteerResult,
+    AcpEvent, AgentFileChangeReport, AsyncTaskDelta, AsyncTaskUsage, AvailableCommandInfo,
+    ConnectionInfo, ConnectionStatus, GrokModelCatalog, GrokModelSpec, KiroReasoning,
+    PermissionOptionInfo, PlanEntryInfo, PluginLoadFailure, PromptCapabilitiesInfo,
+    PromptInputBlock, SessionConfigBooleanInfo, SessionConfigKindInfo, SessionConfigOptionInfo,
+    SessionConfigSelectGroupInfo, SessionConfigSelectInfo, SessionConfigSelectOptionInfo,
+    SessionFailureRecord, SessionModeInfo, SessionModeStateInfo, SessionNotice, SteerResult,
+    ToolCallImageInfo, UserMessageBlock,
 };
 use crate::logging::throttle::LeadingEdgeThrottle;
 use crate::models::agent::AgentType;

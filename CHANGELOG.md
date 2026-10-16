@@ -1,8 +1,8 @@
 # Changelog
 
-## 0.35.2-fix1 — 2026-10-16
+## 0.36.0-fix1 — 2026-10-16
 
-- Rebase the fork onto upstream v0.35.2 while preserving existing recovery,
+- Rebase the fork onto upstream v0.36.0 while preserving existing recovery,
   bounded history, deliverables, native fork and collaboration fixes.
 - Unify Codex execution into Direct / Plan first / Execute goal. Use native
   collaboration mode and Goal RPCs, with an objective, status, pause, resume
@@ -22,7 +22,7 @@
 - Statically link the Windows C runtime and check ordinary/delayed PE imports in
   both packages, rejecting missing external redistributables before publication.
 
-See [release notes](docs/releases/v0.35.2-fix1.md) for native protocol behavior
+See [release notes](docs/releases/v0.36.0-fix1.md) for native protocol behavior
 and validation details.
 
 ## 0.35.1-fix2 — 2026-10-13

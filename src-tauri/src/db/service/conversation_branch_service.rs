@@ -303,6 +303,8 @@ pub async fn create_branch_row_with_operation(
                         deleted_at: Set(None),
                         pinned_at: Set(None),
                         origin_cwd: Set(source_origin_cwd),
+                        assistant_id: Set(None),
+                        assistant_snapshot: Set(None),
                     }
                     .insert(txn)
                     .await?;

@@ -309,7 +309,11 @@ describe("SubAgentSessionDialog", () => {
           onOpenChange={() => {}}
           childConversationId={99}
           childConnectionId="child-connection"
-          agentType="codex"
+          identity={{
+            agentType: "codex",
+            assistantId: null,
+            assistantName: null,
+          }}
         />
       </GoalControlProvider>
     )
@@ -682,7 +686,11 @@ describe("SubAgentSessionDialog", () => {
         onOpenChange={() => {}}
         childConversationId={99}
         childConnectionId="c1"
-        agentType="codex"
+        identity={{
+          agentType: "codex",
+          assistantId: null,
+          assistantName: null,
+        }}
       />
     )
     mockRefetchDetail.mockClear()
