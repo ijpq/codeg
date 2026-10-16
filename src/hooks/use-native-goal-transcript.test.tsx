@@ -175,6 +175,24 @@ describe("native Goal transcript projection", () => {
     expect(session().pendingOutOfTurnContent).toBe(true)
   })
 
+  it("backs off failures that arrive after the next timer was scheduled", async () => {
+    runtime.actions.refetchDetail.mockImplementation(() => {
+      // The real reader clears errors on start, then asynchronously fails.
+      session().detailError = null
+      queueMicrotask(() => {
+        session().detailError = "unreadable"
+      })
+    })
+    const { result } = renderHook(() => useNativeGoalTranscript("c", 42, true))
+    act(() => result.current(snapshot("active")))
+    await advance(500)
+    expect(runtime.actions.refetchDetail).toHaveBeenCalledTimes(1)
+    await advance(4500)
+    expect(runtime.actions.refetchDetail).toHaveBeenCalledTimes(1)
+    await advance(500)
+    expect(runtime.actions.refetchDetail).toHaveBeenCalledTimes(2)
+  })
+
   it("cancels pending reads when the surface unmounts", async () => {
     const { result, unmount } = renderHook(() =>
       useNativeGoalTranscript("c", 42, true)
