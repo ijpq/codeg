@@ -1,3 +1,4 @@
+/* eslint-disable @next/next/no-img-element -- Intentionally exercise a delayed native image without a reserved height. */
 import { useEffect, useState } from "react"
 import { createRoot } from "react-dom/client"
 import { NextIntlClientProvider } from "next-intl"
