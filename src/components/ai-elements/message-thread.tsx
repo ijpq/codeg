@@ -228,7 +228,11 @@ const EscapeLockOnUserScroll = () => {
     // wheel/touch/key/scrollbar intent above still releases the lock directly.
     const onScrollCapture = () => {
       const { scrollTop } = viewport
-      const delta = (state.lastScrollTop ?? scrollTop) - scrollTop
+      const delta =
+        Math.max(
+          state.lastScrollTop ?? scrollTop,
+          state.ignoreScrollToTop ?? scrollTop
+        ) - scrollTop
       if (
         state.isAtBottom &&
         !state.escapedFromLock &&

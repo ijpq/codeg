@@ -230,6 +230,9 @@ try {
     JSON.stringify(
       {
         baseline,
+        transitions: await testPage
+          ?.evaluate(() => window.scrollTransitions)
+          .catch(() => null),
         failures,
         results,
         writes: await testPage
