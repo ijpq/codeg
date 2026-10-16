@@ -492,6 +492,7 @@ pub async fn acp_set_config_option(
 pub struct AcpGoalControlParams {
     pub connection_id: String,
     pub action: crate::acp::connection::GoalControlAction,
+    pub objective: Option<String>,
 }
 
 pub async fn acp_goal_control(
@@ -500,7 +501,7 @@ pub async fn acp_goal_control(
 ) -> Result<Json<()>, AppCommandError> {
     let manager = &state.connection_manager;
     manager
-        .goal_control(&state.db.conn, &params.connection_id, params.action)
+        .goal_control_with_objective(&state.db.conn, &params.connection_id, params.action, params.objective)
         .await
         .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
     Ok(Json(()))
@@ -1631,4 +1632,12 @@ mod tests {
         assert!(text.contains(r#"{"agentType":"antigravity"}"#));
         assert!(!text.contains("codex"));
     }
+}
+
+pub async fn acp_get_goal_state(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<AcpConnectionIdParams>,
+) -> Result<Json<serde_json::Value>, AppCommandError> {
+    acp_commands::acp_get_goal_state_core(&state.connection_manager, &params.connection_id).await
+        .map(Json).map_err(|error| AppCommandError::task_execution_failed(error.to_string()))
 }

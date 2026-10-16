@@ -2612,6 +2612,8 @@ const ConversationTabView = memo(function ConversationTabView({
       (connStatus === "connected" || connStatus === "prompting") &&
       !conn.isViewer
     return {
+      connectionId: conn.connectionId,
+      readOnly: !live,
       onGoalControl: live
         ? (action) => {
             void acpActions.goalControl(tabId, action)

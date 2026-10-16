@@ -87,6 +87,7 @@ import { ComposerContextUsage } from "@/components/chat/composer-context-usage"
 import { ComposerCodexQuota } from "@/components/chat/composer-codex-quota"
 import { ComposerConnectionStatus } from "@/components/chat/composer-connection-status"
 import { InlineModeSelector } from "@/components/chat/mode-selector"
+import { ExecutionModeControl } from "@/components/chat/execution-mode-control"
 import {
   InlineSessionConfigSelector,
   InlineSessionConfigToggle,
@@ -943,9 +944,22 @@ export function MessageInput({
     () => vocabulary.modes(modes ?? []),
     [modes, vocabulary]
   )
+  const executionOption =
+    agentType === "codex"
+      ? configOptions?.find(
+          (option) =>
+            option.id === "collaboration_mode" && option.kind.type === "select"
+        )
+      : undefined
   const availableConfigOptions = useMemo(
-    () => vocabulary.configOptions(configOptions ?? []),
-    [configOptions, vocabulary]
+    () =>
+      vocabulary
+        .configOptions(configOptions ?? [])
+        .filter(
+          (option) =>
+            agentType !== "codex" || option.id !== "collaboration_mode"
+        ),
+    [configOptions, vocabulary, agentType]
   )
   const hasConfigOptions = availableConfigOptions.length > 0
   const hasModes = availableModes.length > 0
@@ -2408,6 +2422,13 @@ export function MessageInput({
                     onAddFeedback={onAddFeedback}
                     feedbackAddDisabled={feedbackAddDisabled}
                   />
+                  {executionOption && (
+                    <ExecutionModeControl
+                      option={executionOption}
+                      onSelect={onConfigOptionChange}
+                      active={isActive !== false}
+                    />
+                  )}
                   {hasInlineSelectors && (
                     <div className="hidden min-w-0 items-end gap-1 @[30rem]:flex">
                       {inlineSelectorItems}

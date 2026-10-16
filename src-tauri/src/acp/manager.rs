@@ -3076,6 +3076,15 @@ impl ConnectionManager {
         config_id: String,
         value_id: String,
     ) -> Result<(), AcpError> {
+        // Changing collaboration mode must never leave a native goal running.
+        // The composer first pauses it through the confirmed goal RPC.
+        if config_id == "collaboration_mode" {
+            if let Some(state) = self.get_state(conn_id).await {
+                if state.read().await.goal_active {
+                    return Err(AcpError::protocol("Pause the active goal before switching execution mode"));
+                }
+            }
+        }
         let cmd_tx = {
             let connections = self.connections.lock().await;
             let conn = connections
@@ -3143,6 +3152,16 @@ impl ConnectionManager {
         conn_id: &str,
         action: GoalControlAction,
     ) -> Result<(), AcpError> {
+        self.goal_control_with_objective(db, conn_id, action, None).await
+    }
+
+    pub async fn goal_control_with_objective(
+        &self,
+        db: &sea_orm::DatabaseConnection,
+        conn_id: &str,
+        action: GoalControlAction,
+        objective: Option<String>,
+    ) -> Result<(), AcpError> {
         let (cmd_tx, agent_type, state_arc) = {
             let connections = self.connections.lock().await;
             let conn = connections
@@ -3150,12 +3169,31 @@ impl ConnectionManager {
                 .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?;
             (conn.cmd_tx.clone(), conn.agent_type, conn.state.clone())
         };
+        let objective = objective.map(|value| value.trim().to_string());
+        if action == GoalControlAction::Set && objective.as_deref().is_none_or(str::is_empty) {
+            return Err(AcpError::protocol("Goal objective must not be empty"));
+        }
+        if let Some(actions) = state_arc.read().await.goal_actions.as_ref() {
+            let wire_action = serde_json::to_value(action).unwrap();
+            if !actions.iter().any(|item| Some(item.as_str()) == wire_action.as_str()) {
+                return Err(AcpError::protocol("Goal action is not supported by this adapter"));
+            }
+        } else if matches!(action, GoalControlAction::Set | GoalControlAction::Resume) {
+            return Err(AcpError::protocol("Goal capabilities are not known yet"));
+        }
+        if matches!(action, GoalControlAction::Set | GoalControlAction::Resume) {
+            let state = state_arc.read().await;
+            if state.goal_active || state.turn_in_flight {
+                return Err(AcpError::protocol("Stop the current work before starting or resuming a goal"));
+            }
+        }
         // Read the goal state as it was when the user clicked — reading it after
         // the round-trip would see the transition we just asked for.
         let interrupts = crate::acp::registry::goal_control_is_out_of_band(agent_type)
+            && matches!(action, GoalControlAction::Pause | GoalControlAction::Clear)
             && state_arc.read().await.goal_active;
         // Only ask for an answer when it would change what we do next.
-        let (reply_tx, reply_rx) = if interrupts {
+        let (reply_tx, reply_rx) = if interrupts || agent_type == AgentType::Codex {
             let (tx, rx) = tokio::sync::oneshot::channel();
             (Some(tx), Some(rx))
         } else {
@@ -3164,6 +3202,7 @@ impl ConnectionManager {
         cmd_tx
             .send(ConnectionCommand::GoalControl {
                 action,
+                objective,
                 reply: reply_tx,
             })
             .await
@@ -3173,8 +3212,9 @@ impl ConnectionManager {
             return Ok(());
         };
         if !matches!(reply_rx.await, Ok(true)) {
-            return Ok(());
+            return Err(AcpError::protocol("The adapter did not confirm the goal action"));
         }
+        if !interrupts { return Ok(()); }
         tracing::info!(
             "[ACP] goal {:?} landed; interrupting so the work stops now connection={}",
             action,
@@ -8535,7 +8575,7 @@ mod tests {
     > {
         tokio::spawn(async move {
             match rx.recv().await.expect("goal control enqueued") {
-                ConnectionCommand::GoalControl { action, reply } => {
+                ConnectionCommand::GoalControl { action, reply, .. } => {
                     assert_eq!(action, expected);
                     reply
                         .expect("an interrupting caller attaches a reply")
@@ -8592,7 +8632,7 @@ mod tests {
 
         mgr.goal_control(&db.conn, "c-goal-refused", GoalControlAction::Pause)
             .await
-            .unwrap();
+            .unwrap_err();
 
         let mut rx = loop_stub.await.unwrap();
         assert!(rx.try_recv().is_err(), "a failed control cancels nothing");
@@ -8636,21 +8676,16 @@ mod tests {
         use crate::db::test_helpers;
         let db = test_helpers::fresh_in_memory_db().await;
         let mgr = ConnectionManager::new();
-        let mut rx = insert_live_connection(&mgr, "c-goal-paused", AgentType::Codex, None).await;
+        let rx = insert_live_connection(&mgr, "c-goal-paused", AgentType::Codex, None).await;
         mark_prompting(&mgr, "c-goal-paused").await; // the user's own prompt
                                                      // `goal_active` stays false: the last snapshot was `paused`.
 
+        let loop_stub = answer_goal_control(rx, GoalControlAction::Clear, true);
         mgr.goal_control(&db.conn, "c-goal-paused", GoalControlAction::Clear)
             .await
             .unwrap();
 
-        match rx.try_recv() {
-            Ok(ConnectionCommand::GoalControl { action, reply }) => {
-                assert_eq!(action, GoalControlAction::Clear);
-                assert!(reply.is_none(), "no interrupt is intended, so none waits");
-            }
-            _ => panic!("expected a GoalControl command"),
-        }
+        let mut rx = loop_stub.await.unwrap();
         assert!(rx.try_recv().is_err(), "the user's turn survives");
     }
 
@@ -8675,13 +8710,43 @@ mod tests {
             .unwrap();
 
         match rx.try_recv() {
-            Ok(ConnectionCommand::GoalControl { action, reply }) => {
+            Ok(ConnectionCommand::GoalControl { action, reply, .. }) => {
                 assert_eq!(action, GoalControlAction::Clear);
                 assert!(reply.is_none(), "nobody waits on an in-band control");
             }
             _ => panic!("expected a GoalControl command"),
         }
         assert!(rx.try_recv().is_err(), "the carrying turn survives");
+    }
+
+    #[tokio::test]
+    async fn goal_start_requires_capabilities_and_a_nonempty_objective() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let mgr = ConnectionManager::new();
+        let mut rx = insert_live_connection(&mgr, "goal-create", AgentType::Codex, None).await;
+        assert!(mgr.goal_control_with_objective(&db.conn, "goal-create", GoalControlAction::Set, Some("".into())).await.is_err());
+        assert!(mgr.goal_control_with_objective(&db.conn, "goal-create", GoalControlAction::Set, Some("ship".into())).await.is_err());
+        assert!(rx.try_recv().is_err());
+        mgr.get_state("goal-create").await.unwrap().write().await.goal_actions = Some(vec!["set".into(), "resume".into()]);
+        let responder = tokio::spawn(async move {
+            let Some(ConnectionCommand::GoalControl { action, objective, reply }) = rx.recv().await else { panic!("goal command") };
+            assert_eq!(action, GoalControlAction::Set);
+            assert_eq!(objective.as_deref(), Some("ship"));
+            reply.unwrap().send(true).unwrap();
+            rx
+        });
+        mgr.goal_control_with_objective(&db.conn, "goal-create", GoalControlAction::Set, Some("  ship  ".into())).await.unwrap();
+        let mut rx = responder.await.unwrap();
+        assert!(rx.try_recv().is_err(), "creating a goal must not cancel it");
+    }
+
+    #[tokio::test]
+    async fn collaboration_mode_cannot_change_while_a_goal_remains_active() {
+        let mgr = ConnectionManager::new();
+        let mut rx = insert_live_connection(&mgr, "goal-mode", AgentType::Codex, None).await;
+        mark_goal_active(&mgr, "goal-mode").await;
+        assert!(mgr.set_config_option("goal-mode", "collaboration_mode".into(), "plan".into()).await.is_err());
+        assert!(rx.try_recv().is_err(), "no switch while the goal could continue");
     }
 
     async fn mark_native_steer_ready(mgr: &ConnectionManager, conn_id: &str) {

@@ -1144,7 +1144,9 @@ fn prepend_officecli_path(env: &mut BTreeMap<String, String>) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum GoalControlAction {
+    Set,
     Pause,
+    Resume,
     Clear,
 }
 
@@ -1201,6 +1203,7 @@ pub enum ConnectionCommand {
     },
     GoalControl {
         action: GoalControlAction,
+        objective: Option<String>,
         /// Did the goal-control request LAND? Attached only by a caller that
         /// intends to follow a successful control with an interrupt
         /// (`ConnectionManager::goal_control`), because aborting the turn is
@@ -9568,16 +9571,30 @@ async fn send_goal_control(
     cx: &ConnectionTo<Agent>,
     session_id: &SessionId,
     action: GoalControlAction,
+    objective: Option<&str>,
+    state: &Arc<RwLock<SessionState>>,
+    emitter: &EventEmitter,
     method: &str,
 ) -> Result<(), agent_client_protocol::Error> {
     // `method` is the connection's stored `goal_control_method`: the
     // advertised provider-neutral `_session/goal` (claude 0.66+/codex 1.2+)
     // or the legacy `_codex/session/goal_control` default. Both take the
     // same `{sessionId, action}` request shape.
-    let params = serde_json::json!({
+    // Goals run in Codex's execution mode. Confirm the native configuration
+    // before arming the goal; a rejected Plan -> Default change aborts creation.
+    if matches!(action, GoalControlAction::Set | GoalControlAction::Resume)
+        && state.read().await.agent_type == AgentType::Codex
+    {
+        set_session_config_option(cx, session_id, state, emitter,
+            "collaboration_mode".into(), "default".into()).await?;
+    }
+    let mut params = serde_json::json!({
         "sessionId": session_id,
         "action": action,
     });
+    if let Some(objective) = objective {
+        params["objective"] = serde_json::json!(objective);
+    }
     let untyped_req = UntypedMessage::new(method, params).map_err(|e| {
         agent_client_protocol::util::internal_error(format!(
             "Failed to build goal_control request: {e}"
@@ -12966,10 +12983,10 @@ async fn run_conversation_loop(
                                         .await;
                                     }
                                 }
-                                Some(ConnectionCommand::GoalControl { action, reply }) => {
+                                Some(ConnectionCommand::GoalControl { action, objective, reply }) => {
                                     let method = state.read().await.goal_control_method.clone();
                                     let landed =
-                                        match send_goal_control(&cx, &sid, action, &method).await {
+                                        match send_goal_control(&cx, &sid, action, objective.as_deref(), state, emitter, &method).await {
                                             Ok(()) => true,
                                             Err(e) => {
                                                 emit_with_state(
@@ -13303,11 +13320,11 @@ async fn run_conversation_loop(
                     .await;
                 }
             }
-            Some(ConnectionCommand::GoalControl { action, reply }) => {
+            Some(ConnectionCommand::GoalControl { action, objective, reply }) => {
                 let cx = session.connection();
                 let sid = session.session_id().clone();
                 let method = state.read().await.goal_control_method.clone();
-                let landed = match send_goal_control(&cx, &sid, action, &method).await {
+                let landed = match send_goal_control(&cx, &sid, action, objective.as_deref(), state, emitter, &method).await {
                     Ok(()) => true,
                     Err(e) => {
                         emit_with_state(
@@ -19575,7 +19592,9 @@ async fn emit_conversation_update(
                 // goal justifies following a pause/clear with an interrupt. A
                 // paused goal is not driving anything, so clearing it must
                 // leave whatever the user started themselves alone.
-                state.write().await.goal_active = cb_state.codex_open_goal.is_some();
+                let mut goal_state = state.write().await;
+                goal_state.goal_active = cb_state.codex_open_goal.is_some();
+                goal_state.goal = goal.clone();
             }
             // JetBrains AIR typed session failure (claude-agent-acp 0.67+/
             // codex-acp 1.2+): published only because codeg advertises
