@@ -200,6 +200,9 @@ jobs:
 
   build-tauri:
     needs: create-draft-release
+    env:
+      # Apply to the application and both prepared sidecars.
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: "-C target-feature=+crt-static"
     # v0.30.7-fix1 is the server-only maintenance release requested by the
     # operator. Keep the normal desktop matrix for later tags.
     if: github.event_name == 'push' && github.ref_name != 'v0.30.7-fix1'
@@ -888,6 +891,8 @@ jobs:
 
       - name: Rust cache
         uses: swatinem/rust-cache@v2
+        env:
+          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: "-C target-feature=+crt-static"
         with:
           workspaces: "./src-tauri -> target"
           shared-key: server-${{ matrix.target }}
@@ -987,6 +992,9 @@ jobs:
 
       - name: Build server + codeg-mcp companion + computer-use helper
         working-directory: src-tauri
+        env:
+          # The separate pinned CLI already sets static CRT in its own builder.
+          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: "-C target-feature=+crt-static"
         # `codeg-mcp` is the stdio MCP companion the runtime injects per
         # session (see acp/delegation/companion.rs). Built with the same
         # `--no-default-features --target` flags as the server so it shares
@@ -1284,6 +1292,7 @@ jobs:
             ${{ runner.temp }}/draft-verification/**/*.png
             ${{ runner.temp }}/draft-verification/**/scroll-results.json
             ${{ runner.temp }}/draft-verification/**/resources-and-migrations.json
+            ${{ runner.temp }}/draft-verification/**/*dependencies.json
           if-no-files-found: warn
           retention-days: 14
 
@@ -1500,5 +1509,6 @@ jobs:
             ${{ runner.temp }}/published-verification/**/*.png
             ${{ runner.temp }}/published-verification/**/scroll-results.json
             ${{ runner.temp }}/published-verification/**/resources-and-migrations.json
+            ${{ runner.temp }}/published-verification/**/*dependencies.json
           if-no-files-found: warn
           retention-days: 14
