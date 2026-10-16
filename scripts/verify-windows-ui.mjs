@@ -753,12 +753,6 @@ async function nativeDraftGoalPage(page, api, name) {
       .click()
     await until(goal, (value) => value.goal?.status === "paused", "pause")
     await page.keyboard.press("Escape")
-    await page
-      .locator(".chat-scroll-port:visible")
-      .last()
-      .getByText("SYNTHETIC NATIVE GOAL RESPONSE", { exact: true })
-      .first()
-      .waitFor({ timeout: 60_000 })
     const detail = await until(
       () =>
         api("get_folder_conversation", {
@@ -770,12 +764,30 @@ async function nativeDraftGoalPage(page, api, name) {
       "persisted native output"
     )
     assert.equal(detail.summary.external_id, row.external_id)
+    await writeFile(
+      join(output, `${name}-draft-goal-paused-detail.json`),
+      JSON.stringify(detail, null, 2)
+    )
+    const response = () =>
+      page
+        .locator(".chat-scroll-port:visible")
+        .last()
+        .getByText("SYNTHETIC NATIVE GOAL RESPONSE", { exact: true })
+        .first()
+    await response().waitFor({ timeout: 60_000 })
+    await page.screenshot({
+      path: join(output, `${name}-draft-goal-paused.png`),
+    })
     await trigger().click()
     await dialog()
       .getByRole("button", { name: /^(End goal|结束目标|結束目標)$/ })
       .click()
     await until(goal, (value) => value.goal === null, "ended")
     await page.keyboard.press("Escape")
+    // Include the trailing out-of-prompt read, rather than only the previous
+    // frame's still-visible answer before the clear snapshot is projected.
+    await delay(2000)
+    await response().waitFor({ timeout: 60_000 })
     await page.reload()
     const restoredTab = page.locator(
       `[data-tab-id="conv-${row.folder_id}-codex-${row.id}"] [role="tab"]`
@@ -797,6 +809,8 @@ async function nativeDraftGoalPage(page, api, name) {
       conversationId: row.id,
       nativeSessionId: row.external_id,
       outputVisible: true,
+      pausedOutputVisible: true,
+      endedOutputVisible: true,
       restoredAfterReload: true,
     })
   } catch (error) {

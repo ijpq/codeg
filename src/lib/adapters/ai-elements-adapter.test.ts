@@ -708,7 +708,8 @@ describe("groupGoalRuns", () => {
       nextText,
       poll("update_goal"),
     ])
-    expect(goalRunOf(firstMerge[0]).items).toEqual([firstText, nextText])
+    expect(goalRunOf(firstMerge[0]).items).toEqual([])
+    expect(firstMerge.slice(1)).toEqual([firstText, nextText])
     expect(goalRunOf(unfinished).items).toEqual([firstText])
 
     const secondMerge = groupGoalRuns([
@@ -716,7 +717,7 @@ describe("groupGoalRuns", () => {
       nextText,
       poll("update_goal"),
     ])
-    expect(goalRunOf(secondMerge[0]).items).toEqual([firstText, nextText])
+    expect(secondMerge).toEqual(firstMerge)
   })
 
   it("merges repeated unfinished goal runs into one cross-turn card", () => {
@@ -1087,7 +1088,11 @@ describe("adaptMessageTurn goal update text", () => {
       true
     )
 
-    expect(adapted.content.map((p) => p.type)).toEqual(["goal-run", "text"])
+    expect(adapted.content.map((p) => p.type)).toEqual([
+      "goal-run",
+      "text",
+      "text",
+    ])
     const goalRun = goalRunOf(adapted.content[0])
     expect(JSON.parse(goalRun.start.input ?? "{}")).toEqual({
       objective: "分析 README 文件",
@@ -1098,16 +1103,17 @@ describe("adaptMessageTurn goal update text", () => {
         status: "complete",
       },
     })
-    expect(goalRun.items).toEqual([
+    expect(goalRun.items).toEqual([])
+    expect(adapted.content.slice(1)).toEqual([
       {
         type: "text",
         text: "我也顺手对照了 `package.json` 和 `app` 目录。",
       },
+      {
+        type: "text",
+        text: "已分析 [README.md](/Users/xggz/my/my-app/README.md:1)。",
+      },
     ])
-    expect(adapted.content[1]).toEqual({
-      type: "text",
-      text: "已分析 [README.md](/Users/xggz/my/my-app/README.md:1)。",
-    })
   })
 
   it("keeps the known streaming objective when later text is appended without a separator", () => {
