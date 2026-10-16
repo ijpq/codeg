@@ -2558,8 +2558,9 @@ const ConversationTabView = memo(function ConversationTabView({
   // here (where the connection is owned) rather than in the deep goal card.
   // `null` when the session isn't live or the user is a viewer → the card hides
   // its buttons. Codex is the only agent that produces goal cards, so no
-  // agent-type gate is needed. Provided only around the main panel's list; the
-  // read-only sub-agent dialog renders its own MessageListView with no provider.
+  // agent-type gate is needed. The provider covers both the transcript and
+  // composer, including the welcome input. Read-only transcript viewers reset
+  // this context so they cannot control the parent conversation's Goal.
   // The adapter's ADVERTISED goal-control vocabulary (fail-closed: no
   // controls until the snapshot for this exact connectionId reports a known
   // one — see `useAdvertisedGoalActions`). `connStatus` is what brings the
@@ -2748,7 +2749,6 @@ const ConversationTabView = memo(function ConversationTabView({
   )
 
   const messageListNode = (
-    <GoalControlProvider value={goalControlValue}>
       <MessageListView
         conversationId={effectiveConversationId}
         imageRoot={workingDirForConnection ?? null}
@@ -2800,7 +2800,6 @@ const ConversationTabView = memo(function ConversationTabView({
           hasPersistedConversation ? handleForkFromMessage : null
         }
       />
-    </GoalControlProvider>
   )
 
   // Live-feedback bar gating + the "agent never read your note" resend fallback.
@@ -3161,6 +3160,7 @@ const ConversationTabView = memo(function ConversationTabView({
   }
 
   return (
+    <GoalControlProvider value={goalControlValue}>
     <ConversationShell
       resizableWidth
       getSentHistory={getSentHistory}
@@ -3326,8 +3326,32 @@ const ConversationTabView = memo(function ConversationTabView({
                   disabled={dbConversationId != null}
                 />
               </div>
+              <div className="flex-1" />
+              <div className="mx-auto w-full chat-content-w shrink-0 px-4 pb-6">
+                <WelcomeTip />
+              </div>
+            </div>
+          </ScrollArea>
+        ) : showDraftHeader ? (
+          <div className="flex h-full min-h-0 flex-col">
+            <div className="px-4 pt-3 pb-2">
+              <AgentSelector
+                defaultAgentType={selectedAgent}
+                onSelect={handleAgentSelect}
+                onFallback={handleAgentFallback}
+                onAgentsLoaded={(agents) => {
+                  setAgentsLoaded(true)
+                  setUsableAgentCount(
+                    agents.filter((agent) => agent.enabled && agent.available)
+                      .length
+                  )
+                }}
+                onOpenAgentsSettings={handleOpenAgentsSettings}
+                // Same draft/saved rule as the welcome-mode picker above.
+                disabled={dbConversationId != null}
+              />
               {composerBlockedMessage ? (
-                <div className="flex w-full items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+                <div className="mt-2 flex w-full items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
                   <button
                     type="button"
                     onClick={handleOpenAgentsSettings}
@@ -3347,109 +3371,30 @@ const ConversationTabView = memo(function ConversationTabView({
                   ) : null}
                 </div>
               ) : null}
-              <ChatInput
-                // composerConnStatus (not connStatus): a chat draft mid-reconnect
-                // reads "connecting" until the connection's cwd matches, so the
-                // send affordance stays disabled until handleSend would accept it.
-                status={composerConnStatus}
-                promptCapabilities={conn.promptCapabilities}
-                defaultPath={workingDirForConnection}
-                agentName={getAgentLabel(selectedAgent)}
-                onFocus={handleFocus}
-                onSend={handleSend}
-                onCancel={handleCancel}
-                modes={connectionModes}
-                configOptions={connectionConfigOptions}
-                modeLoading={modeLoading}
-                configOptionsLoading={configOptionsLoading}
-                selectorsLoading={selectorsLoading}
-                selectedModeId={selectedModeId}
-                onModeChange={handleModeChange}
-                onConfigOptionChange={handleSetConfigOption}
-                agentType={selectedAgent}
-                availableCommands={connectionCommands}
-                attachmentTabId={tabId}
-                draftStorageKey={draftStorageKey}
-                isActive={isActive}
-                showActiveFlow={showActiveFlow}
-                onAddFeedback={
-                  feedback.featureEnabled ? feedback.openDialog : undefined
-                }
-                feedbackAddDisabled={!feedback.canSubmit}
-                injectContent={composerInject}
-                onInjectConsumed={handleComposerInjectConsumed}
-                flush
-                tall
-              />
             </div>
-            <div className="flex-1" />
-            <div className="mx-auto w-full chat-content-w shrink-0 px-4 pb-6">
-              <WelcomeTip />
-            </div>
+            <div className="min-h-0 flex-1">{messageListNode}</div>
           </div>
-        </ScrollArea>
-      ) : showDraftHeader ? (
-        <div className="flex h-full min-h-0 flex-col">
-          <div className="px-4 pt-3 pb-2">
-            <AgentSelector
-              defaultAgentType={selectedAgent}
-              onSelect={handleAgentSelect}
-              onFallback={handleAgentFallback}
-              onAgentsLoaded={(agents) => {
-                setAgentsLoaded(true)
-                setUsableAgentCount(
-                  agents.filter((agent) => agent.enabled && agent.available)
-                    .length
-                )
-              }}
-              onOpenAgentsSettings={handleOpenAgentsSettings}
-              // Same draft/saved rule as the welcome-mode picker above.
-              disabled={dbConversationId != null}
-            />
-            {composerBlockedMessage ? (
-              <div className="mt-2 flex w-full items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
-                <button
-                  type="button"
-                  onClick={handleOpenAgentsSettings}
-                  title={composerBlockedMessage}
-                  className="min-w-0 flex-1 cursor-pointer overflow-hidden text-ellipsis whitespace-nowrap text-left transition-colors hover:text-destructive/80"
-                >
-                  {composerBlockedMessage}
-                </button>
-                {selectedAgentNotInstalled ? (
-                  <button
-                    type="button"
-                    onClick={() => setComposerDiagnosticsOpen(true)}
-                    className="shrink-0 rounded border border-destructive/40 px-2 py-0.5 font-medium transition-colors hover:bg-destructive/10"
-                  >
-                    {tDiag("button")}
-                  </button>
-                ) : null}
-              </div>
-            ) : null}
-          </div>
-          <div className="min-h-0 flex-1">{messageListNode}</div>
-        </div>
-      ) : (
-        messageListNode
-      )}
-      <FeedbackDialog
-        open={feedback.dialogOpen}
-        onOpenChange={(open) => {
-          if (open) feedback.openDialog()
-          else feedback.closeDialog()
-        }}
-        onSubmit={feedback.submit}
-        submitting={feedback.submitting}
-        agentName={getAgentLabel(selectedAgent)}
-        channel={feedback.channel}
-      />
-      <AgentDiagnosticsDialog
-        open={composerDiagnosticsOpen}
-        onOpenChange={setComposerDiagnosticsOpen}
-        agentType={selectedAgent}
-      />
-    </ConversationShell>
+        ) : (
+          messageListNode
+        )}
+        <FeedbackDialog
+          open={feedback.dialogOpen}
+          onOpenChange={(open) => {
+            if (open) feedback.openDialog()
+            else feedback.closeDialog()
+          }}
+          onSubmit={feedback.submit}
+          submitting={feedback.submitting}
+          agentName={getAgentLabel(selectedAgent)}
+          channel={feedback.channel}
+        />
+        <AgentDiagnosticsDialog
+          open={composerDiagnosticsOpen}
+          onOpenChange={setComposerDiagnosticsOpen}
+          agentType={selectedAgent}
+        />
+      </ConversationShell>
+    </GoalControlProvider>
   )
 })
 
