@@ -357,6 +357,27 @@ describe("MessageThread escape on user scroll", () => {
     expect(testState.stopScroll).toHaveBeenCalledTimes(1)
   })
 
+  it.each([
+    { name: "Ctrl+Home", ctrlKey: true, metaKey: false },
+    { name: "Cmd+Home", ctrlKey: false, metaKey: true },
+  ])("escapes on $name while leaving editor navigation alone", (modifiers) => {
+    const row = mountScrollable()
+    const input = document.createElement("textarea")
+    viewport().appendChild(input)
+    const key = () =>
+      new KeyboardEvent("keydown", {
+        key: "Home",
+        ctrlKey: modifiers.ctrlKey,
+        metaKey: modifiers.metaKey,
+        bubbles: true,
+      })
+
+    input.dispatchEvent(key())
+    expect(testState.stopScroll).not.toHaveBeenCalled()
+    row.dispatchEvent(key())
+    expect(testState.stopScroll).toHaveBeenCalledTimes(1)
+  })
+
   // The reported bug, scrollbar: a drag reaches the library only as scroll
   // events, which it discards while a content resize is in flight.
   it("escapes when the scrollbar is dragged up, even mid-resize", () => {
