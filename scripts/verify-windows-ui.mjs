@@ -115,6 +115,29 @@ async function install(setup, path) {
   await run(resolve(setup), ["/S", `/D=${path}`])
   assert.ok((await readFile(join(path, "codeg.exe"))).length > 1_000_000)
 }
+async function stopOwnedProcess(child) {
+  if (child.exitCode !== null || child.signalCode !== null) return
+  // WebView2 children can exit while taskkill enumerates the tree. Windows
+  // then returns 128 even after killing the owned root. Observe that process's
+  // actual exit rather than a stale exitCode during execFileSync's blocked tick.
+  await new Promise((done, fail) => {
+    let killError
+    const onExit = () => {
+      clearTimeout(timer)
+      done()
+    }
+    const timer = setTimeout(() => {
+      child.removeListener("exit", onExit)
+      fail(killError ?? Error(`Owned process ${child.pid} did not exit`))
+    }, 10_000)
+    child.once("exit", onExit)
+    try {
+      execFileSync("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"])
+    } catch (error) {
+      killError = error
+    }
+  })
+}
 async function startDesktop(installDir, f, name) {
   const port = await reservePort()
   const env = {
@@ -159,22 +182,15 @@ async function startDesktop(installDir, f, name) {
     )
     return { child, browser, page, port, log }
   } catch (error) {
-    if (child.pid && child.exitCode === null)
-      execFileSync("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"])
     await browser?.close().catch(() => {})
+    if (child.pid) await stopOwnedProcess(child)
     log.end()
     throw error
   }
 }
 async function stopDesktop(app) {
   await app.browser.close().catch(() => {})
-  if (app.child.exitCode === null) {
-    try {
-      execFileSync("taskkill.exe", ["/PID", String(app.child.pid), "/T", "/F"])
-    } catch (error) {
-      if (app.child.exitCode === null) throw error
-    }
-  }
+  await stopOwnedProcess(app.child)
   await delay(1000)
   app.log.end()
 }
