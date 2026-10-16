@@ -108,7 +108,7 @@ try {
         viewport: { width: 1000, height: 800 },
         deviceScaleFactor: 1.25,
       })
-  const page = await context.newPage()
+  const page = remote ? context.pages()[0] : await context.newPage()
   testPage = page
   const errors = []
   page.on("pageerror", (error) => errors.push(String(error)))

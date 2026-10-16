@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import importlib.util
 from pathlib import Path
 import socket
 import secrets
@@ -23,6 +24,10 @@ def main():
     root = args.root.resolve(strict=True)
     logs = args.log_dir.resolve()
     logs.mkdir(parents=True, exist_ok=True)
+    spec = importlib.util.spec_from_file_location("release_resources", Path(__file__).with_name("release-resources.py"))
+    resources = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(resources)
+    inventory = resources.verify(root / "web", args.version)
     suffix = ".exe" if os.name == "nt" else ""
     server = root / ("codeg-server" + suffix)
     companion = root / ("codeg-mcp" + suffix)
@@ -122,6 +127,8 @@ def main():
                 with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=2) as response:
                     if response.status != 200 or b"<html" not in response.read().lower():
                         raise RuntimeError("Packaged frontend is not served")
+                inventory["database"] = resources.verify_db(Path(environment["CODEG_DATA_DIR"]))
+                (logs / "resources-and-migrations.json").write_text(json.dumps(inventory, indent=2))
                 print(json.dumps({"version": args.version, "server": "passed", "mcp": "passed", "static": "passed", "startup_ms": round((time.monotonic() - started) * 1000)}))
             finally:
                 # Only the child created here; no service lookup or shared-port shutdown.
