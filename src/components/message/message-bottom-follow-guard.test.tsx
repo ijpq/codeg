@@ -242,6 +242,7 @@ it("does not spin animation frames at a settled, rounded target", async () => {
 it("observes a replacement last row after an earlier measurement", async () => {
   const view = render(<MessageBottomFollowGuard layoutSignal="complete:4" />)
   await flushFrames()
+  const oldRow = h.content!.querySelector('[data-message-thread-last="true"]')!
   const row = document.createElement("div")
   row.dataset.messageThreadLast = "true"
   setRect(row, { top: 300, bottom: 375 })
@@ -252,5 +253,17 @@ it("observes a replacement last row after an earlier measurement", async () => {
     await Promise.resolve()
   })
   expect(h.observers[0]!.observe).toHaveBeenCalledWith(row)
+  expect(h.observers[0]!.unobserve).toHaveBeenCalledWith(oldRow)
+  const observations = h.observers[0]!.observe.mock.calls.length
+  await act(async () => {
+    row.append(document.createElement("span"))
+    await Promise.resolve()
+  })
+  expect(h.observers[0]!.observe).toHaveBeenCalledTimes(observations)
+  await act(async () => {
+    row.remove()
+    await Promise.resolve()
+  })
+  expect(h.observers[0]!.unobserve).toHaveBeenCalledWith(row)
   view.unmount()
 })
