@@ -43,6 +43,11 @@ const eslintConfig = defineConfig([
     // PDF.js's worker and wasm-decoder fallbacks, copied out of
     // node_modules by postinstall like Monaco's above.
     "public/pdfjs/**",
+    // Local release staging and diagnostic captures are generated output.
+    // They can contain a second copy of the exported frontend and must not be
+    // traversed by `pnpm eslint .`.
+    "release/**",
+    "artifacts/**",
     // Gitignored scratch space for planning/review docs and one-off probe
     // scripts. Prettier already skips it — its `--ignore-path` defaults to
     // `.gitignore` — but flat config has no such default, so without this

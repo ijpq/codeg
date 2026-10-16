@@ -5,7 +5,6 @@ import type { DbConversationDetail, MessageTurn } from "@/lib/types"
 import {
   type ConversationRuntimeSession,
   resetConversationRuntimeStore,
-  TAIL_TURNS_DEFAULT,
   useConversationRuntimeStore,
 } from "@/stores/conversation-runtime-store"
 import {
@@ -18,6 +17,7 @@ import {
 vi.mock("@/lib/api", () => ({
   getFolderConversation: vi.fn(),
   getFolderConversationTurns: vi.fn(),
+  invalidateFolderConversationCache: vi.fn(),
 }))
 
 const { getFolderConversation } = await import("@/lib/api")
@@ -46,6 +46,7 @@ function seedSession(
           pendingBackgroundSettlements: [],
           optimisticTurns: [],
           liveMessage: null,
+          promptDeliveries: {},
           syncState: "idle",
           activeTurnToken: null,
           lastTurnOwned: false,
@@ -183,7 +184,11 @@ describe("useConversationDetail visibility gating", () => {
     })
 
     expect(mockGet).toHaveBeenCalledTimes(1)
-    expect(mockGet).toHaveBeenCalledWith(CID, { tailTurns: TAIL_TURNS_DEFAULT })
+    expect(mockGet).toHaveBeenCalledWith(CID, {
+      userTurnLimit: 25,
+      requestGeneration: 1,
+      signal: expect.any(AbortSignal),
+    })
   })
 
   // A hidden tab is not session-less: the panel's mount effects (the runtime

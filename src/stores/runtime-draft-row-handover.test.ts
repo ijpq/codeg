@@ -33,6 +33,7 @@ import type { DbConversationDetail, MessageTurn } from "@/lib/types"
 
 vi.mock("@/lib/api", () => ({
   getFolderConversation: vi.fn(),
+  invalidateFolderConversationCache: vi.fn(),
 }))
 
 const { getFolderConversation } = await import("@/lib/api")
@@ -176,7 +177,10 @@ describe("handing a draft's runtime session to the row it created", () => {
     await flushMicrotasks()
 
     expect(mockGetFolderConversation).toHaveBeenCalledWith(ROW, {
-      tailTurns: 120,
+      cacheMode: "reload",
+      requestGeneration: expect.any(Number),
+      signal: expect.any(AbortSignal),
+      userTurnLimit: 25,
     })
     expect(session(ROW)?.syncState).toBe("awaiting_persist")
     expect(timelineIds(ROW)).toContain(SENT.id)

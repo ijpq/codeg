@@ -21,6 +21,7 @@ import {
   FolderX,
   Info,
   ChevronRight,
+  GitBranch,
 } from "lucide-react"
 import { useTranslations } from "next-intl"
 import { useImeGuard } from "@/hooks/use-ime-guard"
@@ -191,6 +192,7 @@ interface SidebarConversationCardProps {
   onRename: (id: number, newTitle: string) => Promise<void>
   onDelete: (id: number, agentType: string, folderId: number) => Promise<void>
   onStatusChange: (id: number, status: ConversationStatus) => Promise<void>
+  onCreateBranch?: (conversation: DbConversationSummary) => Promise<void>
   onNewConversation?: (folderId: number) => void
   onTogglePin?: (id: number, nextPinned: boolean) => void
   /** Delegation-tree nesting depth (0 = root). Drives the per-level indent. */
@@ -214,6 +216,7 @@ export const SidebarConversationCard = memo(function SidebarConversationCard({
   onRename,
   onDelete,
   onStatusChange,
+  onCreateBranch,
   onNewConversation,
   onTogglePin,
   depth = 0,
@@ -226,6 +229,7 @@ export const SidebarConversationCard = memo(function SidebarConversationCard({
   const tSidebar = useTranslations("Folder.sidebar")
   const tStatus = useTranslations("Folder.statusLabels")
   const tDetails = useTranslations("Folder.sessionDetails")
+  const tBranch = useTranslations("Folder.conversation.branch")
   const [renameOpen, setRenameOpen] = useState(false)
   const [deleteOpen, setDeleteOpen] = useState(false)
   const [detailsOpen, setDetailsOpen] = useState(false)
@@ -243,6 +247,7 @@ export const SidebarConversationCard = memo(function SidebarConversationCard({
   // Nor a branch chip, like they get no tags: their parent row carries it.
   const isSubsession = conversation.parent_id != null
   const branch = useBranchChip(isSubsession ? null : conversation.git_branch)
+  const [branchBusy, setBranchBusy] = useState(false)
 
   const handleClick = useCallback(() => {
     onSelect(conversation.id, conversation.agent_type, conversation.folder_id)
@@ -323,6 +328,16 @@ export const SidebarConversationCard = memo(function SidebarConversationCard({
     conversation.folder_id,
     onDelete,
   ])
+
+  const handleCreateBranch = useCallback(async () => {
+    if (!onCreateBranch || branchBusy) return
+    setBranchBusy(true)
+    try {
+      await onCreateBranch(conversation)
+    } finally {
+      setBranchBusy(false)
+    }
+  }, [branchBusy, conversation, onCreateBranch])
 
   const status = conversation.status as ConversationStatus
   const isRunning = status === "in_progress"
@@ -681,6 +696,19 @@ export const SidebarConversationCard = memo(function SidebarConversationCard({
               <Pencil className="h-4 w-4" />
               {t("rename")}
             </ContextMenuItem>
+            {onCreateBranch && (
+              <ContextMenuItem
+                disabled={branchBusy}
+                onSelect={handleCreateBranch}
+              >
+                {branchBusy ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <GitBranch className="h-4 w-4" />
+                )}
+                {tBranch("create")}
+              </ContextMenuItem>
+            )}
             {onTogglePin && (
               <ContextMenuItem
                 onSelect={() => onTogglePin(conversation.id, !isPinned)}

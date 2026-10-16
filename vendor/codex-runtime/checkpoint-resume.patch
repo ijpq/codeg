@@ -1,0 +1,2715 @@
+diff --git a/codex-rs/Cargo.lock b/codex-rs/Cargo.lock
+index 1cee117..1ff36df 100644
+--- a/codex-rs/Cargo.lock
++++ b/codex-rs/Cargo.lock
+@@ -276,7 +276,7 @@ checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
+ 
+ [[package]]
+ name = "app_test_support"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "base64 0.22.1",
+@@ -1895,7 +1895,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-agent-extension"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "codex-core",
+@@ -1907,7 +1907,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-agent-graph-store"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "codex-protocol",
+  "codex-state",
+@@ -1922,7 +1922,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-agent-identity"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "base64 0.22.1",
+@@ -1942,7 +1942,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-agent-message-board-client"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "chrono",
+@@ -1965,7 +1965,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-agent-message-board-extension"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "base64 0.22.1",
+  "caseless",
+@@ -1988,7 +1988,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-agent-roles"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "codex-config",
+  "codex-file-system",
+@@ -2001,7 +2001,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-analytics"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "codex-app-server-protocol",
+  "codex-git-utils",
+@@ -2024,7 +2024,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-ansi-escape"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "ansi-to-tui",
+  "pretty_assertions",
+@@ -2035,7 +2035,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-api"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "assert_matches",
+@@ -2073,7 +2073,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-app-server"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "app_test_support",
+@@ -2187,7 +2187,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-app-server-client"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "codex-app-server",
+  "codex-app-server-protocol",
+@@ -2214,7 +2214,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-app-server-daemon"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "blake3",
+@@ -2240,7 +2240,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-app-server-protocol"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "codex-app-server-protocol-noop-macros",
+@@ -2274,11 +2274,11 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-app-server-protocol-noop-macros"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ 
+ [[package]]
+ name = "codex-app-server-test-client"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "clap",
+@@ -2300,7 +2300,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-app-server-transport"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "axum",
+  "base64 0.22.1",
+@@ -2342,7 +2342,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-apply-patch"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "assert_cmd",
+@@ -2362,7 +2362,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-arg0"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "codex-apply-patch",
+@@ -2386,7 +2386,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-async-utils"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "pretty_assertions",
+  "rand 0.9.3",
+@@ -2396,7 +2396,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-attachment-store"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "pretty_assertions",
+  "serde",
+@@ -2406,7 +2406,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-aws-auth"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "aws-config",
+  "aws-credential-types",
+@@ -2432,7 +2432,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-backend-client"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "codex-api",
+@@ -2452,7 +2452,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-backend-openapi-models"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "serde",
+  "serde_json",
+@@ -2461,7 +2461,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-build-info"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "codex-install-context",
+  "pretty_assertions",
+@@ -2474,7 +2474,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-bwrap"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "cc",
+  "libc",
+@@ -2483,7 +2483,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-chatgpt"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "clap",
+@@ -2505,7 +2505,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-cli"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "app_test_support",
+@@ -2607,7 +2607,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-client"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "codex-http-client",
+  "eventsource-stream",
+@@ -2621,7 +2621,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-cloud-client"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "async-stream",
+@@ -2645,7 +2645,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-cloud-config"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "base64 0.22.1",
+  "chrono",
+@@ -2671,7 +2671,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-cloud-tasks"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "chrono",
+@@ -2704,7 +2704,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-cloud-tasks-client"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "chrono",
+@@ -2719,7 +2719,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-cloud-tasks-mock-client"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "chrono",
+  "codex-cloud-tasks-client",
+@@ -2728,7 +2728,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-code-mode"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "codex-code-mode-protocol",
+  "codex-http-client",
+@@ -2751,7 +2751,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-code-mode-host"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "axum",
+@@ -2780,7 +2780,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-code-mode-protocol"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "codex-protocol",
+  "glob",
+@@ -2798,7 +2798,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-code-mode-runtime"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "base64 0.22.1",
+  "codex-code-mode-protocol",
+@@ -2816,11 +2816,11 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-collaboration-mode-templates"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ 
+ [[package]]
+ name = "codex-config"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "base64 0.22.1",
+@@ -2870,7 +2870,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-config-schema"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "clap",
+@@ -2879,7 +2879,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-connectors"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "arc-swap",
+@@ -2901,7 +2901,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-connectors-extension"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "codex-connectors",
+  "codex-core-plugins",
+@@ -2915,7 +2915,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-context-fragments"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "codex-protocol",
+  "codex-utils-string",
+@@ -2925,7 +2925,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-core"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "arc-swap",
+@@ -3067,7 +3067,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-core-api"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "codex-analytics",
+  "codex-app-server-protocol",
+@@ -3090,7 +3090,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-core-plugin-common"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "codex-utils-absolute-path",
+  "semver",
+@@ -3101,7 +3101,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-core-plugins"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "chrono",
+@@ -3158,7 +3158,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-diagnostics"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "libc",
+  "pretty_assertions",
+@@ -3166,7 +3166,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-exec"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "assert_cmd",
+@@ -3218,7 +3218,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-exec-server"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "arc-swap",
+@@ -3287,7 +3287,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-exec-server-protocol"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "base64 0.22.1",
+  "codex-file-system",
+@@ -3304,7 +3304,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-exec-server-test-support"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "codex-exec-server",
+@@ -3319,7 +3319,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-execpolicy"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "clap",
+@@ -3337,7 +3337,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-experimental-api-macros"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "proc-macro2",
+  "quote",
+@@ -3346,7 +3346,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-extension-api"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "codex-api",
+  "codex-config",
+@@ -3368,7 +3368,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-extension-items"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "codex-utils-absolute-path",
+  "pretty_assertions",
+@@ -3380,7 +3380,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-external-agent-migration"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "chrono",
+  "codex-analytics",
+@@ -3410,7 +3410,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-features"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "codex-network-proxy",
+  "codex-protocol",
+@@ -3424,7 +3424,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-feedback"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "bytes",
+@@ -3451,7 +3451,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-file-search"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "clap",
+@@ -3467,7 +3467,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-file-system"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "bytes",
+  "codex-protocol",
+@@ -3479,7 +3479,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-file-watcher"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "notify",
+  "pretty_assertions",
+@@ -3490,7 +3490,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-git-attribution"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "codex-backend-client",
+  "codex-extension-api",
+@@ -3503,7 +3503,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-git-utils"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "chrono",
+@@ -3531,7 +3531,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-goal-extension"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "chrono",
+@@ -3556,7 +3556,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-guardian-context"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "codex-context-fragments",
+  "codex-history",
+@@ -3568,7 +3568,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-guardian-reviewer"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "codex-analytics",
+@@ -3593,7 +3593,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-guardian-v2"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "codex-analytics",
+@@ -3630,7 +3630,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-history"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "codex-protocol",
+@@ -3642,7 +3642,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-history-notes-extension"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "codex-analytics",
+  "codex-client",
+@@ -3667,7 +3667,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-home"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "codex-extension-api",
+  "codex-utils-absolute-path",
+@@ -3679,7 +3679,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-hooks"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "async-channel",
+@@ -3707,7 +3707,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-http-client"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "bytes",
+  "codex-utils-cargo-bin",
+@@ -3743,7 +3743,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-image-generation-extension"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "base64 0.22.1",
+  "codex-api",
+@@ -3771,7 +3771,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-install-context"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "codex-utils-absolute-path",
+  "codex-utils-home-dir",
+@@ -3784,7 +3784,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-keyring-store"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "keyring",
+  "pretty_assertions",
+@@ -3795,7 +3795,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-linux-sandbox"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "clap",
+  "codex-core",
+@@ -3824,7 +3824,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-lmstudio"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "codex-core",
+  "codex-http-client",
+@@ -3838,7 +3838,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-login"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "base64 0.22.1",
+@@ -3884,7 +3884,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-mcp"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "arc-swap",
+@@ -3924,7 +3924,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-mcp-extension"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "axum",
+@@ -3957,7 +3957,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-memories-extension"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "codex-core",
+  "codex-extension-api",
+@@ -3979,7 +3979,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-memories-read"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "codex-protocol",
+  "codex-shell-command",
+@@ -3989,7 +3989,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-memories-write"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "chrono",
+@@ -4026,7 +4026,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-mermaid"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "insta",
+  "pretty_assertions",
+@@ -4035,7 +4035,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-message-history"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "codex-config",
+  "memchr",
+@@ -4049,7 +4049,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-model-provider"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "base64 0.22.1",
+  "chrono",
+@@ -4083,7 +4083,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-model-provider-info"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "codex-client",
+  "codex-protocol",
+@@ -4101,7 +4101,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-models-manager"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "chrono",
+  "codex-http-client",
+@@ -4120,7 +4120,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-mxc-sandbox"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "appcontainer_common",
+@@ -4142,7 +4142,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-network-proxy"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "base64 0.22.1",
+@@ -4191,7 +4191,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-ollama"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "assert_matches",
+  "async-stream",
+@@ -4211,7 +4211,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-otel"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "bytes",
+  "chrono",
+@@ -4248,7 +4248,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-otel-trace-websocket"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "axum",
+@@ -4259,7 +4259,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-plugin"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "codex-config",
+  "codex-core-plugin-common",
+@@ -4274,7 +4274,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-process-hardening"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "libc",
+  "pretty_assertions",
+@@ -4282,7 +4282,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-prompts"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "codex-collaboration-mode-templates",
+@@ -4299,7 +4299,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-protocol"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "chardetng",
+@@ -4344,7 +4344,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-queue-extension"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "codex-core",
+@@ -4365,7 +4365,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-realtime-webrtc"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "codex-build-info",
+@@ -4384,7 +4384,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-response-debug-context"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "base64 0.22.1",
+  "codex-api",
+@@ -4395,7 +4395,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-responses-api-proxy"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "clap",
+@@ -4412,7 +4412,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-rmcp-client"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "axum",
+@@ -4463,7 +4463,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-rollout"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "chrono",
+@@ -4494,7 +4494,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-rollout-trace"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "codex-code-mode",
+@@ -4510,7 +4510,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-sandboxing"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "codex-mxc-sandbox",
+@@ -4538,7 +4538,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-secrets"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "age",
+  "anyhow",
+@@ -4559,7 +4559,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-shell-command"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "base64 0.22.1",
+@@ -4582,7 +4582,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-shell-escalation"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "clap",
+@@ -4602,7 +4602,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-skills"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "codex-protocol",
+  "codex-shell-command",
+@@ -4619,7 +4619,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-skills-extension"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "assert_matches",
+  "blake3",
+@@ -4657,7 +4657,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-state"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "chrono",
+@@ -4684,7 +4684,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-stdio-to-uds"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "codex-uds",
+@@ -4696,7 +4696,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-tcp-tunnel"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "bytes",
+@@ -4717,7 +4717,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-terminal-detection"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "pretty_assertions",
+  "tracing",
+@@ -4725,7 +4725,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-test-binary-support"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "codex-arg0",
+  "tempfile",
+@@ -4733,7 +4733,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-thread-manager-sample"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "clap",
+@@ -4744,7 +4744,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-thread-store"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "chrono",
+  "codex-app-server-protocol",
+@@ -4770,12 +4770,13 @@ dependencies = [
+  "tokio",
+  "tracing",
+  "uuid",
++ "windows-sys 0.61.2",
+  "zstd",
+ ]
+ 
+ [[package]]
+ name = "codex-tools"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "bitflags 2.13.1",
+  "codex-code-mode",
+@@ -4801,7 +4802,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-tui"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "app_test_support",
+@@ -4927,7 +4928,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-uds"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "async-io",
+  "libc",
+@@ -4941,7 +4942,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-user-verification"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "base64 0.22.1",
+  "core-foundation 0.10.1",
+@@ -4961,7 +4962,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-absolute-path"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "dirs",
+  "dunce",
+@@ -4975,14 +4976,14 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-approval-presets"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "codex-protocol",
+ ]
+ 
+ [[package]]
+ name = "codex-utils-audio"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "base64 0.22.1",
+  "codex-protocol",
+@@ -4996,7 +4997,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-cache"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "lru",
+  "sha1 0.10.6",
+@@ -5005,7 +5006,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-cargo-bin"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "assert_cmd",
+  "runfiles",
+@@ -5014,7 +5015,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-cli"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "clap",
+  "codex-protocol",
+@@ -5026,15 +5027,15 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-elapsed"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ 
+ [[package]]
+ name = "codex-utils-fuzzy-match"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ 
+ [[package]]
+ name = "codex-utils-git-discovery"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "codex-git-utils",
+  "codex-utils-absolute-path",
+@@ -5047,7 +5048,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-home-dir"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "codex-utils-absolute-path",
+  "dirs",
+@@ -5057,7 +5058,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-image"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "base64 0.22.1",
+  "codex-utils-cache",
+@@ -5071,7 +5072,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-json-to-toml"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "pretty_assertions",
+  "serde_json",
+@@ -5080,7 +5081,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-oss"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "codex-core",
+  "codex-lmstudio",
+@@ -5090,7 +5091,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-output-truncation"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "codex-protocol",
+  "codex-utils-string",
+@@ -5100,7 +5101,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-path"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "codex-utils-absolute-path",
+  "dunce",
+@@ -5111,7 +5112,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-path-uri"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "base64 0.22.1",
+  "codex-utils-absolute-path",
+@@ -5127,7 +5128,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-plugins"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "codex-exec-server",
+  "codex-exec-server-protocol",
+@@ -5141,7 +5142,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-process"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "pretty_assertions",
+  "tokio",
+@@ -5149,7 +5150,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-pty"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "codex-utils-cargo-bin",
+@@ -5168,7 +5169,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-readiness"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "assert_matches",
+  "thiserror 2.0.18",
+@@ -5178,7 +5179,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-redacted-string"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "schemars 0.8.22",
+  "serde",
+@@ -5186,14 +5187,14 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-rustls-provider"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "rustls",
+ ]
+ 
+ [[package]]
+ name = "codex-utils-sandbox-summary"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "codex-protocol",
+  "codex-utils-absolute-path",
+@@ -5203,7 +5204,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-sleep-inhibitor"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "core-foundation 0.9.4",
+  "libc",
+@@ -5213,14 +5214,14 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-stream-parser"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "pretty_assertions",
+ ]
+ 
+ [[package]]
+ name = "codex-utils-string"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "pretty_assertions",
+  "regex-lite",
+@@ -5230,14 +5231,14 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-utils-template"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "pretty_assertions",
+ ]
+ 
+ [[package]]
+ name = "codex-v8-poc"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "pretty_assertions",
+  "v8",
+@@ -5245,7 +5246,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-voice-host"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "codex-install-context",
+@@ -5272,7 +5273,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-web-search-extension"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "codex-api",
+  "codex-core",
+@@ -5294,7 +5295,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-websocket-auth"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "base64 0.22.1",
+@@ -5313,7 +5314,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-websocket-client"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "codex-http-client",
+  "codex-utils-rustls-provider",
+@@ -5329,7 +5330,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-windows-sandbox"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "base64 0.22.1",
+@@ -5359,7 +5360,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-windows-sandbox-service"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "codex-cloud-config",
+@@ -5376,14 +5377,14 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-windows-sandbox-test-support"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "dirs",
+ ]
+ 
+ [[package]]
+ name = "codex-workload-identity"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "codex-http-client",
+  "pretty_assertions",
+@@ -5398,7 +5399,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "codex-worktree"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "codex-git-utils",
+@@ -5639,7 +5640,7 @@ dependencies = [
+ 
+ [[package]]
+ name = "core_test_support"
+-version = "0.0.0"
++version = "0.162.1-codeg.1"
+ dependencies = [
+  "anyhow",
+  "assert_cmd",
+diff --git a/codex-rs/Cargo.toml b/codex-rs/Cargo.toml
+index 0482340..a465cbb 100644
+--- a/codex-rs/Cargo.toml
++++ b/codex-rs/Cargo.toml
+@@ -160,7 +160,7 @@ members = [
+ resolver = "2"
+ 
+ [workspace.package]
+-version = "0.162.1"
++version = "0.162.1-codeg.1"
+ # Track the edition for all workspace crates in one place. Individual
+ # crates can still override this value, but keeping it here means new
+ # crates created with `cargo new -w ...` automatically inherit the 2024
+diff --git a/codex-rs/app-server/src/request_processors/thread_processor.rs b/codex-rs/app-server/src/request_processors/thread_processor.rs
+index 8bdf6bb..0be7fa2 100644
+--- a/codex-rs/app-server/src/request_processors/thread_processor.rs
++++ b/codex-rs/app-server/src/request_processors/thread_processor.rs
+@@ -98,6 +98,7 @@ struct ResumeConfigState {
+ struct PreparedResumeConfig {
+     state: ResumeConfigState,
+     config: Config,
++    history: Option<InitialHistory>,
+ }
+ 
+ struct ThreadRevertRuntimeSnapshot {
+@@ -2276,7 +2277,7 @@ impl ThreadRequestProcessor {
+             )
+             .await?;
+         let (thread_history, resume_source_thread) = self
+-            .load_resume_initial_history_from_stored_thread(stored_thread)
++            .load_resume_initial_history_from_stored_thread(stored_thread, false, None)
+             .await?;
+         let response_history = thread_history.clone();
+         let NewThread {
+@@ -3723,15 +3724,25 @@ impl ThreadRequestProcessor {
+             initial_turns_page,
+         } = params.clone();
+         let include_turns = !exclude_turns;
++        let bounded_legacy = exclude_turns
++            && initial_turns_page.is_none()
++            && path.is_none()
++            && std::env::var("CODEG_LEGACY_CHECKPOINT_RESUME").as_deref() == Ok("1");
+ 
+         let resume_result = if let Some(history) = history {
+             self.resume_thread_from_history(history.as_slice())
+                 .await
+                 .map(|thread_history| (thread_history, None))
+         } else if let Some(stored_thread) = stored_thread_from_running_probe {
+-            self.load_resume_initial_history_from_stored_thread(*stored_thread)
+-                .await
+-                .map(|(thread_history, stored_thread)| (thread_history, Some(stored_thread)))
++            self.load_resume_initial_history_from_stored_thread(
++                *stored_thread,
++                bounded_legacy,
++                prepared_config
++                    .as_ref()
++                    .and_then(|prepared| prepared.history.as_ref()),
++            )
++            .await
++            .map(|(thread_history, stored_thread)| (thread_history, Some(stored_thread)))
+         } else {
+             match self
+                 .read_stored_thread_for_resume(
+@@ -3742,7 +3753,13 @@ impl ThreadRequestProcessor {
+                 .await
+             {
+                 Ok(stored_thread) => self
+-                    .load_resume_initial_history_from_stored_thread(stored_thread)
++                    .load_resume_initial_history_from_stored_thread(
++                        stored_thread,
++                        bounded_legacy,
++                        prepared_config
++                            .as_ref()
++                            .and_then(|prepared| prepared.history.as_ref()),
++                    )
+                     .await
+                     .map(|(thread_history, stored_thread)| (thread_history, Some(stored_thread))),
+                 Err(error) => Err(error),
+@@ -3970,6 +3987,7 @@ impl ThreadRequestProcessor {
+                 *prepared_config = Some(PreparedResumeConfig {
+                     state: config_state,
+                     config,
++                    history: bounded_legacy.then(|| thread_history.clone()),
+                 });
+                 // Recheck the thread and history after a possible archive, delete, or aliased resume.
+                 return Ok(ControlFlow::Continue(()));
+@@ -4587,23 +4605,64 @@ impl ThreadRequestProcessor {
+     async fn load_resume_initial_history_from_stored_thread(
+         &self,
+         stored_thread: StoredThread,
++        bounded_legacy: bool,
++        prepared_history: Option<&InitialHistory>,
+     ) -> Result<(InitialHistory, StoredThread), JSONRPCErrorError> {
+-        if matches!(stored_thread.history_mode, ThreadHistoryMode::Paginated) {
++        // Config loading releases coordination locks. Re-read current metadata,
++        // then reuse this RPC's history only if the same legacy file is unchanged.
++        // The live writer still validates the revision under its own lock.
++        if bounded_legacy
++            && matches!(stored_thread.history_mode, ThreadHistoryMode::Legacy)
++            && let Some(InitialHistory::Resumed(resumed)) = prepared_history
++            && resumed.conversation_id == stored_thread.thread_id
++            && resumed.rollout_path == stored_thread.rollout_path
++            && let (Some(path), Some(revision)) = (
++                resumed.rollout_path.as_deref(),
++                resumed.history_revision.as_deref(),
++            )
++            && codex_thread_store::validate_local_history_revision(path, revision).await
++        {
++            return Ok((InitialHistory::Resumed(resumed.clone()), stored_thread));
++        }
++        if matches!(stored_thread.history_mode, ThreadHistoryMode::Paginated) || bounded_legacy {
+             let model_context = self
+                 .thread_store
+                 .load_latest_model_context(StoreLoadThreadHistoryParams {
++                    allow_legacy_checkpoint: bounded_legacy,
+                     thread_id: stored_thread.thread_id,
+                     include_archived: true,
+                 })
+                 .await
+                 .map_err(thread_store_resume_read_error)?;
++            let bounded_checkpoint = model_context.bounded_legacy_checkpoint;
+             let history = InitialHistory::Resumed(ResumedHistory {
+                 history_revision: model_context.revision,
+                 conversation_id: model_context.thread_id,
+                 history: Arc::new(model_context.items),
+                 rollout_path: stored_thread.rollout_path.clone(),
+             });
+-            return Ok((history, stored_thread));
++            if !bounded_checkpoint || codex_core::can_resume_legacy_checkpoint(&history) {
++                return Ok((history, stored_thread));
++            }
++            tracing::info!("CodeG legacy resume: incomplete runtime state; full replay fallback");
++            let full = self
++                .thread_store
++                .load_latest_model_context(StoreLoadThreadHistoryParams {
++                    allow_legacy_checkpoint: false,
++                    thread_id: stored_thread.thread_id,
++                    include_archived: true,
++                })
++                .await
++                .map_err(thread_store_resume_read_error)?;
++            return Ok((
++                InitialHistory::Resumed(ResumedHistory {
++                    history_revision: full.revision,
++                    conversation_id: full.thread_id,
++                    history: Arc::new(full.items),
++                    rollout_path: stored_thread.rollout_path.clone(),
++                }),
++                stored_thread,
++            ));
+         }
+ 
+         let thread_id = stored_thread.thread_id.to_string();
+@@ -5061,6 +5120,7 @@ impl ThreadRequestProcessor {
+             Some(Arc::new(
+                 self.thread_store
+                     .load_latest_model_context(StoreLoadThreadHistoryParams {
++                        allow_legacy_checkpoint: false,
+                         thread_id: source_thread_id,
+                         include_archived: true,
+                     })
+diff --git a/codex-rs/core/src/agent/control/spawn.rs b/codex-rs/core/src/agent/control/spawn.rs
+index 20e28a8..65beb32 100644
+--- a/codex-rs/core/src/agent/control/spawn.rs
++++ b/codex-rs/core/src/agent/control/spawn.rs
+@@ -179,6 +179,7 @@ async fn load_agent_model_context(
+             .await?
+             .history
+             .map(|history| codex_thread_store::StoredModelContext {
++                bounded_legacy_checkpoint: false,
+                 thread_id,
+                 revision: history.revision,
+                 items: history.items,
+@@ -186,6 +187,7 @@ async fn load_agent_model_context(
+         ThreadHistoryMode::Paginated => Ok(Some(
+             state
+                 .load_latest_model_context(LoadThreadHistoryParams {
++                    allow_legacy_checkpoint: false,
+                     thread_id,
+                     include_archived: true,
+                 })
+diff --git a/codex-rs/core/src/lib.rs b/codex-rs/core/src/lib.rs
+index a2b44e3..69b1c98 100644
+--- a/codex-rs/core/src/lib.rs
++++ b/codex-rs/core/src/lib.rs
+@@ -186,6 +186,7 @@ pub(crate) mod state_db_bridge;
+ pub use state_db_bridge::StateDbHandle;
+ pub use state_db_bridge::init_state_db;
+ mod thread_rollout_truncation;
++pub use thread_rollout_truncation::can_resume_legacy_checkpoint;
+ pub use thread_rollout_truncation::truncate_rollout_after_turn_id;
+ pub use thread_rollout_truncation::truncate_rollout_before_turn_id;
+ mod tools;
+diff --git a/codex-rs/core/src/session/tests.rs b/codex-rs/core/src/session/tests.rs
+index 496114a..7bfc732 100644
+--- a/codex-rs/core/src/session/tests.rs
++++ b/codex-rs/core/src/session/tests.rs
+@@ -2400,6 +2400,158 @@ fn collect_explicit_app_ids_from_skill_items_skips_plain_mentions_with_skill_con
+     assert_eq!(connector_ids, HashSet::<String>::new());
+ }
+ 
++#[tokio::test]
++async fn codeg_checkpoint_matches_full_replay_with_images_and_tools() {
++    let (session, turn_context) = make_session_and_context().await;
++    let (mut full, _) = sample_rollout(&session, &turn_context).await;
++    let checkpoint_index = full
++        .iter()
++        .rposition(|item| matches!(item, RolloutItem::Compacted(_)))
++        .unwrap();
++    let RolloutItem::Compacted(checkpoint) = &mut full[checkpoint_index] else {
++        unreachable!()
++    };
++    checkpoint.replacement_history =
++        Some(vec![user_message("state-complete native summary").into()]);
++    checkpoint.resume_metadata = Some(codex_history::CompactionResumeMetadata {
++        multi_agent_version: Some(MultiAgentVersion::V1),
++        last_started_turn_id: None,
++        turn_attribution: None,
++        previous_turn_settings: None,
++    });
++    for value in [
++        serde_json::json!({"type":"message","role":"user","content":[
++            {"type":"input_text","text":"image reference remains intact"},
++            {"type":"input_image","image_url":"data:image/png;base64,VEVTVA=="}
++        ]}),
++        serde_json::json!({"type":"function_call","call_id":"paired","name":"exec_command","arguments":"{}"}),
++        serde_json::json!({"type":"function_call_output","call_id":"paired","output":"saved result"}),
++        serde_json::json!({"type":"function_call","call_id":"pending","name":"exec_command","arguments":"{}"}),
++    ] {
++        let item: ResponseItem = serde_json::from_value(value).unwrap();
++        full.push(RolloutItem::ResponseItem(item.into()));
++    }
++    let bounded = &full[checkpoint_index..];
++    let full_state = session
++        .reconstruct_history_from_rollout(&turn_context, &full)
++        .await;
++    let bounded_state = session
++        .reconstruct_history_from_rollout(&turn_context, bounded)
++        .await;
++    assert_eq!(full_state, bounded_state);
++    let full_initial = InitialHistory::Forked(full.clone());
++    let bounded_initial = InitialHistory::Forked(bounded.to_vec());
++    assert_eq!(
++        crate::thread_rollout_truncation::initial_history_has_prior_user_turns(&full_initial),
++        crate::thread_rollout_truncation::initial_history_has_prior_user_turns(&bounded_initial)
++    );
++    assert_eq!(
++        full_initial.get_multi_agent_version(),
++        bounded_initial.get_multi_agent_version()
++    );
++    let encoded = serde_json::to_string(&raw_envelopes(&bounded_state.history)).unwrap();
++    assert!(encoded.contains("data:image/png;base64,VEVTVA=="));
++    assert!(encoded.contains("saved result"));
++    assert!(encoded.contains("pending"));
++    assert!(!encoded.contains("assistant reply one"));
++}
++
++#[tokio::test]
++async fn codeg_checkpoint_rejects_ambiguous_runtime_state() {
++    let (session, _) = make_session_and_context().await;
++    let tid = session.thread_id;
++    let mut items = vec![
++        RolloutItem::ResponseItem(user_message("real prior user input").into()),
++        RolloutItem::Compacted(CompactedItem {
++            message: String::new(),
++            replacement_history: Some(vec![]),
++            guardian_history: None,
++            retained_context: None,
++            mcp_resource_origins: None,
++            window_number: Some(1),
++            first_window_id: None,
++            previous_window_id: None,
++            window_id: None,
++            compaction_response_id: None,
++            latest_token_usage_record: None,
++            resume_metadata: Some(codex_history::CompactionResumeMetadata {
++                multi_agent_version: Some(MultiAgentVersion::V1),
++                last_started_turn_id: Some("prior".into()),
++                turn_attribution: None,
++                previous_turn_settings: None,
++            }),
++        }),
++        RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(
++            codex_protocol::protocol::ThreadSettingsAppliedEvent {
++                thread_id: Some(tid),
++                thread_settings: session.thread_settings_snapshot().await,
++            },
++        )),
++    ];
++    items.push(RolloutItem::EventMsg(
++        serde_json::from_value(serde_json::json!({
++            "type":"task_complete", "turn_id":"prior", "last_agent_message":null
++        }))
++        .unwrap(),
++    ));
++    let initial = |items: Vec<RolloutItem>| {
++        InitialHistory::Resumed(ResumedHistory {
++            history_revision: None,
++            conversation_id: tid,
++            history: Arc::new(items),
++            rollout_path: None,
++        })
++    };
++    let valid = initial(items.clone());
++    assert!(crate::can_resume_legacy_checkpoint(&valid));
++    let mut foreign_terminal = items.clone();
++    if let RolloutItem::EventMsg(EventMsg::TurnComplete(event)) =
++        foreign_terminal.last_mut().unwrap()
++    {
++        event.turn_id = "different task".into();
++    }
++    assert!(!crate::can_resume_legacy_checkpoint(&initial(
++        foreign_terminal
++    )));
++    let mut unmatched_input = items.clone();
++    unmatched_input.push(RolloutItem::ResponseItem(
++        user_message("unfinished user input").into(),
++    ));
++    assert!(!crate::can_resume_legacy_checkpoint(&initial(
++        unmatched_input
++    )));
++    let mut running = items.clone();
++    running.push(RolloutItem::EventMsg(
++        serde_json::from_value(serde_json::json!({
++            "type":"task_started", "turn_id":"unfinished", "model_context_window":262144
++        }))
++        .unwrap(),
++    ));
++    assert!(!crate::can_resume_legacy_checkpoint(&initial(running)));
++    let eof_checkpoint = initial(items[1..].to_vec());
++    assert!(!crate::can_resume_legacy_checkpoint(&eof_checkpoint));
++    assert!(!crate::can_resume_legacy_checkpoint(&initial(
++        items[..2].to_vec()
++    )));
++    if let RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) = &mut items[2] {
++        event.thread_id = Some(ThreadId::new());
++    }
++    assert!(!crate::can_resume_legacy_checkpoint(&initial(
++        items.clone()
++    )));
++    if let RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event)) = &mut items[2] {
++        event.thread_id = Some(tid);
++    }
++    if let RolloutItem::Compacted(checkpoint) = &mut items[1] {
++        checkpoint
++            .resume_metadata
++            .as_mut()
++            .unwrap()
++            .multi_agent_version = None;
++    }
++    assert!(!crate::can_resume_legacy_checkpoint(&initial(items)));
++}
++
+ #[tokio::test]
+ async fn reconstruct_history_matches_live_compactions() {
+     let (session, turn_context) = make_session_and_context().await;
+diff --git a/codex-rs/core/src/thread_manager.rs b/codex-rs/core/src/thread_manager.rs
+index ea4dee3..9988380 100644
+--- a/codex-rs/core/src/thread_manager.rs
++++ b/codex-rs/core/src/thread_manager.rs
+@@ -2614,6 +2614,10 @@ struct SnapshotTurnState {
+     active_turn_start_index: Option<usize>,
+ }
+ 
++pub(crate) fn snapshot_ends_mid_turn(history: &InitialHistory) -> bool {
++    snapshot_turn_state(history).ends_mid_turn
++}
++
+ fn snapshot_turn_state(history: &InitialHistory) -> SnapshotTurnState {
+     let rollout_items = history.get_rollout_items();
+     let mut builder = ThreadHistoryBuilder::new();
+diff --git a/codex-rs/core/src/thread_rollout_truncation.rs b/codex-rs/core/src/thread_rollout_truncation.rs
+index 5dde1d1..4b8dc10 100644
+--- a/codex-rs/core/src/thread_rollout_truncation.rs
++++ b/codex-rs/core/src/thread_rollout_truncation.rs
+@@ -19,6 +19,63 @@ pub(crate) fn initial_history_has_prior_user_turns(conversation_history: &Initia
+     conversation_history.scan_rollout_items(rollout_item_is_user_turn_boundary)
+ }
+ 
++/// Conservative validation for a bounded legacy resume. The omitted prefix must
++/// not change first-turn detection, runtime selection, or owned thread settings.
++/// This deliberately rejects ambiguous checkpoints rather than guessing text.
++pub fn can_resume_legacy_checkpoint(history: &InitialHistory) -> bool {
++    let InitialHistory::Resumed(resumed) = history else {
++        return false;
++    };
++    let checkpoint_turn_id = resumed
++        .history
++        .iter()
++        .rev()
++        .find_map(|item| match item {
++            RolloutItem::Compacted(checkpoint) => Some(
++                checkpoint
++                    .resume_metadata
++                    .as_ref()
++                    .and_then(|metadata| metadata.last_started_turn_id.as_deref()),
++            ),
++            _ => None,
++        })
++        .flatten();
++    let Some(checkpoint_turn_id) = checkpoint_turn_id else {
++        return false;
++    };
++    let checkpoint_closed = resumed.history.iter().any(|item| match item {
++        RolloutItem::EventMsg(EventMsg::TurnComplete(event)) => event.turn_id == checkpoint_turn_id,
++        RolloutItem::EventMsg(EventMsg::TurnAborted(event)) => {
++            event.turn_id.as_deref() == Some(checkpoint_turn_id)
++        }
++        _ => false,
++    });
++    checkpoint_closed
++        && !crate::thread_manager::snapshot_ends_mid_turn(history)
++        && initial_history_has_prior_user_turns(history)
++        && history.get_multi_agent_version().is_some()
++        && resumed
++            .history
++            .iter()
++            .rev()
++            .find_map(|item| match item {
++                RolloutItem::EventMsg(
++                    event @ (EventMsg::TurnStarted(_)
++                    | EventMsg::TurnComplete(_)
++                    | EventMsg::TurnAborted(_)),
++                ) => Some(event),
++                _ => None,
++            })
++            .is_some_and(|event| {
++                matches!(event, EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_))
++            })
++        && resumed.history.iter().any(|item| {
++            matches!(item,
++            RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event))
++                if event.thread_id == Some(resumed.conversation_id))
++        })
++}
++
+ fn rollout_item_is_user_turn_boundary(item: &RolloutItem) -> bool {
+     match item {
+         RolloutItem::ResponseItem(item) => is_user_turn_boundary(item),
+diff --git a/codex-rs/core/tests/suite/agent_control_tests.rs b/codex-rs/core/tests/suite/agent_control_tests.rs
+index 41162ea..dd229e7 100644
+--- a/codex-rs/core/tests/suite/agent_control_tests.rs
++++ b/codex-rs/core/tests/suite/agent_control_tests.rs
+@@ -283,6 +283,7 @@ async fn host_threads_preserve_lineage_settings_and_resume_routing() -> anyhow::
+     let saved = test
+         .thread_store
+         .load_latest_model_context(codex_thread_store::LoadThreadHistoryParams {
++            allow_legacy_checkpoint: false,
+             thread_id: child.thread_id,
+             include_archived: false,
+         })
+diff --git a/codex-rs/core/tests/suite/agent_execution.rs b/codex-rs/core/tests/suite/agent_execution.rs
+index 41b1b6e..98348a7 100644
+--- a/codex-rs/core/tests/suite/agent_execution.rs
++++ b/codex-rs/core/tests/suite/agent_execution.rs
+@@ -258,6 +258,7 @@ async fn child_turn_start_preserves_root_attribution() -> Result<()> {
+         let history = test
+             .thread_store
+             .load_latest_model_context(codex_thread_store::LoadThreadHistoryParams {
++                allow_legacy_checkpoint: false,
+                 thread_id,
+                 include_archived: false,
+             })
+diff --git a/codex-rs/core/tests/suite/agents_md.rs b/codex-rs/core/tests/suite/agents_md.rs
+index 729c704..4b33632 100644
+--- a/codex-rs/core/tests/suite/agents_md.rs
++++ b/codex-rs/core/tests/suite/agents_md.rs
+@@ -284,6 +284,7 @@ pub(super) async fn persisted_resume_history(
+             history: Arc::new(
+                 store
+                     .load_latest_model_context(codex_thread_store::LoadThreadHistoryParams {
++                        allow_legacy_checkpoint: false,
+                         thread_id,
+                         include_archived: true,
+                     })
+@@ -1581,6 +1582,7 @@ async fn fork_preserves_thread_instructions(
+             let stored = test
+                 .thread_store
+                 .load_latest_model_context(LoadThreadHistoryParams {
++                    allow_legacy_checkpoint: false,
+                     thread_id: parent_id,
+                     include_archived: true,
+                 })
+diff --git a/codex-rs/core/tests/suite/compact.rs b/codex-rs/core/tests/suite/compact.rs
+index b46bc10..48fa653 100644
+--- a/codex-rs/core/tests/suite/compact.rs
++++ b/codex-rs/core/tests/suite/compact.rs
+@@ -4646,6 +4646,7 @@ async fn paginated_compaction_cold_resume_from_bounded_suffix() -> Result<()> {
+     let context = test
+         .thread_store
+         .load_latest_model_context(codex_thread_store::LoadThreadHistoryParams {
++            allow_legacy_checkpoint: false,
+             thread_id: test.session_configured.thread_id,
+             include_archived: false,
+         })
+diff --git a/codex-rs/core/tests/suite/guardian_checkpoint_migration_tests.rs b/codex-rs/core/tests/suite/guardian_checkpoint_migration_tests.rs
+index 6d06f1c..3a956ad 100644
+--- a/codex-rs/core/tests/suite/guardian_checkpoint_migration_tests.rs
++++ b/codex-rs/core/tests/suite/guardian_checkpoint_migration_tests.rs
+@@ -51,6 +51,7 @@ async fn saved_history(test: &TestCodex, thread: &CodexThread) -> Result<Vec<Rol
+     Ok(test
+         .thread_store
+         .load_latest_model_context(LoadThreadHistoryParams {
++            allow_legacy_checkpoint: false,
+             thread_id: thread.startup_metadata().thread_id,
+             include_archived: false,
+         })
+diff --git a/codex-rs/core/tests/suite/guardian_history.rs b/codex-rs/core/tests/suite/guardian_history.rs
+index dcb0cc7..51df28c 100644
+--- a/codex-rs/core/tests/suite/guardian_history.rs
++++ b/codex-rs/core/tests/suite/guardian_history.rs
+@@ -101,6 +101,7 @@ async fn guardian_history_survives_restart_and_user_fork(
+     let model_context = initial
+         .thread_store
+         .load_latest_model_context(LoadThreadHistoryParams {
++            allow_legacy_checkpoint: false,
+             thread_id,
+             include_archived: false,
+         })
+diff --git a/codex-rs/core/tests/suite/guardian_persistence_tests.rs b/codex-rs/core/tests/suite/guardian_persistence_tests.rs
+index 60a0728..72c1e41 100644
+--- a/codex-rs/core/tests/suite/guardian_persistence_tests.rs
++++ b/codex-rs/core/tests/suite/guardian_persistence_tests.rs
+@@ -111,6 +111,7 @@ impl ThreadStore for GatedReviewerStore {
+                 let history = ThreadStore::load_latest_model_context(
+                     &self.inner,
+                     LoadThreadHistoryParams {
++                        allow_legacy_checkpoint: false,
+                         thread_id,
+                         include_archived: true,
+                     },
+diff --git a/codex-rs/core/tests/suite/guardian_retained_context.rs b/codex-rs/core/tests/suite/guardian_retained_context.rs
+index adc7804..38c187d 100644
+--- a/codex-rs/core/tests/suite/guardian_retained_context.rs
++++ b/codex-rs/core/tests/suite/guardian_retained_context.rs
+@@ -208,6 +208,7 @@ async fn load_context(test: &TestCodex, thread: &CodexThread) -> Result<Vec<Roll
+     Ok(test
+         .thread_store
+         .load_latest_model_context(LoadThreadHistoryParams {
++            allow_legacy_checkpoint: false,
+             thread_id: thread.startup_metadata().thread_id,
+             include_archived: false,
+         })
+diff --git a/codex-rs/core/tests/suite/guardian_subagent_authorization.rs b/codex-rs/core/tests/suite/guardian_subagent_authorization.rs
+index cf3f570..13f8921 100644
+--- a/codex-rs/core/tests/suite/guardian_subagent_authorization.rs
++++ b/codex-rs/core/tests/suite/guardian_subagent_authorization.rs
+@@ -1427,6 +1427,7 @@ async fn run_guardian_subagent_review(
+         let saved = test
+             .thread_store
+             .load_latest_model_context(LoadThreadHistoryParams {
++                allow_legacy_checkpoint: false,
+                 thread_id: root_thread_id,
+                 include_archived: false,
+             })
+@@ -1677,6 +1678,7 @@ async fn run_guardian_subagent_review(
+             let saved = test
+                 .thread_store
+                 .load_latest_model_context(LoadThreadHistoryParams {
++                    allow_legacy_checkpoint: false,
+                     thread_id: root_thread_id,
+                     include_archived: false,
+                 })
+@@ -1833,6 +1835,7 @@ async fn run_guardian_subagent_review(
+             let saved = test
+                 .thread_store
+                 .load_latest_model_context(LoadThreadHistoryParams {
++                    allow_legacy_checkpoint: false,
+                     thread_id: root_thread_id,
+                     include_archived: false,
+                 })
+diff --git a/codex-rs/core/tests/suite/managed_threads_tests.rs b/codex-rs/core/tests/suite/managed_threads_tests.rs
+index e116aad..bc8c453 100644
+--- a/codex-rs/core/tests/suite/managed_threads_tests.rs
++++ b/codex-rs/core/tests/suite/managed_threads_tests.rs
+@@ -221,6 +221,7 @@ async fn owner_cancellation_closes_agent_and_preserves_history_and_parent() -> a
+     let history = fixture
+         .thread_store
+         .load_latest_model_context(codex_thread_store::LoadThreadHistoryParams {
++            allow_legacy_checkpoint: false,
+             thread_id: agent.thread_id,
+             include_archived: false,
+         })
+diff --git a/codex-rs/core/tests/suite/network_approval.rs b/codex-rs/core/tests/suite/network_approval.rs
+index f59554f..9575feb 100644
+--- a/codex-rs/core/tests/suite/network_approval.rs
++++ b/codex-rs/core/tests/suite/network_approval.rs
+@@ -1819,6 +1819,7 @@ async fn unattributed_network_request_uses_active_turn_environment_fallback(
+                 let history = test
+                     .thread_store
+                     .load_latest_model_context(LoadThreadHistoryParams {
++                        allow_legacy_checkpoint: false,
+                         thread_id,
+                         include_archived: false,
+                     })
+diff --git a/codex-rs/core/tests/suite/pending_input_persistence.rs b/codex-rs/core/tests/suite/pending_input_persistence.rs
+index 81a7f71..514f3d2 100644
+--- a/codex-rs/core/tests/suite/pending_input_persistence.rs
++++ b/codex-rs/core/tests/suite/pending_input_persistence.rs
+@@ -503,6 +503,7 @@ async fn local_preparation_is_durable_before_first_input_and_survives_restart(
+     );
+     let context = store
+         .load_latest_model_context(LoadThreadHistoryParams {
++            allow_legacy_checkpoint: false,
+             thread_id,
+             include_archived: false,
+         })
+diff --git a/codex-rs/core/tests/suite/resume.rs b/codex-rs/core/tests/suite/resume.rs
+index b78e305..a8f6b03 100644
+--- a/codex-rs/core/tests/suite/resume.rs
++++ b/codex-rs/core/tests/suite/resume.rs
+@@ -50,6 +50,7 @@ async fn local_thread_history_mode_survives_restart(
+     let history = initial
+         .thread_store
+         .load_latest_model_context(LoadThreadHistoryParams {
++            allow_legacy_checkpoint: false,
+             thread_id: initial.session_configured.thread_id,
+             include_archived: true,
+         })
+diff --git a/codex-rs/core/tests/suite/rollout_compression.rs b/codex-rs/core/tests/suite/rollout_compression.rs
+index 03f01be..ac2b42e 100644
+--- a/codex-rs/core/tests/suite/rollout_compression.rs
++++ b/codex-rs/core/tests/suite/rollout_compression.rs
+@@ -160,6 +160,7 @@ async fn compressed_shared_fork_resume_preserves_checkpoint_and_frozen_history()
+     // Follow the paginated resume path: load the latest checkpoint from disk, then resume core.
+     let context = store
+         .load_latest_model_context(LoadThreadHistoryParams {
++            allow_legacy_checkpoint: false,
+             thread_id: child.thread_id,
+             include_archived: false,
+         })
+diff --git a/codex-rs/core/tests/suite/skills_extension.rs b/codex-rs/core/tests/suite/skills_extension.rs
+index d3ca22f..70649a8 100644
+--- a/codex-rs/core/tests/suite/skills_extension.rs
++++ b/codex-rs/core/tests/suite/skills_extension.rs
+@@ -3224,6 +3224,7 @@ async fn production_turn_keeps_rebalanced_catalogs_stable_after_compaction_and_r
+     let history = test
+         .thread_store
+         .load_latest_model_context(LoadThreadHistoryParams {
++            allow_legacy_checkpoint: false,
+             thread_id: cloud_thread.session_configured.thread_id,
+             include_archived: true,
+         })
+diff --git a/codex-rs/core/tests/suite/subagent_notifications.rs b/codex-rs/core/tests/suite/subagent_notifications.rs
+index 7f56f82..567ac97 100644
+--- a/codex-rs/core/tests/suite/subagent_notifications.rs
++++ b/codex-rs/core/tests/suite/subagent_notifications.rs
+@@ -1113,6 +1113,7 @@ async fn spawned_child_receives_forked_parent_context(
+     let reopened_store = codex_core::thread_store_from_config(&test.config, /*state_db*/ None);
+     let persisted = reopened_store
+         .load_latest_model_context(LoadThreadHistoryParams {
++            allow_legacy_checkpoint: false,
+             thread_id: child_thread_id,
+             include_archived: false,
+         })
+diff --git a/codex-rs/core/tests/suite/tools.rs b/codex-rs/core/tests/suite/tools.rs
+index 62ab267..eecb9d8 100644
+--- a/codex-rs/core/tests/suite/tools.rs
++++ b/codex-rs/core/tests/suite/tools.rs
+@@ -171,6 +171,7 @@ async fn strict_tool_collisions_fail_the_turn_before_sampling(
+     let history = test
+         .thread_store
+         .load_latest_model_context(codex_thread_store::LoadThreadHistoryParams {
++            allow_legacy_checkpoint: false,
+             thread_id,
+             include_archived: false,
+         })
+diff --git a/codex-rs/thread-store/Cargo.toml b/codex-rs/thread-store/Cargo.toml
+index 31e16dd..6d7f043 100644
+--- a/codex-rs/thread-store/Cargo.toml
++++ b/codex-rs/thread-store/Cargo.toml
+@@ -42,3 +42,6 @@ pretty_assertions = { workspace = true }
+ tempfile = { workspace = true }
+ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+ uuid = { workspace = true }
++
++[target.'cfg(windows)'.dependencies]
++windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+diff --git a/codex-rs/thread-store/src/in_memory.rs b/codex-rs/thread-store/src/in_memory.rs
+index 152c1d0..0de1f8b 100644
+--- a/codex-rs/thread-store/src/in_memory.rs
++++ b/codex-rs/thread-store/src/in_memory.rs
+@@ -390,6 +390,7 @@ mod tests {
+         assert_paginated_threads_unsupported(
+             store
+                 .load_history(LoadThreadHistoryParams {
++                    allow_legacy_checkpoint: false,
+                     thread_id,
+                     include_archived: false,
+                 })
+@@ -702,6 +703,7 @@ impl InMemoryThreadStore {
+                     thread_id: params.thread_id,
+                 })?;
+         Ok(StoredModelContext {
++            bounded_legacy_checkpoint: false,
+             revision: None,
+             thread_id: params.thread_id,
+             items: items.clone(),
+diff --git a/codex-rs/thread-store/src/lib.rs b/codex-rs/thread-store/src/lib.rs
+index 9cf1267..04106cc 100644
+--- a/codex-rs/thread-store/src/lib.rs
++++ b/codex-rs/thread-store/src/lib.rs
+@@ -42,6 +42,7 @@ pub use local::RolloutMigrationOutcome;
+ pub use local::RolloutMigrationProgress;
+ pub use local::RolloutMigrationReport;
+ pub use local::RolloutMigrationStatus;
++pub use local::validate_local_history_revision;
+ pub use projects::CreateProjectParams;
+ pub use projects::CreatedProject;
+ pub use projects::DeletedProject;
+diff --git a/codex-rs/thread-store/src/live_thread.rs b/codex-rs/thread-store/src/live_thread.rs
+index ab18df6..72a373c 100644
+--- a/codex-rs/thread-store/src/live_thread.rs
++++ b/codex-rs/thread-store/src/live_thread.rs
+@@ -319,6 +319,7 @@ impl LiveThread {
+     ) -> ThreadStoreResult<StoredThreadHistory> {
+         self.thread_store
+             .load_history(LoadThreadHistoryParams {
++                allow_legacy_checkpoint: false,
+                 thread_id: self.thread_id,
+                 include_archived,
+             })
+diff --git a/codex-rs/thread-store/src/local/compression_writer_tests.rs b/codex-rs/thread-store/src/local/compression_writer_tests.rs
+index 1ea0161..bcdd790 100644
+--- a/codex-rs/thread-store/src/local/compression_writer_tests.rs
++++ b/codex-rs/thread-store/src/local/compression_writer_tests.rs
+@@ -192,6 +192,7 @@ async fn metadata_updates_share_ownership_and_resume_compressed_rollouts() -> Te
+     compress(home.path()).await?;
+     let snapshot = competitor
+         .load_history(LoadThreadHistoryParams {
++            allow_legacy_checkpoint: false,
+             thread_id,
+             include_archived: true,
+         })
+diff --git a/codex-rs/thread-store/src/local/history_revision.rs b/codex-rs/thread-store/src/local/history_revision.rs
+index ad241a4..883ffad 100644
+--- a/codex-rs/thread-store/src/local/history_revision.rs
++++ b/codex-rs/thread-store/src/local/history_revision.rs
+@@ -22,7 +22,93 @@ pub(super) async fn read(path: &Path) -> Option<String> {
+             metadata.ctime_nsec(),
+         ))
+     };
+-    #[cfg(not(unix))]
++    #[cfg(windows)]
++    let identity = Some(windows_identity(&path)?);
++    #[cfg(not(any(unix, windows)))]
+     let identity: Option<(u64, u64, i64, i64)> = None;
+     serde_json::to_string(&("local", path, metadata.len(), modified, created, identity)).ok()
+ }
++
++#[cfg(windows)]
++fn windows_identity(path: &Path) -> Option<(u32, u64)> {
++    use std::os::windows::io::AsRawHandle;
++    use windows_sys::Win32::Storage::FileSystem::{
++        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
++    };
++    let file = std::fs::File::open(path).ok()?;
++    let mut information = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
++    // SAFETY: the handle is borrowed from an open file and the output points to
++    // correctly sized, aligned writable memory. The file outlives this call.
++    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), information.as_mut_ptr()) } == 0 {
++        return None;
++    }
++    // SAFETY: a successful GetFileInformationByHandle initialized every field.
++    let information = unsafe { information.assume_init() };
++    let file_index =
++        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
++    if file_index == 0 {
++        // Some network/filesystem providers report an unavailable identity as zero.
++        return None;
++    }
++    Some((information.dwVolumeSerialNumber, file_index))
++}
++
++#[cfg(test)]
++mod codeg_revision_tests {
++    use super::*;
++    use std::io::Write;
++    #[tokio::test]
++    async fn revision_invalidates_on_append_and_replacement() {
++        let dir = tempfile::tempdir().unwrap();
++        let path = dir.path().join("rollout.jsonl");
++        std::fs::write(&path, b"original\n").unwrap();
++        let original = read(&path).await.expect("file identity");
++        assert_eq!(read(&path).await, Some(original.clone()));
++        assert!(super::super::validate_local_history_revision(&path, &original).await);
++        let foreign = dir.path().join("foreign.jsonl");
++        std::fs::write(&foreign, b"original\n").unwrap();
++        assert!(!super::super::validate_local_history_revision(&foreign, &original).await);
++        std::fs::OpenOptions::new()
++            .append(true)
++            .open(&path)
++            .unwrap()
++            .write_all(b"delta\n")
++            .unwrap();
++        let appended = read(&path).await.expect("append identity");
++        assert_ne!(original, appended);
++        assert!(!super::super::validate_local_history_revision(&path, &original).await);
++        assert!(super::super::validate_local_history_revision(&path, &appended).await);
++        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
++        let replacement = dir.path().join("replacement.jsonl");
++        std::fs::write(&replacement, b"original\ndelta\n").unwrap();
++        std::fs::File::options()
++            .write(true)
++            .open(&replacement)
++            .unwrap()
++            .set_times(std::fs::FileTimes::new().set_modified(modified))
++            .unwrap();
++        std::fs::rename(&replacement, &path).unwrap();
++        assert_ne!(read(&path).await.expect("replacement identity"), appended);
++        assert!(!super::super::validate_local_history_revision(&path, &appended).await);
++        assert!(
++            !super::super::validate_local_history_revision(
++                &foreign.with_extension("missing"),
++                &original
++            )
++            .await
++        );
++    }
++    #[cfg(windows)]
++    #[test]
++    fn windows_volume_and_file_id_differ_between_files() {
++        let dir = tempfile::tempdir().unwrap();
++        let one = dir.path().join("one");
++        let two = dir.path().join("two");
++        std::fs::write(&one, b"same").unwrap();
++        std::fs::write(&two, b"same").unwrap();
++        assert_ne!(
++            windows_identity(&one).unwrap(),
++            windows_identity(&two).unwrap()
++        );
++    }
++}
+diff --git a/codex-rs/thread-store/src/local/legacy_checkpoint.rs b/codex-rs/thread-store/src/local/legacy_checkpoint.rs
+new file mode 100644
+index 0000000..9843240
+--- /dev/null
++++ b/codex-rs/thread-store/src/local/legacy_checkpoint.rs
+@@ -0,0 +1,188 @@
++//! Opt-in resume of legacy files at a native, state-complete compaction.
++//! Never used for UI history. No cache or original file is written here.
++use codex_protocol::protocol::{EventMsg, SessionMetaLine};
++use codex_rollout::{ReverseJsonlScanner, RolloutItem, ScanOutcome};
++use std::fs::File;
++use std::io::{self, Read, Seek, SeekFrom};
++use std::path::Path;
++
++const SCAN_LIMIT: u64 = 64 * 1024 * 1024;
++
++struct BudgetedFile {
++    file: File,
++    remaining: u64,
++}
++impl Read for BudgetedFile {
++    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
++        if self.remaining == 0 {
++            return Err(io::Error::other("checkpoint scan budget exhausted"));
++        }
++        let limit = bytes.len().min(self.remaining as usize);
++        let read = self.file.read(&mut bytes[..limit])?;
++        self.remaining -= read as u64;
++        Ok(read)
++    }
++}
++impl Seek for BudgetedFile {
++    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
++        self.file.seek(pos)
++    }
++}
++
++pub(super) fn try_load(path: &Path, meta: SessionMetaLine) -> io::Result<Option<Vec<RolloutItem>>> {
++    let reader = BudgetedFile {
++        file: File::open(path)?,
++        remaining: SCAN_LIMIT,
++    };
++    let mut scanner = ReverseJsonlScanner::new(reader)?;
++    let mut newest_first = Vec::new();
++    let mut companion_context = false;
++    let mut companion_world = false;
++    while let Some(line) = scanner.scan_next_rollout_line()? {
++        let ScanOutcome::Parsed(line) = line else {
++            return Ok(None);
++        };
++        match &line.item {
++            // Rollback may refer to an older turn. Let canonical full replay decide.
++            RolloutItem::EventMsg(EventMsg::ThreadRolledBack(_)) => return Ok(None),
++            RolloutItem::SessionMeta(_) => return Ok(None),
++            RolloutItem::TurnContext(_) => companion_context = true,
++            RolloutItem::WorldState(world) if world.full => companion_world = true,
++            RolloutItem::Compacted(compacted) => {
++                // Only the newest compaction is eligible. In particular an old summary
++                // cannot reconstruct window, attribution or previous-turn settings.
++                if compacted.replacement_history.is_none()
++                    || compacted.window_number.is_none()
++                    || compacted.resume_metadata.is_none()
++                    || !companion_context
++                    || !companion_world
++                {
++                    return Ok(None);
++                }
++                newest_first.push(line.item);
++                newest_first.push(RolloutItem::SessionMeta(meta));
++                newest_first.reverse();
++                tracing::info!(
++                    items = newest_first.len(),
++                    "CodeG legacy resume: validated native checkpoint"
++                );
++                return Ok(Some(newest_first));
++            }
++            _ => {}
++        }
++        newest_first.push(line.item);
++    }
++    Ok(None)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use codex_rollout::RolloutLine;
++    use std::io::Write;
++    fn fixture(
++        checkpoint: serde_json::Value,
++        tail: &[serde_json::Value],
++    ) -> (tempfile::NamedTempFile, SessionMetaLine) {
++        let mut file = tempfile::NamedTempFile::new().unwrap();
++        let meta: RolloutLine = codex_rollout::parse_rollout_line(
++            &serde_json::json!({
++                "timestamp":"2026-10-12T00:00:00Z","type":"session_meta", "payload": {
++                    "id":"12345678-1234-1234-1234-123456789012", "timestamp":"2026-10-12T00:00:00Z",
++                    "cwd":std::env::temp_dir(),"originator":"test","cli_version":"0.162.1","source":"cli"
++                }
++            })
++            .to_string(),
++        )
++        .unwrap();
++        writeln!(file, "{}", serde_json::to_string(&meta).unwrap()).unwrap();
++        for payload in std::iter::once(&checkpoint).chain(tail.iter()) {
++            writeln!(file, "{}", payload).unwrap();
++        }
++        let RolloutItem::SessionMeta(meta) = meta.item else {
++            panic!("meta");
++        };
++        (file, meta)
++    }
++    fn cp() -> serde_json::Value {
++        serde_json::json!({"timestamp":"2026-10-12T00:00:00Z","type":"compacted","payload":{
++            "message":"summary","replacement_history":[],"window_number":1,"resume_metadata":{}
++        }})
++    }
++    fn companions() -> Vec<serde_json::Value> {
++        vec![
++            serde_json::json!({"timestamp":"2026-10-12T00:00:00Z","type":"world_state","payload":{"full":true,"state":{}}}),
++            serde_json::json!({"timestamp":"2026-10-12T00:00:00Z","type":"turn_context","payload":{
++                "cwd":std::env::temp_dir(),"approval_policy":"never","sandbox_policy":{"type":"read-only"},
++                "model":"gpt-6-astra","summary":"auto"
++            }}),
++        ]
++    }
++    #[test]
++    fn complete_native_checkpoint_preserves_identity_and_order() {
++        let (file, meta) = fixture(cp(), &companions());
++        let id = meta.meta.id;
++        let items = try_load(file.path(), meta).unwrap().expect("checkpoint");
++        assert!(matches!(&items[0], RolloutItem::SessionMeta(meta) if meta.meta.id==id));
++        assert!(matches!(&items[1], RolloutItem::Compacted(_)));
++        assert!(matches!(&items[2], RolloutItem::WorldState(_)));
++        assert!(matches!(&items[3], RolloutItem::TurnContext(_)));
++    }
++    #[test]
++    fn legacy_summary_never_bounds_replay() {
++        let mut checkpoint = cp();
++        checkpoint["payload"]
++            .as_object_mut()
++            .unwrap()
++            .remove("resume_metadata");
++        let (file, meta) = fixture(checkpoint, &companions());
++        assert!(try_load(file.path(), meta).unwrap().is_none());
++    }
++    #[test]
++    fn incomplete_companions_fall_back() {
++        let (file, meta) = fixture(cp(), &[]);
++        assert!(try_load(file.path(), meta).unwrap().is_none());
++    }
++    #[test]
++    fn malformed_tail_falls_back() {
++        let (mut file, meta) = fixture(cp(), &companions());
++        writeln!(file, "{{broken").unwrap();
++        assert!(try_load(file.path(), meta).unwrap().is_none());
++    }
++
++    #[test]
++    fn rollback_suffix_never_uses_an_older_checkpoint() {
++        let mut tail = companions();
++        tail.push(
++            serde_json::json!({"timestamp":"2026-10-12T00:00:00Z","type":"event_msg",
++            "payload":{"type":"thread_rolled_back","num_turns":1}}),
++        );
++        let (file, meta) = fixture(cp(), &tail);
++        assert!(try_load(file.path(), meta).unwrap().is_none());
++    }
++    #[test]
++    fn newest_incomplete_checkpoint_never_reuses_an_older_one() {
++        let mut tail = companions();
++        let mut incomplete = cp();
++        incomplete["payload"]
++            .as_object_mut()
++            .unwrap()
++            .remove("resume_metadata");
++        tail.push(incomplete);
++        tail.extend(companions());
++        let (file, meta) = fixture(cp(), &tail);
++        assert!(try_load(file.path(), meta).unwrap().is_none());
++    }
++    #[test]
++    fn probe_has_strict_byte_budget() {
++        let fixture = tempfile::NamedTempFile::new().unwrap();
++        std::fs::write(fixture.path(), b"bounded bytes").unwrap();
++        let mut reader = BudgetedFile {
++            file: File::open(fixture.path()).unwrap(),
++            remaining: 3,
++        };
++        let mut bytes = [0; 20];
++        assert_eq!(reader.read(&mut bytes).unwrap(), 3);
++        assert!(reader.read(&mut bytes).is_err());
++    }
++}
+diff --git a/codex-rs/thread-store/src/local/live_writer.rs b/codex-rs/thread-store/src/local/live_writer.rs
+index e1b49e8..37682f2 100644
+--- a/codex-rs/thread-store/src/local/live_writer.rs
++++ b/codex-rs/thread-store/src/local/live_writer.rs
+@@ -89,9 +89,14 @@ pub(super) async fn resume_thread(
+             history
+         }
+         _ => Arc::new(
+-            super::model_context::load_from_rollout_path(store, params.thread_id, &rollout_path)
+-                .await?
+-                .items,
++            super::model_context::load_from_rollout_path(
++                store,
++                params.thread_id,
++                &rollout_path,
++                false,
++            )
++            .await?
++            .items,
+         ),
+     };
+     let history_mode = canonical_history_mode_from_rollout_items(&history);
+diff --git a/codex-rs/thread-store/src/local/mod.rs b/codex-rs/thread-store/src/local/mod.rs
+index 1380ff5..9065316 100644
+--- a/codex-rs/thread-store/src/local/mod.rs
++++ b/codex-rs/thread-store/src/local/mod.rs
+@@ -61,6 +61,12 @@ use tokio::sync::OwnedRwLockReadGuard;
+ use tokio::sync::OwnedRwLockWriteGuard;
+ use tokio::sync::RwLock;
+ 
++/// Revalidate a local resume snapshot after asynchronous host configuration work.
++/// Unknown identities and changed files cannot reuse the prior history.
++pub async fn validate_local_history_revision(path: &std::path::Path, revision: &str) -> bool {
++    history_revision::read(path).await.as_deref() == Some(revision)
++}
++
+ use crate::AddThreadAttachmentOutcome;
+ use crate::AddThreadAttachmentParams;
+ use crate::AppendThreadItemsParams;
+@@ -1657,6 +1663,7 @@ mod tests {
+                 .expect("load rollout path");
+             let snapshot = primary
+                 .load_latest_model_context(LoadThreadHistoryParams {
++                    allow_legacy_checkpoint: false,
+                     thread_id,
+                     include_archived: true,
+                 })
+@@ -1860,6 +1867,7 @@ mod tests {
+ 
+         let history = store
+             .load_history(LoadThreadHistoryParams {
++                allow_legacy_checkpoint: false,
+                 thread_id,
+                 include_archived: false,
+             })
+@@ -1984,6 +1992,7 @@ mod tests {
+ 
+         let err = store
+             .load_history(LoadThreadHistoryParams {
++                allow_legacy_checkpoint: false,
+                 thread_id,
+                 include_archived: false,
+             })
+@@ -1994,6 +2003,7 @@ mod tests {
+ 
+         let history = store
+             .load_history(LoadThreadHistoryParams {
++                allow_legacy_checkpoint: false,
+                 thread_id,
+                 include_archived: true,
+             })
+@@ -2114,6 +2124,7 @@ mod tests {
+         assert_paginated_threads_unsupported(
+             store
+                 .load_history(LoadThreadHistoryParams {
++                    allow_legacy_checkpoint: false,
+                     thread_id,
+                     include_archived: false,
+                 })
+diff --git a/codex-rs/thread-store/src/local/model_context.rs b/codex-rs/thread-store/src/local/model_context.rs
+index 13a81b7..fe2a6f9 100644
+--- a/codex-rs/thread-store/src/local/model_context.rs
++++ b/codex-rs/thread-store/src/local/model_context.rs
+@@ -25,6 +25,9 @@ use crate::ThreadStoreResult;
+ #[path = "model_context_tests.rs"]
+ mod tests;
+ 
++#[path = "legacy_checkpoint.rs"]
++mod legacy_checkpoint;
++
+ /// Loads rollout items needed to reconstruct the latest model-visible context.
+ ///
+ /// Paginated JSONL rollouts use a reverse scan. It stops at the newest `CompactedItem` with both
+@@ -49,13 +52,20 @@ pub(super) async fn load_latest_model_context(
+                 message: format!("no rollout found for thread id {}", params.thread_id),
+             })?;
+ 
+-    load_from_rollout_path(store, params.thread_id, &path).await
++    load_from_rollout_path(
++        store,
++        params.thread_id,
++        &path,
++        params.allow_legacy_checkpoint,
++    )
++    .await
+ }
+ 
+ pub(super) async fn load_from_rollout_path(
+     store: &LocalThreadStore,
+     thread_id: codex_protocol::ThreadId,
+     path: &Path,
++    allow_legacy_checkpoint: bool,
+ ) -> ThreadStoreResult<StoredModelContext> {
+     let before = super::history_revision::read(path).await;
+     let session_meta = codex_rollout::read_session_meta_line(path)
+@@ -74,17 +84,54 @@ pub(super) async fn load_from_rollout_path(
+         });
+     }
+ 
++    let mut used_checkpoint = false;
+     let items = if matches!(session_meta.meta.history_mode, ThreadHistoryMode::Paginated) {
+         let lineage = store
+             .resolve_rollout_lineage(thread_id, Some(path.to_path_buf()))
+             .await?;
+         scan_model_context_from_lineage(lineage, session_meta).await?
++    } else if allow_legacy_checkpoint
++        && before.is_some()
++        && std::env::var("CODEG_LEGACY_CHECKPOINT_RESUME").as_deref() == Ok("1")
++    {
++        let scan_path = path.to_path_buf();
++        let scan = tokio::task::spawn_blocking(move || {
++            legacy_checkpoint::try_load(&scan_path, session_meta)
++        })
++        .await
++        .map_err(|err| ThreadStoreError::Internal {
++            message: format!("failed to join legacy checkpoint scan: {err}"),
++        })?;
++        match scan {
++            Ok(Some(items)) => {
++                used_checkpoint = true;
++                items
++            }
++            result => {
++                tracing::info!(reason = ?result.err(), "CodeG legacy resume: full replay fallback");
++                read_thread::load_history_items(path).await?
++            }
++        }
+     } else {
+         read_thread::load_history_items(path).await?
+     };
+ 
+     let after = super::history_revision::read(path).await;
++    if used_checkpoint && before != after {
++        // The original recorder validates this revision again under writer ownership.
++        // Never hand it a suffix collected across an append or file replacement.
++        let before = super::history_revision::read(path).await;
++        let items = read_thread::load_history_items(path).await?;
++        let after = super::history_revision::read(path).await;
++        return Ok(StoredModelContext {
++            bounded_legacy_checkpoint: false,
++            revision: before.filter(|revision| Some(revision) == after.as_ref()),
++            thread_id,
++            items,
++        });
++    }
+     Ok(StoredModelContext {
++        bounded_legacy_checkpoint: used_checkpoint,
+         revision: before.filter(|revision| Some(revision) == after.as_ref()),
+         thread_id,
+         items,
+diff --git a/codex-rs/thread-store/src/local/model_context_tests.rs b/codex-rs/thread-store/src/local/model_context_tests.rs
+index 3e74f2b..cf136f5 100644
+--- a/codex-rs/thread-store/src/local/model_context_tests.rs
++++ b/codex-rs/thread-store/src/local/model_context_tests.rs
+@@ -60,6 +60,7 @@ async fn stops_at_newest_usable_compaction_and_keeps_companions() {
+ 
+     let context = store
+         .load_latest_model_context(LoadThreadHistoryParams {
++            allow_legacy_checkpoint: false,
+             thread_id,
+             include_archived: false,
+         })
+@@ -124,6 +125,7 @@ async fn loads_recent_context_after_many_empty_wake_turns() {
+     let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+     let context = store
+         .load_latest_model_context(LoadThreadHistoryParams {
++            allow_legacy_checkpoint: false,
+             thread_id,
+             include_archived: false,
+         })
+@@ -430,6 +432,7 @@ async fn replays_nested_archived_lineage_from_frozen_prefix() {
+ 
+     let context = store
+         .load_latest_model_context(LoadThreadHistoryParams {
++            allow_legacy_checkpoint: false,
+             thread_id: child_id,
+             include_archived: false,
+         })
+@@ -472,6 +475,7 @@ async fn replays_nested_archived_lineage_from_frozen_prefix() {
+     }
+     let compressed_context = store
+         .load_latest_model_context(LoadThreadHistoryParams {
++            allow_legacy_checkpoint: false,
+             thread_id: child_id,
+             include_archived: false,
+         })
+@@ -579,6 +583,7 @@ async fn assert_reverse_scan_matches_full_history(home: &Path, path: &Path) {
+     let store = LocalThreadStore::new(test_config(home), /*state_db*/ None);
+     let items = store
+         .load_latest_model_context(LoadThreadHistoryParams {
++            allow_legacy_checkpoint: false,
+             thread_id: session_meta.meta.id,
+             include_archived: false,
+         })
+diff --git a/codex-rs/thread-store/src/local/rollout_migration_tests.rs b/codex-rs/thread-store/src/local/rollout_migration_tests.rs
+index 61d8a6a..43b0db3 100644
+--- a/codex-rs/thread-store/src/local/rollout_migration_tests.rs
++++ b/codex-rs/thread-store/src/local/rollout_migration_tests.rs
+@@ -2152,6 +2152,7 @@ async fn migration_compacts_subagent_prefix_and_does_not_project_it() {
+     );
+     let context = store
+         .load_latest_model_context(LoadThreadHistoryParams {
++            allow_legacy_checkpoint: false,
+             thread_id,
+             include_archived: false,
+         })
+diff --git a/codex-rs/thread-store/src/types.rs b/codex-rs/thread-store/src/types.rs
+index 1dd5b4e..8ff8dc0 100644
+--- a/codex-rs/thread-store/src/types.rs
++++ b/codex-rs/thread-store/src/types.rs
+@@ -166,6 +166,9 @@ pub struct AppendThreadItemsParams {
+ /// Parameters for loading persisted history for resume, fork, and memory jobs.
+ #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+ pub struct LoadThreadHistoryParams {
++    /// Only the app-server resume caller validates native runtime state before use.
++    #[serde(default)]
++    pub allow_legacy_checkpoint: bool,
+     /// Thread id to load.
+     pub thread_id: ThreadId,
+     /// Whether archived threads are eligible.
+@@ -191,6 +194,9 @@ pub struct StoredThreadHistory {
+ /// the existing rollout reconstruction path.
+ #[derive(Clone, Debug, Serialize, Deserialize)]
+ pub struct StoredModelContext {
++    /// A legacy suffix requires caller validation of native first-turn/runtime/settings state.
++    #[serde(skip)]
++    pub bounded_legacy_checkpoint: bool,
+     /// Thread id represented by the model context.
+     pub thread_id: ThreadId,
+     /// Persisted rollout items in replay order.

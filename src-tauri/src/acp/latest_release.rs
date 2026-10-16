@@ -485,6 +485,7 @@ mod tests {
         AcpAgentMeta {
             agent_type,
             supports_mcp: true,
+            supports_steer: false,
             name: "Test agent",
             description: "",
             distribution,

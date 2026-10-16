@@ -267,6 +267,10 @@ export function ComposerContextUsage({ tabId }: { tabId: string | null }) {
                 </span>
               </div>
             ) : null}
+            <div className="flex items-center justify-between text-xs leading-none text-muted-foreground">
+              <span>{t("source")}</span>
+              <span>{t("contextSource")}</span>
+            </div>
           </div>
         ) : null}
         {hasTokenSection ? (
