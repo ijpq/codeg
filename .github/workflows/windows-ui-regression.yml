@@ -45,6 +45,7 @@ jobs:
         with:
           workspaces: "./src-tauri -> target"
           shared-key: x86_64-pc-windows-msvc
+          cache-on-failure: true
       - name: Build isolated candidate Setup and Server
         if: inputs.candidate
         shell: pwsh
@@ -52,10 +53,25 @@ jobs:
           pnpm tauri:prepare-sidecars --target x86_64-pc-windows-msvc
           if ($LASTEXITCODE -ne 0) { throw 'Candidate sidecar build failed' }
           $env:CODEG_SKIP_SIDECAR='1'
-          pnpm tauri build --target x86_64-pc-windows-msvc --bundles nsis --config '{"bundle":{"createUpdaterArtifacts":false}}'
+          $config=Join-Path $env:RUNNER_TEMP 'candidate-tauri-config.json'
+          '{"bundle":{"createUpdaterArtifacts":false}}' | Set-Content $config
+          pnpm tauri build --target x86_64-pc-windows-msvc --bundles nsis --config $config
           if ($LASTEXITCODE -ne 0) { throw 'Candidate Setup build failed' }
           cargo build --manifest-path src-tauri/Cargo.toml --release --no-default-features --features server-bin --bin codeg-server --target x86_64-pc-windows-msvc
           if ($LASTEXITCODE -ne 0) { throw 'Candidate Server build failed' }
+      - name: Retain candidate binaries for diagnosis without rebuilding
+        if: inputs.candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: candidate-windows-binaries
+          path: |
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+            src-tauri/target/x86_64-pc-windows-msvc/release/codeg-server.exe
+            src-tauri/target/x86_64-pc-windows-msvc/release/codeg-mcp.exe
+            src-tauri/target/x86_64-pc-windows-msvc/release/codeg-computer-helper.exe
+            out/
+          if-no-files-found: error
+          retention-days: 7
       - name: Download verified published baseline into the runner
         shell: pwsh
         env:
