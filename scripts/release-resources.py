@@ -1,5 +1,6 @@
 """Generate/verify the shipped frontend inventory and compiled migration list."""
 import argparse
+from contextlib import closing
 import hashlib
 import json
 import os
@@ -48,7 +49,7 @@ def verify(root, version):
 def verify_db(data):
     candidates = list(data.rglob('codeg.db'))
     assert len(candidates) == 1, 'Expected one isolated application database'
-    with sqlite3.connect(candidates[0].as_uri() + '?mode=ro', uri=True) as db:
+    with closing(sqlite3.connect(candidates[0].as_uri() + '?mode=ro', uri=True)) as db:
         applied = [row[0] for row in db.execute('SELECT version FROM seaql_migrations ORDER BY version')]
         expected = migrations()
         assert sorted(expected) == applied, {'missing': sorted(set(expected)-set(applied)), 'unexpected': sorted(set(applied)-set(expected))}
