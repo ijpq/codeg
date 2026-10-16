@@ -874,6 +874,7 @@ jobs:
     name: Server ${{ matrix.name }}
     permissions:
       contents: write
+      actions: read
     strategy:
       fail-fast: false
       matrix:
@@ -960,8 +961,49 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Prepare pinned recovery source for the native build cache
+      - name: Reuse the tested runtime from the exact successful ordinary CI
+        id: tested-runtime
         if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference='Stop'
+          $sourceSha=(git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve checked-out source' }
+          $runs=gh run list --repo $env:GITHUB_REPOSITORY --workflow test.yml --commit $sourceSha --branch '${{ github.event.repository.default_branch }}' --status success --limit 20 --json databaseId,headSha,event,conclusion | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot read ordinary CI provenance' }
+          $run=@($runs | Where-Object { $_.headSha -eq $sourceSha -and $_.event -eq 'push' -and $_.conclusion -eq 'success' }) | Select-Object -First 1
+          $artifact=$null
+          if ($run) {
+            $listing=gh api "repos/$env:GITHUB_REPOSITORY/actions/runs/$($run.databaseId)/artifacts?per_page=100" | ConvertFrom-Json
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot read runtime artifact metadata' }
+            $artifact=@($listing.artifacts | Where-Object { $_.name -eq 'tested-codex-runtime-Windows-X64' -and -not $_.expired }) | Select-Object -First 1
+          }
+          if (-not $artifact) {
+            # Old tags and expired artifacts retain the reproducible source build.
+            "reused=false" >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+          if ($artifact.workflow_run.head_sha -ne $sourceSha) { throw 'Runtime artifact source mismatch' }
+          gh run download $run.databaseId --repo $env:GITHUB_REPOSITORY --name $artifact.name --dir dist/codex-runtime
+          if ($LASTEXITCODE -ne 0) { throw 'Tested runtime download failed' }
+          $root=(Resolve-Path dist/codex-runtime).Path
+          $actual=Get-Content (Join-Path $root 'source.json') -Raw | ConvertFrom-Json | ConvertTo-Json -Compress
+          $expected=Get-Content vendor/codex-runtime/source.json -Raw | ConvertFrom-Json | ConvertTo-Json -Compress
+          if ($actual -ne $expected) { throw 'Runtime source pin does not match release' }
+          foreach ($line in Get-Content (Join-Path $root 'runtime.sha256')) {
+            if ($line -notmatch '^([a-f0-9]{64})  ([a-zA-Z0-9_./-]+)$') { throw 'Invalid runtime checksum entry' }
+            $hash=$Matches[1]; $name=$Matches[2]
+            $path=[IO.Path]::GetFullPath((Join-Path $root $name))
+            if (-not $path.StartsWith("$root\", [StringComparison]::OrdinalIgnoreCase)) { throw 'Runtime checksum path escapes bundle' }
+            if ((Get-FileHash $path -Algorithm SHA256).Hash.ToLower() -ne $hash) { throw "Runtime hash mismatch: $name" }
+          }
+          @{ commit=$sourceSha; workflow='test.yml'; run_id=$run.databaseId; artifact_id=$artifact.id; artifact_digest=$artifact.digest } | ConvertTo-Json | Set-Content (Join-Path $root 'ci-provenance.json')
+          "reused=true" >> $env:GITHUB_OUTPUT
+
+      - name: Prepare pinned recovery source for the native build cache
+        if: matrix.target == 'x86_64-pc-windows-msvc' && steps.tested-runtime.outputs.reused != 'true'
         shell: pwsh
         run: |
           rustup toolchain install 1.95.0 --profile minimal --component clippy
@@ -970,7 +1012,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Pinned runtime source preparation failed' }
 
       - name: Cache pinned recovery compilation
-        if: matrix.target == 'x86_64-pc-windows-msvc'
+        if: matrix.target == 'x86_64-pc-windows-msvc' && steps.tested-runtime.outputs.reused != 'true'
         uses: swatinem/rust-cache@v2
         env:
           RUST_BACKTRACE: short
@@ -984,7 +1026,7 @@ jobs:
           cache-on-failure: true
 
       - name: Build pinned Codex recovery runtime
-        if: matrix.target == 'x86_64-pc-windows-msvc'
+        if: matrix.target == 'x86_64-pc-windows-msvc' && steps.tested-runtime.outputs.reused != 'true'
         shell: pwsh
         env:
           RUST_BACKTRACE: short

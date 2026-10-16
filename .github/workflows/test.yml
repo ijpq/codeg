@@ -286,6 +286,13 @@ jobs:
       - name: Verify native Plan and Goal on the shipped runtime
         if: runner.os == 'Linux'
         run: python3 -B scripts/test-codex-goal-protocol.py --cli "$RUNNER_TEMP/codeg-codex-runtime/codex" --acp "$RUNNER_TEMP/codeg-acp-222/node_modules/@agentclientprotocol/codex-acp/dist/index.js" --output "$RUNNER_TEMP/codeg-codex-evidence/native-goal"
+      - name: Retain tested private runtime for this exact commit
+        uses: actions/upload-artifact@v4
+        with:
+          name: tested-codex-runtime-${{ runner.os }}-${{ runner.arch }}
+          path: ${{ runner.temp }}/codeg-codex-runtime/
+          if-no-files-found: error
+          retention-days: 14
       - name: Retain recovery diagnostics
         if: always()
         uses: actions/upload-artifact@v4
