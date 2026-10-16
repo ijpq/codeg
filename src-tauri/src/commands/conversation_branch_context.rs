@@ -522,6 +522,8 @@ mod tests {
                 parent_tool_use_id: None,
                 delegation_call_id: None,
                 origin_cwd: Some("/workspace/project".into()),
+                assistant_id: None,
+                assistant_name: None,
             },
             turns,
             user_turns_before_offset: Some(0),
