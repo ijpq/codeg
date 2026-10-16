@@ -215,15 +215,49 @@ async function importAndOpen(api, f) {
     ],
   })
   assert.equal(saved.accepted, true)
+  const detail = await api("get_folder_conversation", {
+    conversationId: conversation.id,
+    userTurnLimit: 25,
+  })
+  report.checks.push({
+    name: "import-fixture",
+    conversation,
+    tabSave: saved,
+    turns: detail.turns?.length,
+    hasFinal: JSON.stringify(detail).includes("RELEASE_FINAL_LINE"),
+  })
   return conversation
 }
 async function actualPage(page, name, verifyScroll = true) {
   const errors = []
   page.on("pageerror", (error) => errors.push(String(error)))
   await page.reload()
-  await page
-    .getByText("RELEASE_FINAL_LINE", { exact: true })
-    .waitFor({ timeout: 60_000 })
+  try {
+    await page
+      .getByText("RELEASE_FINAL_LINE", { exact: true })
+      .waitFor({ timeout: 60_000 })
+  } catch (error) {
+    await page.screenshot({ path: join(output, `${name}-failure.png`) })
+    await writeFile(
+      join(output, `${name}-failure.json`),
+      JSON.stringify(
+        {
+          origin: new URL(page.url()).origin,
+          path: new URL(page.url()).pathname,
+          body: (await page.locator("body").innerText()).slice(-12000),
+          errors,
+          tabs: await page
+            .evaluate(() =>
+              window.__TAURI_INTERNALS__?.invoke("list_opened_tabs")
+            )
+            .catch(() => null),
+        },
+        null,
+        2
+      )
+    )
+    throw error
+  }
   const viewport = page.locator(".chat-scroll-port").last()
   await viewport.evaluate((el) => {
     el.scrollTop = el.scrollHeight
