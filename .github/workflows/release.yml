@@ -943,6 +943,7 @@ jobs:
         run: |
           pnpm install --frozen-lockfile
           pnpm build
+          pnpm release:resources
 
       - uses: actions/setup-python@v5
         with:
@@ -1252,6 +1253,15 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pnpm install --frozen-lockfile
       - uses: actions/download-artifact@v4
         with:
           name: release-windows-setup-evidence
@@ -1267,7 +1277,12 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: release-draft-verification
-          path: ${{ runner.temp }}/draft-verification/**/verification.json
+          path: |
+            ${{ runner.temp }}/draft-verification/**/verification.json
+            ${{ runner.temp }}/draft-verification/**/*.log
+            ${{ runner.temp }}/draft-verification/**/*.png
+            ${{ runner.temp }}/draft-verification/**/scroll-results.json
+            ${{ runner.temp }}/draft-verification/**/resources-and-migrations.json
           if-no-files-found: warn
           retention-days: 14
 
@@ -1454,6 +1469,15 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pnpm install --frozen-lockfile
       - uses: actions/download-artifact@v4
         with:
           name: release-windows-setup-evidence
@@ -1469,6 +1493,11 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: release-published-verification
-          path: ${{ runner.temp }}/published-verification/**/verification.json
+          path: |
+            ${{ runner.temp }}/published-verification/**/verification.json
+            ${{ runner.temp }}/published-verification/**/*.log
+            ${{ runner.temp }}/published-verification/**/*.png
+            ${{ runner.temp }}/published-verification/**/scroll-results.json
+            ${{ runner.temp }}/published-verification/**/resources-and-migrations.json
           if-no-files-found: warn
           retention-days: 14

@@ -3,6 +3,7 @@ param(
   [Parameter(Mandatory=$true)][string]$Repository,
   [Parameter(Mandatory=$true)][string]$Destination,
   [Parameter(Mandatory=$true)][string]$SetupManifest,
+  [string]$UpgradeFromTag = 'v0.35.1-fix2',
   [switch]$RequirePublished
 )
 $ErrorActionPreference = 'Stop'
@@ -47,7 +48,19 @@ foreach ($file in $manifest.files) {
   $path = Join-Path $installed $file.path
   if (-not (Test-Path $path -PathType Leaf) -or (Get-FileHash -Algorithm SHA256 $path).Hash.ToLower() -ne $file.sha256) { throw "Installed payload mismatch: $($file.path)" }
 }
+python -B scripts/release-resources.py verify (Join-Path $installed 'web') $version
+if ($LASTEXITCODE -ne 0) { throw 'Installed frontend/migration inventory failed' }
 $mcpVersion = (& (Join-Path $installed 'codeg-mcp.exe') --version | Out-String).Trim()
 if ($LASTEXITCODE -ne 0 -or $mcpVersion -ne $version) { throw 'Installed MCP version mismatch' }
-@{ tag=$ReleaseTag; commit=$env:GITHUB_SHA; published=(-not $release.isDraft); assets=$evidence; installation='passed'; server_startup='passed'; installed_files=$manifest.files.Count } | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $Destination 'verification.json')
+$previous = Join-Path $Destination 'previous-release'
+New-Item -ItemType Directory -Force $previous | Out-Null
+$oldVersion = $UpgradeFromTag.TrimStart('v')
+$oldSetup = "codeg_${oldVersion}_x64-setup.exe"
+gh release download $UpgradeFromTag --repo $Repository --dir $previous --pattern $oldSetup --pattern "$oldSetup.sha256"
+if ($LASTEXITCODE -ne 0) { throw 'Could not download upgrade baseline' }
+$oldHash = ((Get-Content (Join-Path $previous "$oldSetup.sha256") -Raw).Trim() -split '\s+')[0].ToLower()
+if ((Get-FileHash (Join-Path $previous $oldSetup) -Algorithm SHA256).Hash.ToLower() -ne $oldHash) { throw 'Upgrade baseline checksum mismatch' }
+node scripts/verify-windows-ui.mjs --setup (Join-Path $Destination $setupName) --previous (Join-Path $previous $oldSetup) --server $root --output (Join-Path $Destination 'ui') --version $version
+if ($LASTEXITCODE -ne 0) { throw 'Setup upgrade/startup or actual Server/Desktop UI verification failed' }
+@{ tag=$ReleaseTag; commit=$env:GITHUB_SHA; published=(-not $release.isDraft); assets=$evidence; installation='passed'; server_startup='passed'; setup_startup='passed'; upgrade='passed'; actual_ui='passed'; installed_files=$manifest.files.Count } | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $Destination 'verification.json')
 Get-Content (Join-Path $Destination 'verification.json')
