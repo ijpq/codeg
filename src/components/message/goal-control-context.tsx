@@ -27,10 +27,11 @@ export interface GoalControlValue {
   /**
    * Fire a pause/clear on the session's currently active goal, or `null`
    * when goal control isn't available for this surface — a history reload with
-   * no live connection, a read-only viewer, or the read-only sub-agent dialog
+   * no live connection or a read-only sub-agent dialog
    * (which resets this context around its `MessageListView`). The goal card
-   * hides its control buttons whenever this is `null`, so liveness/ownership are
-   * decided once at the panel where the connection is owned, not in the card.
+   * hides its control buttons whenever this is `null`, so availability is
+   * decided once by the surface. Non-owning, co-controlling clients may use
+   * these controls; process teardown ownership is a separate concern.
    */
   onGoalControl: ((action: GoalControlAction) => void) | null
   /**
