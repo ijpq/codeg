@@ -5,6 +5,10 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 import { SubAgentSessionDialog } from "./sub-agent-session-dialog"
 import enMessages from "@/i18n/messages/en.json"
 import type { ConnectionState } from "@/contexts/acp-connections-context"
+import {
+  GoalControlProvider,
+  useGoalControl,
+} from "@/components/message/goal-control-context"
 
 const mockSubscribe = vi.hoisted(() =>
   vi.fn(async (event: string, listener: (change: unknown) => void) => {
@@ -174,27 +178,33 @@ vi.mock("@/hooks/use-conversation-detail", () => ({
 // so the read-only-mode test can assert that no `onReload`/`onNewSession`/
 // `sendSignal` are wired in.
 vi.mock("@/components/message/message-list-view", () => ({
-  MessageListView: (props: Record<string, unknown>) => (
-    <div
-      data-testid="message-list-view"
-      data-conversation-id={String(props.conversationId)}
-      data-is-active={String(props.isActive)}
-      data-has-on-reload={String(props.onReload !== undefined)}
-      data-has-on-new-session={String(props.onNewSession !== undefined)}
-      data-has-send-signal={String(props.sendSignal !== undefined)}
-      data-conn-status={
-        props.connStatus === null || props.connStatus === undefined
-          ? "null"
-          : String(props.connStatus)
-      }
-      data-agent-type={String(props.agentType)}
-      data-available-commands={
-        props.availableCommands === undefined
-          ? "undefined"
-          : JSON.stringify(props.availableCommands)
-      }
-    />
-  ),
+  MessageListView: (props: Record<string, unknown>) => {
+    const goal = useGoalControl()
+    return (
+      <div
+        data-testid="message-list-view"
+        data-goal-connection={goal.connectionId ?? "none"}
+        data-goal-read-only={String(goal.readOnly)}
+        data-has-goal-control={String(goal.onGoalControl !== null)}
+        data-conversation-id={String(props.conversationId)}
+        data-is-active={String(props.isActive)}
+        data-has-on-reload={String(props.onReload !== undefined)}
+        data-has-on-new-session={String(props.onNewSession !== undefined)}
+        data-has-send-signal={String(props.sendSignal !== undefined)}
+        data-conn-status={
+          props.connStatus === null || props.connStatus === undefined
+            ? "null"
+            : String(props.connStatus)
+        }
+        data-agent-type={String(props.agentType)}
+        data-available-commands={
+          props.availableCommands === undefined
+            ? "undefined"
+            : JSON.stringify(props.availableCommands)
+        }
+      />
+    )
+  },
 }))
 
 function renderWithIntl(ui: React.ReactElement) {
@@ -281,6 +291,32 @@ describe("SubAgentSessionDialog", () => {
       error: null,
       acpLoadError: null,
     }
+  })
+
+  it("cannot inherit the parent conversation's Goal controls", () => {
+    const parentControl = vi.fn()
+    renderWithIntl(
+      <GoalControlProvider
+        value={{
+          connectionId: "parent-connection",
+          readOnly: false,
+          onGoalControl: parentControl,
+          actions: ["set", "pause", "resume", "clear"],
+        }}
+      >
+        <SubAgentSessionDialog
+          open
+          onOpenChange={() => {}}
+          childConversationId={99}
+          childConnectionId="child-connection"
+          agentType="codex"
+        />
+      </GoalControlProvider>
+    )
+    const transcript = screen.getByTestId("message-list-view")
+    expect(transcript).toHaveAttribute("data-goal-connection", "none")
+    expect(transcript).toHaveAttribute("data-goal-read-only", "true")
+    expect(transcript).toHaveAttribute("data-has-goal-control", "false")
   })
 
   it("renders nothing while closed — the body and bridge stay dormant", () => {
