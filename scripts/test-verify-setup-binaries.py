@@ -1,5 +1,7 @@
 import importlib.util
+from contextlib import closing
 from pathlib import Path
+import sqlite3
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -14,6 +16,44 @@ dependency_spec = importlib.util.spec_from_file_location(
 )
 dependencies = importlib.util.module_from_spec(dependency_spec)
 dependency_spec.loader.exec_module(dependencies)
+resource_spec = importlib.util.spec_from_file_location(
+    "release_resources", Path(__file__).with_name("release-resources.py")
+)
+resources = importlib.util.module_from_spec(resource_spec)
+resource_spec.loader.exec_module(resources)
+
+
+class MigrationResourceTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.path = self.root / 'codeg.db'
+        with closing(sqlite3.connect(self.path)) as db:
+            db.execute('CREATE TABLE seaql_migrations (version TEXT PRIMARY KEY)')
+            db.executemany('INSERT INTO seaql_migrations VALUES (?)',
+                           [(name,) for name in resources.migrations()])
+            db.commit()
+        self.probe = sqlite3.connect(self.path.as_uri() + '?mode=ro', uri=True)
+        self.addCleanup(self.probe.close)
+
+    def assert_database_released(self):
+        # Retain the real connection so GC cannot hide a leaked Windows handle.
+        with self.assertRaises(sqlite3.ProgrammingError):
+            self.probe.execute('SELECT 1')
+        self.path.unlink()
+
+    def test_migration_check_releases_database_before_scratch_cleanup(self):
+        with patch.object(resources.sqlite3, 'connect', return_value=self.probe):
+            self.assertEqual(resources.verify_db(self.root)['integrity'], 'ok')
+        self.assert_database_released()
+
+    def test_failed_migration_check_also_releases_database(self):
+        with patch.object(resources.sqlite3, 'connect', return_value=self.probe), \
+                patch.object(resources, 'migrations', return_value=[]):
+            with self.assertRaises(AssertionError):
+                resources.verify_db(self.root)
+        self.assert_database_released()
 
 
 class VerifySetupTests(unittest.TestCase):
