@@ -10,6 +10,7 @@ import "../../src/app/globals.css"
 
 declare global {
   interface Window {
+    scrollTransitions?: Array<Record<string, unknown>>
     scrollFixture: {
       change: (state: Partial<State>) => void
       writes: Array<{ top: number; stack: string }>
@@ -29,6 +30,30 @@ type State = {
 }
 function Probe() {
   const { state } = useStickToBottomContext()
+  useEffect(() => {
+    window.scrollTransitions = []
+    for (const key of ["isAtBottom", "escapedFromLock"] as const) {
+      let value = state[key]
+      Object.defineProperty(state, key, {
+        configurable: true,
+        get: () => value,
+        set: (next) => {
+          if (next !== value)
+            window.scrollTransitions?.push({
+              key,
+              next,
+              top: state.scrollTop,
+              last: state.lastScrollTop,
+              ignore: state.ignoreScrollToTop,
+              target: state.targetScrollTop,
+              resize: state.resizeDifference,
+              stack: new Error().stack?.split("\n").slice(1, 6).join("\n"),
+            })
+          value = next
+        },
+      })
+    }
+  }, [state])
   useEffect(() => {
     if (window.scrollFixture)
       window.scrollFixture.debug = () => ({
