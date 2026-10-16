@@ -13,6 +13,7 @@ on:
 
 env:
   RUST_BACKTRACE: short
+  CARGO_BUILD_JOBS: 1
   HUSKY: 0
   RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
 
@@ -963,6 +964,7 @@ jobs:
         uses: swatinem/rust-cache@v2
         env:
           RUST_BACKTRACE: short
+  CARGO_BUILD_JOBS: 1
           CARGO_BUILD_JOBS: 1
           CARGO_PROFILE_DEV_DEBUG: "0"
           CARGO_PROFILE_TEST_DEBUG: "0"
@@ -977,6 +979,7 @@ jobs:
         shell: pwsh
         env:
           RUST_BACKTRACE: short
+  CARGO_BUILD_JOBS: 1
           CARGO_BUILD_JOBS: 1
           CARGO_PROFILE_DEV_DEBUG: "0"
           CARGO_PROFILE_TEST_DEBUG: "0"
