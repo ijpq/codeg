@@ -76,6 +76,17 @@ export function useNativeGoalTranscript(
       if (cancelled || document.visibilityState === "hidden") return
       const runtime = useConversationRuntimeStore.getState()
       const session = runtime.byConversationId.get(conversationId)
+      // A failure arrives after the next timer was scheduled. Check again
+      // here: FETCH_DETAIL_START clears detailError synchronously, so only
+      // checking it after starting a read would lose the retry backoff.
+      if (
+        session?.detailError &&
+        lastRead.current.key === key &&
+        Date.now() < lastRead.current.at + ERROR_RETRY_MS
+      ) {
+        schedule()
+        return
+      }
       if (
         session &&
         // A draft keeps its negative runtime key after binding. The reader
