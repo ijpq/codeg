@@ -5496,9 +5496,8 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
         }
         const boundaryIndex = session.batchBoundaryIndex
 
-        // Read the authoritative newest bounded tail. Aligning its final
-        // assistant turns to the local batch remains valid when compaction has
-        // rewritten an older prefix, and avoids a full rollout parse.
+        // Keep metadata reads bounded. Verify the captured batch boundary in
+        // the returned tail before applying per-turn fields.
         const metadataRequest = getFolderConversation(dbConversationId, {
           userTurnLimit: HISTORY_PAGE_USER_TURNS,
           cacheMode: "reload",
@@ -5520,41 +5519,22 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
               }
             }
 
-            // Persisted history precedes this batch in the parse; the count
-            // of leading parsed assistant turns that are history tells the
-            // alignment where the batch starts so it never folds a historical
-            // turn's stats into the first reply.
-            //
-            // WINDOWED response: the fingerprint gate decides. The window was
-            // requested at the batch boundary, so on a verified prefix the
-            // count is simply 0 (the whole window is this session's — the
-            // same semantics as the adopt path). A mismatch — boundary hash
-            // absent (captured under a legacy detail), offset not honored,
-            // or the prefix rewritten by compaction between capture and sync
-            // — means count-based alignment could pin WRONG metadata onto
-            // local turns, and first-write-wins would make that permanent.
-            // Metadata absence is recoverable; a mis-patch is not. So skip
-            // the turn patches entirely (session stats are still safe: they
-            // describe the full transcript regardless of the window).
-            //
-            // LEGACY response (old server, or no boundary was captured): the
-            // full parse, cut below.
+            // The bounded tail can begin before the batch. Verify the prefix
+            // at the boundary, then cut there so historical turns never receive
+            // this batch's metadata. A compacted/unverified prefix stays unpatched.
             const responseWindowed = isWindowedDetail(parsed)
             const windowVerified =
               responseWindowed &&
-              boundaryHash != null &&
-              parsed.turns_offset === boundaryIndex &&
-              parsed.prefix_hash === boundaryHash
-            // A legacy response is the whole transcript. Cut it at the batch
-            // boundary too, so it opens where `localTurns` do, exactly like
-            // the window would: counting history replies alone leaves the
-            // prompt of a viewer batch whose echo deduped against `detail`
-            // at the front, one round more than the tab holds, and a parse a
-            // round behind then hands the first reply's stats to the newest.
-            // The cut is trusted only while the history before it still holds
-            // the `historyAssistantBaseline` replies it held at capture;
-            // otherwise the baseline alone (the old math) decides, aligning
-            // from the end.
+              boundaryIndex != null &&
+              cur.batchBoundaryPrefixHash != null &&
+              boundaryIndex >= turnsOffsetOf(parsed) &&
+              boundaryIndex <= turnsOffsetOf(parsed) + parsed.turns.length &&
+              extendPrefixFingerprint(
+                parsed.prefix_hash ?? FNV_SEED_HEX,
+                parsed.turns.slice(0, boundaryIndex - turnsOffsetOf(parsed))
+              ) === cur.batchBoundaryPrefixHash
+            // Legacy servers return full history. Cut only when its historical
+            // assistant count still matches the captured batch boundary.
             const legacyCut =
               !responseWindowed &&
               boundaryIndex != null &&
@@ -5564,8 +5544,8 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
                 .filter((t) => t.role === "assistant").length ===
                 (cur.historyAssistantBaseline ?? 0)
             const parsedTurns =
-              legacyCut && boundaryIndex != null
-                ? parsed.turns.slice(boundaryIndex)
+              boundaryIndex != null && (windowVerified || legacyCut)
+                ? parsed.turns.slice(boundaryIndex - turnsOffsetOf(parsed))
                 : parsed.turns
             const persistedAssistantCount =
               responseWindowed || legacyCut
@@ -5584,18 +5564,16 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
                       cur.localTurns
                     ),
                   })
-            // An unverified window is worth another look ONLY when the
-            // transcript is behind: `fromIndex` clamps to the total, so an
-            // offset SHORT of the boundary means the batch has not reached
-            // disk yet and a later round can verify. Every other mismatch is
-            // permanent for this batch — the boundary hash is absent (captured
-            // under a legacy detail) or the prefix was rewritten at the same
-            // offset (compaction) — and patches stay `[]` however long we
-            // poll, so five reparses would buy nothing.
+            // Retry an unverified tail only if its end is still behind the
+            // batch boundary. A missing/compacted fingerprint or a boundary
+            // before this bounded tail cannot recover by repeating the read.
             const windowUnverifiableForGood =
               responseWindowed &&
               !windowVerified &&
-              !(boundaryIndex != null && parsed.turns_offset < boundaryIndex)
+              !(
+                boundaryIndex != null &&
+                turnsOffsetOf(parsed) + parsed.turns.length < boundaryIndex
+              )
 
             if (patches.length > 0 || parsed.session_stats) {
               dispatch({

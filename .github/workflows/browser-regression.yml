@@ -1,7 +1,7 @@
 name: Transcript browser regression
 on:
   push:
-    branches: ["main", "fix/execution-scroll-v0.35.2"]
+    branches: ["main", "fix/execution-scroll-v0.36.0"]
   pull_request:
   workflow_dispatch:
     inputs:

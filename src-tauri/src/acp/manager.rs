@@ -3068,7 +3068,13 @@ impl ConnectionManager {
             .clone()
             .or_else(|| Some(uuid::Uuid::new_v4().to_string()));
         match self
-            .send_prompt_inner(conn_id, blocks, user_message, internal_suffix, report_request_id)
+            .send_prompt_inner(
+                conn_id,
+                blocks,
+                user_message,
+                internal_suffix,
+                report_request_id,
+            )
             .await
         {
             Ok(()) => {
@@ -9967,6 +9973,7 @@ mod tests {
             blocks,
             user_message,
             internal_suffix,
+            ..
         } = cmd_rx.try_recv().expect("one prompt command")
         else {
             panic!("expected prompt command");
