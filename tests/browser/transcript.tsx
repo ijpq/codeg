@@ -28,7 +28,16 @@ type State = {
 }
 function Probe() {
   const { state } = useStickToBottomContext()
-  useEffect(() => { if (window.scrollFixture) window.scrollFixture.debug = () => ({isAtBottom: state.isAtBottom, escaped: state.escapedFromLock, target: state.targetScrollTop, resize: state.resizeDifference, animation: state.animation?.behavior}) })
+  useEffect(() => {
+    if (window.scrollFixture)
+      window.scrollFixture.debug = () => ({
+        isAtBottom: state.isAtBottom,
+        escaped: state.escapedFromLock,
+        target: state.targetScrollTop,
+        resize: state.resizeDifference,
+        animation: state.animation?.behavior,
+      })
+  })
   return null
 }
 function Fixture() {
@@ -42,8 +51,7 @@ function Fixture() {
     smooth: false,
   })
   useEffect(() => {
-    const writes: Array<{ top: number; stack: string }>
-      debug?: () => unknown = []
+    const writes: Array<{ top: number; stack: string }> = []
     window.scrollFixture = {
       change: (next) => set((current) => ({ ...current, ...next })),
       writes,
@@ -84,7 +92,7 @@ function Fixture() {
           resize={state.smooth ? "smooth" : "instant"}
         >
           <Probe />
-        <MessageBottomFollowGuard
+          <MessageBottomFollowGuard
             scopeKey="browser-fixture"
             layoutSignal={JSON.stringify(state)}
           />
