@@ -1583,6 +1583,16 @@ pub async fn acp_current_platform() -> Json<String> {
     Json(custom_agent_commands::acp_current_platform_core())
 }
 
+pub async fn acp_get_goal_state(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<AcpConnectionIdParams>,
+) -> Result<Json<serde_json::Value>, AppCommandError> {
+    acp_commands::acp_get_goal_state_core(&state.connection_manager, &params.connection_id)
+        .await
+        .map(Json)
+        .map_err(|error| AppCommandError::task_execution_failed(error.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -1632,12 +1642,4 @@ mod tests {
         assert!(text.contains(r#"{"agentType":"antigravity"}"#));
         assert!(!text.contains("codex"));
     }
-}
-
-pub async fn acp_get_goal_state(
-    Extension(state): Extension<Arc<AppState>>,
-    Json(params): Json<AcpConnectionIdParams>,
-) -> Result<Json<serde_json::Value>, AppCommandError> {
-    acp_commands::acp_get_goal_state_core(&state.connection_manager, &params.connection_id).await
-        .map(Json).map_err(|error| AppCommandError::task_execution_failed(error.to_string()))
 }
