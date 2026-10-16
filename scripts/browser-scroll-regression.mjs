@@ -127,6 +127,7 @@ try {
         lr = line?.getBoundingClientRect()
       return {
         debug: window.scrollFixture.debug?.(),
+        frames: window.scrollFixture.frames,
         following: v.dataset.bottomFollowing,
         top: v.scrollTop,
         height: v.scrollHeight,
@@ -152,6 +153,10 @@ try {
     const last = samples.at(-1)
     results.push({ name, spread, samples })
     try {
+      assert.ok(
+        last.frames - samples[0].frames < 8,
+        `${name}: animation frames never settled`
+      )
       assert.ok(spread <= 1, `${name}: unstable scroll ${spread}px`)
       assert.ok(last.remaining <= 2, `${name}: tail gap ${last.remaining}px`)
       assert.ok(
