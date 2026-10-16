@@ -52,6 +52,8 @@ python -B scripts/release-resources.py verify (Join-Path $installed 'web') $vers
 if ($LASTEXITCODE -ne 0) { throw 'Installed frontend/migration inventory failed' }
 $mcpVersion = (& (Join-Path $installed 'codeg-mcp.exe') --version | Out-String).Trim()
 if ($LASTEXITCODE -ne 0 -or $mcpVersion -ne $version) { throw 'Installed MCP version mismatch' }
+python -B scripts/verify-windows-dependencies.py $installed --report (Join-Path $Destination 'setup-windows-dependencies.json')
+if ($LASTEXITCODE -ne 0) { throw 'Installed Windows runtime dependency verification failed' }
 $previous = Join-Path $Destination 'previous-release'
 New-Item -ItemType Directory -Force $previous | Out-Null
 $oldVersion = $UpgradeFromTag.TrimStart('v')
@@ -60,7 +62,10 @@ gh release download $UpgradeFromTag --repo $Repository --dir $previous --pattern
 if ($LASTEXITCODE -ne 0) { throw 'Could not download upgrade baseline' }
 $oldHash = ((Get-Content (Join-Path $previous "$oldSetup.sha256") -Raw).Trim() -split '\s+')[0].ToLower()
 if ((Get-FileHash (Join-Path $previous $oldSetup) -Algorithm SHA256).Hash.ToLower() -ne $oldHash) { throw 'Upgrade baseline checksum mismatch' }
-node scripts/verify-windows-ui.mjs --setup (Join-Path $Destination $setupName) --previous (Join-Path $previous $oldSetup) --server $root --output (Join-Path $Destination 'ui') --version $version
+$nativeTools = Join-Path $Destination 'native-agent-tools'
+npm install --prefix $nativeTools --global --ignore-scripts --no-audit --no-fund '@agentclientprotocol/codex-acp@2.2.2'
+if ($LASTEXITCODE -ne 0) { throw 'Isolated ACP installation failed' }
+node scripts/verify-windows-ui.mjs --setup (Join-Path $Destination $setupName) --previous (Join-Path $previous $oldSetup) --server $root --output (Join-Path $Destination 'ui') --version $version --native-tools $nativeTools
 if ($LASTEXITCODE -ne 0) { throw 'Setup upgrade/startup or actual Server/Desktop UI verification failed' }
 @{ tag=$ReleaseTag; commit=$env:GITHUB_SHA; published=(-not $release.isDraft); assets=$evidence; installation='passed'; server_startup='passed'; setup_startup='passed'; upgrade='passed'; actual_ui='passed'; installed_files=$manifest.files.Count } | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $Destination 'verification.json')
 Get-Content (Join-Path $Destination 'verification.json')
