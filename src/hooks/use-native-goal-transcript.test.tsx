@@ -7,6 +7,7 @@ const runtime = vi.hoisted(() => ({
   byConversationId: new Map<
     number,
     {
+      dbConversationId: number | null
       detailLoading: boolean
       loadingOlderTurns: boolean
       activeTurnToken: string | null
@@ -35,6 +36,7 @@ beforeEach(() => {
   vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible")
   runtime.byConversationId.clear()
   runtime.byConversationId.set(42, {
+    dbConversationId: null,
     detailLoading: false,
     loadingOlderTurns: false,
     activeTurnToken: null,
@@ -133,17 +135,15 @@ describe("native Goal transcript projection", () => {
     expect(runtime.actions.refetchDetail).toHaveBeenCalledTimes(1)
   })
 
-  it("does not read a negative draft id, then follows its durable handoff", async () => {
-    const { result, rerender } = renderHook(
-      ({ id }) => useNativeGoalTranscript("c", id, true),
-      { initialProps: { id: -9 } }
-    )
+  it("keeps the negative runtime key and waits for its durable DB binding", async () => {
+    runtime.byConversationId.set(-9, { ...session() })
+    const { result } = renderHook(() => useNativeGoalTranscript("c", -9, true))
     act(() => result.current(snapshot("active")))
     await advance(5000)
     expect(runtime.actions.refetchDetail).not.toHaveBeenCalled()
-    rerender({ id: 42 })
-    await advance(500)
-    expect(runtime.actions.refetchDetail).toHaveBeenCalledWith(42, {
+    runtime.byConversationId.get(-9)!.dbConversationId = 42
+    await advance(2000)
+    expect(runtime.actions.refetchDetail).toHaveBeenCalledWith(-9, {
       preserveLive: true,
     })
   })
