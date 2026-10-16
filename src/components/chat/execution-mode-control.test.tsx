@@ -29,7 +29,10 @@ const option = {
     groups: [],
   },
 } as SessionConfigOptionInfo
-function mount(onSelect = vi.fn()) {
+function mount(
+  onSelect = vi.fn(),
+  startGoal?: (objective: string) => Promise<void>
+) {
   render(
     <NextIntlClientProvider locale="en" messages={messages}>
       <GoalControlProvider
@@ -38,6 +41,7 @@ function mount(onSelect = vi.fn()) {
           readOnly: false,
           onGoalControl: null,
           actions: [],
+          startGoal,
         }}
       >
         <ExecutionModeControl option={option} onSelect={onSelect} />
@@ -95,6 +99,23 @@ describe("ExecutionModeControl", () => {
       )
     )
     expect(await screen.findByText("Status: Active")).toBeInTheDocument()
+  })
+  it("waits for the owning surface to bind a draft, and never falls back to unbound work on failure", async () => {
+    const startGoal = vi.fn(async () => {
+      throw new Error("history binding failed")
+    })
+    mount(undefined, startGoal)
+    await open()
+    await userEvent.click(screen.getByRole("radio", { name: "Execute goal" }))
+    fireEvent.change(screen.getByRole("textbox", { name: "Goal objective" }), {
+      target: { value: "ship" },
+    })
+    await userEvent.click(screen.getByRole("button", { name: "Start goal" }))
+    expect(startGoal).toHaveBeenCalledWith("ship")
+    expect(
+      await screen.findByText("Error: history binding failed")
+    ).toBeInTheDocument()
+    expect(acpGoalControl).not.toHaveBeenCalled()
   })
   it("waits for pause confirmation before changing mode; returning to Goal requires explicit resume", async () => {
     state.goal = { objective: "ship", status: "active" }

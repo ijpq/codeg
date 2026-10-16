@@ -39,7 +39,7 @@ export function ExecutionModeControl({
   option: SessionConfigOptionInfo
   onSelect?: (configId: string, value: string) => void
 }) {
-  const { connectionId, readOnly } = useGoalControl()
+  const { connectionId, readOnly, startGoal } = useGoalControl()
   // Keying the inner component makes connection changes discard pending UI.
   return (
     <ExecutionModeSession
@@ -47,6 +47,7 @@ export function ExecutionModeControl({
       option={option}
       connectionId={connectionId ?? null}
       readOnly={Boolean(readOnly)}
+      startGoal={startGoal}
       onSelect={onSelect}
       active={active}
     />
@@ -57,6 +58,7 @@ function ExecutionModeSession({
   option,
   connectionId,
   readOnly,
+  startGoal,
   onSelect,
   active,
 }: {
@@ -64,6 +66,7 @@ function ExecutionModeSession({
   option: SessionConfigOptionInfo
   connectionId: string | null
   readOnly: boolean
+  startGoal?: (objective: string) => Promise<void>
   onSelect?: (configId: string, value: string) => void
 }) {
   const t = useTranslations("Folder.chat.execution")
@@ -140,11 +143,15 @@ function ExecutionModeSession({
     setBusy(true)
     setError(null)
     try {
-      await acpGoalControl(
-        connectionId,
-        action,
-        action === "set" ? objective.trim() : undefined
-      )
+      if (action === "set" && startGoal) {
+        await startGoal(objective.trim())
+      } else {
+        await acpGoalControl(
+          connectionId,
+          action,
+          action === "set" ? objective.trim() : undefined
+        )
+      }
       await refresh()
     } catch (e) {
       if (mounted.current) setError(String(e))
