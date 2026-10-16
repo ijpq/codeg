@@ -238,8 +238,7 @@ const EscapeLockOnUserScroll = () => {
       if (
         state.isAtBottom &&
         !state.escapedFromLock &&
-        delta > 0 &&
-        delta <= 1
+        (state.isNearBottom || (delta > 0 && delta <= 1))
       ) {
         state.ignoreScrollToTop = scrollTop
       }
