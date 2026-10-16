@@ -118,7 +118,6 @@ export const MessageBottomFollowGuard = memo(function MessageBottomFollowGuard({
     useStickToBottomContext()
   const frameRef = useRef<number | null>(null)
   const generationRef = useRef(0)
-  const lastRowRef = useRef<HTMLElement | null>(null)
   const scheduleRef = useRef<() => void>(() => undefined)
 
   const cancelScheduled = useCallback(() => {
@@ -229,6 +228,8 @@ export const MessageBottomFollowGuard = memo(function MessageBottomFollowGuard({
     resizeObserver.observe(content)
     if (bottomDock) resizeObserver.observe(bottomDock)
 
+    let observedSentinel: HTMLElement | null = null
+    let observedLastRow: HTMLElement | null = null
     const bindDynamicTargets = () => {
       const sentinel = content.querySelector<HTMLElement>(
         "[data-message-end-sentinel]"
@@ -236,10 +237,15 @@ export const MessageBottomFollowGuard = memo(function MessageBottomFollowGuard({
       const lastRow = content.querySelector<HTMLElement>(
         '[data-message-thread-last="true"]'
       )
-      if (sentinel) resizeObserver.observe(sentinel)
-      if (lastRow && lastRow !== lastRowRef.current) {
-        if (lastRowRef.current) resizeObserver.unobserve(lastRowRef.current)
-        resizeObserver.observe(lastRow)
+      if (sentinel !== observedSentinel) {
+        if (observedSentinel) resizeObserver.unobserve(observedSentinel)
+        if (sentinel) resizeObserver.observe(sentinel)
+        observedSentinel = sentinel
+      }
+      if (lastRow !== observedLastRow) {
+        if (observedLastRow) resizeObserver.unobserve(observedLastRow)
+        if (lastRow) resizeObserver.observe(lastRow)
+        observedLastRow = lastRow
       }
       scheduleCorrection()
     }

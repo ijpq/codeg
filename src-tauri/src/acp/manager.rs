@@ -3381,7 +3381,7 @@ impl ConnectionManager {
         }
     }
 
-    /// Pause or clear the session's active goal via the connection loop
+    /// Apply native Goal control via the connection loop
     /// (codex-acp #293; the provider-neutral `_session/goal` since codex 1.2 /
     /// claude 0.66). Looked up by connectionId; the loop sources the sessionId
     /// from the live session, so callers only supply the action.

@@ -10993,11 +10993,11 @@ async fn set_session_config_option_inner(
 /// Send the connection's goal-control extension request to pause or clear the
 /// session's active goal — the advertised `_session/goal` (claude 0.66+ / codex
 /// 1.2+) or codex's bespoke `_codex/session/goal_control` (#293, v1.1.4) it
-/// still accepts as an alias. Start / resume / re-objective are NOT this method
-/// — they go through the `/goal` prompt.
+/// still accepts as an alias. Modern adapters support set/resume here too;
+/// creation carries an objective and is gated by the advertised vocabulary.
 ///
 /// The agent replies with an empty object and then pushes the resulting goal
-/// snapshot as a normal `session_info_update` (`_meta.goal`, the legacy
+/// snapshot as a normal `session_info_update` (AIR goal metadata, the legacy
 /// `_meta.codex.goal`, or `null` for a clear), which the existing goal-card
 /// path renders — so the response value carries nothing to parse and is
 /// intentionally discarded.

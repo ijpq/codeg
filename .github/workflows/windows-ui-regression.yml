@@ -1,8 +1,11 @@
 name: Isolated Windows UI regression
 on:
   push:
-    branches: ["fix/execution-scroll-v0.35.2"]
+    branches: ["main", "fix/execution-scroll-v0.35.2"]
     paths:
+      - "src/components/message/**"
+      - "src/components/ai-elements/message-thread*"
+      - "tests/browser/**"
       - "scripts/verify-windows-ui.mjs"
       - "scripts/browser-scroll-regression.mjs"
       - ".github/workflows/windows-ui-regression.yml"
