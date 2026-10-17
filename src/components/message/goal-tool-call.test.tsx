@@ -44,6 +44,28 @@ const renderTextPart = (part: AdaptedContentPart, key: string) =>
   part.type === "text" ? <div key={key}>{part.text}</div> : null
 
 describe("GoalToolCallPart", () => {
+  it("keeps completed Goal seconds visible in the collapsed history card", () => {
+    renderWithIntl(
+      <GoalToolCallPart
+        part={{
+          type: "tool-call",
+          toolCallId: "completed-timed-goal",
+          toolName: "update_goal",
+          input: JSON.stringify({ status: "complete" }),
+          state: "output-available",
+          output: JSON.stringify({
+            goal: {
+              objective: "Finished goal",
+              status: "complete",
+              timeUsedSeconds: 3661,
+            },
+          }),
+        }}
+      />
+    )
+    expect(screen.getByTitle("Elapsed")).toHaveTextContent("1h 1m 1s")
+  })
+
   it("renders Codex goal completion as a compact goal card", () => {
     renderWithIntl(
       <GoalToolCallPart

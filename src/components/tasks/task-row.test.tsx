@@ -82,6 +82,18 @@ function renderRow(
 }
 
 describe("TaskRow", () => {
+  it("shows the recorded work time without counting the wait for acceptance", () => {
+    renderRow(
+      task({
+        status: "done",
+        started_at: "2026-08-01T08:00:00+08:00",
+        settled_at: "2026-08-01T00:02:03Z",
+        finished_at: "2026-08-02T00:00:00Z",
+      })
+    )
+    expect(screen.getByText("Last run: 2m 3s")).toBeInTheDocument()
+  })
+
   it("carries the same primary action the card derives for the status", async () => {
     const onMerge = vi.fn()
     renderRow(task(), { onMerge })

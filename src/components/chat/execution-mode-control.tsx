@@ -17,6 +17,7 @@ import {
   type SessionGoalState,
 } from "@/lib/api"
 import type { SessionConfigOptionInfo } from "@/lib/types"
+import { formatElapsedLabel } from "@/lib/format-elapsed"
 
 const GOAL_STATUS_KEYS = {
   active: "statuses.active",
@@ -73,6 +74,8 @@ function ExecutionModeSession({
   onSelect?: (configId: string, value: string) => void
 }) {
   const t = useTranslations("Folder.chat.execution")
+  const tElapsed = useTranslations("Folder.chat.liveTurnStats")
+  const tGoal = useTranslations("Folder.chat.contentParts.goal")
   const [snapshot, setSnapshot] = useState<SessionGoalState | null>(null)
   const [goalSelected, setGoalSelected] = useState(false)
   const [objective, setObjective] = useState("")
@@ -263,6 +266,20 @@ function ExecutionModeSession({
                     {goal.tokenBudget != null ? ` / ${goal.tokenBudget}` : ""}
                   </p>
                 )}
+                {typeof goal.timeUsedSeconds === "number" &&
+                  Number.isFinite(goal.timeUsedSeconds) &&
+                  goal.timeUsedSeconds >= 0 && (
+                    <p
+                      className="text-xs tabular-nums text-muted-foreground"
+                      data-goal-duration={goal.timeUsedSeconds}
+                    >
+                      {tGoal("elapsed")}:{" "}
+                      {formatElapsedLabel(
+                        goal.timeUsedSeconds * 1000,
+                        tElapsed
+                      )}
+                    </p>
+                  )}
                 <div className="flex gap-2">
                   {goal.status === "active" ? (
                     <Button
