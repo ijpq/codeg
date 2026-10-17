@@ -1657,7 +1657,10 @@ mod tests {
                         owner_window_label: "main".to_string(),
                         shell: Some("/bin/sh".to_string()),
                         initial_command: Some(format!(
-                            "printf 'started\\n' >> '{}'; sleep 30",
+                            // Opening the redirected file precedes the write.
+                            // Keep that empty-file window deterministic.
+                            ": >> '{}'; sleep 0.05; printf 'started\\n' >> '{}'; sleep 30",
+                            output.display(),
                             output.display()
                         )),
                         extra_env: None,
@@ -1675,10 +1678,19 @@ mod tests {
         assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !output.exists() && Instant::now() < deadline {
+        let text = loop {
+            match std::fs::read_to_string(&output) {
+                Ok(text) if text.ends_with('\n') => break text,
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("spawn marker: {error}"),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "child did not finish its spawn marker"
+            );
             std::thread::sleep(Duration::from_millis(10));
-        }
-        let text = std::fs::read_to_string(&output).expect("spawn marker");
+        };
         assert_eq!(text.lines().count(), 1, "command was run twice");
         manager.kill(&id).expect("the winning child is reachable");
         let _ = std::fs::remove_file(output);
