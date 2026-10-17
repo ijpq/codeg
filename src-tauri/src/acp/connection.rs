@@ -31667,10 +31667,13 @@ mod tests {
                     )
                     .connect_with(agent_end, async move |cx: ConnectionTo<Client>| {
                         cx.incoming_closed().await;
-                        let _ = closed_tx.send(());
                         Ok(())
                     })
                     .await;
+                // Disconnect can close the transport before a pending prompt
+                // reply is written. connect_with may then return before its
+                // incoming_closed callback, but the agent has still stopped.
+                let _ = closed_tx.send(());
             });
             Self {
                 seen,
