@@ -1,4 +1,11 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import { NextIntlClientProvider } from "next-intl"
 import { beforeEach, describe, expect, it, vi } from "vitest"
@@ -73,6 +80,47 @@ beforeEach(() => {
   )
 })
 describe("ExecutionModeControl", () => {
+  it("shows completed native Goal time after reconnect without a ticking estimate", async () => {
+    state.goal = {
+      objective: "Finished goal",
+      status: "complete",
+      timeUsedSeconds: 3661,
+    }
+    mount()
+    await open()
+    expect(screen.getByText("Elapsed: 1h 1m 1s")).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "Resume" })).toBeNull()
+    cleanup()
+    mount()
+    await open()
+    expect(screen.getByText("Elapsed: 1h 1m 1s")).toBeInTheDocument()
+  })
+
+  it.each([undefined, -1, NaN, Infinity])(
+    "omits unavailable or invalid Goal time: %s",
+    async (seconds) => {
+      state.goal = {
+        objective: "Finished goal",
+        status: "complete",
+        timeUsedSeconds: seconds,
+      }
+      mount()
+      await open()
+      expect(screen.queryByText(/^Elapsed:/)).toBeNull()
+    }
+  )
+
+  it("shows the native zero-second value", async () => {
+    state.goal = {
+      objective: "Finished goal",
+      status: "complete",
+      timeUsedSeconds: 0,
+    }
+    mount()
+    await open()
+    expect(screen.getByText("Elapsed: 0s")).toBeInTheDocument()
+  })
+
   it("uses the native collaboration option for Plan", async () => {
     const select = mount()
     await open()

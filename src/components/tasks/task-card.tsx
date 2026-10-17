@@ -27,6 +27,7 @@ import {
 import { buildTaskActions, type TaskActionItem } from "./task-actions"
 import type { TaskActionHandlers } from "./task-actions"
 import type { WorkTask } from "@/lib/types"
+import { TaskDuration } from "./task-duration"
 
 type StatusLabelKey =
   | "statusTodo"
@@ -485,6 +486,7 @@ export function TaskCard({
           <span className="text-muted-foreground/40">·</span>
         ) : null}
         {when ? <span className="shrink-0">{when}</span> : null}
+        <TaskDuration task={task} />
         <ScheduleChip task={task} />
         <MergeQueuedChip task={task} rank={mergeQueueRank} />
         <PreflightChip task={task} />

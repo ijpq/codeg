@@ -411,13 +411,14 @@ describe("MessageInput (RichComposer integration)", () => {
       clearMessageInputDraftV2(draftKey)
     })
 
-    const composer = (isActive: boolean) => (
+    const composer = (isActive: boolean, isPrompting = false) => (
       <NextIntlClientProvider locale="en" messages={enMessages}>
         <MessageInput
           onSend={vi.fn()}
           promptCapabilities={CAPS}
           draftStorageKey={draftKey}
           isActive={isActive}
+          isPrompting={isPrompting}
         />
       </NextIntlClientProvider>
     )
@@ -498,6 +499,25 @@ describe("MessageInput (RichComposer integration)", () => {
       await nextFrame() // an auto-focus effect's own frame, were one scheduled
       await nextFrame() // Tiptap's deferred DOM focus
       expect(document.activeElement).toBe(document.body)
+    })
+
+    it("keeps keyboard navigation in the transcript when a turn settles", async () => {
+      const { rerender } = await mountReady(true, false)
+      await nextFrame()
+      rerender(composer(true, true))
+      const viewport = document.createElement("div")
+      viewport.className = "chat-scroll-port"
+      viewport.tabIndex = 0
+      document.body.append(viewport)
+      try {
+        act(() => viewport.focus())
+        rerender(composer(true, false))
+        await nextFrame()
+        await nextFrame()
+        expect(document.activeElement).toBe(viewport)
+      } finally {
+        viewport.remove()
+      }
     })
   })
 

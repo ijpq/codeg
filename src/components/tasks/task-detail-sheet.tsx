@@ -83,6 +83,8 @@ import {
   usesMergeRequests,
 } from "./task-acceptance"
 import { StatusChip, statusLabelKey } from "./task-card"
+import { TaskDuration } from "./task-duration"
+import { taskRunDurationMs } from "@/lib/task-duration"
 import {
   TaskMessageComposer,
   type TaskMessageComposerHandle,
@@ -1192,6 +1194,11 @@ export function TaskDetailSheet({
                   {task.finished_at ? (
                     <InfoRow label={t("detailFinished")}>
                       {formatDateTime(task.finished_at)}
+                    </InfoRow>
+                  ) : null}
+                  {taskRunDurationMs(task) !== null ? (
+                    <InfoRow label={t("detailRunDuration")}>
+                      <TaskDuration task={task} />
                     </InfoRow>
                   ) : null}
                 </dl>

@@ -88,6 +88,57 @@ function renderCard(
 }
 
 describe("TaskCard review primary", () => {
+  it("keeps a completed task's execution time fixed across reloads and later acceptance", () => {
+    const completed = task({
+      status: "done",
+      started_at: "2026-08-01T00:00:00Z",
+      settled_at: "2026-08-01T01:01:01Z",
+      finished_at: "2026-08-02T00:00:00Z",
+      archived_at: "2026-08-03T00:00:00Z",
+    })
+    const first = renderCard(completed)
+    expect(screen.getByText("Last run: 1h 1m 1s")).toBeInTheDocument()
+    expect(screen.getByTitle(/Excludes subsequent review/)).toBeInTheDocument()
+    first.unmount()
+    renderCard(structuredClone(completed))
+    expect(screen.getByText("Last run: 1h 1m 1s")).toBeInTheDocument()
+  })
+
+  it.each([
+    { started_at: null },
+    { started_at: "invalid" },
+    { settled_at: "2026-07-31T23:59:00Z" },
+    { status: "running" as const },
+    { status: "queued" as const },
+    { status: "canceled" as const },
+    { status: "failed" as const },
+    { settled_at: null, finished_at: "2026-08-02T00:00:00Z" },
+  ])(
+    "does not invent elapsed time for unavailable or stale timing: %j",
+    (overrides) => {
+      renderCard(
+        task({
+          status: "done",
+          started_at: "2026-08-01T00:00:00Z",
+          settled_at: "2026-08-01T00:01:01Z",
+          ...overrides,
+        })
+      )
+      expect(screen.queryByText(/Last run:/)).not.toBeInTheDocument()
+    }
+  )
+
+  it("shows an actually recorded sub-second completion as zero seconds", () => {
+    renderCard(
+      task({
+        status: "done",
+        started_at: "2026-08-01T00:00:00.000Z",
+        settled_at: "2026-08-01T00:00:00.200Z",
+      })
+    )
+    expect(screen.getByText("Last run: 0s")).toBeInTheDocument()
+  })
+
   it("offers completion — not a merge — when the task changed nothing", async () => {
     const onMerge = vi.fn()
     const onComplete = vi.fn()

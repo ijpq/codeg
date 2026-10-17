@@ -17,6 +17,7 @@ import { unwrapWholeFence } from "@/lib/fenced-text"
 import { ChevronRightIcon, PauseIcon, XIcon } from "lucide-react"
 import { useTranslations } from "next-intl"
 import { useGoalControl } from "./goal-control-context"
+import { formatElapsedLabel } from "@/lib/format-elapsed"
 
 type GoalToolPart = Extract<AdaptedContentPart, { type: "tool-call" }>
 
@@ -137,15 +138,6 @@ function formatTokens(count: number | null, tokenLabel: string): string | null {
   return `${count} ${tokenLabel}`
 }
 
-function formatDuration(seconds: number | null): string | null {
-  if (seconds === null) return null
-  if (seconds < 60) return `${Math.round(seconds)}s`
-  const minutes = seconds / 60
-  if (minutes < 60) return `${minutes.toFixed(1).replace(/\.0$/, "")}m`
-  const hours = minutes / 60
-  return `${hours.toFixed(1).replace(/\.0$/, "")}h`
-}
-
 function statusTone(
   status: string | null
 ): "active" | "complete" | "error" | "muted" {
@@ -215,6 +207,7 @@ function GoalCard({
   renderPart?: RenderGoalPart
 }) {
   const t = useTranslations("Folder.chat.contentParts.goal")
+  const tElapsed = useTranslations("Folder.chat.liveTurnStats")
   const inferredRunning =
     startPart.state === "input-available" ||
     startPart.state === "input-streaming" ||
@@ -250,7 +243,12 @@ function GoalCard({
   const tokenSummary = formatTokens(goal.tokensUsed, t("tokens"))
   const budgetSummary = formatTokens(goal.tokenBudget, t("tokens"))
   const remainingSummary = formatTokens(goal.remainingTokens, t("tokens"))
-  const durationSummary = formatDuration(goal.timeUsedSeconds)
+  const durationSummary =
+    goal.timeUsedSeconds !== null &&
+    Number.isFinite(goal.timeUsedSeconds) &&
+    goal.timeUsedSeconds >= 0
+      ? formatElapsedLabel(goal.timeUsedSeconds * 1000, tElapsed)
+      : null
 
   const errorText = endPart?.errorText ?? startPart.errorText
 
@@ -306,7 +304,11 @@ function GoalCard({
           </span>
         )}
         {durationSummary && (
-          <span className="shrink-0 text-muted-foreground/60">
+          <span
+            className="shrink-0 tabular-nums text-muted-foreground/60"
+            title={t("elapsed")}
+            data-goal-duration={goal.timeUsedSeconds ?? undefined}
+          >
             {durationSummary}
           </span>
         )}

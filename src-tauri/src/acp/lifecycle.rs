@@ -3418,13 +3418,15 @@ mod tests {
             },
         }));
 
+        // This checks eventual ordered delivery, not sub-second latency.
+        // Thousands of concurrent Windows tests can delay the SQLite worker.
         let observed_external =
-            poll_external_id(&db, conv.id, "ext-final", Duration::from_millis(500)).await;
+            poll_external_id(&db, conv.id, "ext-final", Duration::from_secs(5)).await;
         let observed_status = poll_status(
             &db,
             conv.id,
             ConversationStatus::PendingReview,
-            Duration::from_millis(500),
+            Duration::from_secs(5),
         )
         .await;
 
