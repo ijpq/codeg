@@ -693,6 +693,10 @@ export function MessageInput({
     if (!isActive || !composerReady || isPrompting) return
     if (isPrimaryPointerCoarse()) return
     const raf = requestAnimationFrame(() => {
+      // A turn (including a native Goal continuation) can finish while the
+      // reader navigates the transcript. Moving focus back to Tiptap then
+      // redirects Home/PageUp to the editor and may scroll it into view.
+      if (document.activeElement?.closest(".chat-scroll-port")) return
       editorRef.current?.focus()
     })
     // Dropped if the tab goes inactive or a turn starts before the frame runs.

@@ -27,6 +27,7 @@ import {
   type TaskActionItem,
 } from "./task-actions"
 import type { WorkTask } from "@/lib/types"
+import { TaskDuration } from "./task-duration"
 
 /**
  * The list's column geometry, shared verbatim by the header (TaskList) and
@@ -176,6 +177,7 @@ export function TaskRow({
             <MergeQueuedChip task={task} rank={mergeQueueRank} />
             <WorktreeRemovedChip task={task} />
           </div>
+          <TaskDuration task={task} />
           {note ? (
             <span
               className={cn(

@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.36.0-fix1 — 2026-10-16
+## 0.36.0-fix1 — 2026-10-17
 
 - Rebase the fork onto upstream v0.36.0 while preserving existing recovery,
   bounded history, deliverables, native fork and collaboration fixes.
@@ -17,11 +17,17 @@
   Back off asynchronous read failures without dropping pending output.
 - Keep the latest Goal answer visible when a native pause/completion snapshot
   arrives after it, including history reloads with collapsed process cards.
+- Show completed tasks' most recent execution duration on cards, list rows and
+  details using stored start/review times, excluding the later acceptance wait.
+  Show native Goal elapsed time in its controls and historical cards, to the
+  second, including after completion and reload; never estimate missing times.
 - Share the transcript scroll target, prevent virtual row compensation from
   falsely escaping the follow lock, and terminate unreachable-sentinel retries.
   Preserve virtualization, delayed-content following and deliberate reader escape.
 - Retain Ctrl/Cmd+Home navigation outside editors while shielding programmatic
   measurement corrections; cover the shortcuts in real browser regressions.
+- Preserve transcript keyboard focus when a turn settles, including native
+  Goal continuations, so composer autofocus cannot redirect reader navigation.
 - Add native CLI/ACP, browser and Windows WebView2 regressions; verify actual
   packaged Server Web and installed desktop pages plus isolated Setup upgrades.
 - Inventory every packaged frontend resource and verify all compiled database
