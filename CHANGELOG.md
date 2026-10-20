@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.38.0-fix1 — 2026-10-20
+
+- Restore ordinary conversation completion labels to “Worked for …” using
+  Codex's native whole-task duration, matched by `turn_id`. Count it once across
+  tool/model fragments and separate consecutive automated tasks and notices.
+- Continue bounded metadata reconciliation when usage arrives before timing,
+  including the main conversation, Canvas and background viewers. Supersede
+  stale requests and preserve already loaded history while patching metadata.
+- Infer missing Codex timing only from matching explicit task start/end records;
+  leave genuinely untimed old messages unknown instead of timing partial replies.
+- Remove the previous release's unrelated To-dos duration additions and extra
+  Goal elapsed panel. Preserve native Direct / Plan / Goal controls, safe Goal
+  switching, transcript focus and the existing virtualized scrolling fixes.
+- Rebase onto upstream v0.38.0 and retain its CLI, session settings and details.
+  Include the matching CLI companion in both Windows packages and verify it.
+- Test native timing, delayed metadata, stale requests, multi-tool and automated
+  rounds; verify ordinary live/history labels on packaged Server Web and Setup,
+  along with isolated installation, upgrade, resources, migrations and hashes.
+
+See [release notes](docs/releases/v0.38.0-fix1.md) and
+[timing diagnosis](docs/completed-turn-duration.md).
+
 ## 0.36.0-fix1 — 2026-10-17
 
 - Rebase the fork onto upstream v0.36.0 while preserving existing recovery,

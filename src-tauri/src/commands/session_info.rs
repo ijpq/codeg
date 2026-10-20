@@ -451,6 +451,7 @@ mod tests {
             model: None,
             completed_at: None,
         agent_message_id: None,
+        native_task_id: None,
         }
     }
 

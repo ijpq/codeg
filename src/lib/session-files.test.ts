@@ -146,7 +146,7 @@ describe("warmTurnFileChanges", () => {
   it("parses every turn ahead of the grouping, at once when it fits", () => {
     const a = countedTurn("a1")
     const done = vi.fn()
-    warmTurnFileChanges([userTurn("u1", "go"), a.turn], done)
+    warmTurnFileChanges([userTurn("u1", "go"), a.turn], done, Infinity)
     expect(done).toHaveBeenCalledTimes(1)
     const parsed = a.reads
     expect(parsed).toBeGreaterThan(0)

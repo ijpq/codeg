@@ -377,7 +377,7 @@ jobs:
           case "${{ matrix.target }}" in
             *windows*) ext=".exe" ;;
           esac
-          for bin in codeg-mcp codeg-computer-helper; do
+          for bin in codeg-mcp codeg-computer-helper codeg-cli; do
             file="src-tauri/binaries/${bin}-${{ matrix.target }}${ext}"
             if [ ! -s "$file" ]; then
               echo "FATAL: sidecar $file missing or empty after prepare-sidecars"
@@ -789,7 +789,7 @@ jobs:
           $mcpVersion = (& (Join-Path $dest 'codeg-mcp.exe') --version | Out-String).Trim()
           if ($LASTEXITCODE -ne 0 -or $mcpVersion -ne $version) { throw 'Setup MCP version mismatch' }
           $files = @()
-          foreach ($name in @('codeg.exe','codeg-mcp.exe','codeg-computer-helper.exe')) {
+          foreach ($name in @('codeg.exe','codeg-mcp.exe','codeg-computer-helper.exe','codeg-cli.exe')) {
             $files += @{ path=$name; sha256=(Get-FileHash (Join-Path $dest $name) -Algorithm SHA256).Hash.ToLower() }
           }
           $out = (Resolve-Path out).Path
@@ -1054,6 +1054,7 @@ jobs:
           cargo build --release --bin codeg-server --no-default-features --features server-bin --target ${{ matrix.target }}
           cargo build --release --bin codeg-mcp --no-default-features --features mcp-bin --target ${{ matrix.target }}
           cargo build --release --bin codeg-computer-helper --no-default-features --features computer-helper --target ${{ matrix.target }}
+          cargo build --release --bin codeg-cli --no-default-features --features cli-bin --target ${{ matrix.target }}
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
@@ -1061,8 +1062,9 @@ jobs:
           mkdir -p dist/${{ matrix.artifact }}
           cp src-tauri/target/${{ matrix.target }}/release/codeg-server dist/${{ matrix.artifact }}/
           cp src-tauri/target/${{ matrix.target }}/release/codeg-mcp dist/${{ matrix.artifact }}/
+          cp src-tauri/target/${{ matrix.target }}/release/codeg-cli dist/${{ matrix.artifact }}/
           cp src-tauri/target/${{ matrix.target }}/release/codeg-computer-helper dist/${{ matrix.artifact }}/
-          chmod +x dist/${{ matrix.artifact }}/codeg-server dist/${{ matrix.artifact }}/codeg-mcp dist/${{ matrix.artifact }}/codeg-computer-helper
+          chmod +x dist/${{ matrix.artifact }}/codeg-server dist/${{ matrix.artifact }}/codeg-mcp dist/${{ matrix.artifact }}/codeg-computer-helper dist/${{ matrix.artifact }}/codeg-cli
           cp -r out dist/${{ matrix.artifact }}/web
           cd dist && tar czf ${{ matrix.artifact }}.tar.gz ${{ matrix.artifact }}
 
@@ -1073,6 +1075,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist/${{ matrix.artifact }}
           Copy-Item src-tauri/target/${{ matrix.target }}/release/codeg-server.exe dist/${{ matrix.artifact }}/
           Copy-Item src-tauri/target/${{ matrix.target }}/release/codeg-mcp.exe dist/${{ matrix.artifact }}/
+          Copy-Item src-tauri/target/${{ matrix.target }}/release/codeg-cli.exe dist/${{ matrix.artifact }}/
           Copy-Item -Recurse dist/codex-runtime "dist/${{ matrix.artifact }}/runtime"
           Copy-Item src-tauri/target/${{ matrix.target }}/release/codeg-computer-helper.exe dist/${{ matrix.artifact }}/
           Copy-Item -Recurse out dist/${{ matrix.artifact }}/web

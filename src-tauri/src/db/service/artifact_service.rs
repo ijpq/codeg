@@ -1065,6 +1065,7 @@ mod tests {
         let page_turns = vec![MessageTurn {
             id: "page-user".into(),
             agent_message_id: None,
+            native_task_id: None,
             role: TurnRole::User,
             blocks: Vec::new(),
             timestamp: Utc::now(),

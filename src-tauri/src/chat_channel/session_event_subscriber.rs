@@ -14,8 +14,10 @@ use crate::acp::internal_bus::InternalEventBus;
 use crate::acp::manager::ConnectionManager;
 use crate::acp::types::{
     AcpEvent, ConnectionStatus, DelegationResultSummary, EventEnvelope, PermissionAnswerOrigin,
-    PermissionOptionInfo, PromptInputBlock,
+    PermissionOptionInfo,
 };
+#[cfg(test)]
+use crate::acp::types::PromptInputBlock;
 
 use crate::db::service::{
     app_metadata_service, conversation_service, sender_context_service, thread_binding_service,
@@ -3012,7 +3014,8 @@ mod auto_approve_tests {
                 tool_call_inputs: std::collections::HashMap::new(),
                 delegation_rendered: std::collections::HashSet::new(),
                 last_flushed: Instant::now(),
-                pending_prompt: None,
+                pending_prompts: std::collections::VecDeque::new(),
+                forward_events: true,
                 permission_pending: None,
             },
         );

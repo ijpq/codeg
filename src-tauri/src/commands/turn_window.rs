@@ -226,6 +226,7 @@ fn nav_outline_turn(turn: &MessageTurn) -> MessageTurn {
         model: None,
         completed_at: None,
         agent_message_id: None,
+        native_task_id: None,
     }
 }
 
@@ -287,6 +288,7 @@ mod tests {
             model: None,
             completed_at: None,
         agent_message_id: None,
+        native_task_id: None,
         }
     }
 

@@ -4599,6 +4599,7 @@ mod tests {
             Arc::new(NoBrowserTabs),
             Arc::new(NoComputerDesktop),
             results.clone(),
+            Arc::new(StubDeliverables),
         );
         let ask = |token: &str| {
             BrokerMessage::ResultSchema(BrokerResultSchemaRequest {

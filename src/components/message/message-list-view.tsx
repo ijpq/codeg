@@ -284,6 +284,7 @@ export interface ResolvedMessageGroup {
   images: UserImageDisplay[]
   usage?: import("@/lib/types").TurnUsage | null
   duration_ms?: number | null
+  native_task_id?: string | null
   model?: string | null
   models?: string[]
   /**
@@ -1280,6 +1281,14 @@ export function mergeConsecutiveAssistantTurns(
         for (const s of skipped) result.push(s)
         skipped.length = 0
       }
+      // Separate native tasks even when automation emitted no user bubble.
+      // Untimed out-of-turn notices also cannot inherit a task's duration.
+      if (
+        buffer.length > 0 &&
+        (buffer[0].group.native_task_id ?? null) !==
+          (item.group.native_task_id ?? null)
+      )
+        flush()
       buffer.push(item)
       continue
     }
@@ -1948,6 +1957,7 @@ export function MessageListView({
           images: msg.userImages ?? [],
           usage: msg.usage,
           duration_ms: msg.duration_ms,
+          native_task_id: msg.native_task_id,
           model: msg.model,
           completed_at: msg.completed_at,
         }
@@ -2487,7 +2497,8 @@ export function MessageListView({
   }, [insightsInSidebar, conversationId, insightsOwner])
 
   const [deliverablesExpanded, setDeliverablesExpanded] = useState(false)
-  const hasRenderableContent = renderableThreadItems.length > 0 || Boolean(liveMessage)
+  const hasRenderableContent =
+    renderableThreadItems.length > 0 || Boolean(liveMessage)
 
   if (detailLoading && !hasRenderableContent) {
     return (

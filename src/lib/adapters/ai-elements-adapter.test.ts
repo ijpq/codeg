@@ -3056,6 +3056,26 @@ describe("createMessageTurnAdapter — per-turn cache invalidation", () => {
     expect(second).toBe(first)
   })
 
+  it("invalidates task identity and late timing while reusing untouched content", () => {
+    const adapter = createMessageTurnAdapter()
+    const [first] = adapter.adapt([reply], labels)
+    const identified = { ...reply, native_task_id: "native-task" }
+    const [second] = adapter.adapt([identified], labels)
+    expect(second).not.toBe(first)
+    expect(second.native_task_id).toBe("native-task")
+    const [timed] = adapter.adapt(
+      [{ ...identified, duration_ms: 168795 }],
+      labels
+    )
+    expect(timed).not.toBe(second)
+    expect(timed.duration_ms).toBe(168795)
+    const [unchanged] = adapter.adapt(
+      [{ ...identified, duration_ms: 168795 }],
+      labels
+    )
+    expect(unchanged).toBe(timed)
+  })
+
   it("re-adapts when a later sync places source_turn_id on an already-patched turn", () => {
     // The post-turn reparse can name a reply in a ROUND AFTER the one that
     // pinned its stats, leaving `source_turn_id` as the only changed field.

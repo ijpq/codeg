@@ -3,7 +3,7 @@ param(
   [Parameter(Mandatory=$true)][string]$Repository,
   [Parameter(Mandatory=$true)][string]$Destination,
   [Parameter(Mandatory=$true)][string]$SetupManifest,
-  [string]$UpgradeFromTag = 'v0.35.1-fix2',
+  [string]$UpgradeFromTag = 'v0.36.0-fix1',
   [switch]$RequirePublished
 )
 $ErrorActionPreference = 'Stop'
@@ -34,7 +34,7 @@ foreach ($name in @($setupName, 'codeg-server-windows-x64.zip')) {
 $expanded = Join-Path $Destination 'expanded'
 Expand-Archive (Join-Path $Destination 'codeg-server-windows-x64.zip') $expanded
 $root = Join-Path $expanded 'codeg-server-windows-x64'
-foreach ($name in @('codeg-server.exe','codeg-mcp.exe','codeg-computer-helper.exe','web/index.html')) {
+foreach ($name in @('codeg-server.exe','codeg-mcp.exe','codeg-computer-helper.exe','codeg-cli.exe','web/index.html')) {
   if (-not (Test-Path (Join-Path $root $name) -PathType Leaf)) { throw "Server package missing $name" }
 }
 python -B scripts/smoke-server-package.py $root $version --require-runtime --log-dir (Join-Path $Destination 'server-smoke')

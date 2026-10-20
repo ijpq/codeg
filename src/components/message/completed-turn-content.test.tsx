@@ -4,6 +4,7 @@ import { NextIntlClientProvider } from "next-intl"
 import { describe, expect, it } from "vitest"
 
 import enMessages from "@/i18n/messages/en.json"
+import zhMessages from "@/i18n/messages/zh-CN.json"
 import {
   adaptMessageTurn,
   type AdaptedContentPart,
@@ -44,6 +45,31 @@ const COMPLETED_PARTS: AdaptedContentPart[] = [
 // recycled row re-mounts open), which makes a shared array a hidden channel
 // between tests. Render tests take a fresh copy.
 const freshCompletedParts = (): AdaptedContentPart[] => [...COMPLETED_PARTS]
+
+describe("ordinary completed turn duration", () => {
+  it.each([
+    [168795, "工作了 2 分钟 48 秒"],
+    [615361, "工作了 10 分钟 15 秒"],
+    [309047, "工作了 5 分钟 9 秒"],
+    [0, "工作了 0 秒"],
+    [undefined, "工作已结束"],
+    [-1, "工作已结束"],
+  ])(
+    "renders native %s ms without inventing missing timing",
+    (durationMs, label) => {
+      render(
+        <NextIntlClientProvider locale="zh-CN" messages={zhMessages}>
+          <CompletedTurnContent
+            parts={[{ type: "text", text: "完成" }]}
+            completed
+            durationMs={durationMs}
+          />
+        </NextIntlClientProvider>
+      )
+      expect(screen.getByText(label)).toBeInTheDocument()
+    }
+  )
+})
 
 describe("splitAssistantTurnParts", () => {
   it("keeps only the trailing final response outside progress", () => {

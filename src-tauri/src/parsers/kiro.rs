@@ -830,6 +830,7 @@ fn parse_transcript(log: &[u8], meta: &SessionMeta) -> Transcript {
             model,
             completed_at,
             agent_message_id: None,
+            native_task_id: None,
         });
     }
 

@@ -275,6 +275,7 @@ pub async fn create_branch_row_with_operation(
     let source_model = source.model.clone();
     let source_git_branch = source.git_branch.clone();
     let source_origin_cwd = source.origin_cwd.clone();
+    let conversation_source = source.source.clone();
     let fork_mode = fork_mode.to_string();
     let result = conn
         .transaction::<_, (conversation::Model, conversation_branch::Model), sea_orm::DbErr>(
@@ -305,6 +306,7 @@ pub async fn create_branch_row_with_operation(
                         origin_cwd: Set(source_origin_cwd),
                         assistant_id: Set(None),
                         assistant_snapshot: Set(None),
+                        source: Set(conversation_source),
                     }
                     .insert(txn)
                     .await?;
@@ -1674,6 +1676,7 @@ pub async fn merge_turns_for_target(
             model: None,
             completed_at: Some(row.created_at),
             agent_message_id: None,
+            native_task_id: None,
         });
         turns.push(MessageTurn {
             id: format!("branch-merge-{}-result", row.id),
@@ -1685,6 +1688,7 @@ pub async fn merge_turns_for_target(
             model: None,
             completed_at: Some(row.created_at),
             agent_message_id: None,
+            native_task_id: None,
         });
     }
     Ok(turns)

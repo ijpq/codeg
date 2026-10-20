@@ -883,47 +883,71 @@ function assistantReplyGroups(turns: MessageTurn[]): MessageTurn[][] {
   return groups
 }
 
+interface ExternalProducedFacts {
+  blocks: ContentBlock[]
+  paths: string[]
+  hasSuccessfulShell: boolean
+  links?: string[]
+}
+
+// Match the immutable per-turn cache used by native edits below. Metadata
+// updates replace a turn; unrelated grouping must not reparse long tool output.
+const externalProducedFactsCache = new WeakMap<
+  MessageTurn,
+  ExternalProducedFacts
+>()
+
+function externalProducedFacts(turn: MessageTurn): ExternalProducedFacts {
+  const cached = externalProducedFactsCache.get(turn)
+  if (cached) return cached
+  const blocks = turn.blocks
+  const facts: ExternalProducedFacts = {
+    blocks,
+    paths: [],
+    hasSuccessfulShell: false,
+  }
+  for (const block of blocks) {
+    if (block.type !== "tool_use") continue
+    if (!SHELL_OPS.has(normalizeToolName(block.tool_name))) continue
+    const result = matchingToolResult(blocks, block.tool_use_id)
+    if (result?.is_error) continue
+    facts.hasSuccessfulShell = true
+    facts.paths.push(
+      ...extractShellProducedPaths(
+        block.input_preview,
+        result?.output_preview ?? null
+      )
+    )
+  }
+  externalProducedFactsCache.set(turn, facts)
+  return facts
+}
+
 /** Files created by opaque shell/tool execution, in first-seen order. */
 function extractExternalProducedPaths(turns: MessageTurn[]): string[] {
   const all = new Set<string>()
-
   for (const group of assistantReplyGroups(turns)) {
-    let hasSuccessfulShell = false
-
-    for (const turn of group) {
-      for (const block of turn.blocks) {
-        if (block.type !== "tool_use") continue
-        if (!SHELL_OPS.has(normalizeToolName(block.tool_name))) continue
-
-        const result = matchingToolResult(turn.blocks, block.tool_use_id)
-        if (result?.is_error) continue
-        hasSuccessfulShell = true
-        for (const path of extractShellProducedPaths(
-          block.input_preview,
-          result?.output_preview ?? null
-        )) {
-          all.add(path)
-        }
-      }
-    }
-
-    // Some generators hide the destination in a script and only the final
-    // answer exposes it. Accept common artifact links only when this same user
-    // request actually ran a successful shell tool.
-    if (hasSuccessfulShell) {
-      for (const turn of group) {
-        for (const block of turn.blocks) {
-          if (block.type !== "text" || !block.text) continue
-          for (const token of tokenizeReferenceLinks(block.text)) {
-            if (token.type !== "link") continue
-            const path = linkDestinationToLocalPath(token.destination)
-            if (path) all.add(path)
+    const facts = group.map(externalProducedFacts)
+    for (const fact of facts) for (const path of fact.paths) all.add(path)
+    // Keep link fallback scoped to a request with a successful shell call.
+    // Parse prose lazily; a text-only conversation needs no link tokenization.
+    if (facts.some((fact) => fact.hasSuccessfulShell)) {
+      for (const fact of facts) {
+        if (!fact.links) {
+          fact.links = []
+          for (const block of fact.blocks) {
+            if (block.type !== "text" || !block.text) continue
+            for (const token of tokenizeReferenceLinks(block.text)) {
+              if (token.type !== "link") continue
+              const path = linkDestinationToLocalPath(token.destination)
+              if (path) fact.links.push(path)
+            }
           }
         }
+        for (const path of fact.links) all.add(path)
       }
     }
   }
-
   return Array.from(all)
 }
 
@@ -1157,6 +1181,7 @@ export function warmTurnFileChanges(
       if (turn.role === "assistant") {
         try {
           turnFileChanges(turn)
+          externalProducedFacts(turn)
         } catch {
           // Left to the grouping, which meets it where it always has.
         }

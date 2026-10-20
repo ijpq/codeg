@@ -3336,7 +3336,8 @@ mod tests {
                 tool_call_inputs: std::collections::HashMap::new(),
                 delegation_rendered: std::collections::HashSet::new(),
                 last_flushed: Instant::now(),
-                pending_prompt: None,
+                pending_prompts: std::collections::VecDeque::new(),
+                forward_events: true,
                 permission_pending: Some(PendingPermission {
                     request_id: "req-1".to_string(),
                     tool_description: "Bash: rm -rf build".to_string(),

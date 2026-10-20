@@ -489,6 +489,7 @@ mod tests {
         MessageTurn {
             id: id.into(),
             agent_message_id: None,
+            native_task_id: None,
             role,
             blocks: vec![ContentBlock::Text { text: text.into() }],
             timestamp: DateTime::from_timestamp(seconds, 0).unwrap(),
@@ -524,6 +525,7 @@ mod tests {
                 origin_cwd: Some("/workspace/project".into()),
                 assistant_id: None,
                 assistant_name: None,
+                source: None,
             },
             turns,
             user_turns_before_offset: Some(0),

@@ -1789,6 +1789,7 @@ mod tests {
         let turn = |id: &str, role: TurnRole, completed: bool| MessageTurn {
             id: id.into(),
             agent_message_id: None,
+            native_task_id: None,
             role,
             blocks: vec![ContentBlock::Text { text: id.into() }],
             timestamp: chrono::Utc::now(),

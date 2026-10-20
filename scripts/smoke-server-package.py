@@ -35,7 +35,8 @@ def main():
     suffix = ".exe" if os.name == "nt" else ""
     server = root / ("codeg-server" + suffix)
     companion = root / ("codeg-mcp" + suffix)
-    for path in (server, companion, root / "web" / "index.html"):
+    cli = root / ("codeg-cli" + suffix)
+    for path in (server, companion, cli, root / "web" / "index.html"):
         if not path.is_file():
             raise RuntimeError(f"Required package file is missing: {path.name}")
     forbidden_names = {"auth.json", "tokens.json", "config.toml", ".env"}
@@ -47,6 +48,10 @@ def main():
         version = subprocess.check_output([str(binary), "--version"], text=True).strip()
         if version != args.version:
             raise RuntimeError(f"{binary.name} version {version!r} differs from {args.version!r}")
+
+    cli_version = subprocess.check_output([str(cli), "--version"], text=True).strip()
+    if cli_version != "codeg-cli " + args.version:
+        raise RuntimeError(f"CLI version mismatch: {cli_version}")
 
     runtime = root / "runtime" / ("codex" + suffix)
     if args.require_runtime and not runtime.is_file():

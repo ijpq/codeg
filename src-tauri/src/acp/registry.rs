@@ -5503,6 +5503,7 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
         },
         AgentType::Trae => AcpAgentMeta {
             agent_type,
+            supports_steer: false,
             supports_mcp: true,
             name: "TRAE CLI",
             description: "ByteDance's TRAE coding agent in the terminal (native ACP via traecli acp serve)",
@@ -5558,6 +5559,7 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
         },
         AgentType::CommandCode => AcpAgentMeta {
             agent_type,
+            supports_steer: false,
             supports_mcp: true,
             name: "Command Code",
             description: "Command Code's coding agent in the terminal (native ACP via command-code acp)",

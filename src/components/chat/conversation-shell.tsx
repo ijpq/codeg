@@ -359,14 +359,14 @@ export function ConversationShell({
               {/* key on approval_id so the card always remounts (fresh in-flight /
                   feedback state) if the slot is ever reused for a new approval. */}
               <MarkdownImageProvider rootPath={defaultPath ?? null}>
-              <PlanApprovalCard
-                key={pendingPlanApproval.approval_id}
-                approval={pendingPlanApproval}
-                onAnswer={onAnswerPlanApproval}
-              />
-            </MarkdownImageProvider>
-          </div>
-        )}
+                <PlanApprovalCard
+                  key={pendingPlanApproval.approval_id}
+                  approval={pendingPlanApproval}
+                  onAnswer={onAnswerPlanApproval}
+                />
+              </MarkdownImageProvider>
+            </div>
+          )}
 
           {composerBanner && (
             <div className="mx-auto w-full chat-content-w px-4 pb-2">

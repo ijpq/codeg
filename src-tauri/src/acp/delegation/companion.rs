@@ -5308,6 +5308,7 @@ mod tests {
         ask: false,
         sessions: false,
         tasks: false,
+        result: false,
         automations: false,
         taskboard: false,
         deliverables: true,
