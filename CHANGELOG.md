@@ -15,6 +15,8 @@
   switching, transcript focus and the existing virtualized scrolling fixes.
 - Rebase onto upstream v0.38.0 and retain its CLI, session settings and details.
   Include the matching CLI companion in both Windows packages and verify it.
+- Preserve upgrade revalidation for unhashed web resources while retaining
+  immutable hashed chunks and small 404 responses for missing static files.
 - Test native timing, delayed metadata, stale requests, multi-tool and automated
   rounds; verify ordinary live/history labels on packaged Server Web and Setup,
   along with isolated installation, upgrade, resources, migrations and hashes.
