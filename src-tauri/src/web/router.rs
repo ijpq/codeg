@@ -2327,13 +2327,11 @@ async fn static_response_policy(request: axum::extract::Request, next: Next) -> 
     } else if path.starts_with("/local-enhancements/") && path.ends_with(".json") {
         // Polling control files must always reflect their latest small payload.
         "no-store"
-    } else if path == "/" || path.ends_with(".html") || !path.contains('.') {
-        // HTML owns the build's hashed asset graph and must revalidate after an
-        // upgrade. ServeDir's Last-Modified handling is the condition-request
-        // validator (304) for these files.
-        "no-cache"
     } else {
-        "public, max-age=3600"
+        // Unhashed resources keep their names across upgrades. Revalidate HTML
+        // and manifests rather than keeping a previous release's asset graph.
+        // ServeDir's Last-Modified handling still allows a body-free 304.
+        "no-cache"
     };
     response
         .headers_mut()

@@ -415,11 +415,16 @@ async fn static_files_revalidate_except_fingerprinted_assets() {
     // A fingerprinted asset never changes under its name.
     let chunk = server.get("/_next/static/chunks/app-1a2b.js").await;
     assert_eq!(chunk.status_code(), 200);
-    assert_eq!(cache_control(&chunk), None);
-    // The index.html standing in for a missing one is still a document.
+    assert_eq!(
+        cache_control(&chunk).as_deref(),
+        Some("public, max-age=31536000, immutable")
+    );
+    // Missing assets must remain a 404, never the application's HTML under a
+    // script URL. Keep the missing-watchdog-poll payload fix as well.
     let missing = server.get("/_next/static/chunks/gone.js").await;
-    assert_eq!(missing.text(), "<html>index</html>");
-    assert_eq!(cache_control(&missing).as_deref(), Some("no-cache"));
+    assert_eq!(missing.status_code(), 404);
+    assert_ne!(missing.text(), "<html>index</html>");
+    assert_eq!(cache_control(&missing), None);
 
     // Revalidating keeps the copy: it is not modified, so nothing is resent.
     let first = server.get("/").await;
