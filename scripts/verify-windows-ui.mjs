@@ -576,6 +576,7 @@ async function completedConversationPage(page, api, conversation, name) {
   await tab.click()
   await header().waitFor({ timeout: 60_000 })
   assert.equal(await header().innerText(), "Worked for 5m 9s")
+  await header().scrollIntoViewIfNeeded()
   await page.screenshot({ path: join(output, `${name}-ordinary-duration.png`) })
   await page
     .locator(".tab-strip-tail")
@@ -609,14 +610,14 @@ async function completedConversationPage(page, api, conversation, name) {
       .filter({ visible: true })
       .last()
     await input.waitFor({ timeout: 60_000 })
-    await input.fill(`ORDINARY_DURATION ${randomUUID()}`)
+    const prompt = `ORDINARY_DURATION ${randomUUID()}`
+    await input.fill(prompt)
     await input.press("Enter")
-    const answer = page
+    const answers = page
       .locator(".chat-scroll-port:visible")
       .last()
       .getByText("SYNTHETIC ORDINARY RESPONSE", { exact: true })
-      .last()
-    await answer.waitFor({ timeout: 90_000 })
+    await answers.last().waitFor({ timeout: 90_000 })
     let native
     for (let i = 0; i < 300; i++) {
       const detail = await read()
@@ -637,9 +638,43 @@ async function completedConversationPage(page, api, conversation, name) {
           `.chat-scroll-port:visible [data-completed-turn-duration-ms="${native.duration_ms}"]`
         )
         .last()
+    // A metadata refresh can briefly expose the persisted reply beside its
+    // promoted local copy. Seeing ONE timed header alone is insufficient: the
+    // second copy may still say "Finished working". Verify the actual round
+    // converges before taking evidence, and remains singular after reload.
+    const settledRound = async () => {
+      const viewport = page.locator(".chat-scroll-port:visible").last()
+      for (let i = 0; i < 450; i++) {
+        if (
+          (await answers.count()) === 1 &&
+          (await viewport.getByText(prompt, { exact: true }).count()) === 1
+        ) {
+          const row = answers.locator(
+            "xpath=ancestor::*[@data-message-thread-row]"
+          )
+          if (
+            (await row
+              .locator(
+                `[data-completed-turn-duration-ms="${native.duration_ms}"]`
+              )
+              .count()) === 1
+          ) {
+            return
+          }
+        }
+        await delay(100)
+      }
+      throw Error(
+        `${name}: ordinary round retained duplicate or untimed output`
+      )
+    }
     await duration().waitFor({ timeout: 45_000 })
+    await settledRound()
+    await delay(500)
+    await settledRound()
     const liveLabel = await duration().innerText()
     assert.match(liveLabel, /^Worked for /)
+    await duration().scrollIntoViewIfNeeded()
     await page.screenshot({
       path: join(output, `${name}-ordinary-live-duration.png`),
     })
@@ -647,7 +682,12 @@ async function completedConversationPage(page, api, conversation, name) {
     await tab.waitFor({ timeout: 30_000 })
     await tab.click()
     await duration().waitFor({ timeout: 60_000 })
+    await settledRound()
     assert.equal(await duration().innerText(), liveLabel)
+    await duration().scrollIntoViewIfNeeded()
+    await page.screenshot({
+      path: join(output, `${name}-ordinary-restored-duration.png`),
+    })
     const restored = (await read()).turns.findLast(
       (turn) =>
         turn.native_task_id === native.native_task_id &&
@@ -660,7 +700,25 @@ async function completedConversationPage(page, api, conversation, name) {
       nativeTaskId: native.native_task_id,
       durationMs: native.duration_ms,
       label: liveLabel,
+      singularTimedRound: true,
     })
+  } catch (error) {
+    await page
+      .screenshot({ path: join(output, `${name}-ordinary-failure.png`) })
+      .catch(() => {})
+    await writeFile(
+      join(output, `${name}-ordinary-failure.json`),
+      JSON.stringify(
+        {
+          error: String(error),
+          body: (await page.locator("body").innerText()).slice(-16000),
+          detail: await read().catch(() => null),
+        },
+        null,
+        2
+      )
+    )
+    throw error
   } finally {
     goalModel.ordinary(false)
   }
