@@ -2883,57 +2883,57 @@ const ConversationTabView = memo(function ConversationTabView({
   )
 
   const messageListNode = (
-      <MessageListView
-        conversationId={effectiveConversationId}
-        imageRoot={workingDirForConnection ?? null}
-        agentType={selectedAgent}
-        availableCommands={connectionCommands}
-        connStatus={connStatus}
-        isActive={isActive}
-        sendSignal={sendSignal}
-        detailLoading={detailLoading}
-        detailError={detailError}
-        acpLoadError={acpLoadError}
-        hasEarlierHistory={hasEarlierHistory}
-        earlierHistoryLoading={earlierHistoryLoading}
-        earlierHistoryError={earlierHistoryError}
-        onLoadEarlierHistory={loadEarlierHistory}
-        hideEmptyState={!hasPersistedConversation || hasSentMessage}
-        // The conversation page's navigator, plan and sub-agents show in the
-        // Session Details side panel rather than over the messages.
-        insightsInSidebar
-        onReload={canShowDetailErrorActions ? handleReloadDetail : undefined}
-        onNewSession={
-          canShowDetailErrorActions ? handleOpenNewSession : undefined
-        }
-        onQuoteSelection={composerAvailable ? handleQuoteSelection : undefined}
-        // Asking opens its own conversation, so it needs a folder to open it in
-        // rather than a usable composer here — a transcript whose composer is
-        // blocked (session/load failure) can still spawn the question elsewhere.
-        onAskSelection={canAskSelection ? handleAskSelection : undefined}
-        // Fork carries no draft, so — unlike a send — a non-empty queue is
-        // not at risk of being jumped and needs no guard here. A turn in
-        // flight is still rejected, by the backend, which is the only place
-        // that can see it without racing.
-        //
-        // "prompting" belongs on this side of the gate (same shape as the
-        // goal-control gate above): this answers "can this surface fork at
-        // all", and a turn in flight is a passing "not right now" that the
-        // view greys the button out for. Dropping the handler instead made
-        // every reply's fork icon disappear for the length of each reply.
-        // `handleForkFromTurn` re-checks liveness at click time.
-        onForkFromTurn={
-          (connStatus === "connected" || connStatus === "prompting") &&
-          hasPersistedConversation &&
-          conn.supportsFork
-            ? handleForkFromTurn
-            : undefined
-        }
-        deliverableRuns={detail?.deliverable_runs}
-        onForkFromMessage={
-          hasPersistedConversation ? handleForkFromMessage : null
-        }
-      />
+    <MessageListView
+      conversationId={effectiveConversationId}
+      imageRoot={workingDirForConnection ?? null}
+      agentType={selectedAgent}
+      availableCommands={connectionCommands}
+      connStatus={connStatus}
+      isActive={isActive}
+      sendSignal={sendSignal}
+      detailLoading={detailLoading}
+      detailError={detailError}
+      acpLoadError={acpLoadError}
+      hasEarlierHistory={hasEarlierHistory}
+      earlierHistoryLoading={earlierHistoryLoading}
+      earlierHistoryError={earlierHistoryError}
+      onLoadEarlierHistory={loadEarlierHistory}
+      hideEmptyState={!hasPersistedConversation || hasSentMessage}
+      // The conversation page's navigator, plan and sub-agents show in the
+      // Session Details side panel rather than over the messages.
+      insightsInSidebar
+      onReload={canShowDetailErrorActions ? handleReloadDetail : undefined}
+      onNewSession={
+        canShowDetailErrorActions ? handleOpenNewSession : undefined
+      }
+      onQuoteSelection={composerAvailable ? handleQuoteSelection : undefined}
+      // Asking opens its own conversation, so it needs a folder to open it in
+      // rather than a usable composer here — a transcript whose composer is
+      // blocked (session/load failure) can still spawn the question elsewhere.
+      onAskSelection={canAskSelection ? handleAskSelection : undefined}
+      // Fork carries no draft, so — unlike a send — a non-empty queue is
+      // not at risk of being jumped and needs no guard here. A turn in
+      // flight is still rejected, by the backend, which is the only place
+      // that can see it without racing.
+      //
+      // "prompting" belongs on this side of the gate (same shape as the
+      // goal-control gate above): this answers "can this surface fork at
+      // all", and a turn in flight is a passing "not right now" that the
+      // view greys the button out for. Dropping the handler instead made
+      // every reply's fork icon disappear for the length of each reply.
+      // `handleForkFromTurn` re-checks liveness at click time.
+      onForkFromTurn={
+        (connStatus === "connected" || connStatus === "prompting") &&
+        hasPersistedConversation &&
+        conn.supportsFork
+          ? handleForkFromTurn
+          : undefined
+      }
+      deliverableRuns={detail?.deliverable_runs}
+      onForkFromMessage={
+        hasPersistedConversation ? handleForkFromMessage : null
+      }
+    />
   )
 
   // Live-feedback bar gating + the "agent never read your note" resend fallback.
@@ -3295,169 +3295,228 @@ const ConversationTabView = memo(function ConversationTabView({
 
   return (
     <GoalControlProvider value={goalControlValue}>
-    <ConversationShell
-      resizableWidth
-      getSentHistory={getSentHistory}
-      topBanner={
-        <>
-          <SessionConfigStaleBanner contextKey={tabId} />
-          <PiProjectTrustBanner
-            contextKey={tabId}
-            agentType={selectedAgent}
-            workingDir={workingDirForConnection}
-          />
-        </>
-      }
-      status={isCancelling ? "cancelling" : connStatus}
-      promptCapabilities={conn.promptCapabilities}
-      defaultPath={workingDirForConnection}
-      agentName={getAgentLabel(selectedAgent)}
-      claudeApiRetry={conn.claudeApiRetry}
-      sessionFailures={conn.sessionFailures}
-      onSessionFailureDismiss={handleSessionFailureDismiss}
-      asyncTasks={conn.asyncTasks}
-      onStopAsyncTask={
-        // Owners of a live connection only — same gate as the failure actions:
-        // a viewer has no connection to send the stop on.
-        conn.connectionId !== null && !conn.isViewer
-          ? handleStopAsyncTask
-          : undefined
-      }
-      remoteControl={connIsForOtherAgent ? null : conn.remoteControl}
-      onRemoteControlOff={
-        // Owners of a live connection only, like the stop above.
-        conn.connectionId !== null && !conn.isViewer
-          ? handleRemoteControlOff
-          : undefined
-      }
-      pendingPermission={conn.pendingPermission}
-      pendingQuestion={conn.pendingQuestion}
-      pendingAskQuestion={conn.pendingAskQuestion}
-      pendingPlanApproval={conn.pendingPlanApproval}
-      onFocus={handleFocus}
-      onSend={handleSend}
-      supportsSteer={conn.supportsSteer}
-      onGuide={handleGuide}
-      onCancel={handleCancel}
-      onRespondPermission={handleRespondPermission}
-      onAnswerQuestion={handleAnswerQuestion}
-      onAnswerAskQuestion={handleAnswerAskQuestion}
-      onAnswerPlanApproval={handleAnswerPlanApproval}
-      modes={connectionModes}
-      configOptions={connectionConfigOptions}
-      modeLoading={modeLoading}
-      configOptionsLoading={configOptionsLoading}
-      selectorsLoading={selectorsLoading}
-      selectedModeId={selectedModeId}
-      onModeChange={handleModeChange}
-      onConfigOptionChange={handleSetConfigOption}
-      agentType={selectedAgent}
-      availableCommands={connectionCommands}
-      // The previous agent's prediction is no use to the one just picked.
-      promptSuggestion={connIsForOtherAgent ? null : conn.promptSuggestion}
-      attachmentTabId={tabId}
-      draftStorageKey={draftStorageKey}
-      hideInput={isWelcomeMode || Boolean(acpLoadError)}
-      injectContent={composerInject}
-      onInjectConsumed={handleComposerInjectConsumed}
-      composerBanner={acpLoadErrorBanner ?? null}
-      feedbackList={
-        feedback.showList ? (
-          <FeedbackNotesDisplay
-            notes={feedback.notes}
-            // Past the turn the list is the only place an unread note still
-            // exists on screen, so it carries its own recovery actions rather
-            // than disappearing with the turn that never read it.
-            expired={feedback.notesExpired}
-            onResend={feedback.resendNote}
-            onDismiss={feedback.dismissNote}
-          />
-        ) : null
-      }
-      onAddFeedback={feedback.featureEnabled ? feedback.openDialog : undefined}
-      feedbackAddDisabled={!feedback.canSubmit}
-      isActive={isActive}
-      showActiveFlow={showActiveFlow}
-      queue={msgQueue}
-      onEnqueue={mqEnqueue}
-      onQueueReorder={mqReorder}
-      onQueueEdit={handleQueueEdit}
-      onQueueDelete={mqRemove}
-      onQueueSteer={
-        // Same gate as the composer's mid-turn send, plus a turn actually in
-        // flight: a queued row can only be inserted into a RUNNING turn —
-        // idle sessions have the queue's own auto-flush for that.
-        feedback.featureEnabled &&
-        feedback.steerAvailable &&
-        connStatus === "prompting"
-          ? handleQueueSteer
-          : undefined
-      }
-      onQueueRetry={handleQueueRetry}
-      onConvertGuideToPrompt={mqConvertGuideToPrompt}
-      editingItemId={mqEditingItemId}
-      editingDraftText={editingQueueDraftText}
-      editingDraftBlocks={editingQueueDraftBlocks}
-      isEditingQueueItem={mqEditingItemId != null}
-      onSaveQueueEdit={handleSaveQueueEdit}
-      onCancelQueueEdit={handleQueueCancelEdit}
-      onSteer={
-        // Any working delivery channel, not just the native push: the pull
-        // tool records a waiting note the agent reads on its next check, and
-        // `steerChannel` swaps the copy so pull sessions never promise an
-        // instant insert. Sessions with NEITHER channel keep the historical
-        // prompting branch (Stop button alone, Enter queues). The prompting
-        // scope itself is enforced where the button renders.
-        feedback.featureEnabled && feedback.steerAvailable
-          ? handleSteer
-          : undefined
-      }
-      allowOfflineCompose={hasPersistedConversation && !connectionReady}
-      onForkSend={
-        hasPersistedConversation && conn.supportsFork
-          ? handleForkSend
-          : undefined
-      }
-      steerChannel={feedback.channel}
-    >
-      {isWelcomeMode ? (
-        // Same overlay scrollbar as the sidebar / file lists (os-theme-codeg)
-        // instead of the platform's native bar. `min-h-full` on the inner column
-        // keeps the original layout: content parked between two spacers, the
-        // page scrolling only once it outgrows the viewport.
-        <ScrollArea
-          className="relative isolate h-full min-h-0"
-          x="hidden"
-          y="scroll"
-        >
-          <div className="flex min-h-full flex-col">
-            <div className="flex-1" />
-            <div className="mx-auto flex w-full chat-content-w shrink-0 flex-col gap-6 px-4 py-4">
-              <WelcomeHero />
-              <QuickActions
-                onSelect={handleQuickAction}
-                agentType={selectedAgent}
-              />
-              <div className="flex justify-center">
-                <AgentSelector
-                  // The selector spans the row it is given (it has to measure
-                  // how much room it has), so the centring lives inside it now
-                  // — the `justify-center` above only centres a full-width box.
-                  align="center"
-                  defaultAgentType={selectedAgent}
-                  onSelect={handleAgentSelect}
-                  onFallback={handleAgentFallback}
-                  onAgentsLoaded={(agents) => {
-                    setAgentsLoaded(true)
-                    setUsableAgentCount(
-                      agents.filter((agent) => agent.enabled && agent.available)
-                        .length
-                    )
-                  }}
-                  onOpenAgentsSettings={handleOpenAgentsSettings}
-                  // Drafts remain switchable while connecting; saved
-                  // conversations retain the agent they were created with.
-                  disabled={dbConversationId != null}
+      <ConversationShell
+        resizableWidth
+        getSentHistory={getSentHistory}
+        topBanner={
+          <>
+            <SessionConfigStaleBanner contextKey={tabId} />
+            <PiProjectTrustBanner
+              contextKey={tabId}
+              agentType={selectedAgent}
+              workingDir={workingDirForConnection}
+            />
+          </>
+        }
+        status={isCancelling ? "cancelling" : connStatus}
+        promptCapabilities={conn.promptCapabilities}
+        defaultPath={workingDirForConnection}
+        agentName={getAgentLabel(selectedAgent)}
+        claudeApiRetry={conn.claudeApiRetry}
+        sessionFailures={conn.sessionFailures}
+        onSessionFailureDismiss={handleSessionFailureDismiss}
+        asyncTasks={conn.asyncTasks}
+        onStopAsyncTask={
+          // Owners of a live connection only — same gate as the failure actions:
+          // a viewer has no connection to send the stop on.
+          conn.connectionId !== null && !conn.isViewer
+            ? handleStopAsyncTask
+            : undefined
+        }
+        remoteControl={connIsForOtherAgent ? null : conn.remoteControl}
+        onRemoteControlOff={
+          // Owners of a live connection only, like the stop above.
+          conn.connectionId !== null && !conn.isViewer
+            ? handleRemoteControlOff
+            : undefined
+        }
+        pendingPermission={conn.pendingPermission}
+        pendingQuestion={conn.pendingQuestion}
+        pendingAskQuestion={conn.pendingAskQuestion}
+        pendingPlanApproval={conn.pendingPlanApproval}
+        onFocus={handleFocus}
+        onSend={handleSend}
+        supportsSteer={conn.supportsSteer}
+        onGuide={handleGuide}
+        onCancel={handleCancel}
+        onRespondPermission={handleRespondPermission}
+        onAnswerQuestion={handleAnswerQuestion}
+        onAnswerAskQuestion={handleAnswerAskQuestion}
+        onAnswerPlanApproval={handleAnswerPlanApproval}
+        modes={connectionModes}
+        configOptions={connectionConfigOptions}
+        modeLoading={modeLoading}
+        configOptionsLoading={configOptionsLoading}
+        selectorsLoading={selectorsLoading}
+        selectedModeId={selectedModeId}
+        onModeChange={handleModeChange}
+        onConfigOptionChange={handleSetConfigOption}
+        agentType={selectedAgent}
+        availableCommands={connectionCommands}
+        // The previous agent's prediction is no use to the one just picked.
+        promptSuggestion={connIsForOtherAgent ? null : conn.promptSuggestion}
+        attachmentTabId={tabId}
+        draftStorageKey={draftStorageKey}
+        hideInput={isWelcomeMode || Boolean(acpLoadError)}
+        injectContent={composerInject}
+        onInjectConsumed={handleComposerInjectConsumed}
+        composerBanner={acpLoadErrorBanner ?? null}
+        feedbackList={
+          feedback.showList ? (
+            <FeedbackNotesDisplay
+              notes={feedback.notes}
+              // Past the turn the list is the only place an unread note still
+              // exists on screen, so it carries its own recovery actions rather
+              // than disappearing with the turn that never read it.
+              expired={feedback.notesExpired}
+              onResend={feedback.resendNote}
+              onDismiss={feedback.dismissNote}
+            />
+          ) : null
+        }
+        onAddFeedback={
+          feedback.featureEnabled ? feedback.openDialog : undefined
+        }
+        feedbackAddDisabled={!feedback.canSubmit}
+        isActive={isActive}
+        showActiveFlow={showActiveFlow}
+        queue={msgQueue}
+        onEnqueue={mqEnqueue}
+        onQueueReorder={mqReorder}
+        onQueueEdit={handleQueueEdit}
+        onQueueDelete={mqRemove}
+        onQueueSteer={
+          // Same gate as the composer's mid-turn send, plus a turn actually in
+          // flight: a queued row can only be inserted into a RUNNING turn —
+          // idle sessions have the queue's own auto-flush for that.
+          feedback.featureEnabled &&
+          feedback.steerAvailable &&
+          connStatus === "prompting"
+            ? handleQueueSteer
+            : undefined
+        }
+        onQueueRetry={handleQueueRetry}
+        onConvertGuideToPrompt={mqConvertGuideToPrompt}
+        editingItemId={mqEditingItemId}
+        editingDraftText={editingQueueDraftText}
+        editingDraftBlocks={editingQueueDraftBlocks}
+        isEditingQueueItem={mqEditingItemId != null}
+        onSaveQueueEdit={handleSaveQueueEdit}
+        onCancelQueueEdit={handleQueueCancelEdit}
+        onSteer={
+          // Any working delivery channel, not just the native push: the pull
+          // tool records a waiting note the agent reads on its next check, and
+          // `steerChannel` swaps the copy so pull sessions never promise an
+          // instant insert. Sessions with NEITHER channel keep the historical
+          // prompting branch (Stop button alone, Enter queues). The prompting
+          // scope itself is enforced where the button renders.
+          feedback.featureEnabled && feedback.steerAvailable
+            ? handleSteer
+            : undefined
+        }
+        allowOfflineCompose={hasPersistedConversation && !connectionReady}
+        onForkSend={
+          hasPersistedConversation && conn.supportsFork
+            ? handleForkSend
+            : undefined
+        }
+        steerChannel={feedback.channel}
+      >
+        {isWelcomeMode ? (
+          // Same overlay scrollbar as the sidebar / file lists (os-theme-codeg)
+          // instead of the platform's native bar. `min-h-full` on the inner column
+          // keeps the original layout: content parked between two spacers, the
+          // page scrolling only once it outgrows the viewport.
+          <ScrollArea
+            className="relative isolate h-full min-h-0"
+            x="hidden"
+            y="scroll"
+          >
+            <div className="flex min-h-full flex-col">
+              <div className="flex-1" />
+              <div className="mx-auto flex w-full chat-content-w shrink-0 flex-col gap-6 px-4 py-4">
+                <WelcomeHero />
+                <QuickActions
+                  onSelect={handleQuickAction}
+                  agentType={selectedAgent}
+                />
+                <div className="flex justify-center">
+                  <AgentSelector
+                    // The selector spans the row it is given (it has to measure
+                    // how much room it has), so the centring lives inside it now
+                    // — the `justify-center` above only centres a full-width box.
+                    align="center"
+                    defaultAgentType={selectedAgent}
+                    onSelect={handleAgentSelect}
+                    onFallback={handleAgentFallback}
+                    onAgentsLoaded={(agents) => {
+                      setAgentsLoaded(true)
+                      setUsableAgentCount(
+                        agents.filter(
+                          (agent) => agent.enabled && agent.available
+                        ).length
+                      )
+                    }}
+                    onOpenAgentsSettings={handleOpenAgentsSettings}
+                    // Drafts remain switchable while connecting; saved
+                    // conversations retain the agent they were created with.
+                    disabled={dbConversationId != null}
+                  />
+                </div>
+                {composerBlockedMessage ? (
+                  <div className="flex w-full items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+                    <button
+                      type="button"
+                      onClick={handleOpenAgentsSettings}
+                      title={composerBlockedMessage}
+                      className="min-w-0 flex-1 cursor-pointer overflow-hidden text-ellipsis whitespace-nowrap text-left transition-colors hover:text-destructive/80"
+                    >
+                      {composerBlockedMessage}
+                    </button>
+                    {selectedAgentNotInstalled ? (
+                      <button
+                        type="button"
+                        onClick={() => setComposerDiagnosticsOpen(true)}
+                        className="shrink-0 rounded border border-destructive/40 px-2 py-0.5 font-medium transition-colors hover:bg-destructive/10"
+                      >
+                        {tDiag("button")}
+                      </button>
+                    ) : null}
+                  </div>
+                ) : null}
+                <ChatInput
+                  // composerConnStatus (not connStatus): a chat draft mid-reconnect
+                  // reads "connecting" until the connection's cwd matches, so the
+                  // send affordance stays disabled until handleSend would accept it.
+                  status={composerConnStatus}
+                  promptCapabilities={conn.promptCapabilities}
+                  defaultPath={workingDirForConnection}
+                  agentName={getAgentLabel(selectedAgent)}
+                  onFocus={handleFocus}
+                  onSend={handleSend}
+                  onCancel={handleCancel}
+                  modes={connectionModes}
+                  configOptions={connectionConfigOptions}
+                  modeLoading={modeLoading}
+                  configOptionsLoading={configOptionsLoading}
+                  selectorsLoading={selectorsLoading}
+                  selectedModeId={selectedModeId}
+                  onModeChange={handleModeChange}
+                  onConfigOptionChange={handleSetConfigOption}
+                  agentType={selectedAgent}
+                  availableCommands={connectionCommands}
+                  attachmentTabId={tabId}
+                  draftStorageKey={draftStorageKey}
+                  isActive={isActive}
+                  showActiveFlow={showActiveFlow}
+                  onAddFeedback={
+                    feedback.featureEnabled ? feedback.openDialog : undefined
+                  }
+                  feedbackAddDisabled={!feedback.canSubmit}
+                  injectContent={composerInject}
+                  onInjectConsumed={handleComposerInjectConsumed}
+                  flush
+                  tall
                 />
               </div>
               <div className="flex-1" />

@@ -1944,6 +1944,7 @@ mod tests {
         let turns = vec![MessageTurn {
             id: "parser-stable-user-id".into(),
             agent_message_id: None,
+            native_task_id: None,
             role: TurnRole::User,
             blocks: vec![ContentBlock::Text { text: text.into() }],
             timestamp: run.started_at + chrono::Duration::hours(8),
@@ -2000,6 +2001,7 @@ mod tests {
             MessageTurn {
                 id: "assistant-nearest".into(),
                 agent_message_id: None,
+                native_task_id: None,
                 role: TurnRole::Assistant,
                 blocks: Vec::new(),
                 timestamp: run.started_at,
@@ -2011,6 +2013,7 @@ mod tests {
             MessageTurn {
                 id: "user-nearby".into(),
                 agent_message_id: None,
+                native_task_id: None,
                 role: TurnRole::User,
                 blocks: vec![ContentBlock::Text {
                     text: "legacy prompt".into(),
@@ -2592,6 +2595,7 @@ mod tests {
         let turns = vec![MessageTurn {
             id: "message-run-visible".into(),
             agent_message_id: None,
+            native_task_id: None,
             role: TurnRole::User,
             blocks: vec![ContentBlock::Text {
                 text: "visible".into(),

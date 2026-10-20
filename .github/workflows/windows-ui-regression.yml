@@ -118,6 +118,7 @@ jobs:
             src-tauri/target/x86_64-pc-windows-msvc/release/codeg-server.exe
             src-tauri/target/x86_64-pc-windows-msvc/release/codeg-mcp.exe
             src-tauri/target/x86_64-pc-windows-msvc/release/codeg-computer-helper.exe
+            src-tauri/target/x86_64-pc-windows-msvc/release/codeg-cli.exe
             out/
           if-no-files-found: error
           retention-days: 7
@@ -130,18 +131,18 @@ jobs:
           $ErrorActionPreference='Stop'
           $root=Join-Path $env:RUNNER_TEMP 'ui-baseline'
           New-Item -ItemType Directory -Force $root | Out-Null
-          gh release download v0.35.1-fix2 --repo $env:GITHUB_REPOSITORY --dir $root
+          gh release download v0.36.0-fix1 --repo $env:GITHUB_REPOSITORY --dir $root
           if ($LASTEXITCODE -ne 0) { throw 'Baseline download failed' }
-          foreach ($file in @('codeg_0.35.1-fix2_x64-setup.exe','codeg-server-windows-x64.zip')) {
+          foreach ($file in @('codeg_0.36.0-fix1_x64-setup.exe','codeg-server-windows-x64.zip')) {
             $hash=((Get-Content (Join-Path $root "$file.sha256") -Raw).Trim() -split '\s+')[0].ToLower()
             if ((Get-FileHash (Join-Path $root $file) -Algorithm SHA256).Hash.ToLower() -ne $hash) { throw 'Baseline hash mismatch' }
           }
           Expand-Archive (Join-Path $root 'codeg-server-windows-x64.zip') (Join-Path $root 'server')
-          $setup=Join-Path $root 'codeg_0.35.1-fix2_x64-setup.exe'
+          $setup=Join-Path $root 'codeg_0.36.0-fix1_x64-setup.exe'
           $previous=$setup
           $server=Join-Path $root 'server/codeg-server-windows-x64'
           $extra=@('--baseline','true')
-          $version='0.35.1-fix2'
+          $version='0.36.0-fix1'
           if ($env:CANDIDATE_UI -eq 'true') {
             $version=(Get-Content package.json -Raw | ConvertFrom-Json).version
             $setup=(Get-Item "src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/codeg_${version}_x64-setup.exe").FullName
@@ -149,7 +150,7 @@ jobs:
             New-Item -ItemType Directory -Force $candidate | Out-Null
             Copy-Item -Recurse out (Join-Path $candidate 'web')
             Copy-Item -Recurse (Join-Path $server 'runtime') (Join-Path $candidate 'runtime')
-            foreach ($binary in @('codeg-server','codeg-mcp','codeg-computer-helper')) {
+            foreach ($binary in @('codeg-server','codeg-mcp','codeg-computer-helper','codeg-cli')) {
               Copy-Item "src-tauri/target/x86_64-pc-windows-msvc/release/$binary.exe" $candidate
             }
             # The unchanged private CLI is a test input from the checksum-verified

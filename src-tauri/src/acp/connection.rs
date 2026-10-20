@@ -31766,6 +31766,7 @@ mod tests {
             SessionId::new("codex-session".to_string()),
             &cwd,
             vec![companion],
+            false,
         );
 
         assert_eq!(req.mcp_servers.len(), 1);
@@ -37241,7 +37242,7 @@ mod tests {
             .iter()
             .position(|a| a == "--features")
             .map(|i| server.args[i + 1].clone());
-        assert_eq!(features.as_deref(), Some("result"));
+        assert_eq!(features.as_deref(), Some("deliverables,result"));
         assert!(injection.tokens.lookup(&injected.token).await.is_some());
     }
 
@@ -39979,6 +39980,7 @@ mod tests {
                             "/tmp",
                             false,
                             &[],
+                            None,
                             &ledger,
                             None,
                             &stderr_tail,
@@ -40009,6 +40011,7 @@ mod tests {
                     blocks: vec![PromptInputBlock::Text { text: text.into() }],
                     user_message: None,
                     internal_suffix: Vec::new(),
+                    agent_file_change_report_request_id: None,
                 })
                 .await
                 .expect("the loop is running");
@@ -41302,6 +41305,7 @@ mod tests {
                         "/tmp",
                         false,
                         &[],
+                        None,
                         &ledger,
                         None,
                         &stderr_tail,

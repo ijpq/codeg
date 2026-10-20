@@ -486,6 +486,113 @@ describe("syncViewerDetail — owner/guard no-ops", () => {
 })
 
 describe("reconcileCompletedTurn — lost stream recovery", () => {
+  it("fills a background completion by task ID without dropping older loaded turns", async () => {
+    vi.useFakeTimers()
+    const old = assistantTurn("old", "loaded older history")
+    const user = userTurn("u", "background request")
+    const reply = {
+      ...assistantTurn("a", "background final"),
+      native_task_id: "background",
+      usage: {
+        input_tokens: 1,
+        output_tokens: 1,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+      },
+    }
+    seed({ detail: detail([old, user], 10) })
+    mockGet
+      .mockResolvedValueOnce(detail([old, user, reply], 20))
+      .mockResolvedValue(detail([user, { ...reply, duration_ms: 309047 }], 30))
+    sync()
+    await vi.advanceTimersByTimeAsync(10)
+    expect(session()?.detail?.turns.slice(-1)[0]?.duration_ms).toBeUndefined()
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(session()?.detail?.turns[0]).toBe(old)
+    expect(session()?.detail?.turns.slice(-1)[0]?.duration_ms).toBe(309047)
+    expect(mockGet).toHaveBeenCalledTimes(2)
+  })
+
+  it("restores exact native timings on a cold history load", async () => {
+    const turns = [168795, 615361, 309047].map((duration_ms, i) => ({
+      ...assistantTurn(`a-${i}`, `automation ${i}`),
+      native_task_id: `task-${i}`,
+      duration_ms,
+    }))
+    mockGet.mockResolvedValue(detail(turns))
+    useConversationRuntimeStore.getState().actions.fetchDetail(CID)
+    await vi.waitFor(() => expect(session()?.detailLoading).toBe(false))
+    expect(
+      session()?.detail?.turns.map((turn) => [
+        turn.native_task_id,
+        turn.duration_ms,
+      ])
+    ).toEqual([
+      ["task-0", 168795],
+      ["task-1", 615361],
+      ["task-2", 309047],
+    ])
+    expect(mockGet).toHaveBeenCalledTimes(1)
+  })
+
+  it("fills timing when a cold refresh races the native terminal record", async () => {
+    vi.useFakeTimers()
+    const reply = {
+      ...assistantTurn("a", "restored reply"),
+      native_task_id: "refresh-task",
+      usage: {
+        input_tokens: 1,
+        output_tokens: 1,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+      },
+    }
+    mockGet
+      .mockResolvedValueOnce(detail([reply]))
+      .mockResolvedValue(detail([{ ...reply, duration_ms: 168795 }]))
+    useConversationRuntimeStore.getState().actions.fetchDetail(CID)
+    await vi.advanceTimersByTimeAsync(10)
+    expect(session()?.detail?.turns[0].duration_ms).toBeUndefined()
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(session()?.detail?.turns[0].duration_ms).toBe(168795)
+    expect(mockGet).toHaveBeenCalledTimes(2)
+  })
+
+  it("keeps reconciling native duration after the final reply and usage persist", async () => {
+    vi.useFakeTimers()
+    const user = userTurn("u", "ordinary request")
+    const reply = {
+      ...assistantTurn("a", "complete final"),
+      native_task_id: "native-ordinary",
+      usage: {
+        input_tokens: 10,
+        output_tokens: 5,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+      },
+    }
+    const first = detail([user, reply])
+    const timed = detail([user, { ...reply, duration_ms: 168795 }])
+    seed({
+      detail: detail([user]),
+      localTurns: [assistantTurn("live-a", "complete final")],
+      historyAssistantBaseline: 0,
+      lastTurnOwned: true,
+    })
+    mockGet.mockResolvedValueOnce(first).mockResolvedValue(timed)
+    useConversationRuntimeStore
+      .getState()
+      .actions.reconcileCompletedTurn(CID, CID, "u")
+    await vi.advanceTimersByTimeAsync(100)
+    expect(session()?.detail?.turns.slice(-1)[0]?.duration_ms).toBeUndefined()
+    await vi.advanceTimersByTimeAsync(40_000)
+    expect(session()?.detail?.turns.slice(-1)[0]?.duration_ms).toBe(168795)
+    expect(session()?.detail?.turns.slice(-1)[0]?.native_task_id).toBe(
+      "native-ordinary"
+    )
+    expect(mockGet).toHaveBeenCalledTimes(2)
+  })
+
   it("does not replace a promoted final with a partial bounded page", async () => {
     vi.useFakeTimers()
     const user = userTurn("u", "request")

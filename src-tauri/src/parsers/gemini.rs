@@ -844,6 +844,7 @@ impl GeminiParser {
                         model: None,
                         completed_at: Some(timestamp),
                     agent_message_id: None,
+                    native_task_id: None,
                     });
                 }
                 "gemini" | "assistant" | "model" => {
@@ -864,6 +865,7 @@ impl GeminiParser {
                             .map(|s| s.to_string()),
                         completed_at: Some(timestamp),
                     agent_message_id: None,
+                    native_task_id: None,
                     });
                 }
                 "system" => {
@@ -880,6 +882,7 @@ impl GeminiParser {
                         model: None,
                         completed_at: Some(timestamp),
                     agent_message_id: None,
+                    native_task_id: None,
                     });
                 }
                 _ => {}
@@ -1014,6 +1017,7 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
                 model: None,
                 completed_at: msg.completed_at,
             agent_message_id: None,
+            native_task_id: None,
             });
             i += 1;
             continue;
@@ -1030,6 +1034,7 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
                 model: None,
                 completed_at: msg.completed_at,
             agent_message_id: None,
+            native_task_id: None,
             });
             i += 1;
             continue;
@@ -1074,6 +1079,7 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
             model,
             completed_at,
         agent_message_id: None,
+        native_task_id: None,
         });
     }
 

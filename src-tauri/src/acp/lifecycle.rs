@@ -209,14 +209,15 @@ async fn handle_event_with_retry(
 /// CONNECTION survives (the agent rejected the prompt — with ACP's -32000 when
 /// it wants the user to sign in, with anything else when it simply would not
 /// run this one), but their turn is just as dead as the others — leaving those
-/// rows out would strand them at InProgress for good. `cancelled` is already
-/// written by `manager.cancel()` (eager CAS InProgress → Cancelled at the
-/// user-cancel entry point), so it — and any future reason — writes nothing.
+/// rows out would strand them at InProgress for good. Cancellation requests
+/// first enter `cancelling`; the terminal event owns the durable final state.
 pub(crate) fn turn_complete_status(stop_reason: &str) -> Option<ConversationStatus> {
     match stop_reason {
         "end_turn" => Some(ConversationStatus::PendingReview),
         "refusal" | "max_tokens" | "max_turn_requests" | "unknown" | "empty" | "auth_required"
-        | "rejected" => Some(ConversationStatus::Cancelled),
+        | "rejected" | "cancelled" | "cancel_timeout" | "cancel_command_channel_closed" => {
+            Some(ConversationStatus::Cancelled)
+        }
         _ => None,
     }
 }
@@ -316,7 +317,7 @@ pub(crate) async fn write_turn_status(
                 tracing::info!(
                     conversation_id = conversation_id,
                     turn_run_id = ?latest_run.as_ref().map(|run| &run.id),
-                    connection_id = %envelope.connection_id,
+                    connection_id = %connection_id,
                     event_seq = event_seq,
                     stage = "durable_terminal_persisted",
                     old_state = ?latest_run.as_ref().map(|run| &run.status),
@@ -329,7 +330,7 @@ pub(crate) async fn write_turn_status(
                     state,
                     emitter,
                     AcpEvent::ConversationStatusChanged {
-                        conversation_id: conversation_id,
+                        conversation_id,
                         status: ts,
                     },
                 )
@@ -488,10 +489,9 @@ pub(crate) async fn handle_event(
             // would not run this one), but their turn is just as dead as the
             // others — leaving those rows out of this arm would strand them at
             // InProgress for good.
-            // `cancelled` is already written by `manager.cancel()` (eager
-            // CAS InProgress → Cancelled at the user-cancel entry point), so
-            // we leave it alone here. `completed` transitions remain
-            // frontend-driven.
+            // Cancellation requests first enter `cancelling`; this terminal
+            // event finalizes the run and conversation together. `completed`
+            // transitions remain frontend-driven.
             let Some((state_arc, emitter)) =
                 manager.get_state_and_emitter(&envelope.connection_id).await
             else {
@@ -2575,6 +2575,11 @@ mod tests {
             "the late lifecycle write was skipped"
         );
 
+        // A new prompt first makes the conversation active again, even when
+        // best-effort artifact capture could not create a run for it.
+        conversation_service::update_status(&db.conn, conv.id, ConversationStatus::InProgress)
+            .await
+            .unwrap();
         // The next turn is the worker's again, retries included.
         handle_event(&db.conn, &mgr, &turn(9), None).await.unwrap();
         assert_eq!(

@@ -35,6 +35,7 @@ async function reservePort() {
 async function startGoalModel() {
   let requests = 0
   let finishNext = false
+  let ordinaryMode = false
   const server = createServer(async (request, response) => {
     if (request.method !== "POST") {
       response.writeHead(404).end()
@@ -44,7 +45,9 @@ async function startGoalModel() {
     for await (const chunk of request) chunks.push(chunk)
     const body = JSON.parse(Buffer.concat(chunks).toString())
     requests++
-    const text = "SYNTHETIC NATIVE GOAL RESPONSE"
+    const text = ordinaryMode
+      ? "SYNTHETIC ORDINARY RESPONSE"
+      : "SYNTHETIC NATIVE GOAL RESPONSE"
     let item = {
       id: `msg_${requests}`,
       type: "message",
@@ -163,6 +166,9 @@ async function startGoalModel() {
   return {
     url: `http://127.0.0.1:${server.address().port}/v1`,
     count: () => requests,
+    ordinary: (value) => {
+      ordinaryMode = value
+    },
     completeNext: () => {
       finishNext = true
     },
@@ -246,10 +252,19 @@ async function fixture(name) {
         images: [],
       },
       { type: "agent_message", message: text, phase: "final_answer" },
-      { type: "task_complete", turn_id: `turn-${i}`, last_agent_message: text },
+      {
+        type: "task_complete",
+        turn_id: `turn-${i}`,
+        last_agent_message: text,
+        duration_ms: [168795, 615361, 309047][i - 297] ?? 2000,
+      },
     ]) {
       entries.push({
-        timestamp: new Date(Date.parse(timestamp) + i * 1000).toISOString(),
+        timestamp: new Date(
+          Date.parse(timestamp) +
+            i * 1200000 +
+            (payload.type === "task_complete" ? payload.duration_ms : 0)
+        ).toISOString(),
         type: "event_msg",
         payload,
       })
@@ -526,92 +541,129 @@ async function actualPage(page, name, verifyScroll = true) {
   report.checks.push({ name, samples, errors })
 }
 
-// A historical task fixture exercises persisted timing, not the task engine.
-// Only the invocation's disposable data directory can be opened for writing.
-function seedCompletedTask(f, conversation) {
-  return JSON.parse(
-    execFileSync(
-      "python",
-      [
-        "-B",
-        "-c",
-        `
-import json, os, sqlite3, sys
-from pathlib import Path
-root=Path(sys.argv[1]).resolve()
-assert os.environ.get('GITHUB_ACTIONS') == 'true'
-assert root.is_relative_to(Path(os.environ['RUNNER_TEMP']).resolve())
-paths=list(root.rglob('codeg.db'))
-assert len(paths) == 1
-config={'prompt_blocks': [], 'display_text': 'Historical timing fixture', 'config_values': {}}
-with sqlite3.connect(paths[0]) as db:
-    cursor=db.execute('''INSERT INTO work_task
-      (folder_id,title,config,status,created_at,updated_at,started_at,settled_at,finished_at)
-      VALUES (?,?,?,'done',?,?,?,?,?)''',
-      (int(sys.argv[2]), 'Completed timing fixture', json.dumps(config),
-       '2026-10-12T00:00:00Z', '2026-10-13T00:00:00Z',
-       '2026-10-12T00:00:00Z', '2026-10-12T01:01:01Z', '2026-10-13T00:00:00Z'))
-    print(json.dumps({'id': cursor.lastrowid}))
-`,
-        f.data,
-        String(conversation.folder_id),
-      ],
-      { encoding: "utf8" }
+// Verify normal conversation headers through the real parser and packaged UI.
+// The synthetic rollout and app data belong exclusively to this CI invocation.
+async function completedConversationPage(page, api, conversation, name) {
+  const read = () =>
+    api("get_folder_conversation", {
+      conversationId: conversation.id,
+      userTurnLimit: 25,
+    })
+  const parsed = await read()
+  const expected = [168795, 615361, 309047]
+  for (const [n, duration] of expected.entries()) {
+    const id = `turn-${297 + n}`
+    const task = parsed.turns.filter(
+      (turn) => turn.role === "assistant" && turn.native_task_id === id
     )
+    assert.deepEqual(
+      task
+        .filter((turn) => turn.duration_ms != null)
+        .map((turn) => turn.duration_ms),
+      [duration],
+      `${name}: ${id} native whole-task timing`
+    )
+  }
+  const tab = page.locator(
+    `[data-tab-id="conv-${conversation.folder_id}-codex-${conversation.id}"] [role="tab"]`
   )
-}
-
-async function completedTaskPage(page, api, task, name) {
-  const saved = await api("work_task_get", { id: task.id })
-  assert.equal(saved.status, "done")
-  assert.equal(
-    Date.parse(saved.settled_at) - Date.parse(saved.started_at),
-    3661_000
-  )
+  const header = () =>
+    page
+      .locator(
+        '.chat-scroll-port:visible [data-completed-turn-duration-ms="309047"]'
+      )
+      .last()
+  await tab.click()
+  await header().waitFor({ timeout: 60_000 })
+  assert.equal(await header().innerText(), "Worked for 5m 9s")
+  await page.screenshot({ path: join(output, `${name}-ordinary-duration.png`) })
+  await page
+    .locator(".tab-strip-tail")
+    .getByRole("button", { name: /^(New Conversation|新建会话|新增會話)$/ })
+    .first()
+    .click()
+  await tab.click()
+  await header().waitFor({ timeout: 60_000 })
+  assert.equal(await header().innerText(), "Worked for 5m 9s")
   await page.reload()
-  const openTasks = () =>
-    page.getByRole("button", { name: /^(To-dos|待办|待辦)$/ }).click()
-  await openTasks()
-  const duration = () =>
-    page.locator(`[data-task-duration="${task.id}"]:visible`)
-  await duration().waitFor({ timeout: 30_000 })
-  assert.equal(await duration().innerText(), "Last run: 1h 1m 1s")
-  await page.screenshot({
-    path: join(output, `${name}-completed-task-board.png`),
-  })
-  await page.getByRole("button", { name: "Switch to list view" }).click()
-  assert.equal(await duration().innerText(), "Last run: 1h 1m 1s")
-  await page.getByText("Completed timing fixture", { exact: true }).click()
-  const detail = page.getByRole("dialog")
-  await detail.locator(`[data-task-duration="${task.id}"]`).waitFor()
-  assert.equal(
-    await detail.locator(`[data-task-duration="${task.id}"]`).innerText(),
-    "Last run: 1h 1m 1s"
-  )
-  await page.screenshot({
-    path: join(output, `${name}-completed-task-detail.png`),
-  })
-  await page.keyboard.press("Escape")
-  await detail.waitFor({ state: "hidden" })
-  await delay(1600)
-  assert.equal(await duration().innerText(), "Last run: 1h 1m 1s")
-  await page.reload()
-  await openTasks()
-  await duration().waitFor({ timeout: 30_000 })
-  assert.equal(await duration().innerText(), "Last run: 1h 1m 1s")
-  await page.screenshot({
-    path: join(output, `${name}-completed-task-reloaded.png`),
-  })
+  await tab.waitFor({ timeout: 30_000 })
+  await tab.click()
+  await header().waitFor({ timeout: 60_000 })
+  assert.equal(await header().innerText(), "Worked for 5m 9s")
   report.checks.push({
-    name: `${name}-completed-task-duration`,
+    name: `${name}-ordinary-completed-duration`,
     passed: true,
-    board: true,
-    list: true,
-    detail: true,
-    restoredAfterReload: true,
-    excludesAcceptanceWait: true,
-    durationMs: 3661_000,
+    durationsMs: expected,
+    switchAndReload: true,
   })
+  if (!goalModel) return
+  goalModel.ordinary(true)
+  try {
+    const before = new Set(
+      parsed.turns.flatMap((turn) =>
+        turn.native_task_id ? [turn.native_task_id] : []
+      )
+    )
+    const input = page
+      .locator('[contenteditable="true"]')
+      .filter({ visible: true })
+      .last()
+    await input.waitFor({ timeout: 60_000 })
+    await input.fill(`ORDINARY_DURATION ${randomUUID()}`)
+    await input.press("Enter")
+    const answer = page
+      .locator(".chat-scroll-port:visible")
+      .last()
+      .getByText("SYNTHETIC ORDINARY RESPONSE", { exact: true })
+      .last()
+    await answer.waitFor({ timeout: 90_000 })
+    let native
+    for (let i = 0; i < 300; i++) {
+      const detail = await read()
+      native = detail.turns.findLast(
+        (turn) =>
+          turn.role === "assistant" &&
+          turn.native_task_id &&
+          !before.has(turn.native_task_id) &&
+          turn.duration_ms != null
+      )
+      if (native) break
+      await delay(100)
+    }
+    assert.ok(native, `${name}: ordinary completion omitted native timing`)
+    const duration = () =>
+      page
+        .locator(
+          `.chat-scroll-port:visible [data-completed-turn-duration-ms="${native.duration_ms}"]`
+        )
+        .last()
+    await duration().waitFor({ timeout: 45_000 })
+    const liveLabel = await duration().innerText()
+    assert.match(liveLabel, /^Worked for /)
+    await page.screenshot({
+      path: join(output, `${name}-ordinary-live-duration.png`),
+    })
+    await page.reload()
+    await tab.waitFor({ timeout: 30_000 })
+    await tab.click()
+    await duration().waitFor({ timeout: 60_000 })
+    assert.equal(await duration().innerText(), liveLabel)
+    const restored = (await read()).turns.findLast(
+      (turn) =>
+        turn.native_task_id === native.native_task_id &&
+        turn.role === "assistant"
+    )
+    assert.equal(restored.duration_ms, native.duration_ms)
+    report.checks.push({
+      name: `${name}-ordinary-live-and-restored-duration`,
+      passed: true,
+      nativeTaskId: native.native_task_id,
+      durationMs: native.duration_ms,
+      label: liveLabel,
+    })
+  } finally {
+    goalModel.ordinary(false)
+  }
 }
 
 async function nativeGoalPage(page, api, f, conversation, name) {
@@ -800,39 +852,15 @@ async function nativeGoalPage(page, api, f, conversation, name) {
     await quiet()
     await page.screenshot({ path: join(output, `${name}-goal-ended.png`) })
 
-    // Complete through the real model tool and native runtime, then compare
-    // the displayed duration with its authoritative frozen execution seconds.
-    await dialog.locator("textarea").fill(`${name}: timed completed Goal`)
+    // Still verify native Goal completion; elapsed UI belongs to ordinary
+    // conversation headers, not an extra Goal timing panel.
+    await dialog.locator("textarea").fill(`${name}: completed Goal`)
     goalModel.completeNext()
     await dialog
       .getByRole("button", { name: /^(Start goal|开始目标|開始目標)$/ })
       .click()
-    const completed = await status("complete")
-    const seconds = completed.goal.timeUsedSeconds
-    assert.ok(
-      Number.isFinite(seconds) && seconds >= 0,
-      "Native completed Goal omitted elapsed time"
-    )
-    const elapsed = dialog.locator("[data-goal-duration]")
-    await until(
-      () => elapsed.getAttribute("data-goal-duration"),
-      (value) => Number(value) === seconds,
-      "completed Goal duration"
-    )
-    assert.match(await elapsed.innerText(), /Elapsed: \d/)
-    await page.screenshot({
-      path: join(output, `${name}-goal-completed-duration.png`),
-    })
+    await status("complete")
     await quiet()
-    assert.equal(
-      (await goal()).goal.timeUsedSeconds,
-      seconds,
-      "Completed native Goal time continued to grow"
-    )
-    assert.equal(
-      Number(await elapsed.getAttribute("data-goal-duration")),
-      seconds
-    )
     await page.keyboard.press("Escape")
     report.checks.push({
       name: `${name}-native-goal-controls`,
@@ -844,8 +872,7 @@ async function nativeGoalPage(page, api, f, conversation, name) {
       pauseAndEndStopWork: true,
       nativeOutputVisible: true,
       readerEscape: true,
-      completedDurationVisible: true,
-      completedDurationSeconds: seconds,
+      nativeCompletion: true,
       modelRequests: goalModel.count(),
     })
   } catch (error) {
@@ -1028,10 +1055,8 @@ try {
   await install(options.previous, installation)
   let app = await startDesktop(installation, f, "previous-startup")
   let saved
-  let timedTask
   try {
     saved = await importAndOpen(desktopApi(app.page), f)
-    if (options.baseline !== "true") timedTask = seedCompletedTask(f, saved)
     await actualPage(app.page, "previous-frontend", false)
   } finally {
     await stopDesktop(app)
@@ -1059,15 +1084,15 @@ try {
       "Upgrade lost existing conversation"
     )
     await actualPage(app.page, "upgraded-frontend", options.baseline !== "true")
-    await nativeGoalPage(app.page, desktopApi(app.page), f, saved, "setup")
-    await nativeDraftGoalPage(app.page, desktopApi(app.page), "setup")
-    if (timedTask)
-      await completedTaskPage(
+    if (options.baseline !== "true")
+      await completedConversationPage(
         app.page,
         desktopApi(app.page),
-        timedTask,
+        saved,
         "setup"
       )
+    await nativeGoalPage(app.page, desktopApi(app.page), f, saved, "setup")
+    await nativeDraftGoalPage(app.page, desktopApi(app.page), "setup")
     if (options.baseline !== "true") {
       const migration = JSON.parse(
         execFileSync(
@@ -1133,8 +1158,6 @@ try {
       await delay(500)
     }
     const conversation = await importAndOpen(api, s)
-    const timedTask =
-      options.baseline !== "true" ? seedCompletedTask(s, conversation) : null
     browser = await chromium.launch({ channel: "msedge", headless: true })
     const context = await browser.newContext({
       viewport: { width: 1200, height: 900 },
@@ -1146,9 +1169,10 @@ try {
     const page = await context.newPage()
     await page.goto(`http://127.0.0.1:${port}/workspace`)
     await actualPage(page, "server-web-frontend", options.baseline !== "true")
+    if (options.baseline !== "true")
+      await completedConversationPage(page, api, conversation, "server-web")
     await nativeGoalPage(page, api, s, conversation, "server-web")
     await nativeDraftGoalPage(page, api, "server-web")
-    if (timedTask) await completedTaskPage(page, api, timedTask, "server-web")
     if (options.baseline !== "true")
       report.checks.push({
         name: "server-migrations",

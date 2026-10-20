@@ -4931,6 +4931,7 @@ impl CodexParser {
         page_start_offset: Option<u64>,
     ) -> Result<ConversationDetail, ParseError> {
         let mut messages = Vec::new();
+        let mut task_timings = super::codex_task_timing::CodexTaskTimings::default();
         let mut cwd: Option<String> = cwd_hint;
         let mut parent_id: Option<String> = None;
         let mut session_header_seen = false;
@@ -4958,10 +4959,8 @@ impl CodexParser {
         // persisted the `/goal` text as the opening `user_message`, which arrives
         // BEFORE the goal — there the flag stays false and nothing is synthesized.
         let mut goal_opens_session = false;
-        // Start-of-turn markers, chronological, fed to
-        // `backfill_turn_durations` so the first reply of a turn is measured
-        // from when codex began working — not from the previous turn's end,
-        // which would charge it the user's thinking time.
+        // Start markers keep adjacent reasoning cards from different tasks
+        // apart. Timing itself comes only from the task-ID tracker above.
         //
         // Two lists because the two events are not equally trustworthy.
         // `task_started` fires exactly once per turn. `turn_context` normally
@@ -5237,6 +5236,7 @@ impl CodexParser {
                     }
                 }
                 "turn_context" => {
+                    task_timings.context(value.get("payload"));
                     // A new API turn means any prior agent lifecycle is complete.
                     active_agent_count = 0;
                     if model.is_none() {
@@ -5290,6 +5290,7 @@ impl CodexParser {
                                 &mut grouped_reasoning,
                                 &mut pending_reasoning,
                                 pending_reasoning_ts,
+                                task_timings.current_id(),
                             );
                         }
 
@@ -5344,6 +5345,7 @@ impl CodexParser {
 
                         match payload_type {
                             "task_started" => {
+                                task_timings.start(payload, parse_codex_timestamp(&value));
                                 if context_window_max_tokens.is_none() {
                                     context_window_max_tokens = payload
                                         .get("model_context_window")
@@ -5450,6 +5452,7 @@ impl CodexParser {
                                     model: None,
                                     completed_at: Some(timestamp),
                                     agent_message_id: None,
+                                    native_task_id: task_timings.current_id().map(str::to_owned),
                                 });
                             }
                             "agent_message" => {
@@ -5488,6 +5491,7 @@ impl CodexParser {
                                     model: None,
                                     completed_at: Some(timestamp),
                                     agent_message_id: None,
+                                    native_task_id: task_timings.current_id().map(str::to_owned),
                                 });
                             }
                             "thread_goal_updated" => {
@@ -5569,6 +5573,9 @@ impl CodexParser {
                                         model: None,
                                         completed_at: Some(timestamp),
                                         agent_message_id: None,
+                                        native_task_id: task_timings
+                                            .current_id()
+                                            .map(str::to_owned),
                                     });
                                 }
                             }
@@ -5599,7 +5606,7 @@ impl CodexParser {
                                 // (codex persists no `error` event). An
                                 // interrupted turn closes on `turn_aborted`
                                 // instead and is no failure.
-                                if let Some(failure) =
+                                if let Some(mut failure) =
                                     codex_turn_failure(payload).and_then(|message| {
                                         super::turn_error_message(
                                             format!("turn-error-{}", messages.len()),
@@ -5608,8 +5615,16 @@ impl CodexParser {
                                         )
                                     })
                                 {
+                                    failure.native_task_id = payload
+                                        .get("turn_id")
+                                        .and_then(serde_json::Value::as_str)
+                                        .map(str::to_owned);
                                     messages.push(failure);
                                 }
+                                task_timings.finish(payload, parse_codex_timestamp(&value));
+                            }
+                            "turn_aborted" => {
+                                task_timings.finish(payload, parse_codex_timestamp(&value));
                             }
                             "item_completed" => {
                                 // The compaction the last `compacted` record
@@ -5687,6 +5702,7 @@ impl CodexParser {
                                     model: None,
                                     completed_at: Some(timestamp),
                                     agent_message_id: None,
+                                    native_task_id: task_timings.current_id().map(str::to_owned),
                                 });
                                 pending_plan_twin = Some((messages.len() - 1, plan.to_string()));
                                 plan_rendered = true;
@@ -5756,6 +5772,7 @@ impl CodexParser {
                                     model: None,
                                     completed_at: Some(timestamp),
                                     agent_message_id: None,
+                                    native_task_id: task_timings.current_id().map(str::to_owned),
                                 });
                                 if !call_id.is_empty() {
                                     emitted_image_ids.insert(call_id);
@@ -5823,6 +5840,7 @@ impl CodexParser {
                                     model: None,
                                     completed_at: Some(timestamp),
                                     agent_message_id: None,
+                                    native_task_id: task_timings.current_id().map(str::to_owned),
                                 });
                             }
                             "token_count" => {
@@ -5987,6 +6005,7 @@ impl CodexParser {
                                 &mut grouped_reasoning,
                                 &mut pending_reasoning,
                                 pending_reasoning_ts,
+                                task_timings.current_id(),
                             );
                         }
                         // The card this record just closed, if any. When the
@@ -6083,6 +6102,9 @@ impl CodexParser {
                                             model: None,
                                             completed_at: Some(timestamp),
                                             agent_message_id: None,
+                                            native_task_id: task_timings
+                                                .current_id()
+                                                .map(str::to_owned),
                                         });
                                     }
                                 }
@@ -6233,6 +6255,9 @@ impl CodexParser {
                                             model: None,
                                             completed_at: Some(timestamp),
                                             agent_message_id: None,
+                                            native_task_id: task_timings
+                                                .current_id()
+                                                .map(str::to_owned),
                                         });
                                     }
                                     "wait_agent" => {
@@ -6301,6 +6326,9 @@ impl CodexParser {
                                             model: None,
                                             completed_at: Some(timestamp),
                                             agent_message_id: None,
+                                            native_task_id: task_timings
+                                                .current_id()
+                                                .map(str::to_owned),
                                         });
                                     }
                                     _ => {
@@ -6375,6 +6403,9 @@ impl CodexParser {
                                             model: None,
                                             completed_at: Some(timestamp),
                                             agent_message_id: None,
+                                            native_task_id: task_timings
+                                                .current_id()
+                                                .map(str::to_owned),
                                         });
                                     }
                                 }
@@ -6508,6 +6539,9 @@ impl CodexParser {
                                         model: None,
                                         completed_at: Some(timestamp),
                                         agent_message_id: None,
+                                        native_task_id: task_timings
+                                            .current_id()
+                                            .map(str::to_owned),
                                     });
                                 } else if is_spawn {
                                     if let Some(output_obj) = parse_codex_json_output(payload) {
@@ -6535,6 +6569,9 @@ impl CodexParser {
                                         model: None,
                                         completed_at: Some(timestamp),
                                         agent_message_id: None,
+                                        native_task_id: task_timings
+                                            .current_id()
+                                            .map(str::to_owned),
                                     });
                                 } else if is_wait || is_list {
                                     // Emit one `collab_agent` capsule per wait or
@@ -6595,6 +6632,9 @@ impl CodexParser {
                                             model: None,
                                             completed_at: Some(timestamp),
                                             agent_message_id: None,
+                                            native_task_id: task_timings
+                                                .current_id()
+                                                .map(str::to_owned),
                                         });
                                         messages.push(UnifiedMessage {
                                             id: format!("tool-result-{}", messages.len()),
@@ -6612,6 +6652,9 @@ impl CodexParser {
                                             model: None,
                                             completed_at: Some(timestamp),
                                             agent_message_id: None,
+                                            native_task_id: task_timings
+                                                .current_id()
+                                                .map(str::to_owned),
                                         });
                                     }
                                 } else if is_close {
@@ -6731,6 +6774,9 @@ impl CodexParser {
                                         model: None,
                                         completed_at: Some(timestamp),
                                         agent_message_id: None,
+                                        native_task_id: task_timings
+                                            .current_id()
+                                            .map(str::to_owned),
                                     });
                                 }
                             }
@@ -6770,6 +6816,9 @@ impl CodexParser {
                                             model: None,
                                             completed_at: Some(timestamp),
                                             agent_message_id: None,
+                                            native_task_id: task_timings
+                                                .current_id()
+                                                .map(str::to_owned),
                                         });
                                         continue;
                                     }
@@ -6842,6 +6891,9 @@ impl CodexParser {
                                                     model: None,
                                                     completed_at: Some(timestamp),
                                                     agent_message_id: None,
+                                                    native_task_id: task_timings
+                                                        .current_id()
+                                                        .map(str::to_owned),
                                                 });
                                             }
                                         }
@@ -6868,6 +6920,7 @@ impl CodexParser {
                                 };
                                 promotion.push_candidate(record_ordinal, is_user, &text);
                                 pending_promotions.push(PendingPromotedMessage {
+                                    native_task_id: task_timings.current_id().map(str::to_owned),
                                     insert_at: messages.len(),
                                     is_user,
                                     blocks,
@@ -6930,6 +6983,7 @@ impl CodexParser {
                                     model: None,
                                     completed_at: Some(timestamp),
                                     agent_message_id: None,
+                                    native_task_id: task_timings.current_id().map(str::to_owned),
                                 });
                                 if !id.is_empty() {
                                     emitted_image_ids.insert(id);
@@ -6962,6 +7016,7 @@ impl CodexParser {
                         &mut grouped_reasoning,
                         &mut pending_reasoning,
                         pending_reasoning_ts,
+                        task_timings.current_id(),
                     );
                     let summary = codex_compacted_summary(value.get("payload"));
                     let handoff = promotion
@@ -7022,6 +7077,7 @@ impl CodexParser {
             &mut grouped_reasoning,
             &mut pending_reasoning,
             pending_reasoning_ts,
+            task_timings.current_id(),
         );
 
         // A round still waiting for an assistant message to bill — the transcript
@@ -7166,6 +7222,7 @@ impl CodexParser {
                     model: None,
                     completed_at: Some(pending.timestamp),
                     agent_message_id: None,
+                    native_task_id: pending.native_task_id,
                 })
                 .collect();
             messages.splice(insert_at..insert_at, group);
@@ -7222,6 +7279,7 @@ impl CodexParser {
                         model: None,
                         completed_at: first_timestamp,
                         agent_message_id: None,
+                        native_task_id: None,
                     },
                 );
             }
@@ -7253,9 +7311,9 @@ impl CodexParser {
         super::relocate_orphaned_tool_results(&mut turns);
         super::structurize_read_tool_output(&mut turns);
         super::resolve_patch_line_numbers(&mut turns, cwd.as_deref());
-        // After relocation every turn's `completed_at` is final — tile the
-        // timeline into per-reply durations before stats aggregate them.
-        super::backfill_turn_durations(&mut turns, turn_starts);
+        // Native task timing is a whole execution, recorded once on its last
+        // assistant fragment. Message/tool timestamps are not task boundaries.
+        task_timings.apply(&mut turns);
         let mut session_stats = super::compute_session_stats(&turns);
         session_stats =
             merge_codex_total_usage_stats(session_stats, latest_total_usage, latest_total_tokens);
@@ -7637,6 +7695,7 @@ fn continues_thought(
     let resumed_by = next.completed_at.unwrap_or(next.timestamp);
     is_thinking_card(previous)
         && is_thinking_card(next)
+        && previous.native_task_id == next.native_task_id
         && !turn_starts
             .iter()
             .any(|start| *start > paused_at && *start <= resumed_by)
@@ -7655,6 +7714,7 @@ fn flush_pending_reasoning(
     grouped: &mut Vec<String>,
     pending: &mut Vec<String>,
     ts: Option<DateTime<Utc>>,
+    native_task_id: Option<&str>,
 ) {
     if grouped.is_empty() && pending.is_empty() {
         return;
@@ -7678,6 +7738,7 @@ fn flush_pending_reasoning(
         model: None,
         completed_at: Some(timestamp),
         agent_message_id: None,
+        native_task_id: native_task_id.map(str::to_owned),
     });
 }
 
@@ -7897,6 +7958,7 @@ fn push_plan_review_marker(messages: &mut Vec<UnifiedMessage>, timestamp: DateTi
         model: None,
         completed_at: Some(timestamp),
         agent_message_id: None,
+        native_task_id: None,
     });
 }
 
@@ -8258,6 +8320,7 @@ struct PromotionCandidate {
 /// [`ResponseItemPromotion::candidates`] so one shared decision drives both.
 #[derive(Debug)]
 struct PendingPromotedMessage {
+    native_task_id: Option<String>,
     /// Where in `messages` this record would have been pushed. Valid only until
     /// something else mutates `messages`, which is why the splice runs first in
     /// the post-loop sequence.
@@ -8592,6 +8655,7 @@ fn codex_compaction_divider(
         model: None,
         completed_at: Some(timestamp),
         agent_message_id: None,
+        native_task_id: None,
     }
 }
 
@@ -8829,6 +8893,7 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
                 model: None,
                 completed_at: msg.completed_at,
                 agent_message_id: None,
+                native_task_id: msg.native_task_id.clone(),
             });
             i += 1;
         } else if matches!(msg.role, MessageRole::System) {
@@ -8842,6 +8907,7 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
                 model: None,
                 completed_at: msg.completed_at,
                 agent_message_id: None,
+                native_task_id: msg.native_task_id.clone(),
             });
             i += 1;
         } else {
@@ -8856,7 +8922,10 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
 
             // Only absorb immediately following Tool messages
             // (stop at the next assistant message to keep turns small for virtualization)
-            while i < messages.len() && matches!(messages[i].role, MessageRole::Tool) {
+            while i < messages.len()
+                && matches!(messages[i].role, MessageRole::Tool)
+                && messages[i].native_task_id == msg.native_task_id
+            {
                 blocks.extend(messages[i].content.clone());
                 if usage.is_none() {
                     usage = messages[i].usage.clone();
@@ -8883,6 +8952,7 @@ fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn> {
                 model: turn_model,
                 completed_at,
                 agent_message_id: None,
+                native_task_id: msg.native_task_id.clone(),
             });
         }
     }
@@ -9834,16 +9904,12 @@ mod tests {
     use super::codex_compacted_summary;
     use super::codex_line_ordinal;
     use super::codex_parent_thread_id;
+    use super::codex_usage_counters;
     use super::completed_mcp_call;
     use super::extract_codex_title_candidate;
     use super::extract_context_window_used_tokens_from_token_count_info;
     use super::extract_response_item_user_image_blocks;
     use super::extract_turn_usage_from_codex_usage;
-    use super::codex_usage_counters;
-    use super::serialize_preview;
-    use super::truncate_str;
-    use super::BudgetedSink;
-    use super::MCP_RESULT_FALLBACK_CAP;
     use super::is_encrypted_envelope;
     use super::is_promotable_user_text;
     use super::merge_codex_context_window_stats;
@@ -9854,10 +9920,13 @@ mod tests {
     use super::recover_current_turn_citation_sources_from_path;
     use super::redact_encrypted_args;
     use super::resolve_codex_home_dir_from;
+    use super::serialize_preview;
     use super::should_skip_duplicate_user_message;
     use super::strip_blocked_resource_mentions;
     use super::trim_subagent_replay_prefix;
+    use super::truncate_str;
     use super::AgentParser;
+    use super::BudgetedSink;
     use super::CodexParser;
     use super::RolloutFileName;
     use super::CODEX_COMPACTION_SUMMARY_PREFIX;
@@ -9868,6 +9937,7 @@ mod tests {
     use super::CODEX_SUBAGENT_LAUNCH_KEY;
     use super::CODEX_SUBAGENT_STATE_KEY;
     use super::COLLAB_OP_KEY;
+    use super::MCP_RESULT_FALLBACK_CAP;
     use super::{
         build_history_index_slice, history_index_entries_path, history_index_path,
         HISTORY_INDEX_CACHE, HISTORY_PAGE_CACHE,
@@ -10836,6 +10906,7 @@ mod tests {
             model: None,
             completed_at: Some(now),
             agent_message_id: None,
+            native_task_id: None,
         }];
 
         assert!(should_skip_duplicate_user_message(
@@ -11568,118 +11639,196 @@ mod tests {
     }
 
     #[test]
-    fn parse_detail_durations_partition_a_multi_message_turn() {
-        // Regression: durations came from `turn_context → token_count`, and
-        // codex fires `token_count` once per model request — so every reply in
-        // a turn restated the elapsed time SINCE THE PROMPT. The UI merges a
-        // turn's replies into one card by summing their durations, so a 30s
-        // turn reported 10+22+30 = 62s (on a real 4-prompt rollout: 26 minutes
-        // of work shown as 109). Each reply must instead carry only its own
-        // slice, and the slices must add up to the turn.
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time ok")
-            .as_nanos();
-        let path: PathBuf = env::temp_dir().join(format!("codeg-codex-spans-{nanos}.jsonl"));
-
-        let content = concat!(
-            "{\"timestamp\":\"2026-03-01T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"spans-1\",\"cwd\":\"/tmp/demo\"}}\n",
-            "{\"timestamp\":\"2026-03-01T10:00:00.100Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n",
-            "{\"timestamp\":\"2026-03-01T10:00:00.200Z\",\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5-codex\"}}\n",
-            "{\"timestamp\":\"2026-03-01T10:00:00.300Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"go\"}}\n",
-            // Reply 1 at +10s, then two more model requests inside the SAME turn.
-            "{\"timestamp\":\"2026-03-01T10:00:10.300Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"one\"}}\n",
-            "{\"timestamp\":\"2026-03-01T10:00:11.000Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":10,\"cached_input_tokens\":0,\"output_tokens\":2,\"total_tokens\":12}}}}\n",
-            "{\"timestamp\":\"2026-03-01T10:00:22.300Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"two\"}}\n",
-            "{\"timestamp\":\"2026-03-01T10:00:23.000Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":10,\"cached_input_tokens\":0,\"output_tokens\":2,\"total_tokens\":12}}}}\n",
-            "{\"timestamp\":\"2026-03-01T10:00:30.300Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"three\"}}\n",
-            "{\"timestamp\":\"2026-03-01T10:00:30.400Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":10,\"cached_input_tokens\":0,\"output_tokens\":2,\"total_tokens\":12}}}}\n",
-            // A second prompt arrives 10 minutes later; that idle gap belongs
-            // to nobody, so its reply must report 4s and not 10m4s.
-            "{\"timestamp\":\"2026-03-01T10:10:30.000Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n",
-            "{\"timestamp\":\"2026-03-01T10:10:30.100Z\",\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5-codex\"}}\n",
-            "{\"timestamp\":\"2026-03-01T10:10:30.300Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"again\"}}\n",
-            "{\"timestamp\":\"2026-03-01T10:10:34.300Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"four\"}}\n"
+    fn native_task_durations_cover_tools_and_consecutive_automated_tasks_once() {
+        let mut records = Vec::new();
+        let mut record = |time: &str, kind: &str, payload: serde_json::Value| {
+            records.push(
+                serde_json::json!({"timestamp": time, "type": kind, "payload": payload})
+                    .to_string(),
+            );
+        };
+        record(
+            "2026-10-19T10:00:00Z",
+            "session_meta",
+            serde_json::json!({"id":"native-times", "cwd":"/tmp/demo"}),
         );
-        fs::write(&path, content).expect("write test jsonl");
-
-        let parser = CodexParser::new();
-        let detail = parser
-            .parse_conversation_detail(&path, "spans-1")
-            .expect("parse detail ok");
-
-        let assistant_durations: Vec<Option<u64>> = detail
-            .turns
-            .iter()
-            .filter(|t| matches!(t.role, TurnRole::Assistant))
-            .map(|t| t.duration_ms)
-            .collect();
+        for (id, start, end, duration) in [
+            ("a", "2026-10-19T10:00:00Z", "2026-10-19T10:02:49Z", 168795),
+            ("b", "2026-10-19T10:10:00Z", "2026-10-19T10:20:16Z", 615361),
+            ("c", "2026-10-19T10:30:00Z", "2026-10-19T10:35:10Z", 309047),
+        ] {
+            record(
+                start,
+                "event_msg",
+                serde_json::json!({"type":"task_started", "turn_id":id}),
+            );
+            record(
+                start,
+                "turn_context",
+                serde_json::json!({"turn_id":id, "model":"codex"}),
+            );
+            if id == "a" {
+                record(
+                    start,
+                    "event_msg",
+                    serde_json::json!({"type":"user_message", "message":"long automation"}),
+                );
+            }
+            record(
+                start,
+                "event_msg",
+                serde_json::json!({"type":"agent_message", "message":format!("Starting {id}")}),
+            );
+            for n in 0..8 {
+                record(
+                    start,
+                    "response_item",
+                    serde_json::json!({"type":"function_call", "name":"exec_command", "call_id":format!("{id}-{n}"), "arguments":"{\"cmd\":\"pwd\"}"}),
+                );
+                record(
+                    start,
+                    "response_item",
+                    serde_json::json!({"type":"function_call_output", "call_id":format!("{id}-{n}"), "output":"/tmp/demo"}),
+                );
+                // Configuration updates and metering aren't new task starts.
+                record(
+                    end,
+                    "turn_context",
+                    serde_json::json!({"turn_id":id, "model":"codex"}),
+                );
+            }
+            record(
+                end,
+                "event_msg",
+                serde_json::json!({"type":"agent_message", "message":format!("Finished {id}")}),
+            );
+            record(
+                end,
+                "event_msg",
+                serde_json::json!({"type":"task_complete", "turn_id":id, "duration_ms":duration, "started_at":0, "completed_at":1}),
+            );
+        }
+        // A branch-return notice after completion must not inherit the old task.
+        record(
+            "2026-10-19T11:00:00Z",
+            "turn_context",
+            serde_json::json!({"turn_id":"c"}),
+        );
+        record(
+            "2026-10-19T11:00:00Z",
+            "event_msg",
+            serde_json::json!({"type":"agent_message", "message":"Returned to the branch"}),
+        );
+        let content = records.join("\n");
+        let detail = parse_rollout("native-times", &content, "native-times");
+        for (id, duration) in [("a", 168795), ("b", 615361), ("c", 309047)] {
+            let task: Vec<_> = detail
+                .turns
+                .iter()
+                .filter(|turn| {
+                    turn.native_task_id.as_deref() == Some(id)
+                        && matches!(turn.role, TurnRole::Assistant)
+                })
+                .collect();
+            assert!(
+                task.len() > 2,
+                "tool/model fragments retained for virtualization"
+            );
+            assert_eq!(
+                task.iter()
+                    .filter_map(|turn| turn.duration_ms)
+                    .collect::<Vec<_>>(),
+                vec![duration]
+            );
+            assert_eq!(task.last().unwrap().duration_ms, Some(duration));
+        }
+        assert_eq!(detail.turns.last().unwrap().native_task_id, None);
+        assert_eq!(detail.turns.last().unwrap().duration_ms, None);
         assert_eq!(
-            assistant_durations,
-            vec![
-                Some(10_000), // prompt → "one"
-                Some(12_000), // "one" → "two"
-                Some(8_000),  // "two" → "three"
-                Some(4_000),  // second prompt → "four"
-            ]
+            detail.session_stats.unwrap().total_duration_ms,
+            168795 + 615361 + 309047
         );
-
-        // Turn 1's replies sum to its wall clock, and the session total is the
-        // two turns' work — never the idle stretch between them.
-        let turn_one: u64 = assistant_durations[..3].iter().flatten().sum();
-        assert_eq!(turn_one, 30_000);
-        let stats = detail.session_stats.expect("session stats");
-        assert_eq!(stats.total_duration_ms, 34_000);
-
-        let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn a_mid_turn_turn_context_does_not_truncate_the_reply_after_it() {
-        // Newer codex re-emits `turn_context` in the MIDDLE of a turn — it
-        // carries a `turn_id` and is rewritten when the turn's config changes
-        // (6 of 495 records across the local rollout corpus). A start marker
-        // only ever moves the boundary forward, so treating that one as a turn
-        // start would charge the following reply just the time since it and
-        // silently drop the rest of the span from the turn's total. Only
-        // `task_started` — exactly one per turn — anchors the measurement;
-        // `turn_context` is a fallback for rollouts that predate it.
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time ok")
-            .as_nanos();
-        let path: PathBuf = env::temp_dir().join(format!("codeg-codex-midctx-{nanos}.jsonl"));
-
+    fn native_task_timing_is_available_in_a_bounded_tail_without_its_start() {
         let content = concat!(
-            "{\"timestamp\":\"2026-03-01T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"midctx-1\",\"cwd\":\"/tmp/demo\"}}\n",
-            "{\"timestamp\":\"2026-03-01T10:00:00.100Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n",
-            "{\"timestamp\":\"2026-03-01T10:00:00.200Z\",\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-5-codex\"}}\n",
-            "{\"timestamp\":\"2026-03-01T10:00:00.300Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"go\"}}\n",
-            "{\"timestamp\":\"2026-03-01T10:00:10.300Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"one\"}}\n",
-            // Re-emitted mid-turn, 1s before the next reply. If this counted as
-            // a turn start, "two" would report 1s instead of its real 20s.
-            "{\"timestamp\":\"2026-03-01T10:00:29.300Z\",\"type\":\"turn_context\",\"payload\":{\"turn_id\":\"t-1\",\"model\":\"gpt-5-codex\"}}\n",
-            "{\"timestamp\":\"2026-03-01T10:00:30.300Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"two\"}}\n"
+            "{\"timestamp\":\"2026-10-19T10:00:01Z\",\"type\":\"turn_context\",\"payload\":{\"turn_id\":\"tail\",\"model\":\"codex\"}}\n",
+            "{\"timestamp\":\"2026-10-19T10:02:48Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"done\"}}\n",
+            "{\"timestamp\":\"2026-10-19T10:02:49Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"tail\",\"duration_ms\":168795}}\n"
         );
-        fs::write(&path, content).expect("write test jsonl");
+        let detail = CodexParser::new()
+            .parse_conversation_detail_reader(
+                Path::new("/unused/rollout.jsonl"),
+                "tail",
+                std::io::Cursor::new(content),
+                Some("/tmp/demo".to_owned()),
+                Some(1000),
+            )
+            .unwrap();
+        assert_eq!(
+            detail.turns.last().unwrap().native_task_id.as_deref(),
+            Some("tail")
+        );
+        assert_eq!(detail.turns.last().unwrap().duration_ms, Some(168795));
+    }
 
-        let parser = CodexParser::new();
-        let detail = parser
-            .parse_conversation_detail(&path, "midctx-1")
-            .expect("parse detail ok");
+    #[test]
+    fn legacy_messages_and_metering_are_not_whole_task_timing() {
+        let detail = parse_rollout("untimed", concat!(
+            "{\"timestamp\":\"2026-10-19T10:00:01Z\",\"type\":\"turn_context\",\"payload\":{\"model\":\"codex\"}}\n",
+            "{\"timestamp\":\"2026-10-19T10:02:48Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"agent_message\",\"message\":\"done\"}}\n"
+        ), "untimed");
+        assert!(detail.turns.iter().all(|turn| turn.duration_ms.is_none()));
+    }
 
-        let assistant_durations: Vec<Option<u64>> = detail
+    #[test]
+    fn failed_and_cancelled_task_timing_cannot_spill_into_the_next_task() {
+        let mut records = Vec::new();
+        for (id, terminal, duration) in [
+            ("failed", "task_complete", Some(168795)),
+            ("cancelled", "turn_aborted", None),
+            ("next", "task_complete", Some(309047)),
+        ] {
+            records.extend([
+                record(
+                    "2026-10-19T10:00:00Z",
+                    "event_msg",
+                    serde_json::json!({"type":"task_started", "turn_id":id}),
+                ),
+                record(
+                    "2026-10-19T10:00:01Z",
+                    "event_msg",
+                    serde_json::json!({"type":"agent_message", "message":format!("Progress {id}")}),
+                ),
+                record(
+                    "2026-10-19T10:00:02.250Z",
+                    "event_msg",
+                    serde_json::json!({"type":terminal, "turn_id":id, "duration_ms":duration,
+                        "error":if id == "failed" {serde_json::json!({"message":"failed"})} else {serde_json::Value::Null}}),
+                ),
+            ]);
+        }
+        let detail = parse_rollout("terminal-timing", &jsonl(&records), "terminal-timing");
+        let timing: Vec<_> = detail
             .turns
             .iter()
-            .filter(|t| matches!(t.role, TurnRole::Assistant))
-            .map(|t| t.duration_ms)
+            .filter(|turn| matches!(turn.role, TurnRole::Assistant))
+            .map(|turn| (turn.native_task_id.as_deref(), turn.duration_ms))
             .collect();
-        assert_eq!(assistant_durations, vec![Some(10_000), Some(20_000)]);
-        // Still tiles: 10s + 20s is the whole prompt→last-reply span.
-        let total: u64 = assistant_durations.iter().flatten().sum();
-        assert_eq!(total, 30_000);
-
-        let _ = fs::remove_file(path);
+        assert_eq!(
+            timing,
+            vec![
+                (Some("failed"), Some(168795)),
+                (Some("cancelled"), Some(2250)),
+                (Some("next"), Some(309047)),
+            ]
+        );
+        assert!(detail
+            .turns
+            .iter()
+            .filter(|turn| matches!(turn.role, TurnRole::System))
+            .all(|turn| turn.duration_ms.is_none()));
     }
 
     #[test]

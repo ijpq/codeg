@@ -40,6 +40,9 @@ public/pdfjs
 coverage/
 *.snap.new
 .vitest-cache/
+# Local release verification output must not be scanned as application source.
+/artifacts/
+/release/
 
 # macOS signing material. Keep certificates and exported private keys out of git.
 *.cer

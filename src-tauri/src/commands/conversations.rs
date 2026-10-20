@@ -2160,6 +2160,7 @@ pub async fn list_conversation_output_window_core(
             model: None,
             completed_at: Some(turn.timestamp),
             agent_message_id: None,
+            native_task_id: None,
         })
         .collect::<Vec<_>>();
     let started = std::time::Instant::now();
@@ -2768,6 +2769,7 @@ async fn get_folder_conversation_raw_impl(
                 model: None,
                 completed_at: Some(merge.created_at),
                 agent_message_id: None,
+                native_task_id: None,
             };
             let mut preview = merge.summary_preview;
             if merge.summary_bytes > preview.len() as i64 {
@@ -2799,6 +2801,7 @@ async fn get_folder_conversation_raw_impl(
                 model: None,
                 completed_at: Some(merge.created_at),
                 agent_message_id: None,
+                native_task_id: None,
             };
             for merge_turn in [user_turn, assistant_turn] {
                 let index = turns.partition_point(|turn| turn.timestamp <= merge_turn.timestamp);
@@ -4405,6 +4408,7 @@ mod tests {
         let mut turns = vec![MessageTurn {
             id: "branch-first-prompt".into(),
             agent_message_id: None,
+            native_task_id: None,
             role: TurnRole::User,
             blocks: vec![
                 ContentBlock::Text {
@@ -4458,6 +4462,7 @@ mod tests {
         let turn = |id: &str, seconds: i64| MessageTurn {
             id: id.into(),
             agent_message_id: None,
+            native_task_id: None,
             role: TurnRole::User,
             blocks: vec![ContentBlock::Text { text: id.into() }],
             timestamp: base + chrono::Duration::seconds(seconds),
@@ -4588,6 +4593,7 @@ mod tests {
             model: None,
             completed_at: None,
             agent_message_id: None,
+            native_task_id: None,
         }
     }
 
@@ -4627,6 +4633,7 @@ mod tests {
             model: None,
             completed_at: None,
             agent_message_id: None,
+            native_task_id: None,
         }
     }
 
@@ -4646,6 +4653,7 @@ mod tests {
             model: None,
             completed_at: completed.then_some(ts),
             agent_message_id: None,
+            native_task_id: None,
         }
     }
 
@@ -5034,6 +5042,7 @@ mod tests {
             model: None,
             completed_at: None,
             agent_message_id: None,
+            native_task_id: None,
         };
         let pending_image =
             |message_id: &str, data: &str| crate::acp::session_state::PendingUserMessage {
@@ -5236,6 +5245,7 @@ mod tests {
             model: None,
             completed_at: None,
             agent_message_id: None,
+            native_task_id: None,
         }
     }
 
@@ -5499,6 +5509,7 @@ mod tests {
             model: None,
             completed_at: None,
             agent_message_id: None,
+            native_task_id: None,
         }];
         let children = vec![summary_child(42, "tu-1", "completed")];
         inject_delegation_meta(&mut turns, &children);
@@ -8812,6 +8823,7 @@ mod tests {
         let mut turns = vec![MessageTurn {
             id: "assistant-1".into(),
             agent_message_id: None,
+            native_task_id: None,
             role: TurnRole::Assistant,
             blocks: vec![
                 ContentBlock::ToolUse {
@@ -8876,6 +8888,7 @@ mod tests {
         let mut turns = vec![MessageTurn {
             id: "user-1".into(),
             agent_message_id: None,
+            native_task_id: None,
             role: TurnRole::User,
             blocks: vec![ContentBlock::Image {
                 data: full.clone(),
@@ -8919,6 +8932,7 @@ mod tests {
         let mut turns = vec![MessageTurn {
             id: "assistant-reasoning".into(),
             agent_message_id: None,
+            native_task_id: None,
             role: TurnRole::Assistant,
             blocks: vec![ContentBlock::Thinking { text: full.clone() }],
             timestamp: at(0),
@@ -8958,6 +8972,7 @@ mod tests {
             .map(|index| MessageTurn {
                 id: format!("assistant-{index}"),
                 agent_message_id: None,
+                native_task_id: None,
                 role: TurnRole::Assistant,
                 blocks: vec![
                     ContentBlock::ToolUse {

@@ -291,6 +291,29 @@ describe("singletonSourceTurns", () => {
 })
 
 describe("mergeConsecutiveAssistantTurns", () => {
+  it("keeps consecutive native executions and non-execution notices separate", () => {
+    const merged = mergeConsecutiveAssistantTurns([
+      assistantItem("a-tool", { native_task_id: "a" }),
+      assistantItem("a-final", { native_task_id: "a", duration_ms: 168795 }),
+      assistantItem("b-tool", { native_task_id: "b" }),
+      assistantItem("b-final", { native_task_id: "b", duration_ms: 615361 }),
+      assistantItem("c", { native_task_id: "c", duration_ms: 309047 }),
+      assistantItem("branch-return"),
+    ]) as TurnItem[]
+    expect(merged.map((item) => item.group.native_task_id)).toEqual([
+      "a",
+      "b",
+      "c",
+      undefined,
+    ])
+    expect(merged.map((item) => item.group.duration_ms)).toEqual([
+      168795,
+      615361,
+      309047,
+      undefined,
+    ])
+  })
+
   it("surfaces completion time patched onto a non-last sub-turn", () => {
     // Real-device bug (Cursor session 118b6805): the post-turn metadata
     // patch head-aligns onto the FIRST local sub-turn when the parser emits

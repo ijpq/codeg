@@ -25,7 +25,7 @@ def verify_binary(built: bytes, installed: bytes, *, main: bool) -> str:
 
 if __name__ == "__main__":
     build_dir, install_dir = map(Path, sys.argv[1:])
-    names = ["codeg.exe", "codeg-mcp.exe"]
+    names = ["codeg.exe", "codeg-mcp.exe", "codeg-cli.exe"]
     helper = "codeg-computer-helper.exe"
     if (build_dir / helper).exists() or (install_dir / helper).exists():
         names.append(helper)

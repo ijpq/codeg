@@ -42,8 +42,6 @@ import {
   CONVERSATION_DELIVERABLES_CHANGED_EVENT,
   type ConversationArtifactsChanged,
   type ConversationDeliverablesChanged,
-  type PlanApprovalAnswer,
-  type QuestionAnswer,
 } from "@/lib/types"
 import { subscribe } from "@/lib/platform"
 import {

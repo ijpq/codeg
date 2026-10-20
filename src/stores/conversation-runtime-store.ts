@@ -521,6 +521,8 @@ type Action =
       type: "PATCH_TURN_METADATA"
       conversationId: number
       turnPatches: TurnMetadataPatch[]
+      /** Persisted rounds are patched by native identity, never by position. */
+      nativeTimings?: MessageTurn[]
       sessionStats?: SessionStats | null
     }
   | {
@@ -1654,6 +1656,7 @@ export function buildStreamingTurnsFromLiveMessage(
 /** Metadata backfilled onto a local assistant turn by the post-turn reparse. */
 export interface TurnMetadataPatch {
   index: number
+  native_task_id?: string | null
   usage?: TurnUsage | null
   duration_ms?: number | null
   model?: string | null
@@ -1726,6 +1729,19 @@ function assistantTurnRounds(turns: readonly MessageTurn[]): number[][] {
   return rounds
 }
 
+function missingNativeTaskDurations(
+  turns: readonly MessageTurn[]
+): Set<string> {
+  const last = new Map<string, MessageTurn>()
+  for (const turn of turns) {
+    if (turn.role === "assistant" && turn.native_task_id)
+      last.set(turn.native_task_id, turn)
+  }
+  return new Set(
+    [...last].filter(([, turn]) => turn.duration_ms == null).map(([id]) => id)
+  )
+}
+
 /**
  * Where the parse leaves its first `count` assistant turns behind: the
  * position right after the `count`-th one. `turns.length` when the parse holds
@@ -1746,7 +1762,7 @@ function positionPastAssistantTurns(
 
 type TurnStatsPatch = Pick<
   TurnMetadataPatch,
-  "usage" | "duration_ms" | "model" | "completed_at"
+  "usage" | "duration_ms" | "model" | "completed_at" | "native_task_id"
 >
 
 /**
@@ -1904,7 +1920,60 @@ export function computeTurnMetadataPatches(params: {
         : parsedRounds[r + surplus]
       : (parsedRounds[r] ?? [])
     if (parsedRound.length !== localRound.length) everyRoundLinesUp = false
-    alignRoundStats(localRound, parsedRound, stats)
+    const nativeIds = new Set(
+      parsedRound.flatMap((turn) =>
+        turn.native_task_id ? [turn.native_task_id] : []
+      )
+    )
+    if (nativeIds.size === 0) {
+      // Never give legacy positional metadata to an already identified task.
+      alignRoundStats(
+        localRound.filter((i) => !localTurns[i].native_task_id),
+        parsedRound,
+        stats
+      )
+      return
+    }
+    for (const id of nativeIds) {
+      const parsedTask = parsedRound.filter(
+        (turn) => turn.native_task_id === id
+      )
+      const identified = localRound.filter(
+        (i) => localTurns[i].native_task_id === id
+      )
+      // First adoption requires one unambiguous task at the verified batch
+      // boundary. Multiple automated tasks without user bubbles cannot be
+      // distinguished by fragment counts; wait for authoritative history.
+      const canAdopt =
+        nativeIds.size === 1 &&
+        params.parseOpensAtBatch &&
+        parsedTask.length === parsedRound.length &&
+        localRound.every(
+          (i) =>
+            !localTurns[i].native_task_id || localTurns[i].native_task_id === id
+        )
+      const targets = canAdopt ? localRound : identified
+      if (targets.length === 0) continue
+      alignRoundStats(targets, parsedTask, stats)
+      let duration: number | null | undefined
+      for (let i = parsedTask.length - 1; i >= 0; i--) {
+        if (parsedTask[i].duration_ms != null) {
+          duration = parsedTask[i].duration_ms
+          break
+        }
+      }
+      const completed = parsedTask[parsedTask.length - 1]?.completed_at
+      targets.forEach((index, i) => {
+        stats.set(index, {
+          ...stats.get(index),
+          native_task_id: id,
+          // Native duration belongs to the WHOLE task, exactly once, even
+          // when live/parser fragment counts differ.
+          duration_ms: i === targets.length - 1 ? duration : null,
+          completed_at: i === targets.length - 1 ? completed : undefined,
+        })
+      })
+    }
   })
 
   // The parser's name for each turn. Naming a turn is a POSITION claim, and
@@ -1958,14 +2027,23 @@ export function computeTurnMetadataPatches(params: {
   const patches: TurnMetadataPatch[] = []
   localAssistantIndices.forEach((index, i) => {
     const turnStats = stats.get(index)
-    const sourceTurnId = idIsPlaceable ? sessionAssistantTurns[i].id : undefined
+    const source = sessionAssistantTurns[i]
+    const sourceTurnId =
+      idIsPlaceable &&
+      (!localTurns[index].native_task_id ||
+        localTurns[index].native_task_id === source?.native_task_id) &&
+      (!source?.native_task_id ||
+        turnStats?.native_task_id === source.native_task_id)
+        ? source.id
+        : undefined
     // `source_turn_id` counts as something worth emitting on its own: a turn
     // the parser recorded with no stats at all (a plain codex reply carries no
     // per-turn usage) still needs its name, or "fork from here" on it silently
     // degrades to a tail fork.
     if (
       !turnStats?.usage &&
-      !turnStats?.duration_ms &&
+      turnStats?.duration_ms == null &&
+      !turnStats?.native_task_id &&
       !turnStats?.model &&
       !turnStats?.completed_at &&
       !sourceTurnId
@@ -1974,6 +2052,9 @@ export function computeTurnMetadataPatches(params: {
     }
     patches.push({
       index,
+      ...(turnStats?.native_task_id
+        ? { native_task_id: turnStats.native_task_id }
+        : {}),
       usage: turnStats?.usage,
       duration_ms: turnStats?.duration_ms,
       model: turnStats?.model,
@@ -3242,21 +3323,28 @@ function reducer(
 
     case "PATCH_TURN_METADATA": {
       const current = state.byConversationId.get(action.conversationId)
-      if (!current || current.localTurns.length === 0) return state
+      if (!current) return state
 
       const patchedTurns = [...current.localTurns]
       let changed = false
       for (const patch of action.turnPatches) {
         const turn = patchedTurns[patch.index]
         if (!turn) continue
+        if (turn.native_task_id && turn.native_task_id !== patch.native_task_id)
+          continue
         const newUsage = turn.usage ?? patch.usage
-        const newDuration = turn.duration_ms ?? patch.duration_ms
+        const newDuration =
+          patch.native_task_id && patch.duration_ms !== undefined
+            ? patch.duration_ms
+            : (turn.duration_ms ?? patch.duration_ms)
+        const newNativeTaskId = turn.native_task_id ?? patch.native_task_id
         const newModel = turn.model ?? patch.model
         const newCompletedAt = turn.completed_at ?? patch.completed_at
         const newSourceTurnId = turn.source_turn_id ?? patch.source_turn_id
         if (
           newUsage !== turn.usage ||
           newDuration !== turn.duration_ms ||
+          newNativeTaskId !== turn.native_task_id ||
           newModel !== turn.model ||
           newCompletedAt !== turn.completed_at ||
           newSourceTurnId !== turn.source_turn_id
@@ -3265,6 +3353,7 @@ function reducer(
             ...turn,
             usage: newUsage,
             duration_ms: newDuration,
+            ...(newNativeTaskId ? { native_task_id: newNativeTaskId } : {}),
             model: newModel,
             completed_at: newCompletedAt,
             source_turn_id: newSourceTurnId,
@@ -3273,12 +3362,47 @@ function reducer(
         }
       }
 
-      if (!changed && !action.sessionStats) return state
-
-      const patchedDetail =
+      let patchedDetail =
         current.detail && action.sessionStats
           ? { ...current.detail, session_stats: action.sessionStats }
           : current.detail
+      if (patchedDetail && action.nativeTimings?.length) {
+        const incoming = new Map<string, MessageTurn>()
+        for (const turn of action.nativeTimings) {
+          if (turn.role === "assistant" && turn.native_task_id)
+            incoming.set(turn.native_task_id, turn)
+        }
+        let turns: MessageTurn[] | null = null
+        // Only the last fragment of each identified task carries its timing.
+        // Patch metadata in place; don't replace or truncate loaded history.
+        for (
+          let i = patchedDetail.turns.length - 1;
+          i >= 0 && incoming.size;
+          i--
+        ) {
+          const turn = patchedDetail.turns[i]
+          if (turn.role !== "assistant" || !turn.native_task_id) continue
+          const parsed = incoming.get(turn.native_task_id)
+          if (!parsed) continue
+          incoming.delete(turn.native_task_id)
+          if (
+            turn.duration_ms == null &&
+            parsed.duration_ms != null &&
+            Number.isFinite(parsed.duration_ms) &&
+            parsed.duration_ms >= 0
+          ) {
+            turns ??= [...patchedDetail.turns]
+            turns[i] = {
+              ...turn,
+              duration_ms: parsed.duration_ms,
+              completed_at: parsed.completed_at ?? turn.completed_at,
+            }
+          }
+        }
+        if (turns) patchedDetail = { ...patchedDetail, turns }
+      }
+      if (!changed && patchedDetail === current.detail && !action.sessionStats)
+        return state
 
       return updateSessionInState(state, action.conversationId, () => ({
         ...current,
@@ -3626,6 +3750,7 @@ const TURN_METADATA_SYNC_DELAYS_MS = [1500, 3000, 5000, 8000, 13000] as const
 // cancel a poll whose tab has closed.
 const viewerDetailSyncCancels = new Map<number, () => void>()
 const completedTurnReconcileCancels = new Map<number, () => void>()
+const turnMetadataSyncCancels = new Map<number, () => void>()
 
 function cancelViewerDetailSync(conversationId: number): void {
   const cancel = viewerDetailSyncCancels.get(conversationId)
@@ -4609,6 +4734,12 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
         if (!isLatestGeneration(conversationId, generation)) return
         markConversationDetailPhase(conversationId, "data-ready")
         dispatch({ type: "FETCH_DETAIL_SUCCESS", conversationId, detail })
+        if (
+          detail.in_flight_user_turn_id == null &&
+          missingNativeTaskDurations(detail.turns).size
+        ) {
+          syncTurnMetadata(conversationId)
+        }
       })
       .catch((error: unknown) => {
         if (!isLatestGeneration(conversationId, generation)) return
@@ -4675,6 +4806,12 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
           preserveLive: options?.preserveLive ?? false,
           dropLiveTurnIds: options?.dropLiveTurnIds,
         })
+        if (
+          detail.in_flight_user_turn_id == null &&
+          missingNativeTaskDurations(detail.turns).size
+        ) {
+          syncTurnMetadata(fetchId, conversationId)
+        }
       })
       .catch((error: unknown) => {
         if (!isLatestGeneration(conversationId, generation)) return
@@ -5067,6 +5204,13 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
             )
             return
           }
+          if (
+            !replyPending &&
+            isLatest &&
+            missingNativeTaskDurations(detail.turns).size
+          ) {
+            syncTurnMetadata(fetchId, conversationId)
+          }
           cancel()
         })
         .catch(() => {
@@ -5219,6 +5363,9 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
                 preserveLive: false,
               })
               cancel()
+              if (missingNativeTaskDurations(detail.turns).size) {
+                syncTurnMetadata(dbConversationId, runtimeId)
+              }
               onReconciled?.()
               return
             }
@@ -5253,6 +5400,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     runtimeConversationId?: number
   ): (() => void) => {
     const runtimeId = runtimeConversationId ?? dbConversationId
+    turnMetadataSyncCancels.get(runtimeId)?.()
     let cancelled = false
     let timerId: ReturnType<typeof setTimeout> | null = null
     // Highest attempt whose timer has been armed. Keeps the schedule a single
@@ -5265,6 +5413,16 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     // so the allowance is the same wherever in the schedule that state first
     // shows up.
     let usageOnlyRounds = 0
+    const expectedNativeIds = missingNativeTaskDurations(
+      get().byConversationId.get(runtimeId)?.detail?.turns ?? []
+    )
+    const cancel = (): void => {
+      cancelled = true
+      if (timerId) clearTimeout(timerId)
+      if (turnMetadataSyncCancels.get(runtimeId) === cancel)
+        turnMetadataSyncCancels.delete(runtimeId)
+    }
+    turnMetadataSyncCancels.set(runtimeId, cancel)
 
     // Advance the backoff, unless this sync was cancelled, already moved on,
     // or has run out of attempts. Hoisted so the attempt below can call it;
@@ -5272,7 +5430,10 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     function scheduleNext(attempt: number): void {
       if (cancelled) return
       const next = attempt + 1
-      if (next >= TURN_METADATA_SYNC_DELAYS_MS.length) return
+      if (next >= TURN_METADATA_SYNC_DELAYS_MS.length) {
+        cancel()
+        return
+      }
       if (next <= armed) return
       trySync(next)
     }
@@ -5282,7 +5443,13 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       timerId = setTimeout(() => {
         if (cancelled) return
         const session = get().byConversationId.get(runtimeId)
-        if (!session || session.localTurns.length === 0) return
+        if (
+          !session ||
+          (session.localTurns.length === 0 && expectedNativeIds.size === 0)
+        ) {
+          cancel()
+          return
+        }
         // A prompt is in flight again — the user typed ahead inside our
         // backoff, or the queue auto-flushed the moment the reply settled.
         // Patching is unsafe mid-turn, but ABANDONING the schedule is worse:
@@ -5295,6 +5462,8 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
           return
         }
         const boundaryIndex = session.batchBoundaryIndex
+        const requestTurns = session.localTurns
+        const requestToken = session.activeTurnToken
 
         // Keep metadata reads bounded. Verify the captured batch boundary in
         // the returned tail before applying per-turn fields.
@@ -5306,7 +5475,19 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
           .then((parsed) => {
             if (cancelled) return
             const cur = get().byConversationId.get(runtimeId)
-            if (!cur || cur.localTurns.length === 0) return
+            if (!cur) {
+              cancel()
+              return
+            }
+            // A newer send, completion, or detail reconciliation owns the state.
+            // Re-read rather than applying positional fields from an old batch.
+            if (
+              cur.activeTurnToken !== requestToken ||
+              cur.localTurns !== requestTurns
+            ) {
+              scheduleNext(attempt)
+              return
+            }
             if (cur.syncState === "awaiting_persist") {
               scheduleNext(attempt)
               return
@@ -5375,41 +5556,23 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
                 turnsOffsetOf(parsed) + parsed.turns.length < boundaryIndex
               )
 
-            if (patches.length > 0 || parsed.session_stats) {
+            if (
+              patches.length > 0 ||
+              parsed.session_stats ||
+              expectedNativeIds.size
+            ) {
               dispatch({
                 type: "PATCH_TURN_METADATA",
                 conversationId: runtimeId,
                 turnPatches: patches,
+                nativeTimings: parsed.turns,
                 sessionStats: parsed.session_stats,
               })
             }
 
-            // How far behind the transcript still is, judged on the NEWEST
-            // local reply — read from the STORE, not from this round's
-            // patches, so a value an earlier round already pinned counts as
-            // covered (first-write-wins).
-            //
-            // NOTHING at all (no usage, no completion time): the parse either
-            // does not hold that reply yet, or holds it UNFINALIZED — deepseek
-            // attaches both from the single `turn/end` record, which can land
-            // several frames after the reply's text. That is also the state
-            // that withholds `source_turn_id` from EVERY reply of the batch
-            // (see `idIsPlaceable`), i.e. what leaves the earlier replies'
-            // "fork from here" greyed out as "not ready yet" — so it gets the
-            // whole schedule.
-            //
-            // Usage ALONE missing is a much shorter wait: the reply's own
-            // record is on disk (it carried the completion time) and only a
-            // trailing metering record is outstanding — codex writes
-            // `token_count` as the line after the agent message. One extra
-            // look covers that, and capping it there keeps an agent that never
-            // reports usage at all (Cursor) from polling out the full schedule
-            // on every single turn.
-            //
-            // A SURPLUS — the parser split the reply, or an out-of-turn record
-            // landed — is deliberately not a retry signal: it leaves turns
-            // unnamed for the rest of the session however long we poll, and it
-            // patches the newest reply, so it stops here.
+            // Timing can be flushed after both final content and usage. Retry
+            // missing whole-task timing independently, on the same finite
+            // backoff. Only a remaining usage field gets the shorter allowance.
             const after = get().byConversationId.get(runtimeId)
             const lastLocalAssistantIndex =
               localAssistantIndices[localAssistantIndices.length - 1]
@@ -5417,14 +5580,38 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
               lastLocalAssistantIndex === undefined
                 ? undefined
                 : after?.localTurns[lastLocalAssistantIndex]
-            if (newest != null && newest.usage == null) {
+            const detailMissing = missingNativeTaskDurations(
+              after?.detail?.turns ?? []
+            )
+            const pendingNative = [...expectedNativeIds].some((id) =>
+              detailMissing.has(id)
+            )
+            const pendingLocal = assistantTurnRounds(
+              after?.localTurns ?? []
+            ).some((round) => {
+              const last = round[round.length - 1]
+              return (
+                last !== undefined &&
+                after?.localTurns[last]?.duration_ms == null
+              )
+            })
+            // Usage and timing flush independently. A completed reply with
+            // usage but no duration must still get the full bounded schedule.
+            if (
+              pendingNative ||
+              missingNativeTaskDurations(after?.localTurns ?? []).size > 0 ||
+              (pendingLocal && !windowUnverifiableForGood)
+            ) {
+              scheduleNext(attempt)
+            } else if (newest != null && newest.usage == null) {
               if (newest.completed_at == null) {
                 if (!windowUnverifiableForGood) scheduleNext(attempt)
+                else cancel()
               } else if (usageOnlyRounds < 1) {
                 usageOnlyRounds += 1
                 scheduleNext(attempt)
-              }
-            }
+              } else cancel()
+            } else cancel()
           })
           .catch(() => {
             // A failed read is transient (the transcript may be mid-write, or
@@ -5438,10 +5625,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
 
     trySync(0)
 
-    return () => {
-      cancelled = true
-      if (timerId) clearTimeout(timerId)
-    }
+    return cancel
   }
 
   const markOutOfTurnContent = (conversationId: number): void => {
@@ -5603,10 +5787,16 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       // timer immediately).
       cancelViewerDetailSync(conversationId)
       cancelCompletedTurnReconcile(conversationId)
+      turnMetadataSyncCancels.get(conversationId)?.()
       historyPageFlights.delete(conversationId)
       dispatch({ type: "REMOVE_CONVERSATION", conversationId })
     },
-    reset: () => dispatch({ type: "RESET" }),
+    reset: () => {
+      for (const cancel of turnMetadataSyncCancels.values()) cancel()
+      for (const cancel of viewerDetailSyncCancels.values()) cancel()
+      for (const cancel of completedTurnReconcileCancels.values()) cancel()
+      dispatch({ type: "RESET" })
+    },
   }
 
   return {
@@ -5732,6 +5922,7 @@ export function resetConversationRuntimeStore(): void {
   invalidateFolderConversationCache()
   for (const cancel of viewerDetailSyncCancels.values()) cancel()
   for (const cancel of completedTurnReconcileCancels.values()) cancel()
+  for (const cancel of turnMetadataSyncCancels.values()) cancel()
   viewerDetailSyncCancels.clear()
   for (const pending of pendingSessionReleases.values()) clearTimeout(pending)
   pendingSessionReleases.clear()

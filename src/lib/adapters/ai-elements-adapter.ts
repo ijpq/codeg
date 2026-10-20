@@ -300,6 +300,7 @@ export interface AdaptedMessage {
   timestamp: string
   usage?: TurnUsage | null
   duration_ms?: number | null
+  native_task_id?: string | null
   model?: string | null
   /** Wall-clock completion time as ISO string (parsed once at the Rust layer). */
   completed_at?: string | null
@@ -2743,6 +2744,7 @@ export function adaptMessageTurn(
     timestamp: turn.timestamp,
     usage: turn.usage,
     duration_ms: turn.duration_ms,
+    native_task_id: turn.native_task_id,
     model: turn.model,
     completed_at: turn.completed_at,
   }
@@ -2781,6 +2783,7 @@ interface TurnCacheEntry {
   role: MessageRole
   usage: TurnUsage | null | undefined
   duration_ms: number | null | undefined
+  native_task_id: string | null | undefined
   model: string | null | undefined
   completed_at: string | null | undefined
   source_turn_id: string | null | undefined
@@ -2854,6 +2857,7 @@ export function createMessageTurnAdapter(): MessageTurnAdapter {
             cached.role === turn.role &&
             cached.usage === turn.usage &&
             cached.duration_ms === turn.duration_ms &&
+            cached.native_task_id === turn.native_task_id &&
             cached.model === turn.model &&
             cached.completed_at === turn.completed_at &&
             cached.source_turn_id === turn.source_turn_id
@@ -2889,6 +2893,7 @@ export function createMessageTurnAdapter(): MessageTurnAdapter {
             role: turn.role,
             usage: turn.usage,
             duration_ms: turn.duration_ms,
+            native_task_id: turn.native_task_id,
             model: turn.model,
             completed_at: turn.completed_at,
             source_turn_id: turn.source_turn_id,

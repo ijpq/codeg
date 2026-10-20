@@ -193,7 +193,9 @@ export const CompletedTurnContent = memo(function CompletedTurnContent({
   )
 
   const elapsed =
-    typeof durationMs === "number" && durationMs > 0
+    typeof durationMs === "number" &&
+    Number.isFinite(durationMs) &&
+    durationMs >= 0
       ? formatElapsedLabel(durationMs, tElapsed)
       : null
 
@@ -223,7 +225,12 @@ export const CompletedTurnContent = memo(function CompletedTurnContent({
   // text-only reply went "Working…" → no header at all → "Worked for 3s" a
   // second later. The settled-no-duration label holds that slot.
   const labelNode = completed ? (
-    <span className="min-w-0 truncate tabular-nums">{label}</span>
+    <span
+      className="min-w-0 truncate tabular-nums"
+      data-completed-turn-duration-ms={elapsed ? durationMs : undefined}
+    >
+      {label}
+    </span>
   ) : (
     <Shimmer
       as="span"

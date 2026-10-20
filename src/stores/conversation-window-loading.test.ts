@@ -1252,9 +1252,19 @@ describe("syncTurnMetadata transcript-lag polling", () => {
   /** What the parser eventually writes for those same four turns. */
   const parsed: MessageTurn[] = [
     turn("turn-6", "user", 6),
-    { ...turn("turn-7", "assistant", 7), usage, completed_at: ts(7) },
+    {
+      ...turn("turn-7", "assistant", 7),
+      usage,
+      duration_ms: 168795,
+      completed_at: ts(7),
+    },
     turn("turn-8", "user", 8),
-    { ...turn("turn-9", "assistant", 9), usage, completed_at: ts(9) },
+    {
+      ...turn("turn-9", "assistant", 9),
+      usage,
+      duration_ms: 309047,
+      completed_at: ts(9),
+    },
   ]
 
   function parseWindow(upTo: number): DbConversationDetail {
@@ -1313,6 +1323,33 @@ describe("syncTurnMetadata transcript-lag polling", () => {
     expect(session()?.localTurns[3]?.source_turn_id).toBe("turn-9")
   })
 
+  it("backfills native task duration even when usage arrived first", async () => {
+    vi.useFakeTimers()
+    seedBatch()
+    const native = parseWindow(4)
+    native.turns = native.turns.map((t, i) => ({
+      ...t,
+      duration_ms: undefined,
+      native_task_id: i < 2 ? "task-a" : "task-b",
+    }))
+    const timed = {
+      ...native,
+      turns: native.turns.map((t, i) =>
+        i === 3 ? { ...t, duration_ms: 615361 } : t
+      ),
+    }
+    mockGet.mockResolvedValueOnce(native).mockResolvedValue(timed)
+    actions().syncTurnMetadata(CID)
+    await vi.advanceTimersByTimeAsync(1600)
+    expect(session()?.localTurns[3]?.usage).toEqual(usage)
+    expect(session()?.localTurns[3]?.duration_ms).toBeUndefined()
+    await vi.advanceTimersByTimeAsync(3100)
+    expect(session()?.localTurns[3]?.duration_ms).toBe(615361)
+    expect(session()?.localTurns[3]?.native_task_id).toBe("task-b")
+    await vi.advanceTimersByTimeAsync(120_000)
+    expect(mockGet).toHaveBeenCalledTimes(5) // earlier task A remains untimed, also bounded
+  })
+
   it("stops as soon as the newest reply is covered", async () => {
     vi.useFakeTimers()
     seedBatch()
@@ -1320,6 +1357,66 @@ describe("syncTurnMetadata transcript-lag polling", () => {
     actions().syncTurnMetadata(CID)
     await vi.advanceTimersByTimeAsync(40_000)
     expect(mockGet).toHaveBeenCalledTimes(1)
+  })
+
+  it("supersedes an in-flight metadata request and rejects its late result", async () => {
+    vi.useFakeTimers()
+    seedBatch()
+    let resolveOld!: (value: DbConversationDetail) => void
+    const old = new Promise<DbConversationDetail>((resolve) => {
+      resolveOld = resolve
+    })
+    const newest = parseWindow(4)
+    newest.turns = newest.turns.map((t, i) => ({
+      ...t,
+      native_task_id: i < 2 ? "task-a" : "task-b",
+    }))
+    mockGet.mockReturnValueOnce(old).mockResolvedValue(newest)
+    actions().syncTurnMetadata(CID)
+    await vi.advanceTimersByTimeAsync(1600)
+    actions().syncTurnMetadata(CID)
+    await vi.advanceTimersByTimeAsync(1600)
+    const stale = {
+      ...newest,
+      turns: newest.turns.map((t) => ({ ...t, duration_ms: 999999 })),
+    }
+    resolveOld(stale)
+    await flush()
+    expect(session()?.localTurns[1]?.duration_ms).toBe(168795)
+    expect(session()?.localTurns[3]?.duration_ms).toBe(309047)
+    await vi.advanceTimersByTimeAsync(120_000)
+    expect(mockGet).toHaveBeenCalledTimes(2)
+  })
+
+  it("bounds retries for genuinely untimed legacy records even with usage", async () => {
+    vi.useFakeTimers()
+    seedBatch()
+    const untimed = parseWindow(4)
+    untimed.turns = untimed.turns.map((t) => ({ ...t, duration_ms: undefined }))
+    mockGet.mockResolvedValue(untimed)
+    actions().syncTurnMetadata(CID)
+    await vi.advanceTimersByTimeAsync(120_000)
+    expect(mockGet).toHaveBeenCalledTimes(5)
+    expect(session()?.localTurns[3]?.duration_ms).toBeUndefined()
+  })
+
+  it("replaces a partial local estimate with the identified whole-task duration", async () => {
+    vi.useFakeTimers()
+    seedBatch({
+      localTurns: liveTurns.map((t, i) =>
+        i === 3 ? { ...t, duration_ms: 42 } : t
+      ),
+    })
+    const native = parseWindow(4)
+    native.turns = native.turns.map((t, i) => ({
+      ...t,
+      native_task_id: i < 2 ? "task-a" : "task-b",
+    }))
+    mockGet.mockResolvedValue(native)
+    actions().syncTurnMetadata(CID)
+    await vi.advanceTimersByTimeAsync(1600)
+    expect(session()?.localTurns[3]?.native_task_id).toBe("task-b")
+    expect(session()?.localTurns[3]?.duration_ms).toBe(309047)
   })
 
   it("takes ONE more look when only the usage is outstanding", async () => {

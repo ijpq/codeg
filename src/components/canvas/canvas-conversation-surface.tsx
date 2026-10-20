@@ -932,7 +932,11 @@ export function CanvasConversationSurface({
             asyncTasks={conn.asyncTasks}
             onStopAsyncTask={handleStopAsyncTask}
             remoteControl={connIsForOtherAgent ? null : conn.remoteControl}
-            onRemoteControlOff={conn.connectionId !== null && !conn.isViewer ? handleRemoteControlOff : undefined}
+            onRemoteControlOff={
+              conn.connectionId !== null && !conn.isViewer
+                ? handleRemoteControlOff
+                : undefined
+            }
             pendingPermission={conn.pendingPermission}
             pendingQuestion={conn.pendingQuestion}
             pendingAskQuestion={conn.pendingAskQuestion}
@@ -954,7 +958,9 @@ export function CanvasConversationSurface({
             onConfigOptionChange={handleSetConfigOption}
             agentType={agentType}
             availableCommands={connectionCommands ?? []}
-            promptSuggestion={connIsForOtherAgent ? null : conn.promptSuggestion}
+            promptSuggestion={
+              connIsForOtherAgent ? null : conn.promptSuggestion
+            }
             draftStorageKey={`canvas-draft:${contextKey}`}
             getSentHistory={getSentHistory}
             // The card's own connection key doubles as its composer scope: the

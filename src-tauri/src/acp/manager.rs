@@ -1270,6 +1270,7 @@ impl ConnectionManager {
             self.delegation_snapshot(),
             self.terminal_shell_config.clone(),
             None,
+            None,
         )
         .await?;
         let (outcome, elapsed) =
@@ -1424,7 +1425,7 @@ impl ConnectionManager {
         agent_type: AgentType,
         working_dir: Option<String>,
         session_id: Option<String>,
-        runtime_env: BTreeMap<String, String>,
+        mut runtime_env: BTreeMap<String, String>,
         owner_window_label: String,
         emitter: EventEmitter,
         preferred_mode_id: Option<String>,
@@ -5166,6 +5167,7 @@ impl ConnectionManager {
                             origin_cwd: Set(origin_cwd),
                             assistant_id: Set(None),
                             assistant_snapshot: Set(None),
+                            source: Set(source),
                         }
                         .insert(txn)
                         .await?
@@ -5242,18 +5244,10 @@ impl ConnectionManager {
                         last_connection_id: Set(Some(connection_id)),
                         snapshot_digest: Set(None),
                         created_at: Set(now),
-                        updated_at: Set(now),
-                        deleted_at: Set(None),
-                        pinned_at: Set(None),
-                        origin_cwd: Set(None),
-                        assistant_id: Set(None),
-                        assistant_snapshot: Set(None),
-                        source: Set(source),
                         last_merged_at: Set(None),
                         last_merge_key: Set(None),
                         merge_target_conversation_id: Set(None),
-                    };
-                    let inserted = sibling.insert(txn).await?;
+                    }.insert(txn).await?;
                     // The sibling keeps the pre-fork history under the
                     // original's name, so it keeps the original's tags too —
                     // without them the user's tagging would appear to have

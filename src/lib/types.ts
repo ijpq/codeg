@@ -324,6 +324,8 @@ export interface MessageTurn {
   timestamp: string
   usage?: TurnUsage | null
   duration_ms?: number | null
+  /** Native agent task/turn id, shared across every sub-reply of that execution. */
+  native_task_id?: string | null
   model?: string | null
   /** Wall-clock completion time (ISO). Each Rust parser sets this to its
    * own end-marker (e.g. OpenCode's `time.completed`, or just the event-log
