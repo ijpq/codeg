@@ -275,6 +275,7 @@ async fn end_to_end_uds_publish_deliverables_replaces_only_the_active_turn() {
             as Arc<dyn codeg_lib::acp::browser_tools::BrowserToolAccess>,
         Arc::new(codeg_lib::acp::computer_tools::NoComputerDesktop)
             as Arc<dyn codeg_lib::acp::computer_tools::ComputerToolAccess>,
+        Arc::new(codeg_lib::acp::result_tool::NoResultTool),
         Arc::new(DbSessionDeliverableAccess::new(
             db.conn.clone(),
             EventEmitter::Noop,
