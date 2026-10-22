@@ -724,6 +724,192 @@ async function completedConversationPage(page, api, conversation, name) {
   }
 }
 
+async function allDeliverablesPage(page, api, f, conversation, name) {
+  const otherId = await api("create_conversation", {
+    folderId: conversation.folder_id,
+    agentType: "codex",
+    title: "Isolated other deliverables",
+  })
+  execFileSync("python", [
+    "-B",
+    "scripts/seed-release-deliverables.py",
+    f.root,
+    JSON.stringify([
+      [conversation.id, 28],
+      [otherId, 1],
+    ]),
+  ])
+  const history = await api("list_conversation_deliverable_history", {
+    conversationId: conversation.id,
+    offset: 0,
+    limit: 25,
+  })
+  assert.equal(history.total, 28)
+  assert.equal(history.items.length, 25)
+  assert.equal(history.has_more, true)
+  const tabs = await api("list_opened_tabs")
+  assert.equal(
+    (
+      await api("save_opened_tabs", {
+        expectedVersion: tabs.version,
+        origin: "isolated-deliverables-verification",
+        items: [conversation.id, otherId].map((id, position) => ({
+          id: 0,
+          folder_id: conversation.folder_id,
+          conversation_id: id,
+          agent_type: "codex",
+          position,
+          is_active: position === 0,
+          is_pinned: false,
+        })),
+      })
+    ).accepted,
+    true
+  )
+  const tab = (id) =>
+    page.locator(
+      `[data-tab-id="conv-${conversation.folder_id}-codex-${id}"] [role="tab"]`
+    )
+  // Exercise the actual supported minimum width after restoring persisted UI
+  // state, without touching application data or the user's running client.
+  await page.evaluate(() =>
+    localStorage.setItem(
+      "workspace:right-sidebar",
+      JSON.stringify({ isOpen: true, width: 200 })
+    )
+  )
+  await page.reload()
+  await tab(conversation.id).waitFor({ timeout: 30_000 })
+  await tab(conversation.id).click()
+  const panel = page.locator('[class~="group/aux-panel"]:visible')
+  await panel.waitFor({ timeout: 30_000 })
+  const details = panel.getByRole("tab", {
+    name: "Session Details",
+    exact: true,
+  })
+  if (await details.isVisible()) await details.click()
+  const entry = () => panel.getByRole("button", { name: /^All deliverables/ })
+  const files = () =>
+    panel.getByRole("checkbox", { name: /^Select conversation-/ })
+  const firstName = `conversation-${conversation.id}-output-00.txt`
+  const first = () =>
+    panel.getByRole("checkbox", { name: `Select ${firstName}`, exact: true })
+  try {
+    await entry().waitFor({ timeout: 30_000 })
+    assert.equal(await entry().getAttribute("aria-expanded"), "false")
+    assert.equal(await files().count(), 0, "Collapsed history eagerly rendered")
+    await entry().click()
+    await first().waitFor({ timeout: 30_000 })
+    assert.equal(await files().count(), 25)
+    assert.equal(
+      await entry().evaluate((el) => el === document.activeElement),
+      true
+    )
+    await first().click()
+    assert.equal(
+      await panel
+        .getByRole("button", {
+          name: "Download selected files as ZIP",
+          exact: true,
+        })
+        .isEnabled(),
+      true
+    )
+    await panel.getByRole("button", { name: "Load more", exact: true }).click()
+    await panel
+      .getByRole("checkbox", {
+        name: `Select conversation-${conversation.id}-output-27.txt`,
+        exact: true,
+      })
+      .waitFor()
+    assert.equal(await files().count(), 28)
+    const geometry = await first()
+      .locator("xpath=ancestor::li[1]")
+      .evaluate((el) => ({
+        width: el.clientWidth,
+        scrollWidth: el.scrollWidth,
+        actions: [...el.querySelectorAll("button")].map((button) => {
+          const row = el.getBoundingClientRect(),
+            box = button.getBoundingClientRect()
+          return box.left >= row.left && box.right <= row.right + 1
+        }),
+      }))
+    assert.ok(
+      geometry.scrollWidth <= geometry.width + 2,
+      "Narrow deliverable row overflows"
+    )
+    assert.ok(geometry.actions.length >= 2, "Missing deliverable file actions")
+    assert.ok(geometry.actions.every(Boolean), "Narrow pane clips file actions")
+    await entry().scrollIntoViewIfNeeded()
+    await page.screenshot({
+      path: join(output, `${name}-all-deliverables.png`),
+    })
+    await tab(otherId).click()
+    if ((await entry().getAttribute("aria-expanded")) === "false")
+      await entry().click()
+    await panel
+      .getByRole("checkbox", {
+        name: `Select conversation-${otherId}-output-00.txt`,
+        exact: true,
+      })
+      .waitFor({ timeout: 30_000 })
+    assert.equal(
+      await files().count(),
+      1,
+      "Conversation switch retained another session's files"
+    )
+    await tab(conversation.id).click()
+    if ((await entry().getAttribute("aria-expanded")) === "false")
+      await entry().click()
+    await first().waitFor({ timeout: 30_000 })
+    assert.equal(
+      await first().getAttribute("aria-checked"),
+      "false",
+      "Selection leaked across sessions"
+    )
+    await page.reload()
+    await tab(conversation.id).waitFor({ timeout: 30_000 })
+    await tab(conversation.id).click()
+    await entry().waitFor({ timeout: 30_000 })
+    if ((await entry().getAttribute("aria-expanded")) === "false")
+      await entry().click()
+    await first().waitFor({ timeout: 30_000 })
+    assert.equal(await files().count(), 25)
+    report.checks.push({
+      name: `${name}-all-deliverables`,
+      passed: true,
+      persistedHistory: true,
+      total: 28,
+      pageSize: 25,
+      paging: true,
+      switchAndReload: true,
+      selectionReset: true,
+      narrowGeometry: geometry,
+    })
+    await entry().click()
+    await page
+      .getByRole("button", { name: "Toggle Auxiliary Panel", exact: true })
+      .last()
+      .click()
+  } catch (error) {
+    await page
+      .screenshot({ path: join(output, `${name}-deliverables-failure.png`) })
+      .catch(() => {})
+    await writeFile(
+      join(output, `${name}-deliverables-failure.json`),
+      JSON.stringify(
+        {
+          error: String(error),
+          body: (await page.locator("body").innerText()).slice(-12000),
+        },
+        null,
+        2
+      )
+    )
+    throw error
+  }
+}
+
 async function nativeGoalPage(page, api, f, conversation, name) {
   if (!goalModel) return
   const until = async (read, accepts, label) => {
@@ -1149,6 +1335,14 @@ try {
         saved,
         "setup"
       )
+    if (options.baseline !== "true")
+      await allDeliverablesPage(
+        app.page,
+        desktopApi(app.page),
+        f,
+        saved,
+        "setup"
+      )
     await nativeGoalPage(app.page, desktopApi(app.page), f, saved, "setup")
     await nativeDraftGoalPage(app.page, desktopApi(app.page), "setup")
     if (options.baseline !== "true") {
@@ -1229,6 +1423,8 @@ try {
     await actualPage(page, "server-web-frontend", options.baseline !== "true")
     if (options.baseline !== "true")
       await completedConversationPage(page, api, conversation, "server-web")
+    if (options.baseline !== "true")
+      await allDeliverablesPage(page, api, s, conversation, "server-web")
     await nativeGoalPage(page, api, s, conversation, "server-web")
     await nativeDraftGoalPage(page, api, "server-web")
     if (options.baseline !== "true")

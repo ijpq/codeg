@@ -118,6 +118,7 @@ const api = vi.hoisted(() => ({
   createChatConversation: vi.fn(),
   createConversation: vi.fn(),
   createChatDir: vi.fn(),
+  invalidateFolderConversationCache: vi.fn(),
 }))
 vi.mock("@/lib/api", () => api)
 

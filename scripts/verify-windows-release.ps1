@@ -3,7 +3,7 @@ param(
   [Parameter(Mandatory=$true)][string]$Repository,
   [Parameter(Mandatory=$true)][string]$Destination,
   [Parameter(Mandatory=$true)][string]$SetupManifest,
-  [string]$UpgradeFromTag = 'v0.36.0-fix1',
+  [string]$UpgradeFromTag = 'v0.38.0-fix1',
   [switch]$RequirePublished
 )
 $ErrorActionPreference = 'Stop'

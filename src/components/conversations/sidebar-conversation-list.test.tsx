@@ -1258,18 +1258,16 @@ describe("SidebarConversationList — Recent section", () => {
     })
     render(recentTree(true))
 
-    // The Folders section emits the canonical copies first (creation order:
-    // conv-12 is newer); everything after them is the Recent duplicate, in
-    // activity order (conv-11 was touched last). Each row's text is its title
-    // followed by its age label: the Folders copies keep their creation age
-    // ("4m", "5m"), while the Recent copies read their last activity ("now"
-    // for 30s ago, "3m"), so each row's position is explained by what it shows.
+    // This fork places Recent before Folders. Recent follows activity order
+    // (conv-11 was touched last), while the Folders copies follow creation
+    // order (conv-12 is newer). Each label explains its section's position:
+    // "now" / "3m" for Recent and "4m" / "5m" for Folders.
     const rows = Array.from(document.querySelectorAll("[data-conv-key]"))
     expect(rows.map((el) => el.textContent)).toEqual([
-      "conv-124m",
-      "conv-115m",
       "conv-11now",
       "conv-123m",
+      "conv-124m",
+      "conv-115m",
     ])
   })
 

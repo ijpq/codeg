@@ -121,6 +121,7 @@ describe("conversationRowTimestamp", () => {
     chatsExpanded: true,
     recentConversations: [parent],
     showRecent: true,
+    sectionOrder: ["folders", "chats", "recent"],
     conversationExpanded: new Set([1]),
     childrenByParent: new Map([[1, [kid]]]),
   }).filter((r): r is ConversationRow => r.kind === "conversation")

@@ -3608,7 +3608,12 @@ describe("a turn that ended while this client was not listening", () => {
       reattachSnapshot(handlers, "connected", 157)
       unsubscribe()
 
-      expect(read).toHaveBeenCalledWith(42, { tailTurns: 120 })
+      expect(read).toHaveBeenCalledWith(42, {
+        userTurnLimit: 25,
+        cacheMode: "reload",
+        requestGeneration: null,
+        signal: undefined,
+      })
     } finally {
       // Also stops the read's retry schedule (this suite's read rejects).
       resetConversationRuntimeStore()

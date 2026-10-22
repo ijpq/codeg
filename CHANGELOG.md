@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.39.0-fix1 — 2026-10-22
+
+- Restore the conversation-wide deliverables list in the right sidebar under
+  Session Details → All deliverables. Keep per-reply outputs available.
+- Reuse persisted deliverable history, versions, filters and batch/file actions
+  with lazy 25-item pages. Use the persisted conversation ID, reset selection on
+  switches and defer reads while the pane is hidden.
+- Fit file actions and metadata into narrow panes and preserve disclosure focus.
+- Rebase onto upstream v0.39.0 while preserving native whole-task durations,
+  Direct / Plan / Goal controls and virtualized scrolling fixes.
+- Add packaged Server Web and installed Setup regressions for the restored list,
+  paging, conversation switching, reloads and minimum-width layout, alongside
+  the existing isolated install, upgrade, resource and dependency verification.
+
+See [release notes](docs/releases/v0.39.0-fix1.md).
+
 ## 0.38.0-fix1 — 2026-10-20
 
 - Restore ordinary conversation completion labels to “Worked for …” using
