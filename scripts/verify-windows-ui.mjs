@@ -787,7 +787,10 @@ async function allDeliverablesPage(page, api, f, conversation, name) {
     name: "Session Details",
     exact: true,
   })
-  if (await details.isVisible()) await details.click()
+  await details.waitFor({ timeout: 30_000 })
+  // Reselecting the active rail tab closes the panel.
+  if ((await details.getAttribute("aria-selected")) !== "true")
+    await details.click()
   const entry = () => panel.getByRole("button", { name: /^All deliverables/ })
   const files = () =>
     panel.getByRole("checkbox", { name: /^Select conversation-/ })
