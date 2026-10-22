@@ -890,10 +890,7 @@ async function allDeliverablesPage(page, api, f, conversation, name) {
       narrowGeometry: geometry,
     })
     await entry().click()
-    await page
-      .getByRole("button", { name: "Toggle Auxiliary Panel", exact: true })
-      .last()
-      .click()
+    await details.click()
   } catch (error) {
     await page
       .screenshot({ path: join(output, `${name}-deliverables-failure.png`) })
