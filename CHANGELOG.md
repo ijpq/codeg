@@ -10,6 +10,8 @@
 - Fit file actions and metadata into narrow panes and preserve disclosure focus.
 - Rebase onto upstream v0.39.0 while preserving native whole-task durations,
   Direct / Plan / Goal controls and virtualized scrolling fixes.
+- Register two independent same-day migrations in name order for the upstream
+  schema-version checks; preserve every released migration name and SQL file.
 - Add packaged Server Web and installed Setup regressions for the restored list,
   paging, conversation switching, reloads and minimum-width layout, alongside
   the existing isolated install, upgrade, resource and dependency verification.
