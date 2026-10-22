@@ -42654,7 +42654,10 @@ mod tests {
             .await;
             lp.run_turn("one", "first").await;
             lp.open_turn("two", "working, ").await;
-            lp.cmd_tx.send(ConnectionCommand::Cancel).await.unwrap();
+            lp.cmd_tx
+                .send(ConnectionCommand::Cancel { reply: None })
+                .await
+                .unwrap();
             lp.until("cancelled", |e| {
                 matches!(e, AcpEvent::TurnComplete { stop_reason, .. } if stop_reason == "cancelled")
             })
