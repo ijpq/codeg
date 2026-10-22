@@ -27,16 +27,18 @@ import {
 } from "@/lib/api"
 import { toAbsoluteFilePath } from "@/lib/file-path-display"
 import type { ConversationDeliverable } from "@/lib/types"
-import { copyTextToClipboard } from "@/lib/utils"
+import { cn, copyTextToClipboard } from "@/lib/utils"
 
 type Action = "download" | "open" | "copyFile" | "copyPath" | "reveal"
 
 export function DeliverableFileActions({
   conversationId,
   item,
+  className,
 }: {
   conversationId: number
   item: ConversationDeliverable
+  className?: string
 }) {
   const t = useTranslations("Folder.chat.conversationDeliverables")
   const capabilities = useDeliverableCapabilities()
@@ -113,7 +115,7 @@ export function DeliverableFileActions({
 
   return (
     <TooltipProvider>
-      <div className="flex shrink-0 items-center gap-0.5">
+      <div className={cn("flex shrink-0 items-center gap-0.5", className)}>
         {actions.map((action) => {
           if (!action.visible) return null
           const Icon = pending === action.id ? Loader2 : action.icon

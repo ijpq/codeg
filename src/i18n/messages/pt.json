@@ -4385,6 +4385,7 @@
       "conversationDeliverables": {
         "collapsedSummary": "Entregáveis {count}",
         "historyTitle": "Histórico de entregáveis",
+        "allTitle": "Todos os entregáveis",
         "loadingHistory": "Carregando histórico de entregáveis…",
         "retry": "Tentar novamente",
         "versions": "{count} versões",

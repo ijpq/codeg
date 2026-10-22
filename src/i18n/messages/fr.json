@@ -4385,6 +4385,7 @@
       "conversationDeliverables": {
         "collapsedSummary": "Livrables {count}",
         "historyTitle": "Historique des livrables",
+        "allTitle": "Tous les livrables",
         "loadingHistory": "Chargement de l’historique…",
         "retry": "Réessayer",
         "versions": "{count} versions",

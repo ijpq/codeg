@@ -111,6 +111,32 @@ describe("ConversationDeliverablesPanel", () => {
     expect(mocks.listConversationDeliverableHistory).not.toHaveBeenCalled()
   })
 
+  it("defers expanded history while its sidebar tab is hidden and refreshes when shown", async () => {
+    mockHistory([deliverable("report", "报告.pdf")])
+    const panel = (active: boolean) => (
+      <ConversationDeliverablesPanel
+        conversationId={1}
+        expanded
+        onToggle={vi.fn()}
+        presentation="sidebar"
+        active={active}
+      />
+    )
+    const { rerender } = render(panel(false))
+    expect(screen.getByRole("button", { name: "allTitle" })).toBeInTheDocument()
+    expect(mocks.listConversationDeliverableHistory).not.toHaveBeenCalled()
+
+    rerender(panel(true))
+    expect(await screen.findByText("报告.pdf")).toBeInTheDocument()
+    expect(mocks.listConversationDeliverableHistory).toHaveBeenCalledTimes(1)
+
+    rerender(panel(false))
+    rerender(panel(true))
+    await waitFor(() =>
+      expect(mocks.listConversationDeliverableHistory).toHaveBeenCalledTimes(2)
+    )
+  })
+
   it("loads only the persisted, server-filtered history page when expanded", async () => {
     mockHistory([
       deliverable("docx", "报告.docx"),

@@ -4385,6 +4385,7 @@
       "conversationDeliverables": {
         "collapsedSummary": "مخرجات {count}",
         "historyTitle": "سجل المخرجات",
+        "allTitle": "جميع المخرجات",
         "loadingHistory": "جارٍ تحميل سجل المخرجات…",
         "retry": "إعادة المحاولة",
         "versions": "{count} إصدارات",

@@ -4385,6 +4385,7 @@
       "conversationDeliverables": {
         "collapsedSummary": "Deliverables {count}",
         "historyTitle": "Deliverable history",
+        "allTitle": "All deliverables",
         "loadingHistory": "Loading deliverable history…",
         "retry": "Retry",
         "versions": "{count} versions",

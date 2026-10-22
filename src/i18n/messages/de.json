@@ -4385,6 +4385,7 @@
       "conversationDeliverables": {
         "collapsedSummary": "Ergebnisse {count}",
         "historyTitle": "Lieferverlauf",
+        "allTitle": "Alle Ergebnisse",
         "loadingHistory": "Lieferverlauf wird geladen…",
         "retry": "Erneut versuchen",
         "versions": "{count} Versionen",

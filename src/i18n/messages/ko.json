@@ -4385,6 +4385,7 @@
       "conversationDeliverables": {
         "collapsedSummary": "결과물 {count}",
         "historyTitle": "결과물 기록",
+        "allTitle": "모든 결과물",
         "loadingHistory": "결과물 기록 불러오는 중…",
         "retry": "다시 시도",
         "versions": "버전 {count}개",

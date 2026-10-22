@@ -4385,6 +4385,7 @@
       "conversationDeliverables": {
         "collapsedSummary": "产物 {count}",
         "historyTitle": "历史产物",
+        "allTitle": "全部产物",
         "loadingHistory": "正在加载历史产物…",
         "retry": "重试",
         "versions": "{count} 个版本",

@@ -46,11 +46,14 @@ import type {
   ConversationDeliverablesChanged,
 } from "@/lib/types"
 import { CONVERSATION_DELIVERABLES_CHANGED_EVENT } from "@/lib/types"
+import { cn } from "@/lib/utils"
 
 interface ConversationDeliverablesPanelProps {
   conversationId: number
   expanded: boolean
   onToggle: (next: boolean) => void
+  presentation?: "overlay" | "sidebar"
+  active?: boolean
 }
 
 const HISTORY_PAGE_SIZE = 25
@@ -76,8 +79,11 @@ export const ConversationDeliverablesPanel = memo(
     conversationId,
     expanded,
     onToggle,
+    presentation = "overlay",
+    active = true,
   }: ConversationDeliverablesPanelProps) {
     const t = useTranslations("Folder.chat.conversationDeliverables")
+    const sidebar = presentation === "sidebar"
     const capabilities = useDeliverableCapabilities()
     const [typeFilter, setTypeFilter] = useState("all")
     const [sourceFilter, setSourceFilter] = useState("all")
@@ -150,9 +156,9 @@ export const ConversationDeliverablesPanel = memo(
     }, [conversationId])
 
     useEffect(() => {
-      if (!expanded) return
+      if (!expanded || !active) return
       void loadPage(0, false)
-    }, [expanded, loadPage, reloadVersion])
+    }, [active, expanded, loadPage, reloadVersion])
 
     useEffect(() => {
       let disposed = false
@@ -226,7 +232,48 @@ export const ConversationDeliverablesPanel = memo(
       )
     }
 
+    const sidebarHeading = sidebar ? (
+      <h3>
+        <button
+          type="button"
+          aria-expanded={expanded}
+          onClick={() => onToggle(!expanded)}
+          className="group flex h-7 w-full min-w-0 items-center gap-2 rounded-md text-start text-xs outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50"
+        >
+          <span aria-hidden="true" className="flex w-7 shrink-0 justify-center">
+            <ChevronDownIcon
+              className={cn(
+                "size-3.5 text-muted-foreground",
+                !expanded && "-rotate-90 rtl:rotate-90"
+              )}
+            />
+          </span>
+          <PackageCheck
+            aria-hidden="true"
+            className="size-3.5 shrink-0 text-muted-foreground"
+          />
+          <span className="min-w-0 truncate font-semibold">
+            {t("allTitle")}
+          </span>
+          {loaded && (
+            <span className="shrink-0 text-2xs text-muted-foreground tabular-nums">
+              {total}
+            </span>
+          )}
+        </button>
+      </h3>
+    ) : null
+
     if (!expanded) {
+      // Keep the same frame and heading mounted so toggling retains focus.
+      if (sidebar)
+        return (
+          <div className="pointer-events-none flex w-full min-w-0">
+            <div className="pointer-events-auto w-full min-w-0 overflow-hidden">
+              {sidebarHeading}
+            </div>
+          </div>
+        )
       return (
         <CollapsedOverlayChip
           icon={<PackageCheck className="size-3.5" />}
@@ -333,28 +380,42 @@ export const ConversationDeliverablesPanel = memo(
     ]
 
     return (
-      <div className="pointer-events-none flex w-[29rem] max-w-[calc(100vw-2rem)]">
-        <div className="pointer-events-auto w-full overflow-hidden rounded-xl border bg-card/90 shadow-lg backdrop-blur">
-          <div className="flex items-center justify-between border-b px-3 py-2">
-            <div className="flex min-w-0 items-center gap-2">
-              <PackageCheck className="size-4 text-muted-foreground" />
-              <span className="truncate text-sm font-medium">
-                {t("historyTitle")}
-              </span>
-              <Badge variant="secondary" className="h-5">
-                {total}
-              </Badge>
+      <div
+        className={cn(
+          "pointer-events-none flex",
+          sidebar ? "w-full min-w-0" : "w-[29rem] max-w-[calc(100vw-2rem)]"
+        )}
+      >
+        <div
+          className={cn(
+            "pointer-events-auto w-full min-w-0 overflow-hidden",
+            !sidebar && "rounded-xl border bg-card/90 shadow-lg backdrop-blur"
+          )}
+        >
+          {sidebar ? (
+            sidebarHeading
+          ) : (
+            <div className="flex items-center justify-between border-b px-3 py-2">
+              <div className="flex min-w-0 items-center gap-2">
+                <PackageCheck className="size-4 text-muted-foreground" />
+                <span className="truncate text-sm font-medium">
+                  {t("historyTitle")}
+                </span>
+                <Badge variant="secondary" className="h-5">
+                  {total}
+                </Badge>
+              </div>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-xs"
+                aria-label={t("collapse")}
+                onClick={() => onToggle(false)}
+              >
+                <ChevronDownIcon className="size-4" />
+              </Button>
             </div>
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon-xs"
-              aria-label={t("collapse")}
-              onClick={() => onToggle(false)}
-            >
-              <ChevronDownIcon className="size-4" />
-            </Button>
-          </div>
+          )}
 
           <div className="flex flex-wrap gap-1.5 border-b p-2">
             <Select value={typeFilter} onValueChange={setTypeFilter}>
@@ -430,7 +491,12 @@ export const ConversationDeliverablesPanel = memo(
             </Select>
           </div>
 
-          <div className="flex items-center gap-1 border-b px-2 py-1.5">
+          <div
+            className={cn(
+              "flex items-center gap-1 border-b px-2 py-1.5",
+              sidebar && "flex-wrap"
+            )}
+          >
             <Checkbox
               checked={allFilteredSelected}
               onCheckedChange={(value) => toggleAll(value === true)}
@@ -497,7 +563,12 @@ export const ConversationDeliverablesPanel = memo(
                     title={item.description ?? item.title}
                     className="rounded-md border border-border/70 px-2 py-1.5"
                   >
-                    <div className="flex items-center gap-2">
+                    <div
+                      className={cn(
+                        "flex items-center gap-2",
+                        sidebar && "flex-wrap"
+                      )}
+                    >
                       <Checkbox
                         checked={selected.has(item.id)}
                         onCheckedChange={(checked) =>
@@ -527,7 +598,10 @@ export const ConversationDeliverablesPanel = memo(
                         </div>
                         <div
                           data-testid={`deliverable-metadata-${item.id}`}
-                          className="flex min-w-0 items-center gap-1 whitespace-nowrap text-[10px] text-muted-foreground"
+                          className={cn(
+                            "flex min-w-0 items-center gap-1 whitespace-nowrap text-[10px] text-muted-foreground",
+                            sidebar && "flex-wrap"
+                          )}
                         >
                           <span className="shrink-0">
                             {(item.extension ?? item.kind).toUpperCase()}
@@ -552,6 +626,11 @@ export const ConversationDeliverablesPanel = memo(
                       <DeliverableFileActions
                         conversationId={conversationId}
                         item={item}
+                        className={
+                          sidebar
+                            ? "ms-auto w-full flex-wrap justify-end"
+                            : undefined
+                        }
                       />
                     </div>
                     {versions.length > 1 ? (
