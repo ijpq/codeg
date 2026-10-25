@@ -13,6 +13,7 @@ import {
 } from "@/lib/types"
 import { getTransport } from "@/lib/transport"
 import { getSavedPrefsForConnect } from "@/lib/selector-prefs-storage"
+import { toErrorMessage } from "@/lib/app-error"
 
 export function useBusinessConversation(
   conversationId: number | null,
@@ -98,13 +99,27 @@ export function useBusinessConversation(
       setError(null)
       ++generation.current
       try {
+        // Task edits and native rollover can advance the revision between
+        // background polls. Refresh once, but never adopt another client's
+        // main-agent intent just to make this older click pass its CAS.
+        const observed = state?.conversationId === cid ? state : null
+        const latest = await getBusinessState(cid)
+        if (activeId.current === cid) accept(latest)
+        if (
+          observed?.activeAgent !== latest?.activeAgent ||
+          observed?.pendingRequestId !== latest?.pendingRequestId ||
+          (observed && latest && latest.revision < observed.revision)
+        ) {
+          throw new Error(
+            "Conversation changed; refresh its agent state and retry"
+          )
+        }
         const preferences = getSavedPrefsForConnect(targetAgent)
         const next = await switchBusinessAgent({
           conversationId: cid,
           requestId: crypto.randomUUID(),
           targetAgent,
-          expectedRevision:
-            state?.conversationId === cid ? state.revision : null,
+          expectedRevision: latest?.revision ?? null,
           preferredModeId: preferences.modeId,
           preferredConfigValues: preferences.configValues ?? {},
         })
@@ -113,7 +128,7 @@ export function useBusinessConversation(
         if (activeId.current === cid)
           setError({
             conversationId: cid,
-            message: e instanceof Error ? e.message : String(e),
+            message: toErrorMessage(e),
           })
         await refresh().catch(() => {})
       } finally {

@@ -3,6 +3,7 @@
 import { useState } from "react"
 import { useTranslations } from "next-intl"
 import { getAgentLabel } from "@/lib/custom-agents"
+import { toErrorMessage } from "@/lib/app-error"
 import type { AgentType } from "@/lib/types"
 import type { useBusinessConversation } from "@/hooks/use-business-conversation"
 import {
@@ -53,7 +54,7 @@ export function BusinessAgentControl({
       )
       setOpen(true)
     } catch (e) {
-      setEditorError(String(e))
+      setEditorError(toErrorMessage(e))
     }
   }
   const save = async () => {
@@ -85,7 +86,7 @@ export function BusinessAgentControl({
       await business.refresh()
       setOpen(false)
     } catch (e) {
-      setEditorError(String(e))
+      setEditorError(toErrorMessage(e))
       await business.refresh().catch(() => {})
     } finally {
       setSaving(false)

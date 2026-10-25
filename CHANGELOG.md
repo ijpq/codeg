@@ -9,6 +9,8 @@
   for retries, concurrent clients and restart recovery.
 - Claim the SQLite writer before checking switch receipts, so concurrent history
   backfill cannot leave a handoff on a stale read snapshot or change retry clocks.
+- Refresh the revision once before handoff admission without replacing another
+  client's agent intent; render structured rejection details and retain CAS.
 - Persist one paged business history, including native task durations, deferred
   attachment sources and deliverables. Preserve rollover identities and existing
   branch creation, restoration and return behavior.

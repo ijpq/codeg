@@ -89,7 +89,7 @@ describe("business agent handoff client", () => {
       pending = result.current.switchAgent("claude_code")
       void result.current.switchAgent("claude_code")
     })
-    expect(api.switch).toHaveBeenCalledTimes(1)
+    await waitFor(() => expect(api.switch).toHaveBeenCalledTimes(1))
     expect(result.current.pending).toBe(true)
     expect(result.current.state?.activeAgent).toBe("codex")
     await act(async () => {
@@ -140,6 +140,67 @@ describe("business agent handoff client", () => {
     })
     expect(result.current.state?.revision).toBe(5)
     expect(result.current.state?.activeAgent).toBe("claude_code")
+  })
+  it("refreshes a stale task revision before submitting the same handoff intent", async () => {
+    api.get.mockResolvedValue(state(1, 3, "claude_code"))
+    api.switch.mockResolvedValue(state(1, 5, "codex"))
+    const { result } = renderHook(() => useBusinessConversation(1))
+    await waitFor(() => expect(result.current.state?.revision).toBe(3))
+    // Another client edits shared task state before the next background poll.
+    api.get.mockResolvedValue(state(1, 4, "claude_code"))
+    await act(async () => {
+      await result.current.switchAgent("codex")
+    })
+    expect(api.switch).toHaveBeenCalledWith(
+      expect.objectContaining({ targetAgent: "codex", expectedRevision: 4 })
+    )
+    expect(result.current.error).toBeNull()
+  })
+  it("does not overwrite another client's switch discovered before admission", async () => {
+    const { result } = renderHook(() => useBusinessConversation(1))
+    await waitFor(() => expect(result.current.state?.revision).toBe(0))
+    api.get.mockResolvedValue({
+      ...state(1, 1),
+      pendingRequestId: "other-client",
+      pendingAgent: "claude_code",
+      switchStatus: "queued",
+    })
+    api.switch.mockResolvedValue(state(1, 2, "claude_code"))
+    await act(async () => {
+      await result.current.switchAgent("claude_code")
+    })
+    expect(api.switch).not.toHaveBeenCalled()
+    expect(result.current.state?.pendingRequestId).toBe("other-client")
+    expect(result.current.error).toContain("changed")
+  })
+  it("shows structured rejection detail without retrying an unaccepted switch", async () => {
+    api.switch.mockRejectedValue({
+      code: "task_execution_failed",
+      message: "Task execution failed",
+      detail: "Conversation changed; refresh its agent state and retry",
+    })
+    const { result } = renderHook(() => useBusinessConversation(1))
+    await waitFor(() => expect(result.current.state).not.toBeNull())
+    await act(async () => {
+      await result.current.switchAgent("claude_code")
+    })
+    expect(api.switch).toHaveBeenCalledTimes(1)
+    expect(result.current.error).toBe(
+      "Conversation changed; refresh its agent state and retry"
+    )
+    expect(result.current.state?.activeAgent).toBe("codex")
+  })
+  it("does not submit from an old snapshot when the admission read fails", async () => {
+    const { result } = renderHook(() => useBusinessConversation(1))
+    await waitFor(() => expect(result.current.state).not.toBeNull())
+    api.get.mockRejectedValueOnce(new Error("Server unavailable"))
+    await act(async () => {
+      await result.current.switchAgent("claude_code")
+    })
+    expect(api.switch).not.toHaveBeenCalled()
+    expect(result.current.error).toBe("Server unavailable")
+    expect(result.current.state?.activeAgent).toBe("codex")
+    expect(result.current.pending).toBe(false)
   })
   it("preserves the original engine and provides a retry error after preparation fails", async () => {
     api.switch.mockRejectedValue(

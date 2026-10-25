@@ -61,6 +61,18 @@ export async function businessAgentPage({
   })
   const state = () =>
     api("get_business_conversation_state", { conversationId: cid })
+  const switchResponses = []
+  const recordSwitch = async (response) => {
+    if (!response.url().endsWith("/api/switch_business_agent")) return
+    // Only this isolated fixture's synthetic switch parameters and result;
+    // never record transport headers or native credentials.
+    switchResponses.push({
+      request: response.request().postDataJSON(),
+      status: response.status(),
+      body: await response.json().catch(() => null),
+    })
+  }
+  page.on("response", recordSwitch)
   const history = async () => {
     try {
       return await api("get_folder_conversation", {
@@ -355,6 +367,11 @@ export async function businessAgentPage({
       JSON.stringify(
         {
           error: String(error.stack ?? error),
+          switchResponses,
+          visibleErrors: await page
+            .locator("[data-business-agent-control] [role=alert]")
+            .allTextContents()
+            .catch(() => []),
           state: await state().catch(() => null),
           // Every value in this fixture is synthetic; never store native auth.
           history: await history().catch(() => null),
@@ -367,6 +384,7 @@ export async function businessAgentPage({
     )
     throw error
   } finally {
+    page.off("response", recordSwitch)
     goalModel.business(false)
   }
 }
