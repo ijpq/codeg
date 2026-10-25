@@ -35,6 +35,11 @@ import {
   type FileWorkspaceTab,
 } from "@/contexts/workspace-context"
 import * as api from "@/lib/api"
+import { useOfficeDeliveryPreview } from "@/hooks/use-office-delivery-preview"
+import type { OfficeDeliveryPreview } from "@/lib/types"
+vi.mock("@/hooks/use-office-delivery-preview", () => ({
+  useOfficeDeliveryPreview: vi.fn(),
+}))
 import {
   claimSurfaceCreation,
   forgetSurfaceCreation,
@@ -2328,302 +2333,81 @@ describe("applyExternalReload git base does not stale-write after close+reopen",
   })
 })
 
-describe("WorkspaceProvider office auto-preview", () => {
+describe("WorkspaceProvider settled Office review", () => {
   beforeEach(() => {
     workspaceStoreMock.reset()
-    // Preference defaults ON; drop any "false" a prior test left behind.
     localStorage.removeItem("workspace:office-auto-preview")
-    // Reset first: call history is what the "one listing per parent" tests
-    // assert on, and an unconsumed `…Once` from a prior test would otherwise
-    // answer the next one's first lookup.
-    vi.mocked(api.listDirectoryWithFiles).mockReset()
-    vi.mocked(api.listDirectoryWithFiles).mockImplementation(async (root) =>
-      ["report.pptx", "deck.pptx", "report.docx"].map((name) => ({
-        name,
-        path: `${root}/${name}`,
-        isDir: false,
-        hasChildren: false,
-        size: 100,
-      }))
-    )
+    vi.mocked(useOfficeDeliveryPreview).mockClear()
   })
 
-  it("auto-opens an office file's preview when the watcher reports it, with no aux panel involved", async () => {
+  it("workspace file changes never open previews, including Office final-looking names", async () => {
     renderWorkspace()
-    expect(screen.getByTestId("file-tab-count")).toHaveTextContent("0")
-    expect(screen.getByTestId("active-pane")).toHaveTextContent("conversation")
-
-    // The provider — not the (closed-by-default) file-tree aux panel — owns
-    // this subscription, so a watcher envelope surfaces the preview directly.
-    await act(async () => {
-      workspaceStoreMock.emitEnvelope(["report.pptx"])
-    })
-
-    expect(screen.getByTestId("file-tab-count")).toHaveTextContent("1")
-    expect(screen.getByTestId("active-file-tab")).toHaveTextContent(
-      fileTabId("/repo/report.pptx")
-    )
-    expect(screen.getByTestId("active-pane")).toHaveTextContent("files")
-    expect(screen.getByTestId("mode")).toHaveTextContent("fusion")
-  })
-
-  it("ignores non-office changed paths", async () => {
-    renderWorkspace()
-
-    await act(async () => {
-      workspaceStoreMock.emitEnvelope(["notes.txt", "src/app.ts"])
-    })
-
-    expect(screen.getByTestId("file-tab-count")).toHaveTextContent("0")
-    expect(screen.getByTestId("active-pane")).toHaveTextContent("conversation")
-  })
-
-  it("ignores hidden office files and office files inside hidden directories", async () => {
-    renderWorkspace()
-
-    // Dot-prefixed names are machine-owned byproducts (LibreOffice lock file,
-    // AppleDouble sidecar, a doc parked under a scratch dir) — auto-preview
-    // must neither open a tab for them nor start their watch.
-    await act(async () => {
-      workspaceStoreMock.emitEnvelope([
-        ".~lock.report.docx#",
-        "._report.docx",
-        "docs/.draft.xlsx",
-        ".git/report.docx",
-        "build/.tmp/deck.pptx",
-      ])
-    })
-
-    expect(screen.getByTestId("file-tab-count")).toHaveTextContent("0")
-    expect(screen.getByTestId("active-pane")).toHaveTextContent("conversation")
-  })
-
-  it("ignores the burst of `~$` owner files WPS drops when documents are opened", async () => {
-    renderWorkspace()
-
-    // The reported failure: opening a folder of documents in WPS (or Word)
-    // writes one `~$`-prefixed owner file per document, all at once and all
-    // carrying a real office extension. Auto-preview used to answer with a tab
-    // and an `officecli watch` process for every one of them.
-    await act(async () => {
-      workspaceStoreMock.emitEnvelope([
-        "~$report.docx",
-        "~$budget.xlsx",
-        "~$deck.pptx",
-        "docs/~$minutes.docx",
-        // Word truncates long names to fit the prefix, so the tail need not
-        // match any document sitting next to it.
-        "~$cument.docx",
-      ])
-    })
-
-    expect(screen.getByTestId("file-tab-count")).toHaveTextContent("0")
-    expect(screen.getByTestId("active-pane")).toHaveTextContent("conversation")
-  })
-
-  it("still auto-opens the document whose owner file arrives with it", async () => {
-    renderWorkspace()
-
-    // Opening `report.docx` externally touches the document itself as well as
-    // its owner file. The owner file is the byproduct; the document is still a
-    // legitimate preview, so the filter must not swallow the pair.
-    await act(async () => {
-      workspaceStoreMock.emitEnvelope(["~$report.docx", "report.docx"])
-    })
-
-    expect(screen.getByTestId("file-tab-count")).toHaveTextContent("1")
-    expect(screen.getByTestId("active-file-tab")).toHaveTextContent(
-      fileTabId("/repo/report.docx")
-    )
-  })
-
-  it("still auto-opens a visible office file reported alongside hidden ones", async () => {
-    renderWorkspace()
-
-    await act(async () => {
-      workspaceStoreMock.emitEnvelope(["._report.docx", "report.docx"])
-    })
-
-    expect(screen.getByTestId("file-tab-count")).toHaveTextContent("1")
-    expect(screen.getByTestId("active-file-tab")).toHaveTextContent(
-      fileTabId("/repo/report.docx")
-    )
-  })
-
-  it("opens each office file once, even when later envelopes re-report it", async () => {
-    renderWorkspace()
-
-    await act(async () => {
-      workspaceStoreMock.emitEnvelope(["deck.pptx"])
-    })
-    await act(async () => {
-      workspaceStoreMock.emitEnvelope(["deck.pptx"])
-    })
-
-    expect(screen.getByTestId("file-tab-count")).toHaveTextContent("1")
-  })
-
-  it("does not open a removed document from a changed_paths envelope", async () => {
-    vi.mocked(api.listDirectoryWithFiles).mockResolvedValue([])
-    renderWorkspace()
-
-    await act(async () => {
-      workspaceStoreMock.emitEnvelope(["report.docx"])
-    })
-
-    expect(screen.getByTestId("file-tab-count")).toHaveTextContent("0")
-    expect(screen.getByTestId("active-pane")).toHaveTextContent("conversation")
-  })
-
-  it("does not open documents from a removed parent directory", async () => {
-    vi.mocked(api.listDirectoryWithFiles).mockRejectedValue(
-      new Error("Path is not a directory")
-    )
-    renderWorkspace()
-
-    await act(async () => {
-      workspaceStoreMock.emitEnvelope(["scratch/report.docx"])
-    })
-
-    expect(screen.getByTestId("file-tab-count")).toHaveTextContent("0")
-  })
-
-  it("keeps a dismissed preview closed after switching folders and back", async () => {
-    renderWorkspace()
-    await act(async () => {
-      workspaceStoreMock.emitEnvelope(["report.docx"])
-    })
-    act(() => screen.getByRole("button", { name: "Close active" }).click())
-    act(() => foldersMock.setActiveFolderId(2))
-    act(() => foldersMock.setActiveFolderId(1))
-    await act(async () => {
-      workspaceStoreMock.emitEnvelope(["report.docx"])
-    })
-
-    expect(screen.getByTestId("file-tab-count")).toHaveTextContent("0")
-  })
-
-  it("can open a document recreated after an earlier removal event", async () => {
-    vi.mocked(api.listDirectoryWithFiles).mockResolvedValueOnce([])
-    renderWorkspace()
-    await act(async () => {
-      workspaceStoreMock.emitEnvelope(["report.docx"])
-    })
-    expect(screen.getByTestId("file-tab-count")).toHaveTextContent("0")
-
-    await act(async () => {
-      workspaceStoreMock.emitEnvelope(["report.docx"])
-    })
-    expect(screen.getByTestId("file-tab-count")).toHaveTextContent("1")
-  })
-
-  it("does not mistake a directory with an Office suffix for a document", async () => {
-    vi.mocked(api.listDirectoryWithFiles).mockResolvedValue([
-      {
-        name: "report.docx",
-        path: "/repo/report.docx",
-        isDir: true,
-        hasChildren: true,
-        size: null,
-      },
-    ])
-    renderWorkspace()
-    await act(async () => {
-      workspaceStoreMock.emitEnvelope(["report.docx"])
-    })
-    expect(screen.getByTestId("file-tab-count")).toHaveTextContent("0")
-  })
-
-  it("discards a pending preview when its workspace is no longer active", async () => {
-    let finish!: (
-      entries: Awaited<ReturnType<typeof api.listDirectoryWithFiles>>
-    ) => void
-    vi.mocked(api.listDirectoryWithFiles).mockReturnValueOnce(
-      new Promise((resolve) => {
-        finish = resolve
-      })
-    )
-    renderWorkspace()
-    await act(async () => {
-      workspaceStoreMock.emitEnvelope(["report.docx"])
-    })
-    act(() => foldersMock.setActiveFolderId(2))
-    await act(async () => {
-      finish([
-        {
-          name: "report.docx",
-          path: "/repo/report.docx",
-          isDir: false,
-          hasChildren: false,
-          size: 100,
-        },
-      ])
-    })
-    expect(screen.getByTestId("file-tab-count")).toHaveTextContent("0")
-  })
-
-  it("lists a parent once per burst and never re-lists a decided path", async () => {
-    // The existence probe sits on the watcher's hot path, and the backing
-    // command stats every sibling and ships the whole listing to the renderer
-    // (over HTTP in server/remote mode). Both bounds below are what keep that
-    // affordable: one lookup per parent per envelope, and none at all once a
-    // path has been decided.
-    renderWorkspace()
-
     await act(async () => {
       workspaceStoreMock.emitEnvelope([
         "report.docx",
-        "deck.pptx",
-        "report.pptx",
+        "最终定稿.pptx",
+        "budget.xlsx",
       ])
     })
-
-    expect(screen.getByTestId("file-tab-count")).toHaveTextContent("3")
-    expect(api.listDirectoryWithFiles).toHaveBeenCalledTimes(1)
-    expect(api.listDirectoryWithFiles).toHaveBeenCalledWith("/repo")
-
-    await act(async () => {
-      workspaceStoreMock.emitEnvelope(["report.docx", "deck.pptx"])
-    })
-
-    expect(api.listDirectoryWithFiles).toHaveBeenCalledTimes(1)
+    expect(screen.getByTestId("file-tab-count")).toHaveTextContent("0")
+    expect(screen.getByTestId("active-pane")).toHaveTextContent("conversation")
   })
 
-  it("does not resurface a document the user opened by hand and closed", async () => {
+  it("a settled delivery opens its actual immutable review copy", async () => {
     renderWorkspace()
+    const open = vi.mocked(useOfficeDeliveryPreview).mock.calls[0][1]
+    const preview = {
+      conversation_id: 12,
+      turn_run_id: "run-final",
+      run_sequence: 1,
+      deliverable_id: "file-final",
+      file_name: "report.docx",
+      original_path: "/repo/report.docx",
+      snapshot_path: "/private/review/report.docx",
+      sha256: "hash",
+      status: "ready",
+      error: null,
+      completed_at: "2026-10-26T00:00:00Z",
+    } satisfies OfficeDeliveryPreview
+    act(() => open(preview))
+    expect(screen.getByTestId("file-tab-count")).toHaveTextContent("1")
+    expect(screen.getByTestId("active-file-tab")).toHaveTextContent(
+      fileTabId("/repo/report.docx")
+    )
+    expect(screen.getByTestId("active-pane")).toHaveTextContent("files")
+    // Workspace writes cannot replace the settled metadata or steal selection.
+    await act(async () => {
+      workspaceStoreMock.emitEnvelope(["report.docx", "other.pptx"])
+    })
+    expect(screen.getByTestId("file-tab-count")).toHaveTextContent("1")
+    act(() =>
+      open({
+        ...preview,
+        turn_run_id: "run-next",
+        run_sequence: 2,
+        snapshot_path: "/private/next/report.docx",
+      })
+    )
+    expect(screen.getByTestId("file-tab-count")).toHaveTextContent("1")
+  })
 
+  it("keeps manual Office open and close available", async () => {
+    renderWorkspace()
     await act(async () => {
       screen.getByRole("button", { name: "Open office by hand" }).click()
     })
     expect(screen.getByTestId("file-tab-count")).toHaveTextContent("1")
-
-    // The agent writes while the hand-opened tab is up: nothing to open, and
-    // no existence probe either — the open tab already answers the question.
-    await act(async () => {
-      workspaceStoreMock.emitEnvelope(["report.docx"])
-    })
-    expect(api.listDirectoryWithFiles).not.toHaveBeenCalled()
-
     act(() => screen.getByRole("button", { name: "Close active" }).click())
-    expect(screen.getByTestId("file-tab-count")).toHaveTextContent("0")
-
-    // A document the user has already seen and dismissed stays dismissed.
     await act(async () => {
       workspaceStoreMock.emitEnvelope(["report.docx"])
     })
     expect(screen.getByTestId("file-tab-count")).toHaveTextContent("0")
   })
 
-  it("does not auto-open when the preference is disabled", async () => {
+  it("reuses the existing preference to gate completion events", () => {
     localStorage.setItem("workspace:office-auto-preview", "false")
     renderWorkspace()
-
-    await act(async () => {
-      workspaceStoreMock.emitEnvelope(["report.pptx"])
-    })
-
-    expect(screen.getByTestId("file-tab-count")).toHaveTextContent("0")
-    expect(screen.getByTestId("active-pane")).toHaveTextContent("conversation")
+    expect(vi.mocked(useOfficeDeliveryPreview).mock.calls[0][0]).toBe(false)
   })
 })
 

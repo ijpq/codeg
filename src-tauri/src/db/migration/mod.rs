@@ -25,7 +25,11 @@ mod m20260612_000001_conversation_folder_kind;
 mod m20260621_000001_automation;
 mod m20260630_000001_conversation_parent_id_index;
 mod m20260703_000001_chat_channel_thread_binding;
+mod m20260717_000001_conversation_turn_artifacts;
 mod m20260717_000001_folder_alias;
+mod m20260718_000001_conversation_deliverables;
+mod m20260720_000001_deliverable_management;
+mod m20260725_000001_deliverable_reconciliation;
 mod m20260726_000001_custom_agent;
 mod m20260727_000001_custom_agent_skills;
 mod m20260728_000001_custom_agent_skills_dir;
@@ -33,18 +37,30 @@ mod m20260728_000002_custom_agent_source;
 mod m20260801_000001_work_task;
 mod m20260801_000002_work_task_p2;
 mod m20260801_000003_work_task_template;
+mod m20260802_000001_deliverable_turn_link;
 mod m20260803_000001_folder_link;
 mod m20260803_000001_token_usage;
+mod m20260804_000001_prompt_accepted_at;
 mod m20260807_000001_work_task_scheduled_at;
 mod m20260808_000001_custom_agent_supports_mcp;
+mod m20260813_000001_conversation_branch;
+mod m20260814_000001_conversation_branch_inheritance;
+mod m20260816_000001_chat_channel_final_outbox;
+mod m20260816_000002_conversation_branch_lifecycle;
 mod m20260817_000001_work_task_conversation_title;
+mod m20260817_000002_turn_cancellation;
+mod m20260818_000001_chat_channel_inbound_queue;
 mod m20260818_000001_work_task_source;
 mod m20260819_000001_work_task_completion_kind;
+mod m20260822_000001_conversation_branch_creation_request;
+mod m20260824_000001_conversation_branch_operation_id;
+mod m20260824_000002_native_fork_boundary;
 mod m20260825_000001_remote_workspace_connection_headers;
 mod m20260829_000001_folder_group;
 mod m20260830_000001_canvas_node;
 mod m20260831_000001_canvas_node_group_grid;
 mod m20260907_000001_canvas_node_path;
+mod m20260908_000001_conversation_branch_creation_task;
 mod m20260929_000001_canvas_board;
 mod m20260930_000001_agent_setting_drop_adapter_channel;
 mod m20261006_000001_conversation_tag;
@@ -56,6 +72,10 @@ mod m20261017_000002_conversation_source;
 mod m20261020_000001_folder_command_run_local;
 mod m20261022_000001_tool_approval;
 mod m20261022_000001_work_task_delivery;
+pub(crate) mod m20261025_000001_business_agent_sessions;
+mod m20261026_000001_business_delivery;
+mod m20261026_000002_office_delivery_previews;
+mod m20261027_000001_business_handoff_context;
 pub struct Migrator;
 
 #[async_trait::async_trait]
@@ -87,7 +107,11 @@ impl MigratorTrait for Migrator {
             Box::new(m20260621_000001_automation::Migration),
             Box::new(m20260630_000001_conversation_parent_id_index::Migration),
             Box::new(m20260703_000001_chat_channel_thread_binding::Migration),
+            Box::new(m20260717_000001_conversation_turn_artifacts::Migration),
             Box::new(m20260717_000001_folder_alias::Migration),
+            Box::new(m20260718_000001_conversation_deliverables::Migration),
+            Box::new(m20260720_000001_deliverable_management::Migration),
+            Box::new(m20260725_000001_deliverable_reconciliation::Migration),
             Box::new(m20260726_000001_custom_agent::Migration),
             Box::new(m20260727_000001_custom_agent_skills::Migration),
             Box::new(m20260728_000001_custom_agent_skills_dir::Migration),
@@ -95,18 +119,30 @@ impl MigratorTrait for Migrator {
             Box::new(m20260801_000001_work_task::Migration),
             Box::new(m20260801_000002_work_task_p2::Migration),
             Box::new(m20260801_000003_work_task_template::Migration),
+            Box::new(m20260802_000001_deliverable_turn_link::Migration),
             Box::new(m20260803_000001_folder_link::Migration),
             Box::new(m20260803_000001_token_usage::Migration),
+            Box::new(m20260804_000001_prompt_accepted_at::Migration),
             Box::new(m20260807_000001_work_task_scheduled_at::Migration),
             Box::new(m20260808_000001_custom_agent_supports_mcp::Migration),
+            Box::new(m20260813_000001_conversation_branch::Migration),
+            Box::new(m20260814_000001_conversation_branch_inheritance::Migration),
+            Box::new(m20260816_000001_chat_channel_final_outbox::Migration),
+            Box::new(m20260816_000002_conversation_branch_lifecycle::Migration),
             Box::new(m20260817_000001_work_task_conversation_title::Migration),
+            Box::new(m20260817_000002_turn_cancellation::Migration),
+            Box::new(m20260818_000001_chat_channel_inbound_queue::Migration),
             Box::new(m20260818_000001_work_task_source::Migration),
             Box::new(m20260819_000001_work_task_completion_kind::Migration),
+            Box::new(m20260822_000001_conversation_branch_creation_request::Migration),
+            Box::new(m20260824_000001_conversation_branch_operation_id::Migration),
+            Box::new(m20260824_000002_native_fork_boundary::Migration),
             Box::new(m20260825_000001_remote_workspace_connection_headers::Migration),
             Box::new(m20260829_000001_folder_group::Migration),
             Box::new(m20260830_000001_canvas_node::Migration),
             Box::new(m20260831_000001_canvas_node_group_grid::Migration),
             Box::new(m20260907_000001_canvas_node_path::Migration),
+            Box::new(m20260908_000001_conversation_branch_creation_task::Migration),
             Box::new(m20260929_000001_canvas_board::Migration),
             Box::new(m20260930_000001_agent_setting_drop_adapter_channel::Migration),
             Box::new(m20261006_000001_conversation_tag::Migration),
@@ -118,6 +154,10 @@ impl MigratorTrait for Migrator {
             Box::new(m20261020_000001_folder_command_run_local::Migration),
             Box::new(m20261022_000001_tool_approval::Migration),
             Box::new(m20261022_000001_work_task_delivery::Migration),
+            Box::new(m20261025_000001_business_agent_sessions::Migration),
+            Box::new(m20261026_000001_business_delivery::Migration),
+            Box::new(m20261026_000002_office_delivery_previews::Migration),
+            Box::new(m20261027_000001_business_handoff_context::Migration),
         ]
     }
 }

@@ -46,6 +46,27 @@ import { ActivityLiveProvider } from "@/components/message/activity/activity-liv
 import { EMPTY_TOOL_APPROVALS } from "@/lib/activity/approval"
 import { blockingPrompts } from "@/lib/blocking-prompts"
 import type { AgentType } from "@/lib/types"
+import {
+  CONVERSATION_ARTIFACTS_CHANGED_EVENT,
+  CONVERSATION_DELIVERABLES_CHANGED_EVENT,
+  type ConversationArtifactsChanged,
+  type ConversationDeliverablesChanged,
+} from "@/lib/types"
+import { subscribe } from "@/lib/platform"
+import {
+  GoalControlProvider,
+  NO_GOAL_ACTIONS,
+  type GoalControlValue,
+} from "@/components/message/goal-control-context"
+
+// React portals retain ancestor context. A viewer opened from a live parent
+// must never expose the parent's Goal actions on the child's transcript.
+const READ_ONLY_GOAL_CONTROL: GoalControlValue = {
+  connectionId: null,
+  readOnly: true,
+  onGoalControl: null,
+  actions: NO_GOAL_ACTIONS,
+}
 
 export function useConnectionStateById(
   connectionId: string | null
@@ -256,9 +277,39 @@ export function LiveTranscriptView({
     refetchDetail(conversationId, { preserveLive: true })
   }, [conversationId, refetchDetail])
 
-  // Reader only — its built-in auto-fetch is disabled; the effect above is
-  // the sole fetch path.
-  const { loading, error, acpLoadError } = useConversationDetail(
+  // Final outputs may be published before the reply settles. Keep the shared
+  // viewer current without replacing its bridged live turn with a lagging DB
+  // transcript.
+  useEffect(() => {
+    let disposed = false
+    const unlistens: (() => void)[] = []
+    const installSubscription = <T extends { conversation_id: number }>(
+      event: string
+    ) => {
+      void subscribe<T>(event, (change) => {
+        if (change.conversation_id === conversationId) {
+          refetchDetail(conversationId, { preserveLive: true })
+        }
+      }).then((dispose) => {
+        if (disposed) dispose()
+        else unlistens.push(dispose)
+      })
+    }
+    installSubscription<ConversationDeliverablesChanged>(
+      CONVERSATION_DELIVERABLES_CHANGED_EVENT
+    )
+    installSubscription<ConversationArtifactsChanged>(
+      CONVERSATION_ARTIFACTS_CHANGED_EVENT
+    )
+    return () => {
+      disposed = true
+      unlistens.forEach((dispose) => dispose())
+    }
+  }, [conversationId, refetchDetail])
+
+  // Reader only — its built-in auto-fetch is disabled; the effects above own
+  // fetch timing.
+  const { detail, loading, error, acpLoadError } = useConversationDetail(
     conversationId,
     { enabled: false }
   )
@@ -312,27 +363,30 @@ export function LiveTranscriptView({
           exactly how the main conversation panel mounts the same component. */}
       <div className="min-h-0 flex-1">
         <ActivityLiveProvider value={activityLive}>
-          <MessageListView
-            conversationId={conversationId}
-            // The viewed connection's own cwd. A delegation child runs in a
-            // scratch dir whose folder row this client may not have seen yet
-            // (it is created closed, without a folder-change broadcast), so the
-            // folder lookup would come up empty; `undefined` when there is no
-            // live connection keeps that lookup as the fallback.
-            imageRoot={conn?.workingDir ?? undefined}
-            agentType={transcriptAgent ?? "claude_code"}
-            // With no agent known, that default is a guess, and what it last
-            // advertised in this folder says nothing about this transcript:
-            // `[]` badges no command at all rather than another agent's.
-            availableCommands={transcriptAgent ? conn?.availableCommands : []}
-            connStatus={connStatus}
-            isActive={false}
-            detailLoading={detailLoading}
-            detailError={error}
-            acpLoadError={acpLoadError}
-            hideEmptyState={false}
-            userTurnHeader={userTurnHeader}
-          />
+          <GoalControlProvider value={READ_ONLY_GOAL_CONTROL}>
+            <MessageListView
+              conversationId={conversationId}
+              // The viewed connection's own cwd. A delegation child runs in a
+              // scratch dir whose folder row this client may not have seen yet
+              // (it is created closed, without a folder-change broadcast), so the
+              // folder lookup would come up empty; `undefined` when there is no
+              // live connection keeps that lookup as the fallback.
+              imageRoot={conn?.workingDir ?? undefined}
+              agentType={transcriptAgent ?? "claude_code"}
+              // With no agent known, that default is a guess, and what it last
+              // advertised in this folder says nothing about this transcript:
+              // `[]` badges no command at all rather than another agent's.
+              availableCommands={transcriptAgent ? conn?.availableCommands : []}
+              connStatus={connStatus}
+              isActive={false}
+              detailLoading={detailLoading}
+              detailError={error}
+              acpLoadError={acpLoadError}
+              hideEmptyState={false}
+              userTurnHeader={userTurnHeader}
+              deliverableRuns={detail?.deliverable_runs}
+            />
+          </GoalControlProvider>
         </ActivityLiveProvider>
       </div>
     </div>

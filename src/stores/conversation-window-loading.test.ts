@@ -1,8 +1,7 @@
 /**
  * Coverage for the windowed conversation-loading protocol:
- * - cold loads request a tail window; refreshes re-request the loaded window
- *   (`fromIndex = turns_offset`) and fall back to a fresh tail when the
- *   prefix fingerprint no longer matches (compaction rewrote history);
+ * - cold loads and refreshes use the bounded opaque-cursor endpoint; no
+ *   persisted window can make a refresh fall back to a full-file parse;
  * - `loadOlderTurns` prepends an older page only when its seam proof matches
  *   the current window fingerprint, participates in the fetch-generation
  *   total order, and is single-flight;
@@ -23,7 +22,7 @@ import { extendPrefixFingerprint, FNV_SEED_HEX } from "@/lib/turn-window"
 import {
   resetConversationRuntimeStore,
   useConversationRuntimeStore,
-  TAIL_TURNS_DEFAULT,
+  HISTORY_PAGE_USER_TURNS,
   OLDER_TURNS_PAGE_SIZE,
   type ConversationRuntimeSession,
 } from "@/stores/conversation-runtime-store"
@@ -31,6 +30,8 @@ import {
 vi.mock("@/lib/api", () => ({
   getFolderConversation: vi.fn(),
   getFolderConversationTurns: vi.fn(),
+  invalidateFolderConversationCache: vi.fn(),
+  listConversationOutputWindow: vi.fn(),
 }))
 
 const { getFolderConversation, getFolderConversationTurns } =
@@ -151,6 +152,7 @@ function emptySession(conversationId: number): ConversationRuntimeSession {
     pendingCancelledTurnReports: null,
     optimisticTurns: [],
     liveMessage: null,
+    promptDeliveries: {},
     syncState: "idle",
     activeTurnToken: null,
     lastTurnOwned: false,
@@ -198,12 +200,15 @@ afterEach(() => {
 })
 
 describe("windowed fetch/refetch", () => {
-  it("cold fetch requests the default tail window", async () => {
+  it("cold fetch requests the bounded cursor page", async () => {
     seed({})
     mockGet.mockResolvedValue(windowedDetail(4))
     actions().fetchDetail(CID)
     await flush()
-    expect(mockGet).toHaveBeenCalledWith(CID, { tailTurns: TAIL_TURNS_DEFAULT })
+    expect(mockGet).toHaveBeenCalledWith(
+      CID,
+      expect.objectContaining({ userTurnLimit: HISTORY_PAGE_USER_TURNS })
+    )
     expect(session()?.detail?.turns_offset).toBe(4)
   })
 
@@ -213,7 +218,10 @@ describe("windowed fetch/refetch", () => {
     actions().refetchDetail(CID)
     await flush()
     expect(mockGet).toHaveBeenCalledTimes(1)
-    expect(mockGet).toHaveBeenCalledWith(CID, { fromIndex: 2 })
+    expect(mockGet).toHaveBeenCalledWith(
+      CID,
+      expect.objectContaining({ userTurnLimit: HISTORY_PAGE_USER_TURNS })
+    )
     expect(session()?.detail?.turns.map((t) => t.id)).toEqual([
       "turn-2",
       "turn-3",
@@ -222,7 +230,31 @@ describe("windowed fetch/refetch", () => {
     ])
   })
 
-  it("refetch falls back to a fresh tail when the prefix fingerprint changed", async () => {
+  it("coalesces an event burst into one active refetch and one trailing refresh", async () => {
+    seed({ detail: windowedDetail(2) })
+    let resolveFirst: (detail: DbConversationDetail) => void = () => {}
+    mockGet
+      .mockImplementationOnce(
+        () =>
+          new Promise<DbConversationDetail>((resolve) => {
+            resolveFirst = resolve
+          })
+      )
+      .mockResolvedValueOnce(windowedDetail(4))
+
+    actions().refetchDetail(CID)
+    actions().refetchDetail(CID)
+    actions().refetchDetail(CID)
+    expect(mockGet).toHaveBeenCalledTimes(1)
+
+    resolveFirst(windowedDetail(2))
+    await flush()
+    await flush()
+    expect(mockGet).toHaveBeenCalledTimes(2)
+    expect(session()?.detail?.turns_offset).toBe(4)
+  })
+
+  it("does not issue a legacy full-window retry when an old prefix fingerprint changed", async () => {
     seed({ detail: windowedDetail(2) })
     // The window-refresh read reports a REWRITTEN prefix (different hash);
     // the loaded window's coordinates are garbage → a second request must
@@ -234,11 +266,12 @@ describe("windowed fetch/refetch", () => {
       .mockResolvedValueOnce(windowedDetail(4))
     actions().refetchDetail(CID)
     await flush()
-    expect(mockGet).toHaveBeenNthCalledWith(1, CID, { fromIndex: 2 })
-    expect(mockGet).toHaveBeenNthCalledWith(2, CID, {
-      tailTurns: TAIL_TURNS_DEFAULT,
-    })
-    expect(session()?.detail?.turns_offset).toBe(4)
+    expect(mockGet).toHaveBeenCalledTimes(1)
+    expect(mockGet).toHaveBeenCalledWith(
+      CID,
+      expect.objectContaining({ userTurnLimit: HISTORY_PAGE_USER_TURNS })
+    )
+    expect(session()?.detail?.prefix_hash).toBe("00000000000000ff")
   })
 
   it("refetch falls back to a fresh tail when the total collapsed below the window start", async () => {
@@ -254,10 +287,12 @@ describe("windowed fetch/refetch", () => {
       .mockResolvedValueOnce(windowedDetail(0))
     actions().refetchDetail(CID)
     await flush()
-    expect(mockGet).toHaveBeenNthCalledWith(2, CID, {
-      tailTurns: TAIL_TURNS_DEFAULT,
-    })
-    expect(session()?.detail?.turns_offset).toBe(0)
+    expect(mockGet).toHaveBeenCalledTimes(1)
+    expect(mockGet).toHaveBeenCalledWith(
+      CID,
+      expect.objectContaining({ userTurnLimit: HISTORY_PAGE_USER_TURNS })
+    )
+    expect(session()?.detail?.turns).toEqual([])
   })
 
   it("passes a legacy full response through untouched (old server)", async () => {
@@ -357,7 +392,10 @@ describe("loadOlderTurns", () => {
     // No merge happened; the standard refetch path was invoked instead.
     expect(session()?.detail?.turns_offset).toBe(4)
     expect(session()?.loadingOlderTurns).toBe(false)
-    expect(mockGet).toHaveBeenCalledWith(CID, { fromIndex: 4 })
+    expect(mockGet).toHaveBeenCalledWith(
+      CID,
+      expect.objectContaining({ userTurnLimit: HISTORY_PAGE_USER_TURNS })
+    )
   })
 
   it("drops a page that lost the fetch-generation race to a newer fetch", async () => {
@@ -580,7 +618,13 @@ describe("loadOlderTurnsThrough", () => {
     mockGet.mockResolvedValue(windowedDetail(4))
     await expect(actions().loadOlderTurnsThrough(CID, 0)).resolves.toBe(false)
     expect(mockGetTurns).toHaveBeenCalledTimes(1)
-    expect(mockGet).toHaveBeenCalledWith(CID, { fromIndex: 4 })
+    expect(mockGet).toHaveBeenCalledWith(
+      CID,
+      expect.objectContaining({
+        userTurnLimit: HISTORY_PAGE_USER_TURNS,
+        cacheMode: "reload",
+      })
+    )
   })
 
   it("gives up on a failed page", async () => {
@@ -697,11 +741,51 @@ describe("syncTurnMetadata windowed gate", () => {
     )
     actions().syncTurnMetadata(CID)
     await vi.advanceTimersByTimeAsync(1600)
-    expect(mockGet).toHaveBeenCalledWith(CID, { fromIndex: 6 })
+    expect(mockGet).toHaveBeenCalledWith(
+      CID,
+      expect.objectContaining({ userTurnLimit: HISTORY_PAGE_USER_TURNS })
+    )
     expect(session()?.localTurns[0]?.usage?.input_tokens).toBe(10)
   })
 
-  it("skips turn patches entirely when the boundary fingerprint mismatches", async () => {
+  it("cuts verified history before the batch and keeps another client's reply separate", async () => {
+    vi.useFakeTimers()
+    seed({
+      localTurns: local,
+      historyAssistantBaseline: 3,
+      batchBoundaryIndex: 6,
+      batchBoundaryPrefixHash: hashPrefix(6),
+    })
+    const reply = (id: string, secs: number, tokens: number): MessageTurn => ({
+      ...turn(id, "assistant", secs),
+      usage: {
+        input_tokens: tokens,
+        output_tokens: 5,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+      },
+    })
+    mockGet.mockResolvedValue(
+      windowedDetail(2, {
+        turns: [
+          ...FULL.slice(2),
+          reply("turn-6", 6, 10),
+          turn("other-client", "user", 7),
+          reply("other-reply", 8, 99),
+        ],
+        turns_total: 9,
+      })
+    )
+    actions().syncTurnMetadata(CID)
+    await vi.advanceTimersByTimeAsync(1600)
+    expect(session()?.localTurns[0]?.usage?.input_tokens).toBe(10)
+    expect(mockGet).toHaveBeenCalledWith(
+      CID,
+      expect.objectContaining({ userTurnLimit: HISTORY_PAGE_USER_TURNS })
+    )
+  })
+
+  it("refuses metadata from a compacted prefix", async () => {
     vi.useFakeTimers()
     seed({
       localTurns: local,
@@ -718,21 +802,20 @@ describe("syncTurnMetadata windowed gate", () => {
         cache_read_input_tokens: 0,
       },
     }
-    // Compaction between capture and sync: same offset, different prefix.
+    // A bounded tail starts before the batch, but compaction rewrote its prefix.
     mockGet.mockResolvedValue(
-      windowedDetail(6, {
-        turns: [parsedNew],
+      windowedDetail(2, {
+        turns: [...FULL.slice(2), parsedNew],
         turns_total: 7,
         prefix_hash: "00000000000000ff",
       })
     )
     actions().syncTurnMetadata(CID)
     await vi.advanceTimersByTimeAsync(1600)
-    // The poll keeps retrying (the metadata never lands), but usage must
-    // never be pinned from an unverified window — however many rounds it
-    // takes.
+    // Re-reading a compacted fingerprint cannot verify the old batch.
     await vi.advanceTimersByTimeAsync(120_000)
     expect(session()?.localTurns[0]?.usage).toBeUndefined()
+    expect(mockGet).toHaveBeenCalledTimes(1)
   })
 
   it("legacy full response uses the global baseline math", async () => {
@@ -764,7 +847,10 @@ describe("syncTurnMetadata windowed gate", () => {
     )
     actions().syncTurnMetadata(CID)
     await vi.advanceTimersByTimeAsync(1600)
-    expect(mockGet).toHaveBeenCalledWith(CID, undefined)
+    expect(mockGet).toHaveBeenCalledWith(
+      CID,
+      expect.objectContaining({ userTurnLimit: HISTORY_PAGE_USER_TURNS })
+    )
     expect(session()?.localTurns[0]?.usage?.input_tokens).toBe(42)
   })
 })
@@ -830,7 +916,10 @@ describe("syncTurnMetadata round anchoring", () => {
     )
     actions().syncTurnMetadata(CID)
     await vi.advanceTimersByTimeAsync(1600)
-    expect(mockGet).toHaveBeenCalledWith(CID, { fromIndex: 3 })
+    expect(mockGet).toHaveBeenCalledWith(
+      CID,
+      expect.objectContaining({ userTurnLimit: HISTORY_PAGE_USER_TURNS })
+    )
     expect(session()?.localTurns[0]?.duration_ms).toBe(600_000)
     // Not the first reply's 10 minutes — first-write-wins would keep them.
     expect(session()?.localTurns[2]?.duration_ms).toBeUndefined()
@@ -1129,7 +1218,10 @@ describe("syncTurnMetadata round anchoring", () => {
     )
     actions().syncTurnMetadata(CID)
     await vi.advanceTimersByTimeAsync(1600)
-    expect(mockGet).toHaveBeenCalledWith(CID, undefined)
+    expect(mockGet).toHaveBeenCalledWith(
+      CID,
+      expect.objectContaining({ userTurnLimit: HISTORY_PAGE_USER_TURNS })
+    )
     expect(session()?.localTurns[1]?.duration_ms).toBe(1_234)
   })
 })
@@ -1160,9 +1252,19 @@ describe("syncTurnMetadata transcript-lag polling", () => {
   /** What the parser eventually writes for those same four turns. */
   const parsed: MessageTurn[] = [
     turn("turn-6", "user", 6),
-    { ...turn("turn-7", "assistant", 7), usage, completed_at: ts(7) },
+    {
+      ...turn("turn-7", "assistant", 7),
+      usage,
+      duration_ms: 168795,
+      completed_at: ts(7),
+    },
     turn("turn-8", "user", 8),
-    { ...turn("turn-9", "assistant", 9), usage, completed_at: ts(9) },
+    {
+      ...turn("turn-9", "assistant", 9),
+      usage,
+      duration_ms: 309047,
+      completed_at: ts(9),
+    },
   ]
 
   function parseWindow(upTo: number): DbConversationDetail {
@@ -1221,6 +1323,33 @@ describe("syncTurnMetadata transcript-lag polling", () => {
     expect(session()?.localTurns[3]?.source_turn_id).toBe("turn-9")
   })
 
+  it("backfills native task duration even when usage arrived first", async () => {
+    vi.useFakeTimers()
+    seedBatch()
+    const native = parseWindow(4)
+    native.turns = native.turns.map((t, i) => ({
+      ...t,
+      duration_ms: undefined,
+      native_task_id: i < 2 ? "task-a" : "task-b",
+    }))
+    const timed = {
+      ...native,
+      turns: native.turns.map((t, i) =>
+        i === 3 ? { ...t, duration_ms: 615361 } : t
+      ),
+    }
+    mockGet.mockResolvedValueOnce(native).mockResolvedValue(timed)
+    actions().syncTurnMetadata(CID)
+    await vi.advanceTimersByTimeAsync(1600)
+    expect(session()?.localTurns[3]?.usage).toEqual(usage)
+    expect(session()?.localTurns[3]?.duration_ms).toBeUndefined()
+    await vi.advanceTimersByTimeAsync(3100)
+    expect(session()?.localTurns[3]?.duration_ms).toBe(615361)
+    expect(session()?.localTurns[3]?.native_task_id).toBe("task-b")
+    await vi.advanceTimersByTimeAsync(120_000)
+    expect(mockGet).toHaveBeenCalledTimes(5) // earlier task A remains untimed, also bounded
+  })
+
   it("stops as soon as the newest reply is covered", async () => {
     vi.useFakeTimers()
     seedBatch()
@@ -1228,6 +1357,66 @@ describe("syncTurnMetadata transcript-lag polling", () => {
     actions().syncTurnMetadata(CID)
     await vi.advanceTimersByTimeAsync(40_000)
     expect(mockGet).toHaveBeenCalledTimes(1)
+  })
+
+  it("supersedes an in-flight metadata request and rejects its late result", async () => {
+    vi.useFakeTimers()
+    seedBatch()
+    let resolveOld!: (value: DbConversationDetail) => void
+    const old = new Promise<DbConversationDetail>((resolve) => {
+      resolveOld = resolve
+    })
+    const newest = parseWindow(4)
+    newest.turns = newest.turns.map((t, i) => ({
+      ...t,
+      native_task_id: i < 2 ? "task-a" : "task-b",
+    }))
+    mockGet.mockReturnValueOnce(old).mockResolvedValue(newest)
+    actions().syncTurnMetadata(CID)
+    await vi.advanceTimersByTimeAsync(1600)
+    actions().syncTurnMetadata(CID)
+    await vi.advanceTimersByTimeAsync(1600)
+    const stale = {
+      ...newest,
+      turns: newest.turns.map((t) => ({ ...t, duration_ms: 999999 })),
+    }
+    resolveOld(stale)
+    await flush()
+    expect(session()?.localTurns[1]?.duration_ms).toBe(168795)
+    expect(session()?.localTurns[3]?.duration_ms).toBe(309047)
+    await vi.advanceTimersByTimeAsync(120_000)
+    expect(mockGet).toHaveBeenCalledTimes(2)
+  })
+
+  it("bounds retries for genuinely untimed legacy records even with usage", async () => {
+    vi.useFakeTimers()
+    seedBatch()
+    const untimed = parseWindow(4)
+    untimed.turns = untimed.turns.map((t) => ({ ...t, duration_ms: undefined }))
+    mockGet.mockResolvedValue(untimed)
+    actions().syncTurnMetadata(CID)
+    await vi.advanceTimersByTimeAsync(120_000)
+    expect(mockGet).toHaveBeenCalledTimes(5)
+    expect(session()?.localTurns[3]?.duration_ms).toBeUndefined()
+  })
+
+  it("replaces a partial local estimate with the identified whole-task duration", async () => {
+    vi.useFakeTimers()
+    seedBatch({
+      localTurns: liveTurns.map((t, i) =>
+        i === 3 ? { ...t, duration_ms: 42 } : t
+      ),
+    })
+    const native = parseWindow(4)
+    native.turns = native.turns.map((t, i) => ({
+      ...t,
+      native_task_id: i < 2 ? "task-a" : "task-b",
+    }))
+    mockGet.mockResolvedValue(native)
+    actions().syncTurnMetadata(CID)
+    await vi.advanceTimersByTimeAsync(1600)
+    expect(session()?.localTurns[3]?.native_task_id).toBe("task-b")
+    expect(session()?.localTurns[3]?.duration_ms).toBe(309047)
   })
 
   it("takes ONE more look when only the usage is outstanding", async () => {

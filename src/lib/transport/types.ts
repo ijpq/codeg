@@ -35,6 +35,8 @@ export type AttachDetachReason =
  * frame; subsequent `onEvent` envelopes have `envelope.seq > highWaterSeq`.
  */
 export interface AttachHandlers {
+  /** The transport is (re-)issuing this subscription's attach request. */
+  onAttaching?(): void
   onSnapshot(snapshot: LiveSessionSnapshot, eventSeq: number): void
   onReplay(events: EventEnvelope[], highWaterSeq: number): void
   onEvent(envelope: EventEnvelope): void
@@ -92,6 +94,9 @@ export interface CallOptions {
    * backend can return its own structured error.
    */
   timeoutMs?: number
+  /** Cancel an obsolete read. Web fetches are aborted; IPC transports reject
+   * the caller immediately and discard any late backend result. */
+  signal?: AbortSignal
 }
 
 export interface Transport {

@@ -1,0 +1,32 @@
+name: Transcript browser regression
+on:
+  push:
+    branches: ["main", "fix/execution-scroll-v0.36.0"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      baseline:
+        description: Compare the previous published scroll guard
+        type: boolean
+        default: false
+jobs:
+  browser:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec playwright-core install --with-deps chromium
+      - run: node scripts/browser-scroll-regression.mjs ${{ inputs.baseline && '--baseline' || '' }}
+      - run: node scripts/browser-file-tabs-regression.mjs --baseline-ref 80b4df540d8a32fc82656c21775cc29256ef87c3
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: transcript-browser-evidence
+          path: artifacts/browser-scroll/

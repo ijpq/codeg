@@ -795,6 +795,7 @@ fn parse_transcript(bytes: &[u8]) -> Transcript {
                     model: None,
                     completed_at: Some(timestamp),
                 agent_message_id: None,
+                native_task_id: None,
                 });
                 pending_assistant_chat_id = None;
             }
@@ -886,6 +887,7 @@ fn parse_transcript(bytes: &[u8]) -> Transcript {
                         model: entry_model,
                         completed_at: Some(timestamp),
                     agent_message_id: None,
+                    native_task_id: None,
                     });
                 }
                 pending_assistant_chat_id = message_id;

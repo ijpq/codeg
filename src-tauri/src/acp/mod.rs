@@ -16,13 +16,16 @@ pub mod codex_endpoint_catalog;
 pub mod codex_goal;
 pub mod codex_model_catalog;
 pub mod codex_runtime;
+pub(crate) mod codex_bundled_runtime;
 pub mod command_code;
 pub mod computer_tools;
+pub mod codex_steer_adapter;
 pub mod connection;
 pub mod cursor_acp_retry_compat;
 pub mod cursor_ext;
 pub mod custom_registry;
 pub mod delegation;
+pub mod deliverables;
 pub mod error;
 pub mod event_stream;
 pub mod feedback;
@@ -65,7 +68,10 @@ pub mod work_task_tools;
 pub mod zcode;
 pub(crate) mod zcode_turn;
 
-pub use idle_sweep::{idle_sweep_task, idle_timeout_from_env, SWEEP_INTERVAL_SECS};
+pub use idle_sweep::{
+    idle_sweep_task, idle_timeout_from_env, turn_reconciliation_task, SWEEP_INTERVAL_SECS,
+    TURN_RECONCILIATION_INTERVAL_SECS,
+};
 pub use internal_bus::{EventBusMetrics, EventBusMetricsSnapshot, InternalEventBus};
 pub use lifecycle::lifecycle_subscriber_task;
 pub use session_state::{LiveSessionSnapshot, SessionState};
@@ -101,3 +107,5 @@ pub fn continued_session_ids(agent_type: crate::models::AgentType, session_id: &
     }
     crate::acp_transcript::continuation_ancestors(registry::registry_id_for(agent_type), session_id)
 }
+
+pub(crate) mod pi_runtime;

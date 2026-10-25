@@ -1,0 +1,244 @@
+name: Supplement Windows Setup
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing stable release to supplement without changing its source
+        required: true
+        default: v0.30.7-fix1
+        type: string
+      notes_only:
+        description: Finalize notes for the already verified v0.30.7-fix1 Setup
+        type: boolean
+        default: false
+      reuse_diagnostic_build:
+        description: Reverify the retained v0.30.7-fix1 build from run 34814858821
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: supplement-setup-${{ inputs.release_tag }}
+  cancel-in-progress: false
+
+jobs:
+  setup:
+    if: ${{ !inputs.notes_only }}
+    runs-on: windows-2022
+    permissions:
+      contents: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag }}
+          fetch-depth: 0
+      - name: Verify published source and successful ordinary CI
+        shell: pwsh
+        run: |
+          if ($env:RELEASE_TAG -notmatch '^v\d+\.\d+\.\d+-fix\d+$') { throw 'Invalid stable fork tag' }
+          $sha = (git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve source' }
+          git merge-base --is-ancestor $sha origin/main
+          if ($LASTEXITCODE -ne 0) { throw 'Release source is not on main' }
+          $config = Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
+          if ("v$($config.version)" -ne $env:RELEASE_TAG) { throw 'Version mismatch' }
+          $release = gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --json isDraft,isPrerelease,assets | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $release.isDraft -or $release.isPrerelease) { throw 'Stable published release required' }
+          if (@($release.assets | Where-Object name -Like '*setup.exe*').Count -ne 0) { throw 'Setup assets already exist; refusing overwrite' }
+          $runs = gh run list --repo $env:GITHUB_REPOSITORY --workflow test.yml --commit $sha --status success --json headSha,conclusion | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or @($runs | Where-Object headSha -EQ $sha).Count -eq 0) { throw 'No successful ordinary CI for source' }
+          "SOURCE_SHA=$sha" >> $env:GITHUB_ENV
+          "APP_VERSION=$($config.version)" >> $env:GITHUB_ENV
+          $release.assets | ConvertTo-Json -Depth 10 | Set-Content "$env:RUNNER_TEMP/assets-before.json"
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: .setup-tools
+          sparse-checkout: scripts
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Test strict NSIS payload verification
+        run: python -B .setup-tools/scripts/test-verify-setup-binaries.py
+      - name: Restore pinned diagnostic build without recompiling
+        if: inputs.reuse_diagnostic_build
+        shell: pwsh
+        run: |
+          if ($env:RELEASE_TAG -ne 'v0.30.7-fix1' -or $env:SOURCE_SHA -ne '683fedde78288cd75a640512ecb651c82aa38fd7') { throw 'Diagnostic build source mismatch' }
+          $run = gh run view 34814858821 --repo $env:GITHUB_REPOSITORY --json headSha,workflowName,jobs | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $run.headSha -ne '2335c99118fbf9569c6d84036828726e12edca4c' -or $run.workflowName -ne 'Supplement Windows Setup') { throw 'Unexpected evidence provenance' }
+          foreach ($step in @('Verify published source and successful ordinary CI','Published ACP regression','Stage matching MCP companion','Build unsigned Windows NSIS setup')) {
+            $matches = @($run.jobs[0].steps | Where-Object name -EQ $step)
+            if ($matches.Count -ne 1 -or $matches[0].conclusion -ne 'success') { throw "Unverified build step: $step" }
+          }
+          $evidence = Join-Path $env:RUNNER_TEMP 'setup-build-evidence'
+          gh run download 34814858821 --repo $env:GITHUB_REPOSITORY -n setup-binary-evidence -D $evidence
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot retrieve evidence' }
+          $source = Join-Path $evidence 'codeg/codeg/src-tauri/target/x86_64-pc-windows-msvc/release'
+          $installer = Join-Path $source 'bundle/nsis/codeg_0.30.7-fix1_x64-setup.exe'
+          if ((Get-FileHash $installer).Hash.ToLower() -ne 'dcb3e7a061879b193a6d1362537a4cd33349170651036c2277429b5eecb9da4c') { throw 'Retained installer digest mismatch' }
+          if ((Get-FileHash (Join-Path $source 'codeg.exe')).Hash.ToLower() -ne 'fca4cc8aaa7ab85dceac29373d59c71e163a2c36e46aa25cf96763be3b7ac811') { throw 'Retained build digest mismatch' }
+          $target = 'src-tauri/target/x86_64-pc-windows-msvc/release'
+          New-Item -ItemType Directory -Force $target | Out-Null
+          Copy-Item "$source/*" $target -Recurse -Force
+      - uses: pnpm/action-setup@v4
+        if: ${{ !inputs.reuse_diagnostic_build }}
+        with:
+          run_install: false
+      - uses: actions/setup-node@v4
+        if: ${{ !inputs.reuse_diagnostic_build }}
+        with:
+          node-version: 24
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+        if: ${{ !inputs.reuse_diagnostic_build }}
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: swatinem/rust-cache@v2
+        if: ${{ !inputs.reuse_diagnostic_build }}
+        with:
+          workspaces: './src-tauri -> target'
+          shared-key: x86_64-pc-windows-msvc
+          cache-on-failure: true
+      - name: Install locked dependencies
+        if: ${{ !inputs.reuse_diagnostic_build }}
+        run: pnpm install --frozen-lockfile
+      - name: Published ACP regression
+        if: ${{ !inputs.reuse_diagnostic_build }}
+        run: node --test scripts/test-codex-air-terminal.mjs
+      - name: Stage matching MCP companion
+        if: ${{ !inputs.reuse_diagnostic_build }}
+        run: pnpm tauri:prepare-sidecars --target x86_64-pc-windows-msvc
+      - name: Build unsigned Windows NSIS setup
+        if: ${{ !inputs.reuse_diagnostic_build }}
+        env:
+          CODEG_SKIP_SIDECAR: '1'
+        shell: pwsh
+        run: |
+          '{"bundle":{"createUpdaterArtifacts":false}}' | Set-Content setup-build-config.json
+          pnpm tauri build --target x86_64-pc-windows-msvc --bundles nsis --config setup-build-config.json
+          if ($LASTEXITCODE -ne 0) { throw 'Setup build failed' }
+      - name: Install and verify package in isolated runner
+        shell: pwsh
+        run: |
+          $setups = @(Get-ChildItem src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*_x64-setup.exe)
+          if ($setups.Count -ne 1) { throw 'Expected exactly one Setup' }
+          $setup = $setups[0]
+          if ($setup.Name -ne "codeg_$($env:APP_VERSION)_x64-setup.exe") { throw 'Setup filename version mismatch' }
+          $dest = Join-Path $env:RUNNER_TEMP 'codeg-setup-test'
+          Get-ChildItem src-tauri/target/x86_64-pc-windows-msvc/release -Filter '*.exe' | Get-FileHash -Algorithm SHA256 | Format-List
+          $process = Start-Process $setup.FullName -ArgumentList '/S',"/D=$dest" -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Setup exit: $($process.ExitCode)" }
+          Get-ChildItem $dest -Filter '*.exe' | Get-FileHash -Algorithm SHA256 | Format-List
+          Get-ChildItem $dest -Filter '*.exe' | ForEach-Object { $_.VersionInfo | Format-List FileName,ProductVersion,FileVersion,OriginalFilename }
+          $app = Join-Path $dest 'codeg.exe'
+          $mcp = Join-Path $dest 'codeg-mcp.exe'
+          foreach ($file in @($app, $mcp, (Join-Path $dest 'web/index.html'))) {
+            if (-not (Test-Path $file -PathType Leaf)) { throw "Missing installed file: $file" }
+          }
+          python -B .setup-tools/scripts/verify-setup-binaries.py src-tauri/target/x86_64-pc-windows-msvc/release $dest
+          if ($LASTEXITCODE -ne 0) { throw 'Installed payload verification failed' }
+          $info = (Get-Item $app).VersionInfo
+          $numericVersion = ($env:APP_VERSION -split '-')[0]
+          if ($info.ProductVersion -notin @($env:APP_VERSION, $numericVersion, "$numericVersion.0")) { throw "Unexpected executable version $($info.ProductVersion)" }
+          $help = (& $mcp --help | Out-String)
+          if ($LASTEXITCODE -ne 0 -or $help -notlike '*codeg-mcp --parent-connection-id*') { throw 'Installed MCP failed' }
+          $files = @(Get-ChildItem $dest -Recurse -File)
+          if ($files | Where-Object { $_.Name -in @('auth.json','tokens.json','config.toml') -or $_.Extension -in @('.db','.sqlite','.pdb') }) { throw 'Unexpected private/build file in installed package' }
+          $hash = (Get-FileHash $setup.FullName -Algorithm SHA256).Hash.ToLower()
+          "$hash  $($setup.Name)" | Set-Content -Encoding ascii "$($setup.FullName).sha256"
+          @{ source_sha=$env:SOURCE_SHA; version=$env:APP_VERSION; file=$setup.Name; size=$setup.Length; sha256=$hash; installed_files=$files.Count; product_version=$info.ProductVersion; installation='passed'; mcp='passed' } | ConvertTo-Json | Set-Content "$env:RUNNER_TEMP/setup-verification.json"
+          "SETUP_PATH=$($setup.FullName)" >> $env:GITHUB_ENV
+          "SETUP_NAME=$($setup.Name)" >> $env:GITHUB_ENV
+      - name: Upload verified supplemental assets without replacing existing files
+        shell: pwsh
+        run: |
+          gh release upload $env:RELEASE_TAG $env:SETUP_PATH "$env:SETUP_PATH.sha256" --repo $env:GITHUB_REPOSITORY
+          if ($LASTEXITCODE -ne 0) { throw 'Setup upload failed' }
+      - name: Re-download and verify published Setup and unchanged Server assets
+        shell: pwsh
+        run: |
+          $dest = Join-Path $env:RUNNER_TEMP 'setup-redownload'
+          gh release download $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --pattern $env:SETUP_NAME --pattern "$env:SETUP_NAME.sha256" --dir $dest
+          if ($LASTEXITCODE -ne 0) { throw 'Download failed' }
+          $file = Join-Path $dest $env:SETUP_NAME
+          $expected = ((Get-Content "$file.sha256" -Raw).Trim() -split '\s+')[0]
+          if ((Get-FileHash $file -Algorithm SHA256).Hash.ToLower() -ne $expected) { throw 'Downloaded checksum mismatch' }
+          if ((Get-FileHash $file).Hash -ne (Get-FileHash $env:SETUP_PATH).Hash) { throw 'Downloaded installer differs from tested installer' }
+          $release = gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --json assets,isDraft,isPrerelease | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $release.isDraft -or $release.isPrerelease) { throw 'Release invalid' }
+          $before = @(Get-Content "$env:RUNNER_TEMP/assets-before.json" -Raw | ConvertFrom-Json)
+          if ($release.assets.Count -ne ($before.Count + 2)) { throw 'Unexpected asset count' }
+          foreach ($old in $before) {
+            $current = @($release.assets | Where-Object name -EQ $old.name)
+            if ($current.Count -ne 1 -or $current[0].id -ne $old.id -or $current[0].size -ne $old.size -or $current[0].digest -ne $old.digest) { throw "Existing asset changed: $($old.name)" }
+          }
+          foreach ($name in @($env:SETUP_NAME, "$env:SETUP_NAME.sha256")) {
+            $asset = @($release.assets | Where-Object name -EQ $name)
+            if ($asset.Count -ne 1 -or $asset[0].size -ne (Get-Item (Join-Path $dest $name)).Length) { throw "Published size mismatch: $name" }
+          }
+          $tagCommit = (git ls-remote origin "refs/tags/$($env:RELEASE_TAG)^{}" | ForEach-Object { ($_ -split '\s+')[0] })
+          if ($LASTEXITCODE -ne 0 -or $tagCommit -ne $env:SOURCE_SHA) { throw 'Published tag moved during build' }
+          Get-Content "$env:RUNNER_TEMP/setup-verification.json"
+      - name: Retain package and binary evidence even on verification failure
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: setup-binary-evidence
+          retention-days: 7
+          path: |
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+            src-tauri/target/x86_64-pc-windows-msvc/release/codeg.exe
+            src-tauri/target/x86_64-pc-windows-msvc/release/codeg-mcp.exe
+            src-tauri/target/x86_64-pc-windows-msvc/release/nsis/**/*.nsi
+            src-tauri/binaries/*.exe
+            ${{ runner.temp }}/codeg-setup-test/*.exe
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: setup-verification
+          path: ${{ runner.temp }}/setup-verification.json
+          if-no-files-found: warn
+  notes:
+    if: inputs.notes_only
+    permissions:
+      contents: write
+      actions: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const repo = context.repo;
+            const {data: run} = await github.rest.actions.getWorkflowRun({...repo, run_id: 34819012298});
+            if (run.conclusion !== 'success' || run.head_sha !== 'cecea8f790da245fb681319123b0e7b7cd57bfef') {
+              throw new Error('Verified supplemental workflow required');
+            }
+            const {data: release} = await github.rest.repos.getReleaseByTag({...repo, tag: 'v0.30.7-fix1'});
+            if (release.draft || release.prerelease || release.assets.length !== 4) throw new Error('Unexpected release state');
+            const asset = release.assets.find(a => a.name === 'codeg_0.30.7-fix1_x64-setup.exe');
+            if (!asset || asset.size !== 63679765 || asset.digest !== 'sha256:dcb3e7a061879b193a6d1362537a4cd33349170651036c2277429b5eecb9da4c') {
+              throw new Error('Setup asset mismatch');
+            }
+            const appendix = fs.readFileSync('docs/releases/v0.30.7-fix1-setup.md', 'utf8').trim();
+            const heading = '## Windows Setup 补发验证（2026-09-14）';
+            let body = release.body || '';
+            if (body.includes(heading)) {
+              if (!body.endsWith(appendix)) throw new Error('Existing supplemental notes differ');
+              return;
+            }
+            body = body.replace('- Windows x64 Server ZIP 与独立 SHA256；包含匹配版本的 Server、codeg-mcp、Web',
+              '- Windows x64 Setup 与独立 SHA256（2026-09-14 补发），以及原有 Server ZIP 与独立 SHA256；Server ZIP 包含匹配版本的 Server、codeg-mcp、Web');
+            await github.rest.repos.updateRelease({...repo, release_id: release.id, body: body.trim() + '\n\n' + appendix});
+            const {data: updated} = await github.rest.repos.getRelease({...repo, release_id: release.id});
+            if (updated.body !== body.trim() + '\n\n' + appendix || updated.draft || updated.prerelease) throw new Error('Notes update verification failed');

@@ -13,9 +13,9 @@
 //! processes contending for one file on disk — on Windows this hit a file
 //! lock and the agent's edit failed with "file is in use".
 //!
-//! A `watch` server is a single long-lived HTTP + SSE process that officecli
-//! itself drives (it refreshes the browser when *officecli* mutates the doc),
-//! so the agent's edits and the preview no longer race for the file.
+//! Each watch reads a private stable review copy. Workspace edits cannot
+//! refresh an already-open review into a half-finished document. Delivery
+//! settlement supplies a new immutable path for the next delivered version.
 //!
 //! ## Concurrency model (mirrors `workspace_state::WORKSPACE_STREAMS`)
 //!
@@ -213,6 +213,8 @@ struct WatchInstance {
     /// Per-watch capability the proxy authenticates against (see `OfficeWatchStarted`).
     cap: String,
     file_canonical: PathBuf,
+    /// Private stable copy, held for exactly the lifetime of the preview.
+    _review_copy: Option<tempfile::TempDir>,
     /// References desktop windows hold. Only their releases (and app exit) take
     /// them off: a desktop preview loads loopback directly, so it never shows a
     /// sign of life here, and sweeping it by idle would yank it from the user.
@@ -320,11 +322,20 @@ impl Drop for StartingChild {
 /// The `wait()` is what still belongs on a task: it only keeps the killed
 /// child from lingering as a zombie while the app keeps running, and losing it
 /// at shutdown costs nothing — the OS reaps our orphans.
-fn reap(mut child: Child) {
+fn reap(child: Child) {
+    reap_with_copy(child, None);
+}
+
+fn reap_watch(entry: WatchInstance) {
+    reap_with_copy(entry.child, entry._review_copy);
+}
+
+fn reap_with_copy(mut child: Child, review: Option<tempfile::TempDir>) {
     let _ = child.start_kill();
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         handle.spawn(async move {
             let _ = child.wait().await;
+            drop(review);
         });
     }
 }
@@ -394,7 +405,10 @@ fn loose_key(root_path: &str, rel_path: &str) -> Option<String> {
 /// `PortTimeout`/`StartFailed`, since it needs our own child to announce the port.
 fn allocate_free_port() -> Result<u16, WatchError> {
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).map_err(|_| WatchError::NoPort)?;
-    let port = listener.local_addr().map_err(|_| WatchError::NoPort)?.port();
+    let port = listener
+        .local_addr()
+        .map_err(|_| WatchError::NoPort)?
+        .port();
     drop(listener);
     Ok(port)
 }
@@ -542,12 +556,21 @@ async fn start_within(
     }
 
     let officecli = resolve_officecli().ok_or(WatchError::NotInstalled)?;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let (review_copy, review_path, _) =
+        crate::db::service::office_delivery_preview_service::freeze_file_bounded(
+            canonical_target.clone(),
+            std::env::temp_dir().join("codeg-office-open-previews"),
+            remaining,
+        )
+        .await
+        .map_err(|error| WatchError::StartFailed(error.to_string()))?;
     let port = allocate_free_port()?;
     // Mint the per-watch capability the proxy will authenticate against.
     let cap = uuid::Uuid::new_v4().simple().to_string();
     let mut child = tokio_command(&officecli)
         .arg("watch")
-        .arg(&canonical_target)
+        .arg(&review_path)
         .arg("--port")
         .arg(port.to_string())
         .stdin(Stdio::null())
@@ -574,7 +597,7 @@ async fn start_within(
             Some(mut child) => {
                 let _ = child.start_kill();
                 let stderr = drain_stderr(&mut child).await;
-                reap(child);
+                reap_with_copy(child, Some(review_copy));
                 stderr
             }
             // Quitting killed it already.
@@ -599,7 +622,7 @@ async fn start_within(
             if matches!(entry.child.try_wait(), Ok(None)) {
                 let winner = take_ref(entry, holder);
                 drop(watches);
-                reap(child);
+                reap_with_copy(child, Some(review_copy));
                 Ok(winner)
             } else {
                 // A dead entry squats the key — replace it below.
@@ -610,7 +633,7 @@ async fn start_within(
                     child,
                     port,
                     cap.clone(),
-                    canonical_target,
+                    (canonical_target, review_copy),
                     holder,
                 )
             }
@@ -619,7 +642,7 @@ async fn start_within(
             // locks don't serialize *across different files*, so the early
             // pre-spawn check can be raced past by concurrent first-opens.
             drop(watches);
-            reap(child);
+            reap_with_copy(child, Some(review_copy));
             Err(WatchError::TooMany)
         } else {
             register_new(
@@ -628,7 +651,7 @@ async fn start_within(
                 child,
                 port,
                 cap.clone(),
-                canonical_target,
+                (canonical_target, review_copy),
                 holder,
             )
         }
@@ -645,14 +668,15 @@ fn register_new(
     child: Child,
     port: u16,
     cap: String,
-    file_canonical: PathBuf,
+    review: (PathBuf, tempfile::TempDir),
     holder: WatchHolder,
 ) -> Result<OfficeWatchStarted, WatchError> {
     let mut entry = WatchInstance {
         child,
         port,
         cap,
-        file_canonical,
+        file_canonical: review.0,
+        _review_copy: Some(review.1),
         desktop_refs: 0,
         web_holds: HashMap::new(),
         last_web_activity: Instant::now(),
@@ -697,7 +721,7 @@ fn reuse_live(key: &str, holder: WatchHolder) -> Option<OfficeWatchStarted> {
         _ => {
             // Dead or errored — prune so the slow path respawns.
             if let Some(dead) = watches.remove(key) {
-                reap(dead.child);
+                reap_watch(dead);
             }
             None
         }
@@ -774,7 +798,7 @@ pub async fn stop_office_watch_core(
         // Removing the entry instantly closes the proxy gate (validate looks it
         // up here), so the port can't be forwarded the moment it's unservable.
         drop(watches);
-        reap(entry.child);
+        reap_watch(entry);
     }
     Ok(())
 }
@@ -963,6 +987,7 @@ pub fn insert_known_port_for_test(port: u16, cap: &str) {
             port,
             cap: cap.to_string(),
             file_canonical: PathBuf::from(format!("/__test__/{port}")),
+            _review_copy: None,
             desktop_refs: 0,
             web_holds: HashMap::from([("__test__".to_string(), Instant::now())]),
             last_web_activity: Instant::now(),
@@ -974,7 +999,7 @@ pub fn insert_known_port_for_test(port: u16, cap: &str) {
 #[cfg(feature = "test-utils")]
 pub fn remove_known_port_for_test(port: u16) {
     if let Some(entry) = lock_watches().remove(&format!("__test__:{port}")) {
-        reap(entry.child);
+        reap_watch(entry);
     }
 }
 
@@ -990,7 +1015,7 @@ pub fn stop_all_office_watches() -> usize {
     };
     let n = drained.len() + starting.len();
     for (_, entry) in drained {
-        reap(entry.child);
+        reap_watch(entry);
     }
     for child in starting {
         reap(child);
@@ -1029,7 +1054,7 @@ pub fn stop_office_watches_under_root(root_path: &str) -> usize {
 
     let n = removed.len();
     for entry in removed {
-        reap(entry.child);
+        reap_watch(entry);
     }
     n
 }
@@ -1305,7 +1330,7 @@ mod tests {
         assert_eq!(lock_watches().get(&key).unwrap().desktop_refs, 2);
 
         if let Some(entry) = lock_watches().remove(&key) {
-            reap(entry.child);
+            reap_watch(entry);
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1404,8 +1429,14 @@ mod tests {
 
     #[test]
     fn parse_watch_port_reads_officecli_announce() {
-        assert_eq!(parse_watch_port("Watch: http://localhost:26411"), Some(26411));
-        assert_eq!(parse_watch_port("Watch: http://127.0.0.1:8080/"), Some(8080));
+        assert_eq!(
+            parse_watch_port("Watch: http://localhost:26411"),
+            Some(26411)
+        );
+        assert_eq!(
+            parse_watch_port("Watch: http://127.0.0.1:8080/"),
+            Some(8080)
+        );
         assert_eq!(parse_watch_port("  Watch: http://localhost:1"), Some(1));
         // Other lines are ignored — crucially `Watching:` is not a false match.
         assert_eq!(parse_watch_port("Watching: /tmp/p.docx"), None);
@@ -1440,6 +1471,7 @@ mod tests {
             port,
             cap: cap.to_string(),
             file_canonical: file.into(),
+            _review_copy: None,
             desktop_refs: 1,
             web_holds: HashMap::new(),
             last_web_activity: Instant::now(),
@@ -1487,7 +1519,7 @@ mod tests {
         seed_live_watch("kp", port, "cap-xyz");
         assert!(is_known_watch_port(port));
         if let Some(e) = lock_watches().remove("kp") {
-            reap(e.child);
+            reap_watch(e);
         }
         assert!(!is_known_watch_port(port));
     }
@@ -1506,7 +1538,7 @@ mod tests {
         assert!(!validate_watch_cap(port, "secret-capX"));
         assert!(!validate_watch_cap(port, ""));
         if let Some(e) = lock_watches().remove("vc") {
-            reap(e.child);
+            reap_watch(e);
         }
         assert!(!validate_watch_cap(port, "secret-cap"));
     }
@@ -1559,7 +1591,7 @@ mod tests {
 
         let _ = lock_watches().remove("shadow-dead");
         if let Some(e) = lock_watches().remove("shadow-live") {
-            reap(e.child);
+            reap_watch(e);
         }
     }
 
@@ -1578,7 +1610,7 @@ mod tests {
         release_sse_lease(port);
         assert_eq!(lock_watches().get("lease").unwrap().sse_leases, 0);
         if let Some(e) = lock_watches().remove("lease") {
-            reap(e.child);
+            reap_watch(e);
         }
     }
 
@@ -1763,7 +1795,7 @@ mod tests {
         assert!(is_known_watch_port(port));
 
         if let Some(e) = lock_watches().remove(&key) {
-            reap(e.child);
+            reap_watch(e);
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1816,7 +1848,7 @@ mod tests {
         assert_eq!(held(), Some((0, 1)));
 
         if let Some(e) = lock_watches().remove(&key) {
-            reap(e.child);
+            reap_watch(e);
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1905,7 +1937,7 @@ mod tests {
         assert_eq!(renewed("theirs"), earlier);
 
         if let Some(e) = lock_watches().remove(&key) {
-            reap(e.child);
+            reap_watch(e);
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1962,7 +1994,7 @@ mod tests {
         );
 
         if let Some(e) = lock_watches().remove(&key) {
-            reap(e.child);
+            reap_watch(e);
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2136,7 +2168,7 @@ mod tests {
             "sweep-mixed",
         ] {
             if let Some(e) = lock_watches().remove(key) {
-                reap(e.child);
+                reap_watch(e);
             }
         }
     }

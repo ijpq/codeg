@@ -1,5 +1,5 @@
 import type { ConversationFolderPickerOverride } from "@/components/chat/conversation-context-bar"
-import type { ReactNode } from "react"
+import { useCallback, useLayoutEffect, useRef, type ReactNode } from "react"
 import type {
   AgentType,
   ConnectionStatus,
@@ -74,6 +74,8 @@ interface ConversationShellProps {
   pendingPlanApproval: PendingPlanApprovalState | null
   onFocus: () => void
   onSend: (draft: PromptDraft, modeId?: string | null) => void
+  supportsSteer?: boolean
+  onGuide?: (draft: PromptDraft) => void | Promise<void>
   onCancel: () => void
   onRespondPermission: (requestId: string, optionId: string) => void
   onAnswerQuestion: (answer: string) => void
@@ -133,6 +135,8 @@ interface ConversationShellProps {
    *  live-feedback channel; threaded straight through to the composer's
    *  queue list. See `ChatInputProps.onQueueSteer`. */
   onQueueSteer?: (id: string) => Promise<void> | void
+  onQueueRetry?: (id: string) => void
+  onConvertGuideToPrompt?: (id: string) => void
   editingItemId?: string | null
   editingDraftText?: string | null
   editingDraftBlocks?: PromptInputBlock[] | null
@@ -151,6 +155,9 @@ interface ConversationShellProps {
   /** Which channel `onSteer` rides (picks the composer's honest copy);
    *  threaded straight through. See `MessageInput`. */
   steerChannel?: "native" | "pull"
+  onForkSend?: (draft: PromptDraft, modeId?: string | null) => void
+  /** Keep the composer editable while a historical ACP session restores. */
+  allowOfflineCompose?: boolean
   /** Optional banner pinned to the top of the panel, above the message area
    *  (e.g. the "restart to apply" config-stale banner). Renders nothing when
    *  omitted. */
@@ -166,6 +173,22 @@ interface ConversationShellProps {
    *  handles' layout maths would be off by the zoom factor, and a card has no
    *  window edge to keep clear. */
   resizableWidth?: boolean
+}
+
+export function publishConversationDockHeight(
+  shell: HTMLElement,
+  dock: HTMLElement
+): number {
+  const height = Math.max(0, dock.getBoundingClientRect().height)
+  const next = `${height}px`
+  if (
+    shell.style.getPropertyValue("--codeg-conversation-bottom-dock-height") !==
+    next
+  ) {
+    shell.style.setProperty("--codeg-conversation-bottom-dock-height", next)
+  }
+  shell.dataset.bottomDockHeight = String(height)
+  return height
 }
 
 export function ConversationShell({
@@ -186,6 +209,8 @@ export function ConversationShell({
   pendingPlanApproval,
   onFocus,
   onSend,
+  supportsSteer,
+  onGuide,
   onCancel,
   onRespondPermission,
   onAnswerQuestion,
@@ -220,23 +245,55 @@ export function ConversationShell({
   onQueueEdit,
   onQueueDelete,
   onQueueSteer,
+  onQueueRetry,
+  onConvertGuideToPrompt,
   editingItemId,
   editingDraftText,
   editingDraftBlocks,
   isEditingQueueItem,
   onSaveQueueEdit,
   onCancelQueueEdit,
+  onForkSend,
   onSteer,
   steerChannel,
+  allowOfflineCompose = false,
   topBanner,
   injectContent,
   onInjectConsumed,
   resizableWidth = false,
 }: ConversationShellProps) {
+  const shellRef = useRef<HTMLDivElement>(null)
+  const bottomDockRef = useRef<HTMLDivElement>(null)
+
+  const publishBottomDockGeometry = useCallback(() => {
+    const shell = shellRef.current
+    const dock = bottomDockRef.current
+    if (!shell || !dock) return
+    publishConversationDockHeight(shell, dock)
+  }, [])
+
+  useLayoutEffect(() => {
+    const dock = bottomDockRef.current
+    if (!dock) return
+
+    const observer = new ResizeObserver(publishBottomDockGeometry)
+    observer.observe(dock)
+    publishBottomDockGeometry()
+
+    const onViewportResize = () => publishBottomDockGeometry()
+    window.addEventListener("resize", onViewportResize)
+    window.visualViewport?.addEventListener("resize", onViewportResize)
+    return () => {
+      observer.disconnect()
+      window.removeEventListener("resize", onViewportResize)
+      window.visualViewport?.removeEventListener("resize", onViewportResize)
+    }
+  }, [publishBottomDockGeometry])
+
   return (
-    // The gutter keeps the chat column (transcript and composer alike) off
-    // the window edge, so its width handles stay grabbable at any width.
     <div
+      ref={shellRef}
+      data-conversation-shell
       className="relative flex h-full min-h-0 flex-col"
       style={resizableWidth ? chatGutterStyle : undefined}
     >
@@ -280,101 +337,116 @@ export function ConversationShell({
 
       <QuestionDialog question={pendingQuestion} onAnswer={onAnswerQuestion} />
 
-      {/* Composer dock. The ask-question card sits in normal flow just above the
-          feedback list and input — like the permission/question dialogs — so it
-          shrinks the message list instead of covering it, while staying aligned
-          to the input width. */}
-      <div>
-        {pendingAskQuestion && pendingAskQuestion.questions.length > 0 && (
-          <div className="mx-auto w-full chat-content-w px-4">
-            <AskQuestionCard
-              question={pendingAskQuestion}
-              onAnswer={onAnswerAskQuestion}
-            />
-          </div>
-        )}
-        {pendingPlanApproval && (
-          <div className="mx-auto w-full chat-content-w px-4">
-            {/* key on approval_id so the card always remounts (fresh in-flight /
-                feedback state) if the slot is ever reused for a new approval. */}
-            <MarkdownImageProvider rootPath={defaultPath ?? null}>
-              <PlanApprovalCard
-                key={pendingPlanApproval.approval_id}
-                approval={pendingPlanApproval}
-                onAnswer={onAnswerPlanApproval}
+      {/* One measured bottom surface. The transcript consumes this live geometry
+          instead of assuming a textarea height: queue rows, approval cards,
+          status/failure strips and the editor can all resize independently. */}
+      <div
+        ref={bottomDockRef}
+        data-conversation-bottom-dock
+        className="shrink-0"
+      >
+        {/* Composer dock. The ask-question card sits in normal flow just above
+            the feedback list and input, so the message viewport normally
+            shrinks rather than being covered. The geometry guard also handles
+            embedded/future layouts where the dock overlaps the viewport. */}
+        <div>
+          {pendingAskQuestion && pendingAskQuestion.questions.length > 0 && (
+            <div className="mx-auto w-full chat-content-w px-4">
+              <AskQuestionCard
+                question={pendingAskQuestion}
+                onAnswer={onAnswerAskQuestion}
               />
-            </MarkdownImageProvider>
-          </div>
-        )}
+            </div>
+          )}
+          {pendingPlanApproval && (
+            <div className="mx-auto w-full chat-content-w px-4">
+              {/* key on approval_id so the card always remounts (fresh in-flight /
+                  feedback state) if the slot is ever reused for a new approval. */}
+              <MarkdownImageProvider rootPath={defaultPath ?? null}>
+                <PlanApprovalCard
+                  key={pendingPlanApproval.approval_id}
+                  approval={pendingPlanApproval}
+                  onAnswer={onAnswerPlanApproval}
+                />
+              </MarkdownImageProvider>
+            </div>
+          )}
 
-        {composerBanner && (
-          <div className="mx-auto w-full chat-content-w px-4 pb-2">
-            {composerBanner}
-          </div>
-        )}
+          {composerBanner && (
+            <div className="mx-auto w-full chat-content-w px-4 pb-2">
+              {composerBanner}
+            </div>
+          )}
 
-        {!hideInput && feedbackList && (
-          <div className="mx-auto w-full chat-content-w px-4">
-            {feedbackList}
-          </div>
-        )}
+          {!hideInput && feedbackList && (
+            <div className="mx-auto w-full chat-content-w px-4">
+              {feedbackList}
+            </div>
+          )}
 
-        {!hideInput && (
-          <div className="mx-auto w-full chat-content-w">
-            <ChatInput
-              status={status}
-              promptCapabilities={promptCapabilities}
-              defaultPath={defaultPath}
-              agentName={agentName}
-              onFocus={onFocus}
-              onSend={onSend}
-              onCancel={onCancel}
-              modes={modes}
-              configOptions={configOptions}
-              modeLoading={modeLoading}
-              configOptionsLoading={configOptionsLoading}
-              selectorsLoading={selectorsLoading}
-              selectedModeId={selectedModeId}
-              onModeChange={onModeChange}
-              onConfigOptionChange={onConfigOptionChange}
-              agentType={agentType}
-              availableCommands={availableCommands}
-              promptSuggestion={promptSuggestion}
-              attachmentTabId={attachmentTabId}
-              folderPickerOverride={folderPickerOverride}
-              draftStorageKey={draftStorageKey}
-              getSentHistory={getSentHistory}
-              isActive={isActive}
-              showActiveFlow={showActiveFlow}
-              queue={queue}
-              onEnqueue={onEnqueue}
-              onQueueReorder={onQueueReorder}
-              onQueueEdit={onQueueEdit}
-              onQueueDelete={onQueueDelete}
-              onQueueSteer={onQueueSteer}
-              editingItemId={editingItemId}
-              editingDraftText={editingDraftText}
-              editingDraftBlocks={editingDraftBlocks}
-              isEditingQueueItem={isEditingQueueItem}
-              onSaveQueueEdit={onSaveQueueEdit}
-              onCancelQueueEdit={onCancelQueueEdit}
-              onSteer={onSteer}
-              steerChannel={steerChannel}
-              onAddFeedback={onAddFeedback}
-              feedbackAddDisabled={feedbackAddDisabled}
-              injectContent={injectContent}
-              onInjectConsumed={onInjectConsumed}
-            />
-          </div>
-        )}
+          {!hideInput && (
+            <div className="mx-auto w-full chat-content-w">
+              <ChatInput
+                status={status}
+                promptCapabilities={promptCapabilities}
+                defaultPath={defaultPath}
+                agentName={agentName}
+                onFocus={onFocus}
+                onSend={onSend}
+                supportsSteer={supportsSteer}
+                onGuide={onGuide}
+                onCancel={onCancel}
+                modes={modes}
+                configOptions={configOptions}
+                modeLoading={modeLoading}
+                configOptionsLoading={configOptionsLoading}
+                selectorsLoading={selectorsLoading}
+                selectedModeId={selectedModeId}
+                onModeChange={onModeChange}
+                onConfigOptionChange={onConfigOptionChange}
+                agentType={agentType}
+                promptSuggestion={promptSuggestion}
+                availableCommands={availableCommands}
+                attachmentTabId={attachmentTabId}
+                folderPickerOverride={folderPickerOverride}
+                draftStorageKey={draftStorageKey}
+                getSentHistory={getSentHistory}
+                isActive={isActive}
+                showActiveFlow={showActiveFlow}
+                queue={queue}
+                onEnqueue={onEnqueue}
+                onQueueReorder={onQueueReorder}
+                onQueueEdit={onQueueEdit}
+                onQueueDelete={onQueueDelete}
+                onQueueSteer={onQueueSteer}
+                onQueueRetry={onQueueRetry}
+                onConvertGuideToPrompt={onConvertGuideToPrompt}
+                editingItemId={editingItemId}
+                editingDraftText={editingDraftText}
+                editingDraftBlocks={editingDraftBlocks}
+                isEditingQueueItem={isEditingQueueItem}
+                onSaveQueueEdit={onSaveQueueEdit}
+                onCancelQueueEdit={onCancelQueueEdit}
+                onForkSend={onForkSend}
+                onSteer={onSteer}
+                steerChannel={steerChannel}
+                allowOfflineCompose={allowOfflineCompose}
+                onAddFeedback={onAddFeedback}
+                feedbackAddDisabled={feedbackAddDisabled}
+                injectContent={injectContent}
+                onInjectConsumed={onInjectConsumed}
+              />
+            </div>
+          )}
+        </div>
+
+        <ComposerStatusStrips
+          status={status}
+          claudeApiRetry={claudeApiRetry}
+          sessionFailures={sessionFailures}
+          onSessionFailureDismiss={onSessionFailureDismiss}
+        />
       </div>
-
-      <ComposerStatusStrips
-        status={status}
-        claudeApiRetry={claudeApiRetry}
-        sessionFailures={sessionFailures}
-        onSessionFailureDismiss={onSessionFailureDismiss}
-      />
     </div>
   )
 }

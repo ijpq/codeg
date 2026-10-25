@@ -1,6 +1,11 @@
 "use client"
 
 import { memo, useState } from "react"
+import { useTranslations } from "next-intl"
+import { Download } from "lucide-react"
+import { toast } from "sonner"
+import { downloadOfficeDeliveryPreview } from "@/lib/api"
+import type { OfficeDeliveryPreview } from "@/lib/types"
 
 import { OfficePreview } from "@/components/files/office-preview"
 import {
@@ -73,9 +78,13 @@ export function KeptOfficePreviews() {
   const fileTabs = allFileTabs ?? visibleFileTabs
   const activeId =
     activeFileTab && isOfficeFileTab(activeFileTab) ? activeFileTab.id : null
-  const paths = new Map<string, string | null>()
+  const paths = new Map<
+    string,
+    { path: string | null; delivery?: OfficeDeliveryPreview }
+  >()
   for (const tab of fileTabs) {
-    if (isOfficeFileTab(tab)) paths.set(tab.id, tab.path)
+    if (isOfficeFileTab(tab))
+      paths.set(tab.id, { path: tab.path, delivery: tab.officeDelivery })
   }
 
   const [kept, setKept] = useState<readonly string[]>([])
@@ -86,8 +95,9 @@ export function KeptOfficePreviews() {
     <>
       {next.map((id) => (
         <KeptOfficePreview
-          key={id}
-          path={paths.get(id) ?? null}
+          key={`${id}:${paths.get(id)?.delivery?.turn_run_id ?? "manual"}`}
+          path={paths.get(id)?.path ?? null}
+          delivery={paths.get(id)?.delivery}
           shown={id === activeId}
         />
       ))}
@@ -107,26 +117,61 @@ export function KeptOfficePreviews() {
  */
 const KeptOfficePreview = memo(function KeptOfficePreview({
   path,
+  delivery,
   shown,
 }: {
   path: string | null
+  delivery?: OfficeDeliveryPreview
   shown: boolean
 }) {
-  const io = path ? splitAbsPath(path) : null
+  const t = useTranslations("Folder.fileWorkspacePanel")
+  const target = delivery?.snapshot_path ?? path
+  const io = target ? splitAbsPath(target) : null
   return (
     <div
       className={cn(
-        "absolute inset-0",
+        "absolute inset-0 flex min-h-0 flex-col",
         !shown && "conversation-tab-hidden invisible"
       )}
       aria-hidden={!shown || undefined}
       inert={!shown || undefined}
     >
-      <OfficePreview
-        rootPath={io?.rootPath ?? null}
-        relPath={io?.ioPath ?? null}
-        active={shown}
-      />
+      <div
+        className="flex shrink-0 items-center justify-between gap-2 border-b px-3 py-2 text-xs"
+        data-office-review-run={delivery?.turn_run_id}
+        data-office-review-sha={delivery?.sha256}
+      >
+        <span className="min-w-0 truncate" title={path ?? undefined}>
+          {delivery
+            ? t("officeDeliveredReview", {
+                name: delivery.file_name ?? "",
+                time: new Date(delivery.completed_at).toLocaleString(),
+                run: delivery.turn_run_id.slice(-8),
+              })
+            : t("officeManualReview")}
+        </span>
+        {delivery && (
+          <button
+            type="button"
+            aria-label={t("officeReviewDownload")}
+            className="shrink-0"
+            onClick={() => {
+              void downloadOfficeDeliveryPreview(delivery).catch(() =>
+                toast.error(t("officeWatchFailed"))
+              )
+            }}
+          >
+            <Download className="size-3.5" />
+          </button>
+        )}
+      </div>
+      <div className="relative min-h-0 flex-1">
+        <OfficePreview
+          rootPath={io?.rootPath ?? null}
+          relPath={io?.ioPath ?? null}
+          active={shown}
+        />
+      </div>
     </div>
   )
 })

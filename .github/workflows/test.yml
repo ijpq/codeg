@@ -8,6 +8,7 @@ on:
 
 env:
   RUST_BACKTRACE: short
+  CARGO_BUILD_JOBS: 1
   # Refuse to silently regenerate snapshots in CI — any drift must be
   # accepted locally with `cargo insta review` and committed.
   INSTA_UPDATE: "no"
@@ -22,7 +23,9 @@ env:
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 concurrency:
-  group: test-${{ github.ref }}
+  # Separate the custom Windows scope from already-running full-platform jobs,
+  # so adopting this policy does not cancel their unfinished Windows checks.
+  group: test-${{ github.ref }}-${{ github.repository == 'ijpq/codeg' && 'windows-shared' || 'all-platforms' }}
   cancel-in-progress: true
 
 jobs:
@@ -68,8 +71,53 @@ jobs:
       - name: Unit tests (vitest)
         run: pnpm test
 
+      - name: Published Codex ACP terminal and AIR regression
+        run: node --test scripts/test-codex-air-terminal.mjs
+
+      - name: Official SQLite migration compatibility regression
+        run: python3 -B scripts/test-codex-runtime-migrations.py
+
+      - name: Cross-platform resume context comparison regression
+        run: python3 -B scripts/test-codex-resume-comparison.py
+
+      - name: NSIS payload verification regression
+        run: python3 -B scripts/test-verify-setup-binaries.py
+
+      - name: Draft release reuse regression
+        run: node --test scripts/test-release-draft.mjs
+
+      - name: Custom Windows CI scope regression
+        run: node --test scripts/test-custom-ci-scope.mjs
+
+      - name: Web handlers must route through commands/*_core
+        working-directory: src-tauri
+        run: |
+          if grep -nE 'folder_service::|conversation_service::|tab_service::|import_service::' \
+             src/web/handlers/folders.rs \
+             src/web/handlers/conversations.rs; then
+            echo "::error::Web handlers must call commands/*_core, not services directly."
+            exit 1
+          fi
+
       - name: Static export build
         run: pnpm build
+
+  shared-integration:
+    name: Shared parser and HTTP integration tests
+    if: github.repository == 'ijpq/codeg'
+    # These exercise shared parsers, SQLite, auth and the HTTP router. No Tauri,
+    # Linux/macOS client, system webview libraries or platform package is built.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+          shared-key: shared-headless-integration
+      - name: Run shared integration suites without a desktop runtime
+        working-directory: src-tauri
+        run: cargo test --no-default-features --features test-utils --test parsers_snapshot --test api_integration
 
   rust:
     name: Rust ${{ matrix.mode }} on ${{ matrix.os }}
@@ -77,7 +125,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, macos-latest, windows-latest]
+        # The self-use fork ships Windows only; upstream retains its matrix.
+        os: ${{ fromJSON(github.repository == 'ijpq/codeg' && '["windows-latest"]' || '["ubuntu-22.04","macos-latest","windows-latest"]') }}
         mode: [desktop, server, cli]
         include:
           - mode: desktop
@@ -119,6 +168,20 @@ jobs:
         with:
           components: clippy
 
+      # The standard ARM macOS runner has 7 GB RAM. The workspace library
+      # and its test binary otherwise compile at the same time, each using
+      # several GB. Keep the exact test/clippy scope while reducing compiler
+      # concurrency and debug-info generation; test threads are unchanged.
+      - name: Fit macOS Rust compilation within runner memory
+        if: matrix.os == 'macos-latest'
+        shell: bash
+        run: |
+          {
+            echo "CARGO_BUILD_JOBS=1"
+            echo "CARGO_PROFILE_DEV_DEBUG=0"
+            echo "CARGO_PROFILE_TEST_DEBUG=0"
+          } >> "$GITHUB_ENV"
+
       - name: Rust cache
         uses: swatinem/rust-cache@v2
         with:
@@ -144,13 +207,15 @@ jobs:
         shell: bash
         run: |
           mkdir -p out
+          mkdir -p dist/pi-runtime
           printf '<!doctype html><html><body></body></html>\n' > out/index.html
 
       - name: cargo test
         # Windows desktop test binaries link the Tauri runtime and can fail at
         # process load on GitHub-hosted runners before Rust tests start. Keep
-        # compile coverage here; Linux/macOS desktop and Windows server cells
-        # run the executable test suites.
+        # compile coverage here; Windows server runs shared unit tests and the
+        # headless shared-integration job executes parser/router integration.
+        # Packaged desktop execution is checked in isolated Windows UI jobs.
         working-directory: src-tauri
         run: cargo test ${{ matrix.cargo_args }} ${{ (matrix.os == 'windows-latest' && matrix.mode == 'desktop') && '--no-run' || '' }}
 
@@ -162,21 +227,116 @@ jobs:
         working-directory: src-tauri
         run: cargo clippy ${{ matrix.clippy_args }} -- -D warnings
 
-      - name: Web handlers must route through commands/*_core
-        # Lock in the dedup from Phase 8: web/handlers/{folders,conversations}.rs
-        # must not call DB services directly. They have to delegate to a
-        # `_core` function in `commands/*.rs` so the Tauri command and HTTP
-        # entrypoints share one implementation. Run on Linux only — pure
-        # text check, no per-OS variance.
-        if: matrix.os == 'ubuntu-22.04' && matrix.mode == 'desktop'
-        working-directory: src-tauri
+  codex-recovery:
+    name: Codex recovery on ${{ matrix.os }}
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(github.repository == 'ijpq/codeg' && '["windows-2022"]' || '["ubuntu-22.04","windows-2022"]') }}
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_BUILD_JOBS: 1
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: clippy
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Verify runtime build regressions
         run: |
-          if grep -nE 'folder_service::|conversation_service::|tab_service::|import_service::' \
-             src/web/handlers/folders.rs \
-             src/web/handlers/conversations.rs; then
-            echo "::error::Web handlers must call commands/*_core, not services directly."
-            exit 1
-          fi
+          python -B scripts/test-codex-runtime-migrations.py
+          python -B scripts/test-codex-runtime-cache.py
+          python -B scripts/test-codex-resume-comparison.py
+          python -B scripts/test-reuse-tested-codex-build.py
+      - name: Install native build prerequisites
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev libcap-dev pkg-config cmake clang strace
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install isolated reference CLI
+        run: npm install --prefix "$RUNNER_TEMP/codeg-codex-reference" --ignore-scripts --no-audit --no-fund @openai/codex@0.162.1
+      - name: Reuse an identical originally tested Windows runtime
+        id: codex-build
+        if: github.repository == 'ijpq/codeg' && runner.os == 'Windows'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python -B scripts/reuse-tested-codex-build.py --output-dir "$RUNNER_TEMP/codeg-codex-runtime"
+      - name: Prepare exact pinned runtime source
+        if: steps.codex-build.outputs.reused != 'true'
+        run: python -B scripts/build-codex-runtime.py --source-dir "$RUNNER_TEMP/codeg-codex-source" --output-dir "$RUNNER_TEMP/codeg-codex-runtime" --prepare-only
+      - uses: swatinem/rust-cache@v2
+        if: steps.codex-build.outputs.reused != 'true'
+        with:
+          workspaces: "${{ runner.temp }}/codeg-codex-source/codex-rs -> ../../codeg-codex-target"
+          shared-key: codex-recovery-target-v3-${{ matrix.os }}-${{ hashFiles('vendor/codex-runtime/**', 'scripts/build-codex-runtime.py', '.github/workflows/test.yml') }}
+          cache-workspace-crates: true
+          cache-on-failure: true
+      - name: Test and build pinned recovery runtime
+        if: steps.codex-build.outputs.reused != 'true'
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/codeg-codex-target
+        run: python -B scripts/build-codex-runtime.py --source-dir "$RUNNER_TEMP/codeg-codex-source" --output-dir "$RUNNER_TEMP/codeg-codex-runtime"
+      - name: Verify model context, tools, images, restart and invalidation
+        run: |
+          python - <<'PY'
+          import os, subprocess, sys
+          from pathlib import Path
+          scratch=Path(os.environ['RUNNER_TEMP'])
+          suffix='.exe' if os.name=='nt' else ''
+          references=[p for p in (scratch/'codeg-codex-reference/node_modules/@openai').rglob('codex'+suffix) if p.is_file()]
+          if len(references)!=1:
+            raise RuntimeError(f'Expected one installed reference CLI, found {references}')
+          reference=references[0]
+          if subprocess.check_output([str(reference),'--version'],text=True).strip()!='codex-cli 0.162.1':
+            raise RuntimeError('Reference CLI version does not match the pin')
+          subprocess.run([sys.executable,'-B','scripts/test-codex-resume.py',
+            '--cli',str(scratch/'codeg-codex-runtime'/('codex'+suffix)),
+            '--baseline-cli',str(reference),'--output',str(scratch/'codeg-codex-evidence'),
+            '--size-mib','64','--trace'],check=True)
+          PY
+      - name: Verify one full read for old checkpoint fallback
+        if: runner.os == 'Linux'
+        run: python3 -B scripts/test-codex-resume.py --cli "$RUNNER_TEMP/codeg-codex-runtime/codex" --output "$RUNNER_TEMP/codeg-codex-evidence/legacy-full-read" --size-mib 64 --checkpoint-mode legacy --trace
+      - name: Verify current and newer ACP adapters on the pinned runtime
+        if: runner.os == 'Linux'
+        run: |
+          npm install --prefix "$RUNNER_TEMP/codeg-acp-211" --ignore-scripts --no-audit --no-fund @agentclientprotocol/codex-acp@2.1.1
+          npm install --prefix "$RUNNER_TEMP/codeg-acp-222" --ignore-scripts --no-audit --no-fund @agentclientprotocol/codex-acp@2.2.2
+          python3 -B scripts/diagnose-codex-resume-layers.py --cli "$RUNNER_TEMP/codeg-codex-runtime/codex" --acp "$RUNNER_TEMP/codeg-acp-211/node_modules/.bin/codex-acp" --output "$RUNNER_TEMP/codeg-codex-evidence/acp-211" --size-mib 64 --fast --verify-prompt
+          python3 -B scripts/diagnose-codex-resume-layers.py --cli "$RUNNER_TEMP/codeg-codex-runtime/codex" --acp "$RUNNER_TEMP/codeg-acp-222/node_modules/.bin/codex-acp" --output "$RUNNER_TEMP/codeg-codex-evidence/acp-222" --size-mib 64 --fast --verify-prompt
+      - name: Install the pinned native Plan and Goal adapter
+        run: npm install --prefix "$RUNNER_TEMP/codeg-acp-222" --ignore-scripts --no-audit --no-fund @agentclientprotocol/codex-acp@2.2.2
+      - name: Verify native Plan and Goal on the shipped runtime
+        run: |
+          suffix=""
+          if [ "$RUNNER_OS" = "Windows" ]; then suffix=".exe"; fi
+          python -B scripts/test-codex-goal-protocol.py --cli "$RUNNER_TEMP/codeg-codex-runtime/codex$suffix" --acp "$RUNNER_TEMP/codeg-acp-222/node_modules/@agentclientprotocol/codex-acp/dist/index.js" --output "$RUNNER_TEMP/codeg-codex-evidence/native-goal"
+      - name: Retain tested private runtime for this exact commit
+        uses: actions/upload-artifact@v4
+        with:
+          name: tested-codex-runtime-${{ runner.os }}-${{ runner.arch }}
+          path: ${{ runner.temp }}/codeg-codex-runtime/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Retain recovery diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-recovery-evidence-${{ runner.os }}
+          path: ${{ runner.temp }}/codeg-codex-evidence
+          if-no-files-found: warn
 
       - name: Superpowers standalone skill helper layouts
         # executing-plans ships local copies of its sibling helpers so the
@@ -185,6 +345,8 @@ jobs:
         run: bash scripts/test-superpowers-skill-layouts.sh
 
   install-sh:
+    # Unix installer checks are not a gate for the Windows-only self-use fork.
+    if: github.repository != 'ijpq/codeg'
     # install.sh stops what runs the files it replaces, and nothing else: on
     # Linux `cp` onto a running program fails, but the desktop app, other
     # users, other directories and containers run a codeg-server or codeg-mcp

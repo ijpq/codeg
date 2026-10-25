@@ -546,7 +546,7 @@ function VirtualizedMessageThreadImpl<T>({
   return (
     <MessageScrollProvider value={scrollContextValue}>
       <MessageThreadContent
-        className={cn("mx-0 max-w-none p-0", contentClassName)}
+        className={cn("mx-0 max-w-none gap-0 p-0", contentClassName)}
         scrollClassName="chat-scroll-port scrollbar-thin overscroll-contain [overflow-anchor:none] outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset data-[focus-origin=pointer]:focus-visible:ring-0"
         {...contentProps}
       >
@@ -587,6 +587,10 @@ function VirtualizedMessageThreadImpl<T>({
             {items.map((item, index) => (
               <div
                 key={getItemKey(item, index)}
+                data-message-thread-row
+                data-message-thread-last={
+                  index === items.length - 1 ? "true" : undefined
+                }
                 style={itemStyle(index, items.length)}
               >
                 <div className={cn("mx-auto chat-content-w px-4", className)}>
@@ -596,6 +600,20 @@ function VirtualizedMessageThreadImpl<T>({
             ))}
           </Virtualizer>
         )}
+        {/* A non-virtualised, stable bottom target. The geometry guard updates
+            its margins from actual DOM measurements: margin-top compensates a
+            temporarily under-measured final virtual row; margin-bottom clears
+            any real composer overlap plus a small visual breathing space. */}
+        <div
+          data-message-end-sentinel
+          aria-hidden="true"
+          className="pointer-events-none h-px shrink-0"
+          style={{
+            marginTop: "var(--codeg-message-virtual-overflow-correction, 0px)",
+            marginBottom:
+              "calc(var(--codeg-conversation-bottom-dock-overlap, 0px) + 12px)",
+          }}
+        />
       </MessageThreadContent>
     </MessageScrollProvider>
   )

@@ -1,5 +1,6 @@
 import {
   getActiveRemoteConnectionId,
+  getServerBaseUrl,
   getShellTransport,
   getTransport,
   isDesktop,
@@ -69,12 +70,17 @@ import type {
   ConversationDetail,
   ConversationOutline,
   ConversationTurnsPage,
+  ConversationBranchMergePreviewPage,
+  ConversationSourceBranchPreviewPage,
+  ConversationOutputWindow,
+  MessageTurn,
   DbConversationDetail,
   FolderInfo,
   AgentStats,
   SidebarData,
   ConnectionInfo,
   ConversationConnectionInfo,
+  RestoredConversationConnectionInfo,
   LiveSessionSnapshot,
   FeedbackItem,
   QuestionAnswer,
@@ -97,6 +103,7 @@ import type {
   ProviderModelsRequest,
   CodexCatalogStatus,
   CodexEndpointCatalogView,
+  CodexQuotaSnapshot,
   AgentSkillScope,
   AgentSkillLayout,
   AgentSkillItem,
@@ -135,6 +142,10 @@ import type {
   ImportSelectedResult,
   ScanResult,
   SelectedSessionKey,
+  ConversationDeliverable,
+  OfficeDeliveryPreview,
+  ConversationDeliverableHistoryPage,
+  ConversationTurnDeliverableSet,
   OpenedTab,
   OpenedTabsSnapshot,
   SaveTabsOutcome,
@@ -159,12 +170,14 @@ import type {
   TerminalInfo,
   TerminalSnapshot,
   PromptInputBlock,
+  SteerResult,
   FileTreeNode,
   WorkspaceFileEntry,
   DirectoryEntry,
   DirectoryItem,
   UploadAttachmentResult,
   FilePreviewContent,
+  WorkspaceFileStat,
   FileEditContent,
   FileSaveResult,
   WorkspaceSnapshotResponse,
@@ -201,6 +214,7 @@ import type {
   ChatChannelMessageLog,
   WebhookConfig,
   ModelProviderInfo,
+  ModelProviderProbeResult,
   UpdateModelProviderResult,
   OpencodePluginList,
   OpenCodeCatalogProvider,
@@ -217,6 +231,13 @@ import type {
   TokenUsageSyncResult,
   TokenUsageSyncStatus,
 } from "./types"
+
+let acpLifecycleGeneration = 0
+
+function nextAcpLifecycleGeneration(): number {
+  acpLifecycleGeneration += 1
+  return acpLifecycleGeneration
+}
 
 export async function listConversations(params?: {
   agent_type?: AgentType | null
@@ -315,6 +336,34 @@ export function stripUploadedImagePayloads(
   })
 }
 
+/**
+ * Restore a persisted conversation using the DB row's authoritative agent,
+ * folder and external session id. An already-running turn returns its verified
+ * live connection as `active_turn_attached`; an idle conversation returns only
+ * after resume/load, MCP configuration and the conversation→connection
+ * switchover all succeed.
+ */
+export async function acpRestoreConversation(
+  conversationId: number,
+  preferredModeId?: string | null,
+  preferredConfigValues?: Record<string, string> | null
+): Promise<RestoredConversationConnectionInfo> {
+  return getTransport().call(
+    "acp_restore_conversation",
+    {
+      conversationId,
+      preferredModeId: preferredModeId ?? null,
+      preferredConfigValues: preferredConfigValues ?? null,
+    },
+    // Large Codex rollouts routinely need >60s for session/resume. The web
+    // transport's old default aborted the caller while the ACP writer kept
+    // running, then the UI retry created the active-writer conflict. Let the
+    // backend's bounded restore supervisor (default 300s, configurable up to
+    // 1800s) own the deadline and return its structured terminal result.
+    { timeoutMs: 1_830_000 }
+  )
+}
+
 export async function acpPrompt(
   connectionId: string,
   blocks: PromptInputBlock[],
@@ -323,22 +372,47 @@ export async function acpPrompt(
   clientMessageId: string | null = null
 ): Promise<void> {
   try {
-    await getTransport().call("acp_prompt", {
-      connectionId,
-      // Strip in every mode where the prompt leaves through an HTTP body:
-      // pure web (`!isDesktop`) and desktop-attached-to-remote-workspace.
-      blocks: stripUploadedImagePayloads(
-        blocks,
-        !isDesktop() || getActiveRemoteConnectionId() !== null
-      ),
-      folderId,
-      conversationId,
-      clientMessageId,
-    })
+    const transport = getTransport()
+    // A remote-desktop window can retain a healthy HTTP path while its event
+    // WebSocket is still re-attaching. Wait for the stream first so the
+    // cross-client UserMessage acknowledgement cannot fall into that gap.
+    await transport.waitForReady?.()
+    await transport.call(
+      "acp_prompt",
+      {
+        connectionId,
+        // Strip in every mode where the prompt leaves through an HTTP body:
+        // pure web (`!isDesktop`) and desktop-attached-to-remote-workspace.
+        blocks: stripUploadedImagePayloads(
+          blocks,
+          !isDesktop() || getActiveRemoteConnectionId() !== null
+        ),
+        folderId,
+        conversationId,
+        clientMessageId,
+      },
+      // RemoteDesktopTransport otherwise cancels the request after 30s. Cold
+      // recursive workspace watcher setup happens before prompt enqueue so a
+      // large/network workspace can legitimately need longer; cancellation in
+      // that window means the agent never receives the message.
+      { timeoutMs: 120_000 }
+    )
   } catch (e) {
     if (isTurnInProgressRejection(e)) throw new TurnBusyError()
     throw e
   }
+}
+
+export async function acpSteer(
+  connectionId: string,
+  blocks: PromptInputBlock[],
+  clientMessageId: string
+): Promise<SteerResult> {
+  return getTransport().call("acp_steer", {
+    connectionId,
+    blocks,
+    clientMessageId,
+  })
 }
 
 export async function acpSetMode(
@@ -360,18 +434,61 @@ export async function acpSetConfigOption(
   })
 }
 
-/** Pause or clear the session's active Codex goal (codex-acp #293). The backend
- *  sources the sessionId from the live session, so only the connection + action
- *  are needed here. */
+/** Native Goal control. A draft's first Goal binds its pre-created history row
+ * before sending the native RPC; it never sends an ordinary prompt. */
 export async function acpGoalControl(
   connectionId: string,
-  action: "pause" | "clear"
+  action: "set" | "pause" | "resume" | "clear",
+  objective?: string,
+  conversationId?: number
 ): Promise<void> {
-  return getTransport().call("acp_goal_control", { connectionId, action })
+  return getTransport().call("acp_goal_control", {
+    connectionId,
+    action,
+    objective,
+    conversationId,
+  })
 }
 
-export async function acpCancel(connectionId: string): Promise<void> {
-  return getTransport().call("acp_cancel", { connectionId })
+export interface SessionGoalState {
+  goal: {
+    objective: string
+    status: string
+    tokensUsed?: number
+    tokenBudget?: number | null
+    timeUsedSeconds?: number
+  } | null
+  actions: string[] | null
+}
+
+/** Reads only the adapter's authoritative goal, without cloning history. */
+export async function acpGetGoalState(
+  connectionId: string
+): Promise<SessionGoalState> {
+  return getTransport().call("acp_get_goal_state", { connectionId })
+}
+
+export interface AcpCancelResult {
+  outcome:
+    | "cancelled"
+    | "cancel_requested"
+    | "already_cancelling"
+    | "already_finished"
+    | "run_not_found"
+  cancelRequestId: string
+  turnRunId?: string | null
+  conversationId?: number | null
+  deadlineAt?: string | null
+}
+
+export async function acpCancel(
+  connectionId: string
+): Promise<AcpCancelResult> {
+  return getTransport().call("acp_cancel", {
+    connectionId,
+    requestSource: "user_stop",
+    frontendGeneration: nextAcpLifecycleGeneration(),
+  })
 }
 
 export interface ForkResult {
@@ -477,7 +594,11 @@ export async function acpAnswerPlanApproval(
 }
 
 export async function acpDisconnect(connectionId: string): Promise<void> {
-  return getTransport().call("acp_disconnect", { connectionId })
+  return getTransport().call("acp_disconnect", {
+    connectionId,
+    requestSource: "frontend_disconnect",
+    frontendGeneration: nextAcpLifecycleGeneration(),
+  })
 }
 
 export async function acpTouchConnection(
@@ -1916,12 +2037,52 @@ export async function officecliRenderHtml(
   return getTransport().call("officecli_render_html", { rootPath, path })
 }
 
+/** Read a normally completed and settled turn's immutable review copy. */
+export async function getOfficeDeliveryPreview(
+  conversationId: number,
+  turnRunId: string
+): Promise<OfficeDeliveryPreview | null> {
+  return getTransport().call("get_office_delivery_preview", {
+    conversationId,
+    turnRunId,
+  })
+}
+
+/** Download exactly the review bytes, including after the workspace changes. */
+export async function downloadOfficeDeliveryPreview(
+  preview: OfficeDeliveryPreview
+) {
+  const io = preview.snapshot_path
+    ? splitOfficeReviewPath(preview.snapshot_path)
+    : null
+  if (!io) throw new Error("Office review copy is unavailable")
+  const name = preview.file_name ?? io.path
+  if (isDesktop() && !isRemoteDesktopMode()) {
+    const { save } = await import("@tauri-apps/plugin-dialog")
+    const destination = await save({ defaultPath: name })
+    if (!destination) return { status: WORKSPACE_DOWNLOAD_CANCELLED }
+    await getShellTransport().call("save_office_delivery_preview", {
+      conversationId: preview.conversation_id,
+      turnRunId: preview.turn_run_id,
+      destination,
+    })
+    return { status: "done" as const, savedPath: destination }
+  }
+  return downloadWorkspaceFile(io.root, io.path, name)
+}
+
+function splitOfficeReviewPath(path: string) {
+  const index = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"))
+  return index >= 0
+    ? { root: path.slice(0, index) || "/", path: path.slice(index + 1) }
+    : null
+}
+
 /**
  * Start (or share, by ref-count) a long-lived `officecli watch` preview server
  * for an office file and return its loopback `port` plus a per-watch `cap`
- * capability. `path` is relative to `rootPath`. Live refresh is driven by
- * officecli's own SSE channel, so the preview no longer re-reads (and locks)
- * the file the way the one-shot {@link officecliRenderHtml} did.
+ * capability. `path` is relative to `rootPath`. The watch renders a stable private copy, so later workspace edits cannot
+ * refresh an opened review into a process draft.
  *
  * `cap` names this watch: a new one mints a new `cap`. Web/server mode also
  * authenticates the iframe with it, loading the preview through the
@@ -2563,21 +2724,254 @@ export async function importSelectedSessions(
 }
 
 /**
- * Fetch a conversation's detail, optionally windowed:
- * - `{ tailTurns }` — last N turns, start aligned to a user-round boundary
- * - `{ fromIndex }` — exact slice `turns[fromIndex..]` (window refresh)
- * No window → legacy full response (also what an old server returns for any
- * request; the windowed fields are then absent).
+ * Fetch a conversation's bounded detail page:
+ * - `{ tailTurns }` — legacy last-N window compatibility
+ * - `{ fromIndex }` — legacy exact-index window compatibility
+ * No selector means the server's bounded newest page. Full history is never an
+ * implicit side effect of opening a conversation; export/search explicitly
+ * walk opaque cursor pages.
  */
+interface FolderConversationFlight {
+  promise: Promise<DbConversationDetail>
+  controller: AbortController
+  consumers: number
+  settled: boolean
+  generation: number | null
+  reload: boolean
+}
+
+interface FolderConversationCacheEntry {
+  detail: DbConversationDetail
+  storedAt: number
+  usedAt: number
+}
+
+const FOLDER_CONVERSATION_CACHE_TTL_MS = 30_000
+const FOLDER_CONVERSATION_CACHE_MAX_ENTRIES = 8
+const folderConversationFlights = new Map<string, FolderConversationFlight>()
+const folderConversationCache = new Map<string, FolderConversationCacheEntry>()
+let folderConversationRequestSequence = 0
+
+function cancelledRequestError(): Error {
+  const error = new Error("Request cancelled")
+  error.name = "AbortError"
+  return error
+}
+
+function attachFolderConversationFlight(
+  flight: FolderConversationFlight,
+  signal?: AbortSignal
+): Promise<DbConversationDetail> {
+  if (signal?.aborted) return Promise.reject(cancelledRequestError())
+  flight.consumers += 1
+  return new Promise((resolve, reject) => {
+    let finished = false
+    const release = () => {
+      if (finished) return
+      finished = true
+      signal?.removeEventListener("abort", onAbort)
+      flight.consumers = Math.max(0, flight.consumers - 1)
+      if (!flight.settled && flight.consumers === 0) {
+        flight.controller.abort()
+      }
+    }
+    const onAbort = () => {
+      release()
+      reject(cancelledRequestError())
+    }
+    signal?.addEventListener("abort", onAbort, { once: true })
+    flight.promise.then(
+      (detail) => {
+        if (finished) return
+        release()
+        resolve(detail)
+      },
+      (error) => {
+        if (finished) return
+        release()
+        reject(error)
+      }
+    )
+  })
+}
+
+export function invalidateFolderConversationCache(
+  conversationId?: number
+): void {
+  if (conversationId === undefined) {
+    folderConversationCache.clear()
+    // Detached readers may still finish for their existing consumers, but
+    // cannot satisfy a new refresh or refill the invalidated cache.
+    folderConversationFlights.clear()
+    return
+  }
+  for (const entries of [folderConversationCache, folderConversationFlights]) {
+    for (const [key] of entries) {
+      try {
+        if (JSON.parse(key).conversationId === conversationId) {
+          entries.delete(key)
+        }
+      } catch {
+        entries.delete(key)
+      }
+    }
+  }
+}
+
 export async function getFolderConversation(
   conversationId: number,
-  window?: { tailTurns?: number; fromIndex?: number }
+  options?: {
+    tailTurns?: number
+    fromIndex?: number
+    beforeCursor?: string | null
+    userTurnLimit?: number | null
+    requestGeneration?: number | null
+    signal?: AbortSignal
+    cacheMode?: "default" | "reload"
+  }
 ): Promise<DbConversationDetail> {
-  return getTransport().call("get_folder_conversation", {
+  const requestKey = {
     conversationId,
-    ...(window?.tailTurns != null ? { tailTurns: window.tailTurns } : {}),
-    ...(window?.fromIndex != null ? { fromIndex: window.fromIndex } : {}),
-  })
+    ...(options?.tailTurns != null ? { tailTurns: options.tailTurns } : {}),
+    ...(options?.fromIndex != null ? { fromIndex: options.fromIndex } : {}),
+    ...(options?.beforeCursor !== undefined
+      ? { beforeCursor: options.beforeCursor }
+      : {}),
+    ...(options?.userTurnLimit !== undefined
+      ? { userTurnLimit: options.userTurnLimit }
+      : {}),
+  }
+  const key = JSON.stringify(requestKey)
+  const generation = options?.requestGeneration ?? null
+  const reload = options?.cacheMode === "reload"
+  if (options?.signal?.aborted) throw cancelledRequestError()
+  if (process.env.NODE_ENV !== "test" && options?.cacheMode !== "reload") {
+    const cached = folderConversationCache.get(key)
+    if (
+      cached &&
+      Date.now() - cached.storedAt <= FOLDER_CONVERSATION_CACHE_TTL_MS
+    ) {
+      cached.usedAt = Date.now()
+      console.debug("[conversation][perf] detail cache hit", {
+        conversationId,
+        generation: options?.requestGeneration ?? null,
+        sourceVersion: cached.detail.history_page?.source_version ?? null,
+      })
+      return cached.detail
+    }
+    if (cached) folderConversationCache.delete(key)
+  }
+  const existing = folderConversationFlights.get(key)
+  if (
+    existing &&
+    !existing.controller.signal.aborted &&
+    existing.generation === generation &&
+    (!reload || existing.reload)
+  ) {
+    if (process.env.NODE_ENV !== "test") {
+      console.debug("[conversation][perf] duplicate detail request reused", {
+        conversationId,
+        cursor: options?.beforeCursor ?? null,
+        userTurnLimit: options?.userTurnLimit ?? null,
+        generation: options?.requestGeneration ?? null,
+      })
+    }
+    return attachFolderConversationFlight(existing, options?.signal)
+  }
+  // The last consumer may have detached just before a replacement refresh
+  // arrived. Never attach that refresh to an already-aborted transport flight;
+  // its rejection can still be queued in a later microtask.
+  if (existing && folderConversationFlights.get(key) === existing) {
+    folderConversationFlights.delete(key)
+  }
+  const requestId = `${Date.now().toString(36)}-${(folderConversationRequestSequence += 1).toString(
+    36
+  )}`
+  const args =
+    isDesktop() && !isRemoteDesktopMode()
+      ? { ...requestKey, requestGeneration: options?.requestGeneration ?? null }
+      : {
+          ...requestKey,
+          requestId,
+          requestGeneration: options?.requestGeneration ?? null,
+        }
+  const started = Date.now()
+  const controller = new AbortController()
+  const flight: FolderConversationFlight = {
+    controller,
+    consumers: 0,
+    settled: false,
+    generation,
+    reload,
+    promise: Promise.resolve(null as unknown as DbConversationDetail),
+  }
+  flight.promise = getTransport()
+    .call<DbConversationDetail>("get_folder_conversation", args, {
+      signal: controller.signal,
+    })
+    .then((detail) => {
+      if (
+        process.env.NODE_ENV !== "test" &&
+        detail.history_page?.page_complete !== false &&
+        !controller.signal.aborted &&
+        folderConversationFlights.get(key) === flight
+      ) {
+        const now = Date.now()
+        folderConversationCache.set(key, {
+          detail,
+          storedAt: now,
+          usedAt: now,
+        })
+        while (
+          folderConversationCache.size > FOLDER_CONVERSATION_CACHE_MAX_ENTRIES
+        ) {
+          const oldest = [...folderConversationCache.entries()].sort(
+            (left, right) => left[1].usedAt - right[1].usedAt
+          )[0]?.[0]
+          if (!oldest) break
+          folderConversationCache.delete(oldest)
+        }
+      }
+      if (process.env.NODE_ENV !== "test") {
+        console.debug("[conversation][perf] detail received", {
+          conversationId,
+          requestId,
+          cursor: options?.beforeCursor ?? null,
+          userTurnLimit: options?.userTurnLimit ?? null,
+          loadedTurns: detail.turns.length,
+          elapsedMs: Date.now() - started,
+          requestReused: false,
+          generation: options?.requestGeneration ?? null,
+          readBytes: detail.history_page?.read_bytes ?? null,
+          scanBytes: detail.history_page?.scan_bytes ?? null,
+          parserCacheHit: detail.history_page?.cache_hit ?? null,
+          indexStatus: detail.history_page?.index_status ?? null,
+        })
+      }
+      return detail
+    })
+    .catch((error: unknown) => {
+      if (process.env.NODE_ENV !== "test") {
+        console.debug("[conversation][perf] detail request ended", {
+          conversationId,
+          requestId,
+          generation: options?.requestGeneration ?? null,
+          cancelled:
+            controller.signal.aborted ||
+            (error instanceof Error && error.name === "AbortError"),
+          elapsedMs: Date.now() - started,
+        })
+      }
+      throw error
+    })
+    .finally(() => {
+      flight.settled = true
+      if (folderConversationFlights.get(key) === flight) {
+        folderConversationFlights.delete(key)
+      }
+    })
+  folderConversationFlights.set(key, flight)
+  return attachFolderConversationFlight(flight, options?.signal)
 }
 
 /** Fetch one page of older history ending just before `beforeIndex`. */
@@ -2602,6 +2996,113 @@ export async function getFolderConversationOutline(
     conversationId,
     beforeIndex,
   })
+}
+
+/** Load a single heavy historical tool output that the bounded detail response
+ * represented as a preview. The opaque reference is scoped to one immutable
+ * JSONL byte window and is revalidated against the original content hash. */
+export async function getDeferredHistoryContent(reference: string): Promise<{
+  content: string
+  byte_count: number
+  mime_type?: string | null
+}> {
+  return getTransport().call("get_deferred_history_content", { reference })
+}
+
+/** Paged, preview-only branch returns. Complete summaries are fetched through
+ * getDeferredHistoryContent only after an explicit expansion. */
+export async function listConversationBranchMerges(
+  conversationId: number,
+  offset = 0,
+  limit = 20
+): Promise<ConversationBranchMergePreviewPage> {
+  return getTransport().call("list_conversation_branch_merges", {
+    conversationId,
+    offset,
+    limit,
+  })
+}
+
+/** Explicit, independently paged source-branch summaries. No branch rollout
+ * or stored snapshot context is materialized by this request. */
+export async function listConversationBranches(
+  conversationId: number,
+  offset = 0,
+  limit = 20
+): Promise<ConversationSourceBranchPreviewPage> {
+  return getTransport().call("list_conversation_branches", {
+    conversationId,
+    offset,
+    limit,
+  })
+}
+
+/** Refresh only the loaded transcript in bounded batches. Reuse backend
+ * identities, including fingerprints captured before image deferral; no
+ * prompt/response content crosses the transport and no rollout is parsed. */
+export async function listConversationOutputWindow(
+  conversationId: number,
+  turns: readonly MessageTurn[],
+  references: readonly import("./types").ConversationOutputTurnRef[] = []
+): Promise<ConversationOutputWindow> {
+  const byId = new Map(references.map((reference) => [reference.id, reference]))
+  const artifactRuns = new Map<
+    string,
+    ConversationOutputWindow["artifact_runs"][number]
+  >()
+  const deliverableRuns = new Map<
+    string,
+    ConversationOutputWindow["deliverable_runs"][number]
+  >()
+  for (let offset = 0; offset < turns.length; offset += 200) {
+    const window = await getTransport().call<ConversationOutputWindow>(
+      "list_conversation_output_window",
+      {
+        conversationId,
+        turnRefs: turns.slice(offset, offset + 200).map(
+          (turn) =>
+            byId.get(turn.id) ?? {
+              id: turn.id,
+              timestamp: turn.timestamp,
+              is_user: turn.role === "user",
+            }
+        ),
+      }
+    )
+    for (const run of window.artifact_runs) artifactRuns.set(run.id, run)
+    for (const run of window.deliverable_runs) {
+      const previous = deliverableRuns.get(run.turn_run_id)
+      if (!previous?.user_turn_id || run.user_turn_id) {
+        deliverableRuns.set(run.turn_run_id, run)
+      }
+    }
+  }
+  return {
+    artifact_runs: [...artifactRuns.values()],
+    deliverable_runs: [...deliverableRuns.values()],
+  }
+}
+
+export interface CodexRolloutSizeDiagnostics {
+  file_bytes: number
+  record_count: number
+  ordinary_text_bytes: number
+  reasoning_bytes: number
+  tool_call_bytes: number
+  tool_result_bytes: number
+  image_or_data_url_bytes: number
+  snapshot_or_compaction_bytes: number
+  duplicate_record_bytes: number
+  duplicate_record_count: number
+  other_bytes: number
+}
+
+/** Explicit read-only full-rollout diagnostic. Never called by normal page
+ * opening; operators opt into the O(file size) scan when investigating growth. */
+export async function diagnoseCodexRolloutSize(
+  conversationId: number
+): Promise<CodexRolloutSizeDiagnostics> {
+  return getTransport().call("diagnose_codex_rollout_size", { conversationId })
 }
 
 export async function removeFolderFromHistory(path: string): Promise<void> {
@@ -3781,6 +4282,168 @@ export async function createConversation(
   })
 }
 
+export interface CreateConversationBranchRequest {
+  requestId?: string | null
+  operationId?: string | null
+  sourceConversationId: number
+  forkMessageId?: string | null
+  deferIfSourceBusy?: boolean
+  preferredModeId?: string | null
+  preferredConfigValues?: Record<string, string>
+}
+
+export interface CreateConversationBranchResult {
+  branchConversationId: number
+  sourceConversationId: number
+  folderId: number
+  connectionId?: string | null
+  branchSessionId?: string | null
+  sessionReady: boolean
+  promptReady: boolean
+  lifecycleState: string
+  forkMode: "native" | "snapshot"
+  inheritanceMode: "native_fork" | "full_replay" | "structured_snapshot"
+  inheritedMessageCount: number
+  inheritanceTruncated: boolean
+  fallbackReason?: string | null
+}
+
+export interface ConversationBranchInfo {
+  branchConversationId: number
+  creationRequestId?: string | null
+  operationId?: string | null
+  sourceConversationId: number
+  sourceTitle?: string | null
+  sourceAvailable: boolean
+  forkMessageId?: string | null
+  forkMode: "native" | "snapshot"
+  sourceSessionId?: string | null
+  branchSessionId?: string | null
+  inheritanceMode: "native_fork" | "full_replay" | "structured_snapshot"
+  inheritedMessageCount: number
+  inheritedContextChars: number
+  inheritedEstimatedTokens: number
+  inheritanceCompressed: boolean
+  inheritanceTruncated: boolean
+  inheritanceNote?: string | null
+  forkedThroughAt?: string | null
+  sourceRolloutOffset?: number | null
+  branchRolloutOffset?: number | null
+  forkBoundaryKind?: string | null
+  snapshotVersion: number
+  snapshotConsumedAt?: string | null
+  lifecycleState: string
+  lifecycleError?: string | null
+  lifecycleUpdatedAt?: string | null
+  sessionVerifiedAt?: string | null
+  firstPromptClientMessageId?: string | null
+  firstPromptQueuedAt?: string | null
+  firstPromptAcceptedAt?: string | null
+  initializationRetryCount: number
+  lastConnectionId?: string | null
+  snapshotDigest?: string | null
+  createdAt: string
+  lastMergedAt?: string | null
+  mergeTargetConversationId?: number | null
+}
+
+export interface MergeConversationBranchResult {
+  mergeId: string
+  targetConversationId: number
+  copiedDeliverableCount: number
+  deduplicated: boolean
+}
+
+export interface ConversationBranchCreationTask {
+  requestId: string
+  sourceConversationId: number
+  status: "queued" | "running" | "succeeded" | "failed" | "cancelled"
+  stage: string
+  result?: CreateConversationBranchResult | null
+  error?: string | null
+  cancelRequested: boolean
+  createdAt: string
+  updatedAt: string
+}
+
+export async function createConversationBranch(
+  request: CreateConversationBranchRequest
+): Promise<CreateConversationBranchResult> {
+  const requestId = request.operationId ?? request.requestId
+  if (!requestId)
+    throw new Error("Branch creation requires a stable request id")
+  let task = await getTransport().call<ConversationBranchCreationTask>(
+    "queue_conversation_branch_creation",
+    { request },
+    { timeoutMs: 30_000 }
+  )
+  // The operation belongs to the server. Individual status requests may time
+  // out and be retried, but a slow native fork is never converted into a false
+  // failure merely because one HTTP connection expired.
+  while (task.status === "queued" || task.status === "running") {
+    await new Promise((resolve) => setTimeout(resolve, 1_000))
+    try {
+      const refreshed =
+        await getTransport().call<ConversationBranchCreationTask | null>(
+          "get_conversation_branch_creation_task",
+          { requestId },
+          { timeoutMs: 30_000 }
+        )
+      if (refreshed) task = refreshed
+    } catch {
+      // A browser/network interruption says nothing about the durable task.
+      // Keep querying the same id after reconnect instead of reporting a false
+      // branch failure or starting a duplicate operation.
+    }
+  }
+  if (task.status === "succeeded" && task.result) return task.result
+  if (task.status === "cancelled")
+    throw new Error("Branch creation was cancelled")
+  throw new Error(
+    task.error
+      ? `Branch creation failed: ${task.error}. Retry with the same request id after resolving the reported cause.`
+      : "Branch creation failed without a server error; retry with the same request id."
+  )
+}
+
+export async function getConversationBranchCreationTask(
+  requestId: string
+): Promise<ConversationBranchCreationTask | null> {
+  return getTransport().call("get_conversation_branch_creation_task", {
+    requestId,
+  })
+}
+
+export async function cancelConversationBranchCreationTask(
+  requestId: string
+): Promise<ConversationBranchCreationTask | null> {
+  return getTransport().call("cancel_conversation_branch_creation_task", {
+    requestId,
+  })
+}
+
+export async function getConversationBranchInfo(
+  conversationId: number
+): Promise<ConversationBranchInfo | null> {
+  return getTransport().call("get_conversation_branch_info", {
+    conversationId,
+  })
+}
+
+export async function mergeConversationBranch(params: {
+  branchConversationId: number
+  requestId: string
+}): Promise<MergeConversationBranchResult> {
+  return getTransport().call(
+    "merge_conversation_branch",
+    {
+      branchConversationId: params.branchConversationId,
+      requestId: params.requestId,
+    },
+    { timeoutMs: 90_000 }
+  )
+}
+
 /**
  * Create a folderless "chat mode" conversation. The backend lazily creates a
  * dated per-conversation scratch dir and a dedicated hidden chat folder
@@ -3970,6 +4633,16 @@ export async function tokenUsageSync(
   mode: "incremental" | "full" = "incremental"
 ): Promise<TokenUsageSyncResult> {
   return getTransport().call("token_usage_sync", { mode })
+}
+
+/** Read the latest Codex subscription allowance observed in the current
+ * session transcript. This is local I/O only; it never polls the relay. */
+export async function codexQuotaSnapshot(
+  conversationId: number | null
+): Promise<CodexQuotaSnapshot | null> {
+  return getTransport().call("codex_quota_snapshot", {
+    conversationId,
+  })
 }
 
 // Automations
@@ -4390,12 +5063,10 @@ export async function listDirectoryWithFiles(
   return getTransport().call("list_directory_with_files", { path })
 }
 
-// Hard ceiling for a single attachment, kept in lockstep with the server's
-// `UPLOAD_MAX_BYTES` (`web/handlers/files.rs`, mirrored in
-// `commands/remote_proxy.rs`). Sized to match the desktop drag-drop image
-// limit (`DRAG_DROP_IMAGE_MAX_BYTES`) so the same screenshot attaches in
-// every mode; oversize is rejected up front with a visible toast.
-export const UPLOAD_MAX_BYTES = 20 * 1024 * 1024
+// Attachments upload with no per-file size limit by default. An optional cap
+// (`CODEG_UPLOAD_MAX_ATTACHMENT_BYTES`) is enforced server-side; when it fires,
+// the handler stamps `UPLOAD_I18N_KEY_TOO_LARGE` with the effective `limit`, so
+// the client no longer pre-filters by a hardcoded ceiling.
 
 // `btoa` only accepts a binary string, and `String.fromCharCode(...bytes)`
 // hits the call-stack limit somewhere around a few hundred KB. Chunk the
@@ -5063,6 +5734,13 @@ export async function readFilePreview(
   return getTransport().call("read_file_preview", { rootPath, path })
 }
 
+export async function statWorkspaceFile(
+  rootPath: string,
+  path: string
+): Promise<WorkspaceFileStat> {
+  return getTransport().call("stat_workspace_file", { rootPath, path })
+}
+
 export async function readFileForEdit(
   rootPath: string,
   path: string
@@ -5565,6 +6243,15 @@ export async function listProviderModels(
   params: ProviderModelsRequest
 ): Promise<ProviderModelList> {
   return getTransport().call("list_provider_models", { params })
+}
+
+/** Probe the reachability + latency of the custom provider bound to `agentType`.
+ *  Used by the streaming-diagnostics panel's "test link" button to tell a
+ *  stalled network path (CF tunnel / VPS) apart from a model still working. */
+export async function probeActiveModelProvider(
+  agentType: string
+): Promise<ModelProviderProbeResult> {
+  return getTransport().call("probe_active_model_provider", { agentType })
 }
 
 // ─── Delegation settings ───────────────────────────────────────────────
@@ -6590,4 +7277,190 @@ export async function forgeAutoScanNow(
   folderId: number
 ): Promise<ForgeAutoScanReport> {
   return getTransport().call("forge_auto_scan_now", { folderId })
+}
+
+// ─── Confirmed deliverables ───
+
+export interface DeliverableCapabilities {
+  hostOs: string
+  openWithDefaultApp: boolean
+  copyFiles: boolean
+  revealInFolder: boolean
+  /** Native open/copy/reveal actions affect the Codeg host, not this browser. */
+  hostActionNotice: boolean
+}
+
+export interface DeliverableOperationResult {
+  affected: number
+}
+
+export interface DeliverableSaveResult {
+  savedPath: string
+  bytes: number
+}
+
+export async function getDeliverableCapabilities(): Promise<DeliverableCapabilities> {
+  return getTransport().call<DeliverableCapabilities>(
+    "deliverable_capabilities",
+    {}
+  )
+}
+
+export async function listConversationDeliverables(
+  conversationId: number
+): Promise<ConversationDeliverable[]> {
+  return getTransport().call<ConversationDeliverable[]>(
+    "list_conversation_deliverables",
+    { conversationId }
+  )
+}
+
+export async function listConversationDeliverableHistory(
+  conversationId: number,
+  offset = 0,
+  limit = 25
+): Promise<ConversationDeliverableHistoryPage> {
+  return getTransport().call<ConversationDeliverableHistoryPage>(
+    "list_conversation_deliverable_history",
+    { conversationId, offset, limit }
+  )
+}
+
+export async function listTurnDeliverables(
+  conversationId: number,
+  turnRunId: string
+): Promise<ConversationDeliverable[]> {
+  return getTransport().call<ConversationDeliverable[]>(
+    "list_turn_deliverables",
+    { conversationId, turnRunId }
+  )
+}
+
+export async function listConversationDeliverableRuns(
+  conversationId: number
+): Promise<ConversationTurnDeliverableSet[]> {
+  return getTransport().call<ConversationTurnDeliverableSet[]>(
+    "list_conversation_deliverable_runs",
+    { conversationId }
+  )
+}
+
+export async function copyDeliverableFiles(
+  conversationId: number,
+  deliverableIds: string[]
+): Promise<DeliverableOperationResult> {
+  return getTransport().call<DeliverableOperationResult>("copy_deliverables", {
+    conversationId,
+    deliverableIds,
+  })
+}
+
+export async function openDeliverable(
+  conversationId: number,
+  deliverableId: string
+): Promise<DeliverableOperationResult> {
+  return getTransport().call<DeliverableOperationResult>("open_deliverable", {
+    conversationId,
+    deliverableId,
+  })
+}
+
+export async function revealDeliverable(
+  conversationId: number,
+  deliverableId: string
+): Promise<DeliverableOperationResult> {
+  return getTransport().call<DeliverableOperationResult>("reveal_deliverable", {
+    conversationId,
+    deliverableId,
+  })
+}
+
+export async function hideDeliverables(
+  conversationId: number,
+  deliverableIds: string[]
+): Promise<DeliverableOperationResult> {
+  return getTransport().call<DeliverableOperationResult>("hide_deliverables", {
+    conversationId,
+    deliverableIds,
+  })
+}
+
+export async function downloadDeliverables(args: {
+  conversationId: number
+  deliverableIds: string[]
+  archive?: boolean
+  suggestedName?: string
+}): Promise<WorkspaceDownloadResult> {
+  const archive = Boolean(args.archive || args.deliverableIds.length !== 1)
+  const suggestedName =
+    args.suggestedName ??
+    (archive ? `codeg-deliverables-${args.conversationId}.zip` : "deliverable")
+
+  if (isDesktop() && !isRemoteDesktopMode()) {
+    const { save } = await import("@tauri-apps/plugin-dialog")
+    const destination = await save({ defaultPath: suggestedName })
+    if (!destination) return { status: WORKSPACE_DOWNLOAD_CANCELLED }
+    const result = await getShellTransport().call<DeliverableSaveResult>(
+      "save_deliverables",
+      {
+        conversationId: args.conversationId,
+        deliverableIds: args.deliverableIds,
+        archive,
+        destination,
+      },
+      { timeoutMs: 600_000 }
+    )
+    return {
+      status: "done",
+      savedPath: result.savedPath,
+      bytes: result.bytes,
+    }
+  }
+
+  if (isRemoteDesktopMode()) {
+    const connectionId = getActiveRemoteConnectionId()
+    if (connectionId === null) {
+      throw new Error("downloadDeliverables (remote): no active connection")
+    }
+    const { save } = await import("@tauri-apps/plugin-dialog")
+    const savePath = await save({ defaultPath: suggestedName })
+    if (!savePath) return { status: WORKSPACE_DOWNLOAD_CANCELLED }
+    const { invoke } = await import("@tauri-apps/api/core")
+    try {
+      const result = await invoke<{ transferId: string; bytes: number }>(
+        "remote_download_deliverables",
+        {
+          connectionId,
+          conversationId: args.conversationId,
+          deliverableIds: args.deliverableIds,
+          archive,
+          savePath,
+        }
+      )
+      return {
+        status: "done",
+        savedPath: savePath,
+        bytes: result.bytes,
+        transferId: result.transferId,
+      }
+    } catch (error) {
+      if (isRemoteAuthenticationFailed(error)) {
+        notifyRemoteDesktopUnauthorized()
+      }
+      throw error
+    }
+  }
+
+  const ticket = await getTransport().call<WorkspaceDownloadTicket>(
+    "create_deliverable_download_ticket",
+    {
+      conversationId: args.conversationId,
+      deliverableIds: args.deliverableIds,
+      archive,
+    }
+  )
+  const base = getServerBaseUrl() || window.location.origin
+  const url = new URL(ticket.url, `${base.replace(/\/+$/, "")}/`).toString()
+  openBrowserDownloadUrl(url, ticket.filename || suggestedName)
+  return { status: "started" }
 }

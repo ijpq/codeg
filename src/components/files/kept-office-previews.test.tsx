@@ -270,3 +270,54 @@ describe("KeptOfficePreviews", () => {
     expect(frameOf("b.xlsx")).not.toBeNull()
   })
 })
+
+describe("delivered review bytes", () => {
+  it("reads the immutable target and changes it only for a new settled run", async () => {
+    const first = {
+      ...docA,
+      officeDelivery: {
+        conversation_id: 12,
+        turn_run_id: "run-1",
+        run_sequence: 1,
+        deliverable_id: "d1",
+        original_path: docA.path,
+        snapshot_path: "/private/review-one/a.docx",
+        file_name: "a.docx",
+        sha256: "hash-one",
+        status: "ready" as const,
+        error: null,
+        completed_at: "2026-10-26T00:00:00Z",
+      },
+    }
+    show([first], first)
+    const view = render(<KeptOfficePreviews />)
+    await waitFor(() =>
+      expect(mockStart).toHaveBeenCalledWith("/private/review-one", "a.docx")
+    )
+    expect(
+      document.querySelector('[data-office-review-run="run-1"]')
+    ).not.toBeNull()
+    view.rerender(<KeptOfficePreviews />)
+    expect(mockStart).toHaveBeenCalledTimes(1)
+    const second = {
+      ...first,
+      officeDelivery: {
+        ...first.officeDelivery,
+        turn_run_id: "run-2",
+        run_sequence: 2,
+        snapshot_path: "/private/review-two/a.docx",
+      },
+    }
+    show([second], second)
+    view.rerender(<KeptOfficePreviews />)
+    await waitFor(() =>
+      expect(mockStart).toHaveBeenCalledWith("/private/review-two", "a.docx")
+    )
+    expect(
+      document.querySelector('[data-office-review-run="run-1"]')
+    ).toBeNull()
+    expect(
+      document.querySelector('[data-office-review-run="run-2"]')
+    ).not.toBeNull()
+  })
+})

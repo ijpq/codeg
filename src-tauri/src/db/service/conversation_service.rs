@@ -7,7 +7,7 @@ use sea_orm::{
 };
 
 use crate::db::entities::conversation::ConversationKind;
-use crate::db::entities::{conversation, folder};
+use crate::db::entities::{conversation, conversation_branch, folder};
 use crate::db::error::DbError;
 use crate::db::service::conversation_tag_service;
 use crate::models::{AgentType, AssistantRunSnapshot, DbConversationSummary};
@@ -197,6 +197,17 @@ pub async fn update_title(
     Ok(())
 }
 
+/// Enabled business conversations own their title independently of each native
+/// session. Keep this in the UPDATE predicate as well as candidate selection:
+/// a native title read before business enable must not overwrite it afterward.
+/// Do not change title_locked; disabling the additive migration restores the
+/// original engine's automatic title behavior.
+fn accepts_native_title() -> sea_orm::sea_query::SimpleExpr {
+    sea_orm::sea_query::Expr::cust(
+        "NOT EXISTS (SELECT 1 FROM business_conversation_state b WHERE b.conversation_id=conversation.id AND b.enabled=1)",
+    )
+}
+
 /// Auto-derive counterpart to [`update_title`]: write `title` ONLY when the row
 /// is not user-locked and the value actually changed. Never sets `title_locked`
 /// (the title stays eligible for future auto-refreshes, e.g. when an agent like
@@ -226,6 +237,7 @@ pub async fn refresh_auto_title(
         .filter(conversation::Column::Id.eq(conversation_id))
         .filter(conversation::Column::TitleLocked.eq(false))
         .filter(conversation::Column::DeletedAt.is_null())
+        .filter(accepts_native_title())
         .filter(
             sea_orm::Condition::any()
                 .add(conversation::Column::Title.is_null())
@@ -423,6 +435,7 @@ async fn refresh_codex_auto_title_candidate(
         .filter(conversation::Column::ExternalId.eq(external_id))
         .filter(conversation::Column::DeletedAt.is_null())
         .filter(conversation::Column::TitleLocked.eq(false))
+        .filter(accepts_native_title())
         .filter(
             conversation::Column::FolderId.in_subquery(
                 sea_orm::sea_query::Query::select()
@@ -478,6 +491,7 @@ pub(crate) async fn refresh_codex_auto_titles(
             .filter(conversation::Column::ExternalId.is_in(external_id_chunk.iter().cloned()))
             .filter(conversation::Column::DeletedAt.is_null())
             .filter(conversation::Column::TitleLocked.eq(false))
+            .filter(accepts_native_title())
             .filter(conversation::Column::Kind.ne(ConversationKind::Loop))
             .filter(
                 conversation::Column::FolderId.in_subquery(
@@ -667,6 +681,15 @@ pub async fn bind_external_id(
     use sea_orm::sea_query::Expr;
     use sea_orm::TransactionTrait;
 
+    if crate::db::service::business_conversation_service::bind_managed_external(
+        conn,
+        conversation_id,
+        external_id,
+    )
+    .await?
+    {
+        return Ok(None);
+    }
     let external_id = external_id.to_string();
     let continues: Vec<String> = continues.to_vec();
     // The closure below MOVES `external_id`; keep a copy for the conflict
@@ -856,8 +879,12 @@ pub async fn bind_external_id(
                 let preserved = carried.into_active_model(previous.clone()).insert(txn).await?;
                 // The preserving row IS the old conversation as far as the user
                 // can tell, so it keeps the tags they put on it.
-                conversation_tag_service::copy_conversation_tags(txn, conversation_id, preserved.id)
-                    .await?;
+                conversation_tag_service::copy_conversation_tags(
+                    txn,
+                    conversation_id,
+                    preserved.id,
+                )
+                .await?;
                 // The one signal that this happened at all. Deliberately WARN:
                 // every occurrence means a connection bound to a row while
                 // holding a session unrelated to that row's history, which is
@@ -1041,7 +1068,10 @@ pub async fn renormalize_external_id_alias(
 ) -> Result<(), DbError> {
     use sea_orm::sea_query::Expr;
     let mut query = conversation::Entity::update_many()
-        .col_expr(conversation::Column::ExternalId, Expr::value(external_id))
+        .col_expr(
+            conversation::Column::ExternalId,
+            Expr::value(external_id.clone()),
+        )
         .col_expr(conversation::Column::UpdatedAt, Expr::value(Utc::now()))
         .filter(conversation::Column::Id.eq(conversation_id))
         .filter(conversation::Column::DeletedAt.is_null());
@@ -1049,7 +1079,23 @@ pub async fn renormalize_external_id_alias(
         Some(old) => query.filter(conversation::Column::ExternalId.eq(old)),
         None => query.filter(conversation::Column::ExternalId.is_null()),
     };
-    query.exec(conn).await?;
+    let updated = query.exec(conn).await?;
+    // Keep branch audit metadata converged whenever a restored connection
+    // refreshes a conversation's external id. New branches now persist only
+    // after session/new is prompt-ready, but older rows may still need this
+    // repair path; ordinary rows simply match no branch row.
+    // Respect the alias CAS above: a concurrent rebind that made the
+    // conversation update a no-op must not update branch metadata either.
+    if updated.rows_affected > 0 {
+        conversation_branch::Entity::update_many()
+            .col_expr(
+                conversation_branch::Column::BranchSessionId,
+                Expr::value(external_id),
+            )
+            .filter(conversation_branch::Column::BranchConversationId.eq(conversation_id))
+            .exec(conn)
+            .await?;
+    }
     Ok(())
 }
 
@@ -1417,7 +1463,19 @@ pub async fn list_by_folder(
         _ => query.order_by_desc(conversation::Column::CreatedAt),
     };
 
-    let rows = query.all(conn).await?;
+    let merged_branch_ids: std::collections::HashSet<i32> = conversation_branch::Entity::find()
+        .filter(conversation_branch::Column::LifecycleState.eq("merged"))
+        .all(conn)
+        .await?
+        .into_iter()
+        .map(|row| row.branch_conversation_id)
+        .collect();
+    let rows = query
+        .all(conn)
+        .await?
+        .into_iter()
+        .filter(|row| !merged_branch_ids.contains(&row.id))
+        .collect::<Vec<_>>();
 
     let mut summaries: Vec<DbConversationSummary> = rows.into_iter().map(conv_to_summary).collect();
     fill_summary_extras(conn, &mut summaries).await?;
@@ -1500,7 +1558,19 @@ pub async fn list_all(
         _ => query.order_by_desc(conversation::Column::UpdatedAt),
     };
 
-    let rows = query.all(conn).await?;
+    let merged_branch_ids: std::collections::HashSet<i32> = conversation_branch::Entity::find()
+        .filter(conversation_branch::Column::LifecycleState.eq("merged"))
+        .all(conn)
+        .await?
+        .into_iter()
+        .map(|row| row.branch_conversation_id)
+        .collect();
+    let rows = query
+        .all(conn)
+        .await?
+        .into_iter()
+        .filter(|row| !merged_branch_ids.contains(&row.id))
+        .collect::<Vec<_>>();
     let mut summaries: Vec<DbConversationSummary> = rows.into_iter().map(conv_to_summary).collect();
     fill_summary_extras(conn, &mut summaries).await?;
     Ok(summaries)
@@ -1755,15 +1825,9 @@ mod tests {
     async fn seed_model_fills_an_empty_column_once_without_bumping_updated_at() {
         let db = fresh_in_memory_db().await;
         let folder = seed_folder(&db, "/tmp/codeg-seed-model").await;
-        let conv = create(
-            &db.conn,
-            folder,
-            AgentType::Codex,
-            Some("c".into()),
-            None,
-        )
-        .await
-        .expect("create");
+        let conv = create(&db.conn, folder, AgentType::Codex, Some("c".into()), None)
+            .await
+            .expect("create");
 
         // The gap this closes: a row created in-app carries no model at all,
         // which is why the sidebar could only ever show one for imported
@@ -1817,15 +1881,9 @@ mod tests {
     async fn seed_model_skips_a_soft_deleted_row() {
         let db = fresh_in_memory_db().await;
         let folder = seed_folder(&db, "/tmp/codeg-seed-model-deleted").await;
-        let conv = create(
-            &db.conn,
-            folder,
-            AgentType::Codex,
-            Some("c".into()),
-            None,
-        )
-        .await
-        .expect("create");
+        let conv = create(&db.conn, folder, AgentType::Codex, Some("c".into()), None)
+            .await
+            .expect("create");
         soft_delete(&db.conn, conv.id).await.expect("delete");
 
         assert!(
@@ -1947,7 +2005,10 @@ mod tests {
     }
 
     /// The single live row (if any) holding `external_id`, whatever its id.
-    async fn rows_holding(conn: &DatabaseConnection, external_id: &str) -> Vec<conversation::Model> {
+    async fn rows_holding(
+        conn: &DatabaseConnection,
+        external_id: &str,
+    ) -> Vec<conversation::Model> {
         conversation::Entity::find()
             .filter(conversation::Column::ExternalId.eq(external_id))
             .filter(conversation::Column::DeletedAt.is_null())
@@ -2530,6 +2591,108 @@ mod tests {
             Some("session-S9"),
             "a live row must still receive its external_id"
         );
+    }
+
+    #[tokio::test]
+    async fn managed_business_title_survives_native_refresh_and_manual_rename() {
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/codeg-business-title").await;
+        let row = create(&db.conn, folder, AgentType::Codex, None, None)
+            .await
+            .unwrap();
+        bind_external_id(&db.conn, row.id, "business-title-native", &[])
+            .await
+            .unwrap();
+        let summary = get_by_id(&db.conn, row.id).await.unwrap();
+        super::super::business_conversation_service::initialize(&db.conn, &summary, &[])
+            .await
+            .unwrap();
+
+        // A clean original user prompt can still name an empty business.
+        assert!(
+            seed_auto_title_if_empty(&db.conn, row.id, "Project | conference".into())
+                .await
+                .unwrap()
+        );
+        assert!(!refresh_auto_title(
+            &db.conn,
+            row.id,
+            "<codeg-business-context> Native engine fallback".into(),
+        )
+        .await
+        .unwrap());
+        assert!(refresh_codex_auto_titles(
+            &db.conn,
+            &HashMap::from([("business-title-native".into(), "Codex session name".into())]),
+        )
+        .await
+        .is_empty());
+        let kept = get_by_id(&db.conn, row.id).await.unwrap();
+        assert_eq!(kept.title.as_deref(), Some("Project | conference"));
+        assert!(
+            !kept.title_locked,
+            "business ownership is not a user rename"
+        );
+
+        update_title(&db.conn, row.id, "User's revised business name".into())
+            .await
+            .unwrap();
+        assert_eq!(
+            get_by_id(&db.conn, row.id).await.unwrap().title.as_deref(),
+            Some("User's revised business name")
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_codex_title_candidate_respects_business_enable_and_rollback() {
+        use sea_orm::{ConnectionTrait, DbBackend, Statement};
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/codeg-business-title-cas").await;
+        let row = create(
+            &db.conn,
+            folder,
+            AgentType::Codex,
+            Some("Business name".into()),
+            None,
+        )
+        .await
+        .unwrap();
+        bind_external_id(&db.conn, row.id, "business-title-cas", &[])
+            .await
+            .unwrap();
+        let candidate = conversation::Entity::find_by_id(row.id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let summary = get_by_id(&db.conn, row.id).await.unwrap();
+        super::super::business_conversation_service::initialize(&db.conn, &summary, &[])
+            .await
+            .unwrap();
+        assert!(
+            !refresh_codex_auto_title_candidate(&db.conn, &candidate, "Late native name")
+                .await
+                .unwrap()
+        );
+
+        // Disabling the additive business migration restores the original
+        // unlocked-title behavior without rewriting the user's lock bit.
+        db.conn
+            .execute(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "UPDATE business_conversation_state SET enabled=0 WHERE conversation_id=?",
+                [row.id.into()],
+            ))
+            .await
+            .unwrap();
+        assert!(
+            refresh_codex_auto_title_candidate(&db.conn, &candidate, "Native name")
+                .await
+                .unwrap()
+        );
+        let restored = get_by_id(&db.conn, row.id).await.unwrap();
+        assert_eq!(restored.title.as_deref(), Some("Native name"));
+        assert!(!restored.title_locked);
     }
 
     #[tokio::test]

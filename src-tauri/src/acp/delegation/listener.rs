@@ -15,16 +15,18 @@ use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
 
-use crate::acp::delegation::broker::{DelegationBroker, StatusWait};
 use crate::acp::browser_tools::{
     BrowserActOutcome, BrowserCaptureOutcome, BrowserConsoleOutcome, BrowserEvalOutcome,
     BrowserSnapshotOutcome, BrowserTabOutcome, BrowserTabsOutcome, BrowserToolAccess,
     ERROR_NO_SUCH_TAB,
 };
+use crate::acp::chat_authoring::{AuthoringContext, AuthoringOutcome, ChatAuthoringAccess};
 use crate::acp::computer_tools::{
     ComputerActOutcome, ComputerAppsOutcome, ComputerCaptureOutcome, ComputerSnapshotOutcome,
     ComputerToolAccess, ComputerVerifyOutcome, ComputerWindowsOutcome, ERROR_NO_SUCH_TARGET,
 };
+use crate::acp::delegation::broker::{DelegationBroker, StatusWait};
+use crate::acp::delegation::transport::BrokerDeliverablesRequest;
 use crate::acp::delegation::transport::{
     read_frame, write_frame, BrokerAskRequest, BrokerBrowserActRequest,
     BrokerBrowserCaptureRequest, BrokerBrowserConsoleRequest, BrokerBrowserEvalRequest,
@@ -44,11 +46,14 @@ use crate::acp::delegation::types::{
     delegation_target_from_args, DelegationRequest, DelegationTarget, DelegationTargetError,
     DelegationTaskReport, ResumeDelegationRequest, TaskStatus,
 };
+use crate::acp::deliverables::{
+    PublishDeliverablesArgs, PublishDeliverablesOutcome, RejectedDeliverable,
+    SessionDeliverableAccess,
+};
 use crate::acp::feedback::{PendingFeedback, SessionFeedbackAccess};
 use crate::acp::question::{QuestionOutcome, SessionQuestionAccess};
 #[cfg(unix)]
 use crate::acp::scratch_dir::{is_inside_sweep_scope, SUN_PATH_CAP};
-use crate::acp::chat_authoring::{AuthoringContext, AuthoringOutcome, ChatAuthoringAccess};
 use crate::acp::result_tool::ResultToolAccess;
 use crate::acp::session_info::{SessionInfo, SessionInfoAccess};
 use crate::acp::work_task_tools::{TaskReportAck, WorkTaskToolAccess};
@@ -60,7 +65,6 @@ use serde_json::Value;
 /// `wait_ms = 0` opts out of the ceiling and blocks until the task is terminal.
 const STATUS_WAIT_MAX_MS: u64 = 60_000;
 
-
 /// The bound-but-not-yet-served socket handed from [`DelegationListener::bind`]
 /// to [`DelegationListener::accept_loop`]. A UDS listener on unix; on Windows,
 /// the first named-pipe server instance (the loop creates each subsequent one
@@ -69,7 +73,6 @@ const STATUS_WAIT_MAX_MS: u64 = 60_000;
 pub type BoundSocket = tokio::net::UnixListener;
 #[cfg(windows)]
 pub type BoundSocket = tokio::net::windows::named_pipe::NamedPipeServer;
-
 /// Pluggable "what conversation is this parent currently in?" lookup. The
 /// production impl wraps `ConnectionManager.get_state`; tests use an
 /// in-memory map.
@@ -179,6 +182,8 @@ pub struct DelegationListener {
     /// on the root connection of a `codeg-cli` run given `--output-schema`.
     /// Same token → parent-connection scoping as the delegation arms.
     pub results: Arc<dyn ResultToolAccess>,
+    /// Verifies and persists the agent's explicit final-output declaration.
+    pub deliverables: Arc<dyn SessionDeliverableAccess>,
 }
 
 impl DelegationListener {
@@ -195,6 +200,7 @@ impl DelegationListener {
         browser: Arc<dyn BrowserToolAccess>,
         computer: Arc<dyn ComputerToolAccess>,
         results: Arc<dyn ResultToolAccess>,
+        deliverables: Arc<dyn SessionDeliverableAccess>,
     ) -> Arc<Self> {
         Arc::new(Self {
             broker,
@@ -208,6 +214,7 @@ impl DelegationListener {
             browser,
             computer,
             results,
+            deliverables,
         })
     }
 
@@ -352,11 +359,7 @@ impl DelegationListener {
     #[cfg(unix)]
     fn staging_socket_path(socket_path: &Path) -> PathBuf {
         let salt = uuid::Uuid::new_v4().simple().to_string();
-        socket_path.with_file_name(format!(
-            ".stg-{}-{}",
-            std::process::id(),
-            &salt[..8]
-        ))
+        socket_path.with_file_name(format!(".stg-{}-{}", std::process::id(), &salt[..8]))
     }
 
     #[cfg(windows)]
@@ -489,10 +492,7 @@ impl DelegationListener {
                         write_frame(conn, &feedback_response(&[])?).await?;
                     }
                     Some(parent_conn_id) => {
-                        let pending = self
-                            .feedback
-                            .read_pending_feedback(&parent_conn_id)
-                            .await;
+                        let pending = self.feedback.read_pending_feedback(&parent_conn_id).await;
                         // Read-only: the response carries the note ids
                         // (`_commit_ids`); delivery is committed LATER, by the
                         // companion's `CommitFeedback` once it actually returns
@@ -687,6 +687,9 @@ impl DelegationListener {
             BrokerMessage::ComputerClipboard(req) => {
                 // To its end: a write cannot be recalled.
                 computer_response(&self.process_computer_clipboard(req).await)?
+            }
+            BrokerMessage::PublishDeliverables(req) => {
+                deliverables_response(self.process_deliverables(req).await)?
             }
             BrokerMessage::Cancel(cancel) => {
                 self.process_cancel(cancel).await;
@@ -1074,7 +1077,9 @@ impl DelegationListener {
                 crate::acp::computer_tools::no_such_target_note(&req.target_id),
             );
         }
-        self.computer.capture(&req.target_id, req.max_dimension).await
+        self.computer
+            .capture(&req.target_id, req.max_dimension)
+            .await
     }
 
     async fn process_computer_snapshot(
@@ -1243,6 +1248,43 @@ impl DelegationListener {
         serde_json::json!({ "assistants": self.broker.assistant_roster().await })
     }
 
+    async fn process_deliverables(
+        &self,
+        req: BrokerDeliverablesRequest,
+    ) -> PublishDeliverablesOutcome {
+        let Some(entry) = self.tokens.lookup(&req.token).await else {
+            return publish_rejected("invalid or expired session token");
+        };
+        if entry.parent_connection_id != req.parent_connection_id {
+            return publish_rejected("token does not match the parent connection");
+        }
+        let Some(conversation_id) = self
+            .parent_lookup
+            .current_conversation_id(&req.parent_connection_id)
+            .await
+        else {
+            return publish_rejected("parent has no active conversation");
+        };
+        let request_id = if req.request_id.trim().is_empty() {
+            uuid::Uuid::new_v4().to_string()
+        } else {
+            req.request_id
+        };
+        let args = req.args.unwrap_or_else(|| PublishDeliverablesArgs {
+            deliverables: req.deliverables,
+            ..Default::default()
+        });
+        self.deliverables
+            .publish_deliverables(
+                &request_id,
+                &req.parent_connection_id,
+                conversation_id,
+                &entry.working_dir,
+                args,
+            )
+            .await
+    }
+
     async fn process(&self, req: BrokerRequest) -> DelegationTaskReport {
         // 1. Token + parent_connection_id consistency check. Treat both as
         //    "canceled" since the LLM can't usefully react to either —
@@ -1409,9 +1451,7 @@ fn browser_tabs_response(outcome: BrowserTabsOutcome) -> std::io::Result<BrokerR
 /// Serialize a [`BrowserSnapshotOutcome`] into a [`BrokerResponse`] for the
 /// `BrowserSnapshot` arm — the companion renders it into the `browser_snapshot`
 /// tool result.
-fn browser_snapshot_response(
-    outcome: BrowserSnapshotOutcome,
-) -> std::io::Result<BrokerResponse> {
+fn browser_snapshot_response(outcome: BrowserSnapshotOutcome) -> std::io::Result<BrokerResponse> {
     Ok(BrokerResponse {
         outcome: serde_json::to_value(&outcome).map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, format!("encode: {e}"))
@@ -1554,6 +1594,27 @@ fn authoring_response(outcome: AuthoringOutcome) -> std::io::Result<BrokerRespon
             std::io::Error::new(std::io::ErrorKind::InvalidData, format!("encode: {e}"))
         })?,
     })
+}
+
+fn deliverables_response(outcome: PublishDeliverablesOutcome) -> std::io::Result<BrokerResponse> {
+    Ok(BrokerResponse {
+        outcome: serde_json::to_value(outcome).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("encode: {e}"))
+        })?,
+    })
+}
+
+fn publish_rejected(reason: &str) -> PublishDeliverablesOutcome {
+    PublishDeliverablesOutcome {
+        request_id: String::new(),
+        declaration_status: "failed".to_string(),
+        published: false,
+        accepted: Vec::new(),
+        rejected: vec![RejectedDeliverable {
+            path: String::new(),
+            reason: reason.to_string(),
+        }],
+    }
 }
 
 /// The `declined` outcome — used when the token is invalid, the connection is
@@ -1756,13 +1817,13 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use crate::acp::scratch_dir::short_root;
+    use crate::acp::browser_tools::{NoBrowserTabs, ERROR_GRANT_REQUIRED};
+    use crate::acp::computer_tools::NoComputerDesktop;
     use crate::acp::delegation::broker::{ConversationDepthLookup, DelegationConfig};
     use crate::models::AgentType;
     use crate::acp::delegation::spawner::{
         mock::MockSpawner, ConnectionSpawner, ResumedSpawn, SpawnerError,
     };
-    use crate::acp::browser_tools::{NoBrowserTabs, ERROR_GRANT_REQUIRED};
-    use crate::acp::computer_tools::NoComputerDesktop;
     use crate::acp::delegation::types::{DelegationError, DelegationOutcome, DelegationSuccess};
     use serde_json::json;
     use std::time::Duration;
@@ -1797,10 +1858,7 @@ mod tests {
     }
     #[async_trait]
     impl SessionFeedbackAccess for StubFeedback {
-        async fn read_pending_feedback(
-            &self,
-            parent_connection_id: &str,
-        ) -> Vec<PendingFeedback> {
+        async fn read_pending_feedback(&self, parent_connection_id: &str) -> Vec<PendingFeedback> {
             *self.read_conn.lock().await = Some(parent_connection_id.to_string());
             self.items.lock().await.clone()
         }
@@ -1820,9 +1878,7 @@ mod tests {
     #[derive(Default)]
     struct StubQuestion {
         pending: tokio::sync::Mutex<HashMap<String, oneshot::Sender<QuestionOutcome>>>,
-        registered: tokio::sync::Mutex<
-            Vec<(String, Vec<crate::acp::question::QuestionSpec>)>,
-        >,
+        registered: tokio::sync::Mutex<Vec<(String, Vec<crate::acp::question::QuestionSpec>)>>,
         canceled: tokio::sync::Mutex<Vec<String>>,
     }
     #[async_trait]
@@ -1907,11 +1963,7 @@ mod tests {
                 note: None,
             }
         }
-        async fn snapshot(
-            &self,
-            tab_id: &str,
-            max_chars: Option<usize>,
-        ) -> BrowserSnapshotOutcome {
+        async fn snapshot(&self, tab_id: &str, max_chars: Option<usize>) -> BrowserSnapshotOutcome {
             self.calls
                 .lock()
                 .await
@@ -1965,10 +2017,7 @@ mod tests {
             ));
             BrowserActOutcome::control_required(tab_id)
         }
-        async fn tab_op(
-            &self,
-            op: crate::acp::browser_tools::BrowserTabOp,
-        ) -> BrowserTabOutcome {
+        async fn tab_op(&self, op: crate::acp::browser_tools::BrowserTabOp) -> BrowserTabOutcome {
             self.calls
                 .lock()
                 .await
@@ -2045,6 +2094,23 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct StubDeliverables;
+
+    #[async_trait]
+    impl SessionDeliverableAccess for StubDeliverables {
+        async fn publish_deliverables(
+            &self,
+            _request_id: &str,
+            _parent_connection_id: &str,
+            _conversation_id: i32,
+            _workspace_root: &Path,
+            _args: crate::acp::deliverables::PublishDeliverablesArgs,
+        ) -> PublishDeliverablesOutcome {
+            PublishDeliverablesOutcome::default()
+        }
+    }
+
     use tokio::sync::oneshot;
 
     async fn make_broker(mock: Arc<MockSpawner>) -> Arc<DelegationBroker> {
@@ -2082,6 +2148,7 @@ mod tests {
             Arc::new(NoBrowserTabs),
             Arc::new(NoComputerDesktop),
             Arc::new(crate::acp::result_tool::NoResultTool),
+            Arc::new(StubDeliverables),
         )
     }
 
@@ -2107,6 +2174,7 @@ mod tests {
             Arc::new(NoBrowserTabs),
             Arc::new(NoComputerDesktop),
             Arc::new(crate::acp::result_tool::NoResultTool),
+            Arc::new(StubDeliverables),
         )
     }
 
@@ -2133,6 +2201,7 @@ mod tests {
             Arc::new(NoBrowserTabs),
             Arc::new(NoComputerDesktop),
             Arc::new(crate::acp::result_tool::NoResultTool),
+            Arc::new(StubDeliverables),
         )
     }
 
@@ -2158,6 +2227,7 @@ mod tests {
             Arc::new(NoBrowserTabs),
             Arc::new(NoComputerDesktop),
             Arc::new(crate::acp::result_tool::NoResultTool),
+            Arc::new(StubDeliverables),
         )
     }
 
@@ -2185,6 +2255,7 @@ mod tests {
             Arc::new(NoBrowserTabs),
             Arc::new(NoComputerDesktop),
             Arc::new(crate::acp::result_tool::NoResultTool),
+            Arc::new(StubDeliverables),
         )
     }
 
@@ -2211,6 +2282,7 @@ mod tests {
             browser,
             Arc::new(NoComputerDesktop),
             Arc::new(crate::acp::result_tool::NoResultTool),
+            Arc::new(StubDeliverables),
         )
     }
 
@@ -2797,7 +2869,8 @@ mod tests {
         }
 
         let mock = Arc::new(MockSpawner::new());
-        mock.queue_resume_spawn(Ok(ResumedSpawn::fresh("child-conn-2"))).await;
+        mock.queue_resume_spawn(Ok(ResumedSpawn::fresh("child-conn-2")))
+            .await;
         mock.queue_resume_send(Ok(())).await;
         let broker = Arc::new(
             DelegationBroker::new(
@@ -3046,7 +3119,10 @@ mod tests {
         let commit_ids = resp.outcome["_commit_ids"].as_array().unwrap();
         assert_eq!(commit_ids, &vec!["f1", "f2"]);
         // Read was scoped to the token's parent connection id.
-        assert_eq!(feedback.read_conn.lock().await.as_deref(), Some("parent-conn"));
+        assert_eq!(
+            feedback.read_conn.lock().await.as_deref(),
+            Some("parent-conn")
+        );
         // The Feedback arm is READ-ONLY — it does NOT commit (delivery is
         // committed later, by the companion's CommitFeedback).
         assert!(feedback.committed.lock().await.is_empty());
@@ -3490,7 +3566,10 @@ mod tests {
             .await
             .expect("serve_one must return after peer close");
         result.unwrap().unwrap();
-        assert_eq!(questions.canceled.lock().await.as_slice(), &["q-1".to_string()]);
+        assert_eq!(
+            questions.canceled.lock().await.as_slice(),
+            &["q-1".to_string()]
+        );
     }
 
     /// An invalid token never registers a question and returns a `declined`
@@ -3498,7 +3577,8 @@ mod tests {
     #[tokio::test]
     async fn ask_invalid_token_declined() {
         let questions = Arc::new(StubQuestion::default());
-        let listener = make_question_listener(Arc::new(TokenRegistry::default()), questions.clone());
+        let listener =
+            make_question_listener(Arc::new(TokenRegistry::default()), questions.clone());
         let (mut client, mut server) = duplex(8 * 1024);
         let server_task = tokio::spawn(async move {
             listener.serve_one(&mut server).await.unwrap();
@@ -3549,7 +3629,9 @@ mod tests {
 
         let listed = browser_round_trip(
             listener.clone(),
-            BrokerMessage::BrowserTabs(BrokerBrowserTabsRequest { token: "tok".into() }),
+            BrokerMessage::BrowserTabs(BrokerBrowserTabsRequest {
+                token: "tok".into(),
+            }),
         )
         .await;
         assert_eq!(listed.outcome["tabs"][0]["tabId"], "t1");
@@ -3704,7 +3786,10 @@ mod tests {
             },
         );
         let response = browser_capture_response(huge).unwrap();
-        assert_eq!(response.outcome["error"], crate::acp::browser_tools::ERROR_READ_FAILED);
+        assert_eq!(
+            response.outcome["error"],
+            crate::acp::browser_tools::ERROR_READ_FAILED
+        );
         assert_eq!(response.outcome["tabId"], "t1");
         assert!(response.outcome.get("capture").is_none());
         assert!(serde_json::to_vec(&response.outcome).unwrap().len() < 4096);
@@ -3726,7 +3811,10 @@ mod tests {
                 clipped: false,
             },
         );
-        assert_eq!(browser_capture_response(small).unwrap().outcome["capture"]["data"], "AAAA");
+        assert_eq!(
+            browser_capture_response(small).unwrap().outcome["capture"]["data"],
+            "AAAA"
+        );
     }
 
     /// A caller who cannot prove it is a companion is told the same thing a
@@ -3957,7 +4045,9 @@ mod tests {
             fits_sun_path(&socket),
             "the real path must fit, or this tests the wrong check"
         );
-        assert!(!fits_sun_path(&DelegationListener::staging_socket_path(&socket)));
+        assert!(!fits_sun_path(&DelegationListener::staging_socket_path(
+            &socket
+        )));
 
         let err = DelegationListener::bind(&socket).await.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
@@ -4126,6 +4216,7 @@ mod tests {
             Arc::new(NoBrowserTabs),
             computer,
             Arc::new(crate::acp::result_tool::NoResultTool),
+            Arc::new(StubDeliverables),
         )
     }
 
@@ -4511,6 +4602,7 @@ mod tests {
             Arc::new(NoBrowserTabs),
             Arc::new(NoComputerDesktop),
             results.clone(),
+            Arc::new(StubDeliverables),
         );
         let ask = |token: &str| {
             BrokerMessage::ResultSchema(BrokerResultSchemaRequest {

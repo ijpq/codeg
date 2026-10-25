@@ -31,7 +31,7 @@ export function piUsesCustomAgentDir(agent: AcpAgentInfo): boolean {
  * 0.81.0) on every session open. Mirrors `PI_MIN_RUNTIME_VERSION` in
  * `src-tauri/src/acp/registry.rs`, and a Rust test keeps the two equal.
  */
-export const PI_MIN_RUNTIME_VERSION = "0.81.0"
+export const PI_MIN_RUNTIME_VERSION = "1.4.0"
 
 function parseVersion(text: string | null | undefined): number[] | null {
   const match = text?.match(/(\d+)\.(\d+)\.(\d+)/)
