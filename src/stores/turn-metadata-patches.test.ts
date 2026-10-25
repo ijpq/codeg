@@ -70,6 +70,58 @@ function durations(patches: { index: number; duration_ms?: number | null }[]) {
 }
 
 describe("computeTurnMetadataPatches", () => {
+  it("uses native task identity and publishes whole-task timing on the last local fragment", () => {
+    const patches = computeTurnMetadataPatches({
+      localTurns: [
+        user("p"),
+        asst({ id: "live-1", native_task_id: "a" }),
+        asst({ id: "live-2", native_task_id: "a" }),
+      ],
+      parsedTurns: [
+        user("p"),
+        asst({ id: "parsed", native_task_id: "a", duration_ms: 615361 }),
+      ],
+      persistedAssistantCount: 0,
+      parseOpensAtBatch: true,
+      parseEndsWithAssistant: true,
+    })
+    expect(
+      patches.map((p) => [p.index, p.native_task_id, p.duration_ms])
+    ).toEqual([
+      [1, "a", null],
+      [2, "a", 615361],
+    ])
+  })
+
+  it("does not adopt another native task or guess among automated rounds", () => {
+    const params = {
+      persistedAssistantCount: 0,
+      parseOpensAtBatch: true,
+      parseEndsWithAssistant: true,
+    }
+    expect(
+      computeTurnMetadataPatches({
+        ...params,
+        localTurns: [user("p"), asst({ id: "live", native_task_id: "a" })],
+        parsedTurns: [
+          user("p"),
+          asst({ id: "other", native_task_id: "b", duration_ms: 309047 }),
+        ],
+      })
+    ).toEqual([])
+    expect(
+      computeTurnMetadataPatches({
+        ...params,
+        localTurns: [user("p"), live("live")],
+        parsedTurns: [
+          user("p"),
+          asst({ id: "a", native_task_id: "a", duration_ms: 168795 }),
+          asst({ id: "b", native_task_id: "b", duration_ms: 615361 }),
+        ],
+      })
+    ).toEqual([])
+  })
+
   it("does not fold historical turns' stats into the first reply after resume", () => {
     // Resume a conversation with 3 historical assistant turns (in `detail`),
     // then send one prompt. localTurns = [user, assistant] → assistant at 1.
@@ -727,6 +779,7 @@ function seedDetail(turns: MessageTurn[], inFlightUserTurnId?: string) {
       pendingCancelledTurnReports: null,
       optimisticTurns: [],
       liveMessage: null,
+      promptDeliveries: {},
       syncState: "idle" as const,
       activeTurnToken: null,
       lastTurnOwned: false,

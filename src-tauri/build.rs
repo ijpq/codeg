@@ -3,8 +3,32 @@ fn main() {
     #[cfg(feature = "tauri-runtime")]
     {
         ensure_sidecar_placeholder();
+        ensure_windows_codex_resources();
         place_helper_for_development();
         tauri_build::build();
+    }
+}
+
+/// Cargo-only desktop checks do not download release runtimes. An empty
+/// development directory satisfies Tauri's resource-path validation; release
+/// builds must stage the actual tested group before invoking the bundler.
+#[cfg(feature = "tauri-runtime")]
+fn ensure_windows_codex_resources() {
+    if !std::env::var("TARGET").is_ok_and(|target| target.contains("windows")) {
+        return;
+    }
+    let root = std::path::Path::new("../dist/codex-runtime");
+    if std::env::var("PROFILE").as_deref() == Ok("release") {
+        for name in [
+            "codex.exe",
+            "codex-acp.cmd",
+            "adapter-source.json",
+            "runtime.sha256",
+        ] {
+            assert!(root.join(name).is_file(), "Missing Windows Codex release resource {name}; stage scripts/fetch-tested-codex-runtime.py and scripts/build-codex-adapter.py before building Setup");
+        }
+    } else if !root.exists() {
+        std::fs::create_dir_all(root).expect("create development Codex resource directory");
     }
 }
 

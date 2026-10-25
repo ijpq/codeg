@@ -24,6 +24,7 @@ import type { ContentBlock } from "@/lib/types"
 
 vi.mock("@/lib/api", () => ({
   getFolderConversation: vi.fn(),
+  invalidateFolderConversationCache: vi.fn(),
 }))
 
 function toolCallInfo(overrides: {

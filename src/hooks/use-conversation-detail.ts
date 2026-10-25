@@ -50,6 +50,15 @@ export function useConversationDetail(
      * effect and fetches then.
      */
     enabled?: boolean
+    /**
+     * Force the initial persisted-detail read even when the runtime session
+     * already contains optimistic/local/live data, and retain those buffers
+     * when the response lands. Historical ACP restore uses the DB detail's
+     * external session id as its authoritative identity; the ordinary
+     * `fetchDetail` fast path deliberately skips sessions with live data and
+     * can therefore leave that identity unresolved forever.
+     */
+    preserveLiveOnInitialFetch?: boolean
   }
 ): {
   detail: DbConversationDetail | null
@@ -68,8 +77,14 @@ export function useConversationDetail(
   loading: boolean
   error: string | null
   acpLoadError: string | null
+  hasEarlierHistory: boolean
+  earlierHistoryLoading: boolean
+  earlierHistoryError: string | null
+  loadEarlierHistory: () => Promise<void>
 } {
   const enabled = options?.enabled ?? true
+  const preserveLiveOnInitialFetch =
+    options?.preserveLiveOnInitialFetch ?? false
   // Subscribe to ONLY the detail-related fields this hook exposes, not the whole
   // session object. The live-message sink replaces the session object on every
   // streaming batch (~60/s, via SET_LIVE_MESSAGE); a whole-session selector here
@@ -83,6 +98,8 @@ export function useConversationDetail(
     detailLoading,
     detailError,
     acpLoadError,
+    historyPageLoading,
+    historyPageError,
     hasSession,
     needsFetch,
     retryDue,
@@ -97,12 +114,14 @@ export function useConversationDetail(
         session == null ||
         (session.detail == null &&
           !session.detailLoading &&
-          !sessionHoldsActiveTurns(session))
+          (preserveLiveOnInitialFetch || !sessionHoldsActiveTurns(session)))
       return {
         detail: session?.detail ?? null,
         detailLoading: session?.detailLoading ?? false,
         detailError: session?.detailError ?? null,
         acpLoadError: session?.acpLoadError ?? null,
+        historyPageLoading: session?.historyPageLoading ?? false,
+        historyPageError: session?.historyPageError ?? null,
         hasSession: session != null,
         // Fetch right away — unless the last fetch failed, which waits for
         // the retry schedule instead.
@@ -111,15 +130,34 @@ export function useConversationDetail(
       }
     })
   )
-  const { fetchDetail } = useConversationRuntimeActions()
+  const { fetchDetail, refetchDetail, loadEarlierHistory } =
+    useConversationRuntimeActions()
   const isVirtual = isVirtualConversationId(conversationId)
   const fetchPending = enabled && !isVirtual && needsFetch
   const retryPending = enabled && !isVirtual && retryDue
 
   useEffect(() => {
     if (!fetchPending) return
+    if (preserveLiveOnInitialFetch) {
+      // React Strict Mode may replay this effect with the render-time
+      // `detailLoading=false` snapshot. Re-read the store immediately before
+      // the force-refetch so the first synchronous FETCH_DETAIL_START also
+      // single-flights sibling consumers and the replayed effect.
+      const current = useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(conversationId)
+      if (current?.detail || current?.detailLoading) return
+      refetchDetail(conversationId, { preserveLive: true })
+      return
+    }
     fetchDetail(conversationId)
-  }, [fetchPending, conversationId, fetchDetail])
+  }, [
+    fetchPending,
+    conversationId,
+    fetchDetail,
+    preserveLiveOnInitialFetch,
+    refetchDetail,
+  ])
 
   // Automatic retries spent on the current run of failures. A loaded detail or
   // another conversation starts a new run. A hidden view's pending retry is
@@ -138,15 +176,29 @@ export function useConversationDetail(
       DETAIL_RETRY_DELAYS_MS[Math.min(used, DETAIL_RETRY_DELAYS_MS.length - 1)]
     const timer = setTimeout(() => {
       retriesUsedRef.current = used + 1
-      fetchDetail(conversationId)
+      if (preserveLiveOnInitialFetch) {
+        refetchDetail(conversationId, { preserveLive: true })
+      } else {
+        fetchDetail(conversationId)
+      }
     }, delay)
     return () => clearTimeout(timer)
-  }, [retryPending, conversationId, fetchDetail])
+  }, [
+    retryPending,
+    conversationId,
+    fetchDetail,
+    preserveLiveOnInitialFetch,
+    refetchDetail,
+  ])
 
   return {
     detail,
     loading: hasSession ? detailLoading || fetchPending : !isVirtual,
     error: detailError,
     acpLoadError,
+    hasEarlierHistory: detail?.history_page?.has_more ?? false,
+    earlierHistoryLoading: historyPageLoading,
+    earlierHistoryError: historyPageError,
+    loadEarlierHistory: () => loadEarlierHistory(conversationId),
   }
 }

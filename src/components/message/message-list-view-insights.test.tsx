@@ -45,6 +45,8 @@ vi.mock("@/lib/api", () => ({
   getFolderConversation: vi.fn(),
   getFolderConversationTurns: vi.fn(),
   getFolderConversationOutline: vi.fn(() => new Promise(() => {})),
+  invalidateFolderConversationCache: vi.fn(),
+  listConversationOutputWindow: vi.fn(),
   // The transcript's image scope holds them even without a folder.
   readFileBase64: vi.fn(),
   readWorkspaceFileBase64: vi.fn(),
@@ -72,6 +74,12 @@ vi.mock("@/components/ai-elements/message-thread", () => ({
 }))
 vi.mock("use-stick-to-bottom", () => ({
   useStickToBottomContext: () => ({ scrollToBottom: () => {} }),
+}))
+vi.mock("@/components/message/message-bottom-follow-guard", () => ({
+  MessageBottomFollowGuard: () => null,
+}))
+vi.mock("@/components/message/conversation-deliverables-panel", () => ({
+  ConversationDeliverablesPanel: () => null,
 }))
 vi.mock("@/components/chat/agent-plan-overlay", async (importOriginal) => ({
   ...(await importOriginal<
@@ -212,6 +220,7 @@ function seed(over: Partial<DbConversationDetail> = {}): void {
     olderTurnsPrependEpoch: 0,
     pendingOutOfTurnContent: false,
     pendingCleanup: false,
+    promptDeliveries: {},
   }
   useConversationRuntimeStore.setState({
     byConversationId: new Map([[CID, session]]),

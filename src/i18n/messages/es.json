@@ -1238,7 +1238,8 @@
       "loginSaveFailed": "Inicio de sesión exitoso pero falló al guardar la configuración",
       "apiUrlLabel": "URL de API",
       "apiKeyLabel": "Clave API",
-      "managedKeysHint": "Mientras codeg publica la lista de modelos, gestiona aquí model_catalog_json y «model» en la raíz: cámbialos en la lista de modelos de arriba."
+      "managedKeysHint": "Mientras codeg publica la lista de modelos, gestiona aquí model_catalog_json y «model» en la raíz: cámbialos en la lista de modelos de arriba.",
+      "selectReasoningEffort": "Seleccionar Reasoning Effort"
     },
     "gemini": {
       "authConfig": "Configuración de autenticación de Gemini",
@@ -1573,7 +1574,13 @@
       "disableNonessentialTrafficAria": "Desactivar la telemetría o las solicitudes de red innecesarias de Claude Code",
       "gatewayDiscovery": "Dejar que Claude liste los modelos Claude de la pasarela",
       "gatewayDiscoveryAria": "Dejar que Claude Code liste los modelos Claude de la pasarela",
-      "gatewayDiscoveryHint": "Claude pide los modelos a la URL de la API y solo conserva los ID que contienen «claude» o «anthropic»; aparecen desde la siguiente sesión."
+      "gatewayDiscoveryHint": "Claude pide los modelos a la URL de la API y solo conserva los ID que contienen «claude» o «anthropic»; aparecen desde la siguiente sesión.",
+      "effortLevel": "Nivel de razonamiento",
+      "effortLevelDefault": "Nivel predeterminado",
+      "effortLevel_low": "Bajo",
+      "effortLevel_medium": "Medio",
+      "effortLevel_high": "Alto",
+      "effortLevel_xhigh": "Extra Alto"
     },
     "dialogs": {
       "confirmDeleteProvider": "¿Eliminar proveedor {providerId}?",
@@ -1697,7 +1704,9 @@
       "openCodeV1Unsupported": "{versionText}. OpenCode 1.x ya no es compatible: Codeg ahora usa OpenCode 2. Actualiza para abrir sesiones.",
       "recommendedUnavailable": "{versionText}. No hay una versión recomendada disponible.",
       "latest": "{versionText}. Ya está en la última versión.",
-      "unreviewedAvailable": "{versionText}. Hay una versión más reciente sin revisar."
+      "unreviewedAvailable": "{versionText}. Hay una versión más reciente sin revisar.",
+      "bundledRuntime": "CodeG bundled ACP: {localVersion} · {path}. Updated with the matching CodeG release.",
+      "customRuntime": "Selected custom ACP: {localVersion} · {path}. Managed at the configured runtime path."
     },
     "adapter": {
       "label": "Adaptador ACP",
@@ -2185,7 +2194,8 @@
         "updateGroupFailed": "Error al actualizar el grupo: {message}",
         "deleteGroupFailed": "Error al eliminar el grupo: {message}",
         "moveToGroupFailed": "Error al mover la carpeta: {message}",
-        "applyLayoutFailed": "Error al guardar el orden de las carpetas: {message}"
+        "applyLayoutFailed": "Error al guardar el orden de las carpetas: {message}",
+        "reorderFoldersFailed": "Error al reordenar carpetas: {message}"
       },
       "statsLabel": "{folders} carpetas · {convos} conversaciones",
       "reorderHandle": "Arrastrar para reordenar",
@@ -2340,7 +2350,46 @@
         "toolError": "Error",
         "turnFailed": "Turno fallido"
       },
-      "moreActions": "Más acciones"
+      "moreActions": "Más acciones",
+      "steerInjected": "Instrucción inyectada en el turno actual",
+      "steerFallbackFeedback": "La guía nativa no está disponible; se envió como feedback en tiempo real",
+      "steerTurnEndedQueued": "El turno acaba de terminar; el mensaje quedó en cola para el siguiente turno",
+      "imageSteerQueued": "No se pueden inyectar imágenes durante un turno; mensaje en cola para el siguiente",
+      "promptAcceptanceUnknown": "Conexión interrumpida; comprobando si el servidor aceptó el mensaje",
+      "steerUnsupportedQueued": "La guía nativa no está disponible; el mensaje quedó en cola para el siguiente turno",
+      "steerFailedQueued": "Falló la guía; el mensaje quedó en cola para el siguiente turno",
+      "steerWaitingRestore": "Guía guardada; esperando que se recupere la sesión original",
+      "steerOriginalTurnEnded": "La tarea original terminó; esta guía no se envió",
+      "branch": {
+        "create": "Crear rama",
+        "createFromMessage": "Crear rama desde aquí",
+        "nativeCreated": "Rama nativa independiente creada",
+        "snapshotCreated": "Rama creada desde una instantánea de contexto",
+        "provisionalCreated": "La instantánea de la rama está lista; envía el primer mensaje cuando quieras",
+        "runningForkHint": "Fork & Send espera a que termine el turno actual. Para crear una rama ahora, usa «Crear rama»: heredará hasta el último turno completado. Ambas conversaciones comparten el directorio de trabajo; evita editar los mismos archivos a la vez.",
+        "source": "Rama de: {title}",
+        "sourceDeleted": "Origen eliminado: {title}",
+        "sourceDeletedHint": "La conversación de origen fue eliminada; esta rama sigue siendo independiente.",
+        "nativeMode": "Rama nativa",
+        "snapshotMode": "Instantánea de contexto",
+        "inheritanceRange": "{count} mensajes hasta {boundary}",
+        "inheritanceTruncated": "contexto comprimido",
+        "pendingFirstPrompt": "esperando la inicialización con el primer mensaje",
+        "retryableFailed": "se puede reintentar la inicialización",
+        "merge": "Fusionar en la conversación principal",
+        "mergeSuccess": "Fusionado en la conversación principal ({count} entregables)",
+        "mergePreparing": "Preparando la fusión…",
+        "mergeDeterminingBoundary": "Determinando el punto de bifurcación…",
+        "mergeExtractingIncrement": "Extrayendo cambios de la rama…",
+        "mergeWritingSource": "Escribiendo en la conversación principal…",
+        "mergeCompleted": "Fusión completada",
+        "mergeFailed": "La fusión falló; se puede reintentar",
+        "mergeDescription": "Solo se añaden la conclusión y los entregables seleccionados; no se reescribe el historial.",
+        "summaryPlaceholder": "Conclusión que se devolverá",
+        "selectMessages": "Selecciona respuestas visibles (el texto se puede editar)",
+        "mergeKeep": "Fusionar y seguir usando la rama",
+        "mergeArchive": "Fusionar y marcar la rama como completada"
+      }
     },
     "sessionDetails": {
       "menuLabel": "Detalles de la sesión",
@@ -2460,6 +2509,8 @@
         "contextWindowUsageAria": "Uso de la ventana de contexto",
         "contextWindow": "Ventana de contexto",
         "usedMax": "Usado / Máx",
+        "source": "Fuente",
+        "contextSource": "Respuesta de ejecución",
         "tokenUsage": "Uso de tokens",
         "input": "Entrada",
         "output": "Salida",
@@ -2473,7 +2524,8 @@
         "groups": {
           "workspace": "Espacio de trabajo",
           "navigation": "Navegación",
-          "more": "Más"
+          "more": "Más",
+          "sessions": "Sesiones"
         },
         "browserTab": "Abrir pestaña del navegador",
         "showPet": "Mostrar mascota"
@@ -2507,6 +2559,18 @@
         "loadFailed": "No se pudo leer el estado: {message}",
         "openSettings": "Abrir ajustes completos",
         "refresh": "Actualizar"
+      },
+      "quota": {
+        "summary": "{plan} · queda {remaining} semanal",
+        "lastRoutedPlan": "Plan usado por la última solicitud",
+        "weeklyShort": "Sem. restante",
+        "weeklyRemaining": "Restante semanal",
+        "weeklyUsed": "Uso semanal",
+        "resetsAt": "Se restablece",
+        "observedAt": "Actualizado",
+        "refresh": "Actualizar cuota",
+        "unknown": "Desconocido",
+        "sourceHint": "Leído de la última respuesta real de Codex; sin solicitudes extra al relay."
       }
     },
     "auxPanel": {
@@ -2716,10 +2780,14 @@
       "officeNotInstalled": "OfficeCLI no está instalado",
       "officeNotInstalledHint": "Instala OfficeCLI en Ajustes → Herramientas de Office para previsualizar archivos de Word, Excel y PowerPoint.",
       "officeOpenSettings": "Abrir ajustes",
-      "officeWatchFailed": "No se pudo iniciar la vista previa en vivo",
+      "officeWatchFailed": "No se pudo iniciar la vista previa",
       "officeWatchRetry": "Reintentar",
       "officeServerInstallHint": "OfficeCLI debe instalarse en el host del servidor. Ejecuta este comando allí y vuelve a intentarlo:",
-      "officeRemoteDesktopUnsupported": "La vista previa en vivo no está disponible en una ventana de escritorio remoto. Abre este espacio de trabajo en la interfaz web del servidor para previsualizar archivos de Office."
+      "officeRemoteDesktopUnsupported": "La vista previa en vivo no está disponible en una ventana de escritorio remoto. Abre este espacio de trabajo en la interfaz web del servidor para previsualizar archivos de Office.",
+      "officeDeliveredReview": "Revisión entregada · {name} · {time} · {run}",
+      "officeManualReview": "Archivo actual · copia fija al abrirlo",
+      "officeReviewDownload": "Descargar esta copia de revisión",
+      "officeReviewFailed": "No se pudo preparar la copia de revisión de {name}. Consulta o descarga el archivo actual desde su tarjeta."
     },
     "fileViewer": {
       "title": "Vista previa del archivo",
@@ -3333,6 +3401,31 @@
       "diffDescriptionConflict": "{path} · disco vs sin guardar"
     },
     "chat": {
+      "execution": {
+        "label": "Execution",
+        "direct": "Execute directly",
+        "plan": "Plan first",
+        "goal": "Execute goal",
+        "switchHint": "Switching to Direct or Plan pauses an active goal first. Returning here does not resume it; use Resume explicitly. End clears the native goal and stops its work.",
+        "unsupported": "Goal execution requires verified native controls and status reporting. Connect a supported Codex ACP adapter to enable it.",
+        "stateUnavailable": "Cannot read the current goal. The execution mode was not changed.",
+        "objective": "Goal objective",
+        "status": "Status",
+        "tokens": "Tokens",
+        "start": "Start goal",
+        "pause": "Pause",
+        "resume": "Resume",
+        "end": "End goal",
+        "statuses": {
+          "active": "Active",
+          "paused": "Paused",
+          "blocked": "Blocked",
+          "complete": "Complete",
+          "limited": "Limited",
+          "budgetLimited": "Budget limited",
+          "usageLimited": "Usage limited"
+        }
+      },
       "acpConnections": {
         "actions": {
           "openAgentsSettings": "Abrir ajustes de agentes",
@@ -3423,7 +3516,9 @@
       "chatInput": {
         "connecting": "Conectando...",
         "agentResponding": "{agent} está respondiendo...",
-        "sendMessage": "Enviar un mensaje..."
+        "sendMessage": "Enviar un mensaje...",
+        "stopping": "Deteniendo...",
+        "guideAgent": "Guiar el turno actual de {agent}..."
       },
       "messageInput": {
         "askAnything": "Pregunta lo que sea...",
@@ -3495,7 +3590,12 @@
         "mentionGroupSession": "Sesiones",
         "mentionGroupCommit": "Commits",
         "mentionGroupSkill": "Habilidades",
-        "mentionGroupAssistant": "Asistentes"
+        "mentionGroupAssistant": "Asistentes",
+        "stopping": "Deteniendo...",
+        "steer": "Guiar turno actual",
+        "steerSending": "Inyectando instrucción...",
+        "forkAndSend": "Fork y Enviar",
+        "steerAttachmentsUnsupported": "Solo texto: los borradores con adjuntos pasan por la cola."
       },
       "messageQueue": {
         "addToQueue": "Agregar a la cola",
@@ -3504,7 +3604,16 @@
         "editItem": "Editar",
         "deleteItem": "Eliminar",
         "steerItemNow": "Insertar en el turno actual",
-        "steerItemAsNote": "Enviar como nota para la próxima comprobación"
+        "steerItemAsNote": "Enviar como nota para la próxima comprobación",
+        "queued": "En cola",
+        "waiting_source_turn": "Esperando a que termine la tarea de origen",
+        "creating_branch": "Creando rama",
+        "waiting_session_restore": "Esperando recuperación de sesión",
+        "waiting_connection": "Esperando reintento de conexión",
+        "failed": "Error de envío",
+        "expired_guide": "La tarea original terminó",
+        "retry": "Reintentar",
+        "sendAsPrompt": "Enviar como mensaje nuevo"
       },
       "welcomeInputPanel": {
         "agentsSettingsPath": "Ajustes > Agentes",
@@ -3548,7 +3657,8 @@
           "liveFeedback": "Comentarios en vivo, en el menú +, inserta una nota en el turno que el agente ya está ejecutando, sin interrumpirlo.",
           "skillPacks": "Configuración → Paquetes de habilidades reúne expertos de programación, investigación científica y ofimática; actívalos por agente.",
           "modelProviders": "Configuración → Proveedores de Modelos acepta tu propia clave de API o endpoint, y el modelo lo eliges desde el cuadro de entrada.",
-          "workspaceBackground": "Configuración → Apariencia define una imagen de fondo del espacio de trabajo, la opacidad de los paneles y las fuentes de la app."
+          "workspaceBackground": "Configuración → Apariencia define una imagen de fondo del espacio de trabajo, la opacidad de los paneles y las fuentes de la app.",
+          "forkSend": "El desplegable del botón de enviar incluye Bifurcar y enviar, que ramifica desde el punto actual a una pestaña nueva."
         },
         "quickActions": {
           "excel": "Libro de Excel",
@@ -3775,14 +3885,50 @@
         "jumpToPreviousUserMessage": "Ir al mensaje del usuario",
         "showMore": "Mostrar más",
         "showLess": "Mostrar menos",
-        "resizeWidth": "Arrastra para cambiar el ancho del chat · doble clic para restablecer"
+        "resizeWidth": "Arrastra para cambiar el ancho del chat · doble clic para restablecer",
+        "loadEarlierHistory": "Cargar mensajes anteriores",
+        "partialHistory": "El historial reciente se cargó parcialmente por el límite de lectura. Los mensajes se conservan. Recarga o carga mensajes anteriores para recuperar más.",
+        "retryEarlierHistory": "Reintentar mensajes anteriores",
+        "delivery": {
+          "submitting": "Enviando…",
+          "accepted": "Enviado",
+          "running": "Procesando en el servidor",
+          "persisted": "Guardado",
+          "completed": "Completado",
+          "failed": "Estado de envío desconocido",
+          "queued": "En cola"
+        },
+        "worked": "Trabajo finalizado",
+        "workedFor": "Trabajo realizado durante {duration}",
+        "working": "Trabajando..."
       },
       "liveTurnStats": {
         "elapsedHours": "{value} h",
         "elapsedMinutes": "{value} min",
         "elapsedSeconds": "{value} s",
         "outputSpeedAria": "Velocidad de salida estimada",
-        "outputSpeedTooltip": "Velocidad de salida estimada (texto + razonamiento)"
+        "outputSpeedTooltip": "Velocidad de salida estimada (texto + razonamiento)",
+        "sent": "Enviado",
+        "backendProcessing": "Procesando en el servidor",
+        "stillProcessing": "El servidor sigue procesando",
+        "toolUseCount": "{count, plural, one {# uso de herramienta} other {# usos de herramienta}}",
+        "diagnostics": {
+          "open": "Diagnóstico de conexión",
+          "title": "Diagnóstico de generación",
+          "phase": "Fase actual",
+          "phaseThinking": "Pensando",
+          "phaseTool": "Ejecutando herramienta",
+          "phaseOutput": "Escribiendo respuesta",
+          "phaseWaiting": "Esperando respuesta",
+          "sinceLastData": "Desde los últimos datos",
+          "testLink": "Probar enlace",
+          "testing": "Probando…",
+          "reachable": "Accesible · HTTP {status} · {latency}ms",
+          "unreachable": "Inaccesible · {error}",
+          "notConfigured": "Conexión directa/oficial: nada que probar.",
+          "hintReachable": "El enlace funciona. Si no llegan datos nuevos durante un rato, probablemente el modelo sigue trabajando.",
+          "hintUnreachable": "Problema de enlace: la red o el túnel pueden estar bloqueados."
+        }
       },
       "jsonTree": {
         "viewRaw": "Ver JSON sin formato",
@@ -3897,7 +4043,8 @@
           "reviewKept": "Se mantuvo en modo plan",
           "reviewPending": "Esperando la decisión sobre el plan",
           "submitted": "Plan enviado",
-          "switched": "Modo cambiado"
+          "switched": "Modo cambiado",
+          "planLabel": "Plan"
         },
         "backgroundTask": {
           "polledTimes": "Consultada {count} veces",
@@ -3923,7 +4070,9 @@
         "visualizeFrameTitle": "Visualización de Codex",
         "htmlPreviewOpen": "Vista previa",
         "htmlPreviewOpenAria": "Vista previa de {name}",
-        "htmlPreviewHide": "Ocultar vista previa"
+        "htmlPreviewHide": "Ocultar vista previa",
+        "loadBranchMergeSummary": "Cargar el resumen completo",
+        "loadingBranchMergeSummary": "Cargando el resumen…"
       },
       "activity": {
         "header": {
@@ -4110,7 +4259,9 @@
         "openFile": "Abrir {filePath}",
         "openInEditor": "Abrir en el editor",
         "remove": "Quitar",
-        "noDiffDataAvailable": "No hay datos de diff disponibles para {filePath}"
+        "noDiffDataAvailable": "No hay datos de diff disponibles para {filePath}",
+        "downloadToPc": "Descargar a mi PC",
+        "fileUnavailable": "Archivo no disponible o que ya no existe: {filePath}"
       },
       "askQuestion": {
         "title": "El agente necesita tu elección",
@@ -4287,6 +4438,96 @@
       "proposedPlan": {
         "title": "Plan propuesto",
         "planning": "Planificando…"
+      },
+      "conversationDeliverables": {
+        "collapsedSummary": "Entregables {count}",
+        "historyTitle": "Historial de entregables",
+        "allTitle": "Todos los entregables",
+        "loadingHistory": "Cargando historial de entregables…",
+        "retry": "Reintentar",
+        "versions": "{count} versiones",
+        "toggleVersions": "Mostrar u ocultar {count} versiones históricas",
+        "loadMore": "Cargar más",
+        "title": "Entregables finales",
+        "collapse": "Contraer",
+        "openFile": "Abrir {filePath}",
+        "revealInFolder": "Mostrar en el administrador de archivos",
+        "primary": "Principal",
+        "supporting": "Complementario",
+        "downloadToPc": "Descargar en mi equipo",
+        "fileUnavailable": "Archivo no disponible o que ya no existe: {filePath}",
+        "turnTitle": "Outputs from this turn",
+        "download": "Download to this device",
+        "openWithDefaultAppHost": "Open with default app (Codeg host)",
+        "copyFileHost": "Copy file object (Codeg host)",
+        "copyPath": "Copy path",
+        "revealOnHost": "Reveal on the Codeg host",
+        "fileCopied": "File copied; you can paste it directly",
+        "pathCopied": "Path copied",
+        "filesCopied": "Files copied; you can paste them together",
+        "opened": "Opened with the Codeg host's default app",
+        "operationFailed": "Deliverable operation failed",
+        "declared": "Declared",
+        "inferred": "Automatically inferred",
+        "codeChange": "Cambio de código",
+        "deleted": "Eliminado",
+        "allTypes": "All types",
+        "allSources": "All sources",
+        "allTurns": "All turns",
+        "turnNumber": "Turn {number}",
+        "allTimes": "Any time",
+        "lastDay": "Last 24 hours",
+        "lastWeek": "Last 7 days",
+        "lastMonth": "Last 30 days",
+        "newest": "Recently updated",
+        "oldest": "Oldest updated",
+        "selectAll": "Select filtered items",
+        "selectedCount": "{count} selected",
+        "downloadSelected": "Download selected files individually",
+        "downloadZip": "Download selected files as ZIP",
+        "copySelectedHost": "Copy selected file objects (Codeg host)",
+        "revealFirstHost": "Reveal the first file on the Codeg host",
+        "removeInvalid": "Remove selected invalid records",
+        "removed": "Invalid records removed",
+        "downloadStarted": "Download started",
+        "revealed": "File revealed on the Codeg host",
+        "selectFile": "Select {name}",
+        "missing": "File missing",
+        "empty": "This conversation has no confirmed deliverables yet",
+        "noFilterResults": "No deliverables match these filters",
+        "hostActionNotice": "Open, copy file, and reveal actions affect the host running Codeg Server; downloads always go to the current device.",
+        "previewInCodeg": "Ver en CodeG"
+      },
+      "userResources": {
+        "openFile": "Abrir {filePath}",
+        "fileUnavailable": "Archivo no disponible o que ya no existe: {filePath}"
+      },
+      "businessAgent": {
+        "agent": "Agent",
+        "sharedState": "Shared task & memory",
+        "queued": "Waiting for the current turn to finish",
+        "preparing": "Preparing handoff…",
+        "retry": "Retry {agent}",
+        "objective": "Objective",
+        "requirements": "Requirements (one per line)",
+        "completed": "Completed",
+        "pending": "Next steps",
+        "latestFiles": "Latest files",
+        "decisions": "Key decisions",
+        "memory": "Shared user memory",
+        "memoryScope": "Memory scope",
+        "task": "This business",
+        "project": "This project",
+        "global": "Global preferences",
+        "loadRule": "Confirmed memory is loaded into the next accepted prompt within its context budget; omitted items are explicitly marked. Native private memory stays engine-specific. Save only confirmed facts and requirements.",
+        "save": "Save",
+        "succeeded": "Handoff complete",
+        "phases": {
+          "capturing_history": "Saving history and work rules…",
+          "starting_target": "Starting the target Agent…",
+          "verifying_target": "Verifying the target session…",
+          "activating": "Activating the business session…"
+        }
       }
     },
     "diffPreview": {
@@ -4622,7 +4863,17 @@
       "fr": "Francés",
       "pt": "Portugués",
       "ar": "Árabe"
-    }
+    },
+    "defaultConversation": "Default conversation",
+    "defaultConversationHint": "Use this conversation for the first WeChat message when the sender has no saved binding.",
+    "defaultFolderId": "Folder ID",
+    "defaultConversationId": "Conversation ID",
+    "defaultAgentType": "Agent type",
+    "weixinPushMode": "WeChat push mode",
+    "weixinPushFinalOnly": "Final result only",
+    "weixinPushFinalAndInteractions": "Final result and required interactions",
+    "weixinPushDebug": "Debug mode",
+    "weixinPushModeHint": "Only the final answer is pushed by default. Expired reply tokens keep the result pending until the next inbound message."
   },
   "ModelProviderSettings": {
     "sectionTitle": "Proveedores de Modelos",
@@ -4862,7 +5113,9 @@
       "syncFailed": "Error al sincronizar habilidades"
     },
     "autoPreviewLabel": "Abrir vista previa automáticamente",
-    "autoPreviewHint": "Cuando un agente crea o edita un archivo de Word, Excel o PowerPoint, abre su vista previa en vivo automáticamente."
+    "autoPreviewHint": "Al terminar correctamente la tarea, muestra el archivo final entregado de Word, Excel o PowerPoint. Los cambios de archivos no abren vistas previas.",
+    "autoDownloadProducedLabel": "Descargar automáticamente los entregables finales",
+    "autoDownloadProducedHint": "Al usar el servidor web (p. ej., por Tailscale/LAN), descarga automáticamente a la carpeta de Descargas de este navegador los archivos de entrega final declarados por el agente y verificados."
   },
   "SkillPacksSettings": {
     "title": "Paquetes de habilidades",
@@ -5991,7 +6244,12 @@
     "targetsDescription": "Establece un nivel distinto para módulos específicos (p. ej. codeg_lib::acp) sin cambiar el nivel global.",
     "targetsAdd": "Añadir",
     "targetsRemove": "Quitar anulación",
-    "toggleDetails": "Mostrar detalles"
+    "toggleDetails": "Mostrar detalles",
+    "exportDiagnostics": "Exportar diagnóstico",
+    "exporting": "Exportando…",
+    "exportDescription": "Exporta como JSON los datos de la aplicación y el entorno, la configuración, los metadatos de archivos y los registros recientes. Se ocultan credenciales comunes y se excluyen conversaciones y bases de datos; revisa las rutas y el texto antes de compartir.",
+    "exportSuccess": "Informe de diagnóstico exportado",
+    "exportFailed": "No se pudo exportar el informe de diagnóstico"
   },
   "Automations": {
     "title": "Automatizaciones",
@@ -6126,7 +6384,13 @@
     "branchDefault": "Rama predeterminada",
     "booleanOn": "Activado",
     "booleanOff": "Desactivado",
-    "modelNotSwitched": "El agente no cambió al modelo seleccionado, así que estas opciones pueden ser de otro modelo."
+    "modelNotSwitched": "El agente no cambió al modelo seleccionado, así que estas opciones pueden ser de otro modelo.",
+    "branchUseCustom": "Usar «{query}»",
+    "branchLocal": "Local",
+    "branchRemote": "Remota",
+    "branchSearchPlaceholder": "Buscar ramas…",
+    "branchNone": "Sin ramas",
+    "advanced": "Avanzado"
   },
   "Tasks": {
     "title": "Tareas pendientes",

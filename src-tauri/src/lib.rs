@@ -15,22 +15,25 @@
 
 pub mod acp;
 pub mod acp_transcript;
-pub use acp::{
-    idle_sweep_task, idle_timeout_from_env, lifecycle_subscriber_task, SWEEP_INTERVAL_SECS,
-};
 pub use acp::scratch_dir::scratch_sweep_task;
+pub use acp::{
+    idle_sweep_task, idle_timeout_from_env, lifecycle_subscriber_task, turn_reconciliation_task,
+    SWEEP_INTERVAL_SECS, TURN_RECONCILIATION_INTERVAL_SECS,
+};
 pub use network::proxy::init_proxy_from_db;
 mod app_error;
 #[cfg(all(feature = "tauri-runtime", target_os = "macos"))]
 mod app_menu;
 pub mod app_state;
 pub mod appimage_env;
+pub mod artifact_tracker;
 pub mod automation;
 pub mod backgrounds;
 /// Built-in browser. Only its wire types and its grant rules compile in server
 /// mode — see `browser/mod.rs` for why those two, and only those two.
 pub mod browser;
 pub mod chat_channel;
+pub mod citations;
 /// The `codeg-cli` binary's client side (feature `cli-bin`).
 #[cfg(feature = "cli-bin")]
 pub mod cli;
@@ -99,31 +102,25 @@ mod tauri_app {
     use crate::acp::manager::ConnectionManager;
     use crate::chat_channel::manager::ChatChannelManager;
     use crate::commands::{
-        acp as acp_commands, app_update as app_update_commands,
-        assistants as assistant_commands, automation as automation_commands,
-        background as background_commands, backup,
-        browser as browser_commands,
-        canvas as canvas_commands,
+        acp as acp_commands, app_update as app_update_commands, assistants as assistant_commands,
+        automation as automation_commands, background as background_commands, backup,
+        browser as browser_commands, canvas as canvas_commands,
         chat_authoring as chat_authoring_commands, chat_channel as chat_channel_commands,
-        clipboard as clipboard_commands,
-        commit_message as commit_message_commands,
-        config_sync,
-        conversation_tags,
-        conversations,
-        custom_skills as custom_skills_commands,
+        clipboard as clipboard_commands, codex_quota as codex_quota_commands,
+        commit_message as commit_message_commands, config_sync, conversation_branches,
+        conversation_tags, conversations, custom_skills as custom_skills_commands,
         deepseek_settings as deepseek_settings_commands, delegation as delegation_commands,
-        experts as experts_commands, feedback as feedback_commands, file_io, folder_commands,
-        folder_links, local_command, office_tools as office_tools_commands, open_in,
-        folders, logging as logging_commands, mcp as mcp_commands,
-        model_provider as model_provider_commands, notification, pet as pet_commands, project_boot,
+        deliverables as deliverable_commands, experts as experts_commands,
+        feedback as feedback_commands, file_io, folder_commands, folder_links, folders,
+        forge as forge_commands, local_command, logging as logging_commands, mcp as mcp_commands,
+        model_provider as model_provider_commands, notification,
+        office_tools as office_tools_commands, open_in, pet as pet_commands, project_boot,
         question as question_commands, quick_messages as quick_messages_commands,
-        remote_proxy as remote_proxy_commands,
-        remote_workspace as remote_workspace_commands, science as science_commands,
-        session_info as session_info_commands,
-        system_settings, terminal as terminal_commands,
-        token_usage as token_usage_commands,
-        forge as forge_commands, version_control, windows, work_task as work_task_commands,
-        workspace_state as workspace_state_commands, workspace_windows,
+        remote_proxy as remote_proxy_commands, remote_workspace as remote_workspace_commands,
+        science as science_commands, session_info as session_info_commands, system_settings,
+        terminal as terminal_commands, token_usage as token_usage_commands, version_control,
+        windows, work_task as work_task_commands, workspace_state as workspace_state_commands,
+        workspace_windows,
     };
     use crate::terminal::manager::TerminalManager;
     use crate::{db, git_credential, network, paths, process, web};
@@ -609,7 +606,8 @@ mod tauri_app {
         // After the PATH fixes above, which rewrite PATH.
         if let (Some(data_dir), Ok(exe)) = (&desktop_data_dir, std::env::current_exe()) {
             let local = dirs::data_local_dir().map(|d| d.join(&context.config().identifier));
-            if let Some(layout) = crate::cli_run::shim::plan_desktop(data_dir, local.as_deref(), &exe)
+            if let Some(layout) =
+                crate::cli_run::shim::plan_desktop(data_dir, local.as_deref(), &exe)
             {
                 layout.export();
                 layout.remember();
@@ -1339,6 +1337,12 @@ mod tauri_app {
                                 manager: std::sync::Arc::new(cm_state.clone_ref()),
                             },
                         ),
+                        crate::acp::deliverables::shared_access(
+                            db_conn.clone(),
+                            crate::web::event_bridge::EventEmitter::Tauri(
+                                app.handle().clone(),
+                            ),
+                        ),
                     );
                     // Bind through the service handle rather than a bare
                     // `listener.run` spawn: it keeps the bind error and the
@@ -1377,6 +1381,23 @@ mod tauri_app {
                         bus,
                         Some(broker_for_lifecycle),
                     ));
+                    tauri::async_runtime::spawn(crate::acp::turn_reconciliation_task(
+                        app.state::<ConnectionManager>().clone_ref(),
+                        app.state::<db::AppDatabase>().conn.clone(),
+                        std::time::Duration::from_secs(
+                            crate::acp::TURN_RECONCILIATION_INTERVAL_SECS,
+                        ),
+                    ));
+                }
+
+                {
+                    let manager=app.state::<ConnectionManager>().clone_ref();
+                    let db=app.state::<db::AppDatabase>().inner().clone();
+                    let data_dir=effective_data_dir.clone();
+                    let emitter=crate::web::event_bridge::EventEmitter::Tauri(app.handle().clone());
+                    tauri::async_runtime::spawn(async move {
+                        crate::commands::business_conversations::recover_switches(&manager,&db,&data_dir,emitter).await;
+                    });
                 }
 
                 // Headless `codeg-cli` runs: the service and its loopback
@@ -1851,6 +1872,11 @@ mod tauri_app {
                 conversations::scan_importable_sessions,
                 conversations::import_selected_sessions,
                 conversations::get_folder_conversation,
+                conversations::get_deferred_history_content,
+                conversations::list_conversation_branch_merges,
+                conversations::list_conversation_branches,
+                conversations::list_conversation_output_window,
+                conversations::diagnose_codex_rollout_size,
                 conversations::get_folder_conversation_turns,
                 conversations::get_folder_conversation_outline,
                 conversations::list_folders,
@@ -1876,6 +1902,22 @@ mod tauri_app {
                 conversation_tags::get_conversation_branch_tag,
                 conversation_tags::update_conversation_branch_tag,
                 conversations::delete_conversation,
+                conversation_branches::create_conversation_branch,
+                conversation_branches::queue_conversation_branch_creation,
+                conversation_branches::get_conversation_branch_creation_task,
+                conversation_branches::cancel_conversation_branch_creation_task,
+                conversation_branches::get_conversation_branch_info,
+                conversation_branches::merge_conversation_branch,
+                deliverable_commands::deliverable_capabilities,
+                deliverable_commands::list_conversation_deliverables,
+                deliverable_commands::list_turn_deliverables,
+                deliverable_commands::list_conversation_deliverable_runs,
+                deliverable_commands::list_conversation_deliverable_history,
+                deliverable_commands::copy_deliverables,
+                deliverable_commands::open_deliverable,
+                deliverable_commands::reveal_deliverable,
+                deliverable_commands::hide_deliverables,
+                deliverable_commands::save_deliverables,
                 folders::load_folder_history,
                 folders::get_folder,
                 folders::list_open_folder_details,
@@ -1982,6 +2024,7 @@ mod tauri_app {
                 folders::list_workspace_files,
                 folders::read_file_base64,
                 folders::read_workspace_file_base64,
+                folders::stat_workspace_file,
                 folders::read_file_preview,
                 folders::read_file_for_edit,
                 folders::save_file_content,
@@ -2019,6 +2062,7 @@ mod tauri_app {
                 remote_proxy_commands::remote_cancel_workspace_transfer,
                 remote_proxy_commands::remote_download_workspace_file,
                 remote_proxy_commands::remote_download_workspace_dir,
+                remote_proxy_commands::remote_download_deliverables,
                 remote_proxy_commands::read_local_file_for_upload,
                 remote_proxy_commands::remote_ws_subscribe,
                 remote_proxy_commands::remote_ws_unsubscribe,
@@ -2143,10 +2187,22 @@ mod tauri_app {
                 acp_commands::acp_cursor_list_models,
                 acp_commands::acp_qoder_auth_status,
                 acp_commands::acp_connect,
+                acp_commands::acp_restore_conversation,
+                crate::commands::business_delivery::submit_business_message,
+                crate::commands::business_delivery::get_business_message,
+                crate::commands::business_delivery::cancel_business_message,
+                crate::commands::business_conversations::switch_business_agent,
+                crate::commands::business_conversations::get_business_conversation_state,
+                crate::commands::business_conversations::update_business_task_state,
+                crate::commands::business_conversations::get_business_shared_memory,
+                crate::commands::business_conversations::save_business_shared_memory,
+
                 acp_commands::acp_prompt,
+                acp_commands::acp_steer,
                 acp_commands::acp_set_mode,
                 acp_commands::acp_set_config_option,
                 acp_commands::acp_goal_control,
+                acp_commands::acp_get_goal_state,
                 acp_commands::acp_describe_agent_options,
                 acp_commands::acp_cancel,
                 acp_commands::acp_fork,
@@ -2267,6 +2323,8 @@ mod tauri_app {
                 office_tools_commands::officecli_skill_apply_links,
                 office_tools_commands::officecli_skill_read_content,
                 office_tools_commands::officecli_render_html,
+                office_tools_commands::get_office_delivery_preview,
+                office_tools_commands::save_office_delivery_preview,
                 office_tools_commands::start_office_watch,
                 office_tools_commands::stop_office_watch,
                 office_tools_commands::renew_office_watch,
@@ -2297,6 +2355,7 @@ mod tauri_app {
                 token_usage_commands::token_usage_facets,
                 token_usage_commands::token_usage_status,
                 token_usage_commands::token_usage_sync,
+                codex_quota_commands::codex_quota_snapshot,
                 work_task_commands::work_task_list,
                 work_task_commands::work_task_get,
                 work_task_commands::work_task_events,
@@ -2420,6 +2479,7 @@ mod tauri_app {
                 model_provider_commands::update_model_provider,
                 model_provider_commands::delete_model_provider,
                 model_provider_commands::list_provider_models,
+                model_provider_commands::probe_active_model_provider,
                 web::start_web_server,
                 web::stop_web_server,
                 web::get_web_server_status,

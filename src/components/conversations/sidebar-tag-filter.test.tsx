@@ -409,14 +409,17 @@ describe("SidebarTagFilterSubmenu keyboard", () => {
   })
 
   it("goes back to the row on ← from an empty search box", async () => {
-    const panel = await openPanel()
-    await userEvent.click(searchBox(panel))
+    // A keyboard opening leaves no pointer-hover timer behind. jsdom has no
+    // geometry to deliver the pointer leave that would clear it in a browser.
+    const row = await openMenu()
+    act(() => row.focus())
+    await userEvent.keyboard("{ArrowRight}")
+    const panel = await screen.findByRole("dialog", { name: "Filter by tags" })
+    await waitFor(() => expect(searchBox(panel)).toHaveFocus())
     await userEvent.keyboard("{ArrowLeft}")
 
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull())
-    expect(
-      screen.getByRole("menuitem", { name: "Filter by tags" })
-    ).toHaveFocus()
+    expect(row).toHaveFocus()
   })
 
   it("cycles Tab through the panel's controls, both ways", async () => {

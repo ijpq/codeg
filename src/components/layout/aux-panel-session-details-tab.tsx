@@ -10,6 +10,7 @@ import { useAppWorkspaceStore } from "@/stores/app-workspace-store"
 import { resolveActiveSessionDetails } from "@/components/conversations/active-session-details"
 import { SessionDetailsCard } from "@/components/conversations/session-details-content"
 import { MessageNavScrollContext } from "@/components/message/message-nav-scroll-context"
+import { ConversationDeliverablesPanel } from "@/components/message/conversation-deliverables-panel"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { useAuxPanelContext } from "@/contexts/aux-panel-context"
 import { SessionDetailsInsights } from "./session-details-insights"
@@ -24,7 +25,8 @@ const EMPTY_TURNS: MessageTurn[] = []
  * The aux-panel "Session Details" tab. Shows the active conversation's identity
  * and identifiers as a card (`SessionDetailsCard`; the dialog is the full view,
  * with token usage and timestamps), then what its transcript knows: the
- * agent's plan and the message navigator, whose messages carry their
+ * conversation's complete deliverable history, the agent's plan and the
+ * message navigator, whose messages carry their
  * sub-agents and changed files (`SessionDetailsInsights`). The branch selector
  * + command launcher that used to sit atop this tab now live in the bottom
  * status bar on both platforms.
@@ -81,6 +83,7 @@ export function SessionDetailsTab() {
   // in view of that scroll: it needs the real scroll container, which
   // OverlayScrollbars hands over once it has initialized.
   const [viewport, setViewport] = useState<HTMLElement | null>(null)
+  const [deliverablesExpanded, setDeliverablesExpanded] = useState(false)
   const handleViewportRef = useCallback(
     (element: HTMLElement | null) => setViewport(element),
     []
@@ -101,6 +104,16 @@ export function SessionDetailsTab() {
           <MessageNavScrollContext.Provider value={viewport}>
             <div className="min-w-0 space-y-4 p-3 text-sm">
               <SessionDetailsCard summary={summary} model={model} />
+              {summary.id > 0 && (
+                <ConversationDeliverablesPanel
+                  key={summary.id}
+                  conversationId={summary.id}
+                  expanded={deliverablesExpanded}
+                  onToggle={setDeliverablesExpanded}
+                  presentation="sidebar"
+                  active={active}
+                />
+              )}
               <SessionDetailsInsights
                 conversationId={activeRuntimeId}
                 active={active}

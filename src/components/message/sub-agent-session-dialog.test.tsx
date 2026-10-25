@@ -5,6 +5,19 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 import { SubAgentSessionDialog } from "./sub-agent-session-dialog"
 import enMessages from "@/i18n/messages/en.json"
 import type { ConnectionState } from "@/contexts/acp-connections-context"
+import {
+  GoalControlProvider,
+  useGoalControl,
+} from "@/components/message/goal-control-context"
+
+const mockSubscribe = vi.hoisted(() =>
+  vi.fn(async (event: string, listener: (change: unknown) => void) => {
+    void event
+    void listener
+    return () => {}
+  })
+)
+vi.mock("@/lib/platform", () => ({ subscribe: mockSubscribe }))
 
 // Runtime context — record dispatch calls so we can assert the bridge
 // runs at the right moments without booting the real reducer.
@@ -165,27 +178,33 @@ vi.mock("@/hooks/use-conversation-detail", () => ({
 // so the read-only-mode test can assert that no `onReload`/`onNewSession`/
 // `sendSignal` are wired in.
 vi.mock("@/components/message/message-list-view", () => ({
-  MessageListView: (props: Record<string, unknown>) => (
-    <div
-      data-testid="message-list-view"
-      data-conversation-id={String(props.conversationId)}
-      data-is-active={String(props.isActive)}
-      data-has-on-reload={String(props.onReload !== undefined)}
-      data-has-on-new-session={String(props.onNewSession !== undefined)}
-      data-has-send-signal={String(props.sendSignal !== undefined)}
-      data-conn-status={
-        props.connStatus === null || props.connStatus === undefined
-          ? "null"
-          : String(props.connStatus)
-      }
-      data-agent-type={String(props.agentType)}
-      data-available-commands={
-        props.availableCommands === undefined
-          ? "undefined"
-          : JSON.stringify(props.availableCommands)
-      }
-    />
-  ),
+  MessageListView: (props: Record<string, unknown>) => {
+    const goal = useGoalControl()
+    return (
+      <div
+        data-testid="message-list-view"
+        data-goal-connection={goal.connectionId ?? "none"}
+        data-goal-read-only={String(goal.readOnly)}
+        data-has-goal-control={String(goal.onGoalControl !== null)}
+        data-conversation-id={String(props.conversationId)}
+        data-is-active={String(props.isActive)}
+        data-has-on-reload={String(props.onReload !== undefined)}
+        data-has-on-new-session={String(props.onNewSession !== undefined)}
+        data-has-send-signal={String(props.sendSignal !== undefined)}
+        data-conn-status={
+          props.connStatus === null || props.connStatus === undefined
+            ? "null"
+            : String(props.connStatus)
+        }
+        data-agent-type={String(props.agentType)}
+        data-available-commands={
+          props.availableCommands === undefined
+            ? "undefined"
+            : JSON.stringify(props.availableCommands)
+        }
+      />
+    )
+  },
 }))
 
 function renderWithIntl(ui: React.ReactElement) {
@@ -202,11 +221,17 @@ function makeConnState(overrides: Partial<ConnectionState>): ConnectionState {
     contextKey: "ck1",
     agentType: "codex",
     workingDir: null,
+    conversationId: null,
     status: "connected",
+    promptReady: true,
     promptCapabilities: { image: false, audio: false, embedded_context: false },
     supportsFork: false,
+    supportsSteer: false,
+    steerCapabilityKnown: false,
     selectorsReady: true,
     sessionId: null,
+    codegMcpAvailable: false,
+    mcpServerCount: 0,
     modes: null,
     configOptions: null,
     availableCommands: null,
@@ -233,6 +258,7 @@ function makeConnState(overrides: Partial<ConnectionState>): ConnectionState {
     isViewer: false,
     pendingUserMessage: null,
     steeredMessageIds: [],
+    steerMessages: [],
     configStale: false,
     configStaleKind: null,
     configStaleDismissed: false,
@@ -246,6 +272,8 @@ function makeConnState(overrides: Partial<ConnectionState>): ConnectionState {
 
 describe("SubAgentSessionDialog", () => {
   beforeEach(() => {
+    mockSubscribe.mockClear()
+    mockSubscribe.mockResolvedValue(() => {})
     mockSetLiveMessage.mockReset()
     mockCompleteTurn.mockReset()
     mockRemoveConversation.mockReset()
@@ -267,6 +295,36 @@ describe("SubAgentSessionDialog", () => {
       error: null,
       acpLoadError: null,
     }
+  })
+
+  it("cannot inherit the parent conversation's Goal controls", () => {
+    const parentControl = vi.fn()
+    renderWithIntl(
+      <GoalControlProvider
+        value={{
+          connectionId: "parent-connection",
+          readOnly: false,
+          onGoalControl: parentControl,
+          actions: ["set", "pause", "resume", "clear"],
+        }}
+      >
+        <SubAgentSessionDialog
+          open
+          onOpenChange={() => {}}
+          childConversationId={99}
+          childConnectionId="child-connection"
+          identity={{
+            agentType: "codex",
+            assistantId: null,
+            assistantName: null,
+          }}
+        />
+      </GoalControlProvider>
+    )
+    const transcript = screen.getByTestId("message-list-view")
+    expect(transcript).toHaveAttribute("data-goal-connection", "none")
+    expect(transcript).toHaveAttribute("data-goal-read-only", "true")
+    expect(transcript).toHaveAttribute("data-has-goal-control", "false")
   })
 
   it("renders nothing while closed — the body and bridge stay dormant", () => {
@@ -625,6 +683,41 @@ describe("SubAgentSessionDialog", () => {
     expect(mockSetLiveMessage).toHaveBeenCalledWith(99, liveMessage, true)
   })
 
+  it("refreshes matching declarations and terminal artifact settlement without replacing live state", () => {
+    renderWithIntl(
+      <SubAgentSessionDialog
+        open
+        onOpenChange={() => {}}
+        childConversationId={99}
+        childConnectionId="c1"
+        identity={{
+          agentType: "codex",
+          assistantId: null,
+          assistantName: null,
+        }}
+      />
+    )
+    mockRefetchDetail.mockClear()
+
+    const declarationListener = mockSubscribe.mock.calls.find(
+      ([event]) => event === "conversation://deliverables-changed"
+    )?.[1]
+    const settlementListener = mockSubscribe.mock.calls.find(
+      ([event]) => event === "conversation://artifacts-changed"
+    )?.[1]
+    expect(declarationListener).toBeTypeOf("function")
+    expect(settlementListener).toBeTypeOf("function")
+    act(() => {
+      declarationListener?.({ conversation_id: 99, deliverable_ids: ["d1"] })
+      settlementListener?.({ conversation_id: 99, turn_run_id: "run-1" })
+    })
+
+    expect(mockRefetchDetail).toHaveBeenCalledTimes(2)
+    expect(mockRefetchDetail).toHaveBeenLastCalledWith(99, {
+      preserveLive: true,
+    })
+  })
+
   it("does not refetch on the streaming → settled edge — the promoted local reply is kept, never replaced from the lagging DB", () => {
     const liveMessage = {
       id: "live-1",
@@ -939,7 +1032,7 @@ describe("SubAgentSessionDialog", () => {
     // Second open: body re-mounts. refetchDetail MUST fire again so the
     // resurrected stale session (if any) is overwritten with the latest DB
     // state. The dialog disables useConversationDetail's auto-fetch, so this
-    // gated refetch is the sole fetch path.
+    // mount-owned refetch always establishes the cold-open snapshot.
     renderWithIntl(<SubAgentSessionDialog {...props} />)
     expect(mockRefetchDetail.mock.calls.length).toBeGreaterThan(firstCallCount)
     expect(mockRefetchDetail).toHaveBeenLastCalledWith(99, {

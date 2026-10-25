@@ -13,6 +13,7 @@ import { useActivityRender } from "../activity-context"
 import { ActivityRow } from "../activity-row"
 import { DetailBox } from "../detail-box"
 import { useDisclosure } from "../disclosure-store"
+import { useDeferredHistory } from "../use-deferred-history"
 import { RailIcon } from "../rail-icon"
 import {
   RESULT_ICON,
@@ -63,7 +64,14 @@ export const GenericRow = memo(function GenericRow({
       (failed && !recoveredKeys.has(step.key)) || tool.status === "awaiting",
   })
   const args = useMemo(() => argumentsText(part.input), [part.input])
-  const result = part.errorText ?? part.output ?? null
+  const historyOutput = part.meta?.["codeg.historyOutput"] as
+    | { ref?: string }
+    | undefined
+  const result = useDeferredHistory(
+    historyOutput?.ref,
+    part.errorText ?? part.output ?? "",
+    open
+  )
   const todos = useMemo(
     () =>
       tool.kind === "todo" && part.input ? parseTodosFromJson(part.input) : [],

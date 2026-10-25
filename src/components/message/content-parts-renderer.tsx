@@ -1,6 +1,13 @@
+import { getDeferredHistoryContent } from "@/lib/api"
+import { renderCitationMarkdown, type CitationSource } from "@/lib/citations"
+import {
+  CitationSourcesContext,
+  CitationSourcesScope,
+} from "./citation-sources-context"
 import {
   memo,
   useCallback,
+  useContext,
   useEffect,
   useMemo,
   useState,
@@ -180,6 +187,7 @@ function MarkdownText({
   const motion = useChatMotion()
   const fade = live && isStreaming && motion
   const armed = useFadeArmed(fade)
+  const sources = useContext(CitationSourcesContext)
   return (
     <div
       className='break-words text-sm prose prose-sm dark:prose-invert max-w-none [&_ul]:list-inside [&_ol]:list-inside [&_[data-streamdown="code-block-body"]]:max-h-96 [&_[data-streamdown="code-block-body"]]:overflow-auto'
@@ -194,12 +202,54 @@ function MarkdownText({
           animated={fade ? LIVE_TEXT_ANIMATION : undefined}
           isAnimating={fade}
         >
-          {text}
+          {renderCitationMarkdown(text, sources)}
         </MessageResponse>
       </JsonRenderScope>
     </div>
   )
 }
+
+const DeferredTextPart = memo(function DeferredTextPart({
+  part,
+  citationSources,
+}: {
+  part: Extract<AdaptedContentPart, { type: "deferred-text" }>
+  citationSources: readonly CitationSource[]
+}) {
+  const t = useTranslations("Folder.chat.contentParts")
+  const [content, setContent] = useState(part.text)
+  const [loading, setLoading] = useState(false)
+  const [loaded, setLoaded] = useState(false)
+  const load = useCallback(() => {
+    if (loading || loaded) return
+    setLoading(true)
+    void getDeferredHistoryContent(part.deferredRef)
+      .then((result) => {
+        setContent(result.content)
+        setLoaded(true)
+      })
+      .catch(() => undefined)
+      .finally(() => setLoading(false))
+  }, [loaded, loading, part.deferredRef])
+
+  return (
+    <div className="space-y-2">
+      <TextPart text={renderCitationMarkdown(content, citationSources)} />
+      {!loaded && (
+        <button
+          type="button"
+          className="text-xs text-muted-foreground underline-offset-4 hover:underline disabled:opacity-50"
+          disabled={loading}
+          onClick={load}
+        >
+          {loading
+            ? t("loadingBranchMergeSummary")
+            : t("loadBranchMergeSummary")}
+        </button>
+      )}
+    </div>
+  )
+})
 
 // Codex Plan-mode `<proposed_plan>` block: free-form markdown plan document
 // rendered inside card chrome (distinct from the TodoWrite checklist).
@@ -323,6 +373,14 @@ function renderPart(
           live={live}
         />
       )
+    case "deferred-text":
+      return (
+        <DeferredTextPart
+          key={`deferred-${keyId}`}
+          part={part}
+          citationSources={[]}
+        />
+      )
     case "tool-call":
       return (
         <HostedToolCall key={`tc-${part.toolCallId ?? keyId}`} part={part} />
@@ -423,7 +481,7 @@ const AssistantActivity = memo(function AssistantActivity({
   )
 })
 
-export const ContentPartsRenderer = memo(function ContentPartsRenderer({
+const ContentPartsBody = memo(function ContentPartsBody({
   parts,
   role,
   isStreaming = false,
@@ -437,5 +495,15 @@ export const ContentPartsRenderer = memo(function ContentPartsRenderer({
     <div className="space-y-4">
       {parts.map((part, i) => renderPart(part, `${i}`, role, isStreaming))}
     </div>
+  )
+})
+
+export const ContentPartsRenderer = memo(function ContentPartsRenderer(
+  props: ContentPartsRendererProps
+) {
+  return (
+    <CitationSourcesScope parts={props.parts}>
+      <ContentPartsBody {...props} />
+    </CitationSourcesScope>
   )
 })

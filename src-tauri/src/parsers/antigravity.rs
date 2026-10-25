@@ -801,6 +801,7 @@ impl PendingAssistant {
             model: self.model.take(),
             completed_at: self.last_ts,
         agent_message_id: None,
+        native_task_id: None,
         }
     }
 }
@@ -907,6 +908,7 @@ fn project_steps(steps: &[Step]) -> SessionParse {
                 model: None,
                 completed_at: None,
             agent_message_id: None,
+            native_task_id: None,
             });
             parsed.message_count = parsed.message_count.saturating_add(1);
             continue;

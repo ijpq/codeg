@@ -1,6 +1,7 @@
 "use client"
 
 import { createContext, useContext } from "react"
+import type { SessionGoalState } from "@/lib/api"
 
 export type GoalControlAction = "pause" | "clear"
 
@@ -20,13 +21,20 @@ export const LEGACY_GOAL_ACTIONS: readonly string[] = ["pause", "clear"]
 export const NO_GOAL_ACTIONS: readonly string[] = []
 
 export interface GoalControlValue {
+  connectionId?: string | null
+  readOnly?: boolean
+  /** Bind a draft to durable history before its first native Goal can work. */
+  startGoal?: (objective: string) => Promise<void>
+  /** Observe authoritative native state for the out-of-prompt transcript. */
+  onGoalSnapshot?: (snapshot: SessionGoalState) => void
   /**
    * Fire a pause/clear on the session's currently active goal, or `null`
    * when goal control isn't available for this surface — a history reload with
-   * no live connection, a read-only viewer, or the read-only sub-agent dialog
-   * (which renders its own `MessageListView` with no provider). The goal card
-   * hides its control buttons whenever this is `null`, so liveness/ownership are
-   * decided once at the panel where the connection is owned, not in the card.
+   * no live connection or a read-only sub-agent dialog
+   * (which resets this context around its `MessageListView`). The goal card
+   * hides its control buttons whenever this is `null`, so availability is
+   * decided once by the surface. Non-owning, co-controlling clients may use
+   * these controls; process teardown ownership is a separate concern.
    */
   onGoalControl: ((action: GoalControlAction) => void) | null
   /**

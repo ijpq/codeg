@@ -96,7 +96,13 @@ fn main() -> ExitCode {
     // (`cli_run::shim`): the matching one, whatever else is on their PATH.
     if let Some(cli) = codeg_lib::update::runtime::self_exe()
         .parent()
-        .map(|dir| dir.join(if cfg!(windows) { "codeg-cli.exe" } else { "codeg-cli" }))
+        .map(|dir| {
+            dir.join(if cfg!(windows) {
+                "codeg-cli.exe"
+            } else {
+                "codeg-cli"
+            })
+        })
         .filter(|p| p.metadata().is_ok_and(|m| m.is_file() && m.len() > 0))
     {
         std::env::set_var(codeg_lib::cli_run::shim::CLI_ENV, cli);
@@ -305,9 +311,7 @@ async fn async_main(
         // bearer credential and must never enter the durable log files or the
         // in-app log viewer. `eprintln!` bypasses the tracing sinks (file +
         // ring buffer); only the local terminal / Docker stderr sees it.
-        eprintln!(
-            "[SERVER] No CODEG_TOKEN set; generated an access token (persisted): {token}"
-        );
+        eprintln!("[SERVER] No CODEG_TOKEN set; generated an access token (persisted): {token}");
         eprintln!("[SERVER] Pin your own by setting the CODEG_TOKEN environment variable.");
     }
 
@@ -556,6 +560,10 @@ async fn async_main(
             Arc::new(codeg_lib::acp::result_tool::ConnectionManagerResultLookup {
                 manager: Arc::new(state.connection_manager.clone_ref()),
             }),
+            codeg_lib::acp::deliverables::shared_access(
+                state.db.conn.clone(),
+                state.emitter.clone(),
+            ),
         );
         // Bind through the service handle rather than a bare `listener.run`
         // spawn: it keeps the bind error and the accept-loop handle around, so
@@ -637,6 +645,19 @@ async fn async_main(
         state.acp_event_bus.clone(),
         Some(state.delegation_broker.clone()),
     ));
+    tokio::spawn(codeg_lib::turn_reconciliation_task(
+        state.connection_manager.clone_ref(),
+        state.db.conn.clone(),
+        std::time::Duration::from_secs(codeg_lib::TURN_RECONCILIATION_INTERVAL_SECS),
+    ));
+
+    codeg_lib::commands::business_conversations::recover_switches(
+        &state.connection_manager,
+        &state.db,
+        &state.data_dir,
+        state.emitter.clone(),
+    )
+    .await;
 
     // Spawn the desktop pet state mapper so server-mode browsers viewing
     // /pet receive `pet://state` and `pet://oneshot` over the WebSocket
@@ -826,9 +847,11 @@ async fn async_main(
     // Publish runtime state so the settings page (served by us) shows
     // the truth — running on `actual_port` with this token — instead of
     // the placeholder "stopped" that triggers the stale-port banner.
-    state
-        .web_server_state
-        .mark_externally_running(advertised_host.clone(), actual_port, token.clone());
+    state.web_server_state.mark_externally_running(
+        advertised_host.clone(),
+        actual_port,
+        token.clone(),
+    );
     let addresses = addresses_for_bind(&advertised_host, actual_port);
 
     // Token on stderr ONLY (bearer credential — keep it out of the log files

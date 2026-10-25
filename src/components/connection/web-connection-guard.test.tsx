@@ -29,6 +29,7 @@ const store = vi.hoisted(() => {
       listeners.clear()
     },
     reconnectWebNow: vi.fn(),
+    verifyWebConnectionNow: vi.fn(),
     redirectToCodegLogin: vi.fn(),
   }
 })
@@ -38,6 +39,7 @@ vi.mock("@/lib/transport/web-connection-store", () => ({
   getWebConnectionSnapshot: store.getState,
   getWebConnectionServerSnapshot: () => "connected",
   reconnectWebNow: store.reconnectWebNow,
+  verifyWebConnectionNow: store.verifyWebConnectionNow,
   notifyWebUnauthorized: vi.fn(),
 }))
 
@@ -61,6 +63,7 @@ beforeEach(() => {
   vi.useFakeTimers()
   store.reset()
   store.reconnectWebNow.mockClear()
+  store.verifyWebConnectionNow.mockClear()
   store.redirectToCodegLogin.mockClear()
 })
 
@@ -143,22 +146,37 @@ describe("WebConnectionGuard", () => {
     expect(screen.queryByText("Connection lost")).not.toBeInTheDocument()
   })
 
-  it("probes immediately on network restore while reconnecting", () => {
+  it("verifies immediately on network restore while reconnecting", () => {
     renderGuard()
     act(() => store.setState("reconnecting"))
-    store.reconnectWebNow.mockClear()
+    store.verifyWebConnectionNow.mockClear()
 
     act(() => {
       window.dispatchEvent(new Event("online"))
     })
-    expect(store.reconnectWebNow).toHaveBeenCalledTimes(1)
+    expect(store.verifyWebConnectionNow).toHaveBeenCalledTimes(1)
   })
 
-  it("does not nudge on network events while connected", () => {
+  it("also verifies an apparently connected socket on network events", () => {
     renderGuard()
     act(() => {
       window.dispatchEvent(new Event("online"))
     })
+    expect(store.verifyWebConnectionNow).toHaveBeenCalledTimes(1)
     expect(store.reconnectWebNow).not.toHaveBeenCalled()
+  })
+
+  it("verifies the path as soon as a sleeping tab becomes visible", () => {
+    renderGuard()
+    const visibility = vi
+      .spyOn(document, "visibilityState", "get")
+      .mockReturnValue("visible")
+
+    act(() => {
+      document.dispatchEvent(new Event("visibilitychange"))
+    })
+
+    expect(store.verifyWebConnectionNow).toHaveBeenCalledTimes(1)
+    visibility.mockRestore()
   })
 })

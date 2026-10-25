@@ -400,6 +400,11 @@ function SegmentedSetting({
               key={key}
               type="button"
               aria-pressed={pressed}
+              disabled={
+                setting.target.type === "config" &&
+                setting.target.configId === "service_tier" &&
+                entries.length === 1
+              }
               title={option.description || option.name}
               {...roving.itemProps(key)}
               onClick={() => {

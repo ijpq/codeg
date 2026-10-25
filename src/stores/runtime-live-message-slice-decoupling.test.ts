@@ -30,6 +30,7 @@ function seedSession(sessionStats: SessionStats) {
           pendingCancelledTurnReports: null,
           optimisticTurns: [],
           liveMessage: null,
+          promptDeliveries: {},
           syncState: "awaiting_persist",
           activeTurnToken: null,
           lastTurnOwned: false,

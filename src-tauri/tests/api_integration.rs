@@ -173,6 +173,33 @@ async fn acp_find_connection_for_conversation_returns_null_when_none_live() {
     );
 }
 
+#[tokio::test]
+async fn acp_prompt_accepts_image_payload_larger_than_axum_default() {
+    let (server, _data, _static) = build_test_server().await;
+    // A 1,687,739-byte image expands to 2,250,320 base64 bytes, already above
+    // Axum's default 2 MiB JSON limit before the surrounding prompt envelope.
+    let image_data = "A".repeat(2_250_320);
+    let resp = server
+        .post("/api/acp_prompt")
+        .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
+        .json(&json!({
+            "connectionId": "missing-test-connection",
+            "blocks": [{
+                "type": "image",
+                "data": image_data,
+                "mime_type": "image/png"
+            }]
+        }))
+        .await;
+
+    // There is intentionally no ACP connection in this router fixture. Reaching
+    // the handler's typed connection error proves the JSON extractor accepted
+    // the payload instead of rejecting it with 413 Payload Too Large.
+    assert_eq!(resp.status_code(), 404, "body: {}", resp.text());
+    let body: Value = resp.json();
+    assert_eq!(body["code"], "connection_not_found");
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Field naming sanity (snake_case ↔ camelCase boundary)
 // ────────────────────────────────────────────────────────────────────────────
@@ -388,11 +415,16 @@ async fn static_files_revalidate_except_fingerprinted_assets() {
     // A fingerprinted asset never changes under its name.
     let chunk = server.get("/_next/static/chunks/app-1a2b.js").await;
     assert_eq!(chunk.status_code(), 200);
-    assert_eq!(cache_control(&chunk), None);
-    // The index.html standing in for a missing one is still a document.
+    assert_eq!(
+        cache_control(&chunk).as_deref(),
+        Some("public, max-age=31536000, immutable")
+    );
+    // Missing assets must remain a 404, never the application's HTML under a
+    // script URL. Keep the missing-watchdog-poll payload fix as well.
     let missing = server.get("/_next/static/chunks/gone.js").await;
-    assert_eq!(missing.text(), "<html>index</html>");
-    assert_eq!(cache_control(&missing).as_deref(), Some("no-cache"));
+    assert_eq!(missing.status_code(), 404);
+    assert_ne!(missing.text(), "<html>index</html>");
+    assert_eq!(cache_control(&missing), None);
 
     // Revalidating keeps the copy: it is not modified, so nothing is resent.
     let first = server.get("/").await;
@@ -437,8 +469,8 @@ async fn get_folder_conversation_accepts_turn_window_params() {
     .await
     .expect("create conversation");
 
-    // tailTurns → windowed response: marker fields present even for an empty
-    // transcript (offset/total 0, fingerprint = seed).
+    // tailTurns is accepted only as a compatibility selector and converted to
+    // the same bounded opaque-cursor page used by current clients.
     let resp = server
         .post("/api/get_folder_conversation")
         .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
@@ -446,14 +478,13 @@ async fn get_folder_conversation_accepts_turn_window_params() {
         .await;
     assert_eq!(resp.status_code(), 200);
     let body = resp.json::<Value>();
-    assert_eq!(body["turns_offset"], 0);
-    assert_eq!(body["turns_total"], 0);
-    assert_eq!(body["assistant_turns_before_offset"], 0);
-    assert_eq!(body["user_turns_before_offset"], 0);
-    assert!(body["prefix_hash"].is_string());
-    let window_prefix_hash = body["prefix_hash"].clone();
+    assert_eq!(body["history_page"]["loaded_turns"], 0);
+    assert_eq!(body["history_page"]["has_more"], false);
+    assert!(body.get("turns_offset").is_none());
+    assert!(body.get("prefix_hash").is_none());
 
-    // No params → legacy full response: none of the window fields serialize.
+    // No selectors is an ordinary open and must still be bounded. It must
+    // never silently mean "parse the complete transcript".
     let resp = server
         .post("/api/get_folder_conversation")
         .add_header("authorization", format!("Bearer {TEST_TOKEN}"))
@@ -461,6 +492,8 @@ async fn get_folder_conversation_accepts_turn_window_params() {
         .await;
     assert_eq!(resp.status_code(), 200);
     let body = resp.json::<Value>();
+    assert_eq!(body["history_page"]["loaded_turns"], 0);
+    assert_eq!(body["history_page"]["has_more"], false);
     assert!(body.get("turns_offset").is_none());
     assert!(body.get("user_turns_before_offset").is_none());
     assert!(body.get("prefix_hash").is_none());
@@ -489,6 +522,7 @@ async fn get_folder_conversation_accepts_turn_window_params() {
     assert_eq!(body["user_turns_before_offset"], 0);
     assert!(body["prefix_hash"].is_string());
     assert!(body["prefix_hash_before_index"].is_string());
+    let window_prefix_hash = body["prefix_hash"].clone();
 
     // The navigator's outline of the history above the window: the prefix it
     // covers fingerprints like the window's own prefix hash.

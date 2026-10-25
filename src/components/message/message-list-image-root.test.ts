@@ -38,6 +38,8 @@ const SURFACES = [
 ]
 
 describe("MessageListView image root", () => {
+  // This scans every source file; cold disk reads can outlast five seconds
+  // without saying anything about transcript rendering speed.
   it("is decided by every surface that mounts a transcript", () => {
     // The list is derived, not maintained by hand: a new mount fails here
     // until it is added — and adding it forces the `imageRoot` decision below.
@@ -45,7 +47,7 @@ describe("MessageListView image root", () => {
       read(path).includes("<MessageListView")
     )
     expect(mounts.sort()).toEqual([...SURFACES].sort())
-  })
+  }, 15_000)
 
   it.each(SURFACES)("%s passes an imageRoot", (path) => {
     const source = read(path)

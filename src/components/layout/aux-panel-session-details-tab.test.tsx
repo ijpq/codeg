@@ -1,8 +1,12 @@
-import { fireEvent, render, waitFor, within } from "@testing-library/react"
+import { act, fireEvent, render, waitFor, within } from "@testing-library/react"
 import { NextIntlClientProvider } from "next-intl"
 import { beforeEach, describe, expect, it, vi, type Mock } from "vitest"
 
-import type { DbConversationSummary } from "@/lib/types"
+import type {
+  ConversationDeliverable,
+  ConversationDeliverableHistoryPage,
+  DbConversationSummary,
+} from "@/lib/types"
 import enMessages from "@/i18n/messages/en.json"
 
 // Regression guard: the branch selector + command launcher were REMOVED from
@@ -22,7 +26,23 @@ vi.mock("@/components/agent-icon", () => ({
 }))
 // Stats are always supplied here, so the cold-fetch path must never fire; stub
 // the API so an accidental call is inert rather than a real transport hit.
-vi.mock("@/lib/api", () => ({ getFolderConversation: vi.fn() }))
+const { listConversationDeliverableHistory } = vi.hoisted(() => ({
+  listConversationDeliverableHistory: vi.fn(),
+}))
+vi.mock("@/lib/api", () => ({
+  getFolderConversation: vi.fn(),
+  listConversationDeliverableHistory,
+  copyDeliverableFiles: vi.fn(),
+  downloadDeliverables: vi.fn(),
+  openDeliverable: vi.fn(),
+  revealDeliverable: vi.fn(),
+}))
+vi.mock("@/lib/platform", () => ({
+  subscribe: vi.fn().mockResolvedValue(() => undefined),
+}))
+vi.mock("@/hooks/use-deliverable-capabilities", () => ({
+  useDeliverableCapabilities: () => null,
+}))
 const { copyTextToClipboard } = vi.hoisted(() => ({
   copyTextToClipboard: vi.fn(async () => true),
 }))
@@ -45,6 +65,9 @@ vi.mock("./session-details-insights", () => ({
   },
 }))
 
+vi.mock("@/contexts/workspace-context", () => ({
+  useOptionalWorkspaceActions: () => null,
+}))
 vi.mock("@/contexts/aux-panel-context", () => ({ useAuxPanelContext: vi.fn() }))
 vi.mock("@/contexts/tab-context", () => ({ useTabStore: vi.fn() }))
 vi.mock("@/stores/conversation-runtime-store", () => ({
@@ -101,6 +124,7 @@ function summary(
 
 function setupScene(opts: {
   hasActiveConversation: boolean
+  conversationId?: number
   runtimeConversationId?: number
   activeTab?: string
   conversation?: Partial<DbConversationSummary>
@@ -115,7 +139,7 @@ function setupScene(opts: {
       ? [
           {
             id: 1,
-            conversationId: 7,
+            conversationId: opts.conversationId ?? 7,
             runtimeConversationId: opts.runtimeConversationId,
           },
         ]
@@ -129,7 +153,7 @@ function setupScene(opts: {
   mockWorkspace.mockImplementation((sel: (s: WorkspaceSlice) => unknown) =>
     sel({
       conversations: opts.hasActiveConversation
-        ? [summary(opts.conversation)]
+        ? [summary({ id: opts.conversationId ?? 7, ...opts.conversation })]
         : [],
     })
   )
@@ -140,18 +164,59 @@ function lastInsightsProps() {
   return insightsProps[insightsProps.length - 1]
 }
 
-function renderTab() {
-  return render(
+function tab() {
+  return (
     <NextIntlClientProvider locale="en" messages={enMessages}>
       <SessionDetailsTab />
     </NextIntlClientProvider>
   )
 }
 
+function renderTab() {
+  return render(tab())
+}
+
+function historyPage(
+  conversationId: number
+): ConversationDeliverableHistoryPage {
+  const item: ConversationDeliverable = {
+    id: `file-${conversationId}`,
+    conversation_id: conversationId,
+    turn_run_id: `run-${conversationId}`,
+    root_path: "/repo",
+    path: `out/report-${conversationId}.pdf`,
+    kind: "file",
+    title: "Report",
+    role: "primary",
+    category: "standalone_output",
+    change_kind: "created",
+    position: 0,
+    source: "declared",
+    file_name: `report-${conversationId}.pdf`,
+    extension: "pdf",
+    size_bytes: 1024,
+    is_valid: true,
+    verified_at: "2026-10-22T00:00:00Z",
+    produced_at: "2026-10-22T00:00:00Z",
+    created_at: "2026-10-22T00:00:00Z",
+    updated_at: "2026-10-22T00:00:00Z",
+  }
+  return {
+    items: [{ path_key: item.path, latest: item, versions: [item] }],
+    offset: 0,
+    next_offset: null,
+    has_more: false,
+    total: 1,
+  }
+}
+
 describe("SessionDetailsTab", () => {
   beforeEach(() => {
     vi.clearAllMocks()
     insightsProps.length = 0
+    listConversationDeliverableHistory.mockImplementation(async (id: number) =>
+      historyPage(id)
+    )
   })
 
   it("renders the active session's details with no folder-actions bar", () => {
@@ -249,6 +314,63 @@ describe("SessionDetailsTab", () => {
     const { getByTestId } = renderTab()
     expect(getByTestId("session-insights")).toBeTruthy()
     expect(lastInsightsProps()).toEqual({ conversationId: 7, active: true })
+  })
+
+  it("exposes all deliverables without requiring transcript insights and loads on expansion", async () => {
+    setupScene({ hasActiveConversation: true })
+    const { getByRole, findByText } = renderTab()
+    const entry = getByRole("button", { name: "All deliverables" })
+    expect(entry).toHaveAttribute("aria-expanded", "false")
+    expect(listConversationDeliverableHistory).not.toHaveBeenCalled()
+
+    entry.focus()
+    fireEvent.click(entry)
+    expect(await findByText("report-7.pdf")).toBeInTheDocument()
+    expect(listConversationDeliverableHistory).toHaveBeenCalledWith(7, 0, 25)
+    expect(entry).toHaveAttribute("aria-expanded", "true")
+    expect(entry).toHaveFocus()
+    fireEvent.click(entry)
+    expect(entry).toHaveAttribute("aria-expanded", "false")
+    expect(entry).toHaveFocus()
+  })
+
+  it("uses the persisted id for deliverables while insights use the virtual runtime id", async () => {
+    setupScene({ hasActiveConversation: true, runtimeConversationId: -42 })
+    const { getByRole, findByText } = renderTab()
+    fireEvent.click(getByRole("button", { name: "All deliverables" }))
+    expect(await findByText("report-7.pdf")).toBeInTheDocument()
+    expect(listConversationDeliverableHistory).toHaveBeenCalledWith(7, 0, 25)
+    expect(lastInsightsProps()?.conversationId).toBe(-42)
+  })
+
+  it("ignores a late history response from the previously selected conversation", async () => {
+    let finishPrevious!: (page: ConversationDeliverableHistoryPage) => void
+    listConversationDeliverableHistory.mockImplementation((id: number) =>
+      id === 7
+        ? new Promise((resolve) => {
+            finishPrevious = resolve
+          })
+        : Promise.resolve(historyPage(id))
+    )
+    setupScene({ hasActiveConversation: true })
+    const { getByRole, findByText, queryByText, rerender } = renderTab()
+    fireEvent.click(getByRole("button", { name: "All deliverables" }))
+
+    setupScene({ hasActiveConversation: true, conversationId: 8 })
+    rerender(tab())
+    expect(await findByText("report-8.pdf")).toBeInTheDocument()
+    await act(async () => finishPrevious(historyPage(7)))
+    expect(queryByText("report-7.pdf")).not.toBeInTheDocument()
+    expect(
+      getByRole("checkbox", { name: "Select report-8.pdf" })
+    ).not.toBeChecked()
+  })
+
+  it("does not request persisted deliverables for an unsaved conversation", () => {
+    setupScene({ hasActiveConversation: true, conversationId: -42 })
+    const { queryByRole } = renderTab()
+    expect(queryByRole("button", { name: "All deliverables" })).toBeNull()
+    expect(listConversationDeliverableHistory).not.toHaveBeenCalled()
   })
 
   // A conversation started in this tab streams — and publishes — under its

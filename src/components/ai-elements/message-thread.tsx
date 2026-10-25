@@ -197,8 +197,12 @@ const EscapeLockOnUserScroll = () => {
     }
 
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.defaultPrevented || event.altKey || event.ctrlKey) return
-      if (event.metaKey && event.key !== "ArrowUp") return
+      if (event.defaultPrevented || event.altKey) return
+      // Document-start shortcuts are reader input too; editor targets are
+      // filtered below, before releasing the transcript's lock.
+      if (event.ctrlKey && event.key !== "Home") return
+      if (event.metaKey && event.key !== "ArrowUp" && event.key !== "Home")
+        return
       const upward =
         SCROLL_UP_KEYS.has(event.key) || (event.key === " " && event.shiftKey)
       if (!upward || isEditableTarget(event.target)) return
@@ -213,18 +217,33 @@ const EscapeLockOnUserScroll = () => {
     // by target rather than position because an overlay scrollbar (the macOS
     // default) takes no layout space: it is drawn inside the client box.
     let draggingScrollbar = false
+    let selectingText = false
     let lastScrollTop = viewport.scrollTop
     const onPointerDown = (event: PointerEvent) => {
       draggingScrollbar = event.target === viewport && event.button === 0
+      selectingText = event.target !== viewport && event.button === 0
       lastScrollTop = viewport.scrollTop
     }
     const onPointerEnd = () => {
       draggingScrollbar = false
+      selectingText = false
     }
-    const onScroll = () => {
+    // A DOM scroll event cannot distinguish user input from virtua's measured
+    // offset or a browser clamp. Even the library's pending target can exceed
+    // the new end, and its delayed direction check then falsely escapes. While
+    // locked, shield programmatic scrolls through the library's own mechanism;
+    // actual wheel/touch/keyboard intent above, scrollbar drags and selection
+    // autoscroll below release the SAME lock before that check runs.
+    const onScrollCapture = () => {
       const { scrollTop } = viewport
-      if (draggingScrollbar && scrollTop < lastScrollTop) escape()
+      const selectionDrag =
+        selectingText && document.getSelection()?.isCollapsed === false
+      if ((draggingScrollbar || selectionDrag) && scrollTop < lastScrollTop)
+        escape()
       lastScrollTop = scrollTop
+      if (state.isAtBottom && !state.escapedFromLock) {
+        state.ignoreScrollToTop = scrollTop
+      }
     }
 
     viewport.addEventListener("wheel", onWheel, { passive: true })
@@ -234,7 +253,10 @@ const EscapeLockOnUserScroll = () => {
     viewport.addEventListener("touchcancel", onTouchEnd, { passive: true })
     viewport.addEventListener("keydown", onKeyDown)
     viewport.addEventListener("pointerdown", onPointerDown)
-    viewport.addEventListener("scroll", onScroll, { passive: true })
+    viewport.addEventListener("scroll", onScrollCapture, {
+      capture: true,
+      passive: true,
+    })
     window.addEventListener("pointerup", onPointerEnd)
     window.addEventListener("pointercancel", onPointerEnd)
     return () => {
@@ -245,7 +267,7 @@ const EscapeLockOnUserScroll = () => {
       viewport.removeEventListener("touchcancel", onTouchEnd)
       viewport.removeEventListener("keydown", onKeyDown)
       viewport.removeEventListener("pointerdown", onPointerDown)
-      viewport.removeEventListener("scroll", onScroll)
+      viewport.removeEventListener("scroll", onScrollCapture, true)
       window.removeEventListener("pointerup", onPointerEnd)
       window.removeEventListener("pointercancel", onPointerEnd)
     }

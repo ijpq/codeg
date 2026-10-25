@@ -252,6 +252,9 @@ pub struct UnifiedMessage {
     /// [`MessageTurn::agent_message_id`], which documents what it is for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_message_id: Option<String>,
+    /// Native execution/turn id shared by all messages of one agent task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_task_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -298,4 +301,7 @@ pub struct MessageTurn {
     /// synthesized turns, which name nothing the agent stored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_message_id: Option<String>,
+    /// Native execution/turn id shared by all messages of one agent task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_task_id: Option<String>,
 }

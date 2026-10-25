@@ -1,6 +1,14 @@
 "use client"
 
-import { memo, useCallback, useId, useMemo, useRef, useState } from "react"
+import {
+  type ComponentProps,
+  memo,
+  useCallback,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+} from "react"
 import { useTranslations } from "next-intl"
 
 import {
@@ -16,6 +24,7 @@ import {
 import { buildActivity, hasVisibleAnswer } from "@/lib/activity/build-activity"
 import { disclosureKeysFor } from "@/lib/activity/group"
 import { ActivityParts, ContentPartsRenderer } from "./content-parts-renderer"
+import { CitationSourcesScope } from "./citation-sources-context"
 import { ActivityHeader } from "./activity/activity-header"
 import { useActivityLive } from "./activity/activity-live-context"
 import { openDisclosures } from "./activity/disclosure-store"
@@ -74,7 +83,7 @@ const manualFold = new WeakMap<
   { epoch: number; open: boolean }
 >()
 
-export const CompletedTurnContent = memo(function CompletedTurnContent({
+const CompletedTurnContentBody = memo(function CompletedTurnContentBody({
   parts,
   durationMs,
   completed,
@@ -150,7 +159,9 @@ export const CompletedTurnContent = memo(function CompletedTurnContent({
   )
 
   const elapsed =
-    typeof durationMs === "number" && durationMs > 0
+    typeof durationMs === "number" &&
+    Number.isFinite(durationMs) &&
+    durationMs >= 0
       ? formatElapsedLabel(durationMs, tElapsed)
       : null
 
@@ -286,6 +297,7 @@ export const CompletedTurnContent = memo(function CompletedTurnContent({
       completed={completed}
       hasSteps={activity.items.length > 0}
       elapsed={elapsed}
+      durationMs={elapsed ? durationMs : undefined}
       onJumpToFailure={failureKey ? jumpToFailure : undefined}
       toggle={
         foldable
@@ -405,5 +417,15 @@ export const CompletedTurnContent = memo(function CompletedTurnContent({
         {working && !footShown ? <WorkingMark /> : null}
       </div>
     </ReplyMotion>
+  )
+})
+
+export const CompletedTurnContent = memo(function CompletedTurnContent(
+  props: ComponentProps<typeof CompletedTurnContentBody>
+) {
+  return (
+    <CitationSourcesScope parts={props.parts}>
+      <CompletedTurnContentBody {...props} />
+    </CitationSourcesScope>
   )
 })

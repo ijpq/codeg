@@ -4335,6 +4335,32 @@ export function buildVersionCheck(
   // (its `system_cli` check), or `undefined` before a preflight has answered.
   systemCliFound?: boolean
 ): UiCheckItem | null {
+  if (agent.selected_runtime) {
+    const runtime = agent.selected_runtime
+    return {
+      check_id: "version_status",
+      label: acpText("version.statusLabel", "Version Status"),
+      status: runtime.available
+        ? runtime.adapter_version
+          ? "pass"
+          : "warn"
+        : "fail",
+      message: acpText(
+        runtime.source === "bundled"
+          ? "version.bundledRuntime"
+          : "version.customRuntime",
+        runtime.source === "bundled"
+          ? "CodeG bundled ACP: {localVersion} · {path}. Updated with the matching CodeG release."
+          : "Selected custom ACP: {localVersion} · {path}. Managed at the configured runtime path.",
+        {
+          localVersion: runtime.adapter_version ?? "unknown",
+          path: runtime.adapter_path,
+        }
+      ),
+      fixes: [],
+    }
+  }
+
   // An agent codeg launches but never installs (Kiro CLI): no pin to compare
   // against, and installing or removing it is its own installer's job. The
   // card says whether the user's install was found — where to get it when it

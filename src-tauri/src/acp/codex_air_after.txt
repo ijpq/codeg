@@ -1,0 +1,41 @@
+      if (agentFileChangeReportRequest !== null) {
+        // Capture only the report's inputs. Never retain mutable turn/session
+        // state in a callback that can run during the next prompt.
+        const reportSession = {
+          sessionId: sessionState.sessionId,
+          cwd: sessionState.cwd,
+          additionalDirectories: [...sessionState.additionalDirectories]
+        };
+        const reportRequest = { ...agentFileChangeReportRequest };
+        const reportTurnId = agentFileChangeReportTurnId;
+        const reportReason = agentFileChangeReportUnavailableReason;
+        const reportSignal = activePrompt.signal;
+        // Start after prompt cleanup and response microtasks. Even synchronous
+        // setup for the auxiliary fork must not sit on the terminal path.
+        setTimeout(() => {
+          const startedAt = Date.now();
+          logger.log("AIR audit started after prompt terminal", {
+            sessionId: reportSession.sessionId,
+            turnId: reportTurnId,
+            requestId: reportRequest.requestId,
+            startedAtMs: startedAt
+          });
+          void this.publishAgentFileChangeReport(
+            reportSession, reportTurnId, reportRequest, reportReason, reportSignal
+          ).then(
+            () => logger.log("AIR audit settled after prompt terminal", {
+              sessionId: reportSession.sessionId,
+              turnId: reportTurnId,
+              requestId: reportRequest.requestId,
+              elapsedMs: Date.now() - startedAt
+            }),
+            (error) => logger.error("Detached AIR audit failed", error)
+          );
+        }, 0);
+      }
+      logger.log("Prompt terminal ready", {
+        sessionId: params.sessionId,
+        turnId: agentFileChangeReportTurnId,
+        requestId: agentFileChangeReportRequest?.requestId,
+        readyAtMs: Date.now()
+      });
