@@ -255,7 +255,6 @@ try {
   assert.deepEqual(errors, [])
   await page.screenshot({ path: join(output, "transcript.png") })
   if (failures.length) throw new Error(failures.join("\n"))
-  await page.close()
 } finally {
   await writeFile(
     join(output, "scroll-results.json"),
@@ -275,6 +274,7 @@ try {
       2
     )
   )
+  await testPage?.close().catch(() => {})
   await browser.close()
   server.close()
 }

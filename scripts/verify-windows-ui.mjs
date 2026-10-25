@@ -1225,11 +1225,6 @@ try {
       )
       report.checks.push({ name: "setup-migrations", ...migration })
     }
-    await run(process.execPath, ["scripts/browser-scroll-regression.mjs"], {
-      ...process.env,
-      CODEG_TEST_WEBVIEW_CDP: `http://127.0.0.1:${app.port}`,
-      CODEG_BROWSER_EVIDENCE: join(output, "webview-scroll"),
-    })
     businessSaved = await businessAgentPage({
       page: app.page,
       api: desktopApi(app.page),
@@ -1240,6 +1235,13 @@ try {
       claudeModel,
       report,
       output,
+    })
+    // The scroll harness navigates and closes this isolated WebView. Finish
+    // the app checks first; restart below to verify persisted business state.
+    await run(process.execPath, ["scripts/browser-scroll-regression.mjs"], {
+      ...process.env,
+      CODEG_TEST_WEBVIEW_CDP: `http://127.0.0.1:${app.port}`,
+      CODEG_BROWSER_EVIDENCE: join(output, "webview-scroll"),
     })
   } finally {
     await stopDesktop(app)

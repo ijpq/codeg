@@ -16,7 +16,7 @@ on:
         type: boolean
         default: false
       reuse_candidate:
-        description: Diagnose verification scripts using the pinned aaaba26eb candidate binaries
+        description: Diagnose verification scripts using the pinned 29df14a0c candidate binaries
         type: boolean
         default: false
 env:
@@ -55,9 +55,9 @@ jobs:
           import hashlib, json, os, subprocess, zipfile
           from pathlib import Path
           repo = os.environ['GITHUB_REPOSITORY']
-          run_id, artifact_id = 38902853277, 12051759434
-          source = 'aaaba26eb8e2b0369c390b132a525db7f9068613'
-          digest = '6fa73da01c8102fe4f9683a2d0e5951aa94042ae25f60a360064cd8519c854dc'
+          run_id, artifact_id = 40162274216, 12589902658
+          source = '29df14a0cf0991f0f873ffe20abcb486f453a2a3'
+          digest = 'fbc1672513d3c9105f73ead628dcf24adf987782c450c840d23f46693b77b5c1'
           def api(path):
               return json.loads(subprocess.check_output(['gh', 'api', f'repos/{repo}/{path}']))
           run = api(f'actions/runs/{run_id}')
@@ -65,9 +65,9 @@ jobs:
           assert run['head_sha'] == source and run['path'] == '.github/workflows/windows-ui-regression.yml'
           assert artifact['workflow_run']['id'] == run_id and artifact['workflow_run']['head_sha'] == source
           assert artifact['name'] == 'candidate-windows-binaries' and artifact['digest'] == 'sha256:' + digest
-          # 47c7ff3f0 only relocated the Goal HTTP handler before its test module.
-          # Do not reuse these diagnostic binaries after any further app change.
-          subprocess.run(['git', 'diff', '--exit-code', '47c7ff3f0c0596448b7b99e297a5db58832be824', 'HEAD', '--',
+          # Reuse only while application code exactly matches this built source;
+          # this path diagnoses verification changes, never release binaries.
+          subprocess.run(['git', 'diff', '--exit-code', source, 'HEAD', '--',
                           'src', 'src-tauri', 'i18n', 'public', 'package.json', 'pnpm-lock.yaml', 'next.config.ts'], check=True)
           jobs = api(f'actions/runs/{run_id}/jobs')
           assert any(step['name'] == 'Build isolated candidate Setup and Server' and step['conclusion'] == 'success'
