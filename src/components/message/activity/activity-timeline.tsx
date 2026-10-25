@@ -289,6 +289,9 @@ function ToolStepView({ step: given }: { step: ToolStep }) {
   // answer — whatever the transcript says.
   const step = useLiveToolStep(given)
   const { tool, part } = step
+  if (part.meta?.["codeg.historyOutput"]) {
+    return <GenericRow step={{ ...step, tool: { ...tool, kind: "generic" } }} />
+  }
   switch (tool.kind) {
     case "read":
     case "search":

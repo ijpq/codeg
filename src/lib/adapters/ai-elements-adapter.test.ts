@@ -659,7 +659,8 @@ describe("groupGoalRuns", () => {
       nextText,
       poll("update_goal"),
     ])
-    expect(goalRunOf(firstMerge[0]).items).toEqual([firstText, nextText])
+    expect(goalRunOf(firstMerge[0]).items).toEqual([])
+    expect(firstMerge.slice(1)).toEqual([firstText, nextText])
     expect(goalRunOf(unfinished).items).toEqual([firstText])
 
     const secondMerge = groupGoalRuns([
@@ -667,7 +668,7 @@ describe("groupGoalRuns", () => {
       nextText,
       poll("update_goal"),
     ])
-    expect(goalRunOf(secondMerge[0]).items).toEqual([firstText, nextText])
+    expect(secondMerge).toEqual(firstMerge)
   })
 
   it("merges repeated unfinished goal runs into one cross-turn card", () => {
@@ -1034,7 +1035,11 @@ describe("adaptMessageTurn goal update text", () => {
       true
     )
 
-    expect(adapted.content.map((p) => p.type)).toEqual(["goal-run", "text"])
+    expect(adapted.content.map((p) => p.type)).toEqual([
+      "goal-run",
+      "text",
+      "text",
+    ])
     const goalRun = goalRunOf(adapted.content[0])
     expect(JSON.parse(goalRun.start.input ?? "{}")).toEqual({
       objective: "分析 README 文件",
@@ -1045,16 +1050,17 @@ describe("adaptMessageTurn goal update text", () => {
         status: "complete",
       },
     })
-    expect(goalRun.items).toEqual([
+    expect(goalRun.items).toEqual([])
+    expect(adapted.content.slice(1)).toEqual([
       {
         type: "text",
         text: "我也顺手对照了 `package.json` 和 `app` 目录。",
       },
+      {
+        type: "text",
+        text: "已分析 [README.md](/Users/xggz/my/my-app/README.md:1)。",
+      },
     ])
-    expect(adapted.content[1]).toEqual({
-      type: "text",
-      text: "已分析 [README.md](/Users/xggz/my/my-app/README.md:1)。",
-    })
   })
 
   it("keeps the known streaming objective when later text is appended without a separator", () => {
@@ -2019,6 +2025,92 @@ describe("adaptMessageTurn — image tool results", () => {
     expect(part.label).toBe("Getting Started")
   })
 
+  it("keeps an opaque load reference for a deferred historical image", () => {
+    const adapted = adaptMessageTurn(
+      {
+        id: "read-deferred-image",
+        role: "assistant",
+        timestamp: "2026-06-02T00:00:00.000Z",
+        blocks: [
+          {
+            type: "tool_result",
+            tool_use_id: null,
+            output_preview: null,
+            is_error: false,
+            images: [
+              {
+                data: "",
+                mime_type: "image/png",
+                uri: "codeg-history-content:opaque-ref",
+              },
+            ],
+          },
+        ],
+      },
+      msgText,
+      false
+    )
+
+    const part = adapted.content[0]
+    if (part.type !== "generated-image") {
+      throw new Error("expected a generated-image part")
+    }
+    expect(part.image?.data).toBe("")
+    expect(part.image?.deferredRef).toBe("opaque-ref")
+    expect(part.image?.uri).toBeNull()
+  })
+
+  it("keeps a deferred reasoning reference out of rendered markdown", () => {
+    const adapted = adaptMessageTurn(
+      {
+        id: "deferred-reasoning",
+        role: "assistant",
+        timestamp: "2026-06-02T00:00:00.000Z",
+        blocks: [
+          {
+            type: "thinking",
+            text: "reasoning preview\n\n<!--codeg-history-reasoning:opaque_ref-->",
+          },
+        ],
+      },
+      msgText,
+      false
+    )
+
+    const part = adapted.content[0]
+    if (part.type !== "reasoning") {
+      throw new Error("expected a reasoning part")
+    }
+    expect(part.content).toBe("reasoning preview")
+    expect(part.content).not.toContain("codeg-history-reasoning")
+    expect(part.deferredRef).toBe("opaque_ref")
+  })
+
+  it("keeps a branch merge preview light until its summary is requested", () => {
+    const adapted = adaptMessageTurn(
+      {
+        id: "branch-merge-result",
+        role: "assistant",
+        timestamp: "2026-06-02T00:00:00.000Z",
+        blocks: [
+          {
+            type: "text",
+            text: "merge preview\n\n<!--codeg-branch-merge-summary:opaque_ref-->",
+          },
+        ],
+      },
+      msgText,
+      false
+    )
+
+    const part = adapted.content[0]
+    if (part.type !== "deferred-text") {
+      throw new Error("expected a deferred-text part")
+    }
+    expect(part.text).toBe("merge preview")
+    expect(part.deferredRef).toBe("opaque_ref")
+  })
+
   it("leaves a normal text Read result as a tool card (no regression)", () => {
     const adapted = adaptMessageTurn(
       {
@@ -2899,6 +2991,26 @@ describe("createMessageTurnAdapter — per-turn cache invalidation", () => {
     const [first] = adapter.adapt([reply], labels)
     const [second] = adapter.adapt([{ ...reply }], labels)
     expect(second).toBe(first)
+  })
+
+  it("invalidates task identity and late timing while reusing untouched content", () => {
+    const adapter = createMessageTurnAdapter()
+    const [first] = adapter.adapt([reply], labels)
+    const identified = { ...reply, native_task_id: "native-task" }
+    const [second] = adapter.adapt([identified], labels)
+    expect(second).not.toBe(first)
+    expect(second.native_task_id).toBe("native-task")
+    const [timed] = adapter.adapt(
+      [{ ...identified, duration_ms: 168795 }],
+      labels
+    )
+    expect(timed).not.toBe(second)
+    expect(timed.duration_ms).toBe(168795)
+    const [unchanged] = adapter.adapt(
+      [{ ...identified, duration_ms: 168795 }],
+      labels
+    )
+    expect(unchanged).toBe(timed)
   })
 
   it("re-adapts when a later sync places source_turn_id on an already-patched turn", () => {

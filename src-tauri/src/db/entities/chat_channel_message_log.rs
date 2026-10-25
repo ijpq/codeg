@@ -11,6 +11,10 @@ pub struct Model {
     pub content_preview: String,
     pub status: String,
     pub error_detail: Option<String>,
+    pub origin_message_id: Option<String>,
+    pub turn_run_id: Option<String>,
+    pub final_result_id: Option<String>,
+    pub content_length: Option<i32>,
     pub created_at: DateTimeUtc,
 }
 

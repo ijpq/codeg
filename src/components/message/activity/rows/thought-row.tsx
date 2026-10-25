@@ -9,6 +9,7 @@ import type { ActivityStep } from "@/lib/activity/types"
 import { cn } from "@/lib/utils"
 import { ActivityRow } from "../activity-row"
 import { useDisclosure } from "../disclosure-store"
+import { useDeferredHistory } from "../use-deferred-history"
 import { RailIcon } from "../rail-icon"
 import { THOUGHT_ICON, useStatusText } from "../step-visuals"
 
@@ -27,11 +28,12 @@ export const ThoughtRow = memo(function ThoughtRow({
 }) {
   const t = useTranslations("Folder.chat.activity")
   const statusText = useStatusText()
-  const body = useMemo(
-    () => thoughtBodyWithoutTitle(step.part.content, step.title).trim(),
-    [step.part.content, step.title]
-  )
   const [open, setOpen] = useDisclosure(step.key, { defaultOpen: false })
+  const content = useDeferredHistory(step.part.deferredRef, step.part.content, open)
+  const body = useMemo(
+    () => thoughtBodyWithoutTitle(content, step.title).trim(),
+    [content, step.title]
+  )
   const status = step.streaming ? "running" : "succeeded"
 
   return (

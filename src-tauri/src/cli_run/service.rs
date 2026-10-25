@@ -3181,7 +3181,7 @@ mod tests {
                 ..
             } => format!("set:{config_id}={value_id}"),
             ConnectionCommand::SetMode { mode_id, .. } => format!("mode:{mode_id}"),
-            ConnectionCommand::Cancel => "cancel".into(),
+            ConnectionCommand::Cancel { .. } => "cancel".into(),
             ConnectionCommand::Disconnect => "disconnect".into(),
             _ => "other".into(),
         }
@@ -3254,6 +3254,9 @@ mod tests {
                                 }
                                 _ => unreachable!(),
                             }
+                        }
+                        ConnectionCommand::Cancel { reply: Some(reply) } => {
+                            let _ = reply.send(Ok(()));
                         }
                         _ => {}
                     }
@@ -4331,6 +4334,9 @@ mod tests {
         assert_eq!(result.subtype.exit_code(), 5);
         assert_eq!(result.error.as_ref().unwrap().code, "permission_required");
         assert_eq!(result.permission_denials.len(), 1, "refused by the policy");
+        // The result is published before cancellation is persisted. Disconnect
+        // follows that persistence, so observe it before checking the row.
+        h.until_command(&conn, "disconnect").await;
         assert_eq!(
             h.row_status(started.conversation_id).await,
             ConversationStatus::Cancelled

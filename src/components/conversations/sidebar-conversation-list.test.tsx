@@ -6,7 +6,7 @@ import {
   useImperativeHandle,
   useState,
 } from "react"
-import { act, fireEvent, render, within } from "@testing-library/react"
+import { act, fireEvent, render, screen, within } from "@testing-library/react"
 import { NextIntlClientProvider } from "next-intl"
 import { toast } from "sonner"
 import {
@@ -30,6 +30,7 @@ import {
   useAppWorkspaceStore,
 } from "@/stores/app-workspace-store"
 import enMessages from "@/i18n/messages/en.json"
+import { RECENT_PAGE_SIZE } from "./sidebar-conversation-grouping"
 
 // ── Probes ────────────────────────────────────────────────────────────────
 // AgentIcon renders once per card body → counts card re-renders. The Folder /
@@ -1180,6 +1181,43 @@ describe("SidebarConversationList — Recent section", () => {
     expect(document.body.textContent).not.toContain("conv-13")
   })
 
+  it("shows five recent conversations initially and reveals the rest on demand", () => {
+    const conversations = Array.from({ length: 7 }, (_, index) => {
+      const timestamp = new Date(FIXED + index * MINUTE).toISOString()
+      return conv(20 + index, 1, {
+        created_at: timestamp,
+        updated_at: timestamp,
+      })
+    })
+    useAppWorkspaceStore.setState({ conversations })
+
+    render(recentTree(true))
+
+    // All seven have one canonical Folder row. Only the newest five initially
+    // get a second copy in Recent; the two oldest wait behind Show more.
+    expect(
+      document.querySelectorAll('[data-conversation-id="26"]')
+    ).toHaveLength(2)
+    expect(
+      document.querySelectorAll('[data-conversation-id="22"]')
+    ).toHaveLength(2)
+    expect(
+      document.querySelectorAll('[data-conversation-id="21"]')
+    ).toHaveLength(1)
+    expect(
+      document.querySelectorAll('[data-conversation-id="20"]')
+    ).toHaveLength(1)
+
+    fireEvent.click(screen.getByRole("button", { name: "Show more (2)" }))
+    expect(
+      document.querySelectorAll('[data-conversation-id="21"]')
+    ).toHaveLength(2)
+    expect(
+      document.querySelectorAll('[data-conversation-id="20"]')
+    ).toHaveLength(2)
+    expect(screen.queryByRole("button", { name: "Show more (2)" })).toBeNull()
+  })
+
   it("collapses independently of the other sections", () => {
     render(recentTree(true))
     const header = Array.from(document.querySelectorAll("button")).find(
@@ -1220,18 +1258,16 @@ describe("SidebarConversationList — Recent section", () => {
     })
     render(recentTree(true))
 
-    // The Folders section emits the canonical copies first (creation order:
-    // conv-12 is newer); everything after them is the Recent duplicate, in
-    // activity order (conv-11 was touched last). Each row's text is its title
-    // followed by its age label: the Folders copies keep their creation age
-    // ("4m", "5m"), while the Recent copies read their last activity ("now"
-    // for 30s ago, "3m"), so each row's position is explained by what it shows.
+    // This fork places Recent before Folders. Recent follows activity order
+    // (conv-11 was touched last), while the Folders copies follow creation
+    // order (conv-12 is newer). Each label explains its section's position:
+    // "now" / "3m" for Recent and "4m" / "5m" for Folders.
     const rows = Array.from(document.querySelectorAll("[data-conv-key]"))
     expect(rows.map((el) => el.textContent)).toEqual([
-      "conv-124m",
-      "conv-115m",
       "conv-11now",
       "conv-123m",
+      "conv-124m",
+      "conv-115m",
     ])
   })
 
@@ -1239,11 +1275,7 @@ describe("SidebarConversationList — Recent section", () => {
     // `recentLimit` starts at RECENT_PAGE_SIZE and only ever grew, so a list
     // expanded a few pages deep stayed that way for the rest of the session.
     // These cover the way back out.
-    //
-    // A literal rather than the constant: ten rows a page is the product
-    // decision these assertions pin, so a changed page size has to be a
-    // deliberate edit here too.
-    const PAGE = 10
+    const PAGE = RECENT_PAGE_SIZE
     const TOTAL = PAGE + 4
 
     // Recent duplicates every canonical row, so total cards = canonical + recent

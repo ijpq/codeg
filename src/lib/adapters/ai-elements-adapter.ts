@@ -167,6 +167,7 @@ export type AdaptedProposedPlanPart = {
 
 export type AdaptedContentPart =
   | { type: "text"; text: string }
+  | { type: "deferred-text"; text: string; deferredRef: string }
   | AdaptedToolCallPart
   | {
       type: "tool-result"
@@ -175,7 +176,17 @@ export type AdaptedContentPart =
       errorText?: string
       state: "output-available" | "output-error"
     }
-  | { type: "reasoning"; content: string; isStreaming: boolean }
+  | {
+      type: "reasoning"
+      content: string
+      isStreaming: boolean
+      deferredRef?: string | null
+    }
+  | {
+      type: "tool-group"
+      items: AdaptedToolCallPart[]
+      isStreaming: boolean
+    }
   /**
    * A run of consecutive `get_delegation_status` poll cards, merged into one
    * card. When a delegated task runs longer than the 60s status-wait cap, the
@@ -220,6 +231,63 @@ export interface UserImageDisplay {
   data: string
   mime_type: string
   uri?: string | null
+  /** Opaque authenticated reference for large historical image bytes. */
+  deferredRef?: string | null
+}
+
+const DEFERRED_HISTORY_IMAGE_URI_PREFIX = "codeg-history-content:"
+const DEFERRED_HISTORY_REASONING_RE =
+  /\s*<!--codeg-history-reasoning:([A-Za-z0-9_-]+)-->\s*$/
+const DEFERRED_BRANCH_MERGE_SUMMARY_RE =
+  /\s*<!--codeg-branch-merge-summary:([A-Za-z0-9_-]+)-->\s*$/
+
+function parseDeferredHistoryReasoning(text: string): {
+  content: string
+  deferredRef: string | null
+} {
+  const match = DEFERRED_HISTORY_REASONING_RE.exec(text)
+  if (!match) return { content: text, deferredRef: null }
+  return {
+    content: text.slice(0, match.index).trimEnd(),
+    deferredRef: match[1] ?? null,
+  }
+}
+
+function parseDeferredBranchMergeSummary(text: string): {
+  content: string
+  deferredRef: string | null
+} {
+  const match = DEFERRED_BRANCH_MERGE_SUMMARY_RE.exec(text)
+  if (!match) return { content: text, deferredRef: null }
+  return {
+    content: text.slice(0, match.index).trimEnd(),
+    deferredRef: match[1] ?? null,
+  }
+}
+
+function deferredHistoryImageRef(uri?: string | null): string | null {
+  if (!uri?.startsWith(DEFERRED_HISTORY_IMAGE_URI_PREFIX)) return null
+  const reference = uri.slice(DEFERRED_HISTORY_IMAGE_URI_PREFIX.length)
+  return reference.length > 0 ? reference : null
+}
+
+function imageDataToDisplay(img: {
+  data: string
+  mime_type: string
+  uri?: string | null
+}): UserImageDisplay | null {
+  if (!img.mime_type) return null
+  const deferredRef = deferredHistoryImageRef(img.uri)
+  if (!img.data && !deferredRef) return null
+  return {
+    name: deferredRef
+      ? `image.${img.mime_type.split("/")[1]?.split("+")[0] ?? "png"}`
+      : deriveImageNameFromImageData(img),
+    data: img.data,
+    mime_type: img.mime_type,
+    uri: deferredRef ? null : (img.uri ?? null),
+    deferredRef,
+  }
 }
 
 const BLOCKED_RESOURCE_MENTION_RE = /@([^\s@]+)\s*\[blocked[^\]]*\]/gi
@@ -236,6 +304,7 @@ export interface AdaptedMessage {
   timestamp: string
   usage?: TurnUsage | null
   duration_ms?: number | null
+  native_task_id?: string | null
   model?: string | null
   /** Wall-clock completion time as ISO string (parsed once at the Rust layer). */
   completed_at?: string | null
@@ -1466,29 +1535,14 @@ function splitUserTextAndResources(
   return { parts: nextParts, resources }
 }
 
-function deriveImageNameFromBlock(
-  block: Extract<ContentBlock, { type: "image" }>
-): string {
-  if (block.uri && block.uri.trim().length > 0) {
-    return fileNameFromUri(block.uri)
-  }
-  const ext = block.mime_type.split("/")[1]?.split("+")[0] ?? "image"
-  return `image.${ext}`
-}
-
 function extractUserImagesFromBlocks(
   blocks: ContentBlock[]
 ): UserImageDisplay[] {
   const images: UserImageDisplay[] = []
   for (const block of blocks) {
     if (block.type !== "image") continue
-    if (!block.data || !block.mime_type) continue
-    addImage(images, {
-      name: deriveImageNameFromBlock(block),
-      data: block.data,
-      mime_type: block.mime_type,
-      uri: block.uri ?? null,
-    })
+    const display = imageDataToDisplay(block)
+    if (display) addImage(images, display)
   }
   return images
 }
@@ -1545,24 +1599,19 @@ function adaptContentBlock(
       }
     }
 
-    case "thinking":
+    case "thinking": {
+      const deferred = parseDeferredHistoryReasoning(block.text)
       return {
         type: "reasoning",
-        content: block.text,
+        content: deferred.content,
         isStreaming,
+        deferredRef: deferred.deferredRef,
       }
+    }
 
     case "image_generation": {
       const img = block.image ?? null
-      const display: UserImageDisplay | null =
-        img && img.data && img.mime_type
-          ? {
-              name: deriveImageNameFromImageData(img),
-              data: img.data,
-              mime_type: img.mime_type,
-              uri: img.uri ?? null,
-            }
-          : null
+      const display = img ? imageDataToDisplay(img) : null
       return {
         type: "generated-image",
         revisedPrompt: block.revised_prompt ?? null,
@@ -1634,17 +1683,13 @@ function adaptImageToolResultParts(
   })
   const parts: AdaptedGeneratedImagePart[] = []
   for (const img of images) {
-    if (!img.data || !img.mime_type) continue
+    const display = imageDataToDisplay(img)
+    if (!display) continue
     parts.push({
       type: "generated-image",
       // A Read has no model-revised prompt — only codex image generation does.
       revisedPrompt: null,
-      image: {
-        name: deriveImageNameFromImageData(img),
-        data: img.data,
-        mime_type: img.mime_type,
-        uri: img.uri ?? null,
-      },
+      image: display,
       // Historical replay always carries a present image, so status is
       // irrelevant to the renderer; `null` is treated as success.
       status: null,
@@ -2023,6 +2068,7 @@ function mergeGoalObjectiveHints(
 export function isTurnAnswerPart(part: AdaptedContentPart): boolean {
   switch (part.type) {
     case "text":
+    case "deferred-text":
     case "proposed-plan":
     case "generated-image":
     case "turn-error":
@@ -2039,7 +2085,7 @@ export function isTurnAnswerPart(part: AdaptedContentPart): boolean {
 }
 
 /**
- * Split a reply (or a settled unfinished goal run's body) at its last process
+ * Split a reply (or a settled goal run's body) at its last process
  * part: everything after it is the answer, in order. Answer parts BEFORE a
  * process part stay in `body` — prose followed by more work is a mid-run note,
  * not a wrap-up, and lifting it would reorder the reply.
@@ -2097,10 +2143,10 @@ export function groupGoalRuns(
     // Keep the live answer inside the running card (it opens while in flight).
     // Once the turn settles, lift the trailing answer so a collapsed chip on
     // reload does not hide it.
-    // Only lift when the run never closed. A completed update_goal already
-    // leaves later prose as siblings; mid-run notes stay in that card.
-    const shouldLiftTrailing = !isRunning && end === null
-    if (!shouldLiftTrailing) {
+    // Native pause/completion snapshots can close the run AFTER its answer.
+    // That status marker must not hide prose which was visible while live.
+    // Notes followed by actual work still stay inside the card.
+    if (isRunning) {
       result.push({
         type: "goal-run",
         start,
@@ -2114,7 +2160,7 @@ export function groupGoalRuns(
     result.push({
       type: "goal-run",
       start,
-      end: null,
+      end,
       items: body,
       isRunning: false,
     })
@@ -2340,6 +2386,16 @@ export function adaptMessageTurn(
     const block = turn.blocks[index]
 
     if (turn.role === "assistant" && block.type === "text") {
+      const deferredMerge = parseDeferredBranchMergeSummary(block.text)
+      if (deferredMerge.deferredRef) {
+        adaptedContent.push({
+          type: "deferred-text",
+          text: deferredMerge.content,
+          deferredRef: deferredMerge.deferredRef,
+        })
+        continue
+      }
+
       const goalExpandedParts = expandGoalUpdateText(
         block.text,
         turn.id,
@@ -2614,6 +2670,7 @@ export function adaptMessageTurn(
     timestamp: turn.timestamp,
     usage: turn.usage,
     duration_ms: turn.duration_ms,
+    native_task_id: turn.native_task_id,
     model: turn.model,
     completed_at: turn.completed_at,
   }
@@ -2652,6 +2709,7 @@ interface TurnCacheEntry {
   role: MessageRole
   usage: TurnUsage | null | undefined
   duration_ms: number | null | undefined
+  native_task_id: string | null | undefined
   model: string | null | undefined
   completed_at: string | null | undefined
   source_turn_id: string | null | undefined
@@ -2725,6 +2783,7 @@ export function createMessageTurnAdapter(): MessageTurnAdapter {
             cached.role === turn.role &&
             cached.usage === turn.usage &&
             cached.duration_ms === turn.duration_ms &&
+            cached.native_task_id === turn.native_task_id &&
             cached.model === turn.model &&
             cached.completed_at === turn.completed_at &&
             cached.source_turn_id === turn.source_turn_id
@@ -2760,6 +2819,7 @@ export function createMessageTurnAdapter(): MessageTurnAdapter {
             role: turn.role,
             usage: turn.usage,
             duration_ms: turn.duration_ms,
+            native_task_id: turn.native_task_id,
             model: turn.model,
             completed_at: turn.completed_at,
             source_turn_id: turn.source_turn_id,

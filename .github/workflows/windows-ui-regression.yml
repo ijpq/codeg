@@ -1,0 +1,184 @@
+name: Isolated Windows UI regression
+on:
+  push:
+    branches: ["main", "fix/execution-scroll-v0.36.0"]
+    paths:
+      - "src/components/message/**"
+      - "src/components/ai-elements/message-thread*"
+      - "tests/browser/**"
+      - "scripts/verify-windows-ui.mjs"
+      - "scripts/browser-scroll-regression.mjs"
+      - ".github/workflows/windows-ui-regression.yml"
+  workflow_dispatch:
+    inputs:
+      candidate:
+        description: Build current Windows packages and verify native Goal UI before tagging
+        type: boolean
+        default: false
+      reuse_candidate:
+        description: Diagnose verification scripts using the pinned aaaba26eb candidate binaries
+        type: boolean
+        default: false
+env:
+  CARGO_BUILD_JOBS: 1
+  RUST_BACKTRACE: short
+  CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: "-C target-feature=+crt-static"
+  HUSKY: 0
+jobs:
+  setup-ui:
+    runs-on: windows-2022
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pnpm install --frozen-lockfile
+      - name: Verify payload, dependency and database handle regressions
+        run: python -B scripts/test-verify-setup-binaries.py
+      - name: Restore pinned diagnostic candidate without rebuilding application code
+        if: inputs.candidate && inputs.reuse_candidate
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python - <<'PY'
+          import hashlib, json, os, subprocess, zipfile
+          from pathlib import Path
+          repo = os.environ['GITHUB_REPOSITORY']
+          run_id, artifact_id = 38902853277, 12051759434
+          source = 'aaaba26eb8e2b0369c390b132a525db7f9068613'
+          digest = '6fa73da01c8102fe4f9683a2d0e5951aa94042ae25f60a360064cd8519c854dc'
+          def api(path):
+              return json.loads(subprocess.check_output(['gh', 'api', f'repos/{repo}/{path}']))
+          run = api(f'actions/runs/{run_id}')
+          artifact = api(f'actions/artifacts/{artifact_id}')
+          assert run['head_sha'] == source and run['path'] == '.github/workflows/windows-ui-regression.yml'
+          assert artifact['workflow_run']['id'] == run_id and artifact['workflow_run']['head_sha'] == source
+          assert artifact['name'] == 'candidate-windows-binaries' and artifact['digest'] == 'sha256:' + digest
+          # 47c7ff3f0 only relocated the Goal HTTP handler before its test module.
+          # Do not reuse these diagnostic binaries after any further app change.
+          subprocess.run(['git', 'diff', '--exit-code', '47c7ff3f0c0596448b7b99e297a5db58832be824', 'HEAD', '--',
+                          'src', 'src-tauri', 'i18n', 'public', 'package.json', 'pnpm-lock.yaml', 'next.config.ts'], check=True)
+          jobs = api(f'actions/runs/{run_id}/jobs')
+          assert any(step['name'] == 'Build isolated candidate Setup and Server' and step['conclusion'] == 'success'
+                     for job in jobs['jobs'] for step in job['steps'])
+          archive = Path(os.environ['RUNNER_TEMP']) / 'diagnostic-candidate.zip'
+          with archive.open('wb') as stream:
+              subprocess.run(['gh', 'api', f'repos/{repo}/actions/artifacts/{artifact_id}/zip'], stdout=stream, check=True)
+          assert hashlib.sha256(archive.read_bytes()).hexdigest() == digest
+          root = Path.cwd().resolve()
+          with zipfile.ZipFile(archive) as bundle:
+              assert all((root / name).resolve().is_relative_to(root) for name in bundle.namelist())
+              bundle.extractall(root)
+          assert json.loads((root / 'out/codeg-release-manifest.json').read_text())['commit'] == source
+          with open(os.environ['GITHUB_ENV'], 'a') as output:
+              output.write('CODEG_CANDIDATE_SHA=' + source + '\n')
+          print('Testing the checksum-pinned diagnostic application commit', source)
+          PY
+      - uses: dtolnay/rust-toolchain@stable
+        if: inputs.candidate && !inputs.reuse_candidate
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: swatinem/rust-cache@v2
+        if: inputs.candidate && !inputs.reuse_candidate
+        with:
+          workspaces: "./src-tauri -> target"
+          shared-key: x86_64-pc-windows-msvc
+          cache-on-failure: true
+      - name: Build isolated candidate Setup and Server
+        if: inputs.candidate && !inputs.reuse_candidate
+        shell: pwsh
+        run: |
+          pnpm tauri:prepare-sidecars --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw 'Candidate sidecar build failed' }
+          $env:CODEG_SKIP_SIDECAR='1'
+          $config=Join-Path $env:RUNNER_TEMP 'candidate-tauri-config.json'
+          '{"bundle":{"createUpdaterArtifacts":false}}' | Set-Content $config
+          pnpm tauri build --target x86_64-pc-windows-msvc --bundles nsis --config $config
+          if ($LASTEXITCODE -ne 0) { throw 'Candidate Setup build failed' }
+          cargo build --manifest-path src-tauri/Cargo.toml --release --no-default-features --features server-bin --bin codeg-server --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw 'Candidate Server build failed' }
+      - name: Retain candidate binaries for diagnosis without rebuilding
+        if: inputs.candidate && !inputs.reuse_candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: candidate-windows-binaries
+          path: |
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+            src-tauri/target/x86_64-pc-windows-msvc/release/codeg-server.exe
+            src-tauri/target/x86_64-pc-windows-msvc/release/codeg-mcp.exe
+            src-tauri/target/x86_64-pc-windows-msvc/release/codeg-computer-helper.exe
+            src-tauri/target/x86_64-pc-windows-msvc/release/codeg-cli.exe
+            out/
+          if-no-files-found: error
+          retention-days: 7
+      - name: Download verified published baseline into the runner
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_UI: ${{ inputs.candidate }}
+        run: |
+          $ErrorActionPreference='Stop'
+          $root=Join-Path $env:RUNNER_TEMP 'ui-baseline'
+          New-Item -ItemType Directory -Force $root | Out-Null
+          gh release download v0.36.0-fix1 --repo $env:GITHUB_REPOSITORY --dir $root
+          if ($LASTEXITCODE -ne 0) { throw 'Baseline download failed' }
+          foreach ($file in @('codeg_0.36.0-fix1_x64-setup.exe','codeg-server-windows-x64.zip')) {
+            $hash=((Get-Content (Join-Path $root "$file.sha256") -Raw).Trim() -split '\s+')[0].ToLower()
+            if ((Get-FileHash (Join-Path $root $file) -Algorithm SHA256).Hash.ToLower() -ne $hash) { throw 'Baseline hash mismatch' }
+          }
+          Expand-Archive (Join-Path $root 'codeg-server-windows-x64.zip') (Join-Path $root 'server')
+          $setup=Join-Path $root 'codeg_0.36.0-fix1_x64-setup.exe'
+          $previous=$setup
+          $server=Join-Path $root 'server/codeg-server-windows-x64'
+          $extra=@('--baseline','true')
+          $version='0.36.0-fix1'
+          if ($env:CANDIDATE_UI -eq 'true') {
+            $version=(Get-Content package.json -Raw | ConvertFrom-Json).version
+            $setup=(Get-Item "src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/codeg_${version}_x64-setup.exe").FullName
+            $candidate=Join-Path $env:RUNNER_TEMP 'candidate-server'
+            New-Item -ItemType Directory -Force $candidate | Out-Null
+            Copy-Item -Recurse out (Join-Path $candidate 'web')
+            Copy-Item -Recurse (Join-Path $server 'runtime') (Join-Path $candidate 'runtime')
+            foreach ($binary in @('codeg-server','codeg-mcp','codeg-computer-helper','codeg-cli')) {
+              Copy-Item "src-tauri/target/x86_64-pc-windows-msvc/release/$binary.exe" $candidate
+            }
+            # The unchanged private CLI is a test input from the checksum-verified
+            # baseline, never substituted for a candidate CodeG/MCP executable.
+            $originalSha=$env:GITHUB_SHA
+            try {
+              if ($env:CODEG_CANDIDATE_SHA) { $env:GITHUB_SHA=$env:CODEG_CANDIDATE_SHA }
+              python -B scripts/smoke-server-package.py $candidate $version --require-runtime --log-dir (Join-Path $env:RUNNER_TEMP 'ui-evidence/candidate-smoke')
+            } finally { $env:GITHUB_SHA=$originalSha }
+            if ($LASTEXITCODE -ne 0) { throw 'Candidate package resources/dependencies failed' }
+            $tools=Join-Path $env:RUNNER_TEMP 'candidate-native-tools'
+            npm install --prefix $tools --global --ignore-scripts --no-audit --no-fund '@agentclientprotocol/codex-acp@2.2.2'
+            if ($LASTEXITCODE -ne 0) { throw 'Isolated native ACP installation failed' }
+            $server=$candidate
+            $extra=@('--native-tools',$tools)
+          }
+          node scripts/verify-windows-ui.mjs --setup $setup --previous $previous --server $server --output (Join-Path $env:RUNNER_TEMP 'ui-evidence') --version $version @extra
+          if ($LASTEXITCODE -ne 0) { throw 'Isolated UI verification failed' }
+          if ($env:CANDIDATE_UI -eq 'true') {
+            python -B scripts/verify-windows-dependencies.py (Join-Path $env:RUNNER_TEMP 'ui-evidence/upgraded-installation') --report (Join-Path $env:RUNNER_TEMP 'ui-evidence/setup-windows-dependencies.json')
+            if ($LASTEXITCODE -ne 0) { throw 'Candidate Setup runtime dependencies failed' }
+          }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-ui-evidence
+          path: |
+            ${{ runner.temp }}/ui-evidence/**/*.json
+            ${{ runner.temp }}/ui-evidence/**/*.log
+            ${{ runner.temp }}/ui-evidence/**/*.png
+          retention-days: 14

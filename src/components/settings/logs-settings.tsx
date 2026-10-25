@@ -10,6 +10,7 @@ import {
   useState,
 } from "react"
 import {
+  Download,
   Loader2,
   Pause,
   Play,
@@ -46,6 +47,7 @@ import {
 } from "@/lib/api"
 import { isDesktop, revealItemInDir } from "@/lib/platform"
 import { toErrorMessage } from "@/lib/app-error"
+import { exportDiagnosticReport } from "@/lib/diagnostic-report"
 import type {
   LogFileInfo,
   LogLevel,
@@ -276,6 +278,7 @@ export function LogsSettings() {
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState<string | null>(null)
   const [savingLevel, setSavingLevel] = useState(false)
+  const [exportingDiagnostics, setExportingDiagnostics] = useState(false)
 
   const [captureLevel, setCaptureLevel] = useState<LogLevel>("info")
   const [targets, setTargets] = useState<TargetDirective[]>([])
@@ -644,6 +647,18 @@ export function LogsSettings() {
     [t]
   )
 
+  const handleExportDiagnostics = useCallback(async () => {
+    setExportingDiagnostics(true)
+    try {
+      const result = await exportDiagnosticReport()
+      if (result === "saved") toast.success(t("exportSuccess"))
+    } catch (err) {
+      toast.error(t("exportFailed"), { description: toErrorMessage(err) })
+    } finally {
+      setExportingDiagnostics(false)
+    }
+  }, [t])
+
   if (loading) {
     return (
       <div className="flex h-full items-center justify-center gap-2 text-sm text-muted-foreground">
@@ -656,11 +671,29 @@ export function LogsSettings() {
   return (
     <ScrollArea className="h-full">
       <div className="w-full space-y-4 p-3 md:p-4">
-        <section className="space-y-1">
-          <h1 className="text-sm font-semibold">{t("sectionTitle")}</h1>
-          <p className="text-xs text-muted-foreground">
-            {t("sectionDescription")}
-          </p>
+        <section className="flex flex-wrap items-start justify-between gap-3">
+          <div className="space-y-1">
+            <h1 className="text-sm font-semibold">{t("sectionTitle")}</h1>
+            <p className="text-xs text-muted-foreground">
+              {t("sectionDescription")}
+            </p>
+            <p className="max-w-3xl text-[11px] leading-4 text-muted-foreground">
+              {t("exportDescription")}
+            </p>
+          </div>
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={exportingDiagnostics}
+            onClick={() => void handleExportDiagnostics()}
+          >
+            {exportingDiagnostics ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <Download className="h-3.5 w-3.5" />
+            )}
+            {t(exportingDiagnostics ? "exporting" : "exportDiagnostics")}
+          </Button>
         </section>
 
         {loadError && (

@@ -1,0 +1,18 @@
+      let detachedReport = null;
+      if (agentFileChangeReportRequest !== null && agentFileChangeWorkspace !== null) {
+        if (promptWasCancelled || activePrompt.signal.aborted || this.sessionIsClosing(params.sessionId)) {
+          agentFileChangeReportTurnId = null;
+          agentFileChangeReportUnavailableReason = "cancelled";
+        } else if (agentFileChangeReportTurnId !== null && eventHandler?.isTurnDiffOversized(agentFileChangeReportTurnId)) {
+          agentFileChangeReportTurnId = null;
+          agentFileChangeReportUnavailableReason = "invalidOutput";
+        }
+        detachedReport = {
+          session: { sessionId: sessionState.sessionId },
+          turnId: agentFileChangeReportTurnId,
+          request: { ...agentFileChangeReportRequest },
+          reason: agentFileChangeReportUnavailableReason,
+          diff: agentFileChangeReportTurnId === null || eventHandler === null ? "" : eventHandler.getTurnDiff(agentFileChangeReportTurnId),
+          workspace: { ...agentFileChangeWorkspace, additionalDirectories: [...agentFileChangeWorkspace.additionalDirectories] }
+        };
+      }

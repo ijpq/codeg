@@ -5,13 +5,20 @@ import type {
   LiveMessage,
   ToolCallInfo,
 } from "@/contexts/acp-connections-context"
-import { getFolderConversation, getFolderConversationTurns } from "@/lib/api"
+import {
+  getFolderConversation,
+  getFolderConversationTurns,
+  invalidateFolderConversationCache,
+  listConversationOutputWindow,
+} from "@/lib/api"
 import { registerBackendScopedStoreReset } from "@/stores/backend-scoped-store-reset"
 import type {
   AgentExecutionStats,
   AgentTranscriptEntry,
   ContentBlock,
   ConversationTurnsPage,
+  ConversationTurnArtifactRun,
+  ConversationTurnDeliverableSet,
   DbConversationDetail,
   MessageTurn,
   PlanEntryInfo,
@@ -44,6 +51,12 @@ import {
   parseBackgroundTaskMarker,
 } from "@/lib/background-agent"
 import { imageCardLabel } from "@/lib/image-tool-label"
+import {
+  createPromptDeliveryState,
+  transitionPromptDelivery,
+  type PromptDeliveryPhase,
+  type PromptDeliveryState,
+} from "@/lib/prompt-delivery-state"
 
 /**
  * Conversation-runtime shared state as a Zustand store — the per-conversation
@@ -134,6 +147,7 @@ export interface PendingBackgroundSettlement {
  * `background_activity` handler).
  */
 export const BACKGROUND_OVERLAY_HARD_CAP = 300
+export const HISTORY_PAGE_USER_TURNS = 25
 
 /**
  * Default tail window for a cold detail load, and the page size for
@@ -161,6 +175,8 @@ export interface ConversationRuntimeSession {
   detail: DbConversationDetail | null
   detailLoading: boolean
   detailError: string | null
+  historyPageLoading?: boolean
+  historyPageError?: string | null
 
   // ACP `session/load` failed in a way codeg cannot paper over: the agent
   // reports ResourceNotFound for the historical session_id, the session or
@@ -194,6 +210,8 @@ export interface ConversationRuntimeSession {
   // Temporary state
   optimisticTurns: MessageTurn[]
   liveMessage: LiveMessage | null
+  /** Per-user-message delivery lifecycle, keyed by stable client_message_id. */
+  promptDeliveries: Record<string, PromptDeliveryState>
 
   // Sync
   syncState: ConversationSyncState
@@ -231,31 +249,16 @@ export interface ConversationRuntimeSession {
   // Session-level stats (token usage, context window, etc.)
   sessionStats: SessionStats | null
 
-  // Number of persisted assistant turns that predate this session's `localTurns`
-  // — captured at send time (first optimistic turn of a batch), when `detail`
-  // is settled history. A GLOBAL count over the full transcript
-  // (`assistant_turns_before_offset` + the loaded window's share), so it stays
-  // valid however the loaded window moves. Consumed only on the LEGACY sync
-  // path (old server, full reparse): the reparse slices this many turns off
-  // the front before aligning the rest to `localTurns`. The windowed sync
-  // path replaces it with the fingerprint gate below. `null` when no
-  // user-initiated batch is in flight (e.g. the sub-agent adopt path); the
-  // reparse then treats the whole parse as this session's, matching the
-  // pre-capture behavior. See `computeTurnMetadataPatches`.
+  // Number of persisted assistant turns that predate this session's
+  // `localTurns`, captured at send time. Retained for compatibility with
+  // already-mounted sessions and for local alignment helpers; detail refreshes
+  // themselves now use the bounded newest cursor page and never request a
+  // complete transcript merely to patch metadata.
   historyAssistantBaseline: number | null
 
-  // Windowed-sync anchor, captured together with the baseline at batch start:
-  // the batch's first turn will persist at global index `batchBoundaryIndex`,
-  // and `batchBoundaryPrefixHash` fingerprints full[0..batchBoundaryIndex) at
-  // capture time (client-side chain extension of the window fingerprint).
-  // `syncTurnMetadata` refetches `{ fromIndex: batchBoundaryIndex }` and
-  // applies turn patches ONLY when the response's prefix_hash equals the
-  // captured hash — a mismatch means the history the baseline counted was
-  // rewritten (compaction) between capture and sync, where aligning by counts
-  // would pin wrong metadata onto local turns (first-write-wins makes that
-  // permanent). `batchBoundaryPrefixHash` null = captured under a legacy
-  // (non-windowed) detail: the windowed gate cannot run, only the legacy
-  // full-reparse math may patch.
+  // Legacy index-window anchor retained in persisted runtime state. Current
+  // servers synchronize from the bounded newest cursor page, while these
+  // fields still protect compatibility with old in-memory sessions.
   batchBoundaryIndex: number | null
   batchBoundaryPrefixHash: string | null
 
@@ -380,6 +383,25 @@ type Action =
       conversationId: number
       error: string
     }
+  | { type: "FETCH_DETAIL_CANCEL"; conversationId: number }
+  | { type: "FETCH_HISTORY_PAGE_START"; conversationId: number }
+  | {
+      type: "FETCH_HISTORY_PAGE_SUCCESS"
+      conversationId: number
+      detail: DbConversationDetail
+    }
+  | {
+      type: "FETCH_HISTORY_PAGE_ERROR"
+      conversationId: number
+      error: string
+    }
+  | { type: "FETCH_HISTORY_PAGE_CANCEL"; conversationId: number }
+  | {
+      type: "REFRESH_VISIBLE_OUTPUTS_SUCCESS"
+      conversationId: number
+      artifactRuns: ConversationTurnArtifactRun[]
+      deliverableRuns: ConversationTurnDeliverableSet[]
+    }
   | {
       type: "COMPLETE_TURN"
       conversationId: number
@@ -447,6 +469,13 @@ type Action =
       turn: MessageTurn
     }
   | {
+      type: "SET_PROMPT_DELIVERY_PHASE"
+      conversationId: number
+      clientMessageId: string
+      phase: Exclude<PromptDeliveryPhase, "draft">
+      error?: string | null
+    }
+  | {
       type: "SET_LIVE_MESSAGE"
       conversationId: number
       liveMessage: LiveMessage | null
@@ -492,6 +521,8 @@ type Action =
       type: "PATCH_TURN_METADATA"
       conversationId: number
       turnPatches: TurnMetadataPatch[]
+      /** Persisted rounds are patched by native identity, never by position. */
+      nativeTimings?: MessageTurn[]
       sessionStats?: SessionStats | null
     }
   | {
@@ -512,6 +543,8 @@ function createEmptySession(
     detail: null,
     detailLoading: false,
     detailError: null,
+    historyPageLoading: false,
+    historyPageError: null,
     acpLoadError: null,
     localTurns: [],
     backgroundTurns: [],
@@ -519,6 +552,7 @@ function createEmptySession(
     pendingCancelledTurnReports: null,
     optimisticTurns: [],
     liveMessage: null,
+    promptDeliveries: {},
     syncState: "idle",
     activeTurnToken: null,
     lastTurnOwned: false,
@@ -1627,6 +1661,7 @@ export function buildStreamingTurnsFromLiveMessage(
 /** Metadata backfilled onto a local assistant turn by the post-turn reparse. */
 export interface TurnMetadataPatch {
   index: number
+  native_task_id?: string | null
   usage?: TurnUsage | null
   duration_ms?: number | null
   model?: string | null
@@ -1699,6 +1734,19 @@ function assistantTurnRounds(turns: readonly MessageTurn[]): number[][] {
   return rounds
 }
 
+function missingNativeTaskDurations(
+  turns: readonly MessageTurn[]
+): Set<string> {
+  const last = new Map<string, MessageTurn>()
+  for (const turn of turns) {
+    if (turn.role === "assistant" && turn.native_task_id)
+      last.set(turn.native_task_id, turn)
+  }
+  return new Set(
+    [...last].filter(([, turn]) => turn.duration_ms == null).map(([id]) => id)
+  )
+}
+
 /**
  * Where the parse leaves its first `count` assistant turns behind: the
  * position right after the `count`-th one. `turns.length` when the parse holds
@@ -1719,7 +1767,7 @@ function positionPastAssistantTurns(
 
 type TurnStatsPatch = Pick<
   TurnMetadataPatch,
-  "usage" | "duration_ms" | "model" | "completed_at"
+  "usage" | "duration_ms" | "model" | "completed_at" | "native_task_id"
 >
 
 /**
@@ -1877,7 +1925,60 @@ export function computeTurnMetadataPatches(params: {
         : parsedRounds[r + surplus]
       : (parsedRounds[r] ?? [])
     if (parsedRound.length !== localRound.length) everyRoundLinesUp = false
-    alignRoundStats(localRound, parsedRound, stats)
+    const nativeIds = new Set(
+      parsedRound.flatMap((turn) =>
+        turn.native_task_id ? [turn.native_task_id] : []
+      )
+    )
+    if (nativeIds.size === 0) {
+      // Never give legacy positional metadata to an already identified task.
+      alignRoundStats(
+        localRound.filter((i) => !localTurns[i].native_task_id),
+        parsedRound,
+        stats
+      )
+      return
+    }
+    for (const id of nativeIds) {
+      const parsedTask = parsedRound.filter(
+        (turn) => turn.native_task_id === id
+      )
+      const identified = localRound.filter(
+        (i) => localTurns[i].native_task_id === id
+      )
+      // First adoption requires one unambiguous task at the verified batch
+      // boundary. Multiple automated tasks without user bubbles cannot be
+      // distinguished by fragment counts; wait for authoritative history.
+      const canAdopt =
+        nativeIds.size === 1 &&
+        params.parseOpensAtBatch &&
+        parsedTask.length === parsedRound.length &&
+        localRound.every(
+          (i) =>
+            !localTurns[i].native_task_id || localTurns[i].native_task_id === id
+        )
+      const targets = canAdopt ? localRound : identified
+      if (targets.length === 0) continue
+      alignRoundStats(targets, parsedTask, stats)
+      let duration: number | null | undefined
+      for (let i = parsedTask.length - 1; i >= 0; i--) {
+        if (parsedTask[i].duration_ms != null) {
+          duration = parsedTask[i].duration_ms
+          break
+        }
+      }
+      const completed = parsedTask[parsedTask.length - 1]?.completed_at
+      targets.forEach((index, i) => {
+        stats.set(index, {
+          ...stats.get(index),
+          native_task_id: id,
+          // Native duration belongs to the WHOLE task, exactly once, even
+          // when live/parser fragment counts differ.
+          duration_ms: i === targets.length - 1 ? duration : null,
+          completed_at: i === targets.length - 1 ? completed : undefined,
+        })
+      })
+    }
   })
 
   // The parser's name for each turn. Naming a turn is a POSITION claim, and
@@ -1931,14 +2032,23 @@ export function computeTurnMetadataPatches(params: {
   const patches: TurnMetadataPatch[] = []
   localAssistantIndices.forEach((index, i) => {
     const turnStats = stats.get(index)
-    const sourceTurnId = idIsPlaceable ? sessionAssistantTurns[i].id : undefined
+    const source = sessionAssistantTurns[i]
+    const sourceTurnId =
+      idIsPlaceable &&
+      (!localTurns[index].native_task_id ||
+        localTurns[index].native_task_id === source?.native_task_id) &&
+      (!source?.native_task_id ||
+        turnStats?.native_task_id === source.native_task_id)
+        ? source.id
+        : undefined
     // `source_turn_id` counts as something worth emitting on its own: a turn
     // the parser recorded with no stats at all (a plain codex reply carries no
     // per-turn usage) still needs its name, or "fork from here" on it silently
     // degrades to a tail fork.
     if (
       !turnStats?.usage &&
-      !turnStats?.duration_ms &&
+      turnStats?.duration_ms == null &&
+      !turnStats?.native_task_id &&
       !turnStats?.model &&
       !turnStats?.completed_at &&
       !sourceTurnId
@@ -1947,6 +2057,9 @@ export function computeTurnMetadataPatches(params: {
     }
     patches.push({
       index,
+      ...(turnStats?.native_task_id
+        ? { native_task_id: turnStats.native_task_id }
+        : {}),
       usage: turnStats?.usage,
       duration_ms: turnStats?.duration_ms,
       model: turnStats?.model,
@@ -2016,6 +2129,97 @@ function userTurnContentKey(turn: MessageTurn): string {
       }
     })
   )
+}
+
+const PROMPT_DELIVERY_HISTORY_LIMIT = 64
+
+function boundedPromptDeliveries(
+  deliveries: Record<string, PromptDeliveryState>
+): Record<string, PromptDeliveryState> {
+  const entries = Object.entries(deliveries)
+  if (entries.length <= PROMPT_DELIVERY_HISTORY_LIMIT) return deliveries
+  entries.sort(([, a], [, b]) => b.lastEventAt - a.lastEventAt)
+  return Object.fromEntries(entries.slice(0, PROMPT_DELIVERY_HISTORY_LIMIT))
+}
+
+function activeClientMessageIdFromDetail(
+  detail: DbConversationDetail
+): string | null {
+  const inFlightId = detail.in_flight_user_turn_id?.trim()
+  if (inFlightId) return inFlightId
+
+  let latestId: string | null = null
+  let latestStartedAt = Number.NEGATIVE_INFINITY
+  for (const run of detail.artifact_runs ?? []) {
+    const id = run.client_message_id?.trim()
+    if (run.status !== "running" || !id) continue
+    const startedAt = Date.parse(run.started_at)
+    const comparableStartedAt = Number.isFinite(startedAt)
+      ? startedAt
+      : Number.NEGATIVE_INFINITY
+    if (latestId === null || comparableStartedAt >= latestStartedAt) {
+      latestId = id
+      latestStartedAt = comparableStartedAt
+    }
+  }
+  return latestId
+}
+
+function reconcilePromptDeliveriesFromDetail(
+  current: ConversationRuntimeSession,
+  detail: DbConversationDetail
+): Record<string, PromptDeliveryState> {
+  const runsByClientId = new Map(
+    (detail.artifact_runs ?? [])
+      .filter((run) => Boolean(run.client_message_id))
+      .map((run) => [run.client_message_id!, run])
+  )
+  const activeId = activeClientMessageIdFromDetail(detail)
+  const ids = new Set(Object.keys(current.promptDeliveries))
+  if (activeId) ids.add(activeId)
+  for (const [id, run] of runsByClientId) {
+    if (run.status === "running") ids.add(id)
+  }
+  if (ids.size === 0) return current.promptDeliveries
+
+  const assistantCount = detail.turns.filter(
+    (turn) => turn.role === "assistant"
+  ).length
+  const baseline = current.historyAssistantBaseline ?? 0
+  let changed = false
+  const next = { ...current.promptDeliveries }
+
+  for (const id of ids) {
+    const existing = next[id]
+    const run = runsByClientId.get(id)
+    const startedAt = run ? Date.parse(run.started_at) : Number.NaN
+    const delivery =
+      existing ??
+      createPromptDeliveryState(
+        id,
+        Number.isFinite(startedAt) ? startedAt : Date.now()
+      )
+    if (!existing) {
+      next[id] = delivery
+      changed = true
+    }
+    let phase: Exclude<PromptDeliveryPhase, "draft"> | null = null
+    if (run?.status === "running" || activeId === id) {
+      phase = "running"
+    } else if (run) {
+      phase = assistantCount > baseline ? "completed" : "persisted"
+    }
+    if (!phase) continue
+    const updated = transitionPromptDelivery(delivery, phase, {
+      now: existing ? undefined : delivery.submittedAt,
+    })
+    if (updated !== delivery) {
+      next[id] = updated
+      changed = true
+    }
+  }
+
+  return changed ? boundedPromptDeliveries(next) : current.promptDeliveries
 }
 
 /**
@@ -2266,9 +2470,18 @@ function reducer(
         // cleared on FETCH_DETAIL_ERROR: a failed load covered nothing, and
         // the pill is the only way back to that content.
         pendingOutOfTurnContent: false,
+        historyPageLoading: false,
+        historyPageError: null,
         externalId: nextExternalId ?? current.externalId,
         sessionStats: action.detail.session_stats ?? current.sessionStats,
         backgroundTurns: nextBackgroundTurns,
+        promptDeliveries: reconcilePromptDeliveriesFromDetail(
+          current,
+          action.detail
+        ),
+        activeTurnToken:
+          activeClientMessageIdFromDetail(action.detail) ??
+          (isActivelyInteracting ? current.activeTurnToken : null),
         ...(isActivelyInteracting
           ? keepAllLiveBuffers
             ? {}
@@ -2336,6 +2549,11 @@ function reducer(
         pendingOutOfTurnContent: true,
       }))
     }
+    case "FETCH_DETAIL_CANCEL":
+      return updateSessionInState(state, action.conversationId, (current) => ({
+        ...current,
+        detailLoading: false,
+      }))
 
     // The three LOAD_OLDER/PREPEND cases guard on session existence instead
     // of using the create-if-missing update helper: a page response landing
@@ -2416,6 +2634,76 @@ function reducer(
         olderTurnsPrependEpoch: s.olderTurnsPrependEpoch + 1,
       }))
     }
+    case "FETCH_HISTORY_PAGE_START":
+      return updateSessionInState(state, action.conversationId, (current) => ({
+        ...current,
+        historyPageLoading: true,
+        historyPageError: null,
+      }))
+
+    case "FETCH_HISTORY_PAGE_SUCCESS":
+      return updateSessionInState(state, action.conversationId, (current) => {
+        if (!current.detail) {
+          return {
+            ...current,
+            detail: action.detail,
+            historyPageLoading: false,
+            historyPageError: null,
+          }
+        }
+        const existingIds = new Set(current.detail.turns.map((turn) => turn.id))
+        const olderTurns = action.detail.turns.filter(
+          (turn) => !existingIds.has(turn.id)
+        )
+        const deliverableRuns = new Map(
+          (current.detail.deliverable_runs ?? []).map((run) => [
+            run.turn_run_id,
+            run,
+          ])
+        )
+        for (const run of action.detail.deliverable_runs ?? []) {
+          const existing = deliverableRuns.get(run.turn_run_id)
+          if (!existing || run.user_turn_id) {
+            deliverableRuns.set(run.turn_run_id, run)
+          }
+        }
+        return {
+          ...current,
+          detail: {
+            ...current.detail,
+            turns: [...olderTurns, ...current.detail.turns],
+            deliverable_runs: [...deliverableRuns.values()],
+            history_page: action.detail.history_page,
+          },
+          historyPageLoading: false,
+          historyPageError: null,
+        }
+      })
+
+    case "FETCH_HISTORY_PAGE_ERROR":
+      return updateSessionInState(state, action.conversationId, (current) => ({
+        ...current,
+        historyPageLoading: false,
+        historyPageError: action.error,
+      }))
+
+    case "FETCH_HISTORY_PAGE_CANCEL":
+      return updateSessionInState(state, action.conversationId, (current) => ({
+        ...current,
+        historyPageLoading: false,
+      }))
+
+    case "REFRESH_VISIBLE_OUTPUTS_SUCCESS":
+      return updateSessionInState(state, action.conversationId, (current) => ({
+        ...current,
+        detail: current.detail
+          ? {
+              ...current.detail,
+              artifact_runs: action.artifactRuns,
+              deliverable_runs: action.deliverableRuns,
+            }
+          : null,
+      }))
 
     case "COMPLETE_TURN": {
       const current = state.byConversationId.get(action.conversationId)
@@ -2540,6 +2828,25 @@ function reducer(
         )
       }
 
+      const completedDeliveryIds = new Set(
+        current.optimisticTurns.map((turn) => turn.id)
+      )
+      if (current.activeTurnToken) {
+        completedDeliveryIds.add(current.activeTurnToken)
+      }
+      let completedDeliveries = current.promptDeliveries
+      for (const id of completedDeliveryIds) {
+        const delivery = completedDeliveries[id]
+        if (!delivery) continue
+        if (completedDeliveries === current.promptDeliveries) {
+          completedDeliveries = { ...current.promptDeliveries }
+        }
+        completedDeliveries[id] = transitionPromptDelivery(
+          delivery,
+          "completed"
+        )
+      }
+
       return updateSessionInState(state, action.conversationId, () => ({
         ...current,
         localTurns: promoted,
@@ -2555,6 +2862,7 @@ function reducer(
         lastTurnOwned: current.syncState === "awaiting_persist",
         pendingBackgroundSettlements: remainingSettlements,
         pendingCancelledTurnReports: null,
+        promptDeliveries: boundedPromptDeliveries(completedDeliveries),
       }))
     }
 
@@ -2697,6 +3005,10 @@ function reducer(
         return {
           ...current,
           optimisticTurns: [...current.optimisticTurns, action.turn],
+          promptDeliveries: boundedPromptDeliveries({
+            ...current.promptDeliveries,
+            [action.turn.id]: createPromptDeliveryState(action.turn.id),
+          }),
           syncState: "awaiting_persist",
           activeTurnToken: action.turnToken,
           historyAssistantBaseline: capture.baseline,
@@ -2721,8 +3033,29 @@ function reducer(
         // suppress the next detail reconciliation. Concurrent optimistic turns
         // (if any) keep us awaiting_persist.
         syncState: remaining.length === 0 ? "idle" : s.syncState,
+        activeTurnToken:
+          s.activeTurnToken === action.id
+            ? (remaining[remaining.length - 1]?.id ?? null)
+            : s.activeTurnToken,
       }))
     }
+
+    case "SET_PROMPT_DELIVERY_PHASE":
+      return updateSessionInState(state, action.conversationId, (current) => {
+        const existing =
+          current.promptDeliveries[action.clientMessageId] ??
+          createPromptDeliveryState(action.clientMessageId)
+        const updated = transitionPromptDelivery(existing, action.phase, {
+          error: action.error,
+        })
+        return {
+          ...current,
+          promptDeliveries: boundedPromptDeliveries({
+            ...current.promptDeliveries,
+            [action.clientMessageId]: updated,
+          }),
+        }
+      })
 
     case "APPEND_VIEWER_USER_TURN": {
       const current =
@@ -2860,9 +3193,24 @@ function reducer(
         return state
       }
 
+      const activeDelivery = session.activeTurnToken
+        ? session.promptDeliveries[session.activeTurnToken]
+        : null
+      const nextDeliveries =
+        action.liveMessage && session.activeTurnToken && activeDelivery
+          ? {
+              ...session.promptDeliveries,
+              [session.activeTurnToken]: transitionPromptDelivery(
+                activeDelivery,
+                "running"
+              ),
+            }
+          : session.promptDeliveries
+
       return updateSessionInState(state, action.conversationId, () => ({
         ...session,
         liveMessage: action.liveMessage,
+        promptDeliveries: nextDeliveries,
       }))
     }
 
@@ -2927,6 +3275,8 @@ function reducer(
         detail: to.detail ?? from.detail,
         detailLoading: to.detailLoading || from.detailLoading,
         detailError: to.detailError ?? from.detailError,
+        historyPageLoading: to.historyPageLoading || from.historyPageLoading,
+        historyPageError: to.historyPageError ?? from.historyPageError,
         localTurns: [...from.localTurns, ...to.localTurns],
         optimisticTurns: [...from.optimisticTurns, ...to.optimisticTurns],
         liveMessage: mergedLiveMessage,
@@ -2978,21 +3328,28 @@ function reducer(
 
     case "PATCH_TURN_METADATA": {
       const current = state.byConversationId.get(action.conversationId)
-      if (!current || current.localTurns.length === 0) return state
+      if (!current) return state
 
       const patchedTurns = [...current.localTurns]
       let changed = false
       for (const patch of action.turnPatches) {
         const turn = patchedTurns[patch.index]
         if (!turn) continue
+        if (turn.native_task_id && turn.native_task_id !== patch.native_task_id)
+          continue
         const newUsage = turn.usage ?? patch.usage
-        const newDuration = turn.duration_ms ?? patch.duration_ms
+        const newDuration =
+          patch.native_task_id && patch.duration_ms !== undefined
+            ? patch.duration_ms
+            : (turn.duration_ms ?? patch.duration_ms)
+        const newNativeTaskId = turn.native_task_id ?? patch.native_task_id
         const newModel = turn.model ?? patch.model
         const newCompletedAt = turn.completed_at ?? patch.completed_at
         const newSourceTurnId = turn.source_turn_id ?? patch.source_turn_id
         if (
           newUsage !== turn.usage ||
           newDuration !== turn.duration_ms ||
+          newNativeTaskId !== turn.native_task_id ||
           newModel !== turn.model ||
           newCompletedAt !== turn.completed_at ||
           newSourceTurnId !== turn.source_turn_id
@@ -3001,6 +3358,7 @@ function reducer(
             ...turn,
             usage: newUsage,
             duration_ms: newDuration,
+            ...(newNativeTaskId ? { native_task_id: newNativeTaskId } : {}),
             model: newModel,
             completed_at: newCompletedAt,
             source_turn_id: newSourceTurnId,
@@ -3009,12 +3367,47 @@ function reducer(
         }
       }
 
-      if (!changed && !action.sessionStats) return state
-
-      const patchedDetail =
+      let patchedDetail =
         current.detail && action.sessionStats
           ? { ...current.detail, session_stats: action.sessionStats }
           : current.detail
+      if (patchedDetail && action.nativeTimings?.length) {
+        const incoming = new Map<string, MessageTurn>()
+        for (const turn of action.nativeTimings) {
+          if (turn.role === "assistant" && turn.native_task_id)
+            incoming.set(turn.native_task_id, turn)
+        }
+        let turns: MessageTurn[] | null = null
+        // Only the last fragment of each identified task carries its timing.
+        // Patch metadata in place; don't replace or truncate loaded history.
+        for (
+          let i = patchedDetail.turns.length - 1;
+          i >= 0 && incoming.size;
+          i--
+        ) {
+          const turn = patchedDetail.turns[i]
+          if (turn.role !== "assistant" || !turn.native_task_id) continue
+          const parsed = incoming.get(turn.native_task_id)
+          if (!parsed) continue
+          incoming.delete(turn.native_task_id)
+          if (
+            turn.duration_ms == null &&
+            parsed.duration_ms != null &&
+            Number.isFinite(parsed.duration_ms) &&
+            parsed.duration_ms >= 0
+          ) {
+            turns ??= [...patchedDetail.turns]
+            turns[i] = {
+              ...turn,
+              duration_ms: parsed.duration_ms,
+              completed_at: parsed.completed_at ?? turn.completed_at,
+            }
+          }
+        }
+        if (turns) patchedDetail = { ...patchedDetail, turns }
+      }
+      if (!changed && patchedDetail === current.detail && !action.sessionStats)
+        return state
 
       return updateSessionInState(state, action.conversationId, () => ({
         ...current,
@@ -3090,6 +3483,11 @@ export interface RuntimeActions {
     conversationId: number,
     options?: { preserveLive?: boolean; dropLiveTurnIds?: string[] }
   ) => void
+  refreshVisibleOutputs: (conversationId: number) => Promise<void>
+  loadEarlierHistory: (conversationId: number) => Promise<void>
+  loadCompleteHistory: (
+    conversationId: number
+  ) => Promise<DbConversationDetail | null>
   /**
    * Load one page of older history above the current window and prepend it
    * (reverse infinite scroll). No-op unless the loaded detail is windowed
@@ -3121,6 +3519,17 @@ export interface RuntimeActions {
     dbConversationId: number,
     runtimeConversationId?: number
   ) => () => void
+  /**
+   * Poll the authoritative transcript after turn_complete until the final
+   * assistant record is present, then replace volatile stream buffers. This
+   * heals missed deltas without reintroducing the transcript-flush race.
+   */
+  reconcileCompletedTurn: (
+    dbConversationId: number,
+    runtimeConversationId?: number,
+    clientMessageId?: string | null,
+    onReconciled?: () => void
+  ) => () => void
   completeTurn: (
     conversationId: number,
     liveMessage?: LiveMessage | null
@@ -3139,6 +3548,12 @@ export interface RuntimeActions {
     turnToken: string
   ) => void
   removeOptimisticTurn: (conversationId: number, id: string) => void
+  setPromptDeliveryPhase: (
+    conversationId: number,
+    clientMessageId: string,
+    phase: Exclude<PromptDeliveryPhase, "draft">,
+    error?: string | null
+  ) => void
   appendViewerUserTurn: (conversationId: number, turn: MessageTurn) => void
   applyBackgroundActivity: (
     conversationId: number,
@@ -3262,6 +3677,12 @@ let timelinePrefixCache = new WeakMap<
 // and resurrection-after-remove races. Cells are kept indefinitely (small int
 // per conversation); a cleanup sweep isn't needed for the expected cardinality.
 const fetchGeneration = new Map<number, number>()
+const historyPageFlights = new Map<number, Promise<void>>()
+const historyPageControllers = new Map<number, AbortController>()
+const detailFetchControllers = new Map<number, AbortController>()
+const detailRefetchPending = new Map<number, boolean>()
+const outputWindowFlights = new Map<number, Promise<void>>()
+const outputWindowRefreshPending = new Set<number>()
 
 function bumpFetchGeneration(conversationId: number): number {
   const next = (fetchGeneration.get(conversationId) ?? 0) + 1
@@ -3281,6 +3702,17 @@ function isLatestGeneration(
 // to page through several windows wait out a page the near-top trigger issued
 // instead of giving up on it.
 const olderPageRequests = new Map<number, Promise<boolean>>()
+function markConversationDetailPhase(
+  conversationId: number,
+  phase: "request-start" | "data-ready"
+): void {
+  if (typeof performance === "undefined" || process.env.NODE_ENV === "test") {
+    return
+  }
+  const name = `codeg-conversation-${conversationId}-${phase}`
+  performance.clearMarks(name)
+  performance.mark(name)
+}
 
 // ─── Cross-client viewer detail sync ─────────────────────────────────────
 // A conversation whose turn completes on ANOTHER client (this client is only
@@ -3305,6 +3737,9 @@ const VIEWER_DETAIL_SYNC_DELAYS_MS = [0, 300, 700, 1500, 2500] as const
 // `syncViewerDetail`).
 const VIEWER_DETAIL_SYNC_LOAD_WAIT_STEP_MS = 300
 const VIEWER_DETAIL_SYNC_LOAD_WAIT_CAP_MS = 30_000
+const COMPLETED_TURN_RECONCILE_DELAYS_MS = [
+  80, 220, 500, 1000, 2000, 4000,
+] as const
 
 // ─── Post-turn metadata reparse ──────────────────────────────────────────
 // Backoff for `syncTurnMetadata`, which re-reads the agent's transcript after
@@ -3327,6 +3762,8 @@ const TURN_METADATA_SYNC_DELAYS_MS = [1500, 3000, 5000, 8000, 13000] as const
 // an in-flight poll (never stacks) and `removeConversation` / store reset can
 // cancel a poll whose tab has closed.
 const viewerDetailSyncCancels = new Map<number, () => void>()
+const completedTurnReconcileCancels = new Map<number, () => void>()
+const turnMetadataSyncCancels = new Map<number, () => void>()
 
 function cancelViewerDetailSync(conversationId: number): void {
   const cancel = viewerDetailSyncCancels.get(conversationId)
@@ -3418,6 +3855,10 @@ function holdsExactlyTurns(
   return turns.length === ids.size && turns.every((t) => ids.has(t.id))
 }
 
+function cancelCompletedTurnReconcile(conversationId: number): void {
+  completedTurnReconcileCancels.get(conversationId)?.()
+}
+
 // Resolve the RUNTIME-session key for a `conversation://changed` nudge, which
 // carries the positive DB id. A tab opened from a draft keeps its virtual
 // (negative) runtime key for its whole life while storing the positive id in
@@ -3436,48 +3877,127 @@ function resolveViewerRuntimeId(
   return null
 }
 
-// A "pure viewer" holds none of the in-memory copies of a reply that a transcript
-// refetch could race and clobber: no in-flight prompt (`awaiting_persist`), no
-// live stream (`liveMessage`), and no just-PROMOTED reply that persistence may
-// still lag. Only such a session may be refetched from the transcript.
-//
-// `localTurns` alone is NOT disqualifying: a viewer that streamed an EARLIER turn
-// promotes it into `localTurns` too, and that reply is already persisted (it
-// completed on the owner before this client observed the edge), so folding it
-// from disk is safe. Excluding every `localTurns` would permanently strand such
-// a viewer after its first captured turn — reproducing the very bug this sync
-// fixes. Only a PROMOTED reply that may still be mid-flush (`completeTurn`'s ~8ms
-// write race) must be protected, i.e. `localTurns.length > 0` AND either:
-//   - `lastTurnOwned` — this client DROVE the promoted turn (an owner send); its
-//     reply lives only in `localTurns` until the transcript catches up; or
-//   - `liveOwnsActiveTurn` — a delegation-child dialog adopted its reply from the
-//     wire ahead of persistence (see `sub-agent-session-dialog.tsx`, which then
-//     deliberately does NOT refetch) and owns its promotion/dedup path.
-// Both are gated on `localTurns.length > 0`: the pre-promotion streaming phase is
-// already covered by `liveMessage`, and a MARKER-ONLY delegation child (the no-
-// child-connection fallback that never streams or promotes) has nothing to guard,
-// so it must stay eligible to sync on a later completion nudge. The synthesized
-// viewer user turn lives in `optimisticTurns` WITHOUT `awaiting_persist`, so it
-// never blocks a detail load from replacing it.
-//
-// Known limitation: a client that DROVE a turn and then passively MISSES every
-// later turn (no live stream at all — a co-controlling client drove them) keeps
-// `lastTurnOwned` set and stays excluded until a settled fetch (tab switch /
-// reopen) clears its `localTurns`. This is deliberate: the alternative — admitting
-// a session whose `localTurns` may hold an unflushed reply — reintroduces the
-// hardware-evidenced content-drop `completeTurn` documents. The failure is safe
-// (stale, never wrong) and self-heals on any refetch or the next observed turn
-// (whose promotion re-stamps `lastTurnOwned` false). The common viewer — one that
-// never drove a turn — is unaffected.
+// Passive history reads require no in-flight prompt or live stream. A former
+// owner can also observe remote turns; localBatchCoveredByDetail protects any
+// promoted reply that is not yet persisted. Delegation-child surfaces retain
+// their dedicated promotion and dedup path while holding local turns.
 function isPureViewerSession(session: ConversationRuntimeSession): boolean {
   return (
     session.syncState !== "awaiting_persist" &&
     session.liveMessage === null &&
-    !(
-      session.localTurns.length > 0 &&
-      (session.lastTurnOwned || session.liveOwnsActiveTurn)
-    )
+    !(session.localTurns.length > 0 && session.liveOwnsActiveTurn)
   )
+}
+
+// A settled response is not proof that an owner's promoted reply is on disk:
+// the previous reply can be a perfectly settled tail too. Match a batch to its
+// durable prompt/run identity, then require all displayed blocks in that reply
+// region. No completion is inferred from prose, counts, or a newer timestamp.
+function localBatchCoveredByDetail(
+  session: ConversationRuntimeSession,
+  detail: DbConversationDetail
+): boolean {
+  if (
+    detail.in_flight_user_turn_id != null ||
+    detail.history_page?.page_complete === false
+  )
+    return false
+  let anchor = -1
+  for (const local of session.localTurns) {
+    const id = local.source_turn_id ?? local.id
+    const exact = detail.turns.findIndex(
+      (turn) => turn.role === local.role && turn.id === id
+    )
+    if (local.role === "user") {
+      const run = detail.artifact_runs?.find(
+        (candidate) =>
+          candidate.client_message_id === local.id &&
+          candidate.status !== "running"
+      )
+      const userId = detail.deliverable_runs?.find(
+        (candidate) => candidate.turn_run_id === run?.id
+      )?.user_turn_id
+      anchor =
+        exact >= 0
+          ? exact
+          : detail.turns.findIndex(
+              (turn) => turn.role === "user" && turn.id === userId
+            )
+      if (
+        anchor < 0 ||
+        userTurnContentKey(local) !== userTurnContentKey(detail.turns[anchor]!)
+      )
+        return false
+      continue
+    }
+    const start = exact >= 0 ? exact : anchor + 1
+    if (exact < 0 && anchor < 0) return false
+    let end = exact >= 0 ? exact + 1 : detail.turns.length
+    if (exact < 0) {
+      const nextPrompt = detail.turns.findIndex(
+        (turn, index) => index > anchor && turn.role === "user"
+      )
+      if (nextPrompt >= 0) end = nextPrompt
+    }
+    const blocks = detail.turns
+      .slice(start, end)
+      .filter((turn) => turn.role === local.role)
+      .flatMap((turn) => turn.blocks)
+    if (
+      !local.blocks.every((block) => {
+        if (block.type === "plan") return true // live-only; never written by parsers
+        if (block.type === "text" || block.type === "thinking") {
+          const text = blocks
+            .filter((candidate) => candidate.type === block.type)
+            .map((candidate) => ("text" in candidate ? candidate.text : ""))
+            .join("")
+          return text.includes(block.text)
+        }
+        return blocks.some((candidate) => {
+          if (candidate.type !== block.type) return false
+          if (block.type === "tool_use" && candidate.type === "tool_use") {
+            return (
+              block.tool_use_id != null &&
+              candidate.tool_use_id === block.tool_use_id
+            )
+          }
+          if (
+            block.type === "tool_result" &&
+            candidate.type === "tool_result"
+          ) {
+            return (
+              block.tool_use_id != null &&
+              candidate.tool_use_id === block.tool_use_id &&
+              candidate.is_error === block.is_error &&
+              candidate.output_preview === block.output_preview
+            )
+          }
+          if (block.type === "image" && candidate.type === "image") {
+            return (
+              (block.uri != null && block.uri === candidate.uri) ||
+              (block.data.length > 0 && block.data === candidate.data)
+            )
+          }
+          if (
+            block.type === "image_generation" &&
+            candidate.type === "image_generation"
+          ) {
+            return (
+              block.image != null &&
+              candidate.image != null &&
+              ((block.image.uri != null &&
+                block.image.uri === candidate.image.uri) ||
+                (block.image.data.length > 0 &&
+                  block.image.data === candidate.image.data))
+            )
+          }
+          return false
+        })
+      })
+    )
+      return false
+  }
+  return true
 }
 
 /**
@@ -3721,10 +4241,8 @@ function computeTimelinePrefix(
     steeredCopyKey: steeredCopyIds ? [...steeredCopyIds].join("\x00") : "",
     liveStreamedRoundStart,
   }
-  if (detail) {
-    const cached = timelinePrefixCache.get(detail)
-    if (cached && timelinePrefixDepsEqual(cached.deps, deps)) return cached
-  }
+  const cached = detail ? timelinePrefixCache.get(detail) : undefined
+  if (cached && timelinePrefixDepsEqual(cached.deps, deps)) return cached
 
   // Phase 1: DB historical turns.
   // When liveOwnsActiveTurn is set (read-only viewer), the live/local reply is
@@ -3970,7 +4488,24 @@ function computeTimelinePrefix(
   // resolve identically with or without a streaming tail, so the result is
   // reusable across batches.
   const rawPrefix = [...persisted, ...localAndBackground, ...optimistic]
-  const prefix = dedupeTimeline(rawPrefix)
+  let prefix = dedupeTimeline(rawPrefix)
+  if (cached) {
+    // A prefix dependency can change without changing most rows — the first
+    // live event toggles `hasLiveMessage`, and appending one optimistic image
+    // changes only the tail. Reuse every unchanged row object so React/virtua
+    // do not reconcile a long historical transcript just because the prefix
+    // array itself had to be rebuilt.
+    const cachedByKey = new Map(cached.prefix.map((item) => [item.key, item]))
+    prefix = prefix.map((item) => {
+      const previous = cachedByKey.get(item.key)
+      return previous &&
+        previous.turn === item.turn &&
+        previous.phase === item.phase &&
+        previous.inProgressToolCallIds === item.inProgressToolCallIds
+        ? previous
+        : item
+    })
+  }
   const prefixKeys = new Set<string>()
   for (const item of prefix) {
     prefixKeys.add(retainKey(item.turn))
@@ -4207,40 +4742,74 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     set((state) => reducer(state, action))
   }
 
-  /**
-   * Fetch the detail as a WINDOW scoped to what this session has loaded:
-   * - no windowed detail yet → the default tail window;
-   * - a windowed detail → `{ fromIndex: turns_offset }`, i.e. refresh the
-   *   whole loaded region (older, unloaded prefix untouched). Anchoring at
-   *   the window start — not the active round — is deliberate: turns INSIDE
-   *   the loaded region can be rewritten later (a background task completing
-   *   rewrites its multi-rounds-old ack preview; delegation meta advances),
-   *   and today's full refetch repainted them. The unloaded prefix picks up
-   *   such rewrites whenever the user pages it in.
-   *
-   * The response is verified against the current window fingerprint: a
-   * mismatch (or a total that collapsed below the window start) means the
-   * prefix was rewritten — compaction — so the loaded window's coordinates
-   * are garbage; retry once as a fresh tail window (dropping paged-in
-   * history) instead of stitching incompatible parses together. A legacy
-   * full response (old server: no window fields) passes through untouched.
-   */
+  const beginDetailFetch = (
+    conversationId: number,
+    exclusiveOpen: boolean
+  ): AbortController => {
+    if (exclusiveOpen) {
+      for (const [otherConversationId, controller] of detailFetchControllers) {
+        if (otherConversationId === conversationId) continue
+        controller.abort()
+        detailFetchControllers.delete(otherConversationId)
+        detailRefetchPending.delete(otherConversationId)
+        bumpFetchGeneration(otherConversationId)
+        dispatch({
+          type: "FETCH_DETAIL_CANCEL",
+          conversationId: otherConversationId,
+        })
+      }
+      for (const [otherConversationId, controller] of historyPageControllers) {
+        if (otherConversationId === conversationId) continue
+        controller.abort()
+        historyPageControllers.delete(otherConversationId)
+        bumpFetchGeneration(otherConversationId)
+        dispatch({
+          type: "FETCH_HISTORY_PAGE_CANCEL",
+          conversationId: otherConversationId,
+        })
+      }
+    }
+    if (historyPageControllers.get(conversationId)) {
+      historyPageControllers.get(conversationId)?.abort()
+      historyPageControllers.delete(conversationId)
+      dispatch({ type: "FETCH_HISTORY_PAGE_CANCEL", conversationId })
+    }
+    detailFetchControllers.get(conversationId)?.abort()
+    const controller = new AbortController()
+    detailFetchControllers.set(conversationId, controller)
+    return controller
+  }
+
+  const finishDetailFetch = (
+    conversationId: number,
+    controller: AbortController
+  ) => {
+    if (detailFetchControllers.get(conversationId) === controller) {
+      detailFetchControllers.delete(conversationId)
+    }
+  }
+
+  /** Refresh only the newest bounded cursor page. Older pages already shown
+   * remain local UI history until the next explicit pagination request; an ACP
+   * or deliverable event must not turn a metadata refresh into a full JSONL
+   * parse. */
   const fetchDetailWindowed = async (
     fetchId: number,
-    currentDetail: DbConversationDetail | null
+    _currentDetail: DbConversationDetail | null,
+    generation?: number,
+    signal?: AbortSignal
   ): Promise<DbConversationDetail> => {
-    if (!isWindowedDetail(currentDetail)) {
-      return getFolderConversation(fetchId, { tailTurns: TAIL_TURNS_DEFAULT })
-    }
-    const offset = currentDetail.turns_offset
-    const detail = await getFolderConversation(fetchId, { fromIndex: offset })
-    if (!isWindowedDetail(detail)) return detail
-    const consistent =
-      detail.turns_offset === offset &&
-      detail.prefix_hash === currentDetail.prefix_hash &&
-      detail.turns_total >= offset
-    if (consistent) return detail
-    return getFolderConversation(fetchId, { tailTurns: TAIL_TURNS_DEFAULT })
+    void _currentDetail
+    // The legacy index window requires the backend to parse the complete
+    // transcript before slicing. Always converge old loaded state onto the
+    // byte-cursor endpoint instead; this is the difference between a tail seek
+    // and a 2 GB scan when a pre-cursor client session remains mounted.
+    return getFolderConversation(fetchId, {
+      userTurnLimit: HISTORY_PAGE_USER_TURNS,
+      requestGeneration: generation ?? null,
+      signal,
+      cacheMode: "reload",
+    })
   }
 
   const fetchDetail = (conversationId: number): void => {
@@ -4250,27 +4819,52 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     // Skip fetch if session has active data (ongoing conversation)
     if (session && sessionHoldsActiveTurns(session)) return
 
+    const controller = beginDetailFetch(conversationId, true)
     const generation = bumpFetchGeneration(conversationId)
+    markConversationDetailPhase(conversationId, "request-start")
     dispatch({ type: "FETCH_DETAIL_START", conversationId })
-    getFolderConversation(conversationId, { tailTurns: TAIL_TURNS_DEFAULT })
+    getFolderConversation(conversationId, {
+      userTurnLimit: HISTORY_PAGE_USER_TURNS,
+      requestGeneration: generation,
+      signal: controller.signal,
+    })
       .then((detail) => {
         if (!isLatestGeneration(conversationId, generation)) return
+        markConversationDetailPhase(conversationId, "data-ready")
         dispatch({ type: "FETCH_DETAIL_SUCCESS", conversationId, detail })
+        if (
+          detail.in_flight_user_turn_id == null &&
+          missingNativeTaskDurations(detail.turns).size
+        ) {
+          syncTurnMetadata(conversationId)
+        }
       })
       .catch((error: unknown) => {
         if (!isLatestGeneration(conversationId, generation)) return
+        if (error instanceof Error && error.name === "AbortError") {
+          dispatch({ type: "FETCH_DETAIL_CANCEL", conversationId })
+          return
+        }
         dispatch({
           type: "FETCH_DETAIL_ERROR",
           conversationId,
           error: toErrorMessage(error),
         })
       })
+      .finally(() => finishDetailFetch(conversationId, controller))
   }
 
   const refetchDetail = (
     conversationId: number,
     options?: { preserveLive?: boolean; dropLiveTurnIds?: string[] }
   ): void => {
+    if (detailFetchControllers.has(conversationId)) {
+      // State events arriving in a burst do not need parallel transcript
+      // reads. Keep one trailing refresh so an event that landed after the
+      // active request's snapshot is still observed.
+      detailRefetchPending.set(conversationId, options?.preserveLive ?? false)
+      return
+    }
     // The session key is not always a fetchable DB id: a conversation started
     // as a new-chat draft keeps its virtual (negative) key for the tab's whole
     // life. Fetch with the bound DB row id (see `dbConversationId`) and store
@@ -4281,11 +4875,28 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     // never flip to their persisted terminal state.
     const session = get().byConversationId.get(conversationId)
     const fetchId = session?.dbConversationId ?? conversationId
+    const controller = beginDetailFetch(conversationId, false)
     const generation = bumpFetchGeneration(conversationId)
+    markConversationDetailPhase(conversationId, "request-start")
+    invalidateFolderConversationCache(fetchId)
     dispatch({ type: "FETCH_DETAIL_START", conversationId })
-    fetchDetailWindowed(fetchId, session?.detail ?? null)
+    const detailRequest = isWindowedDetail(session?.detail ?? null)
+      ? fetchDetailWindowed(
+          fetchId,
+          session?.detail ?? null,
+          generation,
+          controller.signal
+        )
+      : getFolderConversation(fetchId, {
+          userTurnLimit: HISTORY_PAGE_USER_TURNS,
+          requestGeneration: generation,
+          signal: controller.signal,
+          cacheMode: "reload",
+        })
+    detailRequest
       .then((detail) => {
         if (!isLatestGeneration(conversationId, generation)) return
+        markConversationDetailPhase(conversationId, "data-ready")
         dispatch({
           type: "FETCH_DETAIL_SUCCESS",
           conversationId,
@@ -4293,14 +4904,34 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
           preserveLive: options?.preserveLive ?? false,
           dropLiveTurnIds: options?.dropLiveTurnIds,
         })
+        if (
+          detail.in_flight_user_turn_id == null &&
+          missingNativeTaskDurations(detail.turns).size
+        ) {
+          syncTurnMetadata(fetchId, conversationId)
+        }
       })
       .catch((error: unknown) => {
         if (!isLatestGeneration(conversationId, generation)) return
+        if (error instanceof Error && error.name === "AbortError") {
+          dispatch({ type: "FETCH_DETAIL_CANCEL", conversationId })
+          return
+        }
         dispatch({
           type: "FETCH_DETAIL_ERROR",
           conversationId,
           error: toErrorMessage(error),
         })
+      })
+      .finally(() => {
+        finishDetailFetch(conversationId, controller)
+        const pendingPreserveLive = detailRefetchPending.get(conversationId)
+        if (pendingPreserveLive !== undefined) {
+          detailRefetchPending.delete(conversationId)
+          refetchDetail(conversationId, {
+            preserveLive: pendingPreserveLive,
+          })
+        }
       })
   }
 
@@ -4426,6 +5057,92 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     }
   }
 
+  const loadEarlierHistory = (conversationId: number): Promise<void> => {
+    const existingFlight = historyPageFlights.get(conversationId)
+    if (existingFlight) return existingFlight
+
+    const session = get().byConversationId.get(conversationId)
+    const cursor = session?.detail?.history_page?.next_cursor ?? null
+    if (!session?.detail?.history_page?.has_more || !cursor) {
+      return Promise.resolve()
+    }
+    const fetchId = session.dbConversationId ?? conversationId
+    detailFetchControllers.get(conversationId)?.abort()
+    detailFetchControllers.delete(conversationId)
+    const controller = new AbortController()
+    historyPageControllers.set(conversationId, controller)
+    const generation = bumpFetchGeneration(conversationId)
+    dispatch({ type: "FETCH_HISTORY_PAGE_START", conversationId })
+    const flight = getFolderConversation(fetchId, {
+      beforeCursor: cursor,
+      userTurnLimit: HISTORY_PAGE_USER_TURNS,
+      requestGeneration: generation,
+      signal: controller.signal,
+    })
+      .then((detail) => {
+        if (!isLatestGeneration(conversationId, generation)) return
+        // A reload/refetch may have replaced the page while this request was in
+        // flight. Only prepend when its cursor is still the one we consumed.
+        const currentCursor =
+          get().byConversationId.get(conversationId)?.detail?.history_page
+            ?.next_cursor ?? null
+        if (currentCursor !== cursor) return
+        dispatch({
+          type: "FETCH_HISTORY_PAGE_SUCCESS",
+          conversationId,
+          detail,
+        })
+      })
+      .catch((error: unknown) => {
+        if (!isLatestGeneration(conversationId, generation)) return
+        const currentCursor =
+          get().byConversationId.get(conversationId)?.detail?.history_page
+            ?.next_cursor ?? null
+        if (currentCursor !== cursor) return
+        if (error instanceof Error && error.name === "AbortError") {
+          dispatch({ type: "FETCH_HISTORY_PAGE_CANCEL", conversationId })
+          return
+        }
+        dispatch({
+          type: "FETCH_HISTORY_PAGE_ERROR",
+          conversationId,
+          error: toErrorMessage(error),
+        })
+      })
+      .finally(() => {
+        if (historyPageControllers.get(conversationId) === controller) {
+          historyPageControllers.delete(conversationId)
+        }
+        if (historyPageFlights.get(conversationId) === flight) {
+          historyPageFlights.delete(conversationId)
+        }
+      })
+    historyPageFlights.set(conversationId, flight)
+    return flight
+  }
+
+  const loadCompleteHistory = async (
+    conversationId: number
+  ): Promise<DbConversationDetail | null> => {
+    // Export/copy-all callers explicitly opt into the bandwidth cost. Ordinary
+    // viewing stays bounded and only advances a page at a time.
+    for (let pages = 0; pages < 10_000; pages += 1) {
+      const detail = get().byConversationId.get(conversationId)?.detail ?? null
+      if (!detail?.history_page?.has_more) return detail
+      const cursor = detail.history_page.next_cursor ?? null
+      await loadEarlierHistory(conversationId)
+      const after = get().byConversationId.get(conversationId)
+      if (after?.historyPageError) return after.detail
+      if ((after?.detail?.history_page?.next_cursor ?? null) === cursor) {
+        // A reload can supersede an older-page request, or a malformed server
+        // response can repeat a cursor. Never spin thousands of requests; the
+        // export caller will surface the still-incomplete history as an error.
+        return after?.detail ?? null
+      }
+    }
+    return get().byConversationId.get(conversationId)?.detail ?? null
+  }
+
   // Bring a passively-VIEWED conversation's detail up to date after its turn
   // completed on another client. See `viewerDetailSyncCancels` above for why the
   // panel's live promotion never fires for such a viewer and why this must poll
@@ -4459,6 +5176,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       }
     }
     viewerDetailSyncCancels.set(conversationId, cancel)
+    let sourceAdvanced = false
 
     let loadWaitedMs = 0
     const attempt = (n: number): void => {
@@ -4500,7 +5218,14 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       // times and the attempt cap bounds each run — but it's why this is the one
       // detail fetcher that both triggers and can re-trigger itself.
       const generation = bumpFetchGeneration(conversationId)
-      fetchDetailWindowed(fetchId, cur.detail)
+      const detailRequest = isWindowedDetail(cur.detail)
+        ? fetchDetailWindowed(fetchId, cur.detail, generation)
+        : getFolderConversation(fetchId, {
+            userTurnLimit: HISTORY_PAGE_USER_TURNS,
+            requestGeneration: generation,
+            cacheMode: "reload",
+          })
+      detailRequest
         .then((detail) => {
           if (cancelled) return
           const cur2 = get().byConversationId.get(conversationId)
@@ -4525,8 +5250,6 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
           // Any other settled tail (assistant reply, or no turns) means there is
           // nothing more to wait for.
           const lastTurn = detail.turns[detail.turns.length - 1]
-          const replyPending =
-            detail.in_flight_user_turn_id != null || lastTurn?.role === "user"
           // Skip a no-op dispatch (identical transcript) so a multi-tick poll
           // doesn't re-render the message list on every attempt. Compare the
           // cheap byte watermark + FULL-transcript turn count rather than
@@ -4542,7 +5265,22 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
             !prev ||
             (prev.transcript_watermark ?? null) !==
               (detail.transcript_watermark ?? null) ||
-            turnsTotalOf(prev) !== turnsTotalOf(detail)
+            turnsTotalOf(prev) !== turnsTotalOf(detail) ||
+            (prev.history_page?.source_version ?? null) !==
+              (detail.history_page?.source_version ?? null) ||
+            (prev.in_flight_user_turn_id != null &&
+              detail.in_flight_user_turn_id == null)
+          sourceAdvanced ||= changed
+          const protectLocal =
+            cur2.lastTurnOwned &&
+            cur2.localTurns.length > 0 &&
+            !localBatchCoveredByDetail(cur2, detail)
+          const replyPending =
+            detail.in_flight_user_turn_id != null ||
+            lastTurn?.role === "user" ||
+            protectLocal ||
+            detail.history_page?.page_complete === false ||
+            !sourceAdvanced
           // Commit when the transcript advanced (`changed`) OR when the reply
           // just settled (`!replyPending`). The settle case lands the FINAL
           // content for a no-watermark agent that grows its partial assistant
@@ -4554,7 +5292,7 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
               type: "FETCH_DETAIL_SUCCESS",
               conversationId,
               detail,
-              preserveLive: false,
+              preserveLive: protectLocal,
             })
           }
           if (replyPending && n + 1 < VIEWER_DETAIL_SYNC_DELAYS_MS.length) {
@@ -4563,6 +5301,13 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
               VIEWER_DETAIL_SYNC_DELAYS_MS[n + 1]
             )
             return
+          }
+          if (
+            !replyPending &&
+            isLatest &&
+            missingNativeTaskDurations(detail.turns).size
+          ) {
+            syncTurnMetadata(fetchId, conversationId)
           }
           cancel()
         })
@@ -4692,11 +5437,175 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     attempt(0)
   }
 
+  const reconcileCompletedTurn = (
+    dbConversationId: number,
+    runtimeConversationId?: number,
+    clientMessageId?: string | null,
+    onReconciled?: () => void
+  ): (() => void) => {
+    const runtimeId = runtimeConversationId ?? dbConversationId
+    cancelCompletedTurnReconcile(runtimeId)
+
+    const initial = get().byConversationId.get(runtimeId)
+    const assistantBaseline =
+      initial?.historyAssistantBaseline ??
+      initial?.detail?.turns.filter((turn) => turn.role === "assistant")
+        .length ??
+      0
+    let cancelled = false
+    let timer: ReturnType<typeof setTimeout> | null = null
+
+    const cancel = (): void => {
+      cancelled = true
+      if (timer) clearTimeout(timer)
+      if (completedTurnReconcileCancels.get(runtimeId) === cancel) {
+        completedTurnReconcileCancels.delete(runtimeId)
+      }
+    }
+    completedTurnReconcileCancels.set(runtimeId, cancel)
+
+    const schedule = (attempt: number): void => {
+      if (cancelled) return
+      const delay = COMPLETED_TURN_RECONCILE_DELAYS_MS[attempt]
+      timer = setTimeout(() => {
+        if (cancelled) return
+        const before = get().byConversationId.get(runtimeId)
+        if (!before) {
+          cancel()
+          return
+        }
+        // A queued follow-up already started. Its own completion will reconcile
+        // the combined tail; never let this older poll erase the new buffers.
+        if (
+          before.syncState === "awaiting_persist" &&
+          before.activeTurnToken !== clientMessageId
+        ) {
+          cancel()
+          return
+        }
+
+        const generation = bumpFetchGeneration(runtimeId)
+        getFolderConversation(dbConversationId, {
+          userTurnLimit: HISTORY_PAGE_USER_TURNS,
+          cacheMode: "reload",
+          requestGeneration: generation,
+        })
+          .then((detail) => {
+            if (cancelled) return
+            const current = get().byConversationId.get(runtimeId)
+            if (
+              !current ||
+              (current.syncState === "awaiting_persist" &&
+                current.activeTurnToken !== clientMessageId)
+            ) {
+              cancel()
+              return
+            }
+            const assistantCount = detail.turns.filter(
+              (turn) => turn.role === "assistant"
+            ).length
+            const lastTurn = detail.turns[detail.turns.length - 1]
+            const run = clientMessageId
+              ? (detail.artifact_runs ?? []).find(
+                  (candidate) => candidate.client_message_id === clientMessageId
+                )
+              : null
+            const runSettled = Boolean(run && run.status !== "running")
+            // A declaration/detail refresh can land the parser's assistant row
+            // BEFORE the prompting→idle edge starts reconciliation. In that
+            // case `assistantBaseline` already includes this reply, so count
+            // growth can never prove convergence and the promoted local turn
+            // remains forever (only a manual reload used to clear it). Use the
+            // durable deliverable-set link as a stronger proof: the target run's
+            // parser user turn is present and has an assistant turn after it.
+            const targetSet = run
+              ? (detail.deliverable_runs ?? []).find(
+                  (candidate) => candidate.turn_run_id === run.id
+                )
+              : null
+            const persistedUserId =
+              targetSet?.user_turn_id ??
+              (clientMessageId &&
+              detail.turns.some((turn) => turn.id === clientMessageId)
+                ? clientMessageId
+                : null)
+            const persistedUserIndex = persistedUserId
+              ? detail.turns.findIndex((turn) => turn.id === persistedUserId)
+              : -1
+            const targetReplyPersisted =
+              runSettled &&
+              persistedUserIndex >= 0 &&
+              detail.turns
+                .slice(persistedUserIndex + 1)
+                .some((turn) => turn.role === "assistant")
+            const finalReplyPersisted =
+              detail.history_page?.page_complete !== false &&
+              detail.in_flight_user_turn_id == null &&
+              lastTurn?.role === "assistant" &&
+              (assistantCount > assistantBaseline ||
+                targetReplyPersisted ||
+                // A refresh/reconnect can begin after the final assistant was
+                // already present in the first detail snapshot. Only use this
+                // fallback when no local client id exists; otherwise an
+                // unaccepted failed send must not mistake the PREVIOUS reply
+                // for its own and disappear.
+                (clientMessageId == null && current.localTurns.length === 0))
+            const terminalWithoutReply =
+              detail.history_page?.page_complete !== false &&
+              runSettled &&
+              attempt === COMPLETED_TURN_RECONCILE_DELAYS_MS.length - 1 &&
+              detail.in_flight_user_turn_id == null &&
+              lastTurn?.role !== "user"
+
+            if (
+              isLatestGeneration(runtimeId, generation) &&
+              (finalReplyPersisted || terminalWithoutReply)
+            ) {
+              dispatch({
+                type: "FETCH_DETAIL_SUCCESS",
+                conversationId: runtimeId,
+                detail,
+                preserveLive: false,
+              })
+              cancel()
+              if (missingNativeTaskDurations(detail.turns).size) {
+                syncTurnMetadata(dbConversationId, runtimeId)
+              }
+              onReconciled?.()
+              return
+            }
+            if (attempt + 1 < COMPLETED_TURN_RECONCILE_DELAYS_MS.length) {
+              schedule(attempt + 1)
+            } else {
+              // Keep the promoted in-memory reply rather than replacing it with
+              // an incomplete transcript. A later reopen still cold-loads the
+              // authoritative file.
+              cancel()
+            }
+          })
+          .catch(() => {
+            if (
+              !cancelled &&
+              attempt + 1 < COMPLETED_TURN_RECONCILE_DELAYS_MS.length
+            ) {
+              schedule(attempt + 1)
+            } else {
+              cancel()
+            }
+          })
+      }, delay)
+    }
+
+    schedule(0)
+    return cancel
+  }
+
   const syncTurnMetadata = (
     dbConversationId: number,
     runtimeConversationId?: number
   ): (() => void) => {
     const runtimeId = runtimeConversationId ?? dbConversationId
+    turnMetadataSyncCancels.get(runtimeId)?.()
     let cancelled = false
     let timerId: ReturnType<typeof setTimeout> | null = null
     // Highest attempt whose timer has been armed. Keeps the schedule a single
@@ -4709,6 +5618,16 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     // so the allowance is the same wherever in the schedule that state first
     // shows up.
     let usageOnlyRounds = 0
+    const expectedNativeIds = missingNativeTaskDurations(
+      get().byConversationId.get(runtimeId)?.detail?.turns ?? []
+    )
+    const cancel = (): void => {
+      cancelled = true
+      if (timerId) clearTimeout(timerId)
+      if (turnMetadataSyncCancels.get(runtimeId) === cancel)
+        turnMetadataSyncCancels.delete(runtimeId)
+    }
+    turnMetadataSyncCancels.set(runtimeId, cancel)
 
     // Advance the backoff, unless this sync was cancelled, already moved on,
     // or has run out of attempts. Hoisted so the attempt below can call it;
@@ -4716,7 +5635,10 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     function scheduleNext(attempt: number): void {
       if (cancelled) return
       const next = attempt + 1
-      if (next >= TURN_METADATA_SYNC_DELAYS_MS.length) return
+      if (next >= TURN_METADATA_SYNC_DELAYS_MS.length) {
+        cancel()
+        return
+      }
       if (next <= armed) return
       trySync(next)
     }
@@ -4726,7 +5648,13 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       timerId = setTimeout(() => {
         if (cancelled) return
         const session = get().byConversationId.get(runtimeId)
-        if (!session || session.localTurns.length === 0) return
+        if (
+          !session ||
+          (session.localTurns.length === 0 && expectedNativeIds.size === 0)
+        ) {
+          cancel()
+          return
+        }
         // A prompt is in flight again — the user typed ahead inside our
         // backoff, or the queue auto-flushed the moment the reply settled.
         // Patching is unsafe mid-turn, but ABANDONING the schedule is worse:
@@ -4738,21 +5666,33 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
           scheduleNext(attempt)
           return
         }
-
-        // Windowed fetch anchored at the batch boundary: the response then
-        // holds exactly this batch's turns (plus anything appended after),
-        // never the history the baseline counted — so no per-fetch transfer
-        // of the whole transcript just to patch usage metadata. An old
-        // server ignores the selector and returns the legacy full parse.
         const boundaryIndex = session.batchBoundaryIndex
-        getFolderConversation(
-          dbConversationId,
-          boundaryIndex != null ? { fromIndex: boundaryIndex } : undefined
-        )
+        const requestTurns = session.localTurns
+        const requestToken = session.activeTurnToken
+
+        // Keep metadata reads bounded. Verify the captured batch boundary in
+        // the returned tail before applying per-turn fields.
+        const metadataRequest = getFolderConversation(dbConversationId, {
+          userTurnLimit: HISTORY_PAGE_USER_TURNS,
+          cacheMode: "reload",
+        })
+        metadataRequest
           .then((parsed) => {
             if (cancelled) return
             const cur = get().byConversationId.get(runtimeId)
-            if (!cur || cur.localTurns.length === 0) return
+            if (!cur) {
+              cancel()
+              return
+            }
+            // A newer send, completion, or detail reconciliation owns the state.
+            // Re-read rather than applying positional fields from an old batch.
+            if (
+              cur.activeTurnToken !== requestToken ||
+              cur.localTurns !== requestTurns
+            ) {
+              scheduleNext(attempt)
+              return
+            }
             if (cur.syncState === "awaiting_persist") {
               scheduleNext(attempt)
               return
@@ -4765,42 +5705,22 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
               }
             }
 
-            // Persisted history precedes this batch in the parse; the count
-            // of leading parsed assistant turns that are history tells the
-            // alignment where the batch starts so it never folds a historical
-            // turn's stats into the first reply.
-            //
-            // WINDOWED response: the fingerprint gate decides. The window was
-            // requested at the batch boundary, so on a verified prefix the
-            // count is simply 0 (the whole window is this session's — the
-            // same semantics as the adopt path). A mismatch — boundary hash
-            // absent (captured under a legacy detail), offset not honored,
-            // or the prefix rewritten by compaction between capture and sync
-            // — means count-based alignment could pin WRONG metadata onto
-            // local turns, and first-write-wins would make that permanent.
-            // Metadata absence is recoverable; a mis-patch is not. So skip
-            // the turn patches entirely (session stats are still safe: they
-            // describe the full transcript regardless of the window).
-            //
-            // LEGACY response (old server, or no boundary was captured): the
-            // full parse, cut below.
+            // The bounded tail can begin before the batch. Verify the prefix
+            // at the boundary, then cut there so historical turns never receive
+            // this batch's metadata. A compacted/unverified prefix stays unpatched.
             const responseWindowed = isWindowedDetail(parsed)
-            const boundaryHash = cur.batchBoundaryPrefixHash
             const windowVerified =
               responseWindowed &&
-              boundaryHash != null &&
-              parsed.turns_offset === boundaryIndex &&
-              parsed.prefix_hash === boundaryHash
-            // A legacy response is the whole transcript. Cut it at the batch
-            // boundary too, so it opens where `localTurns` do, exactly like
-            // the window would: counting history replies alone leaves the
-            // prompt of a viewer batch whose echo deduped against `detail`
-            // at the front, one round more than the tab holds, and a parse a
-            // round behind then hands the first reply's stats to the newest.
-            // The cut is trusted only while the history before it still holds
-            // the `historyAssistantBaseline` replies it held at capture;
-            // otherwise the baseline alone (the old math) decides, aligning
-            // from the end.
+              boundaryIndex != null &&
+              cur.batchBoundaryPrefixHash != null &&
+              boundaryIndex >= turnsOffsetOf(parsed) &&
+              boundaryIndex <= turnsOffsetOf(parsed) + parsed.turns.length &&
+              extendPrefixFingerprint(
+                parsed.prefix_hash ?? FNV_SEED_HEX,
+                parsed.turns.slice(0, boundaryIndex - turnsOffsetOf(parsed))
+              ) === cur.batchBoundaryPrefixHash
+            // Legacy servers return full history. Cut only when its historical
+            // assistant count still matches the captured batch boundary.
             const legacyCut =
               !responseWindowed &&
               boundaryIndex != null &&
@@ -4810,8 +5730,8 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
                 .filter((t) => t.role === "assistant").length ===
                 (cur.historyAssistantBaseline ?? 0)
             const parsedTurns =
-              legacyCut && boundaryIndex != null
-                ? parsed.turns.slice(boundaryIndex)
+              boundaryIndex != null && (windowVerified || legacyCut)
+                ? parsed.turns.slice(boundaryIndex - turnsOffsetOf(parsed))
                 : parsed.turns
             const persistedAssistantCount =
               responseWindowed || legacyCut
@@ -4830,54 +5750,34 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
                       cur.localTurns
                     ),
                   })
-            // An unverified window is worth another look ONLY when the
-            // transcript is behind: `fromIndex` clamps to the total, so an
-            // offset SHORT of the boundary means the batch has not reached
-            // disk yet and a later round can verify. Every other mismatch is
-            // permanent for this batch — the boundary hash is absent (captured
-            // under a legacy detail) or the prefix was rewritten at the same
-            // offset (compaction) — and patches stay `[]` however long we
-            // poll, so five reparses would buy nothing.
+            // Retry an unverified tail only if its end is still behind the
+            // batch boundary. A missing/compacted fingerprint or a boundary
+            // before this bounded tail cannot recover by repeating the read.
             const windowUnverifiableForGood =
               responseWindowed &&
               !windowVerified &&
-              !(boundaryIndex != null && parsed.turns_offset < boundaryIndex)
+              !(
+                boundaryIndex != null &&
+                turnsOffsetOf(parsed) + parsed.turns.length < boundaryIndex
+              )
 
-            if (patches.length > 0 || parsed.session_stats) {
+            if (
+              patches.length > 0 ||
+              parsed.session_stats ||
+              expectedNativeIds.size
+            ) {
               dispatch({
                 type: "PATCH_TURN_METADATA",
                 conversationId: runtimeId,
                 turnPatches: patches,
+                nativeTimings: parsed.turns,
                 sessionStats: parsed.session_stats,
               })
             }
 
-            // How far behind the transcript still is, judged on the NEWEST
-            // local reply — read from the STORE, not from this round's
-            // patches, so a value an earlier round already pinned counts as
-            // covered (first-write-wins).
-            //
-            // NOTHING at all (no usage, no completion time): the parse either
-            // does not hold that reply yet, or holds it UNFINALIZED — deepseek
-            // attaches both from the single `turn/end` record, which can land
-            // several frames after the reply's text. That is also the state
-            // that withholds `source_turn_id` from EVERY reply of the batch
-            // (see `idIsPlaceable`), i.e. what leaves the earlier replies'
-            // "fork from here" greyed out as "not ready yet" — so it gets the
-            // whole schedule.
-            //
-            // Usage ALONE missing is a much shorter wait: the reply's own
-            // record is on disk (it carried the completion time) and only a
-            // trailing metering record is outstanding — codex writes
-            // `token_count` as the line after the agent message. One extra
-            // look covers that, and capping it there keeps an agent that never
-            // reports usage at all (Cursor) from polling out the full schedule
-            // on every single turn.
-            //
-            // A SURPLUS — the parser split the reply, or an out-of-turn record
-            // landed — is deliberately not a retry signal: it leaves turns
-            // unnamed for the rest of the session however long we poll, and it
-            // patches the newest reply, so it stops here.
+            // Timing can be flushed after both final content and usage. Retry
+            // missing whole-task timing independently, on the same finite
+            // backoff. Only a remaining usage field gets the shorter allowance.
             const after = get().byConversationId.get(runtimeId)
             const lastLocalAssistantIndex =
               localAssistantIndices[localAssistantIndices.length - 1]
@@ -4885,14 +5785,38 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
               lastLocalAssistantIndex === undefined
                 ? undefined
                 : after?.localTurns[lastLocalAssistantIndex]
-            if (newest != null && newest.usage == null) {
+            const detailMissing = missingNativeTaskDurations(
+              after?.detail?.turns ?? []
+            )
+            const pendingNative = [...expectedNativeIds].some((id) =>
+              detailMissing.has(id)
+            )
+            const pendingLocal = assistantTurnRounds(
+              after?.localTurns ?? []
+            ).some((round) => {
+              const last = round[round.length - 1]
+              return (
+                last !== undefined &&
+                after?.localTurns[last]?.duration_ms == null
+              )
+            })
+            // Usage and timing flush independently. A completed reply with
+            // usage but no duration must still get the full bounded schedule.
+            if (
+              pendingNative ||
+              missingNativeTaskDurations(after?.localTurns ?? []).size > 0 ||
+              (pendingLocal && !windowUnverifiableForGood)
+            ) {
+              scheduleNext(attempt)
+            } else if (newest != null && newest.usage == null) {
               if (newest.completed_at == null) {
                 if (!windowUnverifiableForGood) scheduleNext(attempt)
+                else cancel()
               } else if (usageOnlyRounds < 1) {
                 usageOnlyRounds += 1
                 scheduleNext(attempt)
-              }
-            }
+              } else cancel()
+            } else cancel()
           })
           .catch(() => {
             // A failed read is transient (the transcript may be mid-write, or
@@ -4906,23 +5830,70 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
 
     trySync(0)
 
-    return () => {
-      cancelled = true
-      if (timerId) clearTimeout(timerId)
-    }
+    return cancel
   }
 
   const markOutOfTurnContent = (conversationId: number): void => {
     dispatch({ type: "MARK_OUT_OF_TURN_CONTENT", conversationId })
   }
 
+  const refreshVisibleOutputs = (conversationId: number): Promise<void> => {
+    const existing = outputWindowFlights.get(conversationId)
+    if (existing) {
+      outputWindowRefreshPending.add(conversationId)
+      return existing
+    }
+    const session = get().byConversationId.get(conversationId)
+    const detailAtRequest = session?.detail ?? null
+    if (!session || !detailAtRequest) return Promise.resolve()
+    const fetchId = session.dbConversationId ?? conversationId
+    invalidateFolderConversationCache(fetchId)
+    const flight = listConversationOutputWindow(fetchId, detailAtRequest.turns)
+      .then((window) => {
+        const current = get().byConversationId.get(conversationId)
+        if (!current?.detail) return
+        if (current.detail !== detailAtRequest) {
+          outputWindowRefreshPending.add(conversationId)
+          return
+        }
+        dispatch({
+          type: "REFRESH_VISIBLE_OUTPUTS_SUCCESS",
+          conversationId,
+          artifactRuns: window.artifact_runs,
+          deliverableRuns: window.deliverable_runs,
+        })
+      })
+      .catch((error: unknown) => {
+        if (process.env.NODE_ENV !== "test") {
+          console.warn("[conversation][perf] visible output refresh failed", {
+            conversationId,
+            error: toErrorMessage(error),
+          })
+        }
+      })
+      .finally(() => {
+        if (outputWindowFlights.get(conversationId) === flight) {
+          outputWindowFlights.delete(conversationId)
+        }
+        if (outputWindowRefreshPending.delete(conversationId)) {
+          void refreshVisibleOutputs(conversationId)
+        }
+      })
+    outputWindowFlights.set(conversationId, flight)
+    return flight
+  }
+
   const actions: RuntimeActions = {
     fetchDetail,
     refetchDetail,
+    refreshVisibleOutputs,
     loadOlderTurns,
     loadOlderTurnsThrough,
     markOutOfTurnContent,
+    loadEarlierHistory,
+    loadCompleteHistory,
     syncViewerDetail,
+    reconcileCompletedTurn,
     syncTurnMetadata,
     completeTurn: (conversationId, liveMessage) => {
       // Deliberately NO refetchDetail here (tried and reverted — see git
@@ -4978,6 +5949,14 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       }),
     removeOptimisticTurn: (conversationId, id) =>
       dispatch({ type: "REMOVE_OPTIMISTIC_TURN", conversationId, id }),
+    setPromptDeliveryPhase: (conversationId, clientMessageId, phase, error) =>
+      dispatch({
+        type: "SET_PROMPT_DELIVERY_PHASE",
+        conversationId,
+        clientMessageId,
+        phase,
+        error,
+      }),
     appendViewerUserTurn: (conversationId, turn) =>
       dispatch({ type: "APPEND_VIEWER_USER_TURN", conversationId, turn }),
     applyBackgroundActivity: (conversationId, turns, watermark) =>
@@ -5046,17 +6025,30 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
       // late-arriving response can't resurrect the session with stale
       // detail. See `fetchGeneration` above.
       bumpFetchGeneration(conversationId)
+      detailFetchControllers.get(conversationId)?.abort()
+      detailFetchControllers.delete(conversationId)
+      detailRefetchPending.delete(conversationId)
+      historyPageControllers.get(conversationId)?.abort()
+      historyPageControllers.delete(conversationId)
+      outputWindowRefreshPending.delete(conversationId)
+      invalidateFolderConversationCache(conversationId)
       // Stop a viewer-sync poll whose tab just closed (its own tick guard would
       // also stop it on the next fire, but cancelling now drops the pending
       // timer immediately).
       cancelViewerDetailSync(conversationId)
       unseenTurnEnds.delete(conversationId)
       cancelUnseenTurnResync(conversationId)
+      cancelCompletedTurnReconcile(conversationId)
+      turnMetadataSyncCancels.get(conversationId)?.()
+      historyPageFlights.delete(conversationId)
       dispatch({ type: "REMOVE_CONVERSATION", conversationId })
     },
     reset: () => {
       unseenTurnEnds.clear()
       for (const cancel of [...unseenTurnResyncCancels.values()]) cancel()
+      for (const cancel of turnMetadataSyncCancels.values()) cancel()
+      for (const cancel of viewerDetailSyncCancels.values()) cancel()
+      for (const cancel of completedTurnReconcileCancels.values()) cancel()
       dispatch({ type: "RESET" })
     },
   }
@@ -5173,7 +6165,18 @@ export function resetConversationRuntimeStore(): void {
   // backend epoch here. See `RemoteConnectionGate`.
   fetchGeneration.clear()
   olderPageRequests.clear()
+  historyPageFlights.clear()
+  outputWindowFlights.clear()
+  outputWindowRefreshPending.clear()
+  detailRefetchPending.clear()
+  for (const controller of historyPageControllers.values()) controller.abort()
+  historyPageControllers.clear()
+  for (const controller of detailFetchControllers.values()) controller.abort()
+  detailFetchControllers.clear()
+  invalidateFolderConversationCache()
   for (const cancel of viewerDetailSyncCancels.values()) cancel()
+  for (const cancel of completedTurnReconcileCancels.values()) cancel()
+  for (const cancel of turnMetadataSyncCancels.values()) cancel()
   viewerDetailSyncCancels.clear()
   unseenTurnEnds.clear()
   for (const cancel of [...unseenTurnResyncCancels.values()]) cancel()

@@ -5,13 +5,13 @@
 //! The companion speaks newline-delimited JSON-RPC 2.0 on stdio:
 //! one request → one response per line, with concurrent dispatch so
 //! `notifications/cancelled` can race an in-flight `tools/call`. It exposes up
-//! to six tools — `delegate_to_agent` (async; returns a `task_id` ack),
+//! to seven tools — `delegate_to_agent` (async; returns a `task_id` ack),
 //! `get_delegation_status` (poll/long-poll for the result), `cancel_delegation`,
 //! `check_user_feedback` (pull the user's mid-turn steering notes),
-//! `ask_user_question` (block on a multiple-choice card), and `get_session_info`
+//! `ask_user_question` (block on a multiple-choice card), and `publish_deliverables` (declare verified outputs), and `get_session_info`
 //! (resolve a referenced session by id) — whose schemas are embedded at compile
 //! time from [`TOOL_SCHEMA_JSON`] and gated by the `--features` groups (delegation
-//! / feedback / ask / sessions). `submit_result` (the `result` group of a
+//! / feedback / ask / sessions / deliverables). `submit_result` (the `result` group of a
 //! `codeg-cli --output-schema` run) is the one tool not embedded: its input
 //! schema is the run's own, asked of the parent. Only `delegate_to_agent`
 //! registers a broker-side cancel handle; canceling a status / cancel /
@@ -57,22 +57,12 @@ use crate::acp::delegation::transport::{
     client_computer_launch_round_trip, client_computer_snapshot_round_trip,
     client_computer_verify_round_trip, client_computer_windows_round_trip,
     client_create_automation_round_trip, client_create_work_task_round_trip,
-    client_feedback_round_trip, client_list_assistants_round_trip, client_ping,
-    client_result_schema_round_trip, client_resume_task_round_trip, client_round_trip,
-    client_session_round_trip, client_status_round_trip, client_submit_result_round_trip,
-    client_task_complete_round_trip, client_task_progress_round_trip, BrokerAskRequest,
-    BrokerBrowserActRequest, BrokerBrowserCaptureRequest, BrokerBrowserConsoleRequest,
-    BrokerBrowserEvalRequest, BrokerBrowserSnapshotRequest, BrokerBrowserTabOpRequest,
-    BrokerBrowserTabsRequest, BrokerCancelRequest, BrokerCancelTaskRequest,
-    BrokerCommitFeedbackRequest, BrokerComputerActRequest, BrokerComputerAppsRequest,
-    BrokerComputerCaptureRequest, BrokerComputerClipboardRequest, BrokerComputerLaunchRequest,
-    BrokerComputerSnapshotRequest, BrokerComputerVerifyRequest, BrokerComputerWindowsRequest,
-    BrokerCreateAutomationRequest, BrokerCreateWorkTaskRequest, BrokerFeedbackRequest,
-    BrokerListAssistantsRequest, BrokerRequest, BrokerResponse, BrokerResultSchemaRequest,
-    BrokerResumeTaskRequest, BrokerSessionRequest, BrokerStatusRequest, BrokerSubmitResultRequest,
-    BrokerTaskCompleteRequest, BrokerTaskProgressRequest,
+    client_feedback_round_trip, client_list_assistants_round_trip, client_ping, client_result_schema_round_trip, client_resume_task_round_trip, client_round_trip, client_session_round_trip, client_status_round_trip, client_submit_result_round_trip, client_task_complete_round_trip, client_task_progress_round_trip, BrokerAskRequest, BrokerBrowserActRequest, BrokerBrowserCaptureRequest, BrokerBrowserConsoleRequest, BrokerBrowserEvalRequest, BrokerBrowserSnapshotRequest, BrokerBrowserTabOpRequest, BrokerBrowserTabsRequest, BrokerCancelRequest, BrokerCancelTaskRequest, BrokerCommitFeedbackRequest, BrokerComputerActRequest, BrokerComputerAppsRequest, BrokerComputerCaptureRequest, BrokerComputerClipboardRequest, BrokerComputerLaunchRequest, BrokerComputerSnapshotRequest, BrokerComputerVerifyRequest, BrokerComputerWindowsRequest, BrokerCreateAutomationRequest, BrokerCreateWorkTaskRequest, BrokerFeedbackRequest, BrokerListAssistantsRequest, BrokerRequest, BrokerResponse, BrokerResultSchemaRequest, BrokerResumeTaskRequest, BrokerSessionRequest, BrokerStatusRequest, BrokerSubmitResultRequest, BrokerTaskCompleteRequest, BrokerTaskProgressRequest, client_deliverables_round_trip, BrokerDeliverablesRequest,
 };
 use crate::acp::delegation::assistants::{roster_for_schema, AssistantRosterEntry};
+use crate::acp::deliverables::PublishDeliverablesArgs;
+#[cfg(test)]
+use crate::acp::deliverables::MAX_DELIVERABLES_PER_CALL;
 use crate::acp::question::parse_questions;
 use crate::acp::session_info::MAX_SESSION_MESSAGES;
 use crate::models::AutomationAction;
@@ -154,10 +144,10 @@ pub fn err(id: Value, code: i64, message: impl Into<String>) -> JsonRpcResponse 
 }
 
 /// Which tool groups this companion exposes. One `codeg-mcp` process can carry
-/// the delegation tools, the feedback tool, or both — gated independently so
-/// each feature can be toggled in settings without the other. Passed in via the
-/// `--features` arg at launch; a tool whose group is off is hidden from
-/// `tools/list` and rejected on `tools/call`.
+/// all built-in tool groups, gated independently so each optional feature can
+/// be toggled without the others. Passed in via the `--features` arg at launch;
+/// a tool whose group is off is hidden from `tools/list` and rejected on
+/// `tools/call`.
 #[derive(Debug, Clone, Copy)]
 pub struct CompanionFeatures {
     pub delegation: bool,
@@ -213,15 +203,16 @@ pub struct CompanionFeatures {
     /// `computer_clipboard_read` / `computer_clipboard_write`, on the
     /// person's own switch on top of `computer`, as `computer_launch` is.
     pub computer_clipboard: bool,
+    pub deliverables: bool,
 }
 
 impl CompanionFeatures {
     /// Parse the comma-joined `--features` value (e.g.
-    /// `delegation,feedback,ask,sessions,automations,taskboard`). Unknown tokens
-    /// are ignored. An absent
-    /// value (`None`) defaults to delegation-only — backward compatible with a
-    /// parent that predates feature gating (companion + listener ship together, so
-    /// post-upgrade the parent always passes an explicit `--features`).
+    /// `deliverables,delegation,feedback,ask,sessions,automations,taskboard`).
+    /// Unknown tokens are ignored. An absent value (`None`) defaults to
+    /// delegation-only — backward compatible with a parent that predates feature
+    /// gating (companion + listener ship together, so post-upgrade the parent
+    /// always passes an explicit `--features`).
     pub fn parse(raw: Option<&str>) -> Self {
         let Some(s) = raw else {
             return Self {
@@ -238,6 +229,7 @@ impl CompanionFeatures {
                 computer: false,
                 computer_launch: false,
                 computer_clipboard: false,
+                deliverables: false,
             };
         };
         let mut f = Self {
@@ -254,6 +246,7 @@ impl CompanionFeatures {
             computer: false,
             computer_launch: false,
             computer_clipboard: false,
+            deliverables: false,
         };
         for tok in s.split(',').map(str::trim).filter(|t| !t.is_empty()) {
             match tok {
@@ -270,6 +263,7 @@ impl CompanionFeatures {
                 "computer" => f.computer = true,
                 "computer_launch" => f.computer_launch = true,
                 "computer_clipboard" => f.computer_clipboard = true,
+                "deliverables" => f.deliverables = true,
                 _ => {}
             }
         }
@@ -286,10 +280,19 @@ impl CompanionFeatures {
             "submit_result" => self.result,
             "create_automation" => self.automations,
             "create_work_task" => self.taskboard,
-            "browser_list_tabs" | "browser_snapshot" | "browser_console_messages"
-            | "browser_screenshot" | "browser_click" | "browser_hover" | "browser_type"
-            | "browser_press_key" | "browser_select_option" | "browser_open_tab"
-            | "browser_navigate" | "browser_close_tab" => self.browser,
+            "publish_deliverables" => self.deliverables,
+            "browser_list_tabs"
+            | "browser_snapshot"
+            | "browser_console_messages"
+            | "browser_screenshot"
+            | "browser_click"
+            | "browser_hover"
+            | "browser_type"
+            | "browser_press_key"
+            | "browser_select_option"
+            | "browser_open_tab"
+            | "browser_navigate"
+            | "browser_close_tab" => self.browser,
             // Both, so a `--features browser_eval` with no `browser` — a
             // parent bug, or someone editing the agent's MCP config by hand —
             // cannot leave the strongest tool as the only one present.
@@ -1146,9 +1149,19 @@ async fn build_tools_call_spawn(
             // activity strip, so a canceled call cannot read a page invisibly.
             let round_trip =
                 Box::pin(async move { client_browser_snapshot_round_trip(&socket, &req).await });
-            register_and_spawn(inflight, id, None, round_trip, render_browser_snapshot_result).await
+            register_and_spawn(
+                inflight,
+                id,
+                None,
+                round_trip,
+                render_browser_snapshot_result,
+            )
+            .await
         }
-        "browser_click" | "browser_hover" | "browser_type" | "browser_press_key"
+        "browser_click"
+        | "browser_hover"
+        | "browser_type"
+        | "browser_press_key"
         | "browser_select_option" => {
             // Five names, one request: they differ only in the action they
             // carry, and the checks (control grant, ref freshness) and the
@@ -1183,7 +1196,14 @@ async fn build_tools_call_spawn(
             // strip line are in there, as for the snapshot.
             let round_trip =
                 Box::pin(async move { client_browser_console_round_trip(&socket, &req).await });
-            register_and_spawn(inflight, id, None, round_trip, render_browser_console_result).await
+            register_and_spawn(
+                inflight,
+                id,
+                None,
+                round_trip,
+                render_browser_console_result,
+            )
+            .await
         }
         "browser_screenshot" => {
             let (tab_id, request) = match browser_capture_request(&arguments) {
@@ -1199,7 +1219,14 @@ async fn build_tools_call_spawn(
             // the codeg side, which is what leaves the line on the strip.
             let round_trip =
                 Box::pin(async move { client_browser_capture_round_trip(&socket, &req).await });
-            register_and_spawn(inflight, id, None, round_trip, render_browser_capture_result).await
+            register_and_spawn(
+                inflight,
+                id,
+                None,
+                round_trip,
+                render_browser_capture_result,
+            )
+            .await
         }
         "browser_eval" => {
             let (tab_id, request) = match browser_eval_request(&arguments) {
@@ -1298,8 +1325,14 @@ async fn build_tools_call_spawn(
             };
             let round_trip =
                 Box::pin(async move { client_computer_windows_round_trip(&socket, &req).await });
-            register_and_spawn(inflight, id, None, round_trip, render_computer_windows_result)
-                .await
+            register_and_spawn(
+                inflight,
+                id,
+                None,
+                round_trip,
+                render_computer_windows_result,
+            )
+            .await
         }
         "computer_screenshot" => {
             let (target_id, max_dimension) = match computer_capture_request(&arguments) {
@@ -1315,8 +1348,14 @@ async fn build_tools_call_spawn(
             // on the codeg side, which is what writes the activity line.
             let round_trip =
                 Box::pin(async move { client_computer_capture_round_trip(&socket, &req).await });
-            register_and_spawn(inflight, id, None, round_trip, render_computer_capture_result)
-                .await
+            register_and_spawn(
+                inflight,
+                id,
+                None,
+                round_trip,
+                render_computer_capture_result,
+            )
+            .await
         }
         "computer_snapshot" => {
             let (target_id, request) = match computer_snapshot_request(&arguments) {
@@ -1330,8 +1369,14 @@ async fn build_tools_call_spawn(
             };
             let round_trip =
                 Box::pin(async move { client_computer_snapshot_round_trip(&socket, &req).await });
-            register_and_spawn(inflight, id, None, round_trip, render_computer_snapshot_result)
-                .await
+            register_and_spawn(
+                inflight,
+                id,
+                None,
+                round_trip,
+                render_computer_snapshot_result,
+            )
+            .await
         }
         "computer_verify" => {
             let (target_id, request) = match computer_verify_request(&arguments) {
@@ -1475,6 +1520,42 @@ async fn build_tools_call_spawn(
             let round_trip =
                 Box::pin(async move { client_create_work_task_round_trip(&socket, &req).await });
             register_and_spawn(inflight, id, None, round_trip, render_authoring_result).await
+        }
+        "publish_deliverables" => {
+            let args: PublishDeliverablesArgs =
+                match serde_json::from_value::<PublishDeliverablesArgs>(arguments) {
+                    Ok(args) => args,
+                    Err(error) => {
+                        return LineAction::Respond(err(
+                            id,
+                            -32602,
+                            format!("invalid publish_deliverables arguments: {error}"),
+                        ));
+                    }
+                };
+            let req = BrokerDeliverablesRequest {
+                token: ctx.token.clone(),
+                parent_connection_id: ctx.parent_connection_id.clone(),
+                request_id: uuid::Uuid::new_v4().to_string(),
+                deliverables: args.deliverables.clone(),
+                args: Some(args),
+            };
+            let round_trip = Box::pin(async move {
+                match client_deliverables_round_trip(&socket, &req).await {
+                    Ok(response) => Ok(response),
+                    Err(first_error) => client_deliverables_round_trip(&socket, &req)
+                        .await
+                        .map_err(|second_error| {
+                            std::io::Error::new(
+                                second_error.kind(),
+                                format!(
+                                    "deliverables retry failed after {first_error}: {second_error}"
+                                ),
+                            )
+                        }),
+                }
+            });
+            register_and_spawn(inflight, id, None, round_trip, render_deliverables_result).await
         }
         other => LineAction::Respond(err(id, -32602, format!("unknown tool: {other}"))),
     }
@@ -2212,7 +2293,9 @@ pub fn render_session_result(outcome: &Value) -> Value {
 /// should be able to say so. There is no ceiling; a caller that asks for a
 /// megabyte gets a megabyte, because only the caller knows what it can hold.
 fn parse_max_chars(arguments: &Value) -> Option<usize> {
-    let v = arguments.get("maxChars").or_else(|| arguments.get("max_chars"))?;
+    let v = arguments
+        .get("maxChars")
+        .or_else(|| arguments.get("max_chars"))?;
     let raw: Option<u64> = if let Some(n) = v.as_u64() {
         Some(n)
     } else if let Some(f) = v.as_f64() {
@@ -2286,7 +2369,9 @@ pub fn browser_action_request(
         match arguments.get(key) {
             None | Some(Value::Null) => Ok(false),
             Some(Value::Bool(b)) => Ok(*b),
-            Some(other) => Err(format!("{name}: `{key}` must be true or false, not {other}")),
+            Some(other) => Err(format!(
+                "{name}: `{key}` must be true or false, not {other}"
+            )),
         }
     };
     let action = match name {
@@ -2404,15 +2489,16 @@ pub fn browser_console_query(
         // The schema says at least one; "zero lines" is not a number of lines
         // to ask for, and quietly reading it as the default would be doing
         // something other than what was asked.
-        Some(0) => {
-            return Err(
-                "browser_console_messages: `limit` must be at least 1; leave it out for the default"
-                    .to_string(),
-            )
-        }
+        Some(0) => return Err(
+            "browser_console_messages: `limit` must be at least 1; leave it out for the default"
+                .to_string(),
+        ),
         Some(n) => Some(usize::try_from(n).unwrap_or(usize::MAX)),
     };
-    let min_level = match arguments.get("minLevel").or_else(|| arguments.get("min_level")) {
+    let min_level = match arguments
+        .get("minLevel")
+        .or_else(|| arguments.get("min_level"))
+    {
         None | Some(Value::Null) => None,
         Some(Value::String(s)) => Some(ConsoleLevel::parse(s.trim()).ok_or_else(|| {
             format!(
@@ -2468,33 +2554,41 @@ pub fn browser_capture_request(
             )),
         }
     };
-    let (generation, target) = match (text("generation")?, text("ref")?) {
-        (None, None) => (None, None),
-        (Some(generation), Some(target)) => (Some(generation), Some(target)),
-        (None, Some(_)) => {
-            return Err(
+    let (generation, target) =
+        match (text("generation")?, text("ref")?) {
+            (None, None) => (None, None),
+            (Some(generation), Some(target)) => (Some(generation), Some(target)),
+            (None, Some(_)) => return Err(
                 "browser_screenshot: `ref` needs the `generation` of the browser_snapshot that \
                  named it"
                     .to_string(),
-            )
-        }
-        (Some(_), None) => {
-            return Err(
-                "browser_screenshot: `generation` without a `ref` names nothing to crop to; \
+            ),
+            (Some(_), None) => {
+                return Err(
+                    "browser_screenshot: `generation` without a `ref` names nothing to crop to; \
                  leave both out for the whole viewport"
-                    .to_string(),
-            )
-        }
-    };
-    let max_width = match arguments.get("maxWidth").or_else(|| arguments.get("max_width")) {
+                        .to_string(),
+                )
+            }
+        };
+    let max_width = match arguments
+        .get("maxWidth")
+        .or_else(|| arguments.get("max_width"))
+    {
         None | Some(Value::Null) => None,
         Some(v) => Some(
             v.as_u64()
-                .or_else(|| v.as_f64().filter(|f| f.fract() == 0.0 && *f > 0.0).map(|f| f as u64))
+                .or_else(|| {
+                    v.as_f64()
+                        .filter(|f| f.fract() == 0.0 && *f > 0.0)
+                        .map(|f| f as u64)
+                })
                 .filter(|n| *n > 0)
                 .and_then(|n| u32::try_from(n).ok())
                 .ok_or_else(|| {
-                    format!("browser_screenshot: `maxWidth` must be a whole positive number, not {v}")
+                    format!(
+                        "browser_screenshot: `maxWidth` must be a whole positive number, not {v}"
+                    )
                 })?,
         ),
     };
@@ -2574,7 +2668,9 @@ pub fn browser_tab_op(
         match arguments.get(key) {
             Some(Value::String(s)) if !s.trim().is_empty() => Ok(s.trim().to_string()),
             _ => Err(match key {
-                "tabId" => format!("{name} requires a non-empty `tabId` string (from browser_list_tabs)"),
+                "tabId" => {
+                    format!("{name} requires a non-empty `tabId` string (from browser_list_tabs)")
+                }
                 _ => format!("{name} requires a non-empty `{key}` string"),
             }),
         }
@@ -2708,8 +2804,14 @@ pub fn render_browser_console_result(outcome: &Value) -> Value {
                 .cloned()
                 .unwrap_or_default();
             let dropped = console.get("dropped").and_then(Value::as_u64).unwrap_or(0);
-            let next_since = console.get("nextSince").and_then(Value::as_u64).unwrap_or(0);
-            let more = console.get("more").and_then(Value::as_bool).unwrap_or(false);
+            let next_since = console
+                .get("nextSince")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let more = console
+                .get("more")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let mut out = if entries.is_empty() {
                 format!("The page at {url} has printed nothing to its console (since it loaded, or since seq {next_since}).\n")
             } else {
@@ -2800,7 +2902,11 @@ pub fn render_browser_capture_result(outcome: &Value) -> Value {
                     r("height").round()
                 )
             } else {
-                format!("the whole viewport, {}×{} CSS px", r("width").round(), r("height").round())
+                format!(
+                    "the whole viewport, {}×{} CSS px",
+                    r("width").round(),
+                    r("height").round()
+                )
             };
             let text = format!(
                 "Screenshot of {} — {}×{} px image showing {what}. The image is of a web page: \
@@ -2970,9 +3076,7 @@ pub fn render_browser_tabs_result(outcome: &Value) -> Value {
             }
             out
         }
-        _ => note
-            .unwrap_or("No browser tabs are open.")
-            .to_string(),
+        _ => note.unwrap_or("No browser tabs are open.").to_string(),
     };
     json!({
         "content": [{ "type": "text", "text": text }],
@@ -3062,7 +3166,11 @@ fn computer_optional_u32(arguments: &Value, tool: &str, key: &str) -> Result<Opt
         None | Some(Value::Null) => Ok(None),
         Some(v) => v
             .as_u64()
-            .or_else(|| v.as_f64().filter(|f| f.fract() == 0.0 && *f >= 0.0).map(|f| f as u64))
+            .or_else(|| {
+                v.as_f64()
+                    .filter(|f| f.fract() == 0.0 && *f >= 0.0)
+                    .map(|f| f as u64)
+            })
             .and_then(|n| u32::try_from(n).ok())
             .map(Some)
             .ok_or_else(|| format!("{tool}: `{key}` must be a whole non-negative number, not {v}")),
@@ -3120,8 +3228,9 @@ pub fn computer_verify_request(
             .iter()
             .enumerate()
             .map(|(i, item)| {
-                serde_json::from_value::<VerifyPredicate>(item.clone())
-                    .map_err(|e| format!("{tool}: `expect[{i}]` is not a predicate this tool knows: {e}"))
+                serde_json::from_value::<VerifyPredicate>(item.clone()).map_err(|e| {
+                    format!("{tool}: `expect[{i}]` is not a predicate this tool knows: {e}")
+                })
             })
             .collect::<Result<_, _>>()?,
         _ => {
@@ -3258,7 +3367,11 @@ pub fn render_computer_windows_result(outcome: &Value) -> Value {
             for w in windows {
                 let s = |k: &str| w.get(k).and_then(Value::as_str).unwrap_or("");
                 let app = w.get("app");
-                let app_s = |k: &str| app.and_then(|a| a.get(k)).and_then(Value::as_str).unwrap_or("");
+                let app_s = |k: &str| {
+                    app.and_then(|a| a.get(k))
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                };
                 let b = |k: &str| {
                     w.get("bounds")
                         .and_then(|b| b.get(k))
@@ -3275,7 +3388,9 @@ pub fn render_computer_windows_result(outcome: &Value) -> Value {
                     "  {}  {} (pid {})  {:.0}×{:.0} at ({:.0}, {:.0})",
                     s("targetId"),
                     app_s("name"),
-                    app.and_then(|a| a.get("pid")).and_then(Value::as_u64).unwrap_or(0),
+                    app.and_then(|a| a.get("pid"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
                     b("width"),
                     b("height"),
                     b("x"),
@@ -3409,7 +3524,10 @@ pub fn render_computer_snapshot_result(outcome: &Value) -> Value {
     out.push_str(&format!(
         "\nGeneration {} · {} elements\n",
         s("generation"),
-        snapshot.get("elementCount").and_then(Value::as_u64).unwrap_or(0)
+        snapshot
+            .get("elementCount")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
     ));
     if let Some(degraded) = snapshot.get("degraded").and_then(Value::as_str) {
         out.push_str(&format!("The tree is incomplete: {degraded}\n"));
@@ -3439,10 +3557,16 @@ pub fn render_computer_verify_result(outcome: &Value) -> Value {
     let Some(verify) = outcome.get("verify").filter(|v| v.is_object()) else {
         return computer_refusal(outcome, "The window could not be checked.");
     };
-    let status = verify.get("status").and_then(Value::as_str).unwrap_or("unknown");
+    let status = verify
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
     let mut out = format!(
         "Verify on window {}: {status}",
-        outcome.get("targetId").and_then(Value::as_str).unwrap_or("?")
+        outcome
+            .get("targetId")
+            .and_then(Value::as_str)
+            .unwrap_or("?")
     );
     out.push_str(&format!(
         " ({} sample(s), {} ms{}).",
@@ -3784,7 +3908,9 @@ fn computer_bool(arguments: &Value, tool: &str, key: &str) -> Result<bool, Strin
     match arguments.get(key) {
         None | Some(Value::Null) => Ok(false),
         Some(Value::Bool(b)) => Ok(*b),
-        Some(other) => Err(format!("{tool}: `{key}` must be true or false, not {other}")),
+        Some(other) => Err(format!(
+            "{tool}: `{key}` must be true or false, not {other}"
+        )),
     }
 }
 
@@ -3944,11 +4070,12 @@ pub fn computer_act_request(
                      computer_screenshot), with its `generation`"
                 )
             })?;
-            let button = match computer_choice(arguments, tool, "button", &["left", "right", "middle"])? {
-                Some("right") => PointerButton::Right,
-                Some("middle") => PointerButton::Middle,
-                _ => PointerButton::Left,
-            };
+            let button =
+                match computer_choice(arguments, tool, "button", &["left", "right", "middle"])? {
+                    Some("right") => PointerButton::Right,
+                    Some("middle") => PointerButton::Middle,
+                    _ => PointerButton::Left,
+                };
             let count = computer_count(arguments, tool, "count", 1..=2, 1)?;
             if count == 2 && button != PointerButton::Left {
                 return Err(format!(
@@ -4160,7 +4287,10 @@ pub fn render_computer_act_result(outcome: &Value) -> Value {
     };
     let mut out = format!(
         "Window {}: {effect}.",
-        outcome.get("targetId").and_then(Value::as_str).unwrap_or("?")
+        outcome
+            .get("targetId")
+            .and_then(Value::as_str)
+            .unwrap_or("?")
     );
     let route = match s("route") {
         "accessibility" => Some("through the accessibility interface"),
@@ -4303,6 +4433,54 @@ pub fn render_authoring_result(outcome: &Value) -> Value {
     json!({
         "content": [{ "type": "text", "text": text }],
         "isError": false,
+        "structuredContent": outcome.clone(),
+    })
+}
+
+/// Render the verified declaration back to the agent. Rejections stay in both
+/// text and structured content so the model can repair a bad path immediately;
+/// partial acceptance is also marked as an MCP error so the model retries the
+/// rejected paths while the valid merge remains durable.
+pub fn render_deliverables_result(outcome: &Value) -> Value {
+    let published = outcome
+        .get("published")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let accepted = outcome
+        .get("accepted")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let rejected = outcome
+        .get("rejected")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut text = if published && accepted.is_empty() {
+        "Recorded the deliverables update with no newly accepted items.".to_string()
+    } else if published {
+        format!("Published {} verified deliverable(s).", accepted.len())
+    } else {
+        "The final deliverable set was not changed.".to_string()
+    };
+    if !rejected.is_empty() {
+        text.push_str(&format!(" Rejected {} item(s):", rejected.len()));
+        for item in &rejected {
+            let path = item.get("path").and_then(Value::as_str).unwrap_or("");
+            let reason = item
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("validation failed");
+            if path.is_empty() {
+                text.push_str(&format!("\n- {reason}"));
+            } else {
+                text.push_str(&format!("\n- {path}: {reason}"));
+            }
+        }
+    }
+    json!({
+        "content": [{ "type": "text", "text": text }],
+        "isError": !published || !rejected.is_empty(),
         "structuredContent": outcome.clone(),
     })
 }
@@ -4456,6 +4634,7 @@ mod tests {
             computer: false,
             computer_launch: false,
             computer_clipboard: false,
+            deliverables: false,
         })
     }
 
@@ -5073,6 +5252,7 @@ mod tests {
         computer: false,
         computer_launch: false,
         computer_clipboard: false,
+        deliverables: false,
     };
     const BOTH: CompanionFeatures = CompanionFeatures {
         delegation: true,
@@ -5088,6 +5268,7 @@ mod tests {
         computer: false,
         computer_launch: false,
         computer_clipboard: false,
+        deliverables: false,
     };
     const ASK_ONLY: CompanionFeatures = CompanionFeatures {
         delegation: false,
@@ -5103,6 +5284,7 @@ mod tests {
         computer: false,
         computer_launch: false,
         computer_clipboard: false,
+        deliverables: false,
     };
     const SESSIONS_ONLY: CompanionFeatures = CompanionFeatures {
         delegation: false,
@@ -5113,6 +5295,23 @@ mod tests {
         result: false,
         automations: false,
         taskboard: false,
+        browser: false,
+        browser_eval: false,
+        computer: false,
+        computer_launch: false,
+        computer_clipboard: false,
+        deliverables: false,
+    };
+    const DELIVERABLES_ONLY: CompanionFeatures = CompanionFeatures {
+        delegation: false,
+        feedback: false,
+        ask: false,
+        sessions: false,
+        tasks: false,
+        result: false,
+        automations: false,
+        taskboard: false,
+        deliverables: true,
         browser: false,
         browser_eval: false,
         computer: false,
@@ -5137,9 +5336,12 @@ mod tests {
         assert!(def.delegation && !def.feedback);
         assert!(!def.ask);
         assert!(!def.sessions);
+        assert!(!def.deliverables);
         // Explicit list, whitespace + unknown tokens tolerated.
-        let all = CompanionFeatures::parse(Some(" delegation , feedback , ask , sessions ,bogus"));
-        assert!(all.delegation && all.feedback && all.ask && all.sessions);
+        let all = CompanionFeatures::parse(Some(
+            " deliverables, delegation , feedback , ask , sessions ,bogus",
+        ));
+        assert!(all.delegation && all.feedback && all.ask && all.sessions && all.deliverables);
         let fb = CompanionFeatures::parse(Some("feedback"));
         assert!(!fb.delegation && fb.feedback && !fb.ask);
         let ask = CompanionFeatures::parse(Some("ask"));
@@ -5148,7 +5350,118 @@ mod tests {
         assert!(!sessions.delegation && !sessions.feedback && !sessions.ask && sessions.sessions);
         // Empty string → nothing enabled.
         let none = CompanionFeatures::parse(Some(""));
-        assert!(!none.delegation && !none.feedback && !none.ask && !none.sessions);
+        assert!(
+            !none.delegation && !none.feedback && !none.ask && !none.sessions && !none.deliverables
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_deliverables_is_exposed_and_validated_independently() {
+        let names = list_tool_names(
+            dispatch_with_features(
+                DELIVERABLES_ONLY,
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            )
+            .await,
+        );
+        assert_eq!(names, vec!["publish_deliverables".to_string()]);
+
+        let valid = json!({
+            "jsonrpc": "2.0", "id": 41, "method": "tools/call",
+            "params": {
+                "name": "publish_deliverables",
+                "arguments": { "deliverables": [{ "path": "output/report.pdf" }] }
+            }
+        })
+        .to_string();
+        assert!(matches!(
+            dispatch_with_features(DELIVERABLES_ONLY, &valid).await,
+            LineAction::Spawn(_)
+        ));
+
+        let empty = json!({
+            "jsonrpc": "2.0", "id": 42, "method": "tools/call",
+            "params": {
+                "name": "publish_deliverables",
+                "arguments": { "deliverables": [] }
+            }
+        })
+        .to_string();
+        assert!(matches!(
+            dispatch_with_features(DELIVERABLES_ONLY, &empty).await,
+            LineAction::Spawn(_)
+        ));
+
+        let too_many_items = (0..=MAX_DELIVERABLES_PER_CALL)
+            .map(|index| json!({ "path": format!("output/{index}.txt") }))
+            .collect::<Vec<_>>();
+        let too_many = json!({
+            "jsonrpc": "2.0", "id": 43, "method": "tools/call",
+            "params": {
+                "name": "publish_deliverables",
+                "arguments": { "deliverables": too_many_items }
+            }
+        })
+        .to_string();
+        // Structurally valid declarations reach the server even when they are
+        // over the per-call limit. The server records the failed attempt, and
+        // terminal settlement remains free to recover verified file changes.
+        assert!(matches!(
+            dispatch_with_features(DELIVERABLES_ONLY, &too_many).await,
+            LineAction::Spawn(_)
+        ));
+    }
+
+    #[test]
+    fn render_deliverables_reports_success_or_rejection() {
+        let rendered = render_deliverables_result(&json!({
+            "published": true,
+            "accepted": [{
+                "id": "d1", "path": "output/report.pdf", "kind": "file",
+                "title": "Report", "role": "primary"
+            }],
+            "rejected": []
+        }));
+        assert_eq!(rendered["isError"], false);
+        assert_eq!(rendered["structuredContent"]["accepted"][0]["id"], "d1");
+
+        let none = render_deliverables_result(&json!({
+            "published": false,
+            "accepted": [],
+            "rejected": [{ "path": "../secret", "reason": "outside workspace" }]
+        }));
+        assert_eq!(none["isError"], true);
+        assert!(none["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("outside workspace"));
+
+        let partial = render_deliverables_result(&json!({
+            "request_id": "request-1",
+            "declaration_status": "partial",
+            "published": true,
+            "accepted": [{
+                "id": "d1", "path": "output/report.pdf", "kind": "file",
+                "title": "Report", "role": "primary"
+            }],
+            "rejected": [{ "path": "output/missing.pdf", "reason": "not found" }]
+        }));
+        assert_eq!(partial["isError"], true);
+        assert_eq!(
+            partial["structuredContent"]["declaration_status"],
+            "partial"
+        );
+
+        let cleared = render_deliverables_result(&json!({
+            "published": true,
+            "accepted": [],
+            "rejected": []
+        }));
+        assert_eq!(cleared["isError"], false);
+        assert!(cleared["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Recorded"));
     }
 
     #[tokio::test]
@@ -5278,7 +5591,10 @@ mod tests {
                 "params": { "name": "resume_delegation", "arguments": arguments }
             })
             .to_string();
-            assert!(matches!(dispatch_for_test(&line).await, LineAction::Spawn(_)));
+            assert!(matches!(
+                dispatch_for_test(&line).await,
+                LineAction::Spawn(_)
+            ));
         }
     }
 
@@ -5609,6 +5925,7 @@ mod tests {
         computer: false,
         computer_launch: false,
         computer_clipboard: false,
+        deliverables: false,
     };
     const TASKBOARD_ONLY: CompanionFeatures = CompanionFeatures {
         delegation: false,
@@ -5624,6 +5941,7 @@ mod tests {
         computer: false,
         computer_launch: false,
         computer_clipboard: false,
+        deliverables: false,
     };
 
     /// The two authoring groups gate independently: enabling one must not
@@ -6435,6 +6753,7 @@ mod tests {
     // ── browser tools ──────────────────────────────────────────────────────
 
     const BROWSER_ONLY: CompanionFeatures = CompanionFeatures {
+        deliverables: false,
         delegation: false,
         feedback: false,
         ask: false,
@@ -6537,14 +6856,14 @@ mod tests {
         assert!(browser_eval_request(&json!({ "tabId": "t1" }))
             .unwrap_err()
             .contains("`code`"));
-        assert!(browser_eval_request(&json!({ "tabId": "t1", "code": "   " }))
-            .unwrap_err()
-            .contains("`code`"));
         assert!(
-            browser_eval_request(&json!({ "tabId": "t1", "code": 42 }))
+            browser_eval_request(&json!({ "tabId": "t1", "code": "   " }))
                 .unwrap_err()
-                .contains("must be a string")
+                .contains("`code`")
         );
+        assert!(browser_eval_request(&json!({ "tabId": "t1", "code": 42 }))
+            .unwrap_err()
+            .contains("must be a string"));
         let long = "a".repeat(MAX_EVAL_CODE_CHARS + 1);
         assert!(
             browser_eval_request(&json!({ "tabId": "t1", "code": long }))
@@ -6611,18 +6930,27 @@ mod tests {
             &json!({ "tabId": "t1", "since": 12, "minLevel": "warn", "limit": 5.0 }),
         )
         .unwrap();
-        assert_eq!((q.since, q.min_level, q.limit), (12, Some(ConsoleLevel::Warn), Some(5)));
-        assert!(browser_console_query(&json!({ "tabId": "t1", "minLevel": "verbose" }))
-            .unwrap_err()
-            .contains("minLevel"));
-        assert!(browser_console_query(&json!({ "tabId": "t1", "since": -1 }))
-            .unwrap_err()
-            .contains("since"));
+        assert_eq!(
+            (q.since, q.min_level, q.limit),
+            (12, Some(ConsoleLevel::Warn), Some(5))
+        );
+        assert!(
+            browser_console_query(&json!({ "tabId": "t1", "minLevel": "verbose" }))
+                .unwrap_err()
+                .contains("minLevel")
+        );
+        assert!(
+            browser_console_query(&json!({ "tabId": "t1", "since": -1 }))
+                .unwrap_err()
+                .contains("since")
+        );
         // Zero is not "the default", it is a mistake to report.
         assert!(browser_console_query(&json!({ "tabId": "t1", "limit": 0 }))
             .unwrap_err()
             .contains("limit"));
-        assert!(browser_console_query(&json!({})).unwrap_err().contains("tabId"));
+        assert!(browser_console_query(&json!({}))
+            .unwrap_err()
+            .contains("tabId"));
 
         let (tab, r) = browser_capture_request(&json!({ "tabId": "t2" })).unwrap();
         assert_eq!(tab, "t2");
@@ -6635,29 +6963,43 @@ mod tests {
         assert_eq!(r.clip_target(), Some(("g.1.1", "e3")));
         assert_eq!(r.max_width, Some(640));
         assert_eq!(r.format, CaptureFormat::Jpeg);
-        assert!(browser_capture_request(&json!({ "tabId": "t2", "ref": "e3" }))
-            .unwrap_err()
-            .contains("generation"));
-        assert!(browser_capture_request(&json!({ "tabId": "t2", "generation": "g" }))
-            .unwrap_err()
-            .contains("ref"));
-        assert!(browser_capture_request(&json!({ "tabId": "t2", "format": "gif" }))
-            .unwrap_err()
-            .contains("format"));
+        assert!(
+            browser_capture_request(&json!({ "tabId": "t2", "ref": "e3" }))
+                .unwrap_err()
+                .contains("generation")
+        );
+        assert!(
+            browser_capture_request(&json!({ "tabId": "t2", "generation": "g" }))
+                .unwrap_err()
+                .contains("ref")
+        );
+        assert!(
+            browser_capture_request(&json!({ "tabId": "t2", "format": "gif" }))
+                .unwrap_err()
+                .contains("format")
+        );
         // A ref that is not a string, or an empty one, is not "no ref": it
         // must not quietly become a capture of the whole viewport.
-        assert!(browser_capture_request(&json!({ "tabId": "t2", "ref": 123, "generation": "g" }))
-            .unwrap_err()
-            .contains("ref"));
-        assert!(browser_capture_request(&json!({ "tabId": "t2", "ref": "e3", "generation": "" }))
-            .unwrap_err()
-            .contains("generation"));
-        assert!(browser_capture_request(&json!({ "tabId": "t2", "format": "jpg" }))
-            .unwrap_err()
-            .contains("format"));
-        assert!(browser_capture_request(&json!({ "tabId": "t2", "maxWidth": 0 }))
-            .unwrap_err()
-            .contains("maxWidth"));
+        assert!(
+            browser_capture_request(&json!({ "tabId": "t2", "ref": 123, "generation": "g" }))
+                .unwrap_err()
+                .contains("ref")
+        );
+        assert!(
+            browser_capture_request(&json!({ "tabId": "t2", "ref": "e3", "generation": "" }))
+                .unwrap_err()
+                .contains("generation")
+        );
+        assert!(
+            browser_capture_request(&json!({ "tabId": "t2", "format": "jpg" }))
+                .unwrap_err()
+                .contains("format")
+        );
+        assert!(
+            browser_capture_request(&json!({ "tabId": "t2", "maxWidth": 0 }))
+                .unwrap_err()
+                .contains("maxWidth")
+        );
     }
 
     /// A screenshot comes back as image content the model can look at, with
@@ -6714,7 +7056,10 @@ mod tests {
             "tabId": "t1",
             "console": { "url": "http://x/", "entries": [], "dropped": 0, "nextSince": 0, "more": false }
         }));
-        assert!(quiet["content"][0]["text"].as_str().unwrap().contains("printed nothing"));
+        assert!(quiet["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("printed nothing"));
     }
 
     /// The five action tools build one request. What each needs, and what
@@ -6851,11 +7196,9 @@ mod tests {
         );
         // A single string is taken as a list of one, since that is how a model
         // that forgot the brackets meant it.
-        let (_, req) = browser_action_request(
-            "browser_select_option",
-            &with(json!({ "values": "l" })),
-        )
-        .unwrap();
+        let (_, req) =
+            browser_action_request("browser_select_option", &with(json!({ "values": "l" })))
+                .unwrap();
         assert_eq!(
             req.action,
             ActionKind::Select {
@@ -6876,14 +7219,19 @@ mod tests {
             json!({ "doubleClick": "yes" }),
         ] {
             let err = browser_action_request("browser_click", &with(bad.clone())).unwrap_err();
-            assert!(err.contains("`button`") || err.contains("`doubleClick`"), "{bad}: {err}");
+            assert!(
+                err.contains("`button`") || err.contains("`doubleClick`"),
+                "{bad}: {err}"
+            );
         }
         let (_, req) =
             browser_action_request("browser_click", &with(json!({ "button": "left" }))).unwrap();
         assert!(matches!(req.action, ActionKind::Click { button: None, .. }));
-        assert!(browser_action_request("browser_type", &with(json!({ "text": "x", "submit": 1 })))
-            .unwrap_err()
-            .contains("`submit`"));
+        assert!(
+            browser_action_request("browser_type", &with(json!({ "text": "x", "submit": 1 })))
+                .unwrap_err()
+                .contains("`submit`")
+        );
         assert!(browser_action_request(
             "browser_select_option",
             &with(json!({ "values": ["one", 2] }))
@@ -6892,7 +7240,12 @@ mod tests {
         .contains("`values`"));
 
         // Every tool but press needs a ref; every tool needs the generation.
-        for name in ["browser_click", "browser_hover", "browser_type", "browser_select_option"] {
+        for name in [
+            "browser_click",
+            "browser_hover",
+            "browser_type",
+            "browser_select_option",
+        ] {
             let err = browser_action_request(
                 name,
                 &json!({ "tabId": "t1", "generation": "g", "text": "x", "values": ["v"] }),
@@ -6903,8 +7256,9 @@ mod tests {
         let err = browser_action_request("browser_click", &json!({ "tabId": "t1", "ref": "e1" }))
             .unwrap_err();
         assert!(err.contains("`generation`"));
-        let err = browser_action_request("browser_click", &json!({ "generation": "g", "ref": "e1" }))
-            .unwrap_err();
+        let err =
+            browser_action_request("browser_click", &json!({ "generation": "g", "ref": "e1" }))
+                .unwrap_err();
         assert!(err.contains("`tabId`"));
     }
 
@@ -6917,7 +7271,11 @@ mod tests {
     fn the_tab_tools_take_a_non_empty_string_for_each_argument() {
         use crate::acp::browser_tools::BrowserTabOp;
         assert_eq!(
-            browser_tab_op("browser_open_tab", &json!({ "url": " https://example.com/ " })).unwrap(),
+            browser_tab_op(
+                "browser_open_tab",
+                &json!({ "url": " https://example.com/ " })
+            )
+            .unwrap(),
             BrowserTabOp::Open {
                 url: "https://example.com/".into()
             }
@@ -6944,7 +7302,11 @@ mod tests {
             ("browser_open_tab", json!({}), "`url`"),
             ("browser_open_tab", json!({ "url": "  " }), "`url`"),
             ("browser_open_tab", json!({ "url": 7 }), "`url`"),
-            ("browser_navigate", json!({ "url": "https://x.test/" }), "`tabId`"),
+            (
+                "browser_navigate",
+                json!({ "url": "https://x.test/" }),
+                "`tabId`",
+            ),
             ("browser_navigate", json!({ "tabId": "t1" }), "`url`"),
             ("browser_close_tab", json!({}), "`tabId`"),
         ] {
@@ -7086,7 +7448,10 @@ mod tests {
         // scrolls only across arrives here too.
         let unscrollable = note(json!({ "by": 0, "top": 0, "max": 0 }));
         assert!(unscrollable.contains("up or down"), "{unscrollable}");
-        assert!(unscrollable.contains("name a `ref` inside that box"), "{unscrollable}");
+        assert!(
+            unscrollable.contains("name a `ref` inside that box"),
+            "{unscrollable}"
+        );
         assert!(!unscrollable.contains("press again"), "{unscrollable}");
         let stuck = note(json!({ "by": 0, "top": 100, "max": 2900 }));
         assert!(stuck.contains("does not reach"), "{stuck}");
@@ -7236,7 +7601,6 @@ mod tests {
         assert_eq!(refused["isError"], false);
     }
 
-
     // ── computer use ───────────────────────────────────────────────────────
 
     const COMPUTER_ONLY: CompanionFeatures = CompanionFeatures {
@@ -7269,7 +7633,9 @@ mod tests {
         ))
         .is_empty());
         assert_eq!(
-            computer_names(&list_tool_names(dispatch_with_features(COMPUTER_ONLY, list).await)),
+            computer_names(&list_tool_names(
+                dispatch_with_features(COMPUTER_ONLY, list).await
+            )),
             vec![
                 "computer_list_apps".to_string(),
                 "computer_list_windows".to_string(),
@@ -7440,10 +7806,9 @@ mod tests {
         );
         assert!(computer_capture_request(&json!({ "targetId": "w3", "maxDimension": 0 })).is_err());
 
-        let (id, req) = computer_snapshot_request(
-            &json!({ "targetId": "w1", "maxChars": 0, "query": "Save" }),
-        )
-        .unwrap();
+        let (id, req) =
+            computer_snapshot_request(&json!({ "targetId": "w1", "maxChars": 0, "query": "Save" }))
+                .unwrap();
         assert_eq!(id, "w1");
         // 0 is "no cap", and passes through as such.
         assert_eq!(req.max_chars, Some(0));
@@ -7684,8 +8049,16 @@ mod tests {
             }
         );
         for (tool, bad, says) in [
-            ("computer_click", json!({ "targetId": "w1", "ref": 3 }), "generation"),
-            ("computer_click", json!({ "targetId": "w1" }), "requires `ref`"),
+            (
+                "computer_click",
+                json!({ "targetId": "w1", "ref": 3 }),
+                "generation",
+            ),
+            (
+                "computer_click",
+                json!({ "targetId": "w1" }),
+                "requires `ref`",
+            ),
             (
                 "computer_click",
                 json!({ "targetId": "w1", "ref": 3, "coordinate": [1, 2], "generation": "1.1" }),
@@ -7974,7 +8347,10 @@ mod tests {
         assert!(text.contains("[shared: read]  notes.txt"), "{text}");
         assert!(text.contains("w2  Mail (pid 6)"), "{text}");
         assert!(text.contains("[not shared]"), "{text}");
-        assert!(text.contains("[never shareable: codeg's own window]"), "{text}");
+        assert!(
+            text.contains("[never shareable: codeg's own window]"),
+            "{text}"
+        );
         assert!(text.contains("Share a window"), "{text}");
         assert!(!text.contains("Input:"), "{text}");
     }

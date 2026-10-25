@@ -488,6 +488,7 @@ impl ClineParser {
                         model: None,
                         completed_at: failure.completed_at,
                         agent_message_id: None,
+                        native_task_id: None,
                     });
                 }
                 continue;
@@ -517,6 +518,7 @@ impl ClineParser {
                         model,
                         completed_at: Some(timestamp),
                         agent_message_id: None,
+                        native_task_id: None,
                     });
                 }
                 "user" => {
@@ -532,6 +534,7 @@ impl ClineParser {
                             model: None,
                             completed_at: Some(timestamp),
                             agent_message_id: None,
+                            native_task_id: None,
                         });
                     }
                     if !parsed.user_blocks.is_empty() {
@@ -545,6 +548,7 @@ impl ClineParser {
                             model: None,
                             completed_at: Some(timestamp),
                             agent_message_id: None,
+                            native_task_id: None,
                         });
                     }
                 }
@@ -836,6 +840,7 @@ impl ClineParser {
                         model,
                         completed_at: Some(timestamp),
                     agent_message_id: None,
+                    native_task_id: None,
                     });
                 }
                 "user" => {
@@ -857,6 +862,7 @@ impl ClineParser {
                             model: None,
                             completed_at: Some(timestamp),
                         agent_message_id: None,
+                        native_task_id: None,
                         });
                     }
 
@@ -873,6 +879,7 @@ impl ClineParser {
                             model: None,
                             completed_at: Some(timestamp),
                         agent_message_id: None,
+                        native_task_id: None,
                         });
                     }
                 }

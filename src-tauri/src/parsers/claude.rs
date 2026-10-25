@@ -656,6 +656,7 @@ fn push_goal_marker(messages: &mut Vec<UnifiedMessage>, goal: &PendingGoal) -> O
         model: None,
         completed_at: Some(goal.timestamp),
     agent_message_id: None,
+    native_task_id: None,
     });
     Some(marker.objective)
 }
@@ -2140,6 +2141,7 @@ impl ClaudeRecordAccumulator {
                             model: None,
                             completed_at: Some(timestamp),
                             agent_message_id: None,
+                            native_task_id: None,
                         },
                     );
                     // Usage ownership is tracked by index, and inserting shifts
@@ -2179,6 +2181,7 @@ impl ClaudeRecordAccumulator {
                         model: None,
                         completed_at: Some(timestamp),
                     agent_message_id: None,
+                    native_task_id: None,
                     },
                     prompt_id,
                 ));
@@ -2355,6 +2358,7 @@ impl ClaudeRecordAccumulator {
                     model: None,
                     completed_at: Some(timestamp),
                 agent_message_id: None,
+                native_task_id: None,
                 });
             }
             "assistant" => {
@@ -2445,6 +2449,7 @@ impl ClaudeRecordAccumulator {
                         agent_message_id: Some(
                             message_id.map_or_else(|| uuid.clone(), str::to_string),
                         ),
+                        native_task_id: None,
                         id: uuid,
                         role: MessageRole::Assistant,
                         content,
@@ -2485,6 +2490,7 @@ impl ClaudeRecordAccumulator {
                         model: None,
                         completed_at: Some(timestamp),
                         agent_message_id: None,
+                        native_task_id: None,
                     });
                     return;
                 }
@@ -2592,6 +2598,7 @@ impl ClaudeRecordAccumulator {
                             // at the tail rather than fingerprinting their
                             // empty text.
                             agent_message_id: None,
+                            native_task_id: None,
                         });
                         // Hold the divider's position open for the `/compact`
                         // prompt whose echo the CLI writes a few records later,
@@ -2643,6 +2650,7 @@ impl ClaudeRecordAccumulator {
                         model: None,
                         completed_at: Some(timestamp),
                     agent_message_id: None,
+                    native_task_id: None,
                     });
                 }
             }
@@ -2766,6 +2774,7 @@ impl ClaudeRecordAccumulator {
                         model: None,
                         completed_at: Some(timestamp),
                     agent_message_id: None,
+                    native_task_id: None,
                     });
                 }
             }
@@ -4062,6 +4071,7 @@ pub(crate) fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn
                 model: turn_model,
                 completed_at,
                 agent_message_id,
+                native_task_id: None,
             });
         } else if matches!(msg.role, MessageRole::System) {
             turns.push(MessageTurn {
@@ -4074,6 +4084,7 @@ pub(crate) fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn
                 model: None,
                 completed_at: msg.completed_at,
             agent_message_id: None,
+            native_task_id: None,
             });
             i += 1;
         } else {
@@ -4087,6 +4098,7 @@ pub(crate) fn group_into_turns(messages: Vec<UnifiedMessage>) -> Vec<MessageTurn
                 model: None,
                 completed_at: msg.completed_at,
             agent_message_id: None,
+            native_task_id: None,
             });
             i += 1;
         }
@@ -5106,6 +5118,7 @@ mod tests {
             model: None,
             completed_at: None,
             agent_message_id: Some(id.into()),
+            native_task_id: None,
         };
         let compaction = |post: u64| MessageTurn {
             id: "turn-c".into(),
@@ -5120,6 +5133,7 @@ mod tests {
             model: None,
             completed_at: None,
             agent_message_id: None,
+            native_task_id: None,
         };
 
         // Nothing since the compaction: the boundary is the only honest number.
@@ -6071,6 +6085,7 @@ mod tests {
                 model: None,
                 completed_at: None,
             agent_message_id: None,
+            native_task_id: None,
             },
             MessageTurn {
                 id: "turn-1".to_string(),
@@ -6087,6 +6102,7 @@ mod tests {
                 model: None,
                 completed_at: None,
             agent_message_id: None,
+            native_task_id: None,
             },
         ];
 

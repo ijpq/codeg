@@ -5,8 +5,10 @@ pub mod claude;
 pub mod cline;
 pub mod codebuddy;
 pub mod codex;
+mod codex_task_timing;
 pub mod codex_code_mode;
 mod codex_desktop_attachments;
+pub mod codex_quota;
 pub mod cursor;
 pub mod deepseek;
 pub mod gemini;
@@ -855,6 +857,7 @@ pub(crate) fn turn_error_message(
         model: None,
         completed_at: Some(timestamp),
         agent_message_id: None,
+        native_task_id: None,
     })
 }
 
@@ -1845,6 +1848,7 @@ mod route_sanitizer_tests {
             model: None,
             completed_at: None,
         agent_message_id: None,
+        native_task_id: None,
         }
     }
 
@@ -2248,6 +2252,7 @@ mod tests {
             model: None,
             completed_at: Some(base + chrono::Duration::seconds(end_s)),
         agent_message_id: None,
+        native_task_id: None,
         }
     }
 
@@ -2627,6 +2632,7 @@ mod tests {
                 model: None,
                 completed_at: None,
             agent_message_id: None,
+            native_task_id: None,
             },
             MessageTurn {
                 id: "turn-1".to_string(),
@@ -2643,6 +2649,7 @@ mod tests {
                 model: None,
                 completed_at: None,
             agent_message_id: None,
+            native_task_id: None,
             },
         ];
 

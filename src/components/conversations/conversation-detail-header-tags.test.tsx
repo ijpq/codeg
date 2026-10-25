@@ -21,8 +21,13 @@ const h = vi.hoisted(() => ({
   },
 }))
 
+vi.mock("@/lib/transport", () => ({
+  subscribe: vi.fn(async () => () => {}),
+}))
+
 vi.mock("@/lib/api", () => ({
   updateConversationTitle: vi.fn(),
+  getConversationBranchInfo: vi.fn(async () => null),
   deleteConversation: vi.fn(),
   updateConversationStatus: vi.fn(),
   updateConversationPinned: vi.fn(),
@@ -47,6 +52,7 @@ vi.mock("@/stores/app-workspace-store", () => {
   const useStore = (selector: (s: typeof full) => unknown) =>
     selector({ ...full, ...h.state })
   useStore.getState = () => ({ ...full, ...h.state })
+  useStore.subscribe = () => () => {}
   return { useAppWorkspaceStore: useStore }
 })
 vi.mock("@/stores/conversation-runtime-store", () => ({

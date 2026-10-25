@@ -787,6 +787,7 @@ fn parse_updates(path: &Path) -> ParsedUpdates {
                         model: None,
                         completed_at: None,
                     agent_message_id: None,
+                    native_task_id: None,
                     });
                 }
             }
@@ -1661,6 +1662,7 @@ fn ensure_assistant(
             model: None,
             completed_at: None,
         agent_message_id: None,
+        native_task_id: None,
         });
     }
     assistant.as_mut().expect("assistant just set")

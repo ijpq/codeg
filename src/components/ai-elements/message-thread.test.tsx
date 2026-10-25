@@ -11,8 +11,11 @@ const testState = vi.hoisted(() => ({
   stopScroll: vi.fn(),
   state: {
     isAtBottom: true,
+    isNearBottom: false,
     escapedFromLock: false,
     resizeDifference: 0,
+    lastScrollTop: undefined as number | undefined,
+    ignoreScrollToTop: undefined as number | undefined,
     animation: undefined as { ignoreEscapes: boolean } | undefined,
   },
 }))
@@ -70,9 +73,12 @@ beforeEach(() => {
   testState.scrollToBottom.mockReset()
   testState.stopScroll.mockReset()
   testState.state.isAtBottom = true
+  testState.state.isNearBottom = false
   testState.state.escapedFromLock = false
   testState.state.resizeDifference = 0
   testState.state.animation = undefined
+  testState.state.lastScrollTop = undefined
+  testState.state.ignoreScrollToTop = undefined
   vi.stubGlobal(
     "ResizeObserver",
     class {
@@ -351,6 +357,27 @@ describe("MessageThread escape on user scroll", () => {
     expect(testState.stopScroll).toHaveBeenCalledTimes(1)
   })
 
+  it.each([
+    { name: "Ctrl+Home", ctrlKey: true, metaKey: false },
+    { name: "Cmd+Home", ctrlKey: false, metaKey: true },
+  ])("escapes on $name while leaving editor navigation alone", (modifiers) => {
+    const row = mountScrollable()
+    const input = document.createElement("textarea")
+    viewport().appendChild(input)
+    const key = () =>
+      new KeyboardEvent("keydown", {
+        key: "Home",
+        ctrlKey: modifiers.ctrlKey,
+        metaKey: modifiers.metaKey,
+        bubbles: true,
+      })
+
+    input.dispatchEvent(key())
+    expect(testState.stopScroll).not.toHaveBeenCalled()
+    row.dispatchEvent(key())
+    expect(testState.stopScroll).toHaveBeenCalledTimes(1)
+  })
+
   // The reported bug, scrollbar: a drag reaches the library only as scroll
   // events, which it discards while a content resize is in flight.
   it("escapes when the scrollbar is dragged up, even mid-resize", () => {
@@ -454,4 +481,66 @@ describe("MessageThread escape on user scroll", () => {
 
     expect(testState.stopScroll).not.toHaveBeenCalled()
   })
+})
+
+describe("fractional virtual-row scroll compensation", () => {
+  it("shields subpixel upward corrections from the library escape detector", () => {
+    mountThreadAt(400)
+    testState.state.lastScrollTop = 600.73
+    testState.scrollRef.current!.scrollTop = 600
+    testState.scrollRef.current!.dispatchEvent(new Event("scroll"))
+    expect(testState.state.ignoreScrollToTop).toBe(600)
+    expect(testState.stopScroll).not.toHaveBeenCalled()
+  })
+
+  it("shields programmatic remeasurement but never rearms an escaped reader", () => {
+    mountThreadAt(400)
+    testState.state.lastScrollTop = 650
+    testState.scrollRef.current!.scrollTop = 600
+    testState.scrollRef.current!.dispatchEvent(new Event("scroll"))
+    expect(testState.state.ignoreScrollToTop).toBe(600)
+    testState.state.ignoreScrollToTop = undefined
+    testState.state.escapedFromLock = true
+    testState.state.lastScrollTop = 600.73
+    testState.scrollRef.current!.dispatchEvent(new Event("scroll"))
+    expect(testState.state.ignoreScrollToTop).toBeUndefined()
+  })
+})
+
+it("shields a stale overshoot target after virtual row remeasurement at the tail", () => {
+  mountThreadAt(400)
+  testState.state.lastScrollTop = 599
+  testState.state.ignoreScrollToTop = 632
+  testState.state.isNearBottom = true
+  testState.scrollRef.current!.scrollTop = 600
+  testState.scrollRef.current!.dispatchEvent(new Event("scroll"))
+  expect(testState.state.ignoreScrollToTop).toBe(600)
+})
+
+it("releases the lock when a text selection drags the transcript upwards", () => {
+  const row = document.createElement("p")
+  row.textContent = "Select this transcript text"
+  const viewport = testState.scrollRef.current!
+  viewport.append(row)
+  document.body.append(viewport)
+  Object.defineProperty(viewport, "scrollHeight", {
+    configurable: true,
+    value: 2000,
+  })
+  Object.defineProperty(viewport, "clientHeight", {
+    configurable: true,
+    value: 400,
+  })
+  viewport.scrollTop = 1600
+  mountThreadAt(400)
+  row.dispatchEvent(new MouseEvent("pointerdown", { button: 0, bubbles: true }))
+  const selection = document.getSelection()!
+  const range = document.createRange()
+  range.selectNodeContents(row)
+  selection.addRange(range)
+  viewport.scrollTop = 1500
+  viewport.dispatchEvent(new Event("scroll"))
+  expect(testState.stopScroll).toHaveBeenCalledTimes(1)
+  selection.removeAllRanges()
+  viewport.remove()
 })
