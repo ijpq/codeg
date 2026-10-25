@@ -7,6 +7,8 @@
 - Queue a running turn's handoff, prepare before publishing, retain the original
   session on failure, and use durable request IDs/revisions and prompt receipts
   for retries, concurrent clients and restart recovery.
+- Claim the SQLite writer before checking switch receipts, so concurrent history
+  backfill cannot leave a handoff on a stale read snapshot or change retry clocks.
 - Persist one paged business history, including native task durations, deferred
   attachment sources and deliverables. Preserve rollover identities and existing
   branch creation, restoration and return behavior.

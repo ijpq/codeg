@@ -258,6 +258,15 @@ pub async fn queue_switch(
     }
     let payload = json(request)?;
     let tx = conn.begin().await?;
+    // Claim SQLite's writer before reading the retry receipt. A deferred
+    // read snapshot cannot be promoted if streaming history writes race it;
+    // busy_timeout cannot recover that promotion. Do not advance the CAS
+    // revision or clocks for this claim or for an idempotent retry.
+    tx.execute(stmt(
+        "UPDATE business_conversation_state SET revision=revision WHERE conversation_id=?",
+        vec![request.conversation_id.into()],
+    ))
+    .await?;
     if let Some(old) = tx
         .query_one(stmt(
             "SELECT request_json FROM business_agent_switch WHERE request_id=?",
@@ -270,6 +279,7 @@ pub async fn queue_switch(
                 "Switch request ID reused with different parameters".into(),
             ));
         }
+        tx.commit().await?;
         return Ok(());
     }
     let expected = request.expected_revision;
@@ -782,7 +792,9 @@ pub async fn verify_prompt_body(
 mod tests {
     use super::*;
     use crate::db::service::conversation_service;
-    use crate::db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder};
+    use crate::db::test_helpers::{
+        fresh_disk_db, fresh_in_memory_db, seed_conversation, seed_folder,
+    };
     use crate::models::message::TurnRole;
 
     fn turn(id: &str, role: TurnRole, text: &str, duration: Option<u64>) -> MessageTurn {
@@ -1050,6 +1062,10 @@ mod tests {
         let b = request(cid, "client-b", AgentType::ClaudeCode, Some(0));
         let (one, two) = tokio::join!(queue_switch(&db.conn, &a), queue_switch(&db.conn, &b));
         assert_ne!(one.is_ok(), two.is_ok());
+        assert!(matches!(
+            if one.is_ok() { &two } else { &one },
+            Err(DbError::Conflict(_))
+        ));
         let winner = if one.is_ok() { &a } else { &b };
         activate(&db.conn, winner, "claude-once").await.unwrap();
         let revision = state(&db.conn, cid).await.unwrap().unwrap().revision;
@@ -1059,6 +1075,66 @@ mod tests {
         assert_eq!(current.revision, revision);
         assert_eq!(current.sessions.len(), 2);
         assert_eq!(current.active_agent, AgentType::ClaudeCode);
+    }
+
+    #[tokio::test]
+    async fn business_switch_waits_for_a_concurrent_history_writer_without_a_stale_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_disk_db(dir.path()).await;
+        let folder = seed_folder(&db, &dir.path().to_string_lossy()).await;
+        let cid = seed_conversation(&db, folder, AgentType::Codex).await;
+        conversation_service::bind_external_id(&db.conn, cid, "codex-original", &[])
+            .await
+            .unwrap();
+        let summary = conversation_service::get_by_id(&db.conn, cid)
+            .await
+            .unwrap();
+        initialize(&db.conn, &summary, &[]).await.unwrap();
+
+        // WAL permits reads while another connection writes. A read-first
+        // switch would take that older snapshot, then fail immediately when
+        // promoting it to a writer, rather than waiting for busy_timeout.
+        let writer_conn = sea_orm::Database::connect(format!(
+            "sqlite:{}?mode=rw",
+            dir.path().join("source.db").to_string_lossy()
+        ))
+        .await
+        .unwrap();
+        let writer = writer_conn.begin().await.unwrap();
+        writer
+            .execute(stmt(
+                "UPDATE conversation SET message_count=message_count+1 WHERE id=?",
+                vec![cid.into()],
+            ))
+            .await
+            .unwrap();
+        let conn = db.conn.clone();
+        let req = request(cid, "after-history-write", AgentType::ClaudeCode, Some(0));
+        let mut pending = tokio::spawn(async move { queue_switch(&conn, &req).await });
+        let early = tokio::time::timeout(std::time::Duration::from_millis(100), &mut pending).await;
+        assert!(
+            early.is_err(),
+            "Switch did not wait for the writer: {early:?}"
+        );
+        writer.commit().await.unwrap();
+        pending.await.unwrap().unwrap();
+
+        let current = state(&db.conn, cid).await.unwrap().unwrap();
+        assert_eq!(current.revision, 1);
+        assert_eq!(current.active_agent, AgentType::Codex);
+        assert_eq!(
+            current.pending_request_id.as_deref(),
+            Some("after-history-write")
+        );
+        queue_switch(
+            &db.conn,
+            &request(cid, "after-history-write", AgentType::ClaudeCode, Some(0)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(state(&db.conn, cid).await.unwrap().unwrap().revision, 1);
+        writer_conn.close().await.unwrap();
+        db.conn.close().await.unwrap();
     }
 
     #[tokio::test]
