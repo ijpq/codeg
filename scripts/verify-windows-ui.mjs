@@ -274,11 +274,32 @@ async function stopDesktop(app) {
   app.log.end()
 }
 function desktopApi(page) {
-  return (command, args = {}) =>
-    page.evaluate(
-      ({ command, args }) => window.__TAURI_INTERNALS__.invoke(command, args),
+  return async (command, args = {}) => {
+    // Playwright otherwise turns a structured Tauri rejection into just
+    // "Object", losing the code needed for bounded missing-rollout retries.
+    const result = await page.evaluate(
+      async ({ command, args }) => {
+        try {
+          return {
+            ok: true,
+            value: await window.__TAURI_INTERNALS__.invoke(command, args),
+          }
+        } catch (error) {
+          return {
+            ok: false,
+            error:
+              error && typeof error === "object"
+                ? { ...error, message: error.message ?? JSON.stringify(error) }
+                : { message: String(error) },
+          }
+        }
+      },
       { command, args }
     )
+    if (!result.ok)
+      throw Object.assign(new Error(result.error.message), result.error)
+    return result.value
+  }
 }
 async function importAndOpen(api, f) {
   await api("scan_importable_sessions")
