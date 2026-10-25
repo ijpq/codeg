@@ -27,7 +27,9 @@ use crate::acp::types::{AcpEvent, ConnectionStatus, EventEnvelope};
 use crate::artifact_tracker::ArtifactTurnFinishStatus;
 use crate::db::entities::conversation::ConversationStatus;
 use crate::db::error::DbError;
-use crate::db::service::{artifact_service, conversation_branch_service, conversation_service, tool_approval_service};
+use crate::db::service::{
+    artifact_service, conversation_branch_service, conversation_service, tool_approval_service,
+};
 use crate::logging::throttle::{LagLogThrottle, LAG_LOG_WINDOW};
 use crate::web::event_bridge::{emit_with_state, EventEmitter};
 use tokio::sync::RwLock;
@@ -66,6 +68,8 @@ fn is_lifecycle_relevant(event: &AcpEvent) -> bool {
     matches!(
         event,
         AcpEvent::SessionStarted { .. }
+            | AcpEvent::SessionModes { .. }
+            | AcpEvent::SessionConfigOptions { .. }
             | AcpEvent::AgentFileChangeReport { .. }
             | AcpEvent::TurnComplete { .. }
             | AcpEvent::ConversationLinked { .. }
@@ -216,10 +220,16 @@ async fn handle_event_with_retry(
 pub(crate) fn turn_complete_status(stop_reason: &str) -> Option<ConversationStatus> {
     match stop_reason {
         "end_turn" => Some(ConversationStatus::PendingReview),
-        "refusal" | "max_tokens" | "max_turn_requests" | "unknown" | "empty" | "auth_required"
-        | "rejected" | "cancelled" | "cancel_timeout" | "cancel_command_channel_closed" => {
-            Some(ConversationStatus::Cancelled)
-        }
+        "refusal"
+        | "max_tokens"
+        | "max_turn_requests"
+        | "unknown"
+        | "empty"
+        | "auth_required"
+        | "rejected"
+        | "cancelled"
+        | "cancel_timeout"
+        | "cancel_command_channel_closed" => Some(ConversationStatus::Cancelled),
         _ => None,
     }
 }
@@ -239,55 +249,65 @@ pub(crate) async fn write_turn_status(
 ) -> Result<(), DbError> {
     let (connection_id, event_seq) = {
         let snapshot = state.read().await;
+        if snapshot.main_agent_retired {
+            return Ok(());
+        }
         (snapshot.connection_id.clone(), snapshot.event_seq)
     };
     let artifact_status = match stop_reason {
         "end_turn" => ArtifactTurnFinishStatus::Completed,
-        "cancelled" | "cancel_timeout" | "cancel_command_channel_closed" => ArtifactTurnFinishStatus::Cancelled,
+        "cancelled" | "cancel_timeout" | "cancel_command_channel_closed" => {
+            ArtifactTurnFinishStatus::Cancelled
+        }
         _ => ArtifactTurnFinishStatus::Failed,
     };
     let mut target_status = turn_complete_status(stop_reason);
-            let latest_run =
-                artifact_service::latest_run_for_connection(db_conn, &connection_id)
-                    .await?;
-            let current_conversation_status = match conversation_service::get_by_id(db_conn, conversation_id)
-                .await?
-                .status
-                .as_str()
-            {
-                "in_progress" => ConversationStatus::InProgress,
-                "pending_review" => ConversationStatus::PendingReview,
-                "completed" => ConversationStatus::Completed,
-                "cancelled" => ConversationStatus::Cancelled,
-                // The SeaORM enum currently makes this unreachable. If a
-                // future binary adds a value, fail closed into a terminal
-                // state instead of reviving the conversation as active.
-                _ => ConversationStatus::Cancelled,
-            };
-            // Cancellation owns the first terminal CAS. If an agent delivers
-            // a late `end_turn` after cancellation/reconciliation already won,
-            // never resurrect the conversation as pending_review.
-            if stop_reason == "end_turn"
-                && latest_run.as_ref().is_some_and(|run| {
-                    matches!(
-                        run.status,
-                        crate::db::entities::conversation_turn_run::ConversationTurnRunStatus::Cancelled
-                            | crate::db::entities::conversation_turn_run::ConversationTurnRunStatus::Interrupted
-                            | crate::db::entities::conversation_turn_run::ConversationTurnRunStatus::Failed
-                    )
-                })
-            {
-                target_status = Some(current_conversation_status.clone());
+    let latest_run = artifact_service::latest_run_for_connection(db_conn, &connection_id).await?;
+    let current_conversation_status =
+        match conversation_service::get_by_id(db_conn, conversation_id)
+            .await?
+            .status
+            .as_str()
+        {
+            "in_progress" => ConversationStatus::InProgress,
+            "pending_review" => ConversationStatus::PendingReview,
+            "completed" => ConversationStatus::Completed,
+            "cancelled" => ConversationStatus::Cancelled,
+            // The SeaORM enum currently makes this unreachable. If a
+            // future binary adds a value, fail closed into a terminal
+            // state instead of reviving the conversation as active.
+            _ => ConversationStatus::Cancelled,
+        };
+    // Cancellation owns the first terminal CAS. If an agent delivers
+    // a late `end_turn` after cancellation/reconciliation already won,
+    // never resurrect the conversation as pending_review.
+    if stop_reason == "end_turn" && latest_run.as_ref().is_some_and(|run| {
+        matches!(
+            run.status,
+            crate::db::entities::conversation_turn_run::ConversationTurnRunStatus::Cancelled
+                | crate::db::entities::conversation_turn_run::ConversationTurnRunStatus::Interrupted
+                | crate::db::entities::conversation_turn_run::ConversationTurnRunStatus::Failed
+        )
+    }) {
+        target_status = Some(current_conversation_status.clone());
+    }
+    if let Some(ts) = target_status.clone() {
+        let run_status = match artifact_status {
+            ArtifactTurnFinishStatus::Completed => {
+                crate::db::entities::conversation_turn_run::ConversationTurnRunStatus::Completed
             }
-            if let Some(ts) = target_status.clone() {
-                let run_status = match artifact_status {
-                    ArtifactTurnFinishStatus::Completed => crate::db::entities::conversation_turn_run::ConversationTurnRunStatus::Completed,
-                    ArtifactTurnFinishStatus::Cancelled => crate::db::entities::conversation_turn_run::ConversationTurnRunStatus::Cancelled,
-                    ArtifactTurnFinishStatus::Interrupted => crate::db::entities::conversation_turn_run::ConversationTurnRunStatus::Interrupted,
-                    ArtifactTurnFinishStatus::Failed => crate::db::entities::conversation_turn_run::ConversationTurnRunStatus::Failed,
-                };
-                let incomplete = artifact_status != ArtifactTurnFinishStatus::Completed;
-                let active_run = latest_run.as_ref().filter(|run| {
+            ArtifactTurnFinishStatus::Cancelled => {
+                crate::db::entities::conversation_turn_run::ConversationTurnRunStatus::Cancelled
+            }
+            ArtifactTurnFinishStatus::Interrupted => {
+                crate::db::entities::conversation_turn_run::ConversationTurnRunStatus::Interrupted
+            }
+            ArtifactTurnFinishStatus::Failed => {
+                crate::db::entities::conversation_turn_run::ConversationTurnRunStatus::Failed
+            }
+        };
+        let incomplete = artifact_status != ArtifactTurnFinishStatus::Completed;
+        let active_run = latest_run.as_ref().filter(|run| {
                     matches!(
                         run.status,
                         crate::db::entities::conversation_turn_run::ConversationTurnRunStatus::Running
@@ -347,7 +367,25 @@ pub(crate) async fn handle_event(
     envelope: &EventEnvelope,
     broker: Option<&Arc<DelegationBroker>>,
 ) -> Result<(), DbError> {
+    if matches!(
+        envelope.payload,
+        AcpEvent::SessionStarted { .. }
+            | AcpEvent::NativeSessionTitle { .. }
+            | AcpEvent::TranscriptRolledOver { .. }
+    ) {
+        if let Some(state) = manager.get_state(&envelope.connection_id).await {
+            if state.read().await.main_agent_retired {
+                return Ok(());
+            }
+        }
+    }
     match &envelope.payload {
+        AcpEvent::SessionModes { .. } | AcpEvent::SessionConfigOptions { .. } => {
+            crate::commands::business_conversations::persist_connection_settings(
+                db_conn, manager, &envelope.connection_id,
+            ).await?;
+            Ok(())
+        }
         // NOTE: parent-side `delegate_to_agent` tool_call_id capture used to
         // live here (a `ToolCall` arm). It now runs in the dispatcher loop via
         // `register_delegation_tool_call_from_event`, off the DB-coupled worker
@@ -520,6 +558,22 @@ pub(crate) async fn handle_event(
             if claimed {
                 write_turn_status(db_conn, &state_arc, &emitter, cid, stop_reason).await?;
             }
+            if !state_arc.read().await.main_agent_retired {
+                let history_db = db_conn.clone();
+                tokio::spawn(async move {
+                    for delay in [0, 100, 350, 1000] {
+                        if delay > 0 {
+                            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                        }
+                        if let Err(e) =
+                            crate::commands::conversations::capture_business_tail(&history_db, cid)
+                                .await
+                        {
+                            tracing::warn!(conversation_id=cid,error=%e,"[business] terminal history capture failed");
+                        }
+                    }
+                });
+            }
 
             // Filesystem debounce, stat calls and inferred deliverable writes
             // are auxiliary. They run after the atomic user-visible terminal
@@ -613,13 +667,9 @@ pub(crate) async fn handle_event(
                     return Ok(());
                 };
                 let continues: Vec<String> = current.external_id.into_iter().collect();
-                let preserved = conversation_service::bind_external_id(
-                    db_conn,
-                    cid,
-                    transcript_id,
-                    &continues,
-                )
-                .await?;
+                let preserved =
+                    conversation_service::bind_external_id(db_conn, cid, transcript_id, &continues)
+                        .await?;
                 crate::commands::conversations::emit_conversation_upsert(&emitter, db_conn, cid)
                     .await;
                 crate::commands::conversations::emit_preserved_conversation(
@@ -780,6 +830,9 @@ async fn handle_terminal_event(
     let Some(entry) = cache.remove(connection_id) else {
         return Ok(());
     };
+    if entry.state.read().await.main_agent_retired {
+        return Ok(());
+    }
     let cid = entry.conversation_id;
     if conversation_branch_service::is_provisional_snapshot(db_conn, cid).await? {
         tracing::info!(
@@ -3027,6 +3080,20 @@ mod tests {
         conversation_id: i32,
     ) {
         try_cache_link(cache, manager, connection_id, conversation_id).await;
+    }
+
+    #[tokio::test]
+    async fn business_retired_parent_exit_does_not_cancel_the_new_main() {
+        let db=test_helpers::fresh_in_memory_db().await;
+        let folder=test_helpers::seed_folder(&db,"/isolated-retired-main").await;
+        let conv=conversation_service::create(&db.conn,folder,AgentType::Codex,None,None).await.unwrap();
+        let mgr=ConnectionManager::new();
+        mgr.connections.lock().await.insert("retired".into(),fake_connection_with_state("retired",Some(conv.id)));
+        mgr.get_state("retired").await.unwrap().write().await.main_agent_retired=true;
+        let mut cache=HashMap::new();
+        seed_cache(&mut cache,&mgr,"retired",conv.id).await;
+        handle_terminal_event(&db.conn,&mut cache,"retired").await.unwrap();
+        assert_eq!(read_row_status(&db,conv.id).await,ConversationStatus::InProgress);
     }
 
     #[tokio::test]

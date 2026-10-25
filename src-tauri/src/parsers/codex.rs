@@ -5830,6 +5830,7 @@ impl CodexParser {
                                             meta,
                                         },
                                         ContentBlock::ToolResult {
+                                            exit_code: None,
                                             tool_use_id: Some(tool_id),
                                             output_preview: None,
                                             is_error: false,
@@ -6092,6 +6093,7 @@ impl CodexParser {
                                                     meta,
                                                 },
                                                 ContentBlock::ToolResult {
+                                                    exit_code: None,
                                                     tool_use_id: Some(dedup_id),
                                                     output_preview: None,
                                                     is_error: false,

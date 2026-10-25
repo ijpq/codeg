@@ -2075,6 +2075,7 @@ export function isTurnAnswerPart(part: AdaptedContentPart): boolean {
       return true
     case "reasoning":
     case "tool-call":
+    case "tool-group":
     case "tool-result":
     case "delegation-status-group":
     case "background-task-group":

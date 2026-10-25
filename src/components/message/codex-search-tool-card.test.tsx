@@ -52,9 +52,11 @@ function renderParts(parts: AdaptedContentPart[], expand = true) {
       <ContentPartsRenderer parts={parts} role="assistant" />
     </NextIntlClientProvider>
   )
-  const header = screen.getAllByRole("button")[0]!
-  if (expand && header.getAttribute("aria-expanded") === "false") {
-    fireEvent.click(header)
+  if (expand) {
+    const header = screen.getAllByRole("button")[0]!
+    if (header.getAttribute("aria-expanded") === "false") {
+      fireEvent.click(header)
+    }
   }
   return result
 }

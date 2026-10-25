@@ -64,7 +64,9 @@ export const GenericRow = memo(function GenericRow({
       (failed && !recoveredKeys.has(step.key)) || tool.status === "awaiting",
   })
   const args = useMemo(() => argumentsText(part.input), [part.input])
-  const historyOutput = part.meta?.["codeg.historyOutput"] as { ref?: string } | undefined
+  const historyOutput = part.meta?.["codeg.historyOutput"] as
+    | { ref?: string }
+    | undefined
   const result = useDeferredHistory(
     historyOutput?.ref,
     part.errorText ?? part.output ?? "",

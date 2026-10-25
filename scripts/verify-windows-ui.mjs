@@ -8,6 +8,12 @@ import { createWriteStream } from "node:fs"
 import { resolve, join, relative, isAbsolute } from "node:path"
 import { randomUUID, randomBytes, createHash } from "node:crypto"
 import assert from "node:assert/strict"
+import { startGoalModel } from "./native-codex-model-fixture.mjs"
+import { startBusinessModel } from "./business-model-fixture.mjs"
+import {
+  businessAgentPage,
+  restoredBusinessPage,
+} from "./business-agent-page.mjs"
 const options = Object.fromEntries(
   process.argv.slice(2).reduce((pairs, arg, i, all) => {
     if (arg.startsWith("--")) pairs.push([arg.slice(2), all[i + 1]])
@@ -32,159 +38,22 @@ async function reservePort() {
   await new Promise((done) => server.close(done))
   return port
 }
-async function startGoalModel() {
-  let requests = 0
-  let finishNext = false
-  let ordinaryMode = false
-  const server = createServer(async (request, response) => {
-    if (request.method !== "POST") {
-      response.writeHead(404).end()
-      return
-    }
-    const chunks = []
-    for await (const chunk of request) chunks.push(chunk)
-    const body = JSON.parse(Buffer.concat(chunks).toString())
-    requests++
-    const text = ordinaryMode
-      ? "SYNTHETIC ORDINARY RESPONSE"
-      : "SYNTHETIC NATIVE GOAL RESPONSE"
-    let item = {
-      id: `msg_${requests}`,
-      type: "message",
-      role: "assistant",
-      status: "completed",
-      content: [{ type: "output_text", text, annotations: [] }],
-    }
-    const result = {
-      id: `resp_${requests}`,
-      object: "response",
-      created_at: 1791763200,
-      status: "completed",
-      model: body.model,
-      output: [item],
-      usage: {
-        input_tokens: 42,
-        output_tokens: 3,
-        total_tokens: 45,
-        input_tokens_details: { cached_tokens: 0 },
-        output_tokens_details: { reasoning_tokens: 0 },
-      },
-    }
-    let events = [
-      {
-        type: "response.created",
-        response: { ...result, status: "in_progress", output: [] },
-      },
-      {
-        type: "response.output_item.added",
-        output_index: 0,
-        item: { ...item, status: "in_progress", content: [] },
-      },
-      {
-        type: "response.content_part.added",
-        item_id: item.id,
-        output_index: 0,
-        content_index: 0,
-        part: { type: "output_text", text: "", annotations: [] },
-      },
-      {
-        type: "response.output_text.delta",
-        item_id: item.id,
-        output_index: 0,
-        content_index: 0,
-        delta: text,
-      },
-      {
-        type: "response.output_text.done",
-        item_id: item.id,
-        output_index: 0,
-        content_index: 0,
-        text,
-      },
-      { type: "response.output_item.done", output_index: 0, item },
-      { type: "response.completed", response: result },
-    ]
-    // Session title/warm-up requests may omit tools. Complete only on the
-    // actual Goal execution request that carries the native update tool.
-    if (finishNext) {
-      const available = [
-        ...(body.tools ?? []),
-        ...(body.input ?? [])
-          .filter((entry) => entry.type === "additional_tools")
-          .flatMap((entry) => entry.tools ?? []),
-      ]
-      const tools = available.flatMap((tool) =>
-        tool.type === "namespace"
-          ? tool.tools.map((entry) => ({ ...entry, namespace: tool.name }))
-          : [tool]
-      )
-      const tool =
-        tools.find((entry) => entry.name === "update_goal") ??
-        tools.find(
-          (entry) =>
-            entry.name === "exec" && entry.description?.includes("update_goal")
-        )
-      if (tool) {
-        finishNext = false
-        const custom = tool.type === "custom"
-        item = {
-          id: `fc_${requests}`,
-          call_id: `complete_goal_${requests}`,
-          type: custom ? "custom_tool_call" : "function_call",
-          name: tool.name,
-          ...(tool.namespace ? { namespace: tool.namespace } : {}),
-          ...(custom
-            ? { input: 'text(await tools.update_goal({status: "complete"}));' }
-            : { arguments: JSON.stringify({ status: "complete" }) }),
-          status: "completed",
-        }
-        result.output = [item]
-        events = [
-          {
-            type: "response.created",
-            response: { ...result, status: "in_progress", output: [] },
-          },
-          {
-            type: "response.output_item.added",
-            output_index: 0,
-            item: { ...item, status: "in_progress" },
-          },
-          { type: "response.output_item.done", output_index: 0, item },
-          { type: "response.completed", response: result },
-        ]
-      }
-    }
-    await delay(100)
-    if (!response.destroyed) {
-      response.writeHead(200, { "Content-Type": "text/event-stream" })
-      response.end(
-        events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join("")
-      )
-    }
-  })
-  await new Promise((done) => server.listen(0, "127.0.0.1", done))
-  return {
-    url: `http://127.0.0.1:${server.address().port}/v1`,
-    count: () => requests,
-    ordinary: (value) => {
-      ordinaryMode = value
-    },
-    completeNext: () => {
-      finishNext = true
-    },
-    close: async () => {
-      server.closeAllConnections()
-      await new Promise((done) => server.close(done))
-    },
-  }
-}
 const goalModel = options["native-tools"] ? await startGoalModel() : null
+const claudeModel = options["native-tools"] ? await startBusinessModel() : null
 async function enableNativeAgent(f) {
   if (!goalModel) return
   const pathKey =
     Object.keys(f.env).find((key) => key.toLowerCase() === "path") ?? "PATH"
   f.env[pathKey] = `${resolve(options["native-tools"])};${f.env[pathKey] ?? ""}`
   f.env.CODEX_PATH = join(resolve(options.server), "runtime", "codex.exe")
+  f.env.CLAUDE_CONFIG_DIR = join(f.root, "claude")
+  await mkdir(f.env.CLAUDE_CONFIG_DIR, { recursive: true })
+  f.env.ANTHROPIC_BASE_URL = claudeModel.url
+  f.env.ANTHROPIC_API_KEY = "isolated-synthetic-provider-only"
+  f.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1"
+  delete f.env.CLAUDE_CODE_OAUTH_TOKEN
+  delete f.env.ANTHROPIC_AUTH_TOKEN
+  delete f.env.ANTHROPIC_CUSTOM_HEADERS
   await writeFile(
     join(f.env.CODEX_HOME, "config.toml"),
     `model = "gpt-6-astra"
@@ -1321,6 +1190,7 @@ try {
   )
   await enableNativeAgent(f)
   app = await startDesktop(installation, f, "upgraded-startup")
+  let businessSaved
   try {
     const conversations = await desktopApi(app.page)("list_all_conversations")
     assert.ok(
@@ -1360,6 +1230,29 @@ try {
       CODEG_TEST_WEBVIEW_CDP: `http://127.0.0.1:${app.port}`,
       CODEG_BROWSER_EVIDENCE: join(output, "webview-scroll"),
     })
+    businessSaved = await businessAgentPage({
+      page: app.page,
+      api: desktopApi(app.page),
+      f,
+      conversation: saved,
+      name: "setup",
+      goalModel,
+      claudeModel,
+      report,
+      output,
+    })
+  } finally {
+    await stopDesktop(app)
+  }
+  app = await startDesktop(installation, f, "business-restart")
+  try {
+    await restoredBusinessPage(
+      app.page,
+      desktopApi(app.page),
+      businessSaved,
+      report,
+      "setup"
+    )
   } finally {
     await stopDesktop(app)
   }
@@ -1427,6 +1320,17 @@ try {
       await allDeliverablesPage(page, api, s, conversation, "server-web")
     await nativeGoalPage(page, api, s, conversation, "server-web")
     await nativeDraftGoalPage(page, api, "server-web")
+    await businessAgentPage({
+      page,
+      api,
+      f: s,
+      conversation,
+      name: "server-web",
+      goalModel,
+      claudeModel,
+      report,
+      output,
+    })
     if (options.baseline !== "true")
       report.checks.push({
         name: "server-migrations",
@@ -1449,6 +1353,7 @@ try {
   throw error
 } finally {
   await goalModel?.close()
+  await claudeModel?.close()
   await writeFile(
     join(output, "verification.json"),
     JSON.stringify(report, null, 2)

@@ -422,7 +422,7 @@ describe("CompletedTurnContent", () => {
     )
 
     expect(screen.getByText("Reply")).toBeInTheDocument()
-    expect(screen.getByText("1m 9s")).toBeInTheDocument()
+    expect(screen.getByText("Worked for 1m 9s")).toBeInTheDocument()
     expect(queryToggle()).toBeNull()
     expect(screen.getByText("Just an answer.")).toBeInTheDocument()
   })

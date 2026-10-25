@@ -589,6 +589,7 @@ mod tests {
             text: "SECRET_CHAIN_OF_THOUGHT".into(),
         });
         hidden.blocks.push(ContentBlock::ToolResult {
+            exit_code: None,
             tool_use_id: None,
             output_preview: Some("UNRELATED_DEBUG_LOG".into()),
             is_error: false,

@@ -722,8 +722,10 @@ describe("ConversationDetailPanel session-load failure surface", () => {
     // it is always the more recently established of the two. `detail` is only
     // the cold-open fallback.
     expect(source).toContain(
-      "runtimeExternalId ?? detail?.summary.external_id ?? undefined"
+      "const externalId = resolveConversationSessionId({"
     )
+    expect(source).toContain("runtimeId: runtimeExternalId")
+    expect(source).toContain("sessions: business.state?.sessions")
     // The regression this guards, and it is not cosmetic. A fork re-points
     // THIS row at S2 and inserts a sibling row holding S1. The panel learns S2
     // from the fork response immediately, but `detail` still says S1 until its

@@ -29,7 +29,11 @@ export const ThoughtRow = memo(function ThoughtRow({
   const t = useTranslations("Folder.chat.activity")
   const statusText = useStatusText()
   const [open, setOpen] = useDisclosure(step.key, { defaultOpen: false })
-  const content = useDeferredHistory(step.part.deferredRef, step.part.content, open)
+  const content = useDeferredHistory(
+    step.part.deferredRef,
+    step.part.content,
+    open
+  )
   const body = useMemo(
     () => thoughtBodyWithoutTitle(content, step.title).trim(),
     [content, step.title]

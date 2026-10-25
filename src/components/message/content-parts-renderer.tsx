@@ -1,7 +1,17 @@
 import { getDeferredHistoryContent } from "@/lib/api"
 import { renderCitationMarkdown, type CitationSource } from "@/lib/citations"
-import { CitationSourcesContext, CitationSourcesScope } from "./citation-sources-context"
-import { memo, useCallback, useContext, useMemo, useState, type ReactNode } from "react"
+import {
+  CitationSourcesContext,
+  CitationSourcesScope,
+} from "./citation-sources-context"
+import {
+  memo,
+  useCallback,
+  useContext,
+  useMemo,
+  useState,
+  type ReactNode,
+} from "react"
 import { useTranslations } from "next-intl"
 
 import type { AdaptedContentPart } from "@/lib/adapters/ai-elements-adapter"
@@ -187,7 +197,6 @@ const DeferredTextPart = memo(function DeferredTextPart({
   )
 })
 
-
 // Codex Plan-mode `<proposed_plan>` block: free-form markdown plan document
 // rendered inside card chrome (distinct from the TodoWrite checklist).
 //
@@ -309,7 +318,13 @@ function renderPart(
         />
       )
     case "deferred-text":
-      return <DeferredTextPart key={`deferred-${keyId}`} part={part} citationSources={[]} />
+      return (
+        <DeferredTextPart
+          key={`deferred-${keyId}`}
+          part={part}
+          citationSources={[]}
+        />
+      )
     case "tool-call":
       return (
         <HostedToolCall key={`tc-${part.toolCallId ?? keyId}`} part={part} />
@@ -419,6 +434,12 @@ const ContentPartsBody = memo(function ContentPartsBody({
   )
 })
 
-export const ContentPartsRenderer = memo(function ContentPartsRenderer(props: ContentPartsRendererProps) {
-  return <CitationSourcesScope parts={props.parts}><ContentPartsBody {...props} /></CitationSourcesScope>
+export const ContentPartsRenderer = memo(function ContentPartsRenderer(
+  props: ContentPartsRendererProps
+) {
+  return (
+    <CitationSourcesScope parts={props.parts}>
+      <ContentPartsBody {...props} />
+    </CitationSourcesScope>
+  )
 })

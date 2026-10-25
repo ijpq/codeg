@@ -20,6 +20,7 @@ pub mod cli_access;
 /// path validation and URI encoding stay compiled in every mode so their tests
 /// run without the tauri stack.
 pub mod clipboard;
+pub mod codex_quota;
 /// The ✨ commit message generator (both runtimes).
 pub mod commit_message;
 /// Computer use: sharing windows, the helper, the agent reads — the desktop
@@ -29,10 +30,9 @@ pub mod computer;
 /// the shared codeg-mcp plumbing reads them.
 pub mod computer_tools;
 pub mod config_sync;
-pub mod conversation_tags;
 mod conversation_branch_context;
-pub mod codex_quota;
 pub mod conversation_branches;
+pub mod conversation_tags;
 pub mod conversations;
 /// "New folder" in the directory browser (both runtimes).
 pub mod create_directory;
@@ -59,10 +59,10 @@ pub mod logging;
 pub mod mcp;
 pub mod mcp_service;
 pub mod model_provider;
-pub mod office_tools;
-pub mod open_in;
 #[cfg(feature = "tauri-runtime")]
 pub mod notification;
+pub mod office_tools;
+pub mod open_in;
 pub mod pet;
 pub mod project_boot;
 pub mod question;
@@ -84,3 +84,6 @@ pub mod work_task;
 pub mod workspace_state;
 #[cfg(feature = "tauri-runtime")]
 pub mod workspace_windows;
+
+pub mod business_conversations;
+pub(crate) mod business_skills;

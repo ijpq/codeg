@@ -1,6 +1,6 @@
 #[cfg(any(test, feature = "test-utils"))]
 use std::collections::VecDeque;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,7 +30,9 @@ use crate::acp::question::{
 };
 use crate::acp::terminal_runtime::TerminalShellRuntimeConfig;
 use crate::acp::types::{
-    AcpEvent, AgentOptionsSnapshot, ConfigStaleKind, ConnectionInfo, ConnectionStatus, ForkResultInfo, PermissionAnswerOrigin, PromptCapabilitiesInfo, PromptInputBlock, AcpCancelResult, ForkProtocolResult, SteerResult,
+    AcpCancelResult, AcpEvent, AgentOptionsSnapshot, ConfigStaleKind, ConnectionInfo,
+    ConnectionStatus, ForkProtocolResult, ForkResultInfo, PermissionAnswerOrigin,
+    PromptCapabilitiesInfo, PromptInputBlock, SteerResult,
 };
 use crate::artifact_tracker::{ArtifactTracker, ArtifactTurnFinishStatus};
 use crate::db::entities::conversation::{self, ConversationKind, ConversationStatus};
@@ -564,6 +566,7 @@ pub struct ConnectionManager {
     /// duplicate HTTP request therefore waits for the first restore and then
     /// observes/reuses its published connection instead of racing it.
     restore_request_locks: Arc<Mutex<HashMap<i32, Arc<Mutex<()>>>>>,
+    business_workers: Arc<Mutex<HashSet<i32>>>,
     /// Serializes every operation that needs an exclusive writer for a
     /// persisted ACP session (restore and native fork source loading). Codex
     /// rejects a second writer even when it comes from a different CodeG
@@ -703,6 +706,13 @@ impl Default for ConnectionManager {
 }
 
 impl ConnectionManager {
+    pub(crate) async fn claim_business_worker(&self, cid: i32) -> bool {
+        self.business_workers.lock().await.insert(cid)
+    }
+    pub(crate) async fn release_business_worker(&self, cid: i32) {
+        self.business_workers.lock().await.remove(&cid);
+    }
+
     pub fn new() -> Self {
         Self {
             connections: Arc::new(Mutex::new(HashMap::new())),
@@ -710,6 +720,7 @@ impl ConnectionManager {
             draining: Arc::new(Mutex::new(Vec::new())),
             spawn_locks: Arc::new(Mutex::new(HashMap::new())),
             restore_request_locks: Arc::new(Mutex::new(HashMap::new())),
+            business_workers: Arc::new(Mutex::new(HashSet::new())),
             session_operation_locks: Arc::new(Mutex::new(HashMap::new())),
             restore_locks: Arc::new(Mutex::new(HashMap::new())),
             branch_recovery_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -737,6 +748,7 @@ impl ConnectionManager {
             draining: self.draining.clone(),
             spawn_locks: self.spawn_locks.clone(),
             restore_request_locks: self.restore_request_locks.clone(),
+            business_workers: self.business_workers.clone(),
             session_operation_locks: self.session_operation_locks.clone(),
             restore_locks: self.restore_locks.clone(),
             branch_recovery_locks: self.branch_recovery_locks.clone(),
@@ -809,6 +821,7 @@ impl ConnectionManager {
             draining: Arc::new(Mutex::new(Vec::new())),
             spawn_locks: Arc::new(Mutex::new(HashMap::new())),
             restore_request_locks: Arc::new(Mutex::new(HashMap::new())),
+            business_workers: Arc::new(Mutex::new(HashSet::new())),
             session_operation_locks: Arc::new(Mutex::new(HashMap::new())),
             restore_locks: Arc::new(Mutex::new(HashMap::new())),
             branch_recovery_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -1061,11 +1074,25 @@ impl ConnectionManager {
         // re-entrant: nothing reachable from here calls `spawn_agent` again.
         let _restore_guard = self.external_restore_lock.read().await;
 
-        let outcome = self.spawn_agent_with_requirements(
-            agent_type, working_dir, session_id, runtime_env, owner_window_label,
-            emitter, preferred_mode_id, preferred_config_values, false, None, cli_root,
-        ).await?;
-        Ok(SpawnOutcome { connection_id: outcome.connection_id, reused: outcome.reused_existing })
+        let outcome = self
+            .spawn_agent_with_requirements(
+                agent_type,
+                working_dir,
+                session_id,
+                runtime_env,
+                owner_window_label,
+                emitter,
+                preferred_mode_id,
+                preferred_config_values,
+                false,
+                None,
+                cli_root,
+            )
+            .await?;
+        Ok(SpawnOutcome {
+            connection_id: outcome.connection_id,
+            reused: outcome.reused_existing,
+        })
     }
 
     /// Start a brand-new ACP session and do not publish it to a caller until
@@ -1883,6 +1910,55 @@ impl ConnectionManager {
         parent_conversation_id: Option<i32>,
         parent_tool_use_id: Option<String>,
     ) -> Result<ConversationActivationOutcome, AcpError> {
+        self.activate_conversation_connection(
+            connection_id,
+            conversation_id,
+            folder_id,
+            expected_session_id,
+            require_codeg_mcp,
+            parent_conversation_id,
+            parent_tool_use_id,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn activate_business_conversation(
+        &self,
+        connection_id: &str,
+        folder_id: i32,
+        external: &str,
+        db: &AppDatabase,
+        request: &crate::db::service::business_conversation_service::AgentSwitchRequest,
+    ) -> Result<ConversationActivationOutcome, AcpError> {
+        self.activate_conversation_connection(
+            connection_id,
+            request.conversation_id,
+            folder_id,
+            external,
+            request.target_agent == AgentType::Codex,
+            None,
+            None,
+            Some((db, request)),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn activate_conversation_connection(
+        &self,
+        connection_id: &str,
+        conversation_id: i32,
+        folder_id: i32,
+        expected_session_id: &str,
+        require_codeg_mcp: bool,
+        parent_conversation_id: Option<i32>,
+        parent_tool_use_id: Option<String>,
+        business: Option<(
+            &AppDatabase,
+            &crate::db::service::business_conversation_service::AgentSwitchRequest,
+        )>,
+    ) -> Result<ConversationActivationOutcome, AcpError> {
         let restore_lock = {
             let mut locks = self.restore_locks.lock().await;
             locks
@@ -1971,14 +2047,28 @@ impl ConnectionManager {
                     continue;
                 }
                 let state = conn.state.read().await;
-                if state.conversation_id != Some(conversation_id) {
+                if state.conversation_id != Some(conversation_id) || state.main_agent_retired {
                     continue;
                 }
                 if state.turn_in_flight || state.status == ConnectionStatus::Prompting {
                     return Err(AcpError::TurnInProgress);
                 }
-                old_ids.push(id.clone());
+                // Keep parent processes alive while legitimate background work
+                // remains. They retain provenance, but cannot accept main turns.
+                if !state.has_active_turn_interaction() && state.active_delegations.is_empty() {
+                    old_ids.push(id.clone());
+                }
                 old_states.push(Arc::clone(&conn.state));
+            }
+
+            if let Some((db, request)) = business {
+                crate::db::service::business_conversation_service::activate(
+                    &db.conn,
+                    request,
+                    expected_session_id,
+                )
+                .await
+                .map_err(|e| AcpError::protocol(e.to_string()))?;
             }
 
             // All validation is complete. These writes happen while the
@@ -1988,11 +2078,13 @@ impl ConnectionManager {
                 let mut state = target_state.write().await;
                 state.conversation_id = Some(conversation_id);
                 state.folder_id = Some(folder_id);
+                state.main_agent_retired = false;
             }
             for state in old_states {
                 let mut state = state.write().await;
-                state.conversation_id = None;
-                state.folder_id = None;
+                state.main_agent_retired = true;
+                // Preserve the original business id for child completion and
+                // permission routing. Active lookups exclude retired mains.
             }
 
             let mut removed = Vec::with_capacity(old_ids.len());
@@ -2119,6 +2211,11 @@ impl ConnectionManager {
             .map_err(|_| AcpError::ProcessExited)?;
         {
             let mut s = state_arc.write().await;
+            if s.main_agent_retired {
+                return Err(AcpError::protocol(
+                    "This engine was handed off; restore the current business agent",
+                ));
+            }
             if s.turn_in_flight {
                 // Names the gate, not just the outcome: the linked path checks
                 // the same flag once before its side effects and again here, and
@@ -2426,6 +2523,22 @@ impl ConnectionManager {
             }
         }
 
+        let business_cid = if let Some(cid) = conversation_id {
+            Some(cid)
+        } else if let Some(state) = self.get_state(conn_id).await {
+            state.read().await.conversation_id
+        } else {
+            None
+        };
+        let _business_guard = match business_cid {
+            Some(cid) => Some(self.lock_restore_request(cid).await?),
+            None => None,
+        };
+        if let Some(cid) = business_cid {
+            crate::commands::business_conversations::validate_prompt_target(db, self, cid, conn_id)
+                .await?;
+        }
+
         // Acquire the per-connection prompt lock for the entire link-check
         // + DB write + emit + cmd_tx.send sequence. Two concurrent prompts
         // (multiple browser tabs of the same conversation; chat-channel
@@ -2483,6 +2596,14 @@ impl ConnectionManager {
             }
         }
 
+        if let (Some(cid), Some(id)) = (business_cid, client_message_id.as_deref()) {
+            crate::db::service::business_conversation_service::verify_prompt_body(
+                &db.conn, cid, id, &blocks,
+            )
+            .await
+            .map_err(|e| AcpError::protocol(e.to_string()))?;
+        }
+
         // The original request reached `send_prompt_inner` and was accepted,
         // but its HTTP/Tauri response may have been lost. The same id is a
         // status recovery request, not a second turn — return after validating
@@ -2500,6 +2621,9 @@ impl ConnectionManager {
                 if artifact_service::was_prompt_accepted(&db.conn, cid, id)
                     .await
                     .map_err(|e| AcpError::protocol(e.to_string()))?
+                    || crate::db::service::business_conversation_service::prompt_is_accepted(&db.conn, cid, id)
+                        .await
+                        .map_err(|e| AcpError::protocol(e.to_string()))?
                     || conversation_branch_service::was_first_prompt_accepted(&db.conn, cid, id)
                         .await
                         .map_err(|e| AcpError::protocol(e.to_string()))?
@@ -2816,6 +2940,21 @@ impl ConnectionManager {
             guard
         };
 
+        let business_admission = if let Some(cid) = state_arc.read().await.conversation_id {
+            crate::commands::business_conversations::prepare_prompt(
+                db,
+                cid,
+                client_message_id.as_deref(),
+                &blocks,
+            )
+            .await?
+        } else {
+            None
+        };
+        if business_admission.as_ref().is_some_and(|a| !a.send) {
+            return Ok(state_arc.read().await.conversation_id);
+        }
+
         // Centralized status transition: every prompt send flips the
         // conversation row to InProgress. This MUST happen on every call
         // (including the already-linked path) so that a follow-up turn whose
@@ -3054,6 +3193,15 @@ impl ConnectionManager {
             );
         }
 
+        if let Some(context) = business_admission.as_ref().and_then(|a| a.context.as_ref()) {
+            blocks.insert(
+                0,
+                PromptInputBlock::Text {
+                    text: context.clone(),
+                },
+            );
+        }
+
         // We hold `_prompt_guard` here, so call the lock-free inner helper —
         // re-entering `send_prompt` would try to acquire the same mutex and
         // deadlock. The helper reserves channel capacity FIRST and only then
@@ -3079,6 +3227,18 @@ impl ConnectionManager {
             .await
         {
             Ok(()) => {
+                if let Some(admission) = business_admission.as_ref() {
+                    crate::db::service::business_conversation_service::accept_prompt(
+                        &db.conn,
+                        admission.conversation_id,
+                        &admission.message_id,
+                        admission.session_id,
+                        admission.context_sequence,
+                        admission.context_boundary,
+                    )
+                    .await
+                    .map_err(|e| AcpError::protocol(e.to_string()))?;
+                }
                 if branch_snapshot.is_some() {
                     if let Some(cid) = conversation_id_for_status {
                         let session_id = state_arc.read().await.external_id.clone();
@@ -3215,6 +3375,15 @@ impl ConnectionManager {
                 Ok(conversation_id_for_status)
             }
             Err(send_err) => {
+                if let Some(admission) = business_admission.as_ref() {
+                    let _ =
+                        crate::db::service::business_conversation_service::release_unsent_prompt(
+                            &db.conn,
+                            admission.conversation_id,
+                            &admission.message_id,
+                        )
+                        .await;
+                }
                 if artifact_run_id.is_some() {
                     self.artifact_tracker.cancel_unsent_turn(conn_id).await;
                     let mut state = state_arc.write().await;
@@ -3324,7 +3493,9 @@ impl ConnectionManager {
         if config_id == "collaboration_mode" {
             if let Some(state) = self.get_state(conn_id).await {
                 if state.read().await.goal_active {
-                    return Err(AcpError::protocol("Pause the active goal before switching execution mode"));
+                    return Err(AcpError::protocol(
+                        "Pause the active goal before switching execution mode",
+                    ));
                 }
             }
         }
@@ -3485,6 +3656,31 @@ impl ConnectionManager {
         } else if matches!(action, GoalControlAction::Set | GoalControlAction::Resume) {
             return Err(AcpError::protocol("Goal capabilities are not known yet"));
         }
+        let _business_start_guard =
+            if matches!(action, GoalControlAction::Set | GoalControlAction::Resume) {
+                let cid = state_arc.read().await.conversation_id.or(conversation_id);
+                if let Some(cid) = cid {
+                    let guard = self.lock_restore_request(cid).await?;
+                    crate::commands::business_conversations::validate_prompt_target(
+                        &AppDatabase { conn: db.clone() },
+                        self,
+                        cid,
+                        conn_id,
+                    )
+                    .await?;
+                    crate::commands::business_conversations::validate_goal_context(
+                        &AppDatabase { conn: db.clone() },
+                        cid,
+                    )
+                    .await?;
+                    Some(guard)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
         // Share the prompt/fork lock only for starts. Pause/clear must remain
         // out of band so they can stop work while another request owns it.
         let _start_guard = if matches!(action, GoalControlAction::Set | GoalControlAction::Resume) {
@@ -5421,6 +5617,20 @@ impl ConnectionManager {
         request_source: &str,
         frontend_generation: Option<u64>,
     ) -> Result<(), AcpError> {
+        if request_source != "internal" {
+            if let Some(state) = self.get_state(conn_id).await {
+                let state = state.read().await;
+                if state.main_agent_retired
+                    && (state.has_active_turn_interaction() || !state.active_delegations.is_empty())
+                {
+                    // The composer detaches its previous engine after a
+                    // handoff. Its legitimate children still own this parent;
+                    // the idle sweep reclaims it after they have settled.
+                    tracing::info!(connection_id=conn_id, request_source, "[business] detached retired main with active children");
+                    return Ok(());
+                }
+            }
+        }
         if let Some(run) = artifact_service::latest_run_for_connection(db, conn_id)
             .await
             .map_err(|error| AcpError::protocol(error.to_string()))?
@@ -6876,7 +7086,7 @@ impl ConnectionManager {
         let connections = self.connections.lock().await;
         for (id, conn) in connections.iter() {
             let state = conn.state.read().await;
-            if state.conversation_id == Some(conversation_id) {
+            if state.conversation_id == Some(conversation_id) && !state.main_agent_retired {
                 return Some(id.clone());
             }
         }
@@ -9588,13 +9798,27 @@ mod tests {
         assert!(rx.try_recv().is_err());
         mgr.get_state("goal-create").await.unwrap().write().await.goal_actions = Some(vec!["set".into(), "resume".into()]);
         let responder = tokio::spawn(async move {
-            let Some(ConnectionCommand::GoalControl { action, objective, reply }) = rx.recv().await else { panic!("goal command") };
+            let Some(ConnectionCommand::GoalControl {
+                action,
+                objective,
+                reply,
+            }) = rx.recv().await
+            else {
+                panic!("goal command")
+            };
             assert_eq!(action, GoalControlAction::Set);
             assert_eq!(objective.as_deref(), Some("ship"));
             reply.unwrap().send(true).unwrap();
             rx
         });
-        mgr.goal_control_with_objective(&db.conn, "goal-create", GoalControlAction::Set, Some("  ship  ".into())).await.unwrap();
+        mgr.goal_control_with_objective(
+            &db.conn,
+            "goal-create",
+            GoalControlAction::Set,
+            Some("  ship  ".into()),
+        )
+        .await
+        .unwrap();
         let mut rx = responder.await.unwrap();
         assert!(rx.try_recv().is_err(), "creating a goal must not cancel it");
     }

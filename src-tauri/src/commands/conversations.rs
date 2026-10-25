@@ -1632,6 +1632,8 @@ async fn get_snapshot_branch_page(
         .await?;
         let source_before = if source_cursor == "latest" {
             None
+        } else if source_cursor.starts_with("business:") {
+            Some(source_cursor.to_owned())
         } else {
             Some(format!("codex:{source_cursor}"))
         };
@@ -1672,7 +1674,7 @@ async fn get_snapshot_branch_page(
             next_cursor: source_page
                 .as_ref()
                 .and_then(|page| page.next_cursor.as_deref())
-                .and_then(|cursor| cursor.strip_prefix("codex:"))
+                .and_then(|cursor| cursor.strip_prefix("codex:").or_else(|| cursor.starts_with("business:").then_some(cursor)))
                 .map(|cursor| format!("{SOURCE_CURSOR_PREFIX}{cursor}")),
             has_more: source_page.as_ref().is_some_and(|page| page.has_more),
             loaded_turns: branch_detail.turns.len() as u32,
@@ -1805,6 +1807,9 @@ struct DeferredHistoryContentRef {
     kind: String,
     tool_use_id: Option<String>,
     content_sha256: String,
+    /// Pin the original Codex transcript across business-agent switches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_session: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1899,6 +1904,7 @@ fn defer_heavy_tool_outputs(
                 continue;
             };
             let reference = DeferredHistoryContentRef {
+                source_session: None,
                 version: 1,
                 conversation_id,
                 start_offset: window.start_offset,
@@ -1939,6 +1945,7 @@ fn defer_heavy_tool_outputs(
                     if text.len() > HISTORY_REASONING_DEFER_THRESHOLD_BYTES =>
                 {
                     let reference = DeferredHistoryContentRef {
+                        source_session: None,
                         version: 1,
                         conversation_id,
                         start_offset: window.start_offset,
@@ -1988,6 +1995,7 @@ fn defer_history_image(
         return;
     }
     let reference = DeferredHistoryContentRef {
+        source_session: None,
         version: 1,
         conversation_id,
         start_offset: window.start_offset,
@@ -2054,14 +2062,35 @@ pub async fn get_deferred_history_content_core(
     let summary = conversation_service::get_by_id(conn, reference.conversation_id)
         .await
         .map_err(AppCommandError::from)?;
-    if summary.agent_type != AgentType::Codex {
+    let pinned = if let Some(external) = reference.source_session.as_ref() {
+        let owned = summary.agent_type == AgentType::Codex
+            && summary.external_id.as_ref() == Some(external)
+            || crate::db::service::business_conversation_service::session_owner(
+                conn,
+                AgentType::Codex,
+                external,
+            )
+            .await
+            .map_err(AppCommandError::from)?
+                == Some(reference.conversation_id);
+        if !owned {
+            return Err(AppCommandError::invalid_input(
+                "History source is not owned by this business",
+            ));
+        }
+        Some(external.clone())
+    } else {
+        None
+    };
+    if pinned.is_none() && summary.agent_type != AgentType::Codex {
         return Err(AppCommandError::invalid_input(
             "History content reference does not target a Codex conversation",
         ));
     }
-    let session_id = summary
-        .external_id
+    let session_id = pinned
+        .or(summary.external_id)
         .ok_or_else(|| AppCommandError::invalid_input("Conversation has no durable session"))?;
+    let agent_env = agent_setting_service::load_agent_env(conn, AgentType::Codex).await;
     let cwd = match summary.origin_cwd {
         Some(cwd) => Some(cwd),
         None => folder_service::get_folder_by_id(conn, summary.folder_id)
@@ -2071,7 +2100,7 @@ pub async fn get_deferred_history_content_core(
             .map(|folder| folder.path),
     };
     let range = tokio::task::spawn_blocking(move || {
-        CodexParser::new().get_conversation_range_between(
+        CodexParser::for_env(&agent_env).get_conversation_range_between(
             &session_id,
             reference.start_offset,
             reference.end_offset,
@@ -2310,6 +2339,12 @@ async fn get_folder_conversation_core_impl(
         return Err(AppCommandError::task_execution_failed(
             "Invalid conversation branch cycle",
         ));
+    }
+    if crate::db::service::business_conversation_service::is_managed(conn, conversation_id)
+        .await
+        .map_err(AppCommandError::from)?
+    {
+        return get_business_conversation_detail(conn, conversation_id, history_request).await;
     }
     let relation = conversation_branch_service::get_info(conn, conversation_id)
         .await
@@ -2721,6 +2756,18 @@ async fn get_folder_conversation_raw_impl(
         strip_branch_snapshot_context(&mut turns);
     }
     strip_branch_merge_context(&mut turns);
+    if crate::db::service::business_conversation_service::is_managed(conn, conversation_id)
+        .await.map_err(AppCommandError::from)? {
+        // Only our injected user-side transport metadata is hidden. Assistant
+        // output, including examples of these tags, must remain byte-for-byte.
+        for turn in turns.iter_mut().filter(|turn| matches!(turn.role, TurnRole::User)) {
+            strip_context_marker_from_turn(
+                turn,
+                "<codeg-business-context>",
+                "</codeg-business-context>",
+            );
+        }
+    }
 
     // If we resolved a different external_id (e.g. ACP UUID → parser branch ID,
     // or a Claude `/clear` transcript rollover), update the database so future
@@ -2735,7 +2782,16 @@ async fn get_folder_conversation_raw_impl(
     // in place instead of splitting a sidebar clone.
     let mut summary = summary;
     if let Some(new_ext_id) = resolved_ext_id {
-        if matches!(summary.agent_type, AgentType::ClaudeCode) {
+        if crate::db::service::business_conversation_service::is_managed(conn, conversation_id)
+            .await.map_err(AppCommandError::from)? {
+            let expected = summary.external_id.as_deref().unwrap_or_default();
+            match crate::db::service::business_conversation_service::bind_managed_external_if_current(
+                conn, conversation_id, summary.agent_type, expected, &new_ext_id,
+            ).await {
+                Ok(()) => summary.external_id = Some(new_ext_id),
+                Err(e) => tracing::warn!(conversation_id,error=%e,"[business] ignored obsolete history rollover"),
+            }
+        } else if matches!(summary.agent_type, AgentType::ClaudeCode) {
             let continues: Vec<String> = summary.external_id.iter().cloned().collect();
             // Refused when another row already holds the successor — the
             // rollover's own file can have been imported as its own
@@ -2843,6 +2899,7 @@ async fn get_folder_conversation_raw_impl(
             let mut preview = merge.summary_preview;
             if merge.summary_bytes > preview.len() as i64 {
                 let reference = DeferredHistoryContentRef {
+                    source_session: None,
                     version: 1,
                     conversation_id,
                     start_offset: 0,
@@ -2881,6 +2938,9 @@ async fn get_folder_conversation_raw_impl(
     let merge_db_elapsed_ms = merge_db_started.elapsed().as_millis() as u64;
     if let Some(window) = history_read_metrics {
         defer_heavy_tool_outputs(&mut turns, conversation_id, window);
+        if let Some(external) = summary.external_id.as_deref() {
+            pin_history_sources(&mut turns, conversation_id, external);
+        }
     }
     let artifacts_db_started = std::time::Instant::now();
     let artifact_runs = if history_page.is_some() {
@@ -4451,6 +4511,214 @@ fn parse_error_to_app_error(error: ParseError) -> AppCommandError {
         ParseError::Db(err) => AppCommandError::database_error("Database operation failed")
             .with_detail(err.to_string()),
     }
+}
+
+/// Rewrite only CodeG-authored opaque load tokens, never user/model prose.
+fn pin_history_sources(turns: &mut [MessageTurn], cid: i32, external: &str) {
+    fn pin(encoded: &str, kind: &str, cid: i32, external: &str) -> Option<String> {
+        let bytes = URL_SAFE_NO_PAD.decode(encoded).ok()?;
+        let mut reference: DeferredHistoryContentRef = serde_json::from_slice(&bytes).ok()?;
+        if reference.version != 1
+            || reference.conversation_id != cid
+            || reference.kind != kind
+            || reference.source_session.is_some()
+        {
+            return None;
+        }
+        reference.source_session = Some(external.to_owned());
+        encode_deferred_history_ref(&reference)
+    }
+    fn pin_image(uri: &mut Option<String>, cid: i32, external: &str) {
+        let encoded = uri
+            .as_deref()
+            .and_then(|uri| uri.strip_prefix(HISTORY_DEFERRED_IMAGE_URI_PREFIX))
+            .and_then(|encoded| pin(encoded, "image", cid, external));
+        if let Some(encoded) = encoded {
+            *uri = Some(format!("{HISTORY_DEFERRED_IMAGE_URI_PREFIX}{encoded}"));
+        }
+    }
+    for turn in turns {
+        for block in &mut turn.blocks {
+            match block {
+                ContentBlock::ToolUse {
+                    meta: Some(meta), ..
+                } => {
+                    if let Some(reference) = meta
+                        .get_mut("codeg.historyOutput")
+                        .and_then(|output| output.get_mut("ref"))
+                    {
+                        if let Some(encoded) = reference
+                            .as_str()
+                            .and_then(|encoded| pin(encoded, "tool_output", cid, external))
+                        {
+                            *reference = serde_json::Value::String(encoded);
+                        }
+                    }
+                }
+                ContentBlock::Thinking { text } => {
+                    if let Some((preview, encoded)) =
+                        text.rsplit_once(HISTORY_DEFERRED_REASONING_MARKER_PREFIX)
+                    {
+                        if let Some(encoded) = encoded
+                            .strip_suffix("-->")
+                            .and_then(|encoded| pin(encoded, "reasoning", cid, external))
+                        {
+                            *text = format!(
+                                "{preview}{HISTORY_DEFERRED_REASONING_MARKER_PREFIX}{encoded}-->"
+                            );
+                        }
+                    }
+                }
+                ContentBlock::Image { uri, .. } => pin_image(uri, cid, external),
+                ContentBlock::ImageGeneration {
+                    image: Some(image), ..
+                } => pin_image(&mut image.uri, cid, external),
+                ContentBlock::ToolResult { images, .. } => {
+                    for image in images {
+                        pin_image(&mut image.uri, cid, external);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Persist a bounded native tail using the exact active mapping. Parsing is
+/// outside SQLite transactions; a concurrent mapping change discards this read.
+pub(crate) async fn capture_business_tail(
+    conn: &sea_orm::DatabaseConnection,
+    cid: i32,
+) -> Result<(), AppCommandError> {
+    use crate::db::service::business_conversation_service as business;
+    let Some(state) = business::state(conn, cid)
+        .await
+        .map_err(AppCommandError::from)?
+    else {
+        return Ok(());
+    };
+    let Some(session) = state
+        .sessions
+        .iter()
+        .find(|s| s.agent_type == state.active_agent)
+    else {
+        return Ok(());
+    };
+    let (detail, _) = get_folder_conversation_raw_impl(
+        conn,
+        cid,
+        Some(ConversationHistoryRequest {
+            before_cursor: None,
+            user_turn_limit: 25,
+            cancellation: None,
+        }),
+    )
+    .await?;
+    let current = conversation_service::get_by_id(conn, cid)
+        .await
+        .map_err(AppCommandError::from)?;
+    if current.agent_type != session.agent_type
+        || current.external_id.as_deref() != Some(session.external_id.as_str())
+    {
+        return Ok(());
+    }
+    business::persist_current_tail(conn, cid, session.id, session.agent_type, &session.external_id, &detail.turns)
+        .await
+        .map(|_| ())
+        .map_err(AppCommandError::from)
+}
+
+async fn get_business_conversation_detail(
+    conn: &sea_orm::DatabaseConnection,
+    cid: i32,
+    request: Option<ConversationHistoryRequest>,
+) -> Result<(DbConversationDetail, Option<String>), AppCommandError> {
+    use crate::db::service::business_conversation_service as business;
+    let before = request
+        .as_ref()
+        .and_then(|r| r.before_cursor.as_deref())
+        .map(|cursor| {
+            cursor
+                .strip_prefix("business:")
+                .ok_or_else(|| AppCommandError::invalid_input("Invalid business history cursor"))?
+                .parse::<i64>()
+                .map_err(|_| AppCommandError::invalid_input("Invalid business history cursor"))
+        })
+        .transpose()?;
+    if before.is_none() {
+        // History already captured remains available even if a native session
+        // is temporarily offline or its auth has expired.
+        if let Err(e) = capture_business_tail(conn, cid).await {
+            tracing::warn!(conversation_id=cid,error=%e,"[business] native tail not available; serving durable history")
+        }
+    }
+    let (turns, next) = business::history(
+        conn,
+        cid,
+        before,
+        request
+            .as_ref()
+            .map(|r| r.user_turn_limit as usize)
+            .unwrap_or(usize::MAX),
+    )
+    .await
+    .map_err(AppCommandError::from)?;
+    let mut summary = conversation_service::get_by_id(conn, cid)
+        .await
+        .map_err(AppCommandError::from)?;
+    summary.message_count = summary.message_count.max(turns.len() as u32);
+    let mut artifact_runs = artifact_service::list_for_turn_window(conn, cid, &turns)
+        .await
+        .map_err(AppCommandError::from)?;
+    let mut deliverable_runs = deliverable_service::list_sets_for_turns(conn, cid, &turns)
+        .await
+        .map_err(AppCommandError::from)?;
+    let relation = conversation_branch_service::get_info(conn,cid).await.map_err(AppCommandError::from)?;
+    if let Some(relation) = relation.as_ref() {
+        let source_artifacts = artifact_service::list_for_turn_window(conn,relation.source_conversation_id,&turns).await.map_err(AppCommandError::from)?;
+        let source_outputs = deliverable_service::list_sets_for_turns(conn,relation.source_conversation_id,&turns).await.map_err(AppCommandError::from)?;
+        artifact_runs.extend(source_artifacts.into_iter().filter(|run|relation.forked_through_at.is_some_and(|end|run.started_at<=end)));
+        deliverable_runs.extend(source_outputs.into_iter().filter(|run|relation.forked_through_at.is_some_and(|end|run.started_at<=end)));
+        artifact_runs.sort_by_key(|run|run.started_at);
+        artifact_runs.dedup_by(|a,b|a.id==b.id);
+        deliverable_runs.sort_by_key(|run|run.started_at);
+        deliverable_runs.dedup_by(|a,b|a.turn_run_id==b.turn_run_id);
+    }
+    let branch_history = relation.map(|relation|crate::models::conversation::ConversationBranchHistory {
+        source_conversation_id:relation.source_conversation_id,
+        fork_message_id:relation.fork_message_id,
+        inherited_turn_count:relation.inherited_message_count.max(0) as usize,
+        branch_turn_count:summary.message_count.saturating_sub(relation.inherited_message_count.max(0) as u32) as usize,
+        inheritance_mode:relation.inheritance_mode,
+    });
+    let history_page = request.map(|_| ConversationHistoryPage {
+        next_cursor: next.map(|s| format!("business:{s}")),
+        has_more: next.is_some(),
+        loaded_turns: turns.len() as u32,
+        page_complete: Some(true),
+        ..Default::default()
+    });
+    Ok((
+        DbConversationDetail {
+            summary,
+            turns,
+            session_stats: None,
+            transcript_watermark: None,
+            in_flight_user_turn_id: None,
+            artifact_runs,
+            deliverables: vec![],
+            deliverable_runs,
+            history_page,
+            branch_history,
+            turns_offset: None,
+            turns_total: None,
+            assistant_turns_before_offset: None,
+            user_turns_before_offset: None,
+            prefix_hash: None,
+            uncovered_prefix_max_ts: None,
+        },
+        None,
+    ))
 }
 
 #[cfg(test)]
@@ -9018,6 +9286,7 @@ mod tests {
                 },
                 ContentBlock::ToolResult {
                     tool_use_id: Some("call-1".into()),
+                    exit_code: None,
                     output_preview: Some(full.clone()),
                     is_error: false,
                     agent_stats: None,
@@ -9063,6 +9332,98 @@ mod tests {
         };
         assert!(preview.len() < full.len() / 2);
         assert!(preview.contains("deferred"));
+    }
+
+    #[test]
+    fn business_history_pins_attachment_sources_without_rewriting_prose() {
+        let reference = |kind: &str| {
+            encode_deferred_history_ref(&DeferredHistoryContentRef {
+                version: 1,
+                conversation_id: 26,
+                start_offset: 100,
+                end_offset: 500,
+                kind: kind.into(),
+                tool_use_id: Some("read-1".into()),
+                content_sha256: sha256_hex("original native content"),
+                source_session: None,
+            })
+            .unwrap()
+        };
+        let image = format!("{HISTORY_DEFERRED_IMAGE_URI_PREFIX}{}", reference("image"));
+        let reasoning = format!(
+            "preview\n{HISTORY_DEFERRED_REASONING_MARKER_PREFIX}{}-->",
+            reference("reasoning")
+        );
+        let quoted = format!("Keep this literal quotation: {reasoning}");
+        let mut turns: Vec<MessageTurn> = serde_json::from_value(serde_json::json!([{
+            "id": "original-native-turn", "role": "assistant",
+            "timestamp": "2026-10-25T01:00:00Z",
+            "blocks": [
+                {"type":"text", "text":quoted},
+                {"type":"tool_use", "tool_name":"Read", "input_preview":quoted,
+                 "meta":{"codeg.historyOutput":{"ref":reference("tool_output")},
+                         "agent_value":{"ref":reference("image")}}},
+                {"type":"image", "data":"", "mime_type":"image/png", "uri":image},
+                {"type":"tool_result", "is_error":false, "output_preview":quoted,
+                 "images":[{"data":"", "mime_type":"image/png", "uri":image}]},
+                {"type":"image_generation", "revised_prompt":quoted,
+                 "image":{"data":"", "mime_type":"image/png", "uri":image}},
+                {"type":"thinking", "text":reasoning}
+            ]
+        }]))
+        .unwrap();
+        let original = serde_json::to_value(&turns[0]).unwrap();
+        pin_history_sources(&mut turns, 26, "codex-original-before-switch");
+        let pinned = serde_json::to_value(&turns[0]).unwrap();
+        for path in [
+            "/blocks/0/text",
+            "/blocks/1/input_preview",
+            "/blocks/1/meta/agent_value/ref",
+            "/blocks/3/output_preview",
+            "/blocks/4/revised_prompt",
+        ] {
+            assert_eq!(pinned.pointer(path), original.pointer(path), "{path}");
+        }
+        let decode = |token: &str| {
+            serde_json::from_slice::<DeferredHistoryContentRef>(&URL_SAFE_NO_PAD.decode(token).unwrap())
+                .unwrap()
+                .source_session
+        };
+        for path in [
+            "/blocks/2/uri",
+            "/blocks/3/images/0/uri",
+            "/blocks/4/image/uri",
+        ] {
+            let uri = pinned.pointer(path).unwrap().as_str().unwrap();
+            assert_eq!(
+                decode(uri.strip_prefix(HISTORY_DEFERRED_IMAGE_URI_PREFIX).unwrap()).as_deref(),
+                Some("codex-original-before-switch")
+            );
+        }
+        assert_eq!(
+            decode(
+                pinned["blocks"][1]["meta"]["codeg.historyOutput"]["ref"]
+                    .as_str()
+                    .unwrap()
+            )
+            .as_deref(),
+            Some("codex-original-before-switch")
+        );
+        let thinking = pinned["blocks"][5]["text"].as_str().unwrap();
+        assert_eq!(
+            decode(
+                thinking
+                    .rsplit_once(HISTORY_DEFERRED_REASONING_MARKER_PREFIX)
+                    .unwrap()
+                    .1
+                    .strip_suffix("-->")
+                    .unwrap()
+            )
+            .as_deref(),
+            Some("codex-original-before-switch")
+        );
+        pin_history_sources(&mut turns, 26, "another-session-must-not-overwrite");
+        assert_eq!(serde_json::to_value(&turns[0]).unwrap(), pinned);
     }
 
     #[test]
@@ -9166,6 +9527,7 @@ mod tests {
                         meta: None,
                     },
                     ContentBlock::ToolResult {
+                        exit_code: None,
                         tool_use_id: Some(format!("call-{index}")),
                         output_preview: Some("x".repeat(512_000)),
                         is_error: false,

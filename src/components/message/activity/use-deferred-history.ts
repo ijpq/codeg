@@ -25,5 +25,7 @@ export function useDeferredHistory(
       current = false
     }
   }, [open, reference, resolved?.reference])
-  return resolved?.reference === reference ? resolved.content : preview
+  return resolved && resolved.reference === reference
+    ? resolved.content
+    : preview
 }

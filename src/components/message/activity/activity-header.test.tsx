@@ -67,11 +67,11 @@ describe("ActivityHeader", () => {
   ])("reads %s, then the time, before the chevron", (_, given, line) => {
     const capsule = renderHeader(summaryOf(given))
     // The time is the summary's last item, after the same separator.
-    expect(capsule.textContent).toBe(`${line} · 3s`)
+    expect(capsule.textContent).toBe(`${line} · Worked for 3s`)
     const chevron = capsule.lastElementChild!
     expect(chevron).toBe(capsule.querySelector("svg.lucide-chevron-right"))
     const time = chevron.previousElementSibling!.lastElementChild!
-    expect(time.textContent).toBe(" · 3s")
+    expect(time.textContent).toBe(" · Worked for 3s")
     // As a flex item of its own the time would drop the separator's
     // leading space; it keeps it as written.
     expect(time.getAttribute("class")!.split(/\s+/)).toContain("whitespace-pre")
@@ -79,10 +79,10 @@ describe("ActivityHeader", () => {
 
   it("keeps the time of a reply with no steps beside its label", () => {
     const capsule = renderHeader(summaryOf({}), { folds: false })
-    expect(capsule.textContent).toBe("Reply3s")
+    expect(capsule.textContent).toBe("ReplyWorked for 3s")
     expect(capsule.querySelector("svg")).toBeNull()
     const time = capsule.querySelector(".activity-mono")!
-    expect(time.textContent).toBe("3s")
+    expect(time.textContent).toBe("Worked for 3s")
     // No separator to set it apart: a gap does.
     expect(time.getAttribute("class")!.split(/\s+/)).toContain("ms-2")
   })

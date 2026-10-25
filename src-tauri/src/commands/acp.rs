@@ -12298,6 +12298,18 @@ async fn acp_restore_conversation_inner(
             ))
         })?;
     let agent_type = conversation.agent_type;
+    // Business sessions own their per-engine picks across browser devices and
+    // restarts. A device's last global picker value cannot overwrite them.
+    let business_session = if crate::db::service::business_conversation_service::is_managed(&db.conn, conversation_id)
+        .await.map_err(|e| AcpError::protocol(e.to_string()))? {
+        crate::db::service::business_conversation_service::find_session(&db.conn, conversation_id, agent_type)
+            .await.map_err(|e| AcpError::protocol(e.to_string()))?
+    } else { None };
+    let (preferred_mode_id, preferred_config_values) = if let Some(session) = business_session {
+        (session.mode_id, session.config_values)
+    } else {
+        (preferred_mode_id, preferred_config_values)
+    };
     let require_codeg_mcp = agent_type == AgentType::Codex;
     let working_dir = PathBuf::from(&folder.path);
     // A native branch operation may temporarily load the same source session

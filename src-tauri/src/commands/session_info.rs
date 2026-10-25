@@ -137,8 +137,15 @@ impl SessionInfoAccess for DbSessionInfoLookup {
         // degrade to metadata-only with an explanatory note rather than failing the
         // whole tool call.
         let conn_owned = self.db.conn.clone();
-        let parse =
-            async move { get_folder_conversation_core(&conn_owned, session_id).await };
+        let parse = async move {
+            if crate::db::service::business_conversation_service::is_managed(&conn_owned,session_id).await.map_err(AppCommandError::from)? {
+                crate::commands::conversations::get_folder_conversation_page_core(
+                    &conn_owned,session_id,crate::commands::conversations::ConversationHistoryRequest {
+                        before_cursor:None,user_turn_limit:max.clamp(1,100),cancellation:None,
+                    },
+                ).await
+            } else {get_folder_conversation_core(&conn_owned, session_id).await}
+        };
         match bounded_parse(self.parse_limit.clone(), PARSE_TIMEOUT, parse).await {
             ParseSlot::Ready(Ok((detail, parsed_title))) => {
                 if info.title.is_none() {

@@ -83,6 +83,8 @@ import { FeedbackDialog } from "@/components/chat/feedback-dialog"
 import { AgentDiagnosticsDialog } from "@/components/settings/agent-diagnostics-dialog"
 import { useFeedbackEnabled } from "@/hooks/use-feedback-enabled"
 import { useSessionFeedback } from "@/hooks/use-session-feedback"
+import { useBusinessConversation } from "@/hooks/use-business-conversation"
+import { BusinessAgentControl } from "@/components/chat/business-agent-control"
 import { AgentSelector } from "@/components/chat/agent-selector"
 import { ChatInput } from "@/components/chat/chat-input"
 import { WelcomeHero, WelcomeTip } from "@/components/chat/welcome-hero"
@@ -121,6 +123,7 @@ import { classifySteerFailure } from "@/lib/steer-errors"
 import { isNetworkOrOfflineError } from "@/lib/network-error"
 import {
   isSessionRestorePendingError,
+  resolveConversationSessionId,
   shouldAwaitHistoricalSessionDetail,
 } from "@/lib/session-restore"
 import {
@@ -134,7 +137,6 @@ import {
   shouldRejectDuplicateCreate,
 } from "@/lib/queue-flush"
 import { deliverQueuedSteer } from "@/lib/queued-steer"
-import { toErrorMessage } from "@/lib/app-error"
 import { blockingPrompts } from "@/lib/blocking-prompts"
 import { notify } from "@/lib/notify"
 import {
@@ -402,7 +404,44 @@ const ConversationTabView = memo(function ConversationTabView({
   >(null)
   const dbConversationId = conversationId ?? createdConversationId
   const [draftAgentType, setDraftAgentType] = useState<AgentType>(agentType)
-  const selectedAgent = conversationId != null ? agentType : draftAgentType
+  const business = useBusinessConversation(
+    dbConversationId,
+    shouldRenderContent
+  )
+  const selectedAgent =
+    business.state?.activeAgent ??
+    (conversationId != null ? agentType : draftAgentType)
+  const businessPending = business.pending
+  // The same tab and business ID survive an engine change. Engine identity
+  // changes only after the backend has prepared and committed the handoff.
+  useEffect(() => {
+    if (
+      !business.state ||
+      business.state.activeAgent === agentType ||
+      dbConversationId == null
+    )
+      return
+    const tab = useTabStore.getState().rawTabs.find((item) => item.id === tabId)
+    if (!tab) return
+    bindConversationTab(
+      tabId,
+      dbConversationId,
+      business.state.activeAgent,
+      tab.title ?? "",
+      tab.runtimeConversationId,
+      tab.folderId,
+      tab.workingDir
+    )
+    refetchDetail(effectiveConversationId, { preserveLive: true })
+  }, [
+    agentType,
+    bindConversationTab,
+    business.state,
+    dbConversationId,
+    effectiveConversationId,
+    refetchDetail,
+    tabId,
+  ])
   // Seed from localStorage so the React state reflects the user's saved
   // mode for this agent immediately on mount. Without this seed, a reuse-
   // path connect (idle window after a refresh, before the agent is GC'd)
@@ -416,6 +455,15 @@ const ConversationTabView = memo(function ConversationTabView({
   const [modeId, setModeId] = useState<string | null>(() =>
     getSavedModeId(agentType)
   )
+  const modeAgent = useRef(selectedAgent)
+  useEffect(() => {
+    if (modeAgent.current === selectedAgent) return
+    modeAgent.current = selectedAgent
+    const session = business.state?.sessions.find(
+      (item) => item.agentType === selectedAgent
+    )
+    setModeId(session?.modeId ?? getSavedModeId(selectedAgent))
+  }, [business.state?.sessions, selectedAgent])
   const [sendSignal, setSendSignal] = useState(0)
   const [agentsLoaded, setAgentsLoaded] = useState(false)
   const [usableAgentCount, setUsableAgentCount] = useState(0)
@@ -716,8 +764,12 @@ const ConversationTabView = memo(function ConversationTabView({
   // it every reconnect passes sessionId=undefined → backend takes session/new
   // → DB.external_id is overwritten on the next prompt → original sid
   // orphaned, agent loses prior context.
-  const externalId =
-    runtimeExternalId ?? detail?.summary.external_id ?? undefined
+  const externalId = resolveConversationSessionId({
+    agent: selectedAgent,
+    sessions: business.state?.sessions,
+    runtimeId: runtimeExternalId,
+    detailId: detail?.summary.external_id,
+  })
   // For persisted conversations opened from the sidebar, wait until the
   // session's external_id has been resolved before auto-connecting.
   // Otherwise the auto-connect effect fires with sessionId=undefined and
@@ -897,6 +949,7 @@ const ConversationTabView = memo(function ConversationTabView({
       conn.conversationId === dbConversationId &&
       (selectedAgent !== "codex" || conn.codegMcpAvailable))
   const connectionReady =
+    !businessPending &&
     !connIsForOtherAgent &&
     restoredIdentityReady &&
     conn.promptReady &&
@@ -2904,7 +2957,9 @@ const ConversationTabView = memo(function ConversationTabView({
               : undefined
           }
           deliverableRuns={detail?.deliverable_runs}
-          onForkFromMessage={hasPersistedConversation ? handleForkFromMessage : null}
+          onForkFromMessage={
+            hasPersistedConversation ? handleForkFromMessage : null
+          }
         />
       </ActivityLiveProvider>
     </GoalControlProvider>
@@ -3334,7 +3389,22 @@ const ConversationTabView = memo(function ConversationTabView({
         hideInput={isWelcomeMode || Boolean(acpLoadError)}
         injectContent={composerInject}
         onInjectConsumed={handleComposerInjectConsumed}
-        composerBanner={acpLoadErrorBanner ?? null}
+        composerBanner={
+          <>
+            {dbConversationId != null &&
+              (selectedAgent === "codex" ||
+                selectedAgent === "claude_code") && (
+                <BusinessAgentControl
+                  key={dbConversationId}
+                  conversationId={dbConversationId}
+                  folderId={folderId}
+                  agent={selectedAgent}
+                  business={business}
+                />
+              )}
+            {acpLoadErrorBanner ?? null}
+          </>
+        }
         feedbackList={
           feedback.showList ? (
             <FeedbackNotesDisplay

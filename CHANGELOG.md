@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.40.0-fix1 — 2026-10-25
+
+- Keep one visible business conversation when switching Codex / Claude Code,
+  with separate native sessions, authentication, writers and per-engine settings.
+- Queue a running turn's handoff, prepare before publishing, retain the original
+  session on failure, and use durable request IDs/revisions and prompt receipts
+  for retries, concurrent clients and restart recovery.
+- Persist one paged business history, including native task durations, deferred
+  attachment sources and deliverables. Preserve rollover identities and existing
+  branch creation, restoration and return behavior.
+- Pin deferred attachments only in typed CodeG load references; preserve prose,
+  quoted references, original tool inputs and unrelated agent metadata.
+- Send bounded unseen context and a recent task boundary, with user-confirmed
+  scoped memory and one shared project Skill body. Declare omitted context and
+  protocol/tool limitations; never import another engine's private native state.
+- Preserve native Direct / Plan / Goal controls, explicit Goal pause on handoff,
+  ordinary whole-task elapsed labels, the all-deliverables pane and virtualized
+  scrolling. Keep live fork identities ahead of stale polled business state.
+- Require delivery of the latest bounded business bridge before a native Goal
+  can start/resume after a handoff; retain the separate older-history cursor.
+- Add additive, reversible business mappings and protocol/failure/concurrency
+  regressions, plus real ACP/runtime checks against isolated model fixtures in
+  packaged Server Web and installed/upgraded Setup WebView2.
+- Rebase on upstream v0.40.0. Publish Windows x64 Server with matching MCP/CLI,
+  frontend and migration inventories, and Windows x64 Setup with isolated
+  installation, upgrade, resource, dependency and downloaded-asset verification.
+
+See [architecture and limitations](docs/single-business-multi-agent.md) and
+[release notes](docs/releases/v0.40.0-fix1.md).
+
 ## 0.39.0-fix1 — 2026-10-22
 
 - Restore the conversation-wide deliverables list in the right sidebar under

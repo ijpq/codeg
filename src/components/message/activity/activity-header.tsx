@@ -211,7 +211,9 @@ export const ActivityHeader = memo(function ActivityHeader({
             )}
           >
             {hasSummaryLine ? separator : null}
-            {elapsed ? tTurn("workedFor", { duration: elapsed }) : tTurn("worked")}
+            {elapsed
+              ? tTurn("workedFor", { duration: elapsed })
+              : tTurn("worked")}
           </span>
         ) : null}
       </span>

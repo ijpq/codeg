@@ -1,8 +1,60 @@
 import { describe, expect, it } from "vitest"
 import {
+  resolveConversationSessionId,
   isRetryableSessionRestoreConflict,
   shouldAwaitHistoricalSessionDetail,
 } from "./session-restore"
+
+describe("resolveConversationSessionId", () => {
+  const sessions = [
+    { agentType: "codex", externalId: "codex-original" },
+    { agentType: "claude_code", externalId: "claude-original" },
+  ]
+  it("keeps a live fork/rollover ahead of stale polled history", () => {
+    expect(
+      resolveConversationSessionId({
+        agent: "codex",
+        sessions,
+        runtimeId: "codex-new-fork",
+        detailId: "codex-original",
+      })
+    ).toBe("codex-new-fork")
+  })
+  it("never resumes the other engine's runtime session after a handoff", () => {
+    expect(
+      resolveConversationSessionId({
+        agent: "claude_code",
+        sessions,
+        runtimeId: "codex-original",
+        detailId: "codex-original",
+      })
+    ).toBe("claude-original")
+    expect(
+      resolveConversationSessionId({
+        agent: "codex",
+        sessions,
+        runtimeId: "claude-original",
+        detailId: "claude-original",
+      })
+    ).toBe("codex-original")
+  })
+  it("retains the existing cold-open and unpersisted draft behavior", () => {
+    expect(
+      resolveConversationSessionId({
+        agent: "codex",
+        runtimeId: null,
+        detailId: "native",
+      })
+    ).toBe("native")
+    expect(
+      resolveConversationSessionId({
+        agent: "codex",
+        runtimeId: "draft",
+        detailId: null,
+      })
+    ).toBe("draft")
+  })
+})
 
 describe("shouldAwaitHistoricalSessionDetail", () => {
   it("lets Codex restore run in parallel with persisted detail loading", () => {

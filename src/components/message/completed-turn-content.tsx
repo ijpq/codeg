@@ -1,6 +1,14 @@
 "use client"
 
-import { type ComponentProps, memo, useCallback, useId, useMemo, useRef, useState } from "react"
+import {
+  type ComponentProps,
+  memo,
+  useCallback,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+} from "react"
 import { useTranslations } from "next-intl"
 
 import {
@@ -336,6 +344,12 @@ const CompletedTurnContentBody = memo(function CompletedTurnContentBody({
   )
 })
 
-export const CompletedTurnContent = memo(function CompletedTurnContent(props: ComponentProps<typeof CompletedTurnContentBody>) {
-  return <CitationSourcesScope parts={props.parts}><CompletedTurnContentBody {...props} /></CitationSourcesScope>
+export const CompletedTurnContent = memo(function CompletedTurnContent(
+  props: ComponentProps<typeof CompletedTurnContentBody>
+) {
+  return (
+    <CitationSourcesScope parts={props.parts}>
+      <CompletedTurnContentBody {...props} />
+    </CitationSourcesScope>
+  )
 })

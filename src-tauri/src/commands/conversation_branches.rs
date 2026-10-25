@@ -167,20 +167,24 @@ pub async fn get_conversation_branch_creation_task_core(
     db: &AppDatabase,
     request_id: &str,
 ) -> Result<Option<ConversationBranchCreationTask>, AppCommandError> {
-    Ok(conversation_branch_task_service::get_reconciled(&db.conn, request_id)
-        .await
-        .map_err(AppCommandError::from)?
-        .map(branch_creation_task_view))
+    Ok(
+        conversation_branch_task_service::get_reconciled(&db.conn, request_id)
+            .await
+            .map_err(AppCommandError::from)?
+            .map(branch_creation_task_view),
+    )
 }
 
 pub async fn cancel_conversation_branch_creation_task_core(
     db: &AppDatabase,
     request_id: &str,
 ) -> Result<Option<ConversationBranchCreationTask>, AppCommandError> {
-    Ok(conversation_branch_task_service::cancel(&db.conn, request_id)
-        .await
-        .map_err(AppCommandError::from)?
-        .map(branch_creation_task_view))
+    Ok(
+        conversation_branch_task_service::cancel(&db.conn, request_id)
+            .await
+            .map_err(AppCommandError::from)?
+            .map(branch_creation_task_view),
+    )
 }
 
 pub async fn run_conversation_branch_creation_task(
@@ -207,26 +211,15 @@ pub async fn run_conversation_branch_creation_task(
     };
     request.request_id = Some(request_id.clone());
     request.operation_id = Some(request_id.clone());
-    let outcome = create_conversation_branch_core(
-        &db,
-        &manager,
-        &emitter,
-        &data_dir,
-        owner_label,
-        request,
-    )
-    .await;
+    let outcome =
+        create_conversation_branch_core(&db, &manager, &emitter, &data_dir, owner_label, request)
+            .await;
     let (result_json, error) = match outcome {
         Ok(result) => (serde_json::to_string(&result).ok(), None),
         Err(error) => (None, Some(error.to_string())),
     };
-    if let Err(error) = conversation_branch_task_service::finish(
-        &db.conn,
-        &request_id,
-        result_json,
-        error,
-    )
-    .await
+    if let Err(error) =
+        conversation_branch_task_service::finish(&db.conn, &request_id, result_json, error).await
     {
         tracing::error!(request_id, error = %error, "failed to persist branch task result");
     }
@@ -413,8 +406,13 @@ pub async fn create_conversation_branch_core(
         None
     };
     if let Some(existing) = existing {
+        // A tail snapshot resolves None to a concrete frozen message. Its
+        // retry still carries None, so preserve the original requested intent
+        // in the boundary kind rather than comparing it to the resolved id.
+        let same_business_tail = request.fork_message_id.is_none()
+            && existing.fork_boundary_kind.as_deref() == Some("business_snapshot_tail_boundary");
         if existing.source_conversation_id != request.source_conversation_id
-            || existing.fork_message_id != request.fork_message_id
+            || (!same_business_tail && existing.fork_message_id != request.fork_message_id)
         {
             return Err(AppCommandError::invalid_input(
                 "Branch operation id was already used for another source or fork point",
@@ -543,11 +541,14 @@ pub async fn create_conversation_branch_core(
         );
         return Err(source_busy_branch_error());
     }
-    let native_candidate = should_attempt_native_fork(
-        request.fork_message_id.as_deref(),
-        source.external_id.as_deref(),
-        source_live_busy,
-    );
+    let managed_business =
+        crate::db::service::business_conversation_service::is_managed(&db.conn, source.id).await?;
+    let native_candidate = !managed_business
+        && should_attempt_native_fork(
+            request.fork_message_id.as_deref(),
+            source.external_id.as_deref(),
+            source_live_busy,
+        );
     let mut use_stable_boundary = source_live_busy;
     let fallback_reason;
     if native_candidate {
@@ -799,6 +800,8 @@ pub async fn create_conversation_branch_core(
                 fallback_reason = Some(error.to_string());
             }
         }
+    } else if managed_business {
+        fallback_reason = Some("Cross-engine business history uses a bounded snapshot; native fork contains only one engine's context".into());
     } else if request.fork_message_id.is_some() {
         fallback_reason = Some("ACP native fork cannot target an earlier message".into());
     } else if source_live_busy {
@@ -814,7 +817,29 @@ pub async fn create_conversation_branch_core(
     // the honest replay/snapshot fallback. This is never sourced from the
     // browser's bounded history page, so every persisted message up to the
     // selected boundary participates before the context-budget rules apply.
-    let (mut source_detail, _) = get_folder_conversation_core(&db.conn, source.id).await?;
+    let (mut source_detail, _) = if managed_business {
+        crate::commands::conversations::get_folder_conversation_page_core(
+            &db.conn, source.id, crate::commands::conversations::ConversationHistoryRequest {
+                before_cursor:None,user_turn_limit:25,cancellation:None,
+            },
+        ).await?
+    } else { get_folder_conversation_core(&db.conn, source.id).await? };
+    if managed_business {
+        // A selected older fork point is resolved page by page, never by
+        // materializing the whole canonical archive just to build a snapshot.
+        if let Some(fork) = request.fork_message_id.as_deref() {
+            while !source_detail.turns.iter().any(|turn| turn.id==fork) {
+                let Some(cursor)=source_detail.history_page.as_ref().and_then(|page|page.next_cursor.clone()) else{break};
+                let (older,_)=crate::commands::conversations::get_folder_conversation_page_core(
+                    &db.conn,source.id,crate::commands::conversations::ConversationHistoryRequest {
+                        before_cursor:Some(cursor),user_turn_limit:25,cancellation:None,
+                    },
+                ).await?;
+                source_detail=older;
+            }
+        }
+    }
+    let bounded_business = managed_business && source_detail.history_page.as_ref().is_some_and(|page|page.has_more);
     if source_detail.summary.origin_cwd.is_none() {
         source_detail.summary.origin_cwd = Some(folder.path.clone());
     }
@@ -833,7 +858,7 @@ pub async fn create_conversation_branch_core(
             "[ACP][branch] excluded the source's in-flight round from snapshot inheritance"
         );
     }
-    let inheritance = match build_branch_inheritance_snapshot(
+    let mut inheritance = match build_branch_inheritance_snapshot(
         &source_detail,
         request.fork_message_id.as_deref(),
         None,
@@ -874,6 +899,17 @@ pub async fn create_conversation_branch_core(
         }
         Err(error) => return Err(error),
     };
+    if bounded_business {
+        let note="This business branch uses a bounded snapshot of recent rounds at the selected boundary. Earlier original history remains in CodeG; this is not a full native context clone.";
+        inheritance.truncated=true;
+        inheritance.compressed=true;
+        inheritance.inheritance_mode="structured_snapshot".into();
+        inheritance.note=Some(note.into());
+        inheritance.context=inheritance.context.replacen("Inheritance: full user-visible replay; truncated: false.","Inheritance: bounded business snapshot; truncated: true.",1);
+        inheritance.context.push_str(&format!("\n{note}\n"));
+        inheritance.context_chars=inheritance.context.chars().count() as i64;
+        inheritance.estimated_tokens=crate::commands::conversation_branch_context::estimate_tokens(&inheritance.context) as i64;
+    }
     tracing::info!(
         creation_request_id = ?creation_request_id,
         operation_id = ?operation_id,
@@ -924,7 +960,11 @@ pub async fn create_conversation_branch_core(
             Some(snapshot),
             None,
             None,
-            Some("snapshot_message_boundary".into()),
+            Some(if managed_business && request.fork_message_id.is_none() {
+                "business_snapshot_tail_boundary".into()
+            } else {
+                "snapshot_message_boundary".into()
+            }),
         ),
     )
     .await
@@ -1201,7 +1241,38 @@ async fn load_branch_merge_increment(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_owned);
-    let mut increment = if branch.agent_type == crate::models::AgentType::Codex {
+    let managed =
+        crate::db::service::business_conversation_service::is_managed(&db.conn, branch.id)
+            .await
+            .map_err(AppCommandError::from)?;
+    let mut increment = if managed {
+        let mut cursor=None;
+        let mut pages=Vec::new();
+        let mut count=0;
+        loop {
+            let (mut page,_)=crate::commands::conversations::get_folder_conversation_page_core(
+                &db.conn,branch.id,crate::commands::conversations::ConversationHistoryRequest {
+                    before_cursor:cursor,user_turn_limit:25,cancellation:None,
+                },
+            ).await?;
+            let reached=relation.forked_through_at.is_some_and(|boundary|page.turns.iter().any(|turn|turn.timestamp<=boundary));
+            page.turns.retain(|turn| relation.forked_through_at.is_none_or(|boundary|turn.timestamp>boundary));
+            count+=page.turns.len();
+            if count>BRANCH_MERGE_MAX_TURNS {
+                return Err(merge_boundary_error("Business branch increment exceeds the safe merge limit"));
+            }
+            pages.push(page.turns);
+            cursor=page.history_page.and_then(|p|p.next_cursor);
+            if reached || cursor.is_none(){break}
+        }
+        BranchMergeIncrement {
+            turns: pages.into_iter().rev().flatten().collect(),
+            start_offset: None,
+            end_offset: None,
+            bytes_read: 0,
+            boundary_kind: "business_history".into(),
+        }
+    } else if branch.agent_type == crate::models::AgentType::Codex {
         let session_id = session_id
             .ok_or_else(|| merge_boundary_error("the branch has no verified Codex session ID"))?;
         load_codex_merge_increment(relation, session_id, folder.path).await?

@@ -265,6 +265,8 @@ pub struct SessionState {
     /// restore is still in progress. Diagnostic only: unlike
     /// `conversation_id`, it never participates in routing or ownership.
     pub restore_conversation_id: Option<i32>,
+    /// Retired main engine; its background children may still finish.
+    pub main_agent_retired: bool,
     /// Monotonic origin for structured restore-stage timing logs.
     pub restore_started_at: Option<std::time::Instant>,
     pub external_id: Option<String>,
@@ -899,6 +901,7 @@ impl SessionState {
             connection_id,
             conversation_id: None,
             restore_conversation_id: None,
+            main_agent_retired: false,
             restore_started_at: None,
             external_id: None,
             external_id_changed_at: None,
@@ -1481,9 +1484,8 @@ impl SessionState {
                 }
                 let mut citation_sources = Vec::new();
                 for tool_call in self.active_tool_calls.values() {
-                    citation_sources.extend(crate::citations::sources_from_meta(
-                        tool_call.meta.as_ref(),
-                    ));
+                    citation_sources
+                        .extend(crate::citations::sources_from_meta(tool_call.meta.as_ref()));
                 }
                 self.last_assistant_citations =
                     crate::citations::merge_sources(citation_sources.iter());
@@ -4901,7 +4903,12 @@ mod tests {
         for i in 0..200 {
             run_tool_call(&mut s, &format!("tc-{i:04}"), 16 * 1024, true);
         }
-        run_tool_call(&mut s, "tc-huge", MAX_SNAPSHOT_TOOL_PAYLOAD_BYTES + 1024, false);
+        run_tool_call(
+            &mut s,
+            "tc-huge",
+            MAX_SNAPSHOT_TOOL_PAYLOAD_BYTES + 1024,
+            false,
+        );
 
         let snap = s.to_snapshot();
         let huge = snap

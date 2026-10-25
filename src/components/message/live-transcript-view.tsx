@@ -363,30 +363,30 @@ export function LiveTranscriptView({
           exactly how the main conversation panel mounts the same component. */}
       <div className="min-h-0 flex-1">
         <ActivityLiveProvider value={activityLive}>
-        <GoalControlProvider value={READ_ONLY_GOAL_CONTROL}>
-          <MessageListView
-            conversationId={conversationId}
-            // The viewed connection's own cwd. A delegation child runs in a
-            // scratch dir whose folder row this client may not have seen yet
-            // (it is created closed, without a folder-change broadcast), so the
-            // folder lookup would come up empty; `undefined` when there is no
-            // live connection keeps that lookup as the fallback.
-            imageRoot={conn?.workingDir ?? undefined}
-            agentType={transcriptAgent ?? "claude_code"}
-            // With no agent known, that default is a guess, and what it last
-            // advertised in this folder says nothing about this transcript:
-            // `[]` badges no command at all rather than another agent's.
-            availableCommands={transcriptAgent ? conn?.availableCommands : []}
-            connStatus={connStatus}
-            isActive={false}
-            detailLoading={detailLoading}
-            detailError={error}
-            acpLoadError={acpLoadError}
-            hideEmptyState={false}
-            userTurnHeader={userTurnHeader}
-            deliverableRuns={detail?.deliverable_runs}
-          />
-        </GoalControlProvider>
+          <GoalControlProvider value={READ_ONLY_GOAL_CONTROL}>
+            <MessageListView
+              conversationId={conversationId}
+              // The viewed connection's own cwd. A delegation child runs in a
+              // scratch dir whose folder row this client may not have seen yet
+              // (it is created closed, without a folder-change broadcast), so the
+              // folder lookup would come up empty; `undefined` when there is no
+              // live connection keeps that lookup as the fallback.
+              imageRoot={conn?.workingDir ?? undefined}
+              agentType={transcriptAgent ?? "claude_code"}
+              // With no agent known, that default is a guess, and what it last
+              // advertised in this folder says nothing about this transcript:
+              // `[]` badges no command at all rather than another agent's.
+              availableCommands={transcriptAgent ? conn?.availableCommands : []}
+              connStatus={connStatus}
+              isActive={false}
+              detailLoading={detailLoading}
+              detailError={error}
+              acpLoadError={acpLoadError}
+              hideEmptyState={false}
+              userTurnHeader={userTurnHeader}
+              deliverableRuns={detail?.deliverable_runs}
+            />
+          </GoalControlProvider>
         </ActivityLiveProvider>
       </div>
     </div>

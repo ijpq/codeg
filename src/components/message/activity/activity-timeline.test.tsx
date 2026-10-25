@@ -291,7 +291,7 @@ describe("activity timeline: the reference turn", () => {
     renderSettled(partsOf(MOCKUP_ASSISTANT_TURN))
     const header = activityHeader()
     expect(header.textContent).toBe(
-      "Activity14 steps · 1 failed, recovered · 3m 34s"
+      "Activity14 steps · 1 failed, recovered · Worked for 3m 34s"
     )
     expect(header.querySelector("[title]")).toHaveAttribute(
       "title",
@@ -300,7 +300,7 @@ describe("activity timeline: the reference turn", () => {
     const chevron = header.lastElementChild!
     expect(chevron).toBe(header.querySelector("svg.lucide-chevron-right"))
     expect(chevron.previousElementSibling!.lastElementChild!.textContent).toBe(
-      " · 3m 34s"
+      " · Worked for 3m 34s"
     )
     expect(foldControl()).toHaveAttribute("aria-expanded", "true")
   })
@@ -1513,7 +1513,7 @@ describe("activity timeline: replies without steps", () => {
   it("keeps a Reply header with no fold control", () => {
     renderSettled([{ type: "text", text: "Already on main." }], 3000)
     expect(screen.getByText("Reply")).toBeTruthy()
-    expect(screen.getByText("3s")).toBeTruthy()
+    expect(screen.getByText("Worked for 3s")).toBeTruthy()
     expect(screen.queryByRole("button")).toBeNull()
     expect(document.querySelector("svg.lucide-chevron-right")).toBeNull()
   })

@@ -4437,6 +4437,26 @@
       "userResources": {
         "openFile": "開啟 {filePath}",
         "fileUnavailable": "檔案不可用或已不存在:{filePath}"
+      },
+      "businessAgent": {
+        "agent": "Agent",
+        "sharedState": "Shared task & memory",
+        "queued": "Waiting for the current turn to finish",
+        "preparing": "Preparing handoff…",
+        "retry": "Retry {agent}",
+        "objective": "Objective",
+        "requirements": "Requirements (one per line)",
+        "completed": "Completed",
+        "pending": "Next steps",
+        "latestFiles": "Latest files",
+        "decisions": "Key decisions",
+        "memory": "Shared user memory",
+        "memoryScope": "Memory scope",
+        "task": "This business",
+        "project": "This project",
+        "global": "Global preferences",
+        "loadRule": "已確認的記憶依上下文預算載入下一次接納的請求，超出部分會明確標示未載入。私有記憶仍由各引擎管理。只儲存已確認的事實與要求。",
+        "save": "Save"
       }
     },
     "diffPreview": {

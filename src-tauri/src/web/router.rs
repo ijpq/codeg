@@ -1095,6 +1095,26 @@ pub fn build_router_with_proxy_auth(
             "/acp_env_diagnostics",
             post(handlers::acp::acp_env_diagnostics),
         )
+        .route(
+            "/switch_business_agent",
+            post(handlers::business_conversations::switch_business_agent),
+        )
+        .route(
+            "/get_business_conversation_state",
+            post(handlers::business_conversations::get_business_conversation_state),
+        )
+        .route(
+            "/update_business_task_state",
+            post(handlers::business_conversations::update_business_task_state),
+        )
+        .route(
+            "/get_business_shared_memory",
+            post(handlers::business_conversations::get_business_shared_memory),
+        )
+        .route(
+            "/save_business_shared_memory",
+            post(handlers::business_conversations::save_business_shared_memory),
+        )
         .route("/acp_connect", post(handlers::acp::acp_connect))
         .route(
             "/acp_restore_conversation",
@@ -1117,7 +1137,10 @@ pub fn build_router_with_proxy_auth(
             post(handlers::acp::acp_set_config_option),
         )
         .route("/acp_goal_control", post(handlers::acp::acp_goal_control))
-        .route("/acp_get_goal_state", post(handlers::acp::acp_get_goal_state))
+        .route(
+            "/acp_get_goal_state",
+            post(handlers::acp::acp_get_goal_state),
+        )
         .route(
             "/acp_describe_agent_options",
             post(handlers::acp::acp_describe_agent_options),
@@ -2147,9 +2170,8 @@ pub fn build_router_with_proxy_auth(
         // happens. See `handlers::forge::forge_webhook`.
         .route(
             "/forge_webhook",
-            post(handlers::forge::forge_webhook).layer(DefaultBodyLimit::max(
-                handlers::forge::WEBHOOK_BODY_LIMIT,
-            )),
+            post(handlers::forge::forge_webhook)
+                .layer(DefaultBodyLimit::max(handlers::forge::WEBHOOK_BODY_LIMIT)),
         )
         .route(
             "/workspace_download/{ticket}",

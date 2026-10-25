@@ -667,6 +667,15 @@ pub async fn bind_external_id(
     use sea_orm::sea_query::Expr;
     use sea_orm::TransactionTrait;
 
+    if crate::db::service::business_conversation_service::bind_managed_external(
+        conn,
+        conversation_id,
+        external_id,
+    )
+    .await?
+    {
+        return Ok(None);
+    }
     let external_id = external_id.to_string();
     let continues: Vec<String> = continues.to_vec();
     // The closure below MOVES `external_id`; keep a copy for the conflict
@@ -856,8 +865,12 @@ pub async fn bind_external_id(
                 let preserved = carried.into_active_model(previous.clone()).insert(txn).await?;
                 // The preserving row IS the old conversation as far as the user
                 // can tell, so it keeps the tags they put on it.
-                conversation_tag_service::copy_conversation_tags(txn, conversation_id, preserved.id)
-                    .await?;
+                conversation_tag_service::copy_conversation_tags(
+                    txn,
+                    conversation_id,
+                    preserved.id,
+                )
+                .await?;
                 // The one signal that this happened at all. Deliberately WARN:
                 // every occurrence means a connection bound to a row while
                 // holding a session unrelated to that row's history, which is
@@ -1798,15 +1811,9 @@ mod tests {
     async fn seed_model_fills_an_empty_column_once_without_bumping_updated_at() {
         let db = fresh_in_memory_db().await;
         let folder = seed_folder(&db, "/tmp/codeg-seed-model").await;
-        let conv = create(
-            &db.conn,
-            folder,
-            AgentType::Codex,
-            Some("c".into()),
-            None,
-        )
-        .await
-        .expect("create");
+        let conv = create(&db.conn, folder, AgentType::Codex, Some("c".into()), None)
+            .await
+            .expect("create");
 
         // The gap this closes: a row created in-app carries no model at all,
         // which is why the sidebar could only ever show one for imported
@@ -1860,15 +1867,9 @@ mod tests {
     async fn seed_model_skips_a_soft_deleted_row() {
         let db = fresh_in_memory_db().await;
         let folder = seed_folder(&db, "/tmp/codeg-seed-model-deleted").await;
-        let conv = create(
-            &db.conn,
-            folder,
-            AgentType::Codex,
-            Some("c".into()),
-            None,
-        )
-        .await
-        .expect("create");
+        let conv = create(&db.conn, folder, AgentType::Codex, Some("c".into()), None)
+            .await
+            .expect("create");
         soft_delete(&db.conn, conv.id).await.expect("delete");
 
         assert!(
@@ -1990,7 +1991,10 @@ mod tests {
     }
 
     /// The single live row (if any) holding `external_id`, whatever its id.
-    async fn rows_holding(conn: &DatabaseConnection, external_id: &str) -> Vec<conversation::Model> {
+    async fn rows_holding(
+        conn: &DatabaseConnection,
+        external_id: &str,
+    ) -> Vec<conversation::Model> {
         conversation::Entity::find()
             .filter(conversation::Column::ExternalId.eq(external_id))
             .filter(conversation::Column::DeletedAt.is_null())

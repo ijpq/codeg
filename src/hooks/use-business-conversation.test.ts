@@ -1,0 +1,166 @@
+import { act, renderHook, waitFor } from "@testing-library/react"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import { useBusinessConversation } from "./use-business-conversation"
+import type { BusinessConversationState } from "@/lib/business-conversation"
+const api = vi.hoisted(() => ({
+  get: vi.fn(),
+  switch: vi.fn(),
+  subscribe: vi.fn(),
+}))
+vi.mock("@/lib/business-conversation", () => ({
+  getBusinessState: api.get,
+  switchBusinessAgent: api.switch,
+}))
+vi.mock("@/lib/transport", () => ({
+  getTransport: () => ({ subscribe: api.subscribe }),
+}))
+const state = (
+  cid = 1,
+  revision = 0,
+  agent: "codex" | "claude_code" = "codex"
+): BusinessConversationState => ({
+  conversationId: cid,
+  revision,
+  activeAgent: agent,
+  pendingRequestId: null,
+  pendingAgent: null,
+  switchStatus: null,
+  switchError: null,
+  taskState: {
+    objective: "conference",
+    requirements: [],
+    completed: [],
+    pending: [],
+    latestFiles: [],
+    decisions: [],
+  },
+  sessions: [],
+  lastSequence: 0,
+})
+beforeEach(() => {
+  localStorage.clear()
+  api.get.mockReset()
+  api.switch.mockReset()
+  api.subscribe.mockResolvedValue(() => {})
+  api.get.mockResolvedValue(state())
+})
+afterEach(() => {
+  vi.clearAllMocks()
+})
+describe("business agent handoff client", () => {
+  it("sends only the selected engine's saved settings", async () => {
+    localStorage.setItem(
+      "codeg:selector-prefs",
+      JSON.stringify({
+        codex: {
+          modeId: "plan",
+          configValues: { model: "codex-model", effort: "high" },
+        },
+        claude_code: {
+          modeId: "default",
+          configValues: { model: "claude-model" },
+        },
+      })
+    )
+    api.switch.mockResolvedValue(state(1, 3, "claude_code"))
+    const { result } = renderHook(() => useBusinessConversation(1))
+    await waitFor(() => expect(result.current.state).not.toBeNull())
+    await act(async () => {
+      await result.current.switchAgent("claude_code")
+    })
+    expect(api.switch).toHaveBeenCalledWith(
+      expect.objectContaining({
+        preferredModeId: "default",
+        preferredConfigValues: { model: "claude-model" },
+      })
+    )
+  })
+  it("keeps the active engine until committed and coalesces repeated clicks", async () => {
+    let resolve!: (value: BusinessConversationState) => void
+    api.switch.mockReturnValue(
+      new Promise((done) => {
+        resolve = done
+      })
+    )
+    const { result } = renderHook(() => useBusinessConversation(1))
+    await waitFor(() => expect(result.current.state?.activeAgent).toBe("codex"))
+    let pending!: Promise<void>
+    act(() => {
+      pending = result.current.switchAgent("claude_code")
+      void result.current.switchAgent("claude_code")
+    })
+    expect(api.switch).toHaveBeenCalledTimes(1)
+    expect(result.current.pending).toBe(true)
+    expect(result.current.state?.activeAgent).toBe("codex")
+    await act(async () => {
+      resolve({ ...state(1, 3, "claude_code"), switchStatus: "succeeded" })
+      await pending
+    })
+    expect(result.current.state?.activeAgent).toBe("claude_code")
+    expect(result.current.pending).toBe(false)
+    expect(api.switch.mock.calls[0][0]).toMatchObject({
+      conversationId: 1,
+      targetAgent: "claude_code",
+      expectedRevision: 0,
+    })
+  })
+  it("does not let a late response retarget a different business", async () => {
+    let resolve!: (value: BusinessConversationState) => void
+    api.switch.mockReturnValue(
+      new Promise((done) => {
+        resolve = done
+      })
+    )
+    const { result, rerender } = renderHook(
+      ({ cid }) => useBusinessConversation(cid),
+      { initialProps: { cid: 1 } }
+    )
+    await waitFor(() => expect(result.current.state?.conversationId).toBe(1))
+    let pending!: Promise<void>
+    act(() => {
+      pending = result.current.switchAgent("claude_code")
+    })
+    api.get.mockResolvedValue(state(2))
+    rerender({ cid: 2 })
+    await waitFor(() => expect(result.current.state?.conversationId).toBe(2))
+    await act(async () => {
+      resolve(state(1, 9, "claude_code"))
+      await pending
+    })
+    expect(result.current.state?.activeAgent).toBe("codex")
+    expect(result.current.state?.conversationId).toBe(2)
+  })
+  it("rejects older generations after another client commits a switch", async () => {
+    api.get.mockResolvedValue(state(1, 5, "claude_code"))
+    const { result } = renderHook(() => useBusinessConversation(1))
+    await waitFor(() => expect(result.current.state?.revision).toBe(5))
+    api.get.mockResolvedValue(state(1, 2, "codex"))
+    await act(async () => {
+      await result.current.refresh()
+    })
+    expect(result.current.state?.revision).toBe(5)
+    expect(result.current.state?.activeAgent).toBe("claude_code")
+  })
+  it("preserves the original engine and provides a retry error after preparation fails", async () => {
+    api.switch.mockRejectedValue(
+      new Error("Claude authentication is unavailable")
+    )
+    const { result } = renderHook(() => useBusinessConversation(1))
+    await waitFor(() => expect(result.current.state).not.toBeNull())
+    await act(async () => {
+      await result.current.switchAgent("claude_code")
+    })
+    expect(result.current.state?.activeAgent).toBe("codex")
+    expect(result.current.error).toContain("authentication")
+    expect(result.current.pending).toBe(false)
+  })
+  it("leaves a new draft ready for its normal first send", () => {
+    const { result } = renderHook(() => useBusinessConversation(null))
+    expect(result.current.pending).toBe(false)
+    expect(api.get).not.toHaveBeenCalled()
+  })
+  it("does not poll hidden business conversations", () => {
+    renderHook(() => useBusinessConversation(1, false))
+    expect(api.get).not.toHaveBeenCalled()
+  })
+})

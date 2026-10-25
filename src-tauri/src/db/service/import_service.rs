@@ -177,7 +177,15 @@ pub(crate) async fn import_summaries(
         }
     }
 
-    Ok((ImportResult { imported, updated, skipped, restored }, updated_ids))
+    Ok((
+        ImportResult {
+            imported,
+            updated,
+            skipped,
+            restored,
+        },
+        updated_ids,
+    ))
 }
 
 /// Like [`import_summaries`] but resilient — a single row's DB error is logged
@@ -222,7 +230,12 @@ pub(crate) async fn import_summaries_resilient(
     }
 
     (
-        ImportResult { imported, updated, skipped, restored },
+        ImportResult {
+            imported,
+            updated,
+            skipped,
+            restored,
+        },
         updated_ids,
         failed,
     )
@@ -418,6 +431,22 @@ async fn import_one(
 ) -> Result<ImportOutcome, DbError> {
     let at_str = agent_type_db_str(agent_type);
 
+    // Retired engine sessions still belong to the same business. Re-importing
+    // one must never manufacture a second visible conversation.
+    if let Some(owner) = crate::db::service::business_conversation_service::session_owner(
+        conn,
+        *agent_type,
+        &summary.id,
+    )
+    .await?
+    {
+        if deleted == DeletedPolicy::Restore
+            && conversation_service::restore_soft_deleted(conn, owner, folder_id).await?
+        {
+            return Ok(ImportOutcome::Restored);
+        }
+        return Ok(ImportOutcome::Skipped);
+    }
     let exists = conversation::Entity::find()
         .filter(conversation::Column::ExternalId.eq(&summary.id))
         .filter(conversation::Column::AgentType.eq(&at_str))
@@ -534,6 +563,32 @@ async fn import_one(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn business_retired_session_import_restores_the_same_business_without_rebinding() {
+        use crate::db::service::business_conversation_service as business;
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let folder = crate::db::test_helpers::seed_folder(&db, "/business-import").await;
+        let source = summary("business-codex", Some("Business"));
+        import_one_skip(&db.conn, folder, &AgentType::Codex, &source).await.unwrap();
+        let cid = find_id(&db.conn, "business-codex").await;
+        let original = conversation_service::get_by_id(&db.conn, cid).await.unwrap();
+        business::initialize(&db.conn, &original, &[]).await.unwrap();
+        let request = business::AgentSwitchRequest {
+            conversation_id: cid, request_id: "business-import-switch".into(),
+            target_agent: AgentType::ClaudeCode, expected_revision: Some(0),
+            preferred_mode_id: None, preferred_config_values: Default::default(),
+        };
+        business::queue_switch(&db.conn, &request).await.unwrap();
+        business::activate(&db.conn, &request, "business-claude").await.unwrap();
+        assert_eq!(import_one_skip(&db.conn, folder, &AgentType::Codex, &source).await.unwrap(), ImportOutcome::Skipped);
+        conversation_service::soft_delete(&db.conn, cid).await.unwrap();
+        assert_eq!(import_one(&db.conn, folder, &AgentType::Codex, &source, DeletedPolicy::Restore).await.unwrap(), ImportOutcome::Restored);
+        let restored = conversation_service::get_by_id(&db.conn, cid).await.unwrap();
+        assert_eq!(restored.agent_type, AgentType::ClaudeCode);
+        assert_eq!(restored.external_id.as_deref(), Some("business-claude"));
+        assert_eq!(conversation::Entity::find().all(&db.conn).await.unwrap().len(), 1);
+    }
     use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
     use chrono::{DateTime, Duration, Utc};
 
@@ -618,9 +673,14 @@ mod tests {
         let folder = seed_folder(&db, "/tmp/codeg-import").await;
         let at = AgentType::ClaudeCode;
 
-        let first = import_one_skip(&db.conn, folder, &at, &summary("ext-1", Some("first prompt")))
-            .await
-            .expect("import");
+        let first = import_one_skip(
+            &db.conn,
+            folder,
+            &at,
+            &summary("ext-1", Some("first prompt")),
+        )
+        .await
+        .expect("import");
         assert_eq!(first, ImportOutcome::Imported);
 
         let id = find_id(&db.conn, "ext-1").await;
@@ -745,9 +805,14 @@ mod tests {
         let folder = seed_folder(&db, "/tmp/codeg-import-lock").await;
         let at = AgentType::ClaudeCode;
 
-        import_one_skip(&db.conn, folder, &at, &summary("ext-1", Some("first prompt")))
-            .await
-            .expect("import");
+        import_one_skip(
+            &db.conn,
+            folder,
+            &at,
+            &summary("ext-1", Some("first prompt")),
+        )
+        .await
+        .expect("import");
         let id = find_id(&db.conn, "ext-1").await;
         conversation_service::update_title(&db.conn, id, "User Pick".into())
             .await
@@ -930,9 +995,15 @@ mod tests {
             .await
             .expect("soft delete");
 
-        import_one(&db.conn, target, &at, &summary("ext-1", Some("t")), DeletedPolicy::Restore)
-            .await
-            .expect("restore");
+        import_one(
+            &db.conn,
+            target,
+            &at,
+            &summary("ext-1", Some("t")),
+            DeletedPolicy::Restore,
+        )
+        .await
+        .expect("restore");
 
         // The picker's group folder is the one `add_folder` just made live AND
         // open; the row's own folder may have been removed or closed since,
@@ -1235,9 +1306,14 @@ mod tests {
             .to_string();
 
         // A root conversation to parent the child.
-        import_one_skip(&db.conn, folder, &at, &summary("parent-ext", Some("parent")))
-            .await
-            .expect("import parent");
+        import_one_skip(
+            &db.conn,
+            folder,
+            &at,
+            &summary("parent-ext", Some("parent")),
+        )
+        .await
+        .expect("import parent");
         let parent_id = find_id(&db.conn, "parent-ext").await;
 
         // A delegation child carrying its own external_id, as a parser would
@@ -1271,9 +1347,14 @@ mod tests {
         .await
         .expect("insert child");
 
-        let outcome = import_one_skip(&db.conn, folder, &at, &summary("child-ext", Some("AI Summary")))
-            .await
-            .expect("re-import child");
+        let outcome = import_one_skip(
+            &db.conn,
+            folder,
+            &at,
+            &summary("child-ext", Some("AI Summary")),
+        )
+        .await
+        .expect("re-import child");
         assert_eq!(
             outcome,
             ImportOutcome::Skipped,

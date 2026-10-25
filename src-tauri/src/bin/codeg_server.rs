@@ -96,7 +96,13 @@ fn main() -> ExitCode {
     // (`cli_run::shim`): the matching one, whatever else is on their PATH.
     if let Some(cli) = codeg_lib::update::runtime::self_exe()
         .parent()
-        .map(|dir| dir.join(if cfg!(windows) { "codeg-cli.exe" } else { "codeg-cli" }))
+        .map(|dir| {
+            dir.join(if cfg!(windows) {
+                "codeg-cli.exe"
+            } else {
+                "codeg-cli"
+            })
+        })
         .filter(|p| p.metadata().is_ok_and(|m| m.is_file() && m.len() > 0))
     {
         std::env::set_var(codeg_lib::cli_run::shim::CLI_ENV, cli);
@@ -644,6 +650,14 @@ async fn async_main(
         state.db.conn.clone(),
         std::time::Duration::from_secs(codeg_lib::TURN_RECONCILIATION_INTERVAL_SECS),
     ));
+
+    codeg_lib::commands::business_conversations::recover_switches(
+        &state.connection_manager,
+        &state.db,
+        &state.data_dir,
+        state.emitter.clone(),
+    )
+    .await;
 
     // Spawn the desktop pet state mapper so server-mode browsers viewing
     // /pet receive `pet://state` and `pet://oneshot` over the WebSocket

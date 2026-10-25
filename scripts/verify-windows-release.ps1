@@ -63,7 +63,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Could not download upgrade baseline' }
 $oldHash = ((Get-Content (Join-Path $previous "$oldSetup.sha256") -Raw).Trim() -split '\s+')[0].ToLower()
 if ((Get-FileHash (Join-Path $previous $oldSetup) -Algorithm SHA256).Hash.ToLower() -ne $oldHash) { throw 'Upgrade baseline checksum mismatch' }
 $nativeTools = Join-Path $Destination 'native-agent-tools'
-npm install --prefix $nativeTools --global --ignore-scripts --no-audit --no-fund '@agentclientprotocol/codex-acp@2.2.2'
+npm install --prefix $nativeTools --global --include=optional --ignore-scripts --no-audit --no-fund '@agentclientprotocol/codex-acp@2.2.2' '@agentclientprotocol/claude-agent-acp@0.94.0'
 if ($LASTEXITCODE -ne 0) { throw 'Isolated ACP installation failed' }
 node scripts/verify-windows-ui.mjs --setup (Join-Path $Destination $setupName) --previous (Join-Path $previous $oldSetup) --server $root --output (Join-Path $Destination 'ui') --version $version --native-tools $nativeTools
 if ($LASTEXITCODE -ne 0) { throw 'Setup upgrade/startup or actual Server/Desktop UI verification failed' }

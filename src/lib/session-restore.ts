@@ -1,4 +1,29 @@
 /**
+ * A runtime fork/rollover id is newer than a polled business snapshot. After
+ * an engine handoff, however, the old engine's runtime id must never become
+ * the target engine's resume id.
+ */
+export function resolveConversationSessionId({
+  agent,
+  sessions = [],
+  runtimeId,
+  detailId,
+}: {
+  agent: string
+  sessions?: readonly { agentType: string; externalId: string }[]
+  runtimeId: string | null | undefined
+  detailId: string | null | undefined
+}): string | undefined {
+  const target = sessions.find((session) => session.agentType === agent)
+  const previousEngine = sessions.some(
+    (session) => session.agentType !== agent && session.externalId === runtimeId
+  )
+  return previousEngine
+    ? target?.externalId
+    : (runtimeId ?? target?.externalId ?? detailId ?? undefined)
+}
+
+/**
  * Transient pre-accept rejection used while an ACP connection exists but the
  * requested historical session has not finished restoring/attaching yet.
  *
@@ -17,6 +42,18 @@ export class SessionRestorePendingError extends Error {
 
 export function isSessionRestorePendingError(error: unknown): boolean {
   if (error instanceof SessionRestorePendingError) return true
+  const text =
+    typeof error === "string"
+      ? error
+      : error instanceof Error
+        ? error.message
+        : ""
+  if (
+    text.includes("Agent handoff is pending") ||
+    text.includes("The business agent changed") ||
+    text.includes("This engine was handed off")
+  )
+    return true
   if (!error || typeof error !== "object") return false
   const code = (error as { code?: unknown }).code
   const message = (error as { message?: unknown }).message

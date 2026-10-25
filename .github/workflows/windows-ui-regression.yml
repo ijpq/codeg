@@ -162,7 +162,7 @@ jobs:
             } finally { $env:GITHUB_SHA=$originalSha }
             if ($LASTEXITCODE -ne 0) { throw 'Candidate package resources/dependencies failed' }
             $tools=Join-Path $env:RUNNER_TEMP 'candidate-native-tools'
-            npm install --prefix $tools --global --ignore-scripts --no-audit --no-fund '@agentclientprotocol/codex-acp@2.2.2'
+            npm install --prefix $tools --global --include=optional --ignore-scripts --no-audit --no-fund '@agentclientprotocol/codex-acp@2.2.2' '@agentclientprotocol/claude-agent-acp@0.94.0'
             if ($LASTEXITCODE -ne 0) { throw 'Isolated native ACP installation failed' }
             $server=$candidate
             $extra=@('--native-tools',$tools)

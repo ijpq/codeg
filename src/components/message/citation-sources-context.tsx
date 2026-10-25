@@ -4,7 +4,9 @@ import { createContext, useContext, useMemo, type ReactNode } from "react"
 import type { AdaptedContentPart } from "@/lib/adapters/ai-elements-adapter"
 import { extractCitationSources, type CitationSource } from "@/lib/citations"
 
-export const CitationSourcesContext = createContext<readonly CitationSource[]>([])
+export const CitationSourcesContext = createContext<readonly CitationSource[]>(
+  []
+)
 
 export function CitationSourcesScope({
   parts,

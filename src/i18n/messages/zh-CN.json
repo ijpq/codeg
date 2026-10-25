@@ -4437,6 +4437,26 @@
       "userResources": {
         "openFile": "打开 {filePath}",
         "fileUnavailable": "文件不可用或已不存在:{filePath}"
+      },
+      "businessAgent": {
+        "agent": "主 Agent",
+        "sharedState": "共享任务与记忆",
+        "queued": "等待当前轮结束后交接",
+        "preparing": "正在准备交接…",
+        "retry": "重试切换至 {agent}",
+        "objective": "任务目标",
+        "requirements": "有效要求（每行一项）",
+        "completed": "已完成事项",
+        "pending": "待办事项",
+        "latestFiles": "最新文件",
+        "decisions": "关键决定",
+        "memory": "共享用户记忆",
+        "memoryScope": "记忆范围",
+        "task": "当前业务",
+        "project": "当前项目",
+        "global": "全局偏好",
+        "loadRule": "已确认的记忆按上下文预算加载到下一次接纳的请求，超出部分会明确标记未加载。私有记忆仍由各引擎管理。只保存已确认的事实与要求。",
+        "save": "保存"
       }
     },
     "diffPreview": {

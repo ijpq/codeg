@@ -15,11 +15,11 @@
 
 pub mod acp;
 pub mod acp_transcript;
+pub use acp::scratch_dir::scratch_sweep_task;
 pub use acp::{
     idle_sweep_task, idle_timeout_from_env, lifecycle_subscriber_task, turn_reconciliation_task,
     SWEEP_INTERVAL_SECS, TURN_RECONCILIATION_INTERVAL_SECS,
 };
-pub use acp::scratch_dir::scratch_sweep_task;
 pub use network::proxy::init_proxy_from_db;
 mod app_error;
 #[cfg(all(feature = "tauri-runtime", target_os = "macos"))]
@@ -33,11 +33,11 @@ pub mod backgrounds;
 /// mode — see `browser/mod.rs` for why those two, and only those two.
 pub mod browser;
 pub mod chat_channel;
+pub mod citations;
 /// The `codeg-cli` binary's client side (feature `cli-bin`).
 #[cfg(feature = "cli-bin")]
 pub mod cli;
 pub mod cli_run;
-pub mod citations;
 pub mod commands;
 pub mod commit_message;
 pub mod computer;
@@ -108,14 +108,9 @@ mod tauri_app {
         browser as browser_commands,
         canvas as canvas_commands,
         chat_authoring as chat_authoring_commands, chat_channel as chat_channel_commands,
-        codex_quota as codex_quota_commands,
-        conversation_branches,
-        clipboard as clipboard_commands,
-        commit_message as commit_message_commands,
-        config_sync,
-        conversation_tags,
-        conversations,
-        custom_skills as custom_skills_commands,
+        clipboard as clipboard_commands, codex_quota as codex_quota_commands,
+        commit_message as commit_message_commands, config_sync, conversation_branches,
+        conversation_tags, conversations, custom_skills as custom_skills_commands,
         deepseek_settings as deepseek_settings_commands, delegation as delegation_commands,
         deliverables as deliverable_commands,
         experts as experts_commands, feedback as feedback_commands, file_io, folder_commands,
@@ -1383,6 +1378,16 @@ mod tauri_app {
                     ));
                 }
 
+                {
+                    let manager=app.state::<ConnectionManager>().clone_ref();
+                    let db=app.state::<db::AppDatabase>().inner().clone();
+                    let data_dir=effective_data_dir.clone();
+                    let emitter=crate::web::event_bridge::EventEmitter::Tauri(app.handle().clone());
+                    tauri::async_runtime::spawn(async move {
+                        crate::commands::business_conversations::recover_switches(&manager,&db,&data_dir,emitter).await;
+                    });
+                }
+
                 // Headless `codeg-cli` runs: the service and its loopback
                 // access. Managed before the web service may start below,
                 // which serves the same routes from this state.
@@ -2171,6 +2176,12 @@ mod tauri_app {
                 acp_commands::acp_qoder_auth_status,
                 acp_commands::acp_connect,
                 acp_commands::acp_restore_conversation,
+                crate::commands::business_conversations::switch_business_agent,
+                crate::commands::business_conversations::get_business_conversation_state,
+                crate::commands::business_conversations::update_business_task_state,
+                crate::commands::business_conversations::get_business_shared_memory,
+                crate::commands::business_conversations::save_business_shared_memory,
+
                 acp_commands::acp_prompt,
                 acp_commands::acp_steer,
                 acp_commands::acp_set_mode,

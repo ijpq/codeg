@@ -4437,6 +4437,26 @@
       "userResources": {
         "openFile": "Abrir {filePath}",
         "fileUnavailable": "Archivo no disponible o que ya no existe: {filePath}"
+      },
+      "businessAgent": {
+        "agent": "Agent",
+        "sharedState": "Shared task & memory",
+        "queued": "Waiting for the current turn to finish",
+        "preparing": "Preparing handoff…",
+        "retry": "Retry {agent}",
+        "objective": "Objective",
+        "requirements": "Requirements (one per line)",
+        "completed": "Completed",
+        "pending": "Next steps",
+        "latestFiles": "Latest files",
+        "decisions": "Key decisions",
+        "memory": "Shared user memory",
+        "memoryScope": "Memory scope",
+        "task": "This business",
+        "project": "This project",
+        "global": "Global preferences",
+        "loadRule": "Confirmed memory is loaded into the next accepted prompt within its context budget; omitted items are explicitly marked. Native private memory stays engine-specific. Save only confirmed facts and requirements.",
+        "save": "Save"
       }
     },
     "diffPreview": {
