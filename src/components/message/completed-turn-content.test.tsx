@@ -5,8 +5,13 @@ import { describe, expect, it, vi } from "vitest"
 
 import enMessages from "@/i18n/messages/en.json"
 import { EMPTY_TOOL_APPROVALS } from "@/lib/activity/approval"
-import type { AdaptedContentPart } from "@/lib/adapters/ai-elements-adapter"
 import { ActivityLiveProvider } from "./activity/activity-live-context"
+import zhMessages from "@/i18n/messages/zh-CN.json"
+import {
+  adaptMessageTurn,
+  type AdaptedContentPart,
+} from "@/lib/adapters/ai-elements-adapter"
+import type { ContentBlock } from "@/lib/types"
 import {
   CompletedTurnContent,
   splitAssistantTurnParts,
@@ -48,6 +53,30 @@ const toggle = () =>
   screen.getByRole("button", { name: /^(Activity|Working)$/ })
 const queryToggle = () =>
   screen.queryByRole("button", { name: /^(Activity|Working)$/ })
+describe("ordinary completed turn duration", () => {
+  it.each([
+    [168795, "工作了 2 分钟 48 秒"],
+    [615361, "工作了 10 分钟 15 秒"],
+    [309047, "工作了 5 分钟 9 秒"],
+    [0, "工作了 0 秒"],
+    [undefined, "工作已结束"],
+    [-1, "工作已结束"],
+  ])(
+    "renders native %s ms without inventing missing timing",
+    (durationMs, label) => {
+      render(
+        <NextIntlClientProvider locale="zh-CN" messages={zhMessages}>
+          <CompletedTurnContent
+            parts={[{ type: "text", text: "完成" }]}
+            completed
+            durationMs={durationMs}
+          />
+        </NextIntlClientProvider>
+      )
+      expect(screen.getByText(label)).toBeInTheDocument()
+    }
+  )
+})
 
 describe("splitAssistantTurnParts", () => {
   it("keeps only the trailing final response outside progress", () => {
@@ -152,6 +181,66 @@ describe("CompletedTurnContent with nothing left to show", () => {
 })
 
 describe("CompletedTurnContent", () => {
+  it.each(["paused", "complete", "budget_limited"])(
+    "keeps native Goal output visible when a trailing %s snapshot settles it",
+    (status) => {
+      // Native thread_goal_updated snapshots arrive after the model's answer,
+      // including an out-of-prompt pause. They are status, not more model work.
+      const marker = (state: string, sequence: number): ContentBlock[] => {
+        const objective = "Read README"
+        const id = `codex-goal-${sequence}`
+        return [
+          {
+            type: "tool_use",
+            tool_use_id: id,
+            tool_name: state === "active" ? "create_goal" : "update_goal",
+            input_preview: JSON.stringify({ objective, status: state }),
+          },
+          {
+            type: "tool_result",
+            tool_use_id: id,
+            output_preview: JSON.stringify({
+              goal: { objective, status: state },
+            }),
+            is_error: false,
+          },
+        ]
+      }
+      const blocks: ContentBlock[] = [
+        ...marker("active", 1),
+        { type: "text", text: "SYNTHETIC NATIVE GOAL RESPONSE" },
+      ]
+      const adapt = (settled: boolean) =>
+        adaptMessageTurn(
+          {
+            id: "native-goal",
+            role: "assistant",
+            timestamp: "2026-10-16T20:54:00Z",
+            blocks: settled ? [...blocks, ...marker(status, 2)] : blocks,
+          },
+          {
+            attachedResources: "Attached resources",
+            toolCallFailed: "Tool failed",
+            pageHandoffName: () => "Page handoff",
+          },
+          !settled
+        ).content
+      const view = renderWithIntl(
+        <CompletedTurnContent parts={adapt(false)} completed={false} />
+      )
+      expect(screen.getByText("SYNTHETIC NATIVE GOAL RESPONSE")).toBeVisible()
+      view.rerender(
+        <NextIntlClientProvider locale="en" messages={enMessages}>
+          <CompletedTurnContent parts={adapt(true)} completed />
+        </NextIntlClientProvider>
+      )
+      expect(screen.getByText("SYNTHETIC NATIVE GOAL RESPONSE")).toBeVisible()
+      view.unmount()
+      renderWithIntl(<CompletedTurnContent parts={adapt(true)} completed />)
+      expect(screen.getByText("SYNTHETIC NATIVE GOAL RESPONSE")).toBeVisible()
+    }
+  )
+
   it("collapses completed progress by default and keeps the answer visible", () => {
     renderWithIntl(
       <CompletedTurnContent
@@ -333,7 +422,7 @@ describe("CompletedTurnContent", () => {
     )
 
     expect(screen.getByText("Reply")).toBeInTheDocument()
-    expect(screen.getByText("1m 9s")).toBeInTheDocument()
+    expect(screen.getByText("Worked for 1m 9s")).toBeInTheDocument()
     expect(queryToggle()).toBeNull()
     expect(screen.getByText("Just an answer.")).toBeInTheDocument()
   })

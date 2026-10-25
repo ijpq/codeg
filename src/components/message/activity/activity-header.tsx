@@ -50,6 +50,7 @@ export const ActivityHeader = memo(function ActivityHeader({
   completed,
   hasSteps,
   elapsed,
+  durationMs,
   toggle,
   onJumpToFailure,
 }: {
@@ -59,11 +60,13 @@ export const ActivityHeader = memo(function ActivityHeader({
   completed: boolean
   hasSteps: boolean
   elapsed: string | null
+  durationMs?: number | null
   /** Folding the turn away, when it can fold. */
   toggle?: { open: boolean; onToggle: () => void; controls?: string }
   onJumpToFailure?: () => void
 }) {
   const t = useTranslations("Folder.chat.activity")
+  const tTurn = useTranslations("Folder.chat.messageList")
   const separator = t("header.separator")
 
   // The line carries the step count only — the breakdown by kind is what the
@@ -205,15 +208,18 @@ export const ActivityHeader = memo(function ActivityHeader({
             would drop its leading space). It stays, a reply with no steps
             keeping its `Reply 3s`, so the slot never blinks in and out as a
             turn settles. */}
-        {elapsed && completed ? (
+        {completed ? (
           <span
+            data-completed-turn-duration-ms={elapsed ? durationMs : undefined}
             className={cn(
               "activity-mono shrink-0 whitespace-pre text-xs text-activity-muted-strong",
               !hasSummaryLine && "ms-2"
             )}
           >
             {hasSummaryLine ? separator : null}
-            {elapsed}
+            {elapsed
+              ? tTurn("workedFor", { duration: elapsed })
+              : tTurn("worked")}
           </span>
         ) : null}
       </span>

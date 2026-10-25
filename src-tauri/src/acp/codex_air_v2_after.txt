@@ -1,0 +1,15 @@
+      if (detachedReport !== null) {
+        const report = detachedReport;
+        setTimeout(() => {
+          void this.publishAgentFileChangeReport(
+            report.session, report.turnId, report.request, report.reason,
+            report.diff, report.workspace
+          ).catch((error) => logger.error("Detached AIR publication failed", error));
+        }, 0);
+      }
+      logger.log("Prompt terminal ready", {
+        sessionId: params.sessionId,
+        turnId: agentFileChangeReportTurnId,
+        requestId: agentFileChangeReportRequest?.requestId,
+        readyAtMs: Date.now()
+      });

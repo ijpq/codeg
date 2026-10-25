@@ -1,0 +1,487 @@
+name: Isolated Windows UI regression
+on:
+  push:
+    branches: ["main", "fix/execution-scroll-v0.36.0"]
+    paths:
+      - "src/components/message/**"
+      - "src/components/ai-elements/message-thread*"
+      - "tests/browser/**"
+      - "scripts/verify-windows-ui.mjs"
+      - "scripts/browser-scroll-regression.mjs"
+      - ".github/workflows/windows-ui-regression.yml"
+  workflow_dispatch:
+    inputs:
+      candidate:
+        description: Build current Windows packages and verify native Goal UI before tagging
+        type: boolean
+        default: false
+      reuse_candidate:
+        description: Diagnose verification scripts using the pinned 29df14a0c candidate binaries
+        type: boolean
+        default: false
+      diagnose_allocation:
+        description: Isolate the published fix3 Server allocation crash; never a release acceptance result
+        type: boolean
+        default: false
+      allocation_original_only:
+        description: Repeat the pinned original dual packages three times without compiling a traced binary
+        type: boolean
+        default: false
+      allocation_annotation_only:
+        description: Only annotate the quarantined failed fix3 release, without building or running packages
+        type: boolean
+        default: false
+      diagnose_fix2:
+        description: Verify the corrected harness against the unchanged unpublished b9c6baeae Windows packages
+        type: boolean
+        default: false
+      diagnose_fix5:
+        description: Preflight the harness against unpublished fix5 assets; not fix6 acceptance
+        type: boolean
+        default: false
+env:
+  CARGO_BUILD_JOBS: 1
+  RUST_BACKTRACE: short
+  CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: "-C target-feature=+crt-static"
+  HUSKY: 0
+jobs:
+  profile-paths:
+    if: ${{ !inputs.diagnose_allocation }}
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Verify isolated profiles with the Windows Known Folder API
+        run: node --test scripts/test-windows-ui-profile.mjs scripts/test-office-test-runtime.mjs scripts/test-verification-progress.mjs
+  setup-ui:
+    if: ${{ !inputs.diagnose_fix2 && !inputs.diagnose_fix5 && !inputs.diagnose_allocation }}
+    runs-on: windows-2022
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pnpm install --frozen-lockfile
+      - name: Verify payload, dependency and database handle regressions
+        run: python -B scripts/test-verify-setup-binaries.py
+      - name: Restore pinned diagnostic candidate without rebuilding application code
+        if: inputs.candidate && inputs.reuse_candidate
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python - <<'PY'
+          import hashlib, json, os, subprocess, zipfile
+          from pathlib import Path
+          repo = os.environ['GITHUB_REPOSITORY']
+          run_id, artifact_id = 40162274216, 12589902658
+          source = '29df14a0cf0991f0f873ffe20abcb486f453a2a3'
+          digest = 'fbc1672513d3c9105f73ead628dcf24adf987782c450c840d23f46693b77b5c1'
+          def api(path):
+              return json.loads(subprocess.check_output(['gh', 'api', f'repos/{repo}/{path}']))
+          run = api(f'actions/runs/{run_id}')
+          artifact = api(f'actions/artifacts/{artifact_id}')
+          assert run['head_sha'] == source and run['path'] == '.github/workflows/windows-ui-regression.yml'
+          assert artifact['workflow_run']['id'] == run_id and artifact['workflow_run']['head_sha'] == source
+          assert artifact['name'] == 'candidate-windows-binaries' and artifact['digest'] == 'sha256:' + digest
+          # Reuse only while application code exactly matches this built source;
+          # this path diagnoses verification changes, never release binaries.
+          subprocess.run(['git', 'diff', '--exit-code', source, 'HEAD', '--',
+                          'src', 'src-tauri', 'i18n', 'public', 'package.json', 'pnpm-lock.yaml', 'next.config.ts'], check=True)
+          jobs = api(f'actions/runs/{run_id}/jobs')
+          assert any(step['name'] == 'Build isolated candidate Setup and Server' and step['conclusion'] == 'success'
+                     for job in jobs['jobs'] for step in job['steps'])
+          archive = Path(os.environ['RUNNER_TEMP']) / 'diagnostic-candidate.zip'
+          with archive.open('wb') as stream:
+              subprocess.run(['gh', 'api', f'repos/{repo}/actions/artifacts/{artifact_id}/zip'], stdout=stream, check=True)
+          assert hashlib.sha256(archive.read_bytes()).hexdigest() == digest
+          root = Path.cwd().resolve()
+          with zipfile.ZipFile(archive) as bundle:
+              assert all((root / name).resolve().is_relative_to(root) for name in bundle.namelist())
+              bundle.extractall(root)
+          assert json.loads((root / 'out/codeg-release-manifest.json').read_text())['commit'] == source
+          with open(os.environ['GITHUB_ENV'], 'a') as output:
+              output.write('CODEG_CANDIDATE_SHA=' + source + '\n')
+          print('Testing the checksum-pinned diagnostic application commit', source)
+          PY
+      - uses: dtolnay/rust-toolchain@stable
+        if: inputs.candidate && !inputs.reuse_candidate
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: swatinem/rust-cache@v2
+        if: inputs.candidate && !inputs.reuse_candidate
+        with:
+          workspaces: "./src-tauri -> target"
+          shared-key: x86_64-pc-windows-msvc
+          cache-on-failure: true
+      - name: Build isolated candidate Setup and Server
+        if: inputs.candidate && !inputs.reuse_candidate
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python -B scripts/fetch-tested-codex-runtime.py --output-dir dist/codex-runtime
+          if ($LASTEXITCODE -ne 0) { throw 'Candidate tested Codex runtime fetch failed' }
+          python -B scripts/build-codex-adapter.py --output-dir dist/codex-runtime
+          if ($LASTEXITCODE -ne 0) { throw 'Candidate private Codex ACP staging failed' }
+          pnpm tauri:prepare-sidecars --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw 'Candidate sidecar build failed' }
+          $env:CODEG_SKIP_SIDECAR='1'
+          $config=Join-Path $env:RUNNER_TEMP 'candidate-tauri-config.json'
+          '{"bundle":{"createUpdaterArtifacts":false}}' | Set-Content $config
+          pnpm tauri build --target x86_64-pc-windows-msvc --bundles nsis --config $config
+          if ($LASTEXITCODE -ne 0) { throw 'Candidate Setup build failed' }
+          cargo build --manifest-path src-tauri/Cargo.toml --release --no-default-features --features server-bin --bin codeg-server --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw 'Candidate Server build failed' }
+      - name: Retain candidate binaries for diagnosis without rebuilding
+        if: inputs.candidate && !inputs.reuse_candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: candidate-windows-binaries
+          path: |
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+            src-tauri/target/x86_64-pc-windows-msvc/release/codeg-server.exe
+            src-tauri/target/x86_64-pc-windows-msvc/release/codeg-mcp.exe
+            src-tauri/target/x86_64-pc-windows-msvc/release/codeg-computer-helper.exe
+            src-tauri/target/x86_64-pc-windows-msvc/release/codeg-cli.exe
+            out/
+            dist/pi-runtime/
+            dist/codex-runtime/
+          if-no-files-found: error
+          retention-days: 7
+      - name: Download verified published baseline into the runner
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_UI: ${{ inputs.candidate }}
+        run: |
+          $ErrorActionPreference='Stop'
+          $root=Join-Path $env:RUNNER_TEMP 'ui-baseline'
+          New-Item -ItemType Directory -Force $root | Out-Null
+          $baselineTag=if ($env:CANDIDATE_UI -eq 'true') { 'v0.40.0-fix4' } else { 'v0.36.0-fix1' }
+          $baselineVersion=$baselineTag.TrimStart('v')
+          $baselineSetup="codeg_${baselineVersion}_x64-setup.exe"
+          gh release download $baselineTag --repo $env:GITHUB_REPOSITORY --dir $root
+          if ($LASTEXITCODE -ne 0) { throw 'Baseline download failed' }
+          foreach ($file in @($baselineSetup,'codeg-server-windows-x64.zip')) {
+            $hash=((Get-Content (Join-Path $root "$file.sha256") -Raw).Trim() -split '\s+')[0].ToLower()
+            if ((Get-FileHash (Join-Path $root $file) -Algorithm SHA256).Hash.ToLower() -ne $hash) { throw 'Baseline hash mismatch' }
+          }
+          Expand-Archive (Join-Path $root 'codeg-server-windows-x64.zip') (Join-Path $root 'server')
+          $setup=Join-Path $root $baselineSetup
+          $previous=$setup
+          $server=Join-Path $root 'server/codeg-server-windows-x64'
+          $previousServer=$server
+          $extra=@('--baseline','true')
+          $version=$baselineVersion
+          if ($env:CANDIDATE_UI -eq 'true') {
+            $version=(Get-Content package.json -Raw | ConvertFrom-Json).version
+            $setup=(Get-Item "src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/codeg_${version}_x64-setup.exe").FullName
+            $candidate=Join-Path $env:RUNNER_TEMP 'candidate-server'
+            New-Item -ItemType Directory -Force $candidate | Out-Null
+            Copy-Item -Recurse out (Join-Path $candidate 'web')
+            Copy-Item -Recurse dist/codex-runtime (Join-Path $candidate 'runtime')
+            Copy-Item -Recurse dist/pi-runtime (Join-Path $candidate 'pi-runtime')
+            foreach ($binary in @('codeg-server','codeg-mcp','codeg-computer-helper','codeg-cli')) {
+              Copy-Item "src-tauri/target/x86_64-pc-windows-msvc/release/$binary.exe" $candidate
+            }
+            # Use the candidate commit's ordinary-CI tested CLI and pinned ACP,
+            # exactly as the Setup and release Server packaging paths do.
+            $originalSha=$env:GITHUB_SHA
+            try {
+              if ($env:CODEG_CANDIDATE_SHA) { $env:GITHUB_SHA=$env:CODEG_CANDIDATE_SHA }
+              python -B scripts/smoke-server-package.py $candidate $version --require-runtime --log-dir (Join-Path $env:RUNNER_TEMP 'ui-evidence/candidate-smoke')
+            } finally { $env:GITHUB_SHA=$originalSha }
+            if ($LASTEXITCODE -ne 0) { throw 'Candidate package resources/dependencies failed' }
+            $tools=Join-Path $env:RUNNER_TEMP 'candidate-native-tools'
+            npm install --prefix $tools --global --include=optional --ignore-scripts --no-audit --no-fund '@agentclientprotocol/codex-acp@2.2.2' '@agentclientprotocol/claude-agent-acp@0.94.0'
+            if ($LASTEXITCODE -ne 0) { throw 'Isolated native ACP installation failed' }
+            python -B scripts/prepare-office-preview-test.py --output $tools
+            if ($LASTEXITCODE -ne 0) { throw 'Isolated Office converter verification failed' }
+            $server=$candidate
+            $extra=@('--native-tools',$tools)
+          }
+          node scripts/verify-windows-ui.mjs --setup $setup --previous $previous --server $server --previous-server $previousServer --output (Join-Path $env:RUNNER_TEMP 'ui-evidence') --version $version @extra
+          if ($LASTEXITCODE -ne 0) { throw 'Isolated UI verification failed' }
+          if ($env:CANDIDATE_UI -eq 'true') {
+            python -B scripts/verify-windows-dependencies.py (Join-Path $env:RUNNER_TEMP 'ui-evidence/upgraded-installation') --report (Join-Path $env:RUNNER_TEMP 'ui-evidence/setup-windows-dependencies.json')
+            if ($LASTEXITCODE -ne 0) { throw 'Candidate Setup runtime dependencies failed' }
+          }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-ui-evidence
+          path: |
+            ${{ runner.temp }}/ui-evidence/**/*.json
+            ${{ runner.temp }}/ui-evidence/**/*.log
+            ${{ runner.temp }}/ui-evidence/**/*.png
+          retention-days: 14
+  diagnose-fix5:
+    if: inputs.diagnose_fix5
+    needs: profile-paths
+    runs-on: windows-2022
+    permissions:
+      actions: read
+      # Read the unpublished source-pinned draft, never publish or replace it.
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pnpm install --frozen-lockfile
+      - name: Preflight the complete suite with pinned unpublished fix5 packages
+        timeout-minutes: 30
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference='Stop'
+          $source='db14cf8a6dcf4df5fe28006740474f437127967d'
+          $run=gh api repos/$env:GITHUB_REPOSITORY/actions/runs/40612364134 | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $run.head_sha -ne $source) { throw 'Diagnostic package workflow source mismatch' }
+          $jobs=gh api repos/$env:GITHUB_REPOSITORY/actions/runs/40612364134/jobs | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot verify diagnostic build provenance' }
+          foreach ($name in @('Build Windows x64','Server Windows x64')) {
+            if (-not ($jobs.jobs | Where-Object { $_.name -eq $name -and $_.conclusion -eq 'success' })) { throw 'Diagnostic binary build did not pass' }
+          }
+          gh run download 40612364134 --repo $env:GITHUB_REPOSITORY --name release-windows-setup-evidence --dir setup-evidence
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned Setup manifest download failed' }
+          # Source and verifier identities remain separate in every report.
+          # This does not validate or publish the newer application commit.
+          $env:CODEG_VERIFIER_SHA=$env:GITHUB_SHA
+          $env:GITHUB_SHA=$source
+          ./scripts/verify-windows-release.ps1 -ReleaseTag v0.40.0-fix5 -Repository $env:GITHUB_REPOSITORY -Destination "$env:RUNNER_TEMP/fix5-verifier-diagnosis" -SetupManifest setup-evidence/payload.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: diagnostic-fix5-verifier-evidence
+          path: |
+            ${{ runner.temp }}/fix5-verifier-diagnosis/**/verification.json
+            ${{ runner.temp }}/fix5-verifier-diagnosis/**/verification-progress.json
+            ${{ runner.temp }}/fix5-verifier-diagnosis/**/*.log
+            ${{ runner.temp }}/fix5-verifier-diagnosis/**/*.png
+            ${{ runner.temp }}/fix5-verifier-diagnosis/**/scroll-results.json
+            ${{ runner.temp }}/fix5-verifier-diagnosis/**/*-failure.json
+            ${{ runner.temp }}/fix5-verifier-diagnosis/**/resources-and-migrations.json
+            ${{ runner.temp }}/fix5-verifier-diagnosis/**/*dependencies.json
+          retention-days: 14
+  diagnose-fix2:
+    if: inputs.diagnose_fix2
+    needs: profile-paths
+    runs-on: windows-2022
+    permissions:
+      actions: read
+      # GitHub requires push access to read an unpublished draft's assets.
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pnpm install --frozen-lockfile
+      - name: Verify the current harness with source-pinned diagnostic packages
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference='Stop'
+          $source='b9c6baeae78498112ddd28a6ece7804e9cfac29e'
+          git diff --exit-code $source HEAD -- src src-tauri/src public vendor pnpm-lock.yaml next.config.ts
+          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic application source differs from the pinned packages' }
+          $run=gh api repos/$env:GITHUB_REPOSITORY/actions/runs/40399440112 | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $run.head_sha -ne $source) { throw 'Diagnostic package workflow source mismatch' }
+          gh run download 40399440112 --repo $env:GITHUB_REPOSITORY --name release-windows-setup-evidence --dir setup-evidence
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned Setup manifest download failed' }
+          $env:CODEG_VERIFIER_SHA=$env:GITHUB_SHA
+          $env:GITHUB_SHA=$source
+          ./scripts/verify-windows-release.ps1 -ReleaseTag v0.40.0-fix2 -Repository $env:GITHUB_REPOSITORY -Destination "$env:RUNNER_TEMP/fix2-verifier-diagnosis" -SetupManifest setup-evidence/payload.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: diagnostic-fix2-verifier-evidence
+          path: |
+            ${{ runner.temp }}/fix2-verifier-diagnosis/**/verification.json
+            ${{ runner.temp }}/fix2-verifier-diagnosis/**/*.log
+            ${{ runner.temp }}/fix2-verifier-diagnosis/**/*.png
+            ${{ runner.temp }}/fix2-verifier-diagnosis/**/scroll-results.json
+            ${{ runner.temp }}/fix2-verifier-diagnosis/**/*-failure.json
+            ${{ runner.temp }}/fix2-verifier-diagnosis/**/resources-and-migrations.json
+            ${{ runner.temp }}/fix2-verifier-diagnosis/**/*dependencies.json
+          retention-days: 14
+  diagnose-allocation:
+    if: inputs.diagnose_allocation
+    permissions:
+      contents: write
+      actions: read
+    env:
+      RUST_BACKTRACE: full
+      PYTHONUTF8: "1"
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v4
+        if: ${{ !inputs.allocation_annotation_only }}
+      - uses: actions/setup-node@v4
+        if: ${{ !inputs.allocation_annotation_only }}
+        with:
+          node-version: 24
+          cache: pnpm
+      - uses: actions/setup-python@v5
+        if: ${{ !inputs.allocation_annotation_only }}
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+        if: ${{ !inputs.allocation_original_only && !inputs.allocation_annotation_only }}
+      - uses: swatinem/rust-cache@v2
+        if: ${{ !inputs.allocation_original_only && !inputs.allocation_annotation_only }}
+        with:
+          workspaces: "./src-tauri -> target"
+          shared-key: server-x86_64-pc-windows-msvc
+          cache-on-failure: true
+      - name: Pin and quarantine the failed release; download diagnostic assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference='Stop'
+          git diff --exit-code 81836e25d1d21d6627eb8062441c2505d4eaf3ea HEAD -- src src-tauri i18n public package.json pnpm-lock.yaml
+          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic must keep product source unchanged' }
+          $root=Join-Path $env:RUNNER_TEMP 'allocation-diagnosis'
+          New-Item -ItemType Directory $root | Out-Null
+          $release=gh api repos/$env:GITHUB_REPOSITORY/releases/tags/v0.40.0-fix3 | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $release.tag_name -ne 'v0.40.0-fix3') { throw 'Wrong diagnostic release' }
+          $failed=gh api repos/$env:GITHUB_REPOSITORY/actions/runs/40449537644 | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $failed.head_sha -ne '81836e25d1d21d6627eb8062441c2505d4eaf3ea' -or $failed.conclusion -ne 'failure') { throw 'Failed release evidence does not match' }
+          $body=$release.body
+          if (-not $body.Contains('发布后验收未通过')) {
+            $body="> **发布后验收未通过：本版本已隔离为预发布。** Windows Server 在发布后隔离复验中出现 32 GiB 分配失败并退出；原因仍在诊断。草稿阶段的通过结果不代表最终交付成功。此版本不作为本次已验收交付，现有 tag 和资产保留用于诊断。`n> 失败证据：https://github.com/ijpq/codeg/actions/runs/40449537644`n`n"+$body
+          }
+          $payload=Join-Path $root 'quarantine-note.json'
+          @{prerelease=$true;make_latest='false';body=$body} | ConvertTo-Json | Set-Content $payload -Encoding utf8
+          gh api --method PATCH repos/$env:GITHUB_REPOSITORY/releases/$($release.id) --input $payload | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to quarantine unverified release' }
+          $updated=gh api repos/$env:GITHUB_REPOSITORY/releases/tags/v0.40.0-fix3 | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or -not $updated.prerelease -or $updated.body -cne $body) { throw 'Quarantine note did not persist' }
+          if (Compare-Object @($release.assets | ForEach-Object { "$($_.id):$($_.name):$($_.digest)" }) @($updated.assets | ForEach-Object { "$($_.id):$($_.name):$($_.digest)" })) { throw 'Release assets changed during annotation' }
+          if ('${{ inputs.allocation_annotation_only }}' -eq 'true') { exit 0 }
+          gh release download v0.40.0-fix3 --repo $env:GITHUB_REPOSITORY --dir $root --pattern codeg-server-windows-x64.zip
+          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic package download failed' }
+          $archive=Join-Path $root 'codeg-server-windows-x64.zip'
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash.ToLower() -ne 'd55a7b1b4b921f13a1f8d435274ddbc1ebfc14c15f34bd9a2c4c24abb15dc485') { throw 'Diagnostic asset hash mismatch' }
+          gh release download v0.40.0-fix3 --repo $env:GITHUB_REPOSITORY --dir $root --pattern codeg_0.40.0-fix3_x64-setup.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic Setup download failed' }
+          $setup=Join-Path $root 'codeg_0.40.0-fix3_x64-setup.exe'
+          if ((Get-FileHash $setup -Algorithm SHA256).Hash.ToLower() -ne 'ec68cf7cba444e2b8ff5955ca7343baf6acea0c6803a26ad57648c3f0e039d56') { throw 'Diagnostic Setup hash mismatch' }
+          gh release download v0.36.0-fix1 --repo $env:GITHUB_REPOSITORY --dir $root --pattern codeg_0.36.0-fix1_x64-setup.exe --pattern codeg_0.36.0-fix1_x64-setup.exe.sha256
+          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic baseline download failed' }
+          $previous=Join-Path $root 'codeg_0.36.0-fix1_x64-setup.exe'
+          $hash=((Get-Content "$previous.sha256" -Raw).Trim() -split '\s+')[0].ToLower()
+          if ((Get-FileHash $previous -Algorithm SHA256).Hash.ToLower() -ne $hash) { throw 'Diagnostic baseline hash mismatch' }
+          "DIAG_SETUP=$setup" >> $env:GITHUB_ENV
+          "DIAG_PREVIOUS=$previous" >> $env:GITHUB_ENV
+          Expand-Archive $archive (Join-Path $root 'expanded')
+          $server=Join-Path $root 'expanded/codeg-server-windows-x64'
+          $manifest=Get-Content (Join-Path $server 'web/codeg-release-manifest.json') -Raw | ConvertFrom-Json
+          if ($manifest.commit -ne '81836e25d1d21d6627eb8062441c2505d4eaf3ea') { throw 'Diagnostic source mismatch' }
+          Copy-Item (Join-Path $server 'web') out -Recurse
+          "DIAG_ROOT=$root" >> $env:GITHUB_ENV
+          "DIAG_SERVER=$server" >> $env:GITHUB_ENV
+      - run: pnpm install --frozen-lockfile
+        if: ${{ !inputs.allocation_annotation_only }}
+      - name: Prepare isolated protocol and browser harness
+        if: ${{ !inputs.allocation_annotation_only }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tools=Join-Path $env:DIAG_ROOT 'native-agent-tools'
+          npm install --prefix $tools --global --include=optional --ignore-scripts --no-audit --no-fund '@agentclientprotocol/codex-acp@2.2.2' '@agentclientprotocol/claude-agent-acp@0.94.0'
+          if ($LASTEXITCODE -ne 0) { throw 'Isolated adapter install failed' }
+          python -B scripts/prepare-office-preview-test.py --output $tools
+          if ($LASTEXITCODE -ne 0) { throw 'Office test converter failed' }
+      - name: Exercise original dual packages in the failed Windows 2022 environment
+        if: ${{ !inputs.allocation_annotation_only }}
+        shell: pwsh
+        run: |
+          $count=if ('${{ inputs.allocation_original_only }}' -eq 'true') { 3 } else { 1 }
+          foreach ($i in 1..$count) {
+            node scripts/verify-windows-ui.mjs --setup $env:DIAG_SETUP --previous $env:DIAG_PREVIOUS --server $env:DIAG_SERVER --output (Join-Path $env:DIAG_ROOT "original-server-$i") --version 0.40.0-fix3 --native-tools (Join-Path $env:DIAG_ROOT 'native-agent-tools')
+            $result=$LASTEXITCODE
+            @{ diagnostic=$true; instrumented=$false; exit_code=$result } | ConvertTo-Json | Set-Content (Join-Path $env:DIAG_ROOT "original-result-$i.json")
+            if ($result -ne 0) { break }
+          }
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: ${{ !inputs.allocation_annotation_only }}
+        with:
+          name: original-windows-2022-diagnosis
+          path: |
+            ${{ runner.temp }}/allocation-diagnosis/original-result-*.json
+            ${{ runner.temp }}/allocation-diagnosis/original-server-*/**/*.json
+            ${{ runner.temp }}/allocation-diagnosis/original-server-*/**/*.log
+            ${{ runner.temp }}/allocation-diagnosis/original-server-*/**/*.png
+          retention-days: 14
+      - name: Build a diagnostic binary with symbolized bounded allocation tracing
+        if: ${{ !inputs.allocation_original_only && !inputs.allocation_annotation_only }}
+        shell: pwsh
+        run: |
+          Get-Content scripts/diagnostic-allocation-trace.rs -Raw | Add-Content src-tauri/src/bin/codeg_server.rs
+          # Keep the library's real Release optimization. Symbols are added only
+          # to this executable, leaving dependency compilation flags unchanged.
+          cargo rustc --manifest-path src-tauri/Cargo.toml --release --target x86_64-pc-windows-msvc --no-default-features --features server-bin --bin codeg-server -- -C debuginfo=line-tables-only
+          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic build failed' }
+          Copy-Item src-tauri/target/x86_64-pc-windows-msvc/release/codeg-server.exe $env:DIAG_SERVER -Force
+          Copy-Item src-tauri/target/x86_64-pc-windows-msvc/release/codeg_server.pdb $env:DIAG_SERVER -ErrorAction SilentlyContinue
+          Copy-Item src-tauri/target/x86_64-pc-windows-msvc/release/codeg-server.pdb $env:DIAG_SERVER -ErrorAction SilentlyContinue
+      - name: Reproduce with allocation call stacks and fresh isolated profiles
+        if: ${{ !inputs.allocation_original_only && !inputs.allocation_annotation_only }}
+        shell: pwsh
+        run: |
+          foreach ($i in 1..3) {
+            node scripts/verify-windows-ui.mjs --setup $env:DIAG_SETUP --previous $env:DIAG_PREVIOUS --server $env:DIAG_SERVER --output (Join-Path $env:DIAG_ROOT "traced-server-$i") --version 0.40.0-fix3 --native-tools (Join-Path $env:DIAG_ROOT 'native-agent-tools')
+            $result=$LASTEXITCODE
+            @{ diagnostic=$true; instrumented=$true; exit_code=$result } | ConvertTo-Json | Set-Content (Join-Path $env:DIAG_ROOT "traced-result-$i.json")
+            if ($result -ne 0) { break }
+          }
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() && !inputs.allocation_original_only && !inputs.allocation_annotation_only }}
+        with:
+          name: server-allocation-diagnostics
+          path: |
+            ${{ runner.temp }}/allocation-diagnosis/**/*result*.json
+            ${{ runner.temp }}/allocation-diagnosis/**/verification.json
+            ${{ runner.temp }}/allocation-diagnosis/**/*.log
+            ${{ runner.temp }}/allocation-diagnosis/**/*-failure.json
+          retention-days: 14

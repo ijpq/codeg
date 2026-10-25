@@ -23,6 +23,7 @@ pub mod clipboard;
 /// Codex's model list: user saves through the commit coordinator, and the
 /// provider-list commands (both runtimes).
 pub mod codex_catalog;
+pub mod codex_quota;
 /// The ✨ commit message generator (both runtimes).
 pub mod commit_message;
 /// Computer use: sharing windows, the helper, the agent reads — the desktop
@@ -32,6 +33,8 @@ pub mod computer;
 /// the shared codeg-mcp plumbing reads them.
 pub mod computer_tools;
 pub mod config_sync;
+mod conversation_branch_context;
+pub mod conversation_branches;
 pub mod conversation_tags;
 pub mod conversations;
 /// "New folder" in the directory browser (both runtimes).
@@ -40,6 +43,7 @@ pub mod custom_agents;
 pub mod custom_skills;
 pub mod deepseek_settings;
 pub mod delegation;
+pub mod deliverables;
 pub mod experts;
 pub mod feedback;
 #[cfg(feature = "tauri-runtime")]
@@ -65,6 +69,8 @@ pub mod opencode_credentials;
 pub mod open_in;
 #[cfg(feature = "tauri-runtime")]
 pub mod notification;
+pub mod office_tools;
+pub mod open_in;
 pub mod pet;
 pub mod project_boot;
 pub mod question;
@@ -86,3 +92,9 @@ pub mod work_task;
 pub mod workspace_state;
 #[cfg(feature = "tauri-runtime")]
 pub mod workspace_windows;
+
+pub mod business_conversations;
+pub mod business_context;
+pub(crate) mod business_skills;
+
+pub mod business_delivery;

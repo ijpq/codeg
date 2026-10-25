@@ -238,7 +238,10 @@ describe("TabBar — maximize/restore", () => {
   it("sits flush right, after the drag spacer", () => {
     renderStrip({ maximizeControl: true })
     const button = maximizeButton()!
-    expect(button.nextElementSibling).toBeNull()
+    expect(button.nextElementSibling).toBe(
+      screen.getByRole("button", { name: "Close All" })
+    )
+    expect(button.nextElementSibling?.nextElementSibling).toBeNull()
     const spacer = button.previousElementSibling
     expect(spacer).toHaveAttribute("data-tauri-drag-region")
     expect(spacer?.previousElementSibling).toBe(

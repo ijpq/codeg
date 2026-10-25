@@ -1,9 +1,9 @@
-import { render } from "@testing-library/react"
+import { act, render, screen } from "@testing-library/react"
 import { NextIntlClientProvider } from "next-intl"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
-import enMessages from "@/i18n/messages/en.json"
 import { extractLiveEditStats, LiveTurnStats } from "./live-turn-stats"
+import enMessages from "@/i18n/messages/en.json"
 import type {
   LiveContentBlock,
   LiveMessage,
@@ -138,5 +138,45 @@ describe("LiveTurnStats", () => {
       expect(row.textContent).toBe("1m 5s")
       view.unmount()
     }
+  })
+
+  it("shows accepted/backend feedback before the first model delta", () => {
+    render(
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <LiveTurnStats
+          message={{
+            id: "pending",
+            role: "assistant",
+            content: [],
+            startedAt: Date.now(),
+          }}
+          agentType="codex"
+        />
+      </NextIntlClientProvider>
+    )
+    expect(screen.getByText(/Sent · Backend processing/)).toBeInTheDocument()
+  })
+
+  it("changes to still-processing after ten seconds without an event", () => {
+    vi.useFakeTimers()
+    render(
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        <LiveTurnStats
+          message={{
+            id: "pending",
+            role: "assistant",
+            content: [],
+            startedAt: Date.now(),
+          }}
+          agentType="codex"
+        />
+      </NextIntlClientProvider>
+    )
+    act(() => {
+      vi.advanceTimersByTime(11_000)
+    })
+    expect(
+      screen.getByText(/Sent · Backend still processing/)
+    ).toBeInTheDocument()
   })
 })

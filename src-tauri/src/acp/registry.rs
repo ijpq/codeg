@@ -152,6 +152,11 @@ impl BinaryDirEntry {
 #[derive(Debug, Clone)]
 pub struct AcpAgentMeta {
     pub agent_type: AgentType,
+    /// Whether this protocol adapter is expected to expose Codeg's
+    /// `session/steer` extension. Runtime preparation/negotiation can still
+    /// downgrade the connection (old adapter/app-server); the frontend consumes
+    /// that per-connection result rather than matching the agent name.
+    pub supports_steer: bool,
     /// 是否经 ACP 线缆（session/new 的 `mcpServers` 字段）向该 agent 转发 MCP
     /// 服务器——既包括用户配置的服务器，也包括内置 codeg-mcp 伴生进程。
     /// OpenClaw 拒绝 `mcpServers` 中的任何服务器条目（会使 session/new 失败），
@@ -459,7 +464,7 @@ const ACP_ADAPTER_DOCS_URL: &str = "https://docs.codeg.app/guide/supported-agent
 /// open without it. Move it with the pin (see `AgentType::Pi` below); the
 /// settings panel warns with the same value (`PI_MIN_RUNTIME_VERSION` in
 /// `src/lib/pi-config.ts`, held equal by a test).
-pub const PI_MIN_RUNTIME_VERSION: &str = "0.81.0";
+pub const PI_MIN_RUNTIME_VERSION: &str = "1.4.0";
 
 /// The `@openai/codex` the pinned codex-acp drives (`AgentType::Codex` below),
 /// for when the installed copy's own package.json cannot be read. A runtime
@@ -500,6 +505,7 @@ pub const CLAUDE_AGENT_ACP_PACKAGE: &str = "@agentclientprotocol/claude-agent-ac
 /// `agent_info.version` meets this minimum.
 pub fn steering_prompt_required_min_version(agent_type: AgentType) -> Option<&'static str> {
     match agent_type {
+        AgentType::Pi => Some("0.0.34-codeg.2"),
         // 0.64.0 (#919) added the `promptRequired` opt-in, but the ACTIVE path
         // stayed unsound until 0.65.0 (#958): steering is delivered at priority
         // `now`, which makes the CLI ABORT the running cycle, and that cycle's
@@ -598,6 +604,7 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
     match agent_type {
         AgentType::ClaudeCode => AcpAgentMeta {
             agent_type,
+            supports_steer: false,
             supports_mcp: true,
             name: "Claude Code",
             description: "ACP wrapper for Anthropic's Claude",
@@ -692,10 +699,11 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             // string literals in `acp-agent.js` are "collecting",
             // "notReported", "providerError", plus the new
             // `dist/file-change-audit.js`) — the AIR `agentFileChangeReport`
-            // capability, shipped in lockstep with codex-acp 1.4.0. It is
-            // OFF unless the client asks for it twice, and codeg deliberately
-            // asks for neither; see `build_client_capabilities` in
-            // connection.rs for the reasoning. The only ambient change is that
+            // capability, shipped in lockstep with codex-acp 1.4.0. It is OFF
+            // unless the client asks for it twice. CodeG enables the Codex
+            // implementation as a watcher backfill but deliberately leaves the
+            // Claude audit off; see `build_client_capabilities` in
+            // connection.rs. The only ambient change is that
             // `airSessionFailureCapabilityMeta` became variadic so the agent
             // can advertise `["sessionFailure", "agentFileChangeReport"]` — an
             // ADDITIVE element in an array codeg only ever membership-tests,
@@ -2743,6 +2751,7 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
         },
         AgentType::Codex => AcpAgentMeta {
             agent_type,
+            supports_steer: true,
             supports_mcp: true,
             name: "Codex CLI",
             description: "ACP adapter for OpenAI's coding assistant",
@@ -3887,6 +3896,7 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
         },
         AgentType::Gemini => AcpAgentMeta {
             agent_type,
+            supports_steer: false,
             supports_mcp: true,
             name: "Gemini CLI",
             description: "Google's official CLI for Gemini",
@@ -3933,6 +3943,7 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
         },
         AgentType::OpenClaw => AcpAgentMeta {
             agent_type,
+            supports_steer: false,
             // OpenClaw 拒绝 `mcpServers` 中的任何服务器条目（会使 session/new 失败），
             // 故不向其转发任何 MCP 条目（含 codeg-mcp 伴生进程）。详见 supports_mcp 字段注释。
             supports_mcp: false,
@@ -4000,6 +4011,7 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
         },
         AgentType::Cline => AcpAgentMeta {
             agent_type,
+            supports_steer: false,
             supports_mcp: true,
             name: "Cline",
             description: "Autonomous coding agent CLI",
@@ -4145,6 +4157,7 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
         },
         AgentType::OpenCode => AcpAgentMeta {
             agent_type,
+            supports_steer: false,
             supports_mcp: true,
             name: "OpenCode",
             description: "The open source coding agent",
@@ -4214,6 +4227,7 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
         },
         AgentType::Hermes => AcpAgentMeta {
             agent_type,
+            supports_steer: false,
             supports_mcp: true,
             name: "Hermes Agent",
             description: "Nous Research's self-improving agent (ACP)",
@@ -4321,6 +4335,7 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
         },
         AgentType::CodeBuddy => AcpAgentMeta {
             agent_type,
+            supports_steer: false,
             supports_mcp: true,
             name: "CodeBuddy",
             description: "Tencent Cloud's official AI coding assistant (ACP)",
@@ -4515,6 +4530,7 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
         },
         AgentType::KimiCode => AcpAgentMeta {
             agent_type,
+            supports_steer: false,
             supports_mcp: true,
             name: "Kimi Code",
             description: "Moonshot AI's official CLI coding assistant (ACP)",
@@ -4915,34 +4931,22 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
         },
         AgentType::Pi => AcpAgentMeta {
             agent_type,
-            // pi-acp accepts ACP-wire `mcpServers` but drops them (does not
-            // forward to pi), and pi has no native MCP. supports_mcp stays
-            // `true` only to satisfy the `only_openclaw_opts_out_of_mcp`
-            // invariant — actual wire forwarding is short-circuited in
-            // `connection.rs` (see the skip-list), so neither user servers nor
-            // the codeg-mcp companion are futilely forwarded.
+            supports_steer: true,
             supports_mcp: true,
             name: "Pi",
-            description: "Self-extensible coding agent (ACP via pi-acp)",
-            // pi-acp 0.0.34 spawns `pi --mode rpc` as a child, so `pi` (npm
-            // `@earendil-works/pi-coding-agent`, at least
-            // `PI_MIN_RUNTIME_VERSION`) must be resolvable on PATH — or
-            // pointed at a custom build via the `PI_ACP_PI_COMMAND` env (see
-            // BYO-pi). Args are empty: the ACP server is the default mode
-            // (`npx -y pi-acp`, no subcommand). `node_required` follows pi's
-            // 22+ requirement (pi-acp's own engines say >=20). The embedded
-            // context env lets pi-acp advertise `promptCapabilities.embeddedContext`.
+            description: "Pi with verified sessions, native MCP and steering",
             distribution: AgentDistribution::Npx {
-                version: "0.0.34",
-                package: "pi-acp@0.0.34",
+                version: "0.0.34-codeg.2",
+                package: "pi-acp@https://github.com/ijpq/pi-acp/releases/download/v0.0.34-codeg.2/pi-acp-0.0.34-codeg.2.tgz",
                 cmd: "pi-acp",
                 args: &[],
                 env: &[("PI_ACP_ENABLE_EMBEDDED_CONTEXT", "true")],
-                node_required: Some("22.0.0"),
+                node_required: Some("22.19.0"),
             },
         },
         AgentType::Grok => AcpAgentMeta {
             agent_type,
+            supports_steer: false,
             supports_mcp: true,
             name: "Grok",
             description: "xAI's official coding agent and CLI (ACP via grok agent stdio)",
@@ -5097,6 +5101,7 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
         },
         AgentType::Cursor => AcpAgentMeta {
             agent_type,
+            supports_steer: false,
             supports_mcp: true,
             name: "Cursor",
             description: "Cursor's coding agent (ACP via cursor-agent acp)",
@@ -5286,6 +5291,7 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
         },
         AgentType::ZCode => AcpAgentMeta {
             agent_type,
+            supports_steer: false,
             supports_mcp: true,
             name: "ZCode",
             description: "Official ZCode runtime via the community ACP bridge",
@@ -5382,6 +5388,7 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
         },
         AgentType::DeepSeek => AcpAgentMeta {
             agent_type,
+            supports_steer: false,
             supports_mcp: true,
             name: "DeepSeek Harness",
             description: "Editor-facing DeepSeek Harness agent (ACP via deepseek-acp)",
@@ -5550,6 +5557,7 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
         },
         AgentType::Qoder => AcpAgentMeta {
             agent_type,
+            supports_steer: false,
             supports_mcp: true,
             name: "Qoder",
             description: "Alibaba's Qoder coding agent CLI (native ACP via --acp)",
@@ -5736,6 +5744,7 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
         },
         AgentType::Antigravity => AcpAgentMeta {
             agent_type,
+            supports_steer: false,
             supports_mcp: true,
             name: "Google Antigravity",
             description: "Google's AI coding agent (first-party ACP server)",
@@ -5947,6 +5956,7 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
         },
         AgentType::Kiro => AcpAgentMeta {
             agent_type,
+            supports_steer: false,
             supports_mcp: true,
             name: "Kiro CLI",
             description: "Amazon's Kiro agent in the terminal (native ACP via kiro-cli acp)",
@@ -5999,6 +6009,7 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
         },
         AgentType::Trae => AcpAgentMeta {
             agent_type,
+            supports_steer: false,
             supports_mcp: true,
             name: "TRAE CLI",
             description: "ByteDance's TRAE coding agent in the terminal (native ACP via traecli acp serve)",
@@ -6055,6 +6066,7 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
         },
         AgentType::CommandCode => AcpAgentMeta {
             agent_type,
+            supports_steer: false,
             supports_mcp: true,
             name: "Command Code",
             description: "Command Code's coding agent in the terminal (native ACP via command-code acp)",
@@ -6342,6 +6354,7 @@ mod tests {
         let build_id_agent = AcpAgentMeta {
             agent_type: AgentType::Custom("build-id-agent"),
             supports_mcp: true,
+            supports_steer: false,
             name: "Build Id Agent",
             description: "an agent whose archives are named after a build id",
             distribution: AgentDistribution::Binary {
@@ -6560,7 +6573,7 @@ mod tests {
     }
 
     #[test]
-    fn steering_prompt_required_min_version_gates_claude_only() {
+    fn steering_prompt_required_min_version_gates_verified_claude_and_pi() {
         // The native-steering policy bit: only an adapter that honors the
         // `promptRequired` opt-in AND keeps the owning prompt in flight across
         // a steered turn gets a minimum version. The floor is the release that
@@ -6575,6 +6588,10 @@ mod tests {
             Some("0.65.0")
         );
         assert_eq!(steering_prompt_required_min_version(AgentType::Codex), None);
+        assert_eq!(
+            steering_prompt_required_min_version(AgentType::Pi),
+            Some("0.0.34-codeg.2")
+        );
         for agent in [
             AgentType::Gemini,
             AgentType::OpenClaw,
@@ -6691,7 +6708,7 @@ mod tests {
             "@agentclientprotocol/codex-acp@2.3.0",
             Some("20.3.0"),
         );
-        assert_npx_version(AgentType::Pi, "0.0.34", "pi-acp@0.0.34", Some("22.0.0"));
+        assert_npx_version(AgentType::Pi, "0.0.34-codeg.2", "pi-acp@https://github.com/ijpq/pi-acp/releases/download/v0.0.34-codeg.2/pi-acp-0.0.34-codeg.2.tgz", Some("22.19.0"));
         assert_npx_version(
             AgentType::Grok,
             "1.0.70",

@@ -27,7 +27,8 @@
       "icons/icon.ico"
     ],
     "resources": {
-      "../out": "web/"
+      "../out": "web/",
+      "../dist/pi-runtime": "pi-runtime/"
     },
     "externalBin": [
       "binaries/codeg-mcp",

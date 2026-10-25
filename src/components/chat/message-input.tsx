@@ -11,6 +11,8 @@ import {
   ClipboardPaste,
   Clock,
   Copy,
+  GitFork,
+  Loader2,
   MessageSquareText,
   Scissors,
   Send,
@@ -74,8 +76,10 @@ import {
   type ConversationFolderPickerOverride,
 } from "@/components/chat/conversation-context-bar"
 import { ComposerContextUsage } from "@/components/chat/composer-context-usage"
+import { ComposerCodexQuota } from "@/components/chat/composer-codex-quota"
 import { ComposerConnectionStatus } from "@/components/chat/composer-connection-status"
 import { SessionSettingsPicker } from "@/components/chat/session-settings-picker"
+import { ExecutionModeControl } from "@/components/chat/execution-mode-control"
 import {
   buildSessionSettings,
   type SessionSettingTarget,
@@ -86,6 +90,7 @@ import { useAgentVocabulary } from "@/hooks/use-agent-vocabulary"
 import {
   clearMessageInputDraftV2,
   loadMessageInputDraftV2,
+  saveMessageInputDraft,
   saveMessageInputDraftV2,
   setLiveComposerContent,
 } from "@/lib/message-input-draft"
@@ -138,6 +143,7 @@ import { ComposerAddMenu } from "@/components/chat/composer/composer-add-menu"
 import { ComposerImageThumbnails } from "@/components/chat/composer/composer-image-thumbnails"
 import { useComposerAttachments } from "@/components/chat/composer/use-composer-attachments"
 import { useComposerShortcuts } from "@/components/chat/composer/use-composer-shortcuts"
+import { draftSupportsNativeSteer } from "@/lib/prompt-delivery-state"
 
 /**
  * Payload pushed into the composer from outside (e.g. a welcome-page quick
@@ -174,6 +180,8 @@ export type ComposerInjectContent =
 
 interface MessageInputProps {
   onSend: (draft: PromptDraft, modeId?: string | null) => void
+  supportsSteer?: boolean
+  onGuide?: (draft: PromptDraft) => void | Promise<void>
   placeholder?: string
   defaultPath?: string
   disabled?: boolean
@@ -181,6 +189,7 @@ interface MessageInputProps {
   onFocus?: () => void
   className?: string
   isPrompting?: boolean
+  isCancelling?: boolean
   onCancel?: () => void
   modes?: SessionModeInfo[]
   configOptions?: SessionConfigOptionInfo[]
@@ -232,6 +241,8 @@ interface MessageInputProps {
   isEditingQueueItem?: boolean
   onSaveQueueEdit?: (draft: PromptDraft) => void
   onCancelQueueEdit?: () => void
+  /** Fork the session and send `draft`; the parent persists/retries it. */
+  onForkSend?: (draft: PromptDraft, modeId?: string | null) => void
   /** Send the draft into the RUNNING turn over the session's live-feedback
    *  channel (see {@link steerChannel}). Present only on sessions with a
    *  working delivery channel — when absent, the prompting branch renders its
@@ -330,6 +341,8 @@ function SelectorLoadingChip({ label }: { label: string }) {
 
 export function MessageInput({
   onSend,
+  supportsSteer = false,
+  onGuide,
   placeholder,
   defaultPath,
   disabled = false,
@@ -337,6 +350,7 @@ export function MessageInput({
   onFocus,
   className,
   isPrompting = false,
+  isCancelling = false,
   onCancel,
   modes,
   configOptions,
@@ -362,6 +376,7 @@ export function MessageInput({
   isEditingQueueItem = false,
   onSaveQueueEdit,
   onCancelQueueEdit,
+  onForkSend,
   onSteer,
   steerChannel = "pull",
   onAddFeedback,
@@ -450,6 +465,8 @@ export function MessageInput({
   // The editor owns the content now; this mirror of its empty state drives the
   // send button and `hasSendableContent`.
   const [composerEmpty, setComposerEmpty] = useState(true)
+  const [steerSubmitting, setSteerSubmitting] = useState(false)
+  const steerSubmittingRef = useRef(false)
   // Flips true once the RichComposer's async (immediatelyRender:false) editor has
   // mounted, so the hydration effect can use the imperative handle.
   const [composerReady, setComposerReady] = useState(false)
@@ -560,9 +577,11 @@ export function MessageInput({
   // reload — a Markdown round-trip would downgrade them to plain links.
   const draftSaveTimerRef = useRef<number | null>(null)
   /** Persist (or clear) the draft from the document as it stands right now. */
-  const writeDraftNow = useCallback(() => {
+  const persistDraftNow = useCallback(() => {
+    if (typeof window === "undefined") return
+    if (!effectiveDraftStorageKey || isEditingQueueItem) return
     const ed = editorRef.current
-    if (!ed || !effectiveDraftStorageKey) return
+    if (!ed) return
     if (ed.isEmpty()) {
       clearMessageInputDraftV2(effectiveDraftStorageKey)
     } else {
@@ -571,7 +590,8 @@ export function MessageInput({
         stripEmbeddedReferences(ed.getJSON())
       )
     }
-  }, [effectiveDraftStorageKey])
+  }, [effectiveDraftStorageKey, isEditingQueueItem])
+
   const scheduleDraftSave = useCallback(() => {
     if (typeof window === "undefined") return
     if (!effectiveDraftStorageKey || isEditingQueueItem) return
@@ -580,9 +600,9 @@ export function MessageInput({
     }
     draftSaveTimerRef.current = window.setTimeout(() => {
       draftSaveTimerRef.current = null
-      writeDraftNow()
+      persistDraftNow()
     }, 300)
-  }, [effectiveDraftStorageKey, isEditingQueueItem, writeDraftNow])
+  }, [effectiveDraftStorageKey, isEditingQueueItem, persistDraftNow])
   /**
    * Land a *pending* debounced save immediately, before something other than
    * the user replaces the document. A save scheduled by the keystrokes that
@@ -594,8 +614,8 @@ export function MessageInput({
     if (draftSaveTimerRef.current == null) return
     window.clearTimeout(draftSaveTimerRef.current)
     draftSaveTimerRef.current = null
-    writeDraftNow()
-  }, [writeDraftNow])
+    persistDraftNow()
+  }, [persistDraftNow])
 
   useEffect(() => {
     return () => {
@@ -690,6 +710,10 @@ export function MessageInput({
     if (!isActive || !composerReady || isPrompting) return
     if (isPrimaryPointerCoarse()) return
     const raf = requestAnimationFrame(() => {
+      // A turn (including a native Goal continuation) can finish while the
+      // reader navigates the transcript. Moving focus back to Tiptap then
+      // redirects Home/PageUp to the editor and may scroll it into view.
+      if (document.activeElement?.closest(".chat-scroll-port")) return
       editorRef.current?.focus()
     })
     // Dropped if the tab goes inactive or a turn starts before the frame runs.
@@ -826,22 +850,33 @@ export function MessageInput({
     return () => cancelAnimationFrame(raf)
   }, [skillPrefix, composerReady])
 
-  const handleComposerChange = useCallback(() => {
-    // The history's own writes are not edits. They must not end navigation, and
-    // they must not be saved as the draft: overwriting the stored draft with a
-    // recalled prompt would lose what the user had typed if they closed the tab
-    // without stepping back down. An actual edit falls into the branch below
-    // and saves normally.
-    if (!applyingHistoryRef.current) {
-      if (historyIndexRef.current !== null) {
-        historyIndexRef.current = null
-        historyDraftRef.current = null
+  const handleComposerChange = useCallback(
+    (text: string) => {
+      // The history's own writes are not edits. They must not end navigation, and
+      // they must not be saved as the draft: overwriting the stored draft with a
+      // recalled prompt would lose what the user had typed if they closed the tab
+      // without stepping back down. An actual edit falls into the branch below
+      // and saves normally.
+      if (!applyingHistoryRef.current) {
+        if (historyIndexRef.current !== null) {
+          historyIndexRef.current = null
+          historyDraftRef.current = null
+        }
+        if (effectiveDraftStorageKey && !isEditingQueueItem) {
+          saveMessageInputDraft(effectiveDraftStorageKey, text)
+        }
+        scheduleDraftSave()
       }
-      scheduleDraftSave()
-    }
-    syncComposerEmpty()
-    detectSlashTriggerRef.current?.()
-  }, [syncComposerEmpty, scheduleDraftSave])
+      syncComposerEmpty()
+      detectSlashTriggerRef.current?.()
+    },
+    [
+      effectiveDraftStorageKey,
+      isEditingQueueItem,
+      syncComposerEmpty,
+      scheduleDraftSave,
+    ]
+  )
 
   // Arrow-key prompt history. RichComposer only calls this from the document
   // edge, so the caret keeps moving line by line inside a multi-line entry. A
@@ -914,9 +949,22 @@ export function MessageInput({
     () => vocabulary.modes(modes ?? []),
     [modes, vocabulary]
   )
+  const executionOption =
+    agentType === "codex"
+      ? configOptions?.find(
+          (option) =>
+            option.id === "collaboration_mode" && option.kind.type === "select"
+        )
+      : undefined
   const availableConfigOptions = useMemo(
-    () => vocabulary.configOptions(configOptions ?? []),
-    [configOptions, vocabulary]
+    () =>
+      vocabulary
+        .configOptions(configOptions ?? [])
+        .filter(
+          (option) =>
+            agentType !== "codex" || option.id !== "collaboration_mode"
+        ),
+    [configOptions, vocabulary, agentType]
   )
   const hasConfigOptions = availableConfigOptions.length > 0
   const hasModes = availableModes.length > 0
@@ -972,6 +1020,7 @@ export function MessageInput({
     intakePending,
     intakeRevision,
   ])
+  const isNativeGuide = isPrompting && supportsSteer && Boolean(onGuide)
 
   // ── Slash command autocomplete ──
   //
@@ -1633,6 +1682,29 @@ export function MessageInput({
       return
     }
 
+    if (isNativeGuide && onGuide && draftSupportsNativeSteer(draft)) {
+      // Consume the draft synchronously so a double-click/key repeat cannot
+      // inject it twice. The parent owns failure recovery and always converts
+      // an unsuccessful guide into live feedback or the ordinary-message queue.
+      if (steerSubmittingRef.current) return
+      steerSubmittingRef.current = true
+      setSteerSubmitting(true)
+      if (effectiveDraftStorageKey) {
+        clearMessageInputDraftV2(effectiveDraftStorageKey)
+      }
+      resetComposer()
+      void Promise.resolve()
+        .then(() => onGuide(draft))
+        .catch(() => {
+          // The parent has already surfaced and recovered the failed draft.
+        })
+        .finally(() => {
+          steerSubmittingRef.current = false
+          setSteerSubmitting(false)
+        })
+      return
+    }
+
     // Prompting mode: enqueue instead of sending
     if (isPrompting && onEnqueue) {
       onEnqueue(draft, showModeSelector ? effectiveModeId : null)
@@ -1663,11 +1735,37 @@ export function MessageInput({
     buildDraft,
     isEditingQueueItem,
     isPrompting,
+    isNativeGuide,
+    onGuide,
     onSaveQueueEdit,
     onEnqueue,
     onSend,
     effectiveModeId,
     showModeSelector,
+    effectiveDraftStorageKey,
+    resetComposer,
+  ])
+
+  const handleForkSendClick = useCallback(() => {
+    if (!onForkSend) return
+    if (hasUploadingImage) {
+      toast.error(tAttach("attachUploadInProgress"))
+      return
+    }
+    const draft = buildDraft()
+    if (!draft) return
+    onForkSend(draft, showModeSelector ? effectiveModeId : null)
+    if (effectiveDraftStorageKey) {
+      clearMessageInputDraftV2(effectiveDraftStorageKey)
+    }
+    resetComposer()
+  }, [
+    onForkSend,
+    hasUploadingImage,
+    tAttach,
+    buildDraft,
+    showModeSelector,
+    effectiveModeId,
     effectiveDraftStorageKey,
     resetComposer,
   ])
@@ -1889,6 +1987,43 @@ export function MessageInput({
         <Check className="size-4" />
       </Button>
     </div>
+  ) : isNativeGuide && onCancel ? (
+    <div className="flex items-center gap-1">
+      <Button
+        onClick={onCancel}
+        variant="destructive"
+        size="icon"
+        className="h-8 w-8"
+        title={t("cancel")}
+      >
+        <Square className="size-4" />
+      </Button>
+      <Button
+        onClick={handleSend}
+        disabled={!hasSendableContent || steerSubmitting}
+        size="icon"
+        className="h-8 w-8"
+        title={steerSubmitting ? t("steerSending") : t("steer")}
+        aria-label={steerSubmitting ? t("steerSending") : t("steer")}
+      >
+        {steerSubmitting ? (
+          <Loader2 className="size-4 animate-spin" />
+        ) : (
+          <Send className="size-4" />
+        )}
+      </Button>
+    </div>
+  ) : isCancelling ? (
+    <Button
+      disabled
+      variant="destructive"
+      size="icon"
+      className="h-8 w-8"
+      title={t("stopping")}
+      aria-label={t("stopping")}
+    >
+      <Loader2 className="size-4 animate-spin" />
+    </Button>
   ) : isPrompting && onCancel ? (
     onSteer && onEnqueue && hasSendableContent ? (
       // Sessions with a working live-feedback channel surface the mid-turn
@@ -1947,6 +2082,12 @@ export function MessageInput({
                 )}
                 {t(steerChannel === "pull" ? "steerAsNote" : "steerIntoTurn")}
               </DropdownMenuItem>
+              {onForkSend && (
+                <DropdownMenuItem onSelect={handleForkSendClick}>
+                  <GitFork className="h-4 w-4" />
+                  {t("forkAndSend")}
+                </DropdownMenuItem>
+              )}
             </DropdownMenuContent>
           </DropdownMenu>
         </div>
@@ -2153,11 +2294,16 @@ export function MessageInput({
                 onReady={handleComposerReady}
                 onSubmit={handleSend}
                 onFocus={onFocus}
+                onBlur={persistDraftNow}
                 onPasteFiles={attach.handlePasteFiles}
                 onDropFiles={attach.handleEditorDrop}
                 onPlainPaste={handlePlainPasteShortcut}
-                submitShortcut={shortcuts.send_message}
-                newlineShortcut={shortcuts.newline_in_message}
+                submitShortcut={
+                  isNativeGuide ? "enter" : shortcuts.send_message
+                }
+                newlineShortcut={
+                  isNativeGuide ? "shift+enter" : shortcuts.newline_in_message
+                }
                 isExternalMenuOpen={slashMenuVisible}
                 onExternalMenuKeyDown={handleExternalMenuKeyDown}
                 onHistoryKeyDown={handleHistoryKeyDown}
@@ -2179,6 +2325,13 @@ export function MessageInput({
                     onAddFeedback={onAddFeedback}
                     feedbackAddDisabled={feedbackAddDisabled}
                   />
+                  {executionOption && (
+                    <ExecutionModeControl
+                      option={executionOption}
+                      onSelect={onConfigOptionChange}
+                      active={isActive !== false}
+                    />
+                  )}
                   {hasAnySelector && (
                     <SessionSettingsPicker
                       agentType={agentType ?? null}
@@ -2193,6 +2346,11 @@ export function MessageInput({
                       onChange={handleSessionSettingChange}
                     />
                   )}
+                  <ComposerCodexQuota
+                    tabId={attachmentTabId ?? null}
+                    agentType={agentType}
+                    isPrompting={isPrompting}
+                  />
                 </div>
                 <div className="shrink-0">{actionButtons}</div>
               </div>

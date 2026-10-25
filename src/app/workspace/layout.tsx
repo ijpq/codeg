@@ -1522,40 +1522,40 @@ function WorkspaceLayoutInner({ children }: { children: React.ReactNode }) {
                     unmount as they close, so none can host it. */}
                 <ConversationTagsManagerHost />
                 <ConversationRuntimeProvider>
-                  <WorkspaceProvider>
-                    <TabProvider>
-                      <WorkspaceDocumentTitle />
-                      <TabKeysSync />
-                      <BrowserEventsBridge />
-                      {/* Beside the events bridge and not inside it: that one
+                  <WorkbenchRouteProvider>
+                    <WorkspaceProvider>
+                      <TabProvider>
+                        <WorkspaceDocumentTitle />
+                        <TabKeysSync />
+                        <BrowserEventsBridge />
+                        {/* Beside the events bridge and not inside it: that one
                           stops where no built-in browser exists, and a local
                           server is worth hearing about in web mode too (the
                           port bridge can show it). */}
-                      <BrowserServiceBridge />
-                      {/* Mounted beside the bridge, not inside a tab: the tab
+                        <BrowserServiceBridge />
+                        {/* Mounted beside the bridge, not inside a tab: the tab
                           an agent asks to run code on is usually not the one
                           the person is looking at. */}
-                      <BrowserEvalConfirm />
-                      {/* Here and not in the browser tab it is opened from:
+                        <BrowserEvalConfirm />
+                        {/* Here and not in the browser tab it is opened from:
                           only the tab on screen is mounted, and a tab opening
                           on its own would take the marks with it. */}
-                      <BrowserScreenshotMarkupHost />
-                      <BrowserTabsPersistence />
-                      <BrowserTabsSuspender />
-                      <HeavyPluginsWarmup />
-                      <DeepLinkBootstrap />
-                      <PetFocusBridge />
-                      <WorkspaceRestoreNotices />
-                      {/* Always mounted: external-change conflicts must be
+                        <BrowserScreenshotMarkupHost />
+                        <BrowserTabsPersistence />
+                        <BrowserTabsSuspender />
+                        <HeavyPluginsWarmup />
+                        <DeepLinkBootstrap />
+                        <PetFocusBridge />
+                        <WorkspaceRestoreNotices />
+                        {/* Always mounted: external-change conflicts must be
                             resolvable even with the aux file tree closed. */}
-                      <ExternalConflictDialog />
-                      <SidebarProvider>
-                        <AuxPanelProvider>
-                          <TerminalProvider>
-                            <SearchDialogProvider>
-                              <AutomationsViewProvider>
-                                <TasksViewProvider>
-                                  <WorkbenchRouteProvider>
+                        <ExternalConflictDialog />
+                        <SidebarProvider>
+                          <AuxPanelProvider>
+                            <TerminalProvider>
+                              <SearchDialogProvider>
+                                <AutomationsViewProvider>
+                                  <TasksViewProvider>
                                     <WorkbenchRouteConversationSync />
                                     {/* The task editor a message's "create
                                           task" opens over the page it is on:
@@ -1570,15 +1570,15 @@ function WorkspaceLayoutInner({ children }: { children: React.ReactNode }) {
                                     <FolderLayoutShell>
                                       {children}
                                     </FolderLayoutShell>
-                                  </WorkbenchRouteProvider>
-                                </TasksViewProvider>
-                              </AutomationsViewProvider>
-                            </SearchDialogProvider>
-                          </TerminalProvider>
-                        </AuxPanelProvider>
-                      </SidebarProvider>
-                    </TabProvider>
-                  </WorkspaceProvider>
+                                  </TasksViewProvider>
+                                </AutomationsViewProvider>
+                              </SearchDialogProvider>
+                            </TerminalProvider>
+                          </AuxPanelProvider>
+                        </SidebarProvider>
+                      </TabProvider>
+                    </WorkspaceProvider>
+                  </WorkbenchRouteProvider>
                 </ConversationRuntimeProvider>
               </DelegationProvider>
             </AcpConnectionsProvider>

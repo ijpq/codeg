@@ -206,3 +206,27 @@ pub async fn renew_office_watch(
         crate::office_watch::WatchHolder::Web,
     )))
 }
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OfficeDeliveryParams {
+    pub conversation_id: i32,
+    pub turn_run_id: String,
+}
+
+pub async fn get_office_delivery_preview(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(params): Json<OfficeDeliveryParams>,
+) -> Result<
+    Json<Option<crate::db::service::office_delivery_preview_service::OfficeDeliveryPreview>>,
+    AppCommandError,
+> {
+    let preview = crate::db::service::office_delivery_preview_service::get(
+        &state.db.conn,
+        params.conversation_id,
+        &params.turn_run_id,
+    )
+    .await
+    .map_err(|error| AppCommandError::task_execution_failed(error.to_string()))?;
+    Ok(Json(preview))
+}

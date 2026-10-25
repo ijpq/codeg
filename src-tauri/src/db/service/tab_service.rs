@@ -1,7 +1,7 @@
 use chrono::Utc;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::NotSet, ColumnTrait, ConnectionTrait, DatabaseConnection,
-    EntityTrait, QueryFilter, QueryOrder, Set, TransactionTrait,
+    DbBackend, EntityTrait, QueryFilter, QueryOrder, Set, Statement, TransactionTrait,
 };
 use std::sync::OnceLock;
 use tokio::sync::Mutex;
@@ -152,6 +152,16 @@ pub async fn save_all_tabs_cas(
     let _guard = version_lock().lock().await;
     let txn = conn.begin().await?;
 
+    // History/index writers do not share the tab mutex. Acquire SQLite's
+    // writer before reading, avoiding a WAL snapshot upgrade that cannot wait.
+    // This also works before the first version row exists, without changing it.
+    txn.execute(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE app_metadata SET value=value WHERE key=?",
+        [OPENED_TABS_VERSION_KEY.into()],
+    ))
+    .await?;
+
     let current = get_tabs_version(&txn).await?;
     if current != expected_version {
         let tabs = list_all_tabs(&txn).await?;
@@ -249,4 +259,89 @@ pub async fn delete_folder_tabs_and_bump(
         version: next,
         emit,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::test_helpers::{fresh_disk_db, seed_conversation, seed_folder};
+
+    #[tokio::test]
+    async fn tab_save_waits_for_an_unrelated_history_writer_before_reading_the_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_disk_db(dir.path()).await;
+        let folder_id = seed_folder(&db, &dir.path().to_string_lossy()).await;
+        let cid = seed_conversation(&db, folder_id, AgentType::Codex).await;
+        let writer_conn = sea_orm::Database::connect(format!(
+            "sqlite:{}?mode=rw",
+            dir.path().join("source.db").to_string_lossy()
+        ))
+        .await
+        .unwrap();
+        // Cover both an absent version row and a previously saved tab set.
+        for expected_version in 0..2 {
+            let writer = writer_conn.begin().await.unwrap();
+            writer
+                .execute_unprepared(&format!(
+                    "UPDATE conversation SET message_count=message_count+1 WHERE id={cid}"
+                ))
+                .await
+                .unwrap();
+            let conn = db.conn.clone();
+            let mut pending = tokio::spawn(async move {
+                save_all_tabs_cas(
+                    &conn,
+                    vec![OpenedTab {
+                        id: 0,
+                        folder_id,
+                        conversation_id: Some(cid),
+                        agent_type: AgentType::Codex,
+                        position: 0,
+                        is_active: true,
+                        is_pinned: false,
+                    }],
+                    expected_version,
+                )
+                .await
+            });
+            let early =
+                tokio::time::timeout(std::time::Duration::from_millis(100), &mut pending).await;
+            writer.commit().await.unwrap();
+            assert!(
+                early.is_err(),
+                "Tab save must await the unrelated writer before taking a read snapshot"
+            );
+            let outcome = pending.await.unwrap().unwrap();
+            assert!(outcome.accepted);
+            assert_eq!(outcome.version, expected_version + 1);
+            assert_eq!(outcome.tabs.len(), 1);
+            assert_eq!(outcome.tabs[0].conversation_id, Some(cid));
+            assert_eq!(
+                get_tabs_version(&db.conn).await.unwrap(),
+                expected_version + 1
+            );
+        }
+        writer_conn.close().await.unwrap();
+        db.conn.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_tab_save_preserves_the_version_row_and_metadata_clock() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = fresh_disk_db(dir.path()).await;
+        let first = save_all_tabs_cas(&db.conn, vec![], 0).await.unwrap();
+        assert!(first.accepted);
+        let read_row = || {
+            crate::db::entities::app_metadata::Entity::find()
+                .filter(crate::db::entities::app_metadata::Column::Key.eq(OPENED_TABS_VERSION_KEY))
+                .one(&db.conn)
+        };
+        let before = read_row().await.unwrap().unwrap();
+        let stale = save_all_tabs_cas(&db.conn, vec![], 0).await.unwrap();
+        assert!(!stale.accepted);
+        assert_eq!(stale.version, 1);
+        assert!(stale.tabs.is_empty());
+        assert_eq!(read_row().await.unwrap().unwrap(), before);
+        db.conn.close().await.unwrap();
+    }
 }

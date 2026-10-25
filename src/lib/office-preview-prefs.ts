@@ -1,8 +1,5 @@
-// Whether to auto-open a live preview when an agent produces an office file
-// (.docx/.xlsx/.pptx) in the workspace. Persisted in localStorage; defaults to
-// ON now that the file-lock contention that made it disruptive is fixed (the
-// preview uses a long-lived `officecli watch` server instead of re-reading the
-// file on every change).
+// Reuse the existing preference for one settled-delivery preview. File changes
+// never trigger it; previews hold stable review bytes throughout later edits.
 
 import { useEffect, useState } from "react"
 

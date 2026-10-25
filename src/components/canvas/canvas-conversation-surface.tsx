@@ -13,6 +13,12 @@ import { AgentSelector } from "@/components/chat/agent-selector"
 import { ConversationShell } from "@/components/chat/conversation-shell"
 import type { ConversationFolderPickerOverride } from "@/components/chat/conversation-context-bar"
 import type { ComposerInjectContent } from "@/components/chat/message-input"
+import {
+  GoalControlProvider,
+  type GoalControlValue,
+} from "@/components/message/goal-control-context"
+import { useAdvertisedGoalActions } from "@/hooks/use-goal-actions"
+import { useNativeGoalTranscript } from "@/hooks/use-native-goal-transcript"
 import { MessageListView } from "@/components/message/message-list-view"
 import {
   getCachedSelectors,
@@ -23,6 +29,7 @@ import { useConnectionLifecycle } from "@/hooks/use-connection-lifecycle"
 import { useConversationDetail } from "@/hooks/use-conversation-detail"
 import {
   acpStopAsyncTask,
+  acpGoalControl,
   createChatConversation,
   createConversation,
   createChatDir,
@@ -830,95 +837,204 @@ export function CanvasConversationSurface({
 
   const isDraft = dbConversationId == null
 
+  const goalActions = useAdvertisedGoalActions(conn.connectionId, connStatus)
+  const observeGoal = useNativeGoalTranscript(
+    conn.connectionId,
+    effectiveConversationId,
+    isActive
+  )
+  const handleStartGoal = useCallback(
+    async (objective: string) => {
+      if (
+        !conn.connectionId ||
+        !conn.promptReady ||
+        connIsForOtherAgent ||
+        connStatus !== "connected"
+      )
+        throw new Error("Goal session is not ready")
+      const existingId = dbConversationIdRef.current
+      if (existingId != null) {
+        await acpGoalControl(conn.connectionId, "set", objective, existingId)
+        return
+      }
+      if (!draftTarget || creatingRef.current)
+        throw new Error("Conversation creation is not ready")
+      creatingRef.current = true
+      setCreating(true)
+      try {
+        const title = objective.slice(0, 120)
+        let newId: number
+        let goalFolderId: number
+        if (draftTarget.kind === "chat") {
+          const created = await createChatConversation(
+            agentType,
+            title,
+            chatDirRef.current ?? undefined
+          )
+          newId = created.conversationId
+          goalFolderId = created.folderId
+          upsertFolder(created.folder)
+        } else {
+          newId = await createConversation(
+            draftTarget.folderId,
+            agentType,
+            title
+          )
+          goalFolderId = draftTarget.folderId
+        }
+        try {
+          await acpGoalControl(conn.connectionId, "set", objective, newId)
+        } finally {
+          dbConversationIdRef.current = newId
+          setExternalId(effectiveConversationId, connSessionId ?? null)
+          setDbConversationId(effectiveConversationId, newId)
+          setCreatedConversationId(newId)
+          setSendSignal((previous) => previous + 1)
+          refreshConversations()
+          onConversationCreated?.(newId, goalFolderId)
+        }
+      } finally {
+        creatingRef.current = false
+        setCreating(false)
+      }
+    },
+    [
+      conn.connectionId,
+      conn.promptReady,
+      connIsForOtherAgent,
+      connStatus,
+      draftTarget,
+      agentType,
+      upsertFolder,
+      effectiveConversationId,
+      connSessionId,
+      setExternalId,
+      setDbConversationId,
+      refreshConversations,
+      onConversationCreated,
+    ]
+  )
+  const goalControlValue = useMemo<GoalControlValue>(() => {
+    const live =
+      Boolean(conn.connectionId) &&
+      (connStatus === "connected" || connStatus === "prompting") &&
+      !connIsForOtherAgent
+    return {
+      connectionId: connIsForOtherAgent ? null : conn.connectionId,
+      readOnly: !live,
+      startGoal: handleStartGoal,
+      onGoalSnapshot: observeGoal,
+      actions: goalActions,
+      onGoalControl: live
+        ? (action) => {
+            void acpActions.goalControl(contextKey, action)
+          }
+        : null,
+    }
+  }, [
+    conn.connectionId,
+    connStatus,
+    connIsForOtherAgent,
+    goalActions,
+    observeGoal,
+    acpActions,
+    contextKey,
+    handleStartGoal,
+  ])
+
   return (
-    <div className={cn("flex h-full min-h-0 w-full flex-col", className)}>
-      {/* `nowheel` keeps the transcript's own scroll from being eaten by the
+    <GoalControlProvider value={goalControlValue}>
+      <div className={cn("flex h-full min-h-0 w-full flex-col", className)}>
+        {/* `nowheel` keeps the transcript's own scroll from being eaten by the
           canvas zoom. Dragging is already confined to the card's title bar by
           the node's `dragHandle`, so the body needs no `nodrag` — and must not
           have one, or it would be one more thing to remember for every child
           added here later. */}
-      <div className="nowheel flex min-h-0 flex-1 flex-col">
-        <ConversationShell
-          status={composerStatus}
-          promptCapabilities={conn.promptCapabilities}
-          defaultPath={workingDir}
-          agentName={getAgentLabel(agentType)}
-          claudeApiRetry={conn.claudeApiRetry}
-          sessionFailures={conn.sessionFailures}
-          onSessionFailureDismiss={handleSessionFailureDismiss}
-          asyncTasks={conn.asyncTasks}
-          onStopAsyncTask={handleStopAsyncTask}
-          remoteControl={connIsForOtherAgent ? null : conn.remoteControl}
-          onRemoteControlOff={
-            conn.connectionId !== null && !conn.isViewer
-              ? handleRemoteControlOff
-              : undefined
-          }
-          pendingPermission={conn.pendingPermission}
-          pendingQuestion={conn.pendingQuestion}
-          pendingAskQuestion={conn.pendingAskQuestion}
-          pendingPlanApproval={conn.pendingPlanApproval}
-          onFocus={handleFocus}
-          onSend={handleSend}
-          onCancel={handleCancel}
-          onRespondPermission={handleRespondPermission}
-          onAnswerQuestion={handleAnswerQuestion}
-          onAnswerAskQuestion={handleAnswerAskQuestion}
-          onAnswerPlanApproval={handleAnswerPlanApproval}
-          modes={connectionModes}
-          configOptions={connectionConfigOptions}
-          modeLoading={modeLoading}
-          configOptionsLoading={configOptionsLoading}
-          selectorsLoading={selectorsLoading}
-          selectedModeId={selectedModeId}
-          onModeChange={handleModeChange}
-          onConfigOptionChange={handleSetConfigOption}
-          agentType={agentType}
-          availableCommands={connectionCommands ?? []}
-          promptSuggestion={connIsForOtherAgent ? null : conn.promptSuggestion}
-          draftStorageKey={`canvas-draft:${contextKey}`}
-          injectContent={composerHandBacks[0] ?? null}
-          onInjectConsumed={handleComposerHandBackConsumed}
-          getSentHistory={getSentHistory}
-          // The card's own connection key doubles as its composer scope: the
-          // context-usage ring and connection dot in the picker row read it as
-          // a contextKey (they showed nothing at all while it was undefined).
-          attachmentTabId={contextKey}
-          folderPickerOverride={folderPickerOverride}
-          isActive={isActive}
-        >
-          {isDraft && onAgentTypeChange && (
-            <div className="flex shrink-0 justify-center border-b border-border/60 px-3 py-2">
-              <AgentSelector
-                align="center"
-                defaultAgentType={agentType}
-                onSelect={onAgentTypeChange}
-                onFallback={onAgentTypeChange}
-                // Draft cards can change agents during connection startup.
-              />
-            </div>
-          )}
-          <MessageListView
-            conversationId={effectiveConversationId}
-            // The card's own cwd, which it already knows before any
-            // conversation row exists — a draft's first reply has no persisted
-            // detail to derive a folder from, so without this its screenshots
-            // stay unresolved until a later refetch. `undefined` (never a
-            // wrong guess) leaves MessageListView's folder fallback in place.
-            imageRoot={workingDir}
+        <div className="nowheel flex min-h-0 flex-1 flex-col">
+          <ConversationShell
+            status={composerStatus}
+            promptCapabilities={conn.promptCapabilities}
+            defaultPath={workingDir}
+            agentName={getAgentLabel(agentType)}
+            claudeApiRetry={conn.claudeApiRetry}
+            sessionFailures={conn.sessionFailures}
+            onSessionFailureDismiss={handleSessionFailureDismiss}
+            asyncTasks={conn.asyncTasks}
+            onStopAsyncTask={handleStopAsyncTask}
+            remoteControl={connIsForOtherAgent ? null : conn.remoteControl}
+            onRemoteControlOff={
+              conn.connectionId !== null && !conn.isViewer
+                ? handleRemoteControlOff
+                : undefined
+            }
+            pendingPermission={conn.pendingPermission}
+            pendingQuestion={conn.pendingQuestion}
+            pendingAskQuestion={conn.pendingAskQuestion}
+            pendingPlanApproval={conn.pendingPlanApproval}
+            onFocus={handleFocus}
+            onSend={handleSend}
+            onCancel={handleCancel}
+            onRespondPermission={handleRespondPermission}
+            onAnswerQuestion={handleAnswerQuestion}
+            onAnswerAskQuestion={handleAnswerAskQuestion}
+            onAnswerPlanApproval={handleAnswerPlanApproval}
+            modes={connectionModes}
+            configOptions={connectionConfigOptions}
+            modeLoading={modeLoading}
+            configOptionsLoading={configOptionsLoading}
+            selectorsLoading={selectorsLoading}
+            selectedModeId={selectedModeId}
+            onModeChange={handleModeChange}
+            onConfigOptionChange={handleSetConfigOption}
             agentType={agentType}
-            availableCommands={connectionCommands}
-            connStatus={connStatus}
+            availableCommands={connectionCommands ?? []}
+            promptSuggestion={
+              connIsForOtherAgent ? null : conn.promptSuggestion
+            }
+            draftStorageKey={`canvas-draft:${contextKey}`}
+            injectContent={composerHandBacks[0] ?? null}
+            onInjectConsumed={handleComposerHandBackConsumed}
+            getSentHistory={getSentHistory}
+            // The card's own connection key doubles as its composer scope: the
+            // context-usage ring and connection dot in the picker row read it as
+            // a contextKey (they showed nothing at all while it was undefined).
+            attachmentTabId={contextKey}
+            folderPickerOverride={folderPickerOverride}
             isActive={isActive}
-            sendSignal={sendSignal}
-            detailLoading={detailLoading}
-            detailError={detailError}
-            acpLoadError={acpLoadError}
-            hideEmptyState={isDraft}
-            onSaveNoteSelection={onSaveSelectionAsNote}
-          />
-        </ConversationShell>
+          >
+            {isDraft && onAgentTypeChange && (
+              <div className="flex shrink-0 justify-center border-b border-border/60 px-3 py-2">
+                <AgentSelector
+                  align="center"
+                  defaultAgentType={agentType}
+                  onSelect={onAgentTypeChange}
+                  onFallback={onAgentTypeChange}
+                  // Draft cards can change agents during connection startup.
+                />
+              </div>
+            )}
+            <MessageListView
+              conversationId={effectiveConversationId}
+              // The card's own cwd, which it already knows before any
+              // conversation row exists — a draft's first reply has no persisted
+              // detail to derive a folder from, so without this its screenshots
+              // stay unresolved until a later refetch. `undefined` (never a
+              // wrong guess) leaves MessageListView's folder fallback in place.
+              imageRoot={workingDir}
+              agentType={agentType}
+              availableCommands={connectionCommands}
+              connStatus={connStatus}
+              isActive={isActive}
+              sendSignal={sendSignal}
+              detailLoading={detailLoading}
+              detailError={detailError}
+              acpLoadError={acpLoadError}
+              hideEmptyState={isDraft}
+              onSaveNoteSelection={onSaveSelectionAsNote}
+            />
+          </ConversationShell>
+        </div>
       </div>
-    </div>
+    </GoalControlProvider>
   )
 }

@@ -25,6 +25,7 @@ import {
 
 vi.mock("@/lib/api", () => ({
   getFolderConversation: vi.fn(),
+  invalidateFolderConversationCache: vi.fn(),
 }))
 
 const { getFolderConversation } = await import("@/lib/api")
@@ -107,6 +108,7 @@ function seedStreamingOwner(
     pendingCancelledTurnReports: null,
     optimisticTurns: [userTurn("local-u1", "write it")],
     liveMessage: live("lm-1", "Line 1. Line 2. "),
+    promptDeliveries: {},
     syncState: "awaiting_persist",
     activeTurnToken: "tok-1",
     lastTurnOwned: false,
@@ -164,7 +166,12 @@ describe("a turn that ended while this client was away", () => {
     // Settled at once on what arrived — no blank reply while the read runs.
     expect(texts()).toEqual(["write it", "Line 1. Line 2. "])
     expect(session()?.detailLoading).toBe(false)
-    expect(mockGet).toHaveBeenCalledWith(DB_ID, { tailTurns: 120 })
+    expect(mockGet).toHaveBeenCalledWith(DB_ID, {
+      userTurnLimit: 25,
+      cacheMode: "reload",
+      requestGeneration: null,
+      signal: undefined,
+    })
 
     await vi.advanceTimersByTimeAsync(0)
 

@@ -20,6 +20,11 @@ const TQ = enMessages.Folder.chat.messageQueue
 function item(id: string, text: string): QueuedMessage {
   return {
     id,
+    clientMessageId: id,
+    intent: "prompt",
+    state: "queued",
+    error: null,
+    guideTarget: null,
     draft: { blocks: [{ type: "text", text }], displayText: text },
     modeId: null,
   }
@@ -29,6 +34,11 @@ function item(id: string, text: string): QueuedMessage {
 function itemWithAttachment(id: string, text: string): QueuedMessage {
   return {
     id,
+    clientMessageId: id,
+    intent: "prompt",
+    state: "queued",
+    error: null,
+    guideTarget: null,
     draft: {
       blocks: [
         { type: "text", text },

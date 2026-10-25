@@ -40,6 +40,9 @@ public/pdfjs
 coverage/
 *.snap.new
 .vitest-cache/
+# Local release verification output must not be scanned as application source.
+/artifacts/
+/release/
 
 # macOS signing material. Keep certificates and exported private keys out of git.
 *.cer
@@ -65,3 +68,6 @@ src-tauri/binaries/
 # executable then sits untracked in the repo root — which is enough to fail a
 # work task's "worktree is clean" check at delivery.
 /rust_out
+
+# Rebuildable private agent runtime staging.
+/dist/pi-runtime/

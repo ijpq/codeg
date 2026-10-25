@@ -31,11 +31,20 @@ vi.mock("next-intl", () => ({
   useLocale: () => "en",
 }))
 vi.mock("@/lib/api", () => ({
+  invalidateFolderConversationCache: vi.fn(),
   getFolderConversation: vi.fn(() => new Promise(() => {})),
   getFolderConversationTurns: vi.fn(),
   getFolderConversationOutline: vi.fn(() => new Promise(() => {})),
   readFileBase64: vi.fn(),
   readWorkspaceFileBase64: vi.fn(),
+  getDeliverableCapabilities: vi.fn(() => new Promise(() => {})),
+}))
+vi.mock("@/lib/transport", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/transport")>()),
+  getTransport: () => ({
+    call: vi.fn(() => new Promise(() => {})),
+    subscribe: vi.fn(async () => () => {}),
+  }),
 }))
 vi.mock("@/components/message/virtualized-message-thread", () => ({
   VirtualizedMessageThread: ({
@@ -59,7 +68,12 @@ vi.mock("@/components/ai-elements/message-thread", () => ({
   MessageThreadScrollButton: () => null,
 }))
 vi.mock("use-stick-to-bottom", () => ({
-  useStickToBottomContext: () => ({ scrollToBottom: () => {} }),
+  useStickToBottomContext: () => ({
+    scrollToBottom: () => {},
+    scrollRef: { current: null },
+    contentRef: { current: null },
+    isAtBottom: true,
+  }),
 }))
 vi.mock("@/components/chat/agent-plan-overlay", async (importOriginal) => ({
   ...(await importOriginal<
@@ -148,6 +162,7 @@ function seed(): void {
     pendingBackgroundSettlements: [],
     pendingCancelledTurnReports: null,
     optimisticTurns: [],
+    promptDeliveries: {},
     liveMessage: null,
     syncState: "idle",
     activeTurnToken: null,
