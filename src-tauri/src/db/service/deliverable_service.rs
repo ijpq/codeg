@@ -1912,6 +1912,10 @@ mod tests {
                 .unwrap();
             let conn = db.conn.clone();
             let root = workspace.path().to_path_buf();
+            // Match the validated storage root passed by the MCP boundary.
+            // tempfile paths may be aliases (/var vs /private/var on macOS)
+            // or use a different verbatim/slash form on Windows.
+            let stored_root = initial[0].root_path.clone();
             let mut pending = tokio::spawn(async move {
                 match action {
                     "replace" | "clear" => replace_declared_for_turn(
@@ -1931,7 +1935,7 @@ mod tests {
                             &conn,
                             cid,
                             "writer-run",
-                            &root.to_string_lossy(),
+                            &stored_root,
                             &["report.pdf".into()],
                         )
                         .await
@@ -1955,7 +1959,8 @@ mod tests {
                     .await
                     .unwrap()
                     .len(),
-                usize::from(action == "replace")
+                usize::from(action == "replace"),
+                "{action} must preserve only its intended turn set"
             );
         }
     }
