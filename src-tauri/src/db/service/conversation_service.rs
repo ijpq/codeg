@@ -197,6 +197,17 @@ pub async fn update_title(
     Ok(())
 }
 
+/// Enabled business conversations own their title independently of each native
+/// session. Keep this in the UPDATE predicate as well as candidate selection:
+/// a native title read before business enable must not overwrite it afterward.
+/// Do not change title_locked; disabling the additive migration restores the
+/// original engine's automatic title behavior.
+fn accepts_native_title() -> sea_orm::sea_query::SimpleExpr {
+    sea_orm::sea_query::Expr::cust(
+        "NOT EXISTS (SELECT 1 FROM business_conversation_state b WHERE b.conversation_id=conversation.id AND b.enabled=1)",
+    )
+}
+
 /// Auto-derive counterpart to [`update_title`]: write `title` ONLY when the row
 /// is not user-locked and the value actually changed. Never sets `title_locked`
 /// (the title stays eligible for future auto-refreshes, e.g. when an agent like
@@ -226,6 +237,7 @@ pub async fn refresh_auto_title(
         .filter(conversation::Column::Id.eq(conversation_id))
         .filter(conversation::Column::TitleLocked.eq(false))
         .filter(conversation::Column::DeletedAt.is_null())
+        .filter(accepts_native_title())
         .filter(
             sea_orm::Condition::any()
                 .add(conversation::Column::Title.is_null())
@@ -423,6 +435,7 @@ async fn refresh_codex_auto_title_candidate(
         .filter(conversation::Column::ExternalId.eq(external_id))
         .filter(conversation::Column::DeletedAt.is_null())
         .filter(conversation::Column::TitleLocked.eq(false))
+        .filter(accepts_native_title())
         .filter(
             conversation::Column::FolderId.in_subquery(
                 sea_orm::sea_query::Query::select()
@@ -478,6 +491,7 @@ pub(crate) async fn refresh_codex_auto_titles(
             .filter(conversation::Column::ExternalId.is_in(external_id_chunk.iter().cloned()))
             .filter(conversation::Column::DeletedAt.is_null())
             .filter(conversation::Column::TitleLocked.eq(false))
+            .filter(accepts_native_title())
             .filter(conversation::Column::Kind.ne(ConversationKind::Loop))
             .filter(
                 conversation::Column::FolderId.in_subquery(
@@ -2577,6 +2591,108 @@ mod tests {
             Some("session-S9"),
             "a live row must still receive its external_id"
         );
+    }
+
+    #[tokio::test]
+    async fn managed_business_title_survives_native_refresh_and_manual_rename() {
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/codeg-business-title").await;
+        let row = create(&db.conn, folder, AgentType::Codex, None, None)
+            .await
+            .unwrap();
+        bind_external_id(&db.conn, row.id, "business-title-native", &[])
+            .await
+            .unwrap();
+        let summary = get_by_id(&db.conn, row.id).await.unwrap();
+        super::super::business_conversation_service::initialize(&db.conn, &summary, &[])
+            .await
+            .unwrap();
+
+        // A clean original user prompt can still name an empty business.
+        assert!(
+            seed_auto_title_if_empty(&db.conn, row.id, "Project | conference".into())
+                .await
+                .unwrap()
+        );
+        assert!(!refresh_auto_title(
+            &db.conn,
+            row.id,
+            "<codeg-business-context> Native engine fallback".into(),
+        )
+        .await
+        .unwrap());
+        assert!(refresh_codex_auto_titles(
+            &db.conn,
+            &HashMap::from([("business-title-native".into(), "Codex session name".into())]),
+        )
+        .await
+        .is_empty());
+        let kept = get_by_id(&db.conn, row.id).await.unwrap();
+        assert_eq!(kept.title.as_deref(), Some("Project | conference"));
+        assert!(
+            !kept.title_locked,
+            "business ownership is not a user rename"
+        );
+
+        update_title(&db.conn, row.id, "User's revised business name".into())
+            .await
+            .unwrap();
+        assert_eq!(
+            get_by_id(&db.conn, row.id).await.unwrap().title.as_deref(),
+            Some("User's revised business name")
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_codex_title_candidate_respects_business_enable_and_rollback() {
+        use sea_orm::{ConnectionTrait, DbBackend, Statement};
+        let db = fresh_in_memory_db().await;
+        let folder = seed_folder(&db, "/tmp/codeg-business-title-cas").await;
+        let row = create(
+            &db.conn,
+            folder,
+            AgentType::Codex,
+            Some("Business name".into()),
+            None,
+        )
+        .await
+        .unwrap();
+        bind_external_id(&db.conn, row.id, "business-title-cas", &[])
+            .await
+            .unwrap();
+        let candidate = conversation::Entity::find_by_id(row.id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        let summary = get_by_id(&db.conn, row.id).await.unwrap();
+        super::super::business_conversation_service::initialize(&db.conn, &summary, &[])
+            .await
+            .unwrap();
+        assert!(
+            !refresh_codex_auto_title_candidate(&db.conn, &candidate, "Late native name")
+                .await
+                .unwrap()
+        );
+
+        // Disabling the additive business migration restores the original
+        // unlocked-title behavior without rewriting the user's lock bit.
+        db.conn
+            .execute(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "UPDATE business_conversation_state SET enabled=0 WHERE conversation_id=?",
+                [row.id.into()],
+            ))
+            .await
+            .unwrap();
+        assert!(
+            refresh_codex_auto_title_candidate(&db.conn, &candidate, "Native name")
+                .await
+                .unwrap()
+        );
+        let restored = get_by_id(&db.conn, row.id).await.unwrap();
+        assert_eq!(restored.title.as_deref(), Some("Native name"));
+        assert!(!restored.title_locked);
     }
 
     #[tokio::test]

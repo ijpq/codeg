@@ -5,6 +5,8 @@
 - Add Pi to the stable business conversation switcher, preserving independent
   native sessions and per-engine settings, incremental context, shared memory,
   Skills, history and deliverables across handoffs and restart.
+- Keep the business title independent of native session auto-titles, including
+  delayed title writers, without changing user rename or rollback behavior.
 - Verify Pi native session/header/path identities, safely import legacy aliases,
   persist empty sessions, and refuse unverified initialization or restoration.
 - Connect Pi 1.4 native MCP, steering and tail clone; exercise actual companion

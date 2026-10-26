@@ -63,6 +63,7 @@ export async function businessAgentPage({
   const state = () =>
     api("get_business_conversation_state", { conversationId: cid })
   const switchResponses = []
+  let businessTitle = null
   const recordSwitch = async (response) => {
     if (!response.url().endsWith("/api/switch_business_agent")) return
     // Only this isolated fixture's synthetic switch parameters and result;
@@ -164,6 +165,12 @@ export async function businessAgentPage({
       .getByText(response, { exact: false })
       .last()
       .waitFor({ timeout: 90_000 })
+    if (businessTitle != null)
+      assert.equal(
+        (await history()).summary.title,
+        businessTitle,
+        "Native session titles cannot rename the shared business"
+      )
   }
   try {
     const initial = await api("acp_connect", {
@@ -222,6 +229,10 @@ export async function businessAgentPage({
       "Queued Claude handoff completes"
     )
     assert.equal(current.sessions.length, 2)
+    businessTitle = (await history()).summary.title
+    assert.ok(
+      businessTitle && !businessTitle.includes("<codeg-business-context>")
+    )
     assert.notEqual(
       current.sessions[0].externalId,
       current.sessions[1].externalId
@@ -489,6 +500,7 @@ export async function businessAgentPage({
     assert.equal(otherAfter.external_id, otherBefore.external_id)
     await openBusiness(page, api, cid, folderId, "pi")
     const restored = await history()
+    assert.equal(restored.summary.title, businessTitle)
     assert.deepEqual(
       restored.turns.map((t) => t.id),
       final.turns.map((t) => t.id)
@@ -511,6 +523,7 @@ export async function businessAgentPage({
       })),
       conversationId: cid,
       visibleCountUnchanged: true,
+      businessTitleStable: true,
       concurrentCas: true,
       historyAfterReload: true,
       otherBusinessUnaffected: true,
