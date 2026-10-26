@@ -1,6 +1,20 @@
 # Changelog
 
-## 0.40.0-fix2 — 2026-10-26
+## 0.40.0-fix3 — 2026-10-26
+
+- Deliver the Pi/business conversation, external delivery, service tier, artifact,
+  Office review and SQLite writer fixes accumulated in the unpublished fix2 candidate.
+- Verify rollback history with bounded opaque pages after native Goal execution
+  appends to the independent CLI store. Verify the old answer is retained and the
+  restored old app renders its actual current tail; missing history still fails.
+- Scope frontend error observations to the page check and snapshot their results,
+  so later isolated scroll-harness navigation cannot mutate earlier evidence.
+- Retain Windows/shared CI and full Server/Setup installation, upgrade, restart,
+  rollback, native protocol and post-publication download verification gates.
+
+See [release notes](docs/releases/v0.40.0-fix3.md).
+
+## 0.40.0-fix2 — 2026-10-26 (unpublished candidate)
 
 - Add Pi to the stable business conversation switcher, preserving independent
   native sessions and per-engine settings, incremental context, shared memory,

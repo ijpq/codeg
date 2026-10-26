@@ -13,6 +13,7 @@ import { startBusinessModel } from "./business-model-fixture.mjs"
 import { startPiModel } from "./pi-native-model-fixture.mjs"
 import { piCapabilityChecks } from "./pi-capability-checks.mjs"
 import { prepareWindowsProfile } from "./windows-ui-profile.mjs"
+import { retainedHistory, scopedPageErrors } from "./release-history-check.mjs"
 import {
   businessAgentPage,
   restoredBusinessPage,
@@ -32,7 +33,13 @@ assert.ok(
   "Evidence/data must be under RUNNER_TEMP"
 )
 await mkdir(output, { recursive: true })
-const report = { version: options.version, checks: [], errors: [] }
+const report = {
+  version: options.version,
+  sourceCommit: process.env.GITHUB_SHA,
+  verifierCommit: process.env.CODEG_VERIFIER_SHA ?? process.env.GITHUB_SHA,
+  checks: [],
+  errors: [],
+}
 const delay = (ms) => new Promise((done) => setTimeout(done, ms))
 async function reservePort() {
   const server = createServer()
@@ -392,86 +399,96 @@ async function importAndOpen(api, f) {
   })
   return conversation
 }
-async function actualPage(page, name, verifyScroll = true) {
-  const errors = []
-  page.on("pageerror", (error) => errors.push(String(error)))
-  await page.reload()
-  // A device-local draft may retain focus across reloads. Select the imported
-  // conversation through its real tab, as a reader would, before inspecting it.
-  const tab = page.locator('[data-tab-id^="conv-"] [role="tab"]').first()
-  await tab.waitFor({ timeout: 30_000 })
-  await tab.click()
+async function actualPage(
+  page,
+  name,
+  verifyScroll = true,
+  expectedText = "RELEASE_FINAL_LINE"
+) {
+  const observation = scopedPageErrors(page)
+  const { errors } = observation
   try {
-    await page
-      .getByText("RELEASE_FINAL_LINE", { exact: true })
-      .waitFor({ timeout: 60_000 })
-  } catch (error) {
-    await page.screenshot({ path: join(output, `${name}-failure.png`) })
-    await writeFile(
-      join(output, `${name}-failure.json`),
-      JSON.stringify(
-        {
-          origin: new URL(page.url()).origin,
-          path: new URL(page.url()).pathname,
-          body: (await page.locator("body").innerText()).slice(-12000),
-          errors,
-          tabs: await page
-            .evaluate(() =>
-              window.__TAURI_INTERNALS__?.invoke("list_opened_tabs")
-            )
-            .catch(() => null),
-        },
-        null,
-        2
+    await page.reload()
+    // A device-local draft may retain focus across reloads. Select the imported
+    // conversation through its real tab, as a reader would, before inspecting it.
+    const tab = page.locator('[data-tab-id^="conv-"] [role="tab"]').first()
+    await tab.waitFor({ timeout: 30_000 })
+    await tab.click()
+    try {
+      await page
+        .getByText(expectedText, { exact: true })
+        .last()
+        .waitFor({ timeout: 60_000 })
+    } catch (error) {
+      await page.screenshot({ path: join(output, `${name}-failure.png`) })
+      await writeFile(
+        join(output, `${name}-failure.json`),
+        JSON.stringify(
+          {
+            origin: new URL(page.url()).origin,
+            path: new URL(page.url()).pathname,
+            body: (await page.locator("body").innerText()).slice(-12000),
+            errors,
+            tabs: await page
+              .evaluate(() =>
+                window.__TAURI_INTERNALS__?.invoke("list_opened_tabs")
+              )
+              .catch(() => null),
+          },
+          null,
+          2
+        )
       )
-    )
-    throw error
+      throw error
+    }
+    const viewport = page.locator(".chat-scroll-port").last()
+    await viewport.evaluate((el) => {
+      el.scrollTop = el.scrollHeight
+    })
+    await page.waitForTimeout(1800)
+    const samples = []
+    for (let i = 0; i < 12; i++) {
+      samples.push(
+        await viewport.evaluate((el) => ({
+          top: el.scrollTop,
+          gap: el.scrollHeight - el.clientHeight - el.scrollTop,
+          rows: el.querySelectorAll("[data-message-thread-row]").length,
+        }))
+      )
+      await page.waitForTimeout(60)
+    }
+    if (verifyScroll) {
+      assert.ok(
+        Math.max(...samples.map((s) => s.top)) -
+          Math.min(...samples.map((s) => s.top)) <=
+          1,
+        `${name}: completed answer keeps moving`
+      )
+      assert.ok(samples.at(-1).gap <= 2, `${name}: final answer not at bottom`)
+      assert.ok(samples.at(-1).rows < 80, `${name}: virtualization missing`)
+      const line = await page
+        .getByText("RELEASE_FINAL_LINE", { exact: true })
+        .boundingBox()
+      const box = await viewport.boundingBox()
+      assert.ok(
+        line.y + line.height <= box.y + box.height + 1,
+        `${name}: final line clipped`
+      )
+      await viewport.hover()
+      await page.mouse.wheel(0, -450)
+      await page.waitForTimeout(300)
+      const before = await viewport.evaluate((el) => el.scrollTop)
+      await page.waitForTimeout(1000)
+      const after = await viewport.evaluate((el) => el.scrollTop)
+      assert.ok(Math.abs(before - after) <= 2, `${name}: reader pulled down`)
+    }
+    await page.screenshot({ path: join(output, `${name}.png`) })
+    // Errors are retained in full and asserted; console warnings are separate.
+    assert.deepEqual(errors, [], `${name}: frontend runtime errors`)
+    report.checks.push({ name, samples, errors: [...errors] })
+  } finally {
+    observation.stop()
   }
-  const viewport = page.locator(".chat-scroll-port").last()
-  await viewport.evaluate((el) => {
-    el.scrollTop = el.scrollHeight
-  })
-  await page.waitForTimeout(1800)
-  const samples = []
-  for (let i = 0; i < 12; i++) {
-    samples.push(
-      await viewport.evaluate((el) => ({
-        top: el.scrollTop,
-        gap: el.scrollHeight - el.clientHeight - el.scrollTop,
-        rows: el.querySelectorAll("[data-message-thread-row]").length,
-      }))
-    )
-    await page.waitForTimeout(60)
-  }
-  if (verifyScroll) {
-    assert.ok(
-      Math.max(...samples.map((s) => s.top)) -
-        Math.min(...samples.map((s) => s.top)) <=
-        1,
-      `${name}: completed answer keeps moving`
-    )
-    assert.ok(samples.at(-1).gap <= 2, `${name}: final answer not at bottom`)
-    assert.ok(samples.at(-1).rows < 80, `${name}: virtualization missing`)
-    const line = await page
-      .getByText("RELEASE_FINAL_LINE", { exact: true })
-      .boundingBox()
-    const box = await viewport.boundingBox()
-    assert.ok(
-      line.y + line.height <= box.y + box.height + 1,
-      `${name}: final line clipped`
-    )
-    await viewport.hover()
-    await page.mouse.wheel(0, -450)
-    await page.waitForTimeout(300)
-    const before = await viewport.evaluate((el) => el.scrollTop)
-    await page.waitForTimeout(1000)
-    const after = await viewport.evaluate((el) => el.scrollTop)
-    assert.ok(Math.abs(before - after) <= 2, `${name}: reader pulled down`)
-  }
-  await page.screenshot({ path: join(output, `${name}.png`) })
-  // Errors are retained in full and asserted; console warnings are separate.
-  assert.deepEqual(errors, [], `${name}: frontend runtime errors`)
-  report.checks.push({ name, samples, errors })
 }
 
 // Verify normal conversation headers through the real parser and packaged UI.
@@ -1266,6 +1283,7 @@ try {
   )
   await enableNativeAgent(f)
   app = await startDesktop(installation, f, "upgraded-startup")
+  const upgradedErrors = scopedPageErrors(app.page)
   let businessSaved
   try {
     const conversations = await desktopApi(app.page)("list_all_conversations")
@@ -1332,6 +1350,13 @@ try {
         assert.match(await readFile(destination, "utf8"), /PI_VERIFIED_CONTENT/)
       },
     })
+    report.checks.push({
+      name: "setup-application-errors",
+      passed: upgradedErrors.errors.length === 0,
+      errors: upgradedErrors.stop(),
+      details: upgradedErrors.details,
+    })
+    assert.deepEqual(upgradedErrors.errors, [], "Setup application page errors")
     // The scroll harness navigates and closes this isolated WebView. Finish
     // the app checks first; restart below to verify persisted business state.
     await run(process.execPath, ["scripts/browser-scroll-regression.mjs"], {
@@ -1340,6 +1365,7 @@ try {
       CODEG_BROWSER_EVIDENCE: join(output, "webview-scroll"),
     })
   } finally {
+    upgradedErrors.stop()
     await stopDesktop(app)
   }
   app = await startDesktop(installation, f, "business-restart")
@@ -1389,7 +1415,21 @@ try {
       ),
       "Rollback lost pre-upgrade history"
     )
-    await actualPage(app.page, "rollback-frontend", false)
+    const preserved = await retainedHistory(
+      (options) =>
+        desktopApi(app.page)("get_folder_conversation", {
+          conversationId: saved.id,
+          ...options,
+        }),
+      "RELEASE_FINAL_LINE"
+    )
+    report.checks.push({ name: "rollback-preupgrade-history", ...preserved })
+    await actualPage(
+      app.page,
+      "rollback-frontend",
+      false,
+      goalModel ? "SYNTHETIC NATIVE GOAL RESPONSE" : "RELEASE_FINAL_LINE"
+    )
     assert.equal(
       await readFile(
         join(rollbackData, "upgrade-retention-marker.txt"),

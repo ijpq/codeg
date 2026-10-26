@@ -84,7 +84,7 @@ jobs:
         run: python3 -B scripts/test-verify-setup-binaries.py
 
       - name: Draft release reuse regression
-        run: node --test scripts/test-release-draft.mjs
+        run: node --test scripts/test-release-draft.mjs scripts/test-release-history-check.mjs
 
       - name: Custom Windows CI scope regression
         run: node --test scripts/test-custom-ci-scope.mjs

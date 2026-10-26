@@ -1,6 +1,6 @@
 # Pi 运行组件与 Fast / Speed
 
-本次固定 CodeG `0.40.0-fix2`、定制 `pi-acp 0.0.34-codeg.2`、Pi `1.4.0` 和 Node
+本次固定 CodeG `0.40.0-fix3`、定制 `pi-acp 0.0.34-codeg.2`、Pi `1.4.0` 和 Node
 `24.16.0`。适配器源码 commit、tarball SHA256 与依赖锁保存在 `vendor/pi-runtime/`。
 Server ZIP 和 Setup 都携带私有 `pi-runtime`，无需全局 npm 或开发机 PATH。上游 MIT
 许可证、Pi 及依赖许可证和 Node LICENSE 随运行组保留。

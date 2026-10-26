@@ -1359,6 +1359,7 @@ jobs:
             ${{ runner.temp }}/draft-verification/**/*.png
             ${{ runner.temp }}/draft-verification/**/scroll-results.json
             ${{ runner.temp }}/draft-verification/**/*business-failure.json
+            ${{ runner.temp }}/draft-verification/**/*-failure.json
             ${{ runner.temp }}/draft-verification/**/resources-and-migrations.json
             ${{ runner.temp }}/draft-verification/**/*dependencies.json
           if-no-files-found: warn
@@ -1577,6 +1578,7 @@ jobs:
             ${{ runner.temp }}/published-verification/**/*.png
             ${{ runner.temp }}/published-verification/**/scroll-results.json
             ${{ runner.temp }}/published-verification/**/*business-failure.json
+            ${{ runner.temp }}/published-verification/**/*-failure.json
             ${{ runner.temp }}/published-verification/**/resources-and-migrations.json
             ${{ runner.temp }}/published-verification/**/*dependencies.json
           if-no-files-found: warn
