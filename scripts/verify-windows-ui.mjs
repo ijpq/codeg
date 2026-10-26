@@ -3,13 +3,15 @@
 import { chromium } from "playwright-core"
 import { spawn, execFileSync } from "node:child_process"
 import { createServer } from "node:http"
-import { mkdir, readFile, writeFile } from "node:fs/promises"
+import { cp, mkdir, readFile, writeFile } from "node:fs/promises"
 import { createWriteStream } from "node:fs"
 import { resolve, join, relative, isAbsolute } from "node:path"
 import { randomUUID, randomBytes, createHash } from "node:crypto"
 import assert from "node:assert/strict"
 import { startGoalModel } from "./native-codex-model-fixture.mjs"
 import { startBusinessModel } from "./business-model-fixture.mjs"
+import { startPiModel } from "./pi-native-model-fixture.mjs"
+import { piCapabilityChecks } from "./pi-capability-checks.mjs"
 import {
   businessAgentPage,
   restoredBusinessPage,
@@ -40,6 +42,7 @@ async function reservePort() {
 }
 const goalModel = options["native-tools"] ? await startGoalModel() : null
 const claudeModel = options["native-tools"] ? await startBusinessModel() : null
+const piModel = options["native-tools"] ? await startPiModel() : null
 async function enableNativeAgent(f) {
   if (!goalModel) return
   const pathKey =
@@ -54,6 +57,46 @@ async function enableNativeAgent(f) {
   delete f.env.CLAUDE_CODE_OAUTH_TOKEN
   delete f.env.ANTHROPIC_AUTH_TOKEN
   delete f.env.ANTHROPIC_CUSTOM_HEADERS
+  // Both Pi's native store and pi-acp's session map live in this disposable
+  // fixture; no account/config/session is discovered from the runner profile.
+  f.env.USERPROFILE = join(f.root, "profile")
+  f.env.PI_CODING_AGENT_DIR = join(f.root, "pi-agent")
+  // The built-in runtime selects its own release-pinned Pi and adapter.
+  delete f.env.PI_ACP_PI_COMMAND
+  delete f.env.CODEG_PI_ACP_PATH
+  await mkdir(f.env.USERPROFILE, { recursive: true })
+  await mkdir(f.env.PI_CODING_AGENT_DIR, { recursive: true })
+  await writeFile(
+    join(f.env.PI_CODING_AGENT_DIR, "models.json"),
+    JSON.stringify({
+      providers: {
+        fixture: {
+          baseUrl: piModel.url,
+          api: "openai-responses",
+          apiKey: "isolated-pi-synthetic-provider-only",
+          models: [
+            {
+              id: "gpt-5.4",
+              name: "Isolated Pi",
+              reasoning: true,
+              input: ["text", "image"],
+              contextWindow: 128000,
+              maxTokens: 4096,
+            },
+          ],
+        },
+      },
+    })
+  )
+  await writeFile(
+    join(f.env.PI_CODING_AGENT_DIR, "settings.json"),
+    JSON.stringify({
+      defaultProvider: "fixture",
+      defaultModel: "gpt-5.4",
+      defaultThinkingLevel: "medium",
+      quietStartup: true,
+    })
+  )
   await writeFile(
     join(f.env.CODEX_HOME, "config.toml"),
     `model = "gpt-6-astra"
@@ -1195,6 +1238,18 @@ try {
   } finally {
     await stopDesktop(app)
   }
+  // A supported rollback restores an offline pre-upgrade data snapshot with
+  // the matching old runtime group. Never run an older migrator on a newer DB.
+  const rollbackData = join(f.root, "preupgrade-data-backup")
+  await cp(f.data, rollbackData, { recursive: true, errorOnExist: true })
+  const previousBinaries = await Promise.all(
+    ["codeg.exe", "codeg-mcp.exe"].map(async (name) => ({
+      name,
+      sha256: createHash("sha256")
+        .update(await readFile(join(installation, name)))
+        .digest("hex"),
+    }))
+  )
   const original = createHash("sha256")
     .update(await readFile(f.rollout))
     .digest("hex")
@@ -1254,8 +1309,28 @@ try {
       name: "setup",
       goalModel,
       claudeModel,
+      piModel,
       report,
       output,
+    })
+    await piCapabilityChecks({
+      api: desktopApi(app.page),
+      page: app.page,
+      f,
+      folderId: saved.folder_id,
+      piModel,
+      report,
+      name: "setup",
+      download: async (conversationId, id) => {
+        const destination = join(f.root, "pi-downloaded.md")
+        await desktopApi(app.page)("save_deliverables", {
+          conversationId,
+          deliverableIds: [id],
+          archive: false,
+          destination,
+        })
+        assert.match(await readFile(destination, "utf8"), /PI_VERIFIED_CONTENT/)
+      },
     })
     // The scroll harness navigates and closes this isolated WebView. Finish
     // the app checks first; restart below to verify persisted business state.
@@ -1282,6 +1357,59 @@ try {
   report.checks.push({
     name: "setup-install-start-upgrade-data-retention",
     passed: true,
+  })
+  const rollbackInstallation = join(output, "rollback-installation")
+  await install(options.previous, rollbackInstallation)
+  for (const file of previousBinaries)
+    assert.equal(
+      createHash("sha256")
+        .update(await readFile(join(rollbackInstallation, file.name)))
+        .digest("hex"),
+      file.sha256
+    )
+  const rollbackFixture = {
+    ...f,
+    data: rollbackData,
+    env: {
+      ...f.env,
+      CODEG_DATA_DIR: rollbackData,
+      CODEG_HOME: rollbackData,
+      WEBVIEW2_USER_DATA_FOLDER: join(f.root, "rollback-webview"),
+    },
+  }
+  app = await startDesktop(
+    rollbackInstallation,
+    rollbackFixture,
+    "offline-backup-rollback"
+  )
+  try {
+    assert.ok(
+      (await desktopApi(app.page)("list_all_conversations")).some(
+        (c) => c.id === saved.id && c.external_id === f.id
+      ),
+      "Rollback lost pre-upgrade history"
+    )
+    await actualPage(app.page, "rollback-frontend", false)
+    assert.equal(
+      await readFile(
+        join(rollbackData, "upgrade-retention-marker.txt"),
+        "utf8"
+      ),
+      f.id
+    )
+    assert.equal(
+      await readFile(join(f.data, "upgrade-retention-marker.txt"), "utf8"),
+      f.id
+    )
+  } finally {
+    await stopDesktop(app)
+  }
+  report.checks.push({
+    name: "setup-offline-backup-group-rollback",
+    passed: true,
+    preupgradeSnapshot: true,
+    matchingBinaries: true,
+    upgradedDataRetained: true,
   })
   const s = await fixture("server-web")
   await enableNativeAgent(s)
@@ -1351,8 +1479,34 @@ try {
       name: "server-web",
       goalModel,
       claudeModel,
+      piModel,
       report,
       output,
+    })
+    await piCapabilityChecks({
+      api,
+      page,
+      f: s,
+      folderId: conversation.folder_id,
+      piModel,
+      report,
+      name: "server-web",
+      download: async (conversationId, id) => {
+        const ticket = await api("create_deliverable_download_ticket", {
+          conversationId,
+          deliverableIds: [id],
+          archive: false,
+        })
+        const response = await fetch(
+          new URL(ticket.url, `http://127.0.0.1:${port}`)
+        )
+        assert.equal(response.status, 200)
+        assert.match(await response.text(), /PI_VERIFIED_CONTENT/)
+        assert.equal(
+          (await fetch(new URL(ticket.url, `http://127.0.0.1:${port}`))).status,
+          404
+        )
+      },
     })
     if (options.baseline !== "true")
       report.checks.push({
@@ -1377,6 +1531,7 @@ try {
 } finally {
   await goalModel?.close()
   await claudeModel?.close()
+  await piModel?.close()
   await writeFile(
     join(output, "verification.json"),
     JSON.stringify(report, null, 2)

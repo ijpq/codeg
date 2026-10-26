@@ -145,6 +145,11 @@ pub struct ConversationDetail {
 pub struct DbConversationDetail {
     pub summary: DbConversationSummary,
     pub turns: Vec<MessageTurn>,
+    /// Content-free turn identities computed before large images are deferred.
+    /// Lightweight output refreshes reuse these instead of reading rollouts or
+    /// guessing a producing turn from nearby wall-clock timestamps.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub output_turn_refs: Vec<ConversationOutputTurnRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_stats: Option<SessionStats>,
     /// See [`ConversationDetail::transcript_watermark`] — threaded through from
@@ -356,14 +361,39 @@ pub struct ConversationTurnDeliverableSet {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_message_id: Option<String>,
     /// Parser-stable id of the user turn that opened this run. New runs are
-    /// resolved by prompt fingerprint; older rows may omit it and let the
-    /// frontend use the guarded timestamp fallback.
+    /// resolved by prompt fingerprint; unresolvable legacy rows remain in the
+    /// conversation-wide ledger rather than being guessed onto a reply.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_turn_id: Option<String>,
     pub started_at: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<DateTime<Utc>>,
     pub deliverables: Vec<ConversationDeliverable>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationOutputTurnRef {
+    pub id: String,
+    pub timestamp: DateTime<Utc>,
+    #[serde(alias = "isUser")]
+    pub is_user: bool,
+    #[serde(
+        default,
+        alias = "promptFingerprint",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub prompt_fingerprint: Option<String>,
+}
+
+impl From<&MessageTurn> for ConversationOutputTurnRef {
+    fn from(turn: &MessageTurn) -> Self {
+        Self {
+            id: turn.id.clone(),
+            timestamp: turn.timestamp,
+            is_user: matches!(turn.role, super::TurnRole::User),
+            prompt_fingerprint: crate::artifact_tracker::user_turn_fingerprint(turn),
+        }
+    }
 }
 
 /// One user-facing file in the conversation-wide deliverable history. The

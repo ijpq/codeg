@@ -2661,6 +2661,15 @@ function reducer(
             run,
           ])
         )
+        const outputTurnRefs = new Map(
+          (current.detail.output_turn_refs ?? []).map((reference) => [
+            reference.id,
+            reference,
+          ])
+        )
+        for (const reference of action.detail.output_turn_refs ?? []) {
+          outputTurnRefs.set(reference.id, reference)
+        }
         for (const run of action.detail.deliverable_runs ?? []) {
           const existing = deliverableRuns.get(run.turn_run_id)
           if (!existing || run.user_turn_id) {
@@ -2672,6 +2681,7 @@ function reducer(
           detail: {
             ...current.detail,
             turns: [...olderTurns, ...current.detail.turns],
+            output_turn_refs: [...outputTurnRefs.values()],
             deliverable_runs: [...deliverableRuns.values()],
             history_page: action.detail.history_page,
           },
@@ -5848,11 +5858,24 @@ export const useConversationRuntimeStore = create<ConversationRuntimeStore>()((
     if (!session || !detailAtRequest) return Promise.resolve()
     const fetchId = session.dbConversationId ?? conversationId
     invalidateFolderConversationCache(fetchId)
-    const flight = listConversationOutputWindow(fetchId, detailAtRequest.turns)
+    const turnTokenAtRequest = session.activeTurnToken
+    // Include accepted local/optimistic turns: on the first task, the native
+    // transcript snapshot can still be empty when MCP publishes the files.
+    const visibleTurns = selectTimelineTurns(get(), conversationId).map(
+      (item) => item.turn
+    )
+    const flight = listConversationOutputWindow(
+      fetchId,
+      visibleTurns,
+      detailAtRequest.output_turn_refs
+    )
       .then((window) => {
         const current = get().byConversationId.get(conversationId)
         if (!current?.detail) return
-        if (current.detail !== detailAtRequest) {
+        if (
+          current.detail !== detailAtRequest ||
+          current.activeTurnToken !== turnTokenAtRequest
+        ) {
           outputWindowRefreshPending.add(conversationId)
           return
         }

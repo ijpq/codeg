@@ -456,7 +456,7 @@ const ACP_ADAPTER_DOCS_URL: &str = "https://docs.codeg.app/guide/supported-agent
 /// open without it. Move it with the pin (see `AgentType::Pi` below); the
 /// settings panel warns with the same value (`PI_MIN_RUNTIME_VERSION` in
 /// `src/lib/pi-config.ts`, held equal by a test).
-pub const PI_MIN_RUNTIME_VERSION: &str = "0.81.0";
+pub const PI_MIN_RUNTIME_VERSION: &str = "1.4.0";
 
 /// The npm package the built-in Claude Code entry runs — and the name the
 /// adapter reports as `agentInfo.name` at `initialize`, which is its
@@ -491,6 +491,7 @@ pub const CLAUDE_AGENT_ACP_PACKAGE: &str = "@agentclientprotocol/claude-agent-ac
 /// `agent_info.version` meets this minimum.
 pub fn steering_prompt_required_min_version(agent_type: AgentType) -> Option<&'static str> {
     match agent_type {
+        AgentType::Pi => Some("0.0.34-codeg.2"),
         // 0.64.0 (#919) added the `promptRequired` opt-in, but the ACTIVE path
         // stayed unsound until 0.65.0 (#958): steering is delivered at priority
         // `now`, which makes the CLI ABORT the running cycle, and that cycle's
@@ -4512,31 +4513,17 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
         },
         AgentType::Pi => AcpAgentMeta {
             agent_type,
-            supports_steer: false,
-            // pi-acp accepts ACP-wire `mcpServers` but drops them (does not
-            // forward to pi), and pi has no native MCP. supports_mcp stays
-            // `true` only to satisfy the `only_openclaw_opts_out_of_mcp`
-            // invariant — actual wire forwarding is short-circuited in
-            // `connection.rs` (see the skip-list), so neither user servers nor
-            // the codeg-mcp companion are futilely forwarded.
+            supports_steer: true,
             supports_mcp: true,
             name: "Pi",
-            description: "Self-extensible coding agent (ACP via pi-acp)",
-            // pi-acp 0.0.34 spawns `pi --mode rpc` as a child, so `pi` (npm
-            // `@earendil-works/pi-coding-agent`, at least
-            // `PI_MIN_RUNTIME_VERSION`) must be resolvable on PATH — or
-            // pointed at a custom build via the `PI_ACP_PI_COMMAND` env (see
-            // BYO-pi). Args are empty: the ACP server is the default mode
-            // (`npx -y pi-acp`, no subcommand). `node_required` follows pi's
-            // 22+ requirement (pi-acp's own engines say >=20). The embedded
-            // context env lets pi-acp advertise `promptCapabilities.embeddedContext`.
+            description: "Pi with verified sessions, native MCP and steering",
             distribution: AgentDistribution::Npx {
-                version: "0.0.34",
-                package: "pi-acp@0.0.34",
+                version: "0.0.34-codeg.2",
+                package: "pi-acp@https://github.com/ijpq/pi-acp/releases/download/v0.0.34-codeg.2/pi-acp-0.0.34-codeg.2.tgz",
                 cmd: "pi-acp",
                 args: &[],
                 env: &[("PI_ACP_ENABLE_EMBEDDED_CONTEXT", "true")],
-                node_required: Some("22.0.0"),
+                node_required: Some("22.19.0"),
             },
         },
         AgentType::Grok => AcpAgentMeta {
@@ -5988,7 +5975,7 @@ mod tests {
     }
 
     #[test]
-    fn steering_prompt_required_min_version_gates_claude_only() {
+    fn steering_prompt_required_min_version_gates_verified_claude_and_pi() {
         // The native-steering policy bit: only an adapter that honors the
         // `promptRequired` opt-in AND keeps the owning prompt in flight across
         // a steered turn gets a minimum version. The floor is the release that
@@ -6003,6 +5990,10 @@ mod tests {
             Some("0.65.0")
         );
         assert_eq!(steering_prompt_required_min_version(AgentType::Codex), None);
+        assert_eq!(
+            steering_prompt_required_min_version(AgentType::Pi),
+            Some("0.0.34-codeg.2")
+        );
         for agent in [
             AgentType::Gemini,
             AgentType::OpenClaw,
@@ -6093,12 +6084,7 @@ mod tests {
             "openclaw@2026.9.8",
             Some("24.16.0"),
         );
-        assert_npx_version(
-            AgentType::Cline,
-            "3.0.73",
-            "cline@3.0.73",
-            Some("22.0.0"),
-        );
+        assert_npx_version(AgentType::Cline, "3.0.73", "cline@3.0.73", Some("22.0.0"));
         assert_npx_version(
             AgentType::CodeBuddy,
             "2.171.0",
@@ -6119,7 +6105,7 @@ mod tests {
             "@agentclientprotocol/codex-acp@2.2.2",
             Some("20.3.0"),
         );
-        assert_npx_version(AgentType::Pi, "0.0.34", "pi-acp@0.0.34", Some("22.0.0"));
+        assert_npx_version(AgentType::Pi, "0.0.34-codeg.2", "pi-acp@https://github.com/ijpq/pi-acp/releases/download/v0.0.34-codeg.2/pi-acp-0.0.34-codeg.2.tgz", Some("22.19.0"));
         assert_npx_version(
             AgentType::Grok,
             "1.0.62",

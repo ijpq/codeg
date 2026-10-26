@@ -2742,10 +2742,14 @@
       "officeNotInstalled": "OfficeCLI n'est pas installé",
       "officeNotInstalledHint": "Installe OfficeCLI dans Paramètres → Outils Office pour prévisualiser les fichiers Word, Excel et PowerPoint.",
       "officeOpenSettings": "Ouvrir les paramètres",
-      "officeWatchFailed": "Impossible de démarrer l'aperçu en direct",
+      "officeWatchFailed": "Impossible de démarrer l’aperçu",
       "officeWatchRetry": "Réessayer",
       "officeServerInstallHint": "OfficeCLI doit être installé sur l'hôte du serveur. Exécutez cette commande là-bas, puis réessayez :",
-      "officeRemoteDesktopUnsupported": "L'aperçu en direct n'est pas disponible dans une fenêtre de bureau à distance. Ouvrez cet espace de travail dans l'interface web du serveur pour prévisualiser les fichiers Office."
+      "officeRemoteDesktopUnsupported": "L'aperçu en direct n'est pas disponible dans une fenêtre de bureau à distance. Ouvrez cet espace de travail dans l'interface web du serveur pour prévisualiser les fichiers Office.",
+      "officeDeliveredReview": "Livraison à relire · {name} · {time} · {run}",
+      "officeManualReview": "Fichier actuel · copie figée à l’ouverture",
+      "officeReviewDownload": "Télécharger cette copie de relecture",
+      "officeReviewFailed": "Impossible de préparer la copie de relecture de {name}. Le fichier actuel reste accessible depuis sa fiche."
     },
     "fileViewer": {
       "title": "Aperçu du fichier",
@@ -4432,7 +4436,8 @@
         "missing": "File missing",
         "empty": "This conversation has no confirmed deliverables yet",
         "noFilterResults": "No deliverables match these filters",
-        "hostActionNotice": "Open, copy file, and reveal actions affect the host running Codeg Server; downloads always go to the current device."
+        "hostActionNotice": "Open, copy file, and reveal actions affect the host running Codeg Server; downloads always go to the current device.",
+        "previewInCodeg": "Voir dans CodeG"
       },
       "userResources": {
         "openFile": "Ouvrir {filePath}",
@@ -5042,7 +5047,7 @@
       "syncFailed": "Échec de la synchronisation des compétences"
     },
     "autoPreviewLabel": "Ouvrir l'aperçu automatiquement",
-    "autoPreviewHint": "Lorsqu'un agent crée ou modifie un fichier Word, Excel ou PowerPoint, ouvrir automatiquement son aperçu en direct.",
+    "autoPreviewHint": "Après la réussite de la tâche, afficher le fichier Word, Excel ou PowerPoint livré. Les modifications des fichiers n’ouvrent aucun aperçu.",
     "autoDownloadProducedLabel": "Télécharger automatiquement les livrables finaux",
     "autoDownloadProducedHint": "Lors de l'utilisation du serveur web (par ex. via Tailscale/LAN), télécharge automatiquement dans le dossier Téléchargements de ce navigateur les fichiers de livrables finaux déclarés par l'agent et vérifiés."
   },

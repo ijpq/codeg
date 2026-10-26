@@ -1129,6 +1129,19 @@ pub fn build_router_with_proxy_auth(
             "/acp_prompt",
             post(handlers::acp::acp_prompt).layer(DefaultBodyLimit::max(ACP_PROMPT_BODY_MAX_BYTES)),
         )
+        .route(
+            "/submit_business_message",
+            post(handlers::business_conversations::submit_business_message)
+                .layer(DefaultBodyLimit::max(ACP_PROMPT_BODY_MAX_BYTES)),
+        )
+        .route(
+            "/get_business_message",
+            post(handlers::business_conversations::get_business_message),
+        )
+        .route(
+            "/cancel_business_message",
+            post(handlers::business_conversations::cancel_business_message),
+        )
         .route("/acp_steer", post(handlers::acp::acp_steer))
         .route("/acp_preflight", post(handlers::acp::acp_preflight))
         .route("/acp_set_mode", post(handlers::acp::acp_set_mode))
@@ -1571,6 +1584,10 @@ pub fn build_router_with_proxy_auth(
         .route(
             "/officecli_render_html",
             post(handlers::office_tools::officecli_render_html),
+        )
+        .route(
+            "/get_office_delivery_preview",
+            post(handlers::office_tools::get_office_delivery_preview),
         )
         .route(
             "/start_office_watch",

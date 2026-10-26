@@ -3,8 +3,8 @@ use std::path::{Component, Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait, IntoActiveModel,
-    QueryFilter, QueryOrder, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, DatabaseTransaction, EntityTrait,
+    IntoActiveModel, QueryFilter, QueryOrder, Set, TransactionTrait,
 };
 
 use crate::db::entities::conversation_turn_file_change::ConversationTurnFileChangeKind;
@@ -339,6 +339,25 @@ pub async fn cache_declaration_outcome(
     Ok(())
 }
 
+/// A read-first deferred SQLite transaction cannot safely promote its WAL
+/// snapshot while history or the artifact watcher is writing. Claim the
+/// writer before reading ownership/provenance, without changing user metadata.
+async fn conversation_write_transaction(
+    conn: &DatabaseConnection,
+    conversation_id: i32,
+) -> Result<DatabaseTransaction, DbError> {
+    let txn = conn.begin().await?;
+    conversation::Entity::update_many()
+        .col_expr(
+            conversation::Column::UpdatedAt,
+            sea_orm::sea_query::Expr::col(conversation::Column::UpdatedAt).into(),
+        )
+        .filter(conversation::Column::Id.eq(conversation_id))
+        .exec(&txn)
+        .await?;
+    Ok(txn)
+}
+
 async fn save_turn_set(
     conn: &DatabaseConnection,
     conversation_id: i32,
@@ -351,7 +370,7 @@ async fn save_turn_set(
     if source != SOURCE_DECLARED && source != SOURCE_INFERRED {
         return Err(DbError::Validation("invalid deliverable source".into()));
     }
-    let txn = conn.begin().await?;
+    let txn = conversation_write_transaction(conn, conversation_id).await?;
     if conversation::Entity::find_by_id(conversation_id)
         .filter(conversation::Column::DeletedAt.is_null())
         .one(&txn)
@@ -605,7 +624,7 @@ pub async fn remove_declared_paths_for_turn(
     if paths.is_empty() {
         return Ok(());
     }
-    let txn = conn.begin().await?;
+    let txn = conversation_write_transaction(conn, conversation_id).await?;
     let Some(run) = conversation_turn_run::Entity::find_by_id(turn_run_id.to_string())
         .filter(conversation_turn_run::Column::ConversationId.eq(conversation_id))
         .filter(conversation_turn_run::Column::Status.eq(ConversationTurnRunStatus::Running))
@@ -1084,6 +1103,11 @@ pub async fn infer_for_turn(
         .cloned()
         .collect::<Vec<_>>();
     missing_expected_paths.sort();
+    if let Err(error) =
+        super::office_delivery_preview_service::capture(conn, conversation_id, turn_run_id).await
+    {
+        tracing::warn!(turn_run_id, error=%error, "[office-preview] review copy failed; task settlement continues");
+    }
     crate::db::service::artifact_service::mark_settled(
         conn,
         turn_run_id,
@@ -1338,11 +1362,6 @@ pub async fn list_for_turn(
     conversation_id: i32,
     turn_run_id: &str,
 ) -> Result<Vec<ConversationDeliverable>, DbError> {
-    let models = refreshed_models(conn, conversation_id).await?;
-    let model_map = models
-        .into_iter()
-        .map(|row| (row.id.clone(), row))
-        .collect::<HashMap<_, _>>();
     let run = conversation_turn_run::Entity::find_by_id(turn_run_id.to_string())
         .filter(conversation_turn_run::Column::ConversationId.eq(conversation_id))
         .one(conn)
@@ -1356,6 +1375,15 @@ pub async fn list_for_turn(
         .order_by_asc(conversation_turn_deliverable::Column::Position)
         .all(conn)
         .await?;
+    let ids = associations
+        .iter()
+        .map(|row| row.deliverable_id.clone())
+        .collect::<HashSet<_>>();
+    let model_map = refreshed_models_for_ids(conn, conversation_id, Some(&ids))
+        .await?
+        .into_iter()
+        .map(|row| (row.id.clone(), row))
+        .collect::<HashMap<_, _>>();
     let authoritative_run_ids = if run_has_authoritative_declaration(&run)
         || associations
             .iter()
@@ -1476,20 +1504,29 @@ pub async fn list_sets_for_turns(
     conversation_id: i32,
     turns: &[MessageTurn],
 ) -> Result<Vec<ConversationTurnDeliverableSet>, DbError> {
+    let refs = turns
+        .iter()
+        .map(crate::models::conversation::ConversationOutputTurnRef::from)
+        .collect::<Vec<_>>();
+    list_sets_for_turn_refs(conn, conversation_id, &refs).await
+}
+
+pub async fn list_sets_for_turn_refs(
+    conn: &DatabaseConnection,
+    conversation_id: i32,
+    turns: &[crate::models::conversation::ConversationOutputTurnRef],
+) -> Result<Vec<ConversationTurnDeliverableSet>, DbError> {
     if turns.is_empty() {
         return Ok(Vec::new());
     }
-    let user_turns = turns
-        .iter()
-        .filter(|turn| matches!(turn.role, crate::models::TurnRole::User))
-        .collect::<Vec<_>>();
+    let user_turns = turns.iter().filter(|turn| turn.is_user).collect::<Vec<_>>();
     let client_message_ids = user_turns
         .iter()
         .map(|turn| turn.id.clone())
         .collect::<Vec<_>>();
     let prompt_fingerprints = user_turns
         .iter()
-        .filter_map(|turn| crate::artifact_tracker::user_turn_fingerprint(turn))
+        .filter_map(|turn| turn.prompt_fingerprint.clone())
         .collect::<Vec<_>>();
     let mut visible = Condition::any()
         .add(conversation_turn_run::Column::Status.eq(ConversationTurnRunStatus::Running));
@@ -1539,7 +1576,7 @@ pub async fn list_sets_for_turns(
             deliverables: Vec::new(),
         })
         .collect::<Vec<_>>();
-    associate_sets_with_run_models(&mut placeholders, &runs, turns);
+    associate_sets_with_run_refs(&mut placeholders, &runs, turns);
     let user_turn_by_run = placeholders
         .into_iter()
         .filter_map(|set| Some((set.turn_run_id, set.user_turn_id?)))
@@ -1563,6 +1600,18 @@ fn associate_sets_with_run_models(
     runs: &[conversation_turn_run::Model],
     turns: &[MessageTurn],
 ) {
+    let refs = turns
+        .iter()
+        .map(crate::models::conversation::ConversationOutputTurnRef::from)
+        .collect::<Vec<_>>();
+    associate_sets_with_run_refs(sets, runs, &refs);
+}
+
+fn associate_sets_with_run_refs(
+    sets: &mut [ConversationTurnDeliverableSet],
+    runs: &[conversation_turn_run::Model],
+    turns: &[crate::models::conversation::ConversationOutputTurnRef],
+) {
     if sets.is_empty() || turns.is_empty() {
         return;
     }
@@ -1572,7 +1621,8 @@ fn associate_sets_with_run_models(
         .collect::<HashMap<_, _>>();
     let candidates = turns
         .iter()
-        .filter_map(|turn| Some((turn, crate::artifact_tracker::user_turn_fingerprint(turn)?)))
+        .filter(|turn| turn.is_user)
+        .filter_map(|turn| Some((turn, turn.prompt_fingerprint.as_ref()?)))
         .collect::<Vec<_>>();
     let mut used = HashSet::new();
 
@@ -1584,53 +1634,57 @@ fn associate_sets_with_run_models(
         };
         if turns
             .iter()
-            .any(|turn| turn.id == client_id && matches!(turn.role, crate::models::TurnRole::User))
+            .any(|turn| turn.id == client_id && turn.is_user)
         {
             set.user_turn_id = Some(client_id.to_string());
             used.insert(client_id.to_string());
         }
     }
 
-    for set in sets.iter_mut().filter(|set| set.user_turn_id.is_none()) {
-        let Some(fingerprint) = fingerprints.get(&set.turn_run_id) else {
+    // Claim the nearest fingerprint pair globally, not the oldest run first.
+    // Otherwise a repeated prompt on an unloaded page steals the visible
+    // prompt's output. Equal-distance ambiguity remains unassociated.
+    let mut pairs = Vec::new();
+    for (index, set) in sets
+        .iter()
+        .enumerate()
+        .filter(|(_, set)| set.user_turn_id.is_none())
+    {
+        if let Some(fingerprint) = fingerprints.get(&set.turn_run_id) {
+            for (turn, candidate) in &candidates {
+                if *candidate == fingerprint && !used.contains(&turn.id) {
+                    let distance = turn
+                        .timestamp
+                        .timestamp_millis()
+                        .abs_diff(set.started_at.timestamp_millis());
+                    pairs.push((distance, index, *turn));
+                }
+            }
+        }
+    }
+    let mut run_distances = HashMap::new();
+    let mut turn_distances = HashMap::new();
+    for (distance, index, turn) in &pairs {
+        *run_distances.entry((*distance, *index)).or_insert(0_u32) += 1;
+        *turn_distances
+            .entry((*distance, turn.id.as_str()))
+            .or_insert(0_u32) += 1;
+    }
+    pairs.sort_by_key(|(distance, _, _)| *distance);
+    for (distance, index, turn) in &pairs {
+        if sets[*index].user_turn_id.is_some() || used.contains(&turn.id) {
             continue;
-        };
-        let best = candidates
-            .iter()
-            .filter(|(turn, candidate)| candidate == fingerprint && !used.contains(&turn.id))
-            .min_by_key(|(turn, _)| {
-                turn.timestamp
-                    .timestamp_millis()
-                    .abs_diff(set.started_at.timestamp_millis())
-            });
-        if let Some((turn, _)) = best {
-            set.user_turn_id = Some(turn.id.clone());
+        }
+        let ambiguous = run_distances[&(*distance, *index)] > 1
+            || turn_distances[&(*distance, turn.id.as_str())] > 1;
+        if !ambiguous {
+            sets[*index].user_turn_id = Some(turn.id.clone());
             used.insert(turn.id.clone());
         }
     }
-
-    // Rows written before prompt fingerprints were persisted can still be
-    // placed safely when their run began near one unclaimed user turn in the
-    // currently loaded history page. Never return a distant guess: an
-    // unmatched set belongs in the history panel, not under the latest reply.
-    for set in sets.iter_mut().filter(|set| set.user_turn_id.is_none()) {
-        let best = turns
-            .iter()
-            .filter(|turn| matches!(turn.role, crate::models::TurnRole::User))
-            .filter(|turn| !used.contains(&turn.id))
-            .filter_map(|turn| {
-                let distance = turn
-                    .timestamp
-                    .timestamp_millis()
-                    .abs_diff(set.started_at.timestamp_millis());
-                (distance <= 90_000).then_some((turn, distance))
-            })
-            .min_by_key(|(_, distance)| *distance);
-        if let Some((turn, _)) = best {
-            set.user_turn_id = Some(turn.id.clone());
-            used.insert(turn.id.clone());
-        }
-    }
+    // A timestamp alone is not evidence of task identity (steer, queued
+    // automation, clock skew and branch notifications can be adjacent).
+    // Unmatched legacy records remain accessible in the total ledger.
 }
 
 /// Bind deliverable runs to parser-stable user-turn ids before a detail is sent
@@ -1676,7 +1730,7 @@ pub async fn hide_for_conversation(
             "duplicate deliverable ids are not allowed".into(),
         ));
     }
-    let txn = conn.begin().await?;
+    let txn = conversation_write_transaction(conn, conversation_id).await?;
     let owned = conversation_deliverable::Entity::find()
         .filter(conversation_deliverable::Column::ConversationId.eq(conversation_id))
         .filter(conversation_deliverable::Column::IsHidden.eq(false))
@@ -1826,6 +1880,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deliverable_mutations_wait_for_a_concurrent_history_writer() {
+        let workspace = tempfile::tempdir().unwrap();
+        let db = crate::db::test_helpers::fresh_disk_db(workspace.path()).await;
+        let folder_id =
+            crate::db::test_helpers::seed_folder(&db, &workspace.path().to_string_lossy()).await;
+        let cid = crate::db::test_helpers::seed_conversation(&db, folder_id, AgentType::Pi).await;
+        std::fs::write(workspace.path().join("report.pdf"), b"delivered").unwrap();
+        seed_run(&db, cid, folder_id, workspace.path(), "writer-run", &[]).await;
+        let writer_conn = sea_orm::Database::connect(format!(
+            "sqlite:{}?mode=rw",
+            workspace.path().join("source.db").to_string_lossy()
+        ))
+        .await
+        .unwrap();
+        for action in ["replace", "clear", "remove", "hide"] {
+            let initial = replace_declared_for_turn(
+                &db.conn,
+                cid,
+                "writer-run",
+                vec![verified(workspace.path(), "report.pdf", "Report")],
+            )
+            .await
+            .unwrap();
+            let writer = writer_conn.begin().await.unwrap();
+            writer
+                .execute_unprepared(&format!(
+                    "UPDATE conversation SET message_count=message_count+1 WHERE id={cid}"
+                ))
+                .await
+                .unwrap();
+            let conn = db.conn.clone();
+            let root = workspace.path().to_path_buf();
+            let mut pending = tokio::spawn(async move {
+                match action {
+                    "replace" | "clear" => replace_declared_for_turn(
+                        &conn,
+                        cid,
+                        "writer-run",
+                        if action == "clear" {
+                            vec![]
+                        } else {
+                            vec![verified(&root, "report.pdf", "Final report")]
+                        },
+                    )
+                    .await
+                    .map(|_| ()),
+                    "remove" => {
+                        remove_declared_paths_for_turn(
+                            &conn,
+                            cid,
+                            "writer-run",
+                            &root.to_string_lossy(),
+                            &["report.pdf".into()],
+                        )
+                        .await
+                    }
+                    "hide" => hide_for_conversation(&conn, cid, &[initial[0].id.clone()])
+                        .await
+                        .map(|_| ()),
+                    _ => unreachable!(),
+                }
+            });
+            let early =
+                tokio::time::timeout(std::time::Duration::from_millis(100), &mut pending).await;
+            writer.commit().await.unwrap();
+            assert!(
+                early.is_err(),
+                "{action} failed to await the writer: {early:?}"
+            );
+            pending.await.unwrap().unwrap();
+            assert_eq!(
+                list_for_turn(&db.conn, cid, "writer-run")
+                    .await
+                    .unwrap()
+                    .len(),
+                usize::from(action == "replace")
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn large_deliverable_ledger_is_returned_as_a_small_independent_page() {
         let db = crate::db::test_helpers::fresh_in_memory_db().await;
         let folder_id = crate::db::test_helpers::seed_folder(&db, "/tmp/large-ledger").await;
@@ -1964,7 +2099,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn timestamp_fallback_never_binds_a_deliverable_run_to_an_assistant_turn() {
+    async fn timestamp_alone_does_not_bind_legacy_outputs_to_a_nearby_user_or_assistant() {
         let db = crate::db::test_helpers::fresh_in_memory_db().await;
         let workspace = tempfile::tempdir().unwrap();
         let folder_id =
@@ -2029,7 +2164,176 @@ mod tests {
         associate_sets_with_user_turns(&db.conn, &mut sets, &turns)
             .await
             .unwrap();
-        assert_eq!(sets[0].user_turn_id.as_deref(), Some("user-nearby"));
+        assert_eq!(sets[0].user_turn_id, None);
+    }
+
+    #[tokio::test]
+    async fn output_window_preserves_durable_link_after_completion_and_clock_skew() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("report.pdf"), b"report").unwrap();
+        let folder_id =
+            crate::db::test_helpers::seed_folder(&db, &workspace.path().to_string_lossy()).await;
+        let conversation_id =
+            crate::db::test_helpers::seed_conversation(&db, folder_id, AgentType::Pi).await;
+        seed_run(
+            &db,
+            conversation_id,
+            folder_id,
+            workspace.path(),
+            "refresh-run",
+            &[],
+        )
+        .await;
+        let text = "deliver final report";
+        let fingerprint = crate::artifact_tracker::prompt_fingerprint(&[PromptInputBlock::Text {
+            text: text.into(),
+        }]);
+        let mut run = conversation_turn_run::Entity::find_by_id("refresh-run")
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap()
+            .into_active_model();
+        run.prompt_fingerprint = Set(fingerprint.clone());
+        let run = run.update(&db.conn).await.unwrap();
+        replace_declared_for_turn(
+            &db.conn,
+            conversation_id,
+            &run.id,
+            vec![verified(workspace.path(), "report.pdf", "Report")],
+        )
+        .await
+        .unwrap();
+        artifact_service::finish_run(
+            &db.conn,
+            &run.id,
+            ConversationTurnRunStatus::Completed,
+            Some("end_turn".into()),
+        )
+        .await
+        .unwrap();
+        let turn = MessageTurn {
+            id: "durable-pi-user".into(),
+            role: TurnRole::User,
+            blocks: vec![ContentBlock::Text { text: text.into() }],
+            timestamp: run.started_at + chrono::Duration::hours(8),
+            usage: None,
+            duration_ms: None,
+            model: None,
+            completed_at: None,
+            agent_message_id: None,
+            native_task_id: None,
+        };
+        let full = list_sets_for_turns(&db.conn, conversation_id, std::slice::from_ref(&turn))
+            .await
+            .unwrap();
+        assert_eq!(full.len(), 1);
+        let refs = serde_json::from_value(serde_json::json!([{
+            "id": turn.id, "timestamp": turn.timestamp,
+            "is_user": true, "prompt_fingerprint": fingerprint,
+        }]))
+        .unwrap();
+        let refreshed = crate::commands::conversations::list_conversation_output_window_core(
+            &db.conn,
+            conversation_id,
+            refs,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            refreshed.deliverable_runs.len(),
+            1,
+            "lightweight refresh must not erase the completed card"
+        );
+        assert_eq!(
+            refreshed.deliverable_runs[0].user_turn_id,
+            full[0].user_turn_id
+        );
+    }
+
+    #[test]
+    fn output_window_accepts_the_existing_frontend_camel_case_role() {
+        let result = serde_json::from_value::<
+            crate::commands::conversations::VisibleConversationTurnRef,
+        >(serde_json::json!({
+            "id": "user-1", "timestamp": "2026-10-26T00:00:00Z", "isUser": true,
+        }));
+        assert!(
+            result.is_ok(),
+            "existing frontend request must deserialize: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_prompt_on_an_unloaded_page_cannot_steal_the_visible_run() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let root = tempfile::tempdir().unwrap();
+        let folder =
+            crate::db::test_helpers::seed_folder(&db, &root.path().to_string_lossy()).await;
+        let cid = crate::db::test_helpers::seed_conversation(&db, folder, AgentType::Codex).await;
+        let text = "publish the report";
+        let fingerprint = crate::artifact_tracker::prompt_fingerprint(&[PromptInputBlock::Text {
+            text: text.into(),
+        }]);
+        let mut runs = Vec::new();
+        for id in ["old-page-run", "visible-page-run"] {
+            seed_run(&db, cid, folder, root.path(), id, &[]).await;
+            let mut run = conversation_turn_run::Entity::find_by_id(id)
+                .one(&db.conn)
+                .await
+                .unwrap()
+                .unwrap();
+            run.prompt_fingerprint = fingerprint.clone();
+            runs.push(run);
+        }
+        runs[0].started_at -= chrono::Duration::days(1);
+        let mut sets = runs
+            .iter()
+            .map(|run| ConversationTurnDeliverableSet {
+                turn_run_id: run.id.clone(),
+                conversation_id: cid,
+                client_message_id: run.client_message_id.clone(),
+                user_turn_id: None,
+                started_at: run.started_at,
+                completed_at: None,
+                deliverables: vec![],
+            })
+            .collect::<Vec<_>>();
+        let turn = MessageTurn {
+            id: "native-visible-user".into(),
+            role: TurnRole::User,
+            blocks: vec![ContentBlock::Text { text: text.into() }],
+            timestamp: runs[1].started_at,
+            usage: None,
+            duration_ms: None,
+            model: None,
+            completed_at: None,
+            agent_message_id: None,
+            native_task_id: None,
+        };
+        associate_sets_with_run_models(&mut sets, &runs, std::slice::from_ref(&turn));
+        assert_eq!(sets[0].user_turn_id, None);
+        assert_eq!(sets[1].user_turn_id.as_deref(), Some("native-visible-user"));
+        runs[0].started_at = runs[1].started_at;
+        for set in &mut sets {
+            set.user_turn_id = None;
+            set.started_at = runs[1].started_at;
+        }
+        associate_sets_with_run_models(&mut sets, &runs, std::slice::from_ref(&turn));
+        assert!(
+            sets.iter().all(|set| set.user_turn_id.is_none()),
+            "ambiguous repeated prompts must remain in the ledger"
+        );
+        let mut different = turn;
+        different.blocks = vec![ContentBlock::Text {
+            text: "different task".into(),
+        }];
+        associate_sets_with_run_models(&mut sets, &runs, &[different]);
+        assert!(
+            sets.iter().all(|set| set.user_turn_id.is_none()),
+            "nearby but different prompts must not be guessed"
+        );
     }
 
     fn verified(root: &Path, path: &str, title: &str) -> VerifiedDeliverable {

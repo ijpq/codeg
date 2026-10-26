@@ -2742,10 +2742,14 @@
       "officeNotInstalled": "OfficeCLI がインストールされていません",
       "officeNotInstalledHint": "設定 → Office ツール から OfficeCLI をインストールすると、Word・Excel・PowerPoint ファイルをプレビューできます。",
       "officeOpenSettings": "設定を開く",
-      "officeWatchFailed": "ライブプレビューを開始できませんでした",
+      "officeWatchFailed": "プレビューを開始できませんでした",
       "officeWatchRetry": "再試行",
       "officeServerInstallHint": "OfficeCLI はサーバーホストにインストールする必要があります。サーバーで次のコマンドを実行してから再試行してください：",
-      "officeRemoteDesktopUnsupported": "リモートデスクトップウィンドウではライブプレビューを利用できません。Office ファイルをプレビューするには、サーバーの Web UI でこのワークスペースを開いてください。"
+      "officeRemoteDesktopUnsupported": "リモートデスクトップウィンドウではライブプレビューを利用できません。Office ファイルをプレビューするには、サーバーの Web UI でこのワークスペースを開いてください。",
+      "officeDeliveredReview": "納品レビュー · {name} · {time} · {run}",
+      "officeManualReview": "現在のファイル · 開いた時点の固定コピー",
+      "officeReviewDownload": "このレビュー用コピーをダウンロード",
+      "officeReviewFailed": "{name} のレビュー用コピーを準備できません。成果物カードから現在のファイルを表示・ダウンロードできます。"
     },
     "fileViewer": {
       "title": "ファイルプレビュー",
@@ -4432,7 +4436,8 @@
         "missing": "File missing",
         "empty": "This conversation has no confirmed deliverables yet",
         "noFilterResults": "No deliverables match these filters",
-        "hostActionNotice": "Open, copy file, and reveal actions affect the host running Codeg Server; downloads always go to the current device."
+        "hostActionNotice": "Open, copy file, and reveal actions affect the host running Codeg Server; downloads always go to the current device.",
+        "previewInCodeg": "CodeG で表示"
       },
       "userResources": {
         "openFile": "{filePath} を開く",
@@ -5042,7 +5047,7 @@
       "syncFailed": "スキルの同期に失敗"
     },
     "autoPreviewLabel": "プレビューを自動で開く",
-    "autoPreviewHint": "エージェントが Word、Excel、PowerPoint ファイルを作成または編集したときに、ライブプレビューを自動で開きます。",
+    "autoPreviewHint": "タスクの正常完了後、最終成果物の Word・Excel・PowerPoint をプレビューします。作業中のファイル変更では開きません。",
     "autoDownloadProducedLabel": "最終成果物を自動ダウンロード",
     "autoDownloadProducedHint": "Web サーバー（Tailscale/LAN 経由など）で使用する際、エージェントが宣言し検証された最終成果物ファイルを、このブラウザーのダウンロードフォルダーに自動ダウンロードします。"
   },

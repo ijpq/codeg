@@ -2742,10 +2742,14 @@
       "officeNotInstalled": "OfficeCLI가 설치되지 않았습니다",
       "officeNotInstalledHint": "설정 → Office 도구에서 OfficeCLI를 설치하면 Word, Excel, PowerPoint 파일을 미리볼 수 있습니다.",
       "officeOpenSettings": "설정 열기",
-      "officeWatchFailed": "실시간 미리보기를 시작할 수 없습니다",
+      "officeWatchFailed": "미리보기를 시작할 수 없습니다",
       "officeWatchRetry": "다시 시도",
       "officeServerInstallHint": "OfficeCLI는 서버 호스트에 설치해야 합니다. 서버에서 다음 명령을 실행한 후 다시 시도하세요:",
-      "officeRemoteDesktopUnsupported": "원격 데스크톱 창에서는 실시간 미리보기를 사용할 수 없습니다. Office 파일을 미리 보려면 서버의 웹 UI에서 이 작업 공간을 여세요."
+      "officeRemoteDesktopUnsupported": "원격 데스크톱 창에서는 실시간 미리보기를 사용할 수 없습니다. Office 파일을 미리 보려면 서버의 웹 UI에서 이 작업 공간을 여세요.",
+      "officeDeliveredReview": "납품 검토 · {name} · {time} · {run}",
+      "officeManualReview": "현재 파일 · 열었을 때의 고정 사본",
+      "officeReviewDownload": "이 검토 사본 다운로드",
+      "officeReviewFailed": "{name} 검토 사본을 준비하지 못했습니다. 결과물 카드에서 현재 파일을 보거나 다운로드하세요."
     },
     "fileViewer": {
       "title": "파일 미리보기",
@@ -4432,7 +4436,8 @@
         "missing": "File missing",
         "empty": "This conversation has no confirmed deliverables yet",
         "noFilterResults": "No deliverables match these filters",
-        "hostActionNotice": "Open, copy file, and reveal actions affect the host running Codeg Server; downloads always go to the current device."
+        "hostActionNotice": "Open, copy file, and reveal actions affect the host running Codeg Server; downloads always go to the current device.",
+        "previewInCodeg": "CodeG에서 보기"
       },
       "userResources": {
         "openFile": "{filePath} 열기",
@@ -5042,7 +5047,7 @@
       "syncFailed": "스킬 동기화 실패"
     },
     "autoPreviewLabel": "미리보기 자동 열기",
-    "autoPreviewHint": "에이전트가 Word, Excel, PowerPoint 파일을 만들거나 편집하면 실시간 미리보기를 자동으로 엽니다.",
+    "autoPreviewHint": "작업이 정상 완료되면 최종 납품된 Word, Excel 또는 PowerPoint 파일을 미리 봅니다. 작업 중 파일 변경으로는 열리지 않습니다.",
     "autoDownloadProducedLabel": "최종 결과물 자동 다운로드",
     "autoDownloadProducedHint": "웹 서버(예: Tailscale/LAN)로 사용할 때 에이전트가 선언하고 검증된 최종 결과물 파일을 이 브라우저의 다운로드 폴더로 자동 다운로드합니다."
   },

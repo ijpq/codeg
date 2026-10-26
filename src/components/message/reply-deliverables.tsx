@@ -55,6 +55,7 @@ export function ReplyDeliverables({
           return (
             <li
               key={item.id}
+              data-deliverable-run={item.turn_run_id ?? undefined}
               className="flex items-center gap-2 rounded-md bg-background/70 px-2 py-1.5"
             >
               <Icon className="size-4 shrink-0 text-muted-foreground" />

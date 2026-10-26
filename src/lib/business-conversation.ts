@@ -1,6 +1,11 @@
 import { getTransport } from "@/lib/transport"
 import type { AgentType } from "@/lib/types"
 
+export const BUSINESS_AGENTS = ["codex", "claude_code", "pi"] as const
+
+export const supportsBusinessHandoff = (agent: AgentType) =>
+  BUSINESS_AGENTS.some((supported) => supported === agent)
+
 export interface BusinessTaskState {
   objective: string
   requirements: string[]

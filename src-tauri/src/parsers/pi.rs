@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -334,6 +334,7 @@ pub struct PiParser {
     /// custom `sessionDir` moves the sessions OUT of the agent dir, so the one
     /// cannot be derived from the other.
     agent_dir: PathBuf,
+    mapping_dirs: Vec<PathBuf>,
 }
 
 impl PiParser {
@@ -343,9 +344,14 @@ impl PiParser {
 
     /// The history of the pi launched with `env`.
     pub fn for_env(env: &AgentEnv) -> Self {
+        let agent_dir = resolve_pi_agent_dir_for_env(env);
+        let mut mapping_dirs = vec![agent_dir.join("pi-acp")];
+        if let Some(dir) = env.var("PI_ACP_DATA_DIR") { mapping_dirs.insert(0, PathBuf::from(dir)); }
+        if let Some(home) = dirs::home_dir() { mapping_dirs.push(home.join(".pi/pi-acp")); }
         Self {
             base_dir: resolve_pi_sessions_dir_for_env(env),
-            agent_dir: resolve_pi_agent_dir_for_env(env),
+            agent_dir,
+            mapping_dirs,
         }
     }
 
@@ -361,8 +367,47 @@ impl PiParser {
             .unwrap_or_else(|| base_dir.clone());
         Self {
             base_dir,
+            mapping_dirs: vec![agent_dir.join("pi-acp")],
             agent_dir,
         }
+    }
+
+    /// Only an explicit adapter mapping plus the real header establishes an
+    /// alias. Names, timestamps and neighbouring JSONL files are never evidence.
+    pub(crate) fn verified_binding(&self, external: &str) -> Result<Option<(String, PathBuf, String)>, ParseError> {
+        use sha2::{Digest, Sha256};
+        let hashed = format!("{:x}.json", Sha256::digest(external.as_bytes()));
+        let mut found = None;
+        for dir in &self.mapping_dirs {
+            let entry = dir.join("session-map.json.d").join(&hashed);
+            let legacy = dir.join("session-map.json");
+            let value = if entry.is_file() {
+                if fs::metadata(&entry)?.len() > 131072 { continue; }
+                serde_json::from_slice::<Value>(&fs::read(&entry)?).ok()
+            } else if legacy.is_file() && fs::metadata(&legacy)?.len() <= 16 * 1024 * 1024 {
+                serde_json::from_slice::<Value>(&fs::read(&legacy)?).ok()
+                    .and_then(|v|v.get("sessions")?.get(external).cloned())
+            } else { None };
+            let Some(value)=value else { continue };
+            if value.get("sessionId").and_then(Value::as_str)!=Some(external) { continue; }
+            let Some(file)=value.get("sessionFile").and_then(Value::as_str) else { continue };
+            let path=fs::canonicalize(file)?;
+            let root=fs::canonicalize(&self.base_dir)?;
+            if !path.starts_with(&root) { return Err(ParseError::ConversationNotFound("PI_MAPPING_OUTSIDE_SESSION_ROOT".into())); }
+            let mut line=String::new();
+            BufReader::new(fs::File::open(&path)?).take(65536).read_line(&mut line)?;
+            let header:Value=serde_json::from_str(&line).map_err(|_|ParseError::ConversationNotFound("PI_INVALID_NATIVE_HEADER".into()))?;
+            let id=header.get("id").and_then(Value::as_str).filter(|id|!id.is_empty());
+            let cwd=header.get("cwd").and_then(Value::as_str);
+            if header.get("type").and_then(Value::as_str)!=Some("session") || id.is_none() || cwd.is_none() || cwd!=value.get("cwd").and_then(Value::as_str) ||
+                value.get("nativeSessionId").and_then(Value::as_str).is_some_and(|expected|Some(expected)!=id) {
+                return Err(ParseError::ConversationNotFound("PI_MAPPING_IDENTITY_MISMATCH".into()));
+            }
+            let current=(id.unwrap().to_owned(),path,cwd.unwrap().to_owned());
+            if found.as_ref().is_some_and(|old|old!=&current) { return Err(ParseError::ConversationNotFound("PI_MAPPING_AMBIGUOUS".into())); }
+            found=Some(current);
+        }
+        Ok(found)
     }
 
     fn parse_summary(&self, path: &Path) -> Option<ConversationSummary> {
@@ -480,6 +525,9 @@ impl AgentParser for PiParser {
     }
 
     fn get_conversation(&self, conversation_id: &str) -> Result<ConversationDetail, ParseError> {
+        if let Some((_,path,_))=self.verified_binding(conversation_id)? {
+            return self.parse_detail(&path,conversation_id);
+        }
         if self.base_dir.exists() {
             for entry in WalkDir::new(&self.base_dir)
                 .into_iter()
@@ -1385,6 +1433,40 @@ fn session_id_of(path: &Path) -> Option<String> {
         break;
     }
     Some(fallback_id(path))
+}
+
+#[cfg(test)]
+mod binding_identity_tests {
+    use super::*;
+    #[test]
+    fn pi_legacy_acp_alias_reads_real_history_without_changing_native_identity() {
+        let root=tempfile::tempdir().unwrap();
+        let sessions=root.path().join("sessions");
+        fs::create_dir(&sessions).unwrap();
+        let file=sessions.join("misleading-filename.jsonl");
+        let header=serde_json::json!({"type":"session","version":3,"id":"real-native","cwd":"/business","timestamp":"2026-10-26T01:00:00Z"});
+        fs::write(&file,format!("{header}\n")).unwrap();
+        let map=root.path().join("pi-acp");fs::create_dir(&map).unwrap();
+        fs::write(map.join("session-map.json"),serde_json::to_vec(&serde_json::json!({"version":1,"sessions":{"old-acp":{"sessionId":"old-acp","cwd":"/business","sessionFile":file}}})).unwrap()).unwrap();
+        let parser=PiParser::with_base_dir(sessions);
+        let verified=parser.verified_binding("old-acp").unwrap().unwrap();
+        assert_eq!(verified.0,"real-native");
+        assert_eq!(verified.2,"/business");
+        assert!(parser.get_conversation("old-acp").is_ok());
+        assert_eq!(session_id_of(&file).as_deref(),Some("real-native"));
+        assert!(parser.verified_binding("misleading-filename").unwrap().is_none());
+    }
+    #[test]
+    fn pi_mapping_conflicts_and_paths_outside_sessions_are_not_repaired_by_guessing() {
+        let root=tempfile::tempdir().unwrap();let sessions=root.path().join("sessions");fs::create_dir(&sessions).unwrap();
+        let file=root.path().join("outside.jsonl");
+        fs::write(&file,"{\"type\":\"session\",\"id\":\"native\",\"cwd\":\"/business\"}\n").unwrap();
+        let map=root.path().join("pi-acp");fs::create_dir(&map).unwrap();
+        fs::write(map.join("session-map.json"),serde_json::to_vec(&serde_json::json!({"version":1,"sessions":{"old":{"sessionId":"old","cwd":"/business","sessionFile":file}}})).unwrap()).unwrap();
+        let parser=PiParser::with_base_dir(sessions);
+        assert!(parser.verified_binding("old").is_err());
+        assert_eq!(session_id_of(&file).as_deref(),Some("native"));
+    }
 }
 
 /// Recover a conversation id from a `<timestamp>_<uuid>.jsonl` filename when the

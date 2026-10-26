@@ -325,6 +325,11 @@ pub(crate) fn apply_custom_version_to_url(
 /// global prefix, then the agent vendor's own native install. The fallbacks
 /// handle GUI environments that don't inherit the user's shell PATH.
 pub(crate) async fn is_cmd_available(agent_type: AgentType, cmd: &str) -> bool {
+    if agent_type == AgentType::Pi
+        && crate::acp::pi_runtime::adapter(&Default::default()).is_some_and(|p| p.is_file())
+    {
+        return true;
+    }
     resolve_npx_command_for(agent_type, cmd).await.is_some()
 }
 
@@ -11813,6 +11818,9 @@ async fn build_runtime_env_for_agent(
     if agent_type == AgentType::Codex {
         crate::acp::codex_runtime::apply(&mut runtime_env);
     }
+    if agent_type == AgentType::Pi {
+        crate::acp::pi_runtime::apply(&mut runtime_env);
+    }
     apply_model_provider_env(agent_type, setting.as_ref(), &mut runtime_env, &db.conn).await;
     // `apply_model_provider_env` writes this agent's generic credential trio —
     // for cline that is `CLINE_BASE_URL`/`CLINE_API_KEY`/`CLINE_MODEL` — so a
@@ -12300,11 +12308,21 @@ async fn acp_restore_conversation_inner(
     let agent_type = conversation.agent_type;
     // Business sessions own their per-engine picks across browser devices and
     // restarts. A device's last global picker value cannot overwrite them.
-    let business_session = if crate::db::service::business_conversation_service::is_managed(&db.conn, conversation_id)
-        .await.map_err(|e| AcpError::protocol(e.to_string()))? {
-        crate::db::service::business_conversation_service::find_session(&db.conn, conversation_id, agent_type)
-            .await.map_err(|e| AcpError::protocol(e.to_string()))?
-    } else { None };
+    let business_session =
+        if crate::db::service::business_conversation_service::is_managed(&db.conn, conversation_id)
+            .await
+            .map_err(|e| AcpError::protocol(e.to_string()))?
+        {
+            crate::db::service::business_conversation_service::find_session(
+                &db.conn,
+                conversation_id,
+                agent_type,
+            )
+            .await
+            .map_err(|e| AcpError::protocol(e.to_string()))?
+        } else {
+            None
+        };
     let (preferred_mode_id, preferred_config_values) = if let Some(session) = business_session {
         (session.mode_id, session.config_values)
     } else {
@@ -13118,13 +13136,7 @@ pub async fn acp_goal_control(
     manager: State<'_, ConnectionManager>,
 ) -> Result<(), AcpError> {
     manager
-        .goal_control_for_conversation(
-            &db.conn,
-            &connection_id,
-            action,
-            objective,
-            conversation_id,
-        )
+        .goal_control_for_conversation(&db.conn, &connection_id, action, objective, conversation_id)
         .await
 }
 
@@ -13457,7 +13469,7 @@ pub(crate) async fn acp_get_agent_status_core(
         .await
         .map_err(|e| AcpError::protocol(e.to_string()))?;
 
-    let (available, installed_version) = match &meta.distribution {
+    let (available, mut installed_version) = match &meta.distribution {
         registry::AgentDistribution::Npx { cmd, package, .. } => {
             let resolved = resolve_npx_command_for(agent_type, cmd).await;
             let mut version = resolved
@@ -13520,6 +13532,9 @@ pub(crate) async fn acp_get_agent_status_core(
         }
     };
 
+    if agent_type == AgentType::Pi && crate::acp::pi_runtime::bundled_root().is_some() {
+        installed_version = Some("0.0.34-codeg.2".into());
+    }
     Ok(crate::acp::types::AcpAgentStatus {
         agent_type,
         available,
@@ -15076,7 +15091,12 @@ async fn run_streaming_command(
             match reader {
                 Some(reader) => {
                     crate::process::collect_lines_lossy(BufReader::new(reader), |line| {
-                        emit_agent_install_event(&emitter, &task_id, AgentInstallEventKind::Log, line);
+                        emit_agent_install_event(
+                            &emitter,
+                            &task_id,
+                            AgentInstallEventKind::Log,
+                            line,
+                        );
                     })
                     .await
                 }
@@ -16566,7 +16586,10 @@ mod tests {
         )
         .await
         .expect_err("codex is not a system agent");
-        assert!(err.to_string().contains("not updated through its own CLI"), "{err}");
+        assert!(
+            err.to_string().contains("not updated through its own CLI"),
+            "{err}"
+        );
     }
 
     #[cfg(unix)]

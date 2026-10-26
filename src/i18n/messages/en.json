@@ -2742,10 +2742,14 @@
       "officeNotInstalled": "OfficeCLI is not installed",
       "officeNotInstalledHint": "Install OfficeCLI under Settings → Office Tools to preview Word, Excel, and PowerPoint files.",
       "officeOpenSettings": "Open Settings",
-      "officeWatchFailed": "Couldn't start the live preview",
+      "officeWatchFailed": "Couldn't start the preview",
       "officeWatchRetry": "Retry",
       "officeServerInstallHint": "OfficeCLI must be installed on the server host. Run this command there, then retry:",
-      "officeRemoteDesktopUnsupported": "Live preview isn't available in a remote-desktop window. Open this workspace in the server's web UI to preview Office files."
+      "officeRemoteDesktopUnsupported": "Live preview isn't available in a remote-desktop window. Open this workspace in the server's web UI to preview Office files.",
+      "officeDeliveredReview": "Delivered review · {name} · {time} · {run}",
+      "officeManualReview": "Current file · stable copy made when opened",
+      "officeReviewDownload": "Download this review copy",
+      "officeReviewFailed": "Could not prepare the review copy for {name}. Use its output card to view or download the current file."
     },
     "fileViewer": {
       "title": "File preview",
@@ -4432,7 +4436,8 @@
         "missing": "File missing",
         "empty": "This conversation has no confirmed deliverables yet",
         "noFilterResults": "No deliverables match these filters",
-        "hostActionNotice": "Open, copy file, and reveal actions affect the host running Codeg Server; downloads always go to the current device."
+        "hostActionNotice": "Open, copy file, and reveal actions affect the host running Codeg Server; downloads always go to the current device.",
+        "previewInCodeg": "View in CodeG"
       },
       "userResources": {
         "openFile": "Open {filePath}",
@@ -5062,7 +5067,7 @@
       "syncFailed": "Failed to sync skills"
     },
     "autoPreviewLabel": "Auto-open preview",
-    "autoPreviewHint": "When an agent creates or edits a Word, Excel, or PowerPoint file, open its live preview automatically.",
+    "autoPreviewHint": "After a task completes successfully, preview its final delivered Word, Excel or PowerPoint file. Workspace edits do not open previews.",
     "autoDownloadProducedLabel": "Auto-download final deliverables",
     "autoDownloadProducedHint": "When using the web server (e.g. over Tailscale/LAN), automatically download verified final-deliverable files declared by the agent to this browser's Downloads folder."
   },

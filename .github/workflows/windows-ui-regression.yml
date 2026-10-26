@@ -120,6 +120,7 @@ jobs:
             src-tauri/target/x86_64-pc-windows-msvc/release/codeg-computer-helper.exe
             src-tauri/target/x86_64-pc-windows-msvc/release/codeg-cli.exe
             out/
+            dist/pi-runtime/
           if-no-files-found: error
           retention-days: 7
       - name: Download verified published baseline into the runner
@@ -150,6 +151,7 @@ jobs:
             New-Item -ItemType Directory -Force $candidate | Out-Null
             Copy-Item -Recurse out (Join-Path $candidate 'web')
             Copy-Item -Recurse (Join-Path $server 'runtime') (Join-Path $candidate 'runtime')
+            Copy-Item -Recurse dist/pi-runtime (Join-Path $candidate 'pi-runtime')
             foreach ($binary in @('codeg-server','codeg-mcp','codeg-computer-helper','codeg-cli')) {
               Copy-Item "src-tauri/target/x86_64-pc-windows-msvc/release/$binary.exe" $candidate
             }
@@ -164,6 +166,8 @@ jobs:
             $tools=Join-Path $env:RUNNER_TEMP 'candidate-native-tools'
             npm install --prefix $tools --global --include=optional --ignore-scripts --no-audit --no-fund '@agentclientprotocol/codex-acp@2.2.2' '@agentclientprotocol/claude-agent-acp@0.94.0'
             if ($LASTEXITCODE -ne 0) { throw 'Isolated native ACP installation failed' }
+            python -B scripts/prepare-office-preview-test.py --output $tools
+            if ($LASTEXITCODE -ne 0) { throw 'Isolated Office converter verification failed' }
             $server=$candidate
             $extra=@('--native-tools',$tools)
           }

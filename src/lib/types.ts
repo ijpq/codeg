@@ -65,6 +65,10 @@ export type AppErrorCode =
   | "external_command_failed"
   | "window_operation_failed"
   | "task_execution_failed"
+  | "business_switch_pending"
+  | "required_agent_mismatch"
+  | "idempotency_key_reused"
+  | "delivery_mode_unsupported"
   | "connection_not_found"
   | "process_exited"
   | (string & {})
@@ -994,6 +998,8 @@ export const CANVAS_BOARD_CHANGED_EVENT = "canvas-board://changed"
 export interface DbConversationDetail {
   summary: DbConversationSummary
   turns: MessageTurn[]
+  /** Stable content-free identities computed before large images are deferred. */
+  output_turn_refs?: ConversationOutputTurnRef[]
   session_stats?: SessionStats | null
   /** See `ConversationDetail.transcript_watermark` (threaded through the DB
    *  fetch path from the same parser detail). */
@@ -1095,6 +1101,13 @@ export interface ConversationOutputWindow {
   deliverable_runs: ConversationTurnDeliverableSet[]
 }
 
+export interface ConversationOutputTurnRef {
+  id: string
+  timestamp: string
+  is_user: boolean
+  prompt_fingerprint?: string | null
+}
+
 /** One page of older history for reverse infinite scroll:
  *  `full[turns_offset .. turns_offset + turns.length)`. */
 export interface ConversationTurnsPage {
@@ -1148,6 +1161,21 @@ export interface ConversationHistoryPage {
     | "limited"
     | null
   indexed_through_offset?: number | null
+}
+
+/** Immutable bytes captured at normal task settlement, not a native file version. */
+export interface OfficeDeliveryPreview {
+  conversation_id: number
+  turn_run_id: string
+  run_sequence: number
+  deliverable_id: string | null
+  file_name: string | null
+  original_path: string | null
+  snapshot_path: string | null
+  sha256: string | null
+  status: "ready" | "none" | "failed"
+  error: string | null
+  completed_at: string
 }
 
 export interface ConversationDeliverable {

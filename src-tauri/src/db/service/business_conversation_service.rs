@@ -2,6 +2,7 @@
 //! Native transcripts and credentials remain exclusively engine-owned.
 
 use crate::db::error::DbError;
+use crate::models::conversation::ConversationOutputTurnRef;
 use crate::models::{AgentType, DbConversationSummary, MessageTurn};
 use chrono::Utc;
 use sea_orm::{
@@ -25,6 +26,13 @@ fn decode<T: serde::de::DeserializeOwned>(value: &str) -> Result<T, DbError> {
 
 pub fn agent_key(agent: AgentType) -> Result<String, DbError> {
     Ok(json(&agent)?.trim_matches('"').to_owned())
+}
+
+pub fn supports_main_agent_handoff(agent: AgentType) -> bool {
+    matches!(
+        agent,
+        AgentType::Codex | AgentType::ClaudeCode | AgentType::Pi
+    )
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -198,6 +206,31 @@ pub async fn persist_turns<C: ConnectionTrait>(
     sid: i64,
     turns: &[MessageTurn],
 ) -> Result<(), DbError> {
+    persist_turns_with_refs(conn, cid, sid, turns, &[]).await
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredBusinessTurn {
+    #[serde(flatten)]
+    turn: MessageTurn,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    codeg_prompt_fingerprint: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct BusinessHistoryArchivePage {
+    pub turns: Vec<MessageTurn>,
+    #[serde(default)]
+    pub output_turn_refs: Vec<ConversationOutputTurnRef>,
+}
+
+async fn persist_turns_with_refs<C: ConnectionTrait>(
+    conn: &C,
+    cid: i32,
+    sid: i64,
+    turns: &[MessageTurn],
+    refs: &[ConversationOutputTurnRef],
+) -> Result<(), DbError> {
     let external: String = conn
         .query_one(stmt(
             "SELECT external_id FROM conversation_agent_session WHERE id=? AND conversation_id=?",
@@ -219,11 +252,25 @@ pub async fn persist_turns<C: ConnectionTrait>(
         // Never replace a completed native duration with a partial parse.
         let previous=conn.query_one(stmt("SELECT turn_json FROM business_message WHERE conversation_id=? AND session_id=? AND native_turn_id=?",vec![cid.into(),sid.into(),native_key.clone().into()])).await?;
         let mut incoming = turn.clone();
+        let mut fingerprint = refs
+            .iter()
+            .find(|reference| reference.id == turn.id)
+            .and_then(|reference| reference.prompt_fingerprint.clone());
+        // Deferred images no longer contain the bytes used for the accepted
+        // prompt hash. Preserve the pre-projection identity, never hash a
+        // preview as if it were the original attachment.
+        if fingerprint.is_none() {
+            fingerprint = crate::artifact_tracker::user_turn_fingerprint(turn);
+        }
         if previous.is_none() {
             inserted += 1;
         }
         if let Some(previous) = previous {
-            let old: MessageTurn = decode(&previous.try_get::<String>("", "turn_json")?)?;
+            let stored: StoredBusinessTurn = decode(&previous.try_get::<String>("", "turn_json")?)?;
+            if fingerprint.is_none() {
+                fingerprint = stored.codeg_prompt_fingerprint;
+            }
+            let old = stored.turn;
             if incoming.duration_ms.is_none() {
                 incoming.duration_ms = old.duration_ms;
             }
@@ -234,7 +281,11 @@ pub async fn persist_turns<C: ConnectionTrait>(
                 incoming.completed_at = old.completed_at;
             }
         }
-        conn.execute(stmt("INSERT INTO business_message(conversation_id,session_id,native_turn_id,role,turn_json) VALUES(?,?,?,?,?) ON CONFLICT(conversation_id,session_id,native_turn_id) DO UPDATE SET turn_json=excluded.turn_json",vec![cid.into(),sid.into(),native_key.into(),role.into(),json(&incoming)?.into()])).await?;
+        let stored = StoredBusinessTurn {
+            turn: incoming,
+            codeg_prompt_fingerprint: fingerprint,
+        };
+        conn.execute(stmt("INSERT INTO business_message(conversation_id,session_id,native_turn_id,role,turn_json) VALUES(?,?,?,?,?) ON CONFLICT(conversation_id,session_id,native_turn_id) DO UPDATE SET turn_json=excluded.turn_json",vec![cid.into(),sid.into(),native_key.into(),role.into(),json(&stored)?.into()])).await?;
     }
     conn.execute(stmt("UPDATE business_conversation_state SET message_count=message_count+? WHERE conversation_id=?",vec![inserted.into(),cid.into()])).await?;
     conn.execute(stmt("UPDATE conversation SET message_count=(SELECT message_count FROM business_conversation_state WHERE conversation_id=?) WHERE id=?",vec![cid.into(),cid.into()])).await?;
@@ -248,12 +299,9 @@ pub async fn queue_switch(
     if request.request_id.trim().is_empty() || request.request_id.len() > 128 {
         return Err(DbError::Validation("Invalid switch request ID".into()));
     }
-    if !matches!(
-        request.target_agent,
-        AgentType::Codex | AgentType::ClaudeCode
-    ) {
+    if !supports_main_agent_handoff(request.target_agent) {
         return Err(DbError::Validation(
-            "Main-agent handoff currently supports Codex and Claude Code".into(),
+            "Main-agent handoff currently supports Codex, Claude Code and Pi".into(),
         ));
     }
     let payload = json(request)?;
@@ -317,13 +365,14 @@ pub async fn persist_current_tail(
     agent: AgentType,
     external: &str,
     turns: &[MessageTurn],
+    refs: &[ConversationOutputTurnRef],
 ) -> Result<bool, DbError> {
     let tx = conn.begin().await?;
     let current=tx.execute(stmt("UPDATE conversation SET updated_at=updated_at WHERE id=? AND agent_type=? AND external_id=? AND deleted_at IS NULL",vec![cid.into(),agent_key(agent)?.into(),external.into()])).await?;
     if current.rows_affected() != 1 {
         return Ok(false);
     }
-    persist_turns(&tx, cid, sid, turns).await?;
+    persist_turns_with_refs(&tx, cid, sid, turns, refs).await?;
     tx.commit().await?;
     Ok(true)
 }
@@ -391,6 +440,23 @@ pub async fn history(
     before: Option<i64>,
     user_limit: usize,
 ) -> Result<(Vec<MessageTurn>, Option<i64>), DbError> {
+    let (turns, next, _) = history_with_output_refs(conn, cid, before, user_limit).await?;
+    Ok((turns, next))
+}
+
+pub async fn history_with_output_refs(
+    conn: &DatabaseConnection,
+    cid: i32,
+    before: Option<i64>,
+    user_limit: usize,
+) -> Result<
+    (
+        Vec<MessageTurn>,
+        Option<i64>,
+        Vec<ConversationOutputTurnRef>,
+    ),
+    DbError,
+> {
     let boundary = if user_limit == usize::MAX {
         None
     } else {
@@ -402,13 +468,24 @@ pub async fn history(
         .unwrap_or(0);
     let rows=conn.query_all(stmt("SELECT sequence,session_id,native_turn_id,turn_json FROM business_message WHERE conversation_id=? AND sequence>=? AND (? IS NULL OR sequence<?) ORDER BY sequence",vec![cid.into(),start.into(),before.into(),before.into()])).await?;
     let mut turns = Vec::with_capacity(rows.len());
+    let mut refs = Vec::with_capacity(rows.len());
     for row in rows {
-        let mut turn: MessageTurn = decode(&row.try_get::<String>("", "turn_json")?)?;
+        let stored: StoredBusinessTurn = decode(&row.try_get::<String>("", "turn_json")?)?;
+        let mut turn = stored.turn;
         let sid: i64 = row.try_get("", "session_id")?;
         turn.id = format!(
             "business:{sid}:{}",
             row.try_get::<String>("", "native_turn_id")?
         );
+        let reference = ConversationOutputTurnRef {
+            id: turn.id.clone(),
+            timestamp: turn.timestamp,
+            is_user: matches!(turn.role, crate::models::TurnRole::User),
+            prompt_fingerprint: stored
+                .codeg_prompt_fingerprint
+                .or_else(|| crate::artifact_tracker::user_turn_fingerprint(&turn)),
+        };
+        refs.push(reference);
         turns.push(turn);
     }
     let more = if start > 0 {
@@ -421,7 +498,7 @@ pub async fn history(
     } else {
         false
     };
-    Ok((turns, more.then_some(start)))
+    Ok((turns, more.then_some(start), refs))
 }
 
 pub async fn update_task_state(
@@ -691,9 +768,21 @@ pub async fn initialize_archive(
         .try_get("", "id")?;
     for path in pages.iter().rev() {
         let bytes = tokio::fs::read(path).await?;
-        let turns: Vec<MessageTurn> =
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum ArchivePage {
+            WithRefs(BusinessHistoryArchivePage),
+            Legacy(Vec<MessageTurn>),
+        }
+        let page: ArchivePage =
             serde_json::from_slice(&bytes).map_err(|e| DbError::Validation(e.to_string()))?;
-        persist_turns(&tx, summary.id, sid, &turns).await?;
+        match page {
+            ArchivePage::WithRefs(page) => {
+                persist_turns_with_refs(&tx, summary.id, sid, &page.turns, &page.output_turn_refs)
+                    .await?
+            }
+            ArchivePage::Legacy(turns) => persist_turns(&tx, summary.id, sid, &turns).await?,
+        }
     }
     tx.execute(stmt(
         "UPDATE business_conversation_state SET enabled=1 WHERE conversation_id=?",
@@ -843,6 +932,140 @@ mod tests {
             preferred_config_values: BTreeMap::new(),
         }
     }
+
+    #[tokio::test]
+    async fn business_output_identity_survives_deferred_images_handoff_and_partial_reparse() {
+        let (db, cid) = setup().await;
+        let session = find_session(&db.conn, cid, AgentType::Codex)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut image_turn = turn("image-user", TurnRole::User, "describe attachment", None);
+        image_turn.blocks.push(crate::models::ContentBlock::Image {
+            data: "aGVsbG8=".into(),
+            mime_type: "image/png".into(),
+            uri: None,
+        });
+        let original = ConversationOutputTurnRef::from(&image_turn);
+        let crate::models::ContentBlock::Image { data, uri, .. } = &mut image_turn.blocks[1] else {
+            unreachable!()
+        };
+        data.clear();
+        *uri = Some("codeg-history-content:opaque-original-image".into());
+        assert_eq!(
+            crate::artifact_tracker::user_turn_fingerprint(&image_turn),
+            None
+        );
+        assert!(persist_current_tail(
+            &db.conn,
+            cid,
+            session.id,
+            AgentType::Codex,
+            "codex-original",
+            std::slice::from_ref(&image_turn),
+            std::slice::from_ref(&original)
+        )
+        .await
+        .unwrap());
+        // Older/partial parsers may not supply refs; they must not replace the
+        // original hash with the empty image preview's hash.
+        persist_turns(&db.conn, cid, session.id, &[image_turn])
+            .await
+            .unwrap();
+        let switch = request(cid, "image-handoff", AgentType::Pi, Some(0));
+        queue_switch(&db.conn, &switch).await.unwrap();
+        activate(&db.conn, &switch, "pi-image-peer").await.unwrap();
+        let (turns, _, refs) = history_with_output_refs(&db.conn, cid, None, 25)
+            .await
+            .unwrap();
+        let last = turns.last().unwrap();
+        assert!(last.id.starts_with("business:"));
+        assert_eq!(refs.last().unwrap().id, last.id);
+        assert_eq!(
+            refs.last().unwrap().prompt_fingerprint,
+            original.prompt_fingerprint
+        );
+        assert!(
+            matches!(&last.blocks[1], crate::models::ContentBlock::Image { data, .. } if data.is_empty()),
+            "identity retention must not rehydrate large attachments"
+        );
+    }
+    #[tokio::test]
+    async fn pi_origin_retains_native_identity_settings_and_history_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::init_database(dir.path(), "0.40.0")
+            .await
+            .unwrap();
+        let folder = seed_folder(&db, "/isolated-pi-business").await;
+        let cid = seed_conversation(&db, folder, AgentType::Pi).await;
+        conversation_service::bind_external_id(&db.conn, cid, "pi-original", &[])
+            .await
+            .unwrap();
+        let summary = conversation_service::get_by_id(&db.conn, cid)
+            .await
+            .unwrap();
+        initialize(
+            &db.conn,
+            &summary,
+            &[
+                turn("u1", TurnRole::User, "Pi original business", None),
+                turn(
+                    "a1",
+                    TurnRole::Assistant,
+                    "Pi original answer",
+                    Some(168795),
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+        let pi_config = BTreeMap::from([
+            ("model".into(), "pi-provider/pi-model".into()),
+            ("thought_level".into(), "high".into()),
+        ]);
+        save_session_settings(
+            &db.conn,
+            cid,
+            AgentType::Pi,
+            Some("high".into()),
+            &pi_config,
+        )
+        .await
+        .unwrap();
+        for (agent, external) in [
+            (AgentType::Codex, "codex-independent"),
+            (AgentType::ClaudeCode, "claude-independent"),
+            (AgentType::Pi, "pi-original"),
+        ] {
+            let revision = state(&db.conn, cid).await.unwrap().unwrap().revision;
+            let req = request(cid, external, agent, Some(revision));
+            queue_switch(&db.conn, &req).await.unwrap();
+            activate(&db.conn, &req, external).await.unwrap();
+        }
+        db.conn.close().await.unwrap();
+        let db = crate::db::init_database(dir.path(), "0.40.0")
+            .await
+            .unwrap();
+        let restored = state(&db.conn, cid).await.unwrap().unwrap();
+        assert_eq!(restored.active_agent, AgentType::Pi);
+        assert_eq!(restored.sessions.len(), 3);
+        let pi = find_session(&db.conn, cid, AgentType::Pi)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pi.external_id, "pi-original");
+        assert_eq!(pi.mode_id.as_deref(), Some("high"));
+        assert_eq!(pi.config_values, pi_config);
+        let native = conversation_service::get_by_id(&db.conn, cid)
+            .await
+            .unwrap();
+        assert_eq!(native.external_id.as_deref(), Some("pi-original"));
+        let history = history(&db.conn, cid, None, 25).await.unwrap().0;
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[1].duration_ms, Some(168795));
+        db.conn.close().await.unwrap();
+    }
+
     #[tokio::test]
     async fn switches_preserve_business_and_engine_identities_with_incremental_cursors() {
         let (db, cid) = setup().await;
@@ -1194,7 +1417,8 @@ mod tests {
             original.id,
             AgentType::Codex,
             "codex-after-clear",
-            &[turn("late", TurnRole::Assistant, "obsolete", None)]
+            &[turn("late", TurnRole::Assistant, "obsolete", None)],
+            &[]
         )
         .await
         .unwrap());
@@ -1235,7 +1459,7 @@ mod tests {
             .unwrap()
             .unwrap()
             .id;
-        let req = request(cid, "recover-after-restart", AgentType::ClaudeCode, None);
+        let req = request(cid, "recover-after-restart", AgentType::Pi, None);
         queue_switch(&db.conn, &req).await.unwrap();
         let blocks = vec![crate::acp::types::PromptInputBlock::Text {
             text: "retained once".into(),

@@ -1,7 +1,7 @@
 # 单业务对话、多 Agent 执行
 
 CodeG 的业务 ID、标题、工作目录和产物归属保持不变。首次在输入区域切换
-Codex / Claude Code 时，才为这条业务启用共享历史；未切换的历史对话继续使用原有
+Codex / Claude Code / Pi 时，才为这条业务启用共享历史；未切换的历史对话继续使用原有
 原生会话及读取路径。全局默认 Agent 仍只影响以后创建的对话。
 
 ## 数据与执行边界
@@ -58,7 +58,8 @@ digest 和持久 accepted 收据去重。SQLite 与任意 ACP 引擎之间没有
 
 ## 模型实际收到什么
 
-Codex 原生 thread/turn 和 Claude Code 原生 SDK session 不支持相互无损导入。
+Codex 原生 thread/turn、Claude Code 原生 SDK session 和 Pi 原生 RPC session
+不支持相互无损导入。
 本实现发送明确标记的上下文桥，不把可见历史冒充原生上下文。
 
 每次普通主轮消息接纳时加载：用户确认的任务状态；global/project/task 范围的共享记忆及
@@ -76,7 +77,7 @@ Codex 原生 thread/turn 和 Claude Code 原生 SDK session 不支持相互无�
 模型推测、工具错误或临时输出自动固化为事实。清空已有记忆也会保存为空。
 
 项目 Skill 主体保留在 `.agents/skills/<name>/SKILL.md`，不搬动现有工作区或私有
-`.codex` / `.claude` 目录。每次只加载目录；用户显式使用 `$name` 或 `/name` 时，
+`.codex` / `.claude` / `.pi` 目录。每次只加载目录；用户显式使用 `$name` 或 `/name` 时，
 把同一主体在预算内读入当前引擎请求。超过预算明确要求按需读文件，不宣称已经加载。
 已有公文/手册模板及验收规则不会被另建模板替换。
 
@@ -86,9 +87,10 @@ Codex 原生 thread/turn 和 Claude Code 原生 SDK session 不支持相互无�
 | --- | --- |
 | Codex | app-server thread/resume、turn/start，经固定 Codex ACP 适配；保持自身 thread 和压缩状态。 |
 | Claude Code | Claude Agent SDK 的独立 session，经固定 Claude ACP 适配；自身认证、权限和工具处理。 |
-| Plan | Codex 原生 collaboration mode；Claude 使用其适配器实际广告的原生 plan 模式。 |
+| Pi | 定制 pi-acp 0.0.34-codeg.2 启动独立 `pi --mode rpc`；随包固定 Pi 1.4.0、Node 24.16.0。使用自己的原生 session/load、模型和 thinking level；支持返回 Pi 原对话或从已有 Pi 业务切出。缺失运行时、认证或项目资源信任时，准备失败保留原 Agent，可在自身设置中处理后重试。 |
+| Plan | Codex 原生 collaboration mode；Claude 使用其适配器实际广告的原生 plan 模式。Pi 广告的 mode 是 thinking level，不能把它当作 Plan。 |
 | Goal | Codex 原生持久 thread/goal RPC。非原生 Goal 扩展不能用提示词代替。切主 Agent 前在轮边界确认暂停；回切不自动继续。暂停成功后目标准备失败，原 Goal 仍保持暂停。 |
-| MCP | 两适配器均支持 session MCP 传递。CodeG companion 按目标进程单独注入，不复制另一引擎的工具句柄或凭证。 |
+| MCP | Codex/Claude 支持 session MCP 传递。定制 Pi 适配器通过 Pi 1.4 原生 `registerMcpServer` 接通 stdio/HTTP MCP 与 companion，支持真实委托和产物登记；SSE 明确拒绝。浏览器/桌面/Office 仍需对应工具和宿主能力，不能仅凭 MCP 连接就宣称可用。 |
 | 浏览器 | 沿用 CodeG browser 工具及其当前可用性；绑定原连接的浏览器状态不能作为目标引擎的已有工具状态。 |
 | 桌面控制 | 依赖当前宿主及打包 helper，继续遵守原权限。Server 无桌面或宿主不支持时不宣称可用。 |
 | Office | 没有协议级的跨引擎 Office 会话迁移。共享文件/Skill 可以复用；外部 Office 工具必须在目标环境独立可用。 |
@@ -114,12 +116,20 @@ session、收据及记忆作为停用归档保留，不 drop 用户数据。回�
 自动化覆盖双引擎交接块和去重、运行中排队、错误身份回退、跨端 CAS、快速重复请求、
 SQLite 关闭重开、独立参数、消息收据、记忆/Skill 实际进入 prompt、分页、旧任务耗时、
 rollover 重号、迟到解析、子任务父连接和业务分支。
+Pi 扩展覆盖三份独立原生身份、Codex→Pi→Claude→Pi→Codex 增量交接、Pi 原业务切出、
+Pi 配置与历史在重启后保持、排队和错误目标回退。Pi 映射使用原有 agent_type 文本列和每引擎唯一索引，不移动原会话文件。外部投递另加
+`m20261026_000001_business_delivery` 持久队列/收据迁移，其 down 保留记录并暂停未完成项。
 
 Windows 发布验证在一次性 runner 的独立目录安装旧 Setup、升级新版，再分别运行
 Setup WebView2 与 Server Web。真实 ACP/原生运行时连接本地确定性模型端点，验证
-Codex→Claude→Codex 的实际模型请求、轮边界排队、同一可见业务、刷新、进程重启和
+Codex→Claude→Codex、Codex↔Pi、Claude↔Pi 的实际模型请求、Pi 运行时缺失后的
+回退与重试、轮边界排队、同一可见业务、刷新、Pi 原生进程重启恢复和
 其他业务隔离；继续执行耗时、总产物、原生 Plan/Goal 和长列表滚动回归。确定性端点
 用于证明协议与传输，不证明模型推理质量或真实账号认证。
 
 当前工作环境的 Codex 未登录，不能宣称真实账号下的双引擎推理往返已通过。最终结果
 以本次保存的测试日志、CI 和重新下载的发布资产校验为准。
+
+外部消息投递、旧连接兼容与崩溃窗口见[稳定业务投递接口](business-message-api.md)。
+Pi 身份映射、原生 MCP、分支、配套运行组件与 Fast / Speed 的实际语义见
+[Pi 运行组件与服务档位](pi-runtime-and-service-tier.md)。

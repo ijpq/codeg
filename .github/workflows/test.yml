@@ -174,6 +174,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p out
+          mkdir -p dist/pi-runtime
           printf '<!doctype html><html><body></body></html>\n' > out/index.html
 
       - name: cargo test

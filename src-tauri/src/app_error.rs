@@ -152,6 +152,10 @@ pub enum AppErrorCode {
     NoActiveSteerTurn,
     /// The adapter/app-server does not implement native steering.
     SteerUnsupported,
+    BusinessSwitchPending,
+    RequiredAgentMismatch,
+    IdempotencyKeyReused,
+    DeliveryModeUnsupported,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, thiserror::Error)]

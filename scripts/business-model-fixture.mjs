@@ -1,7 +1,7 @@
 // A deterministic model endpoint behind the real Claude ACP/SDK runtime.
 // It verifies transport/context, not a live model's reasoning or authentication.
 import { createServer } from "node:http"
-export async function startBusinessModel() {
+export async function startBusinessModel(agent = "claude") {
   const requests = []
   const server = createServer(async (req, res) => {
     if (req.method !== "POST") {
@@ -31,9 +31,14 @@ export async function startBusinessModel() {
       memory: input.includes("BUSINESS_VERIFIED_MEMORY"),
       skill: input.includes("BUSINESS_SHARED_SKILL_BODY"),
       previousAgent: input.includes("BUSINESS_CODEX_COMPLETED"),
-      user: input.includes("BUSINESS_CLAUDE_USER"),
+      fromClaude: input.includes("BUSINESS_CLAUDE_COMPLETED"),
+      fromPi: input.includes("BUSINESS_PI_COMPLETED"),
+      user: input.includes(`BUSINESS_${agent.toUpperCase()}_USER`),
     })
-    const text = "BUSINESS_CLAUDE_COMPLETED agenda-v2.md"
+    const text =
+      agent === "pi"
+        ? "BUSINESS_PI_COMPLETED agenda-v3.md"
+        : "BUSINESS_CLAUDE_COMPLETED agenda-v2.md"
     const result = {
       id: `msg_business_${requests.length}`,
       type: "message",

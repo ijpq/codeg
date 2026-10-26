@@ -20,6 +20,7 @@ def main():
     parser.add_argument("root", type=Path)
     parser.add_argument("version")
     parser.add_argument("--require-runtime", action="store_true")
+    parser.add_argument("--require-pi-runtime", action="store_true")
     parser.add_argument("--log-dir", type=Path, required=True)
     args = parser.parse_args()
     root = args.root.resolve(strict=True)
@@ -29,6 +30,9 @@ def main():
     resources = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(resources)
     inventory = resources.verify(root / "web", args.version)
+    if args.require_pi_runtime or (root / 'pi-runtime').exists():
+        subprocess.run([sys.executable, '-B', str(Path(__file__).with_name('build-pi-runtime.py')),
+                        '--output-dir', str(root / 'pi-runtime'), '--verify'], check=True)
     if os.name == "nt":
         subprocess.run([sys.executable, "-B", str(Path(__file__).with_name("verify-windows-dependencies.py")),
                         str(root), "--report", str(logs / "windows-dependencies.json")], check=True)

@@ -118,6 +118,13 @@ pub(crate) fn user_turn_fingerprint(turn: &crate::models::MessageTurn) -> Option
     if !matches!(turn.role, crate::models::TurnRole::User) {
         return None;
     }
+    if turn.blocks.iter().any(|block| {
+        matches!(block,
+        crate::models::ContentBlock::Image { data, uri: Some(uri), .. }
+            if data.is_empty() && uri.starts_with("codeg-history-content:"))
+    }) {
+        return None;
+    }
     let mut hasher = Sha256::new();
     let mut count = 0;
     for block in &turn.blocks {

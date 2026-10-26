@@ -136,6 +136,7 @@ import type {
   ScanResult,
   SelectedSessionKey,
   ConversationDeliverable,
+  OfficeDeliveryPreview,
   ConversationDeliverableHistoryPage,
   ConversationTurnDeliverableSet,
   OpenedTab,
@@ -1966,12 +1967,52 @@ export async function officecliRenderHtml(
   return getTransport().call("officecli_render_html", { rootPath, path })
 }
 
+/** Read a normally completed and settled turn's immutable review copy. */
+export async function getOfficeDeliveryPreview(
+  conversationId: number,
+  turnRunId: string
+): Promise<OfficeDeliveryPreview | null> {
+  return getTransport().call("get_office_delivery_preview", {
+    conversationId,
+    turnRunId,
+  })
+}
+
+/** Download exactly the review bytes, including after the workspace changes. */
+export async function downloadOfficeDeliveryPreview(
+  preview: OfficeDeliveryPreview
+) {
+  const io = preview.snapshot_path
+    ? splitOfficeReviewPath(preview.snapshot_path)
+    : null
+  if (!io) throw new Error("Office review copy is unavailable")
+  const name = preview.file_name ?? io.path
+  if (isDesktop() && !isRemoteDesktopMode()) {
+    const { save } = await import("@tauri-apps/plugin-dialog")
+    const destination = await save({ defaultPath: name })
+    if (!destination) return { status: WORKSPACE_DOWNLOAD_CANCELLED }
+    await getShellTransport().call("save_office_delivery_preview", {
+      conversationId: preview.conversation_id,
+      turnRunId: preview.turn_run_id,
+      destination,
+    })
+    return { status: "done" as const, savedPath: destination }
+  }
+  return downloadWorkspaceFile(io.root, io.path, name)
+}
+
+function splitOfficeReviewPath(path: string) {
+  const index = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"))
+  return index >= 0
+    ? { root: path.slice(0, index) || "/", path: path.slice(index + 1) }
+    : null
+}
+
 /**
  * Start (or share, by ref-count) a long-lived `officecli watch` preview server
  * for an office file and return its loopback `port` plus a per-watch `cap`
- * capability. `path` is relative to `rootPath`. Live refresh is driven by
- * officecli's own SSE channel, so the preview no longer re-reads (and locks)
- * the file the way the one-shot {@link officecliRenderHtml} did.
+ * capability. `path` is relative to `rootPath`. The watch renders a stable private copy, so later workspace edits cannot
+ * refresh an opened review into a process draft.
  *
  * `cap` names this watch: a new one mints a new `cap`. Web/server mode also
  * authenticates the iframe with it, loading the preview through the
@@ -2926,21 +2967,50 @@ export async function listConversationBranches(
   })
 }
 
-/** Refresh output associations for the already-visible transcript window.
- * Only ids, timestamps, and roles cross the transport; the backend performs no
- * rollout read and never receives prompt or response content. */
+/** Refresh only the loaded transcript in bounded batches. Reuse backend
+ * identities, including fingerprints captured before image deferral; no
+ * prompt/response content crosses the transport and no rollout is parsed. */
 export async function listConversationOutputWindow(
   conversationId: number,
-  turns: readonly MessageTurn[]
+  turns: readonly MessageTurn[],
+  references: readonly import("./types").ConversationOutputTurnRef[] = []
 ): Promise<ConversationOutputWindow> {
-  return getTransport().call("list_conversation_output_window", {
-    conversationId,
-    turnRefs: turns.slice(-200).map((turn) => ({
-      id: turn.id,
-      timestamp: turn.timestamp,
-      isUser: turn.role === "user",
-    })),
-  })
+  const byId = new Map(references.map((reference) => [reference.id, reference]))
+  const artifactRuns = new Map<
+    string,
+    ConversationOutputWindow["artifact_runs"][number]
+  >()
+  const deliverableRuns = new Map<
+    string,
+    ConversationOutputWindow["deliverable_runs"][number]
+  >()
+  for (let offset = 0; offset < turns.length; offset += 200) {
+    const window = await getTransport().call<ConversationOutputWindow>(
+      "list_conversation_output_window",
+      {
+        conversationId,
+        turnRefs: turns.slice(offset, offset + 200).map(
+          (turn) =>
+            byId.get(turn.id) ?? {
+              id: turn.id,
+              timestamp: turn.timestamp,
+              is_user: turn.role === "user",
+            }
+        ),
+      }
+    )
+    for (const run of window.artifact_runs) artifactRuns.set(run.id, run)
+    for (const run of window.deliverable_runs) {
+      const previous = deliverableRuns.get(run.turn_run_id)
+      if (!previous?.user_turn_id || run.user_turn_id) {
+        deliverableRuns.set(run.turn_run_id, run)
+      }
+    }
+  }
+  return {
+    artifact_runs: [...artifactRuns.values()],
+    deliverable_runs: [...deliverableRuns.values()],
+  }
 }
 
 export interface CodexRolloutSizeDiagnostics {

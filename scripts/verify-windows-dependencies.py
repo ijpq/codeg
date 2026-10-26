@@ -67,7 +67,20 @@ def pe_imports(path, require_x64=True):
 
 
 def verify(root, system):
-    binaries = sorted(p for p in root.rglob('*') if p.suffix.lower() in ['.exe', '.dll'])
+    binaries = []
+    inactive_native = []
+    for path in sorted(root.rglob('*')):
+        if path.suffix.lower() not in ['.exe', '.dll', '.node']:
+            continue
+        if path.suffix.lower() == '.node':
+            relative = path.relative_to(root).as_posix()
+            # Pi TUI's upstream npm tarball contains prebuilds for all hosts.
+            # Verify the actual x64 Windows module; retain/inventory the others.
+            marker = 'node_modules/@earendil-works/pi-tui/native/'
+            if marker in relative and not relative.split(marker, 1)[1].startswith('win32/prebuilds/win32-x64/'):
+                inactive_native.append(relative)
+                continue
+        binaries.append(path)
     if not binaries:
         raise ValueError('Package has no Windows binaries')
     result = []
@@ -87,7 +100,7 @@ def verify(root, system):
             else:
                 raise ValueError(f'{binary.name} has an unresolved import: {dependency}')
         result.append({'path': binary.relative_to(root).as_posix(), 'imports': resolved})
-    return {'passed': True, 'binaries': result}
+    return {'passed': True, 'binaries': result, 'inactive_native_modules': inactive_native}
 
 
 if __name__ == '__main__':

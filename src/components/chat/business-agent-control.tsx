@@ -7,6 +7,7 @@ import { toErrorMessage } from "@/lib/app-error"
 import type { AgentType } from "@/lib/types"
 import type { useBusinessConversation } from "@/hooks/use-business-conversation"
 import {
+  BUSINESS_AGENTS,
   getBusinessMemory,
   saveBusinessMemory,
   updateBusinessTaskState,
@@ -106,8 +107,11 @@ export function BusinessAgentControl({
               void business.switchAgent(e.target.value as AgentType)
             }}
           >
-            <option value="codex">Codex</option>
-            <option value="claude_code">Claude Code</option>
+            {BUSINESS_AGENTS.map((value) => (
+              <option key={value} value={value}>
+                {getAgentLabel(value)}
+              </option>
+            ))}
           </select>
         </label>
         {state && (

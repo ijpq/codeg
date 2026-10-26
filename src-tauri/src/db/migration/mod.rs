@@ -72,6 +72,8 @@ mod m20261017_000002_conversation_source;
 mod m20261020_000001_folder_command_run_local;
 mod m20261022_000001_tool_approval;
 pub(crate) mod m20261025_000001_business_agent_sessions;
+mod m20261026_000001_business_delivery;
+mod m20261026_000002_office_delivery_previews;
 pub struct Migrator;
 
 #[async_trait::async_trait]
@@ -150,6 +152,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20261020_000001_folder_command_run_local::Migration),
             Box::new(m20261022_000001_tool_approval::Migration),
             Box::new(m20261025_000001_business_agent_sessions::Migration),
+            Box::new(m20261026_000001_business_delivery::Migration),
+            Box::new(m20261026_000002_office_delivery_previews::Migration),
         ]
     }
 }

@@ -2742,10 +2742,14 @@
       "officeNotInstalled": "OfficeCLI ist nicht installiert",
       "officeNotInstalledHint": "Installiere OfficeCLI unter Einstellungen → Office-Tools, um Word-, Excel- und PowerPoint-Dateien vorzuschauen.",
       "officeOpenSettings": "Einstellungen öffnen",
-      "officeWatchFailed": "Live-Vorschau konnte nicht gestartet werden",
+      "officeWatchFailed": "Vorschau konnte nicht gestartet werden",
       "officeWatchRetry": "Erneut versuchen",
       "officeServerInstallHint": "OfficeCLI muss auf dem Server-Host installiert sein. Führe diesen Befehl dort aus und versuche es erneut:",
-      "officeRemoteDesktopUnsupported": "Die Live-Vorschau ist in einem Remote-Desktop-Fenster nicht verfügbar. Öffne diesen Arbeitsbereich in der Web-Oberfläche des Servers, um Office-Dateien anzusehen."
+      "officeRemoteDesktopUnsupported": "Die Live-Vorschau ist in einem Remote-Desktop-Fenster nicht verfügbar. Öffne diesen Arbeitsbereich in der Web-Oberfläche des Servers, um Office-Dateien anzusehen.",
+      "officeDeliveredReview": "Gelieferte Prüfung · {name} · {time} · {run}",
+      "officeManualReview": "Aktuelle Datei · feste Kopie beim Öffnen",
+      "officeReviewDownload": "Diese Prüfungskopie herunterladen",
+      "officeReviewFailed": "Prüfungskopie für {name} konnte nicht erstellt werden. Die aktuelle Datei ist über die Ergebniskarte verfügbar."
     },
     "fileViewer": {
       "title": "Dateivorschau",
@@ -4432,7 +4436,8 @@
         "missing": "File missing",
         "empty": "This conversation has no confirmed deliverables yet",
         "noFilterResults": "No deliverables match these filters",
-        "hostActionNotice": "Open, copy file, and reveal actions affect the host running Codeg Server; downloads always go to the current device."
+        "hostActionNotice": "Open, copy file, and reveal actions affect the host running Codeg Server; downloads always go to the current device.",
+        "previewInCodeg": "In CodeG ansehen"
       },
       "userResources": {
         "openFile": "{filePath} öffnen",
@@ -5042,7 +5047,7 @@
       "syncFailed": "Skills konnten nicht synchronisiert werden"
     },
     "autoPreviewLabel": "Vorschau automatisch öffnen",
-    "autoPreviewHint": "Wenn ein Agent eine Word-, Excel- oder PowerPoint-Datei erstellt oder bearbeitet, wird die Live-Vorschau automatisch geöffnet.",
+    "autoPreviewHint": "Nach erfolgreichem Aufgabenabschluss die endgültig gelieferte Word-, Excel- oder PowerPoint-Datei anzeigen. Dateiänderungen öffnen keine Vorschau.",
     "autoDownloadProducedLabel": "Endergebnisse automatisch herunterladen",
     "autoDownloadProducedHint": "Bei Nutzung des Webservers (z. B. über Tailscale/LAN) vom Agenten deklarierte und geprüfte Endergebnis-Dateien automatisch in den Downloads-Ordner dieses Browsers herunterladen."
   },

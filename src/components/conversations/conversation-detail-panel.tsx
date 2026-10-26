@@ -85,6 +85,7 @@ import { useFeedbackEnabled } from "@/hooks/use-feedback-enabled"
 import { useSessionFeedback } from "@/hooks/use-session-feedback"
 import { useBusinessConversation } from "@/hooks/use-business-conversation"
 import { BusinessAgentControl } from "@/components/chat/business-agent-control"
+import { supportsBusinessHandoff } from "@/lib/business-conversation"
 import { AgentSelector } from "@/components/chat/agent-selector"
 import { ChatInput } from "@/components/chat/chat-input"
 import { WelcomeHero, WelcomeTip } from "@/components/chat/welcome-hero"
@@ -3392,8 +3393,7 @@ const ConversationTabView = memo(function ConversationTabView({
         composerBanner={
           <>
             {dbConversationId != null &&
-              (selectedAgent === "codex" ||
-                selectedAgent === "claude_code") && (
+              supportsBusinessHandoff(selectedAgent) && (
                 <BusinessAgentControl
                   key={dbConversationId}
                   conversationId={dbConversationId}

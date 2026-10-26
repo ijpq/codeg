@@ -6,6 +6,7 @@ import {
   Copy,
   Download,
   ExternalLink,
+  Eye,
   FolderSearch,
   Loader2,
 } from "lucide-react"
@@ -23,13 +24,22 @@ import {
   copyDeliverableFiles,
   downloadDeliverables,
   openDeliverable,
+  getOfficeDeliveryPreview,
   revealDeliverable,
 } from "@/lib/api"
+import { useOptionalWorkspaceActions } from "@/contexts/workspace-context"
+import { isOfficePreviewable } from "@/lib/language-detect"
 import { toAbsoluteFilePath } from "@/lib/file-path-display"
 import type { ConversationDeliverable } from "@/lib/types"
 import { cn, copyTextToClipboard } from "@/lib/utils"
 
-type Action = "download" | "open" | "copyFile" | "copyPath" | "reveal"
+type Action =
+  | "preview"
+  | "download"
+  | "open"
+  | "copyFile"
+  | "copyPath"
+  | "reveal"
 
 export function DeliverableFileActions({
   conversationId,
@@ -41,7 +51,11 @@ export function DeliverableFileActions({
   className?: string
 }) {
   const t = useTranslations("Folder.chat.conversationDeliverables")
+  const officeT = useTranslations("Folder.fileWorkspacePanel")
   const capabilities = useDeliverableCapabilities()
+  const workspace = useOptionalWorkspaceActions()
+  // Inherited cards retain the source conversation's verified database ids.
+  const ownerConversationId = item.conversation_id ?? conversationId
   const [pending, setPending] = useState<Action | null>(null)
 
   const run = async (action: Action, operation: () => Promise<unknown>) => {
@@ -65,13 +79,39 @@ export function DeliverableFileActions({
     `${item.root_path}/${item.path}`
   const actions = [
     {
+      id: "preview" as const,
+      label: t("previewInCodeg"),
+      icon: Eye,
+      visible: Boolean(
+        workspace && item.kind === "file" && isOfficePreviewable(path)
+      ),
+      operation: async () => {
+        if (!workspace) return
+        const review = item.turn_run_id
+          ? await getOfficeDeliveryPreview(
+              ownerConversationId,
+              item.turn_run_id
+            )
+          : null
+        if (review?.status === "ready" && review.deliverable_id === item.id) {
+          workspace.openOfficeDeliveryPreview(review)
+        } else {
+          if (review?.status === "failed")
+            toast.error(officeT("officeReviewFailed", { name: item.file_name }))
+          // A manual current-file view stays clearly labelled as such. We
+          // never reconstruct an uncaptured historical version from this path.
+          await workspace.openFilePreview(path, { reload: true })
+        }
+      },
+    },
+    {
       id: "download" as const,
       label: t("download"),
       icon: Download,
       visible: true,
       operation: () =>
         downloadDeliverables({
-          conversationId,
+          conversationId: ownerConversationId,
           deliverableIds: [item.id],
           archive: item.kind === "directory",
           suggestedName:
@@ -85,14 +125,14 @@ export function DeliverableFileActions({
       label: t("openWithDefaultAppHost"),
       icon: ExternalLink,
       visible: capabilities?.openWithDefaultApp === true,
-      operation: () => openDeliverable(conversationId, item.id),
+      operation: () => openDeliverable(ownerConversationId, item.id),
     },
     {
       id: "copyFile" as const,
       label: t("copyFileHost"),
       icon: ClipboardCopy,
       visible: capabilities?.copyFiles === true,
-      operation: () => copyDeliverableFiles(conversationId, [item.id]),
+      operation: () => copyDeliverableFiles(ownerConversationId, [item.id]),
     },
     {
       id: "copyPath" as const,
@@ -109,7 +149,7 @@ export function DeliverableFileActions({
       label: t("revealOnHost"),
       icon: FolderSearch,
       visible: capabilities?.revealInFolder === true,
-      operation: () => revealDeliverable(conversationId, item.id),
+      operation: () => revealDeliverable(ownerConversationId, item.id),
     },
   ]
 

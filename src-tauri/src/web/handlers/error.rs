@@ -13,12 +13,16 @@ fn status_for_app_error_code(code: AppErrorCode) -> StatusCode {
         AppErrorCode::ProcessExited => StatusCode::GONE,
         AppErrorCode::AlreadyExists
         | AppErrorCode::TurnInProgress
+        | AppErrorCode::BusinessSwitchPending
+        | AppErrorCode::RequiredAgentMismatch
+        | AppErrorCode::IdempotencyKeyReused
         | AppErrorCode::NoActiveSteerTurn => StatusCode::CONFLICT,
         AppErrorCode::PermissionDenied => StatusCode::FORBIDDEN,
         AppErrorCode::ConfigurationMissing
         | AppErrorCode::ConfigurationInvalid
         | AppErrorCode::DependencyMissing
         | AppErrorCode::SteerUnsupported
+        | AppErrorCode::DeliveryModeUnsupported
         | AppErrorCode::NotAGitRepository
         | AppErrorCode::AuthenticationFailed => StatusCode::UNPROCESSABLE_ENTITY,
         AppErrorCode::NetworkError

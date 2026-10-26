@@ -2167,6 +2167,7 @@ impl ConnectionManager {
         user_message: Option<(String, Vec<crate::acp::UserMessageBlock>)>,
         internal_suffix: Vec<PromptInputBlock>,
         agent_file_change_report_request_id: Option<String>,
+        expected_settings: Option<crate::db::service::business_delivery_service::ExecutionSettings>,
     ) -> Result<(), AcpError> {
         // Reject an empty prompt BEFORE touching the concurrency gate. An empty
         // prompt produces no turn — and thus no `TurnComplete` to clear the gate
@@ -2234,6 +2235,7 @@ impl ConnectionManager {
             user_message,
             internal_suffix,
             agent_file_change_report_request_id,
+            expected_settings,
         });
         Ok(())
     }
@@ -2265,6 +2267,7 @@ impl ConnectionManager {
             None,
             Vec::new(),
             Some(uuid::Uuid::new_v4().to_string()),
+            None,
         )
         .await
     }
@@ -2537,6 +2540,10 @@ impl ConnectionManager {
         if let Some(cid) = business_cid {
             crate::commands::business_conversations::validate_prompt_target(db, self, cid, conn_id)
                 .await?;
+            if let Some(id) = client_message_id.as_deref() {
+                crate::db::service::business_delivery_service::validate_prompt_target(&db.conn, cid, id)
+                    .await.map_err(|e| AcpError::protocol(e.to_string()))?;
+            }
         }
 
         // Acquire the per-connection prompt lock for the entire link-check
@@ -3216,6 +3223,13 @@ impl ConnectionManager {
         let report_request_id = artifact_run_id
             .clone()
             .or_else(|| Some(uuid::Uuid::new_v4().to_string()));
+        let expected_settings = if let (Some(cid), Some(message_id)) = (business_cid, client_message_id.as_deref()) {
+            match crate::db::service::business_delivery_service::get_by_client_id(&db.conn, cid, message_id).await {
+                Ok(receipt) => Some(receipt.target_settings),
+                Err(crate::db::error::DbError::NotFound(_)) => None,
+                Err(e) => return Err(AcpError::protocol(e.to_string())),
+            }
+        } else { None };
         match self
             .send_prompt_inner(
                 conn_id,
@@ -3223,6 +3237,7 @@ impl ConnectionManager {
                 user_message,
                 internal_suffix,
                 report_request_id,
+                expected_settings,
             )
             .await
         {
@@ -3444,6 +3459,11 @@ impl ConnectionManager {
     }
 
     pub async fn set_mode(&self, conn_id: &str, mode_id: String) -> Result<(), AcpError> {
+        if self.pi_setting_requires_ack(conn_id).await? {
+            return Self::confirm_pi_setting(
+                self.set_mode_and_wait(conn_id, mode_id.clone()), &mode_id,
+            ).await;
+        }
         let cmd_tx = {
             let connections = self.connections.lock().await;
             let conn = connections
@@ -3488,6 +3508,11 @@ impl ConnectionManager {
         config_id: String,
         value_id: String,
     ) -> Result<(), AcpError> {
+        if self.pi_setting_requires_ack(conn_id).await? {
+            return Self::confirm_pi_setting(
+                self.set_config_option_and_wait(conn_id, config_id, value_id.clone()), &value_id,
+            ).await;
+        }
         // Changing collaboration mode must never leave a native goal running.
         // The composer first pauses it through the confirmed goal RPC.
         if config_id == "collaboration_mode" {
@@ -3514,6 +3539,30 @@ impl ConnectionManager {
             })
             .await
             .map_err(|_| AcpError::ProcessExited)
+    }
+
+    async fn pi_setting_requires_ack(&self, conn_id: &str) -> Result<bool, AcpError> {
+        let state = self.get_state(conn_id).await
+            .ok_or_else(|| AcpError::ConnectionNotFound(conn_id.into()))?;
+        let state = state.read().await;
+        if state.agent_type != AgentType::Pi { return Ok(false); }
+        if state.turn_in_flight || state.status == ConnectionStatus::Prompting {
+            return Err(AcpError::protocol("PI_SETTINGS_BUSY: change settings after the current task completes"));
+        }
+        Ok(true)
+    }
+
+    async fn confirm_pi_setting(
+        request: impl std::future::Future<Output = Result<SetterOutcome, AcpError>>,
+        expected: &str,
+    ) -> Result<(), AcpError> {
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(35), request)
+            .await.map_err(|_| AcpError::protocol("PI_SETTINGS_UNCONFIRMED: timed out; inspect settings before retrying"))??;
+        match outcome {
+            SetterOutcome::Confirmed { current } if current == expected => Ok(()),
+            SetterOutcome::Refused { message } => Err(AcpError::protocol(message)),
+            _ => Err(AcpError::protocol("PI_SETTINGS_UNCONFIRMED: native acknowledgement did not confirm the requested value")),
+        }
     }
 
     /// [`Self::set_config_option`], then wait for the agent's answer, as
@@ -9600,6 +9649,34 @@ mod tests {
     /// The waiting setters hand back whatever the connection loop answered,
     /// and read a loop that went away without answering as the process gone.
     #[tokio::test]
+    async fn pi_settings_reject_active_tasks_and_require_native_confirmation() {
+        let mgr = ConnectionManager::new();
+        let mut rx = insert_live_connection(&mgr, "pi-settings", AgentType::Pi, None).await;
+        let state = mgr.get_state("pi-settings").await.unwrap();
+        state.write().await.turn_in_flight = true;
+        assert!(mgr.set_config_option("pi-settings", "service_tier".into(), "on".into()).await.unwrap_err().to_string().contains("PI_SETTINGS_BUSY"));
+        assert!(mgr.set_mode("pi-settings", "high".into()).await.is_err());
+        assert!(rx.try_recv().is_err(), "Rejected settings must not be enqueued for the next task");
+        state.write().await.turn_in_flight = false;
+        let loop_stub = tokio::spawn(async move {
+            for outcome in [
+                Err("PI_SERVICE_TIER_UNSUPPORTED".into()),
+                Ok(SetterOutcome::Confirmed { current: "off".into() }),
+                Ok(SetterOutcome::Confirmed { current: "on".into() }),
+            ] {
+                match rx.recv().await.unwrap() {
+                    ConnectionCommand::SetConfigOption { reply: Some(reply), .. } => { let _ = reply.send(outcome); },
+                    _ => panic!("Pi public setters must wait for the actual native reply"),
+                }
+            }
+        });
+        assert!(mgr.set_config_option("pi-settings", "service_tier".into(), "on".into()).await.unwrap_err().to_string().contains("UNSUPPORTED"));
+        assert!(mgr.set_config_option("pi-settings", "service_tier".into(), "on".into()).await.unwrap_err().to_string().contains("UNCONFIRMED"));
+        mgr.set_config_option("pi-settings", "service_tier".into(), "on".into()).await.unwrap();
+        loop_stub.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn waiting_setters_return_the_loops_answer() {
         use crate::acp::connection::SetterOutcome;
         let mgr = ConnectionManager::new();
@@ -11089,6 +11166,7 @@ mod tests {
                 user_message: None,
                 internal_suffix: Vec::new(),
                 agent_file_change_report_request_id: None,
+                expected_settings: None,
             })
             .await
             .unwrap();
@@ -11102,6 +11180,7 @@ mod tests {
             }],
             None,
             Vec::new(),
+            None,
             None,
         );
         let res = tokio::time::timeout(std::time::Duration::from_millis(50), fut).await;

@@ -68,3 +68,6 @@ src-tauri/binaries/
 # executable then sits untracked in the repo root — which is enough to fail a
 # work task's "worktree is clean" check at delivery.
 /rust_out
+
+# Rebuildable private agent runtime staging.
+/dist/pi-runtime/

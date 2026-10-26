@@ -121,6 +121,26 @@ class WindowsDependencyTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'unresolved import'):
                 dependencies.verify(self.root, self.system)
 
+    def test_native_node_module_dependencies_are_checked(self):
+        module = self.root / 'addon.node'
+        module.touch()
+        with patch.object(dependencies, 'pe_imports', side_effect=lambda p, **_: ['missing-addon.dll'] if p == module else []):
+            with self.assertRaisesRegex(ValueError, 'unresolved import'):
+                dependencies.verify(self.root, self.system)
+
+    def test_pi_foreign_prebuilds_are_inventoried_without_loading_them(self):
+        native = self.root / 'pi-runtime/node_modules/@earendil-works/pi-tui/native'
+        windows = native / 'win32/prebuilds/win32-x64/win32-platform.node'
+        foreign = native / 'win32/prebuilds/win32-arm64/win32-platform.node'
+        for path in [windows, foreign]:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.touch()
+        with patch.object(dependencies, 'pe_imports', return_value=[]) as probe:
+            result = dependencies.verify(self.root, self.system)
+        self.assertEqual(result['inactive_native_modules'], [foreign.relative_to(self.root).as_posix()])
+        self.assertIn(windows, [c.args[0] for c in probe.call_args_list])
+        self.assertNotIn(foreign, [c.args[0] for c in probe.call_args_list])
+
 
 if __name__ == "__main__":
     unittest.main()

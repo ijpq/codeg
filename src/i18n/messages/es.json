@@ -2742,10 +2742,14 @@
       "officeNotInstalled": "OfficeCLI no está instalado",
       "officeNotInstalledHint": "Instala OfficeCLI en Ajustes → Herramientas de Office para previsualizar archivos de Word, Excel y PowerPoint.",
       "officeOpenSettings": "Abrir ajustes",
-      "officeWatchFailed": "No se pudo iniciar la vista previa en vivo",
+      "officeWatchFailed": "No se pudo iniciar la vista previa",
       "officeWatchRetry": "Reintentar",
       "officeServerInstallHint": "OfficeCLI debe instalarse en el host del servidor. Ejecuta este comando allí y vuelve a intentarlo:",
-      "officeRemoteDesktopUnsupported": "La vista previa en vivo no está disponible en una ventana de escritorio remoto. Abre este espacio de trabajo en la interfaz web del servidor para previsualizar archivos de Office."
+      "officeRemoteDesktopUnsupported": "La vista previa en vivo no está disponible en una ventana de escritorio remoto. Abre este espacio de trabajo en la interfaz web del servidor para previsualizar archivos de Office.",
+      "officeDeliveredReview": "Revisión entregada · {name} · {time} · {run}",
+      "officeManualReview": "Archivo actual · copia fija al abrirlo",
+      "officeReviewDownload": "Descargar esta copia de revisión",
+      "officeReviewFailed": "No se pudo preparar la copia de revisión de {name}. Consulta o descarga el archivo actual desde su tarjeta."
     },
     "fileViewer": {
       "title": "Vista previa del archivo",
@@ -4432,7 +4436,8 @@
         "missing": "File missing",
         "empty": "This conversation has no confirmed deliverables yet",
         "noFilterResults": "No deliverables match these filters",
-        "hostActionNotice": "Open, copy file, and reveal actions affect the host running Codeg Server; downloads always go to the current device."
+        "hostActionNotice": "Open, copy file, and reveal actions affect the host running Codeg Server; downloads always go to the current device.",
+        "previewInCodeg": "Ver en CodeG"
       },
       "userResources": {
         "openFile": "Abrir {filePath}",
@@ -5042,7 +5047,7 @@
       "syncFailed": "Error al sincronizar habilidades"
     },
     "autoPreviewLabel": "Abrir vista previa automáticamente",
-    "autoPreviewHint": "Cuando un agente crea o edita un archivo de Word, Excel o PowerPoint, abre su vista previa en vivo automáticamente.",
+    "autoPreviewHint": "Al terminar correctamente la tarea, muestra el archivo final entregado de Word, Excel o PowerPoint. Los cambios de archivos no abren vistas previas.",
     "autoDownloadProducedLabel": "Descargar automáticamente los entregables finales",
     "autoDownloadProducedHint": "Al usar el servidor web (p. ej., por Tailscale/LAN), descarga automáticamente a la carpeta de Descargas de este navegador los archivos de entrega final declarados por el agente y verificados."
   },

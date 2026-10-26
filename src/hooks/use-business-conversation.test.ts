@@ -17,7 +17,7 @@ vi.mock("@/lib/transport", () => ({
 const state = (
   cid = 1,
   revision = 0,
-  agent: "codex" | "claude_code" = "codex"
+  agent: "codex" | "claude_code" | "pi" = "codex"
 ): BusinessConversationState => ({
   conversationId: cid,
   revision,
@@ -48,6 +48,64 @@ afterEach(() => {
   vi.clearAllMocks()
 })
 describe("business agent handoff client", () => {
+  it("restores Pi settings independently and keeps its native session after refresh", async () => {
+    localStorage.setItem(
+      "codeg:selector-prefs",
+      JSON.stringify({
+        codex: { modeId: "plan", configValues: { model: "codex-model" } },
+        pi: {
+          modeId: "high",
+          configValues: {
+            model: "pi-provider/pi-model",
+            thought_level: "high",
+          },
+        },
+      })
+    )
+    const pi = {
+      ...state(1, 3, "pi"),
+      sessions: [
+        {
+          id: 1,
+          agentType: "codex" as const,
+          externalId: "codex-native",
+          modeId: "plan",
+          configValues: {},
+          seenSequence: 2,
+        },
+        {
+          id: 2,
+          agentType: "pi" as const,
+          externalId: "pi-native",
+          modeId: "high",
+          configValues: { model: "pi-provider/pi-model" },
+          seenSequence: 4,
+        },
+      ],
+    }
+    api.switch.mockResolvedValue(pi)
+    const { result } = renderHook(() => useBusinessConversation(1))
+    await waitFor(() => expect(result.current.state).not.toBeNull())
+    await act(async () => {
+      await result.current.switchAgent("pi")
+    })
+    expect(api.switch).toHaveBeenCalledWith(
+      expect.objectContaining({
+        targetAgent: "pi",
+        preferredModeId: "high",
+        preferredConfigValues: {
+          model: "pi-provider/pi-model",
+          thought_level: "high",
+        },
+      })
+    )
+    api.get.mockResolvedValue(pi)
+    await act(async () => {
+      await result.current.refresh()
+    })
+    expect(result.current.state).toEqual(pi)
+    expect(api.switch).toHaveBeenCalledTimes(1)
+  })
   it("sends only the selected engine's saved settings", async () => {
     localStorage.setItem(
       "codeg:selector-prefs",

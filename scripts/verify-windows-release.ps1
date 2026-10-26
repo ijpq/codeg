@@ -3,7 +3,7 @@ param(
   [Parameter(Mandatory=$true)][string]$Repository,
   [Parameter(Mandatory=$true)][string]$Destination,
   [Parameter(Mandatory=$true)][string]$SetupManifest,
-  [string]$UpgradeFromTag = 'v0.38.0-fix1',
+  [string]$UpgradeFromTag = 'v0.40.0-fix1',
   [switch]$RequirePublished
 )
 $ErrorActionPreference = 'Stop'
@@ -37,7 +37,7 @@ $root = Join-Path $expanded 'codeg-server-windows-x64'
 foreach ($name in @('codeg-server.exe','codeg-mcp.exe','codeg-computer-helper.exe','codeg-cli.exe','web/index.html')) {
   if (-not (Test-Path (Join-Path $root $name) -PathType Leaf)) { throw "Server package missing $name" }
 }
-python -B scripts/smoke-server-package.py $root $version --require-runtime --log-dir (Join-Path $Destination 'server-smoke')
+python -B scripts/smoke-server-package.py $root $version --require-runtime --require-pi-runtime --log-dir (Join-Path $Destination 'server-smoke')
 if ($LASTEXITCODE -ne 0) { throw 'Downloaded Server ZIP startup failed' }
 $installed = Join-Path $Destination 'installed'
 $process = Start-Process (Join-Path $Destination $setupName) -ArgumentList '/S',"/D=$installed" -Wait -PassThru
@@ -50,6 +50,8 @@ foreach ($file in $manifest.files) {
 }
 python -B scripts/release-resources.py verify (Join-Path $installed 'web') $version
 if ($LASTEXITCODE -ne 0) { throw 'Installed frontend/migration inventory failed' }
+python -B scripts/build-pi-runtime.py --output-dir (Join-Path $installed 'pi-runtime') --verify
+if ($LASTEXITCODE -ne 0) { throw 'Installed Pi runtime inventory failed' }
 $mcpVersion = (& (Join-Path $installed 'codeg-mcp.exe') --version | Out-String).Trim()
 if ($LASTEXITCODE -ne 0 -or $mcpVersion -ne $version) { throw 'Installed MCP version mismatch' }
 python -B scripts/verify-windows-dependencies.py $installed --report (Join-Path $Destination 'setup-windows-dependencies.json')
@@ -65,6 +67,10 @@ if ((Get-FileHash (Join-Path $previous $oldSetup) -Algorithm SHA256).Hash.ToLowe
 $nativeTools = Join-Path $Destination 'native-agent-tools'
 npm install --prefix $nativeTools --global --include=optional --ignore-scripts --no-audit --no-fund '@agentclientprotocol/codex-acp@2.2.2' '@agentclientprotocol/claude-agent-acp@0.94.0'
 if ($LASTEXITCODE -ne 0) { throw 'Isolated ACP installation failed' }
+python -B scripts/prepare-office-preview-test.py --output $nativeTools
+if ($LASTEXITCODE -ne 0) { throw 'Isolated Office converter checksum verification failed' }
+node scripts/test-pi-service-tier.mjs --output (Join-Path $Destination 'pi-service-tier') --pi (Join-Path $root 'pi-runtime/pi.cmd') --adapter (Join-Path $root 'pi-runtime/node_modules/pi-acp/dist/index.js')
+if ($LASTEXITCODE -ne 0) { throw 'Packaged Pi service-tier protocol verification failed' }
 node scripts/verify-windows-ui.mjs --setup (Join-Path $Destination $setupName) --previous (Join-Path $previous $oldSetup) --server $root --output (Join-Path $Destination 'ui') --version $version --native-tools $nativeTools
 if ($LASTEXITCODE -ne 0) { throw 'Setup upgrade/startup or actual Server/Desktop UI verification failed' }
 @{ tag=$ReleaseTag; commit=$env:GITHUB_SHA; published=(-not $release.isDraft); assets=$evidence; installation='passed'; server_startup='passed'; setup_startup='passed'; upgrade='passed'; actual_ui='passed'; installed_files=$manifest.files.Count } | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $Destination 'verification.json')

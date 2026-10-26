@@ -368,7 +368,9 @@ jobs:
       # apply to this cargo invocation.
       - name: Stage sidecars for Tauri bundle
         shell: bash
-        run: pnpm tauri:prepare-sidecars --target ${{ matrix.target }}
+        run: |
+          pnpm pi:prepare-runtime
+          pnpm tauri:prepare-sidecars --target ${{ matrix.target }}
 
       - name: Verify sidecars landed
         shell: bash
@@ -801,6 +803,13 @@ jobs:
             $files += @{ path="web/$relative"; sha256=$hash }
           }
           if (-not (Test-Path (Join-Path $dest 'web/index.html') -PathType Leaf)) { throw 'Setup web entry missing' }
+          python -B scripts/build-pi-runtime.py --output-dir (Join-Path $dest 'pi-runtime') --verify
+          if ($LASTEXITCODE -ne 0) { throw 'Setup Pi runtime inventory failed' }
+          $piRoot=(Resolve-Path (Join-Path $dest 'pi-runtime')).Path
+          foreach ($file in (Get-ChildItem $piRoot -Recurse -File)) {
+            $relative=$file.FullName.Substring($piRoot.Length+1)
+            $files += @{ path="pi-runtime/$relative"; sha256=(Get-FileHash $file.FullName -Algorithm SHA256).Hash.ToLower() }
+          }
           if (Get-ChildItem $dest -Recurse -File | Where-Object { $_.Name -in @('auth.json','tokens.json','config.toml','.env') -or $_.Extension -in @('.db','.sqlite','.sqlite3','.pdb','.key') }) { throw 'Unexpected data/build files in Setup' }
           New-Item -ItemType Directory -Force setup-evidence | Out-Null
           @{ version=$version; commit=$env:GITHUB_SHA; files=$files } | ConvertTo-Json -Depth 5 | Set-Content setup-evidence/payload.json
@@ -1077,6 +1086,9 @@ jobs:
           Copy-Item src-tauri/target/${{ matrix.target }}/release/codeg-mcp.exe dist/${{ matrix.artifact }}/
           Copy-Item src-tauri/target/${{ matrix.target }}/release/codeg-cli.exe dist/${{ matrix.artifact }}/
           Copy-Item -Recurse dist/codex-runtime "dist/${{ matrix.artifact }}/runtime"
+          python -B scripts/build-pi-runtime.py --output-dir dist/pi-runtime
+          if ($LASTEXITCODE -ne 0) { throw 'Private Pi runtime build failed' }
+          Copy-Item -Recurse dist/pi-runtime "dist/${{ matrix.artifact }}/pi-runtime"
           Copy-Item src-tauri/target/${{ matrix.target }}/release/codeg-computer-helper.exe dist/${{ matrix.artifact }}/
           Copy-Item -Recurse out dist/${{ matrix.artifact }}/web
           Compress-Archive -Path dist/${{ matrix.artifact }} -DestinationPath dist/${{ matrix.artifact }}.zip
@@ -1121,7 +1133,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          python -B scripts/smoke-server-package.py "dist/${{ matrix.artifact }}" "$($env:RELEASE_TAG.TrimStart('v'))" --require-runtime --log-dir package-smoke
+          python -B scripts/smoke-server-package.py "dist/${{ matrix.artifact }}" "$($env:RELEASE_TAG.TrimStart('v'))" --require-runtime --require-pi-runtime --log-dir package-smoke
           if ($LASTEXITCODE -ne 0) { throw 'Packaged Server startup failed' }
 
       - name: Upload artifact for Docker build (Linux only)

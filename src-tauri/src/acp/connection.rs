@@ -1210,6 +1210,7 @@ pub enum ConnectionCommand {
         /// get a unique id but their reports are intentionally ignored because
         /// there is no conversation/turn to attach them to.
         agent_file_change_report_request_id: Option<String>,
+        expected_settings: Option<crate::db::service::business_delivery_service::ExecutionSettings>,
     },
     NativeSteer {
         blocks: Vec<PromptInputBlock>,
@@ -2126,15 +2127,20 @@ async fn build_agent(
                     merged_env.push(("APP_SERVER_LOGS".to_string(), dir));
                 }
             }
-            let resolved_launcher = crate::commands::acp::resolve_npx_command(cmd)
-                .await
-                .unwrap_or_else(|| PathBuf::from(crate::process::normalized_program(cmd)));
+            let resolved_launcher = if agent_type == AgentType::Pi {
+                crate::acp::pi_runtime::adapter(runtime_env)
+            } else { None };
+            let resolved_launcher = match resolved_launcher {
+                Some(path) => path,
+                None => crate::commands::acp::resolve_npx_command(cmd).await
+                    .unwrap_or_else(|| PathBuf::from(crate::process::normalized_program(cmd))),
+            };
 
             // Codex's ACP adapter owns the app-server connection and active
             // thread ids. The compatibility preparer leaves normal installs
             // untouched except for exact, anchor-verified bundles: legacy
             // steering/fork bridges and current versions' detached AIR audit.
-            let prepared_steer = if meta.supports_steer {
+            let prepared_steer = if meta.supports_steer && agent_type == AgentType::Codex {
                 match crate::acp::codex_steer_adapter::prepare(&resolved_launcher).await {
                     Ok(prepared) => prepared,
                     Err(error) => {
@@ -7071,28 +7077,10 @@ async fn send_new_session_capturing_models(
     send_capturing_models(cx, AGENT_METHOD_NAMES.session_new, req).await
 }
 
-/// Whether MCP servers forwarded over the ACP wire (`session/new.mcpServers`)
-/// actually reach the agent's model. Almost all adapters deliver them; pi-acp
-/// (0.0.31) accepts the `mcpServers` field but DROPS it — it never forwards MCP
-/// to the inner `pi --mode rpc` process, and pi has no native MCP. So forwarding
-/// either user servers or the built-in codeg-mcp companion to pi is futile, and
-/// injecting codeg-mcp would falsely mark delegation/feedback/ask as available
-/// (`feedback_tool_available`, a registered delegation token pi can never use).
-/// `supports_mcp` stays `true` for pi (session/new tolerates the field), so this
-/// is a separate, narrower gate. Gate codeg-mcp injection on it.
-///
-/// Cline drops them the same way. Its ACP agent (`apps/cli/src/acp/acpAgent.ts`)
-/// keeps the `mcpServers` of `session/new` and `session/load` in its session
-/// state and never reads them back: the config it starts each session with
-/// carries no MCP servers, and the SDK connects only the servers in cline's own
-/// `cline_mcp_settings.json` and its plugins. Checked in the source of every
-/// release from 3.0.55 through 3.0.73, and live on 3.0.71 through 3.0.73: a
-/// stdio server sent on `session/new` is never started, while one in the settings
-/// file is, and its tools reach the model. User servers still reach Cline,
-/// through that file (see [`agent_reads_own_mcp_config`]); the codeg-mcp
-/// companion, which only travels over the wire, cannot.
+/// Cline ignores wire MCP. Pi is admitted only after the verified adapter's
+/// codegPi capability is checked at initialize, before any session is created.
 fn agent_delivers_wire_mcp(agent_type: AgentType) -> bool {
-    !matches!(agent_type, AgentType::Pi | AgentType::Cline)
+    agent_type != AgentType::Cline
 }
 
 /// Agents that load the MCP servers codeg's MCP settings manage from their OWN
@@ -8629,6 +8617,13 @@ async fn run_connection(
             // single chokepoint feeding session/new, session/load, and the
             // load→new fallback, so gating here keeps server entries off the
             // wire on every path. See `AcpAgentMeta::supports_mcp`.
+            if agent_type == AgentType::Pi && !init_resp.meta.as_ref()
+                .and_then(|m|m.get("codegPi"))
+                .is_some_and(|m|m.get("version").and_then(serde_json::Value::as_u64)==Some(1)
+                    && m.get("nativeMcp").and_then(serde_json::Value::as_bool)==Some(true)
+                    && m.get("identityVerified").and_then(serde_json::Value::as_bool)==Some(true)) {
+                return Err(agent_client_protocol::util::internal_error("PI_ADAPTER_UPGRADE_REQUIRED: use CodeG's matching Pi adapter; an older global pi-acp cannot verify sessions or connect native MCP"));
+            }
             let agent_supports_mcp = registry::get_agent_meta(agent_type).supports_mcp;
             // A one-shot generation (`acp::one_shot`) is offered no MCP server
             // at all, neither the user's nor codeg-mcp: it is meant to answer
@@ -11666,6 +11661,8 @@ async fn steer_session(
         SteerProtocol::CodexNative => serde_json::json!({
             "sessionId": session_id,
             "prompt": prompt,
+            "clientMessageId": client_message_id,
+            "promptRequired": true,
         }),
     };
     let untyped = UntypedMessage::new(protocol.method(), request)
@@ -14042,7 +14039,20 @@ async fn run_conversation_loop(
                 user_message,
                 internal_suffix,
                 agent_file_change_report_request_id,
+                expected_settings,
             }) => {
+                if let Some(expected) = expected_settings {
+                    if !expected.matches(&*state.read().await) {
+                        emit_with_state(state, emitter, AcpEvent::Error {
+                            message: "DELIVERY_SETTINGS_CHANGED: queued settings changed before native delivery".into(),
+                            agent_type: agent_type.to_string(), code: None, details: None, terminal: false,
+                        }).await;
+                        emit_with_state(state, emitter, AcpEvent::TurnComplete {
+                            session_id: session.session_id().0.to_string(), stop_reason: "error".into(), agent_type: agent_type.to_string(),
+                        }).await;
+                        continue;
+                    }
+                }
                 // Fingerprint the outgoing prompt for the background watcher's
                 // foreground/out-of-turn classifier BEFORE the blocks are
                 // consumed: the transcript record this prompt becomes must
@@ -31938,6 +31948,7 @@ mod tests {
                     user_message: None,
                     internal_suffix: Vec::new(),
                     agent_file_change_report_request_id: None,
+                expected_settings: None,
                 })
                 .await
                 .expect("the connection is running");
@@ -40073,6 +40084,7 @@ mod tests {
                     user_message: None,
                     internal_suffix: Vec::new(),
                     agent_file_change_report_request_id: None,
+                expected_settings: None,
                 })
                 .await
                 .expect("the loop is running");
@@ -41288,6 +41300,7 @@ mod tests {
                     user_message: None,
                     internal_suffix: Vec::new(),
                     agent_file_change_report_request_id: None,
+                expected_settings: None,
                 })
                 .await
                 .expect("the loop is running");
@@ -41543,6 +41556,7 @@ mod tests {
                     user_message: None,
                     internal_suffix: Vec::new(),
                     agent_file_change_report_request_id: None,
+                expected_settings: None,
                 })
                 .await
                 .expect("the loop is running");
@@ -41930,6 +41944,7 @@ mod tests {
                     user_message: None,
                     internal_suffix: Vec::new(),
                     agent_file_change_report_request_id: None,
+                expected_settings: None,
                 })
                 .await
                 .expect("the loop is running");
@@ -42656,6 +42671,7 @@ mod tests {
                     user_message: None,
                     internal_suffix: Vec::new(),
                     agent_file_change_report_request_id: None,
+                expected_settings: None,
                 })
                 .await
                 .expect("the loop is running");
@@ -44208,8 +44224,8 @@ mod wire_mcp_gate_tests {
     }
 
     #[test]
-    fn pi_stays_off_the_wire_and_the_rest_stay_on_it() {
-        assert!(!agent_delivers_wire_mcp(AgentType::Pi));
+    fn verified_pi_and_other_supported_agents_receive_wire_mcp() {
+        assert!(agent_delivers_wire_mcp(AgentType::Pi));
         for agent_type in [
             AgentType::ClaudeCode,
             AgentType::Codex,

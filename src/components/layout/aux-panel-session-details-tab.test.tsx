@@ -65,6 +65,9 @@ vi.mock("./session-details-insights", () => ({
   },
 }))
 
+vi.mock("@/contexts/workspace-context", () => ({
+  useOptionalWorkspaceActions: () => null,
+}))
 vi.mock("@/contexts/aux-panel-context", () => ({ useAuxPanelContext: vi.fn() }))
 vi.mock("@/contexts/tab-context", () => ({ useTabStore: vi.fn() }))
 vi.mock("@/stores/conversation-runtime-store", () => ({

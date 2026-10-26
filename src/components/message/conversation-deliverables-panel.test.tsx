@@ -257,7 +257,9 @@ describe("ConversationDeliverablesPanel", () => {
   })
 
   it("downloads by deliverable id without sending a source path", async () => {
-    mockHistory([deliverable("docx-id", "交付 文档.docx")])
+    mockHistory([
+      deliverable("docx-id", "交付 文档.docx", { conversation_id: 7 }),
+    ])
     render(
       <ConversationDeliverablesPanel
         conversationId={7}
@@ -279,7 +281,9 @@ describe("ConversationDeliverablesPanel", () => {
   })
 
   it("opens with the host default application by deliverable id", async () => {
-    mockHistory([deliverable("pdf-id", "最终 报告.pdf")])
+    mockHistory([
+      deliverable("pdf-id", "最终 报告.pdf", { conversation_id: 7 }),
+    ])
     render(
       <ConversationDeliverablesPanel
         conversationId={7}

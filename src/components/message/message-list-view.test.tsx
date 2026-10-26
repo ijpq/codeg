@@ -10,7 +10,6 @@ import {
   groupDelegationSources,
   isForkPointUnnamed,
   markThreadTail,
-  appendUnassociatedDeliverablesTail,
   associateDeliverablesWithUserTurns,
   mergeConsecutiveAssistantTurns,
   replyDeliverablesForRun,
@@ -433,7 +432,7 @@ describe("associateDeliverablesWithUserTurns", () => {
     expect(mapped.get("parsed-user-turn")?.[0].id).toBe("output-1")
   })
 
-  it("recovers the producing reply by timestamp after a cold parser reload", () => {
+  it("does not guess a producing reply from nearby timestamps or steer messages", () => {
     const mapped = associateDeliverablesWithUserTurns(
       [
         run(
@@ -452,7 +451,7 @@ describe("associateDeliverablesWithUserTurns", () => {
         { id: "parsed-steer", timestamp: "2026-07-20T10:03:00Z" },
       ]
     )
-    expect(mapped.get("parsed-user-turn")?.[0].id).toBe("output-1")
+    expect(mapped.size).toBe(0)
     expect(mapped.has("old-turn")).toBe(false)
     expect(mapped.has("parsed-steer")).toBe(false)
   })
@@ -558,6 +557,15 @@ describe("replyDeliverablesForRun", () => {
       ])
     ).toEqual([])
   })
+
+  it("does not replace unavailable declared files with inferred outputs", () => {
+    expect(
+      replyDeliverablesForRun([
+        output("declared-missing", { is_valid: false }),
+        output("tracker-noise", { source: "inferred" }),
+      ])
+    ).toEqual([])
+  })
 })
 
 describe("resolveDeliverableAssociations", () => {
@@ -612,17 +620,23 @@ describe("resolveDeliverableAssociations", () => {
     expect(result.unassociated).toEqual([])
   })
 
-  it("keeps unmatched durable outputs visible in a conversation-tail card", () => {
-    const items: ThreadRenderItem[] = []
-    const withTail = appendUnassociatedDeliverablesTail(items, [declared])
-
-    expect(withTail).toHaveLength(1)
-    expect(withTail[0]).toMatchObject({
-      key: "unassociated-deliverables-tail",
-      kind: "deliverables",
-      deliverables: [declared],
-    })
-    expect(appendUnassociatedDeliverablesTail(items, [])).toBe(items)
+  it("does not reassign an unloaded page's exact link to the visible prompt", () => {
+    const result = resolveDeliverableAssociations(
+      [
+        {
+          turn_run_id: "run-old-page",
+          conversation_id: 1,
+          client_message_id: "old-client",
+          user_turn_id: "old-page-user",
+          started_at: "2026-10-26T00:00:00Z",
+          completed_at: "2026-10-26T00:05:00Z",
+          deliverables: [declared],
+        },
+      ],
+      [{ id: "different-user", timestamp: "2026-10-26T00:00:01Z" }]
+    )
+    expect(result.byUserId.size).toBe(0)
+    expect(result.unassociated).toEqual([declared])
   })
 })
 

@@ -7,6 +7,9 @@ export async function startGoalModel() {
   let ordinaryMode = false
   let businessMode = false
   const businessRequests = []
+  const requestParameters = []
+  let tierBehavior
+  let responseDelay = 100
   const server = createServer(async (request, response) => {
     if (request.method !== "POST") {
       response.writeHead(404).end()
@@ -15,6 +18,23 @@ export async function startGoalModel() {
     const chunks = []
     for await (const chunk of request) chunks.push(chunk)
     const body = JSON.parse(Buffer.concat(chunks).toString())
+    requestParameters.push({
+      model: body.model,
+      serviceTier: body.service_tier ?? null,
+      effort: body.reasoning?.effort ?? null,
+    })
+    if (tierBehavior === "reject") {
+      response.writeHead(400, { "Content-Type": "application/json" }).end(
+        JSON.stringify({
+          error: {
+            message: "Synthetic service tier rejected",
+            type: "invalid_request_error",
+            code: "unsupported_service_tier",
+          },
+        })
+      )
+      return
+    }
     requests++
     if (businessMode) {
       const input = JSON.stringify(body.input ?? [])
@@ -23,6 +43,7 @@ export async function startGoalModel() {
         memory: input.includes("BUSINESS_VERIFIED_MEMORY"),
         skill: input.includes("BUSINESS_SHARED_SKILL_BODY"),
         previousAgent: input.includes("BUSINESS_CLAUDE_COMPLETED"),
+        fromPi: input.includes("BUSINESS_PI_COMPLETED"),
         user: input.includes("BUSINESS_CODEX_RETURN"),
       })
     }
@@ -44,6 +65,9 @@ export async function startGoalModel() {
       created_at: 1791763200,
       status: "completed",
       model: body.model,
+      ...(["priority", "default"].includes(tierBehavior)
+        ? { service_tier: tierBehavior }
+        : {}),
       output: [item],
       usage: {
         input_tokens: 42,
@@ -141,7 +165,7 @@ export async function startGoalModel() {
       businessMode &&
         JSON.stringify(body.input ?? []).includes("BUSINESS_SLOW_BOUNDARY")
         ? 8000
-        : 100
+        : responseDelay
     )
     if (!response.destroyed) {
       response.writeHead(200, { "Content-Type": "text/event-stream" })
@@ -154,6 +178,13 @@ export async function startGoalModel() {
   return {
     url: `http://127.0.0.1:${server.address().port}/v1`,
     count: () => requests,
+    parameters: () => [...requestParameters],
+    tier: (value) => {
+      tierBehavior = value
+    },
+    delay: (value) => {
+      responseDelay = value
+    },
     ordinary: (value) => {
       ordinaryMode = value
     },

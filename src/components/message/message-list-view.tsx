@@ -580,13 +580,12 @@ export interface DeliverableUserTurnRef {
 export function replyDeliverablesForRun(
   deliverables: ConversationDeliverable[]
 ): ConversationDeliverable[] {
-  const declared = deliverables.filter(
-    (item) =>
-      item.source === "declared" &&
-      item.is_valid &&
-      item.change_kind !== "deleted"
-  )
-  if (declared.length > 0) return declared
+  const declared = deliverables.filter((item) => item.source === "declared")
+  if (declared.length > 0) {
+    return declared.filter(
+      (item) => item.is_valid && item.change_kind !== "deleted"
+    )
+  }
 
   const eligible = deliverables.filter((item) => {
     return (
@@ -603,7 +602,7 @@ export interface DeliverableAssociationResult {
   /**
    * Durable output sets that could not be correlated to a user turn in the
    * currently loaded history page. They must never be guessed onto a specific
-   * assistant reply, but remain visible in a conversation-tail fallback.
+   * assistant reply. They remain available in the conversation-wide ledger.
    */
   unassociated: ConversationDeliverable[]
 }
@@ -622,10 +621,9 @@ function dedupeDeliverables(
 
 /**
  * Prefer the backend's prompt-fingerprint link, then the exact optimistic id
- * while a session is live. Historical rows created before that link existed
- * retain the guarded timestamp fallback. This deliberately refuses distant
- * guesses; unmatched durable outputs are returned separately for diagnostics
- * and the conversation history panel.
+ * while a session is live. A timestamp is not a task identity: unloaded pages,
+ * queued jobs and steer messages may all fall inside the same time window.
+ * Unmatched outputs remain in the conversation history panel.
  */
 export function associateDeliverablesWithUserTurns(
   runs: ConversationTurnDeliverableSet[],
@@ -640,7 +638,6 @@ export function resolveDeliverableAssociations(
 ): DeliverableAssociationResult {
   const byUserId = new Map<string, ConversationDeliverable[]>()
   const userIds = new Set(userTurns.map((turn) => turn.id))
-  const used = new Set<string>()
   const unresolved: ConversationTurnDeliverableSet[] = []
   const attach = (userId: string, deliverables: ConversationDeliverable[]) => {
     byUserId.set(
@@ -663,46 +660,8 @@ export function resolveDeliverableAssociations(
           : null
     if (exactId) {
       attach(exactId, deliverables)
-      used.add(exactId)
     } else {
       unresolved.push({ ...run, deliverables })
-    }
-  }
-
-  const candidates = userTurns
-    .filter((turn) => !used.has(turn.id))
-    .map((turn) => ({ ...turn, time: Date.parse(turn.timestamp ?? "") }))
-    .filter((turn) => Number.isFinite(turn.time))
-
-  for (const run of [...unresolved].sort(
-    (left, right) => Date.parse(left.started_at) - Date.parse(right.started_at)
-  )) {
-    const started = Date.parse(run.started_at)
-    if (!Number.isFinite(started)) continue
-    const completed = Date.parse(run.completed_at ?? "")
-    const latest = Number.isFinite(completed)
-      ? completed + 60_000
-      : started + 90_000
-    let best: (typeof candidates)[number] | null = null
-    for (const candidate of candidates) {
-      if (
-        used.has(candidate.id) ||
-        candidate.time < started - 60_000 ||
-        candidate.time > latest
-      ) {
-        continue
-      }
-      if (
-        best === null ||
-        Math.abs(candidate.time - started) < Math.abs(best.time - started)
-      ) {
-        best = candidate
-      }
-    }
-    if (best) {
-      attach(best.id, run.deliverables)
-      used.add(best.id)
-      unresolved.splice(unresolved.indexOf(run), 1)
     }
   }
 
@@ -712,21 +671,6 @@ export function resolveDeliverableAssociations(
       unresolved.flatMap((run) => run.deliverables)
     ),
   }
-}
-
-export function appendUnassociatedDeliverablesTail(
-  items: ThreadRenderItem[],
-  deliverables: ConversationDeliverable[]
-): ThreadRenderItem[] {
-  if (deliverables.length === 0) return items
-  return [
-    ...items,
-    {
-      key: "unassociated-deliverables-tail",
-      kind: "deliverables",
-      deliverables,
-    },
-  ]
 }
 
 // Collect the `delegate_to_agent` tool calls within a turn's adapted parts,
@@ -2142,14 +2086,7 @@ export function MessageListView({
       ),
     [deliverableRuns, threadItems]
   )
-  const renderableThreadItems = useMemo(
-    () =>
-      appendUnassociatedDeliverablesTail(
-        threadItems,
-        deliverableAssociations.unassociated
-      ),
-    [deliverableAssociations.unassociated, threadItems]
-  )
+  const renderableThreadItems = threadItems
   const renderThreadItem = useCallback(
     (item: ThreadRenderItem) => {
       switch (item.kind) {

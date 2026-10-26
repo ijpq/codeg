@@ -15,7 +15,7 @@ use crate::{
         },
         AppDatabase,
     },
-    models::{AgentType, ContentBlock, MessageTurn},
+    models::{ContentBlock, MessageTurn},
     web::event_bridge::EventEmitter,
 };
 pub use business::{
@@ -59,7 +59,7 @@ async fn switch_agent_inner(
     let summary = conversation_service::get_by_id(&db.conn, cid)
         .await
         .map_err(error)?;
-    if !matches!(summary.agent_type, AgentType::Codex | AgentType::ClaudeCode) {
+    if !business::supports_main_agent_handoff(summary.agent_type) {
         return Err(error(
             "This conversation's main engine does not support handoff",
         ));
@@ -106,7 +106,11 @@ async fn switch_agent_inner(
                 ));
             }
             let path = archive.path().join(format!("{}.json", paths.len()));
-            tokio::fs::write(&path, serde_json::to_vec(&detail.turns).map_err(error)?)
+            let page = business::BusinessHistoryArchivePage {
+                turns: detail.turns,
+                output_turn_refs: detail.output_turn_refs,
+            };
+            tokio::fs::write(&path, serde_json::to_vec(&page).map_err(error)?)
                 .await
                 .map_err(error)?;
             paths.push(path);
@@ -185,6 +189,7 @@ pub async fn recover_switches(
     data_dir: &Path,
     emitter: EventEmitter,
 ) {
+    crate::commands::business_delivery::recover(manager, db, data_dir, emitter.clone()).await;
     match business::pending_conversations(&db.conn).await {
         Ok(ids) => {
             for cid in ids {
@@ -843,7 +848,7 @@ mod tests {
     use crate::{
         acp::{connection::ConnectionCommand, types::ConnectionStatus},
         db::test_helpers::{fresh_in_memory_db, seed_conversation, seed_folder},
-        models::message::TurnRole,
+        models::{message::TurnRole, AgentType},
     };
     fn turn(id: &str, role: TurnRole, text: &str) -> MessageTurn {
         serde_json::from_value(serde_json::json!({"id":id,"role":role,"blocks":[{"type":"text","text":text}],"timestamp":"2026-10-25T01:00:00Z","usage":null,"duration_ms":null,"model":null})).unwrap()
@@ -908,6 +913,197 @@ mod tests {
             preferred_config_values: BTreeMap::new(),
         }
     }
+    #[tokio::test]
+    async fn business_pi_source_accepts_queued_switch_without_interrupting_native_writer() {
+        let db = fresh_in_memory_db().await;
+        let manager = ConnectionManager::new();
+        let dir = tempfile::tempdir().unwrap();
+        let folder = seed_folder(&db, dir.path().to_str().unwrap()).await;
+        let cid = seed_conversation(&db, folder, AgentType::Pi).await;
+        conversation_service::bind_external_id(&db.conn, cid, "original-pi", &[])
+            .await
+            .unwrap();
+        let summary = conversation_service::get_by_id(&db.conn, cid)
+            .await
+            .unwrap();
+        business::initialize(
+            &db.conn,
+            &summary,
+            &[turn("u", TurnRole::User, "original Pi business")],
+        )
+        .await
+        .unwrap();
+        let mut writer = manager
+            .insert_test_connection_live("pi", AgentType::Pi, None, EventEmitter::Noop)
+            .await;
+        {
+            let state = manager.get_state("pi").await.unwrap();
+            let mut state = state.write().await;
+            state.conversation_id = Some(cid);
+            state.folder_id = Some(folder);
+            state.external_id = Some("original-pi".into());
+            state.turn_in_flight = true;
+            state.status = ConnectionStatus::Prompting;
+        }
+        let state = switch_agent_core(
+            request(cid, "leave-pi", AgentType::Codex, 0),
+            &manager,
+            &db,
+            dir.path(),
+            EventEmitter::Noop,
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.active_agent, AgentType::Pi);
+        assert_eq!(state.pending_agent, Some(AgentType::Codex));
+        assert_eq!(state.switch_status.as_deref(), Some("queued"));
+        assert!(
+            writer.try_recv().is_err(),
+            "Running Pi must receive neither cancel nor an extra prompt"
+        );
+        assert_eq!(
+            manager
+                .find_connection_by_conversation_id(cid)
+                .await
+                .as_deref(),
+            Some("pi")
+        );
+    }
+
+    #[tokio::test]
+    async fn business_pi_roundtrip_uses_three_native_sessions_and_unseen_context() {
+        let (db, manager, cid, folder, mut codex, mut claude, _dir) = fixture().await;
+        let mut pi = manager
+            .insert_test_connection_live("pi", AgentType::Pi, None, EventEmitter::Noop)
+            .await;
+        for id in ["codex", "claude", "pi"] {
+            let state = manager.get_state(id).await.unwrap();
+            let mut state = state.write().await;
+            state.background_outstanding = 1;
+            if id == "pi" {
+                state.external_id = Some("native-pi-business".into());
+                state.selectors_ready = true;
+                state.codeg_mcp_available = false;
+            }
+        }
+        let mut previous = "Conference template version A";
+        for (n, agent, id, external, marker) in [
+            (
+                0,
+                AgentType::Pi,
+                "pi",
+                "native-pi-business",
+                "PI_FIRST_DECISION",
+            ),
+            (
+                1,
+                AgentType::ClaudeCode,
+                "claude",
+                "native-claude-business",
+                "CLAUDE_AFTER_PI",
+            ),
+            (
+                2,
+                AgentType::Pi,
+                "pi",
+                "native-pi-business",
+                "PI_RETURN_DECISION",
+            ),
+            (
+                3,
+                AgentType::Codex,
+                "codex",
+                "native-codex-business",
+                "CODEX_AFTER_PI",
+            ),
+        ] {
+            let state = business::state(&db.conn, cid).await.unwrap().unwrap();
+            let req = request(cid, &format!("pi-roundtrip-{n}"), agent, state.revision);
+            business::queue_switch(&db.conn, &req).await.unwrap();
+            // Same durable request cannot create a second native mapping.
+            business::queue_switch(&db.conn, &req).await.unwrap();
+            manager
+                .activate_business_conversation(id, folder, external, &db, &req)
+                .await
+                .unwrap();
+            manager
+                .send_prompt_linked_with_message_id(
+                    &db,
+                    id,
+                    vec![PromptInputBlock::Text {
+                        text: marker.into(),
+                    }],
+                    Some(folder),
+                    Some(cid),
+                    None,
+                    Some(format!("pi-message-{n}")),
+                )
+                .await
+                .unwrap();
+            let received = match agent {
+                AgentType::Pi => pi.recv().await,
+                AgentType::ClaudeCode => claude.recv().await,
+                AgentType::Codex => codex.recv().await,
+                _ => unreachable!(),
+            };
+            let Some(ConnectionCommand::Prompt { blocks, .. }) = received else {
+                panic!("Expected native prompt for {agent:?}")
+            };
+            let outbound = format!("{blocks:?}");
+            assert!(
+                outbound.contains(previous),
+                "Missing increment for {agent:?}: {previous}"
+            );
+            if n == 2 {
+                assert!(
+                    !outbound.contains("Conference template version A"),
+                    "Pi already received original Codex history"
+                );
+            }
+            let state = manager.get_state(id).await.unwrap();
+            let mut state = state.write().await;
+            state.turn_in_flight = false;
+            state.status = ConnectionStatus::Connected;
+            drop(state);
+            let session = business::find_session(&db.conn, cid, agent)
+                .await
+                .unwrap()
+                .unwrap();
+            business::persist_turns(
+                &db.conn,
+                cid,
+                session.id,
+                &[
+                    turn(&format!("u{n}"), TurnRole::User, marker),
+                    turn(&format!("a{n}"), TurnRole::Assistant, marker),
+                ],
+            )
+            .await
+            .unwrap();
+            previous = marker;
+        }
+        let state = business::state(&db.conn, cid).await.unwrap().unwrap();
+        assert_eq!(state.sessions.len(), 3);
+        assert_eq!(state.active_agent, AgentType::Codex);
+        assert_eq!(
+            business::history(&db.conn, cid, None, 25)
+                .await
+                .unwrap()
+                .0
+                .len(),
+            10
+        );
+        assert_eq!(
+            state
+                .sessions
+                .iter()
+                .find(|s| s.agent_type == AgentType::Pi)
+                .unwrap()
+                .external_id,
+            "native-pi-business"
+        );
+    }
+
     #[tokio::test]
     async fn business_activation_preserves_background_child_parent_and_rejects_stale_main() {
         let (db, manager, cid, folder, _old, _target, _dir) = fixture().await;
@@ -1392,15 +1588,29 @@ mod tests {
         assert!(target.mode_id.is_none());
     }
 
-    #[tokio::test]
-    async fn business_invalid_target_keeps_original_mapping_and_writer_usable() {
+    async fn invalid_target_keeps_original_mapping_and_writer_usable(agent: AgentType) {
         let (db, manager, cid, folder, mut old, _target, _dir) = fixture().await;
-        let req = request(cid, "bad-target", AgentType::ClaudeCode, 0);
+        let target_id = if agent == AgentType::Pi {
+            let _pi = manager
+                .insert_test_connection_live("pi", AgentType::Pi, None, EventEmitter::Noop)
+                .await;
+            let state = manager.get_state("pi").await.unwrap();
+            let mut state = state.write().await;
+            state.external_id = Some("native-pi-business".into());
+            state.selectors_ready = true;
+            "pi"
+        } else {
+            "claude"
+        };
+        let req = request(cid, "bad-target", agent, 0);
         business::queue_switch(&db.conn, &req).await.unwrap();
         let result = manager
-            .activate_business_conversation("claude", folder, "wrong-native-id", &db, &req)
+            .activate_business_conversation(target_id, folder, "wrong-native-id", &db, &req)
             .await;
-        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("restored session mismatch"));
         business::set_switch_status(
             &db.conn,
             &req,
@@ -1451,6 +1661,16 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn business_invalid_target_keeps_original_mapping_and_writer_usable() {
+        invalid_target_keeps_original_mapping_and_writer_usable(AgentType::ClaudeCode).await;
+    }
+
+    #[tokio::test]
+    async fn business_invalid_pi_target_keeps_original_mapping_and_writer_usable() {
+        invalid_target_keeps_original_mapping_and_writer_usable(AgentType::Pi).await;
     }
 
     #[tokio::test]

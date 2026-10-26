@@ -206,12 +206,125 @@ describe("conversation history pagination", () => {
     expect(mockGet).toHaveBeenCalledTimes(1)
     expect(mockOutputs).toHaveBeenCalledWith(
       CONVERSATION_ID,
-      expect.arrayContaining([expect.objectContaining({ id: "u3" })])
+      expect.arrayContaining([expect.objectContaining({ id: "u3" })]),
+      undefined
     )
     expect(
       useConversationRuntimeStore
         .getState()
         .byConversationId.get(CONVERSATION_ID)?.detail?.deliverable_runs
     ).toHaveLength(1)
+  })
+
+  it("retains fingerprint identities across pages and retries a late declaration event", async () => {
+    const latest = page([turn("u3", "user"), turn("a3", "assistant")], "cursor")
+    latest.output_turn_refs = [
+      {
+        id: "u3",
+        timestamp: latest.turns[0].timestamp,
+        is_user: true,
+        prompt_fingerprint: "fp3",
+      },
+    ]
+    mockGet.mockResolvedValueOnce(latest)
+    const actions = useConversationRuntimeStore.getState().actions
+    actions.fetchDetail(CONVERSATION_ID)
+    await vi.waitFor(() =>
+      expect(
+        useConversationRuntimeStore
+          .getState()
+          .byConversationId.get(CONVERSATION_ID)?.detailLoading
+      ).toBe(false)
+    )
+    const older = page([turn("u2", "user"), turn("a2", "assistant")], null)
+    older.output_turn_refs = [
+      {
+        id: "u2",
+        timestamp: older.turns[0].timestamp,
+        is_user: true,
+        prompt_fingerprint: "fp2",
+      },
+    ]
+    mockGet.mockResolvedValueOnce(older)
+    await actions.loadEarlierHistory(CONVERSATION_ID)
+    let resolveFirst!: (value: {
+      artifact_runs: []
+      deliverable_runs: []
+    }) => void
+    mockOutputs.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveFirst = resolve
+        })
+    )
+    mockOutputs.mockResolvedValueOnce({
+      artifact_runs: [],
+      deliverable_runs: [
+        {
+          turn_run_id: "late-old-run",
+          conversation_id: CONVERSATION_ID,
+          user_turn_id: "u2",
+          client_message_id: "client-u2",
+          started_at: older.turns[0].timestamp,
+          deliverables: [],
+        },
+      ],
+    })
+    const flight = actions.refreshVisibleOutputs(CONVERSATION_ID)
+    void actions.refreshVisibleOutputs(CONVERSATION_ID)
+    resolveFirst({ artifact_runs: [], deliverable_runs: [] })
+    await flight
+    await vi.waitFor(() => expect(mockOutputs).toHaveBeenCalledTimes(2))
+    expect(
+      mockOutputs.mock.calls[1][2]?.map((ref) => ref.prompt_fingerprint).sort()
+    ).toEqual(["fp2", "fp3"])
+    expect(
+      useConversationRuntimeStore
+        .getState()
+        .byConversationId.get(CONVERSATION_ID)?.detail?.deliverable_runs?.[0]
+        .user_turn_id
+    ).toBe("u2")
+    expect(mockGet).toHaveBeenCalledTimes(2)
+  })
+
+  it("does not let an old output response overwrite a newer history snapshot", async () => {
+    mockGet.mockResolvedValueOnce(page([turn("u3", "user")], null))
+    const actions = useConversationRuntimeStore.getState().actions
+    actions.fetchDetail(CONVERSATION_ID)
+    await vi.waitFor(() =>
+      expect(
+        useConversationRuntimeStore
+          .getState()
+          .byConversationId.get(CONVERSATION_ID)?.detailLoading
+      ).toBe(false)
+    )
+    let resolveFirst!: (value: {
+      artifact_runs: []
+      deliverable_runs: []
+    }) => void
+    mockOutputs.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveFirst = resolve
+        })
+    )
+    mockOutputs.mockResolvedValueOnce({
+      artifact_runs: [],
+      deliverable_runs: [],
+    })
+    const first = actions.refreshVisibleOutputs(CONVERSATION_ID)
+    mockGet.mockResolvedValueOnce(page([turn("u4", "user")], null))
+    actions.refetchDetail(CONVERSATION_ID)
+    await vi.waitFor(() =>
+      expect(
+        useConversationRuntimeStore
+          .getState()
+          .byConversationId.get(CONVERSATION_ID)?.detail?.turns[0].id
+      ).toBe("u4")
+    )
+    resolveFirst({ artifact_runs: [], deliverable_runs: [] })
+    await first
+    await vi.waitFor(() => expect(mockOutputs).toHaveBeenCalledTimes(2))
+    expect(mockOutputs.mock.calls[1][1][0].id).toBe("u4")
   })
 })

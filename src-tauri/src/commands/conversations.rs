@@ -12,8 +12,8 @@ use crate::app_error::AppCommandError;
 use crate::db::entities::conversation;
 use crate::db::entities::folder::FolderKind;
 use crate::db::service::{
-    agent_setting_service, artifact_service, conversation_branch_service, conversation_service, deliverable_service,
-    folder_service, import_service, tab_service, tool_approval_service,
+    agent_setting_service, artifact_service, conversation_branch_service, conversation_service,
+    deliverable_service, folder_service, import_service, tab_service, tool_approval_service,
 };
 #[cfg(feature = "tauri-runtime")]
 use crate::db::AppDatabase;
@@ -1667,6 +1667,12 @@ async fn get_snapshot_branch_page(
             }
         }
         let source_page = source_detail.history_page.take();
+        for reference in &mut source_detail.output_turn_refs {
+            if let Some(inherited) = rewritten.get(&reference.id) {
+                reference.id = inherited.clone();
+            }
+        }
+        branch_detail.output_turn_refs = source_detail.output_turn_refs;
         branch_detail.turns = source_detail.turns;
         branch_detail.artifact_runs = source_detail.artifact_runs;
         branch_detail.deliverable_runs = source_detail.deliverable_runs;
@@ -1674,7 +1680,11 @@ async fn get_snapshot_branch_page(
             next_cursor: source_page
                 .as_ref()
                 .and_then(|page| page.next_cursor.as_deref())
-                .and_then(|cursor| cursor.strip_prefix("codex:").or_else(|| cursor.starts_with("business:").then_some(cursor)))
+                .and_then(|cursor| {
+                    cursor
+                        .strip_prefix("codex:")
+                        .or_else(|| cursor.starts_with("business:").then_some(cursor))
+                })
                 .map(|cursor| format!("{SOURCE_CURSOR_PREFIX}{cursor}")),
             has_more: source_page.as_ref().is_some_and(|page| page.has_more),
             loaded_turns: branch_detail.turns.len() as u32,
@@ -2217,12 +2227,7 @@ pub async fn list_conversation_branches_core(
     .map_err(AppCommandError::from)
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct VisibleConversationTurnRef {
-    pub id: String,
-    pub timestamp: chrono::DateTime<chrono::Utc>,
-    pub is_user: bool,
-}
+pub type VisibleConversationTurnRef = crate::models::conversation::ConversationOutputTurnRef;
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ConversationOutputWindow {
@@ -2235,11 +2240,15 @@ pub async fn list_conversation_output_window_core(
     conversation_id: i32,
     turn_refs: Vec<VisibleConversationTurnRef>,
 ) -> Result<ConversationOutputWindow, AppCommandError> {
+    if turn_refs.len() > 200 {
+        return Err(AppCommandError::invalid_input(
+            "Output refresh accepts at most 200 turn references per request",
+        ));
+    }
     let turns = turn_refs
-        .into_iter()
-        .take(200)
+        .iter()
         .map(|turn| MessageTurn {
-            id: turn.id,
+            id: turn.id.clone(),
             role: if turn.is_user {
                 TurnRole::User
             } else {
@@ -2256,11 +2265,48 @@ pub async fn list_conversation_output_window_core(
         })
         .collect::<Vec<_>>();
     let started = std::time::Instant::now();
-    let (artifact_runs, deliverable_runs) = tokio::try_join!(
+    let (mut artifact_runs, mut deliverable_runs) = tokio::try_join!(
         artifact_service::list_for_turn_window(conn, conversation_id, &turns),
-        deliverable_service::list_sets_for_turns(conn, conversation_id, &turns),
+        deliverable_service::list_sets_for_turn_refs(conn, conversation_id, &turn_refs),
     )
     .map_err(AppCommandError::from)?;
+    // The initial branch detail includes its frozen source prefix. A refresh
+    // must consult that same scope, rather than erasing inherited cards.
+    let mut scope = conversation_id;
+    let mut seen = std::collections::HashSet::from([scope]);
+    let mut boundary = None;
+    while let Some(relation) = conversation_branch_service::get_info(conn, scope)
+        .await
+        .map_err(AppCommandError::from)?
+    {
+        scope = relation.source_conversation_id;
+        if !seen.insert(scope) {
+            break;
+        }
+        boundary = match (boundary, relation.forked_through_at) {
+            (Some(a), Some(b)) => Some(std::cmp::min(a, b)),
+            (a, b) => a.or(b),
+        };
+        let (source_artifacts, source_outputs) = tokio::try_join!(
+            artifact_service::list_for_turn_window(conn, scope, &turns),
+            deliverable_service::list_sets_for_turn_refs(conn, scope, &turn_refs),
+        )
+        .map_err(AppCommandError::from)?;
+        artifact_runs.extend(
+            source_artifacts
+                .into_iter()
+                .filter(|run| boundary.is_some_and(|end| run.started_at <= end)),
+        );
+        deliverable_runs.extend(
+            source_outputs
+                .into_iter()
+                .filter(|run| boundary.is_some_and(|end| run.started_at <= end)),
+        );
+    }
+    artifact_runs.sort_by(|a, b| a.id.cmp(&b.id));
+    artifact_runs.dedup_by(|a, b| a.id == b.id);
+    deliverable_runs.sort_by(|a, b| a.turn_run_id.cmp(&b.turn_run_id));
+    deliverable_runs.dedup_by(|a, b| a.turn_run_id == b.turn_run_id);
     tracing::info!(
         conversation_id,
         visible_turns = turns.len(),
@@ -2376,10 +2422,10 @@ async fn get_folder_conversation_core_impl(
             )
             .await
             .unwrap_or_default();
-            let source_deliverables = deliverable_service::list_sets_for_turns(
+            let source_deliverables = deliverable_service::list_sets_for_turn_refs(
                 conn,
                 relation.source_conversation_id,
-                &detail.turns,
+                &detail.output_turn_refs,
             )
             .await
             .unwrap_or_default();
@@ -2490,6 +2536,13 @@ async fn get_folder_conversation_core_impl(
             "branch-inherited:{}:{}:{}",
             conversation_id, relation.source_conversation_id, original
         );
+        if let Some(reference) = source_detail
+            .output_turn_refs
+            .iter_mut()
+            .find(|reference| reference.id == original)
+        {
+            reference.id = inherited.clone();
+        }
         inherited_ids.insert(original, inherited.clone());
         turn.id = inherited;
     }
@@ -2503,6 +2556,10 @@ async fn get_folder_conversation_core_impl(
 
     let inherited_turn_count = source_detail.turns.len();
     let branch_turn_count = branch_detail.turns.len();
+    source_detail
+        .output_turn_refs
+        .append(&mut branch_detail.output_turn_refs);
+    branch_detail.output_turn_refs = source_detail.output_turn_refs;
     source_detail.turns.append(&mut branch_detail.turns);
     source_detail
         .artifact_runs
@@ -2757,10 +2814,15 @@ async fn get_folder_conversation_raw_impl(
     }
     strip_branch_merge_context(&mut turns);
     if crate::db::service::business_conversation_service::is_managed(conn, conversation_id)
-        .await.map_err(AppCommandError::from)? {
+        .await
+        .map_err(AppCommandError::from)?
+    {
         // Only our injected user-side transport metadata is hidden. Assistant
         // output, including examples of these tags, must remain byte-for-byte.
-        for turn in turns.iter_mut().filter(|turn| matches!(turn.role, TurnRole::User)) {
+        for turn in turns
+            .iter_mut()
+            .filter(|turn| matches!(turn.role, TurnRole::User))
+        {
             strip_context_marker_from_turn(
                 turn,
                 "<codeg-business-context>",
@@ -2783,7 +2845,9 @@ async fn get_folder_conversation_raw_impl(
     let mut summary = summary;
     if let Some(new_ext_id) = resolved_ext_id {
         if crate::db::service::business_conversation_service::is_managed(conn, conversation_id)
-            .await.map_err(AppCommandError::from)? {
+            .await
+            .map_err(AppCommandError::from)?
+        {
             let expected = summary.external_id.as_deref().unwrap_or_default();
             match crate::db::service::business_conversation_service::bind_managed_external_if_current(
                 conn, conversation_id, summary.agent_type, expected, &new_ext_id,
@@ -2830,7 +2894,9 @@ async fn get_folder_conversation_raw_impl(
         }
     }
     if history_page.is_some() {
-        summary.message_count = summary.message_count.max(crate::parsers::message_turn_count(&turns));
+        summary.message_count = summary
+            .message_count
+            .max(crate::parsers::message_turn_count(&turns));
     } else {
         summary.message_count = crate::parsers::message_turn_count(&turns);
     }
@@ -2936,6 +3002,10 @@ async fn get_folder_conversation_raw_impl(
         }
     }
     let merge_db_elapsed_ms = merge_db_started.elapsed().as_millis() as u64;
+    let output_turn_refs = turns
+        .iter()
+        .map(VisibleConversationTurnRef::from)
+        .collect::<Vec<_>>();
     if let Some(window) = history_read_metrics {
         defer_heavy_tool_outputs(&mut turns, conversation_id, window);
         if let Some(external) = summary.external_id.as_deref() {
@@ -2954,9 +3024,10 @@ async fn get_folder_conversation_raw_impl(
     };
     let artifacts_db_elapsed_ms = artifacts_db_started.elapsed().as_millis() as u64;
     let deliverables_db_started = std::time::Instant::now();
-    let deliverable_runs = deliverable_service::list_sets_for_turns(conn, conversation_id, &turns)
-        .await
-        .map_err(AppCommandError::from)?;
+    let deliverable_runs =
+        deliverable_service::list_sets_for_turn_refs(conn, conversation_id, &output_turn_refs)
+            .await
+            .map_err(AppCommandError::from)?;
     let deliverables_db_elapsed_ms = deliverables_db_started.elapsed().as_millis() as u64;
     // Conversation detail owns only outputs that can be attached to a user
     // turn in this history page. The conversation-wide ledger is fetched
@@ -2991,6 +3062,7 @@ async fn get_folder_conversation_raw_impl(
     Ok((
         DbConversationDetail {
             summary,
+            output_turn_refs,
             turns,
             session_stats,
             transcript_watermark,
@@ -3498,6 +3570,15 @@ async fn get_folder_conversation_with_live_impl(
     if let Some(req) = window {
         apply_turn_window(&mut detail, req);
     }
+    // Keep references bounded to exactly the returned transcript window.
+    let visible_ids = detail
+        .turns
+        .iter()
+        .map(|turn| turn.id.as_str())
+        .collect::<HashSet<_>>();
+    detail
+        .output_turn_refs
+        .retain(|reference| visible_ids.contains(reference.id.as_str()));
     Ok(detail)
 }
 
@@ -4622,10 +4703,18 @@ pub(crate) async fn capture_business_tail(
     {
         return Ok(());
     }
-    business::persist_current_tail(conn, cid, session.id, session.agent_type, &session.external_id, &detail.turns)
-        .await
-        .map(|_| ())
-        .map_err(AppCommandError::from)
+    business::persist_current_tail(
+        conn,
+        cid,
+        session.id,
+        session.agent_type,
+        &session.external_id,
+        &detail.turns,
+        &detail.output_turn_refs,
+    )
+    .await
+    .map(|_| ())
+    .map_err(AppCommandError::from)
 }
 
 async fn get_business_conversation_detail(
@@ -4652,7 +4741,7 @@ async fn get_business_conversation_detail(
             tracing::warn!(conversation_id=cid,error=%e,"[business] native tail not available; serving durable history")
         }
     }
-    let (turns, next) = business::history(
+    let (turns, next, output_turn_refs) = business::history_with_output_refs(
         conn,
         cid,
         before,
@@ -4670,27 +4759,53 @@ async fn get_business_conversation_detail(
     let mut artifact_runs = artifact_service::list_for_turn_window(conn, cid, &turns)
         .await
         .map_err(AppCommandError::from)?;
-    let mut deliverable_runs = deliverable_service::list_sets_for_turns(conn, cid, &turns)
+    let mut deliverable_runs =
+        deliverable_service::list_sets_for_turn_refs(conn, cid, &output_turn_refs)
+            .await
+            .map_err(AppCommandError::from)?;
+    let relation = conversation_branch_service::get_info(conn, cid)
         .await
         .map_err(AppCommandError::from)?;
-    let relation = conversation_branch_service::get_info(conn,cid).await.map_err(AppCommandError::from)?;
     if let Some(relation) = relation.as_ref() {
-        let source_artifacts = artifact_service::list_for_turn_window(conn,relation.source_conversation_id,&turns).await.map_err(AppCommandError::from)?;
-        let source_outputs = deliverable_service::list_sets_for_turns(conn,relation.source_conversation_id,&turns).await.map_err(AppCommandError::from)?;
-        artifact_runs.extend(source_artifacts.into_iter().filter(|run|relation.forked_through_at.is_some_and(|end|run.started_at<=end)));
-        deliverable_runs.extend(source_outputs.into_iter().filter(|run|relation.forked_through_at.is_some_and(|end|run.started_at<=end)));
-        artifact_runs.sort_by_key(|run|run.started_at);
-        artifact_runs.dedup_by(|a,b|a.id==b.id);
-        deliverable_runs.sort_by_key(|run|run.started_at);
-        deliverable_runs.dedup_by(|a,b|a.turn_run_id==b.turn_run_id);
+        let source_artifacts =
+            artifact_service::list_for_turn_window(conn, relation.source_conversation_id, &turns)
+                .await
+                .map_err(AppCommandError::from)?;
+        let source_outputs = deliverable_service::list_sets_for_turn_refs(
+            conn,
+            relation.source_conversation_id,
+            &output_turn_refs,
+        )
+        .await
+        .map_err(AppCommandError::from)?;
+        artifact_runs.extend(source_artifacts.into_iter().filter(|run| {
+            relation
+                .forked_through_at
+                .is_some_and(|end| run.started_at <= end)
+        }));
+        deliverable_runs.extend(source_outputs.into_iter().filter(|run| {
+            relation
+                .forked_through_at
+                .is_some_and(|end| run.started_at <= end)
+        }));
+        artifact_runs.sort_by_key(|run| run.started_at);
+        artifact_runs.dedup_by(|a, b| a.id == b.id);
+        deliverable_runs.sort_by_key(|run| run.started_at);
+        deliverable_runs.dedup_by(|a, b| a.turn_run_id == b.turn_run_id);
     }
-    let branch_history = relation.map(|relation|crate::models::conversation::ConversationBranchHistory {
-        source_conversation_id:relation.source_conversation_id,
-        fork_message_id:relation.fork_message_id,
-        inherited_turn_count:relation.inherited_message_count.max(0) as usize,
-        branch_turn_count:summary.message_count.saturating_sub(relation.inherited_message_count.max(0) as u32) as usize,
-        inheritance_mode:relation.inheritance_mode,
-    });
+    let branch_history =
+        relation.map(
+            |relation| crate::models::conversation::ConversationBranchHistory {
+                source_conversation_id: relation.source_conversation_id,
+                fork_message_id: relation.fork_message_id,
+                inherited_turn_count: relation.inherited_message_count.max(0) as usize,
+                branch_turn_count: summary
+                    .message_count
+                    .saturating_sub(relation.inherited_message_count.max(0) as u32)
+                    as usize,
+                inheritance_mode: relation.inheritance_mode,
+            },
+        );
     let history_page = request.map(|_| ConversationHistoryPage {
         next_cursor: next.map(|s| format!("business:{s}")),
         has_more: next.is_some(),
@@ -4701,6 +4816,7 @@ async fn get_business_conversation_detail(
     Ok((
         DbConversationDetail {
             summary,
+            output_turn_refs,
             turns,
             session_stats: None,
             transcript_watermark: None,
@@ -9072,6 +9188,7 @@ mod tests {
 
     fn windowless_detail(turns: Vec<MessageTurn>) -> DbConversationDetail {
         DbConversationDetail {
+            output_turn_refs: Vec::new(),
             summary: DbConversationSummary {
                 id: 1,
                 folder_id: 1,
@@ -9385,9 +9502,11 @@ mod tests {
             assert_eq!(pinned.pointer(path), original.pointer(path), "{path}");
         }
         let decode = |token: &str| {
-            serde_json::from_slice::<DeferredHistoryContentRef>(&URL_SAFE_NO_PAD.decode(token).unwrap())
-                .unwrap()
-                .source_session
+            serde_json::from_slice::<DeferredHistoryContentRef>(
+                &URL_SAFE_NO_PAD.decode(token).unwrap(),
+            )
+            .unwrap()
+            .source_session
         };
         for path in [
             "/blocks/2/uri",

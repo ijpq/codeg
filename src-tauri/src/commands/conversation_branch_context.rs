@@ -502,6 +502,7 @@ mod tests {
 
     fn detail(turns: Vec<MessageTurn>) -> DbConversationDetail {
         DbConversationDetail {
+            output_turn_refs: Vec::new(),
             summary: DbConversationSummary {
                 tag_ids: vec![],
                 id: 7,
