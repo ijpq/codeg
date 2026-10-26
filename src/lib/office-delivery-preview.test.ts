@@ -125,6 +125,37 @@ describe("settled Office delivery auto-preview", () => {
     expect(c.open).toHaveBeenCalledOnce()
     expect(c.open.mock.calls[0][0].turn_run_id).toBe("run-2")
   })
+  it("a duplicate older event cannot discard a newer review being loaded", async () => {
+    const c = setup()
+    await c.handle(event)
+    const read = deferred<OfficeDeliveryPreview | null>()
+    c.load.mockReturnValueOnce(read.promise)
+    const current = c.handle({ ...event, turn_run_id: "run-2" })
+    await c.handle(event)
+    read.resolve(review("run-2", 2))
+    await current
+    expect(c.open.mock.calls.map(([preview]) => preview.turn_run_id)).toEqual([
+      "run-1",
+      "run-2",
+    ])
+  })
+  it("late events from any consumed turn cannot suppress the next delivery", async () => {
+    const c = setup()
+    await c.handle(event)
+    c.load.mockResolvedValueOnce(review("run-2", 2))
+    await c.handle({ ...event, turn_run_id: "run-2" })
+    const read = deferred<OfficeDeliveryPreview | null>()
+    c.load.mockReturnValueOnce(read.promise)
+    const current = c.handle({ ...event, turn_run_id: "run-3" })
+    await c.handle(event)
+    read.resolve(review("run-3", 3))
+    await current
+    expect(c.open.mock.calls.map(([preview]) => preview.turn_run_id)).toEqual([
+      "run-1",
+      "run-2",
+      "run-3",
+    ])
+  })
   it("a pending event cannot lose the settlement event arriving during its read", async () => {
     const c = setup()
     const read = deferred<OfficeDeliveryPreview | null>()

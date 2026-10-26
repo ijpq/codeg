@@ -17,7 +17,6 @@ export function createOfficeDeliveryPreviewController(options: Options) {
   let disposed = false
   let epoch = 0
   const seen = options.consumed ?? new Map<number, number>()
-  const newestEvent = new Map<number, string>()
   const flights = new Map<string, { again: boolean }>()
   const invalidate = () => {
     epoch += 1
@@ -26,7 +25,6 @@ export function createOfficeDeliveryPreviewController(options: Options) {
   async function handle(event: ConversationArtifactsChanged) {
     const cid = event.conversation_id
     if (disposed || options.activeConversation() !== cid) return
-    newestEvent.set(cid, event.turn_run_id)
     const key = `${cid}:${event.turn_run_id}`
     const existing = flights.get(key)
     if (existing) {
@@ -52,14 +50,16 @@ export function createOfficeDeliveryPreviewController(options: Options) {
           preview.turn_run_id !== event.turn_run_id
         )
           return
+        // Database run order is authoritative. A late duplicate event for an
+        // older run must neither replace a newer review nor invalidate its
+        // outstanding read merely by arriving last.
         if (preview.run_sequence <= (seen.get(cid) ?? 0)) return
         seen.set(cid, preview.run_sequence)
         if (
           disposed ||
           atEpoch !== epoch ||
           options.activeConversation() !== cid ||
-          options.selectionRevision() !== revision ||
-          newestEvent.get(cid) !== event.turn_run_id
+          options.selectionRevision() !== revision
         )
           return
         if (

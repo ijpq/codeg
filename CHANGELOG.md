@@ -30,6 +30,8 @@
   edits. Preserve immutable review bytes during later work, apply final replace/
   clear semantics, deduplicate completion events, and respect user tab choices.
   Keep manual in-app review, clear conversion failures and review-copy downloads.
+- Order Office review updates by persistent task sequence, so a late duplicate
+  from an older delivery cannot discard the next review while it is loading.
 
 See [release notes](docs/releases/v0.40.0-fix2.md).
 
