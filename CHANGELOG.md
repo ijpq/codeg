@@ -7,6 +7,9 @@
   Skills, history and deliverables across handoffs and restart.
 - Keep the business title independent of native session auto-titles, including
   delayed title writers, without changing user rename or rollback behavior.
+- Acquire the SQLite writer before the tab-version CAS read, so restoring a
+  business after restart can wait for background history/index writes. Preserve
+  stale-save rejection, metadata clocks and cross-client ordering.
 - Verify Pi native session/header/path identities, safely import legacy aliases,
   persist empty sessions, and refuse unverified initialization or restoration.
 - Connect Pi 1.4 native MCP, steering and tail clone; exercise actual companion
