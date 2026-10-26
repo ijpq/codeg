@@ -12,6 +12,7 @@ import { startGoalModel } from "./native-codex-model-fixture.mjs"
 import { startBusinessModel } from "./business-model-fixture.mjs"
 import { startPiModel } from "./pi-native-model-fixture.mjs"
 import { piCapabilityChecks } from "./pi-capability-checks.mjs"
+import { prepareWindowsProfile } from "./windows-ui-profile.mjs"
 import {
   businessAgentPage,
   restoredBusinessPage,
@@ -59,12 +60,11 @@ async function enableNativeAgent(f) {
   delete f.env.ANTHROPIC_CUSTOM_HEADERS
   // Both Pi's native store and pi-acp's session map live in this disposable
   // fixture; no account/config/session is discovered from the runner profile.
-  f.env.USERPROFILE = join(f.root, "profile")
+  await prepareWindowsProfile(f.env, join(f.root, "profile"))
   f.env.PI_CODING_AGENT_DIR = join(f.root, "pi-agent")
   // The built-in runtime selects its own release-pinned Pi and adapter.
   delete f.env.PI_ACP_PI_COMMAND
   delete f.env.CODEG_PI_ACP_PATH
-  await mkdir(f.env.USERPROFILE, { recursive: true })
   await mkdir(f.env.PI_CODING_AGENT_DIR, { recursive: true })
   await writeFile(
     join(f.env.PI_CODING_AGENT_DIR, "models.json"),

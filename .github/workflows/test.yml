@@ -84,6 +84,9 @@ jobs:
       - name: Draft release reuse regression
         run: node --test scripts/test-release-draft.mjs
 
+      - name: Isolated desktop profile regression
+        run: node --test scripts/test-windows-ui-profile.mjs
+
       - name: Static export build
         run: pnpm build
 

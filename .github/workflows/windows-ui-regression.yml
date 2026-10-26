@@ -25,6 +25,18 @@ env:
   CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: "-C target-feature=+crt-static"
   HUSKY: 0
 jobs:
+  profile-paths:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Verify isolated profiles with the Windows Known Folder API
+        run: node --test scripts/test-windows-ui-profile.mjs
   setup-ui:
     runs-on: windows-2022
     permissions:
