@@ -17,6 +17,8 @@
   requested, endpoint-reported and verified upstream tiers without billing claims.
 - Ship matching private Node 24.16.0, Pi 1.4.0 and pi-acp 0.0.34-codeg.2 in both
   Windows packages, with source pins, dependency locks, file inventories and licenses.
+- Resolve Windows temporary-directory junctions before validating the pinned
+  Node ZIP, while retaining traversal and nested-link containment checks.
 - Expand isolated Server/Setup protocol, failure, upgrade and asset verification.
   Preserve whole-task timing, native Plan/Goal, all deliverables and scroll fixes.
 - Repair inline deliverable refresh field compatibility, stable prompt identities,

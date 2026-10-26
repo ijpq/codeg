@@ -46,6 +46,16 @@ def verify(root):
     return {'passed': True, 'files': len(expected), 'source': json.loads((root / 'source.json').read_text())}
 
 
+def extract_node_zip(archive, destination):
+    # RUNNER_TEMP can be a Windows junction (and /var a macOS alias). Compare
+    # resolved members against that same physical root, retaining containment
+    # checks for traversal and nested links before writing any archive member.
+    destination = destination.resolve(strict=True)
+    with zipfile.ZipFile(archive) as bundle:
+        assert all((destination / name).resolve().is_relative_to(destination) for name in bundle.namelist()), 'Node archive path escapes extraction root'
+        bundle.extractall(destination)
+
+
 def build(root):
     if root.exists():
         return verify(root)
@@ -57,9 +67,7 @@ def build(root):
     extracted = work / 'node'
     extracted.mkdir()
     if archive_name.endswith('.zip'):
-        with zipfile.ZipFile(archive) as bundle:
-            assert all((extracted / name).resolve().is_relative_to(extracted) for name in bundle.namelist())
-            bundle.extractall(extracted)
+        extract_node_zip(archive, extracted)
     else:
         with tarfile.open(archive) as bundle:
             # Invoke npm-cli.js with the pinned Node directly; the distribution's

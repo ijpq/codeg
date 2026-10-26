@@ -1,9 +1,12 @@
 import importlib.util
 from contextlib import closing
+import os
 from pathlib import Path
 import sqlite3
+import subprocess
 import tempfile
 import unittest
+import zipfile
 from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location(
@@ -21,6 +24,64 @@ resource_spec = importlib.util.spec_from_file_location(
 )
 resources = importlib.util.module_from_spec(resource_spec)
 resource_spec.loader.exec_module(resources)
+pi_spec = importlib.util.spec_from_file_location(
+    "pi_runtime", Path(__file__).with_name("build-pi-runtime.py")
+)
+pi_runtime = importlib.util.module_from_spec(pi_spec)
+pi_spec.loader.exec_module(pi_runtime)
+
+
+class PiRuntimeArchiveTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.destination = self.root / 'extracted'
+        self.destination.mkdir()
+        self.archive = self.root / 'node.zip'
+
+    def directory_alias(self, alias, target):
+        if os.name == 'nt':
+            subprocess.run(['cmd', '/c', 'mklink', '/J', str(alias), str(target)],
+                           capture_output=True, check=True)
+            self.addCleanup(os.rmdir, alias)
+        else:
+            alias.symlink_to(target, target_is_directory=True)
+            self.addCleanup(alias.unlink)
+
+    def write_archive(self, name):
+        with zipfile.ZipFile(self.archive, 'w') as bundle:
+            bundle.writestr(name, b'pinned-node-bytes')
+
+    def test_node_archive_extracts_inside_a_directory_alias(self):
+        alias = self.root / 'runner-temp-alias'
+        self.directory_alias(alias, self.destination)
+        self.write_archive('node-version/node.exe')
+        pi_runtime.extract_node_zip(self.archive, alias)
+        self.assertEqual((self.destination / 'node-version/node.exe').read_bytes(),
+                         b'pinned-node-bytes')
+
+    def test_parent_traversal_is_rejected_before_extraction(self):
+        self.write_archive('../outside.txt')
+        with self.assertRaisesRegex(AssertionError, 'escapes extraction root'):
+            pi_runtime.extract_node_zip(self.archive, self.destination)
+        self.assertFalse((self.root / 'outside.txt').exists())
+
+    def test_absolute_archive_path_is_rejected(self):
+        outside = self.root / 'outside.txt'
+        self.write_archive(str(outside))
+        with self.assertRaisesRegex(AssertionError, 'escapes extraction root'):
+            pi_runtime.extract_node_zip(self.archive, self.destination)
+        self.assertFalse(outside.exists())
+
+    def test_nested_directory_alias_cannot_escape_the_root(self):
+        outside = self.root / 'outside'
+        outside.mkdir()
+        self.directory_alias(self.destination / 'link', outside)
+        self.write_archive('link/node.exe')
+        with self.assertRaisesRegex(AssertionError, 'escapes extraction root'):
+            pi_runtime.extract_node_zip(self.archive, self.destination)
+        self.assertEqual(list(outside.iterdir()), [])
 
 
 class MigrationResourceTests(unittest.TestCase):
