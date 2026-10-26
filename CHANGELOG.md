@@ -12,6 +12,7 @@
 - Correlate runtime exceptions with CDP frame identity and initializer source.
   Preserve the exact Tauri path-initializer child-frame exception separately;
   application, unknown and uncorrelated errors still fail package acceptance.
+  Pin its actual serialized Windows source SHA256 and retain a licensed fixture.
   Keep isolated test authentication out of sandboxed document frames.
 - Retain Windows/shared CI and full Server/Setup installation, upgrade, restart,
   rollback, native protocol and post-publication download verification gates.

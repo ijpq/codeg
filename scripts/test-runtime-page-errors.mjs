@@ -1,6 +1,8 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
 import { EventEmitter, once } from "node:events"
+import { createHash } from "node:crypto"
+import { readFileSync } from "node:fs"
 import {
   correlateRuntimeErrors,
   isEmbeddedTauriPathError,
@@ -10,12 +12,19 @@ import {
 const known = {
   mainFrame: false,
   message: "TypeError: Cannot read properties of undefined (reading 'plugins')",
-  source: `(function () { // Copyright 2019-2024 Tauri Programme within The Commons Conservancy
-    Object.defineProperty(window.__TAURI_INTERNALS__.plugins, 'path', {
-      value: { sep: ${JSON.stringify("\\")}, delimiter: ";" }
-    })
-  })();`,
+  source: readFileSync(
+    new URL("./fixtures/tauri-2.12.4-path-windows.txt", import.meta.url),
+    "utf8"
+  ),
 }
+
+test("the pinned framework fixture matches the actual Windows child script", () => {
+  assert.equal(
+    createHash("sha256").update(known.source).digest("hex"),
+    "aa46bd912cdbc5668bd706619e8f7de659d00d5af8512889de3f1ba61896cc71"
+  )
+  assert.match(known.source, /JSON\.parse/)
+})
 
 test("only the exact Tauri path initializer in a confirmed child frame is classified", () => {
   assert.equal(isEmbeddedTauriPathError(known), true)
@@ -24,6 +33,7 @@ test("only the exact Tauri path initializer in a confirmed child frame is classi
     { mainFrame: null },
     { source: undefined },
     { source: "app.plugins.start()" },
+    { source: known.source.replace("JSON.parse", "JSON.other") },
     { source: `${known.source} throw new Error('app');` },
     { message: "TypeError: actual document conversion failure" },
   ])

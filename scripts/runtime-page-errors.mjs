@@ -4,13 +4,11 @@ import { EventEmitter } from "node:events"
 // Tauri 2.12.4's path initializer also runs in Windows child frames. The
 // framework's IPC globals can be absent there. Recognize only that exact
 // initializer in a verified child frame; application/renderer errors still fail.
-const normalize = (source) =>
-  source.replace(/\/\/[^\r\n]*/g, "").replace(/\s+/g, "")
-const pathInitializer = normalize(`(function () {
-  Object.defineProperty(window.__TAURI_INTERNALS__.plugins, 'path', {
-    value: { sep: ${JSON.stringify("\\")}, delimiter: ";" }
-  })
-})();`)
+// Reconstructed from the pinned crate's path/init.js, plugin wrapper and
+// serialize-to-javascript output; independently matches the Windows CDP source.
+// Keep the exact bytes: an analogous application script is not an exception.
+const pathInitializerSha256 =
+  "aa46bd912cdbc5668bd706619e8f7de659d00d5af8512889de3f1ba61896cc71"
 
 export function isEmbeddedTauriPathError(error) {
   return (
@@ -18,7 +16,8 @@ export function isEmbeddedTauriPathError(error) {
     error.message ===
       "TypeError: Cannot read properties of undefined (reading 'plugins')" &&
     typeof error.source === "string" &&
-    normalize(error.source) === pathInitializer
+    createHash("sha256").update(error.source).digest("hex") ===
+      pathInitializerSha256
   )
 }
 
