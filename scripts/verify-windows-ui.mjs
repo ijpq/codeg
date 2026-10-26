@@ -14,6 +14,7 @@ import { startPiModel } from "./pi-native-model-fixture.mjs"
 import { piCapabilityChecks } from "./pi-capability-checks.mjs"
 import { prepareWindowsProfile } from "./windows-ui-profile.mjs"
 import { retainedHistory, scopedPageErrors } from "./release-history-check.mjs"
+import { scopedRuntimeErrors } from "./runtime-page-errors.mjs"
 import {
   businessAgentPage,
   restoredBusinessPage,
@@ -1283,7 +1284,7 @@ try {
   )
   await enableNativeAgent(f)
   app = await startDesktop(installation, f, "upgraded-startup")
-  const upgradedErrors = scopedPageErrors(app.page)
+  const upgradedErrors = await scopedRuntimeErrors(app.page)
   let businessSaved
   try {
     const conversations = await desktopApi(app.page)("list_all_conversations")
@@ -1350,13 +1351,13 @@ try {
         assert.match(await readFile(destination, "utf8"), /PI_VERIFIED_CONTENT/)
       },
     })
+    const runtimeErrors = await upgradedErrors.stop()
     report.checks.push({
       name: "setup-application-errors",
-      passed: upgradedErrors.errors.length === 0,
-      errors: upgradedErrors.stop(),
-      details: upgradedErrors.details,
+      passed: runtimeErrors.errors.length === 0,
+      ...runtimeErrors,
     })
-    assert.deepEqual(upgradedErrors.errors, [], "Setup application page errors")
+    assert.deepEqual(runtimeErrors.errors, [], "Setup application page errors")
     // The scroll harness navigates and closes this isolated WebView. Finish
     // the app checks first; restart below to verify persisted business state.
     await run(process.execPath, ["scripts/browser-scroll-regression.mjs"], {
@@ -1365,7 +1366,7 @@ try {
       CODEG_BROWSER_EVIDENCE: join(output, "webview-scroll"),
     })
   } finally {
-    upgradedErrors.stop()
+    await upgradedErrors.stop()
     await stopDesktop(app)
   }
   app = await startDesktop(installation, f, "business-restart")
@@ -1498,10 +1499,11 @@ try {
     const context = await browser.newContext({
       viewport: { width: 1200, height: 900 },
     })
-    await context.addInitScript(
-      (token) => localStorage.setItem("codeg_token", token),
-      token
-    )
+    await context.addInitScript((token) => {
+      // Authentication belongs to the application, not sandboxed document
+      // frames (which intentionally cannot access localStorage).
+      if (window === window.top) localStorage.setItem("codeg_token", token)
+    }, token)
     const page = await context.newPage()
     await page.goto(`http://127.0.0.1:${port}/workspace`)
     await actualPage(page, "server-web-frontend", options.baseline !== "true")

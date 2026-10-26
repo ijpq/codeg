@@ -5,6 +5,7 @@ import { readFileSync } from "node:fs"
 import vm from "node:vm"
 import { test } from "node:test"
 import "./test-release-history-check.mjs"
+import "./test-runtime-page-errors.mjs"
 
 const workflow = readFileSync(
   process.env.CODEG_RELEASE_WORKFLOW_FIXTURE ??
