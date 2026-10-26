@@ -189,6 +189,22 @@ gh release view "$RELEASE_TAG" --json tagName,isDraft,isPrerelease,publishedAt,u
 最终报告至少写明：upstream 基线 tag/commit、本地 release commit、origin tag、普通 CI 结果、
 Release CI 结果和 GitHub Release 地址。
 
+## 自用 fork 的门禁范围
+
+`ijpq/codeg` 只交付 Windows x64 Server 和 Setup。普通 `test.yml` 对本 fork 仅创建
+Windows Rust desktop/server/cli 和 Windows Codex 原生运行组件任务；Plan/Goal 的真实
+协议验证也在 Windows 执行。Linux/macOS 客户端编译、Clippy、测试和 Unix 安装脚本不属于
+自用版门禁；保留上游仓库的完整平台矩阵，不删除跨平台源码。
+
+Linux runner 上的通用前端单元测试、静态构建、浏览器滚动回归，以及无 Tauri 依赖的
+共享 parser/HTTP 集成测试继续作为门禁。按测试内容区分共享逻辑与平台专属任务。
+Windows 候选双包、正式双包、安装启动、升级/回滚、资源依赖迁移、实际页面及发布后
+重新下载与 SHA256 验证均继续执行。不得以收窄平台范围为由跳过这些步骤。
+
+旧的混合平台 workflow 不能单独取消一个 job；若仍有必要的 Windows/shared job，保留它
+运行，但纯其他平台结果不再作为本次门禁。只有剩余任务全为不再需要的平台专属任务时，
+才可取消本次自有旧运行。CI 配置变更后的正式发布仍须使用新 commit 的普通 CI 和 Release。
+
 ## CI 失败后的规则
 
 - 只是 GitHub runner、下载源等瞬时基础设施问题且代码未变，可以重跑同一 SHA 的 workflow。

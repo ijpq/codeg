@@ -23,7 +23,9 @@ env:
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 concurrency:
-  group: test-${{ github.ref }}
+  # Separate the custom Windows scope from already-running full-platform jobs,
+  # so adopting this policy does not cancel their unfinished Windows checks.
+  group: test-${{ github.ref }}-${{ github.repository == 'ijpq/codeg' && 'windows-shared' || 'all-platforms' }}
   cancel-in-progress: true
 
 jobs:
@@ -84,8 +86,38 @@ jobs:
       - name: Draft release reuse regression
         run: node --test scripts/test-release-draft.mjs
 
+      - name: Custom Windows CI scope regression
+        run: node --test scripts/test-custom-ci-scope.mjs
+
+      - name: Web handlers must route through commands/*_core
+        working-directory: src-tauri
+        run: |
+          if grep -nE 'folder_service::|conversation_service::|tab_service::|import_service::' \
+             src/web/handlers/folders.rs \
+             src/web/handlers/conversations.rs; then
+            echo "::error::Web handlers must call commands/*_core, not services directly."
+            exit 1
+          fi
+
       - name: Static export build
         run: pnpm build
+
+  shared-integration:
+    name: Shared parser and HTTP integration tests
+    if: github.repository == 'ijpq/codeg'
+    # These exercise shared parsers, SQLite, auth and the HTTP router. No Tauri,
+    # Linux/macOS client, system webview libraries or platform package is built.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+          shared-key: shared-headless-integration
+      - name: Run shared integration suites without a desktop runtime
+        working-directory: src-tauri
+        run: cargo test --no-default-features --features test-utils --test parsers_snapshot --test api_integration
 
   rust:
     name: Rust ${{ matrix.mode }} on ${{ matrix.os }}
@@ -93,7 +125,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, macos-latest, windows-latest]
+        # The self-use fork ships Windows only; upstream retains its matrix.
+        os: ${{ fromJSON(github.repository == 'ijpq/codeg' && '["windows-latest"]' || '["ubuntu-22.04","macos-latest","windows-latest"]') }}
         mode: [desktop, server, cli]
         include:
           - mode: desktop
@@ -180,8 +213,9 @@ jobs:
       - name: cargo test
         # Windows desktop test binaries link the Tauri runtime and can fail at
         # process load on GitHub-hosted runners before Rust tests start. Keep
-        # compile coverage here; Linux/macOS desktop and Windows server cells
-        # run the executable test suites.
+        # compile coverage here; Windows server runs shared unit tests and the
+        # headless shared-integration job executes parser/router integration.
+        # Packaged desktop execution is checked in isolated Windows UI jobs.
         working-directory: src-tauri
         run: cargo test ${{ matrix.cargo_args }} ${{ (matrix.os == 'windows-latest' && matrix.mode == 'desktop') && '--no-run' || '' }}
 
@@ -193,28 +227,12 @@ jobs:
         working-directory: src-tauri
         run: cargo clippy ${{ matrix.clippy_args }} -- -D warnings
 
-      - name: Web handlers must route through commands/*_core
-        # Lock in the dedup from Phase 8: web/handlers/{folders,conversations}.rs
-        # must not call DB services directly. They have to delegate to a
-        # `_core` function in `commands/*.rs` so the Tauri command and HTTP
-        # entrypoints share one implementation. Run on Linux only — pure
-        # text check, no per-OS variance.
-        if: matrix.os == 'ubuntu-22.04' && matrix.mode == 'desktop'
-        working-directory: src-tauri
-        run: |
-          if grep -nE 'folder_service::|conversation_service::|tab_service::|import_service::' \
-             src/web/handlers/folders.rs \
-             src/web/handlers/conversations.rs; then
-            echo "::error::Web handlers must call commands/*_core, not services directly."
-            exit 1
-          fi
-
   codex-recovery:
     name: Codex recovery on ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, windows-2022]
+        os: ${{ fromJSON(github.repository == 'ijpq/codeg' && '["windows-2022"]' || '["ubuntu-22.04","windows-2022"]') }}
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -223,6 +241,7 @@ jobs:
       CARGO_BUILD_JOBS: 1
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
+      PYTHONUTF8: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.95.0
@@ -284,9 +303,13 @@ jobs:
           npm install --prefix "$RUNNER_TEMP/codeg-acp-222" --ignore-scripts --no-audit --no-fund @agentclientprotocol/codex-acp@2.2.2
           python3 -B scripts/diagnose-codex-resume-layers.py --cli "$RUNNER_TEMP/codeg-codex-runtime/codex" --acp "$RUNNER_TEMP/codeg-acp-211/node_modules/.bin/codex-acp" --output "$RUNNER_TEMP/codeg-codex-evidence/acp-211" --size-mib 64 --fast --verify-prompt
           python3 -B scripts/diagnose-codex-resume-layers.py --cli "$RUNNER_TEMP/codeg-codex-runtime/codex" --acp "$RUNNER_TEMP/codeg-acp-222/node_modules/.bin/codex-acp" --output "$RUNNER_TEMP/codeg-codex-evidence/acp-222" --size-mib 64 --fast --verify-prompt
+      - name: Install the pinned native Plan and Goal adapter
+        run: npm install --prefix "$RUNNER_TEMP/codeg-acp-222" --ignore-scripts --no-audit --no-fund @agentclientprotocol/codex-acp@2.2.2
       - name: Verify native Plan and Goal on the shipped runtime
-        if: runner.os == 'Linux'
-        run: python3 -B scripts/test-codex-goal-protocol.py --cli "$RUNNER_TEMP/codeg-codex-runtime/codex" --acp "$RUNNER_TEMP/codeg-acp-222/node_modules/@agentclientprotocol/codex-acp/dist/index.js" --output "$RUNNER_TEMP/codeg-codex-evidence/native-goal"
+        run: |
+          suffix=""
+          if [ "$RUNNER_OS" = "Windows" ]; then suffix=".exe"; fi
+          python -B scripts/test-codex-goal-protocol.py --cli "$RUNNER_TEMP/codeg-codex-runtime/codex$suffix" --acp "$RUNNER_TEMP/codeg-acp-222/node_modules/@agentclientprotocol/codex-acp/dist/index.js" --output "$RUNNER_TEMP/codeg-codex-evidence/native-goal"
       - name: Retain tested private runtime for this exact commit
         uses: actions/upload-artifact@v4
         with:
@@ -303,6 +326,8 @@ jobs:
           if-no-files-found: warn
 
   install-sh:
+    # Unix installer checks are not a gate for the Windows-only self-use fork.
+    if: github.repository != 'ijpq/codeg'
     # install.sh stops what runs the files it replaces, and nothing else: on
     # Linux `cp` onto a running program fails, but the desktop app, other
     # users, other directories and containers run a codeg-server or codeg-mcp

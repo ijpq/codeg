@@ -36,6 +36,10 @@
   from an older delivery cannot discard the next review while it is loading.
 - Keep the active file tab's close target usable in narrow desktop columns;
   verify real pointer hit targets against the reproduced packaged layout.
+- Limit self-use CI gates to Windows builds and shared logic. Retain common
+  frontend/browser and headless parser/HTTP tests on Linux, move native Plan/Goal
+  verification to Windows, and keep both Windows package acceptance gates.
+  Linux/macOS clients and Unix installer checks no longer block this fork.
 
 See [release notes](docs/releases/v0.40.0-fix2.md).
 
