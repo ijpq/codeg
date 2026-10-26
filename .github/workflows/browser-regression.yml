@@ -24,6 +24,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm exec playwright-core install --with-deps chromium
       - run: node scripts/browser-scroll-regression.mjs ${{ inputs.baseline && '--baseline' || '' }}
+      - run: node scripts/browser-file-tabs-regression.mjs --baseline-ref 80b4df540d8a32fc82656c21775cc29256ef87c3
       - uses: actions/upload-artifact@v4
         if: always()
         with:

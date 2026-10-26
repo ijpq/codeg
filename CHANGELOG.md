@@ -32,6 +32,8 @@
   Keep manual in-app review, clear conversion failures and review-copy downloads.
 - Order Office review updates by persistent task sequence, so a late duplicate
   from an older delivery cannot discard the next review while it is loading.
+- Keep the active file tab's close target usable in narrow desktop columns;
+  verify real pointer hit targets against the reproduced packaged layout.
 
 See [release notes](docs/releases/v0.40.0-fix2.md).
 

@@ -497,9 +497,13 @@ const FileWorkspaceTabItem = memo(function FileWorkspaceTabItem({
         // gutter) so the line is the only separation, and the inner row owns its
         // own `overflow-hidden`. The active tab is raised (`z-10`) so its
         // reverse-corner seat is never covered by a hovered neighbour's flare.
+        // Keep the active file's icon and close target inside its own box even
+        // when window controls leave a very narrow file strip. A zero-width
+        // active tab puts its absolute close button under the trailing "+".
+        // The existing nearest scroll keeps this minimum-width tab in view.
         // Standalone: rounded pill, intrinsic width (scroll).
         embedded
-          ? "browser-tab-item min-w-0 grow-0 shrink basis-48 data-[active=true]:z-10"
+          ? "browser-tab-item min-w-0 grow-0 shrink basis-48 data-[active=true]:z-10 data-[active=true]:min-w-12"
           : "rounded-full shrink-0",
         isTouchSorting && "z-50 opacity-90 shadow-md ring-1 ring-primary/25"
       )}
