@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.40.0-fix2 — 2026-10-26
+
+- Add Pi to the stable business conversation switcher, preserving independent
+  native sessions and per-engine settings, incremental context, shared memory,
+  Skills, history and deliverables across handoffs and restart.
+- Verify Pi native session/header/path identities, safely import legacy aliases,
+  persist empty sessions, and refuse unverified initialization or restoration.
+- Connect Pi 1.4 native MCP, steering and tail clone; exercise actual companion
+  delegation, cancellation, result collection and registered deliverable download.
+- Add durable conversation-targeted external messages, frozen Agent/session/
+  generation/settings, constrained delivery, idempotency, status and cancellation.
+  Preserve legacy APIs with strict routing; retain uncertain deliveries without replay.
+- Pass Pi Fast / Speed to actual Responses payloads independently of reasoning,
+  persist per-model choices, reject unsupported/busy changes, and distinguish
+  requested, endpoint-reported and verified upstream tiers without billing claims.
+- Ship matching private Node 24.16.0, Pi 1.4.0 and pi-acp 0.0.34-codeg.2 in both
+  Windows packages, with source pins, dependency locks, file inventories and licenses.
+- Expand isolated Server/Setup protocol, failure, upgrade and asset verification.
+  Preserve whole-task timing, native Plan/Goal, all deliverables and scroll fixes.
+- Repair inline deliverable refresh field compatibility, stable prompt identities,
+  loaded-page/branch scope and first-turn updates; reject ambiguous time-only
+  associations while preserving unlinked history and explicit-empty declarations.
+- Acquire the SQLite writer before deliverable-set reads, avoiding a reproduced
+  native MCP registration failure during concurrent history backfill.
+- Drive Office auto-preview from settled final deliveries instead of workspace
+  edits. Preserve immutable review bytes during later work, apply final replace/
+  clear semantics, deduplicate completion events, and respect user tab choices.
+  Keep manual in-app review, clear conversion failures and review-copy downloads.
+
+See [release notes](docs/releases/v0.40.0-fix2.md).
+
 ## 0.40.0-fix1 — 2026-10-25
 
 - Keep one visible business conversation when switching Codex / Claude Code,
