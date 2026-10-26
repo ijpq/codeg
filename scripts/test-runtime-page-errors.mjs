@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
-import { EventEmitter } from "node:events"
+import { EventEmitter, once } from "node:events"
 import {
   correlateRuntimeErrors,
   isEmbeddedTauriPathError,
@@ -83,4 +83,73 @@ test("CDP frame identity and source are required and the scope closes once", asy
   assert.strictEqual(await scope.stop(), result)
   assert.equal(detached, 1)
   assert.equal(page.listenerCount("pageerror"), 0)
+})
+
+test("out-of-process iframe exceptions are inspected before the child resumes", async () => {
+  const client = new EventEmitter()
+  const page = new EventEmitter()
+  const commands = []
+  const completed = once(client, "child-exception-observed")
+  const emitChild = (method, params) =>
+    client.emit("Target.receivedMessageFromTarget", {
+      sessionId: "office-session",
+      message: JSON.stringify({ method, params }),
+    })
+  client.send = async (method, params) => {
+    if (method === "Page.getFrameTree")
+      return { frameTree: { frame: { id: "app" } } }
+    if (method === "Target.setAutoAttach" && params.autoAttach)
+      queueMicrotask(() =>
+        client.emit("Target.attachedToTarget", {
+          sessionId: "office-session",
+          targetInfo: { type: "iframe", targetId: "office" },
+        })
+      )
+    if (method === "Target.sendMessageToTarget") {
+      const packet = JSON.parse(params.message)
+      commands.push(packet.method)
+      queueMicrotask(() => {
+        if (packet.method === "Runtime.enable")
+          emitChild("Runtime.executionContextCreated", {
+            context: { id: 9, auxData: { frameId: "office" } },
+          })
+        client.emit("Target.receivedMessageFromTarget", {
+          sessionId: "office-session",
+          message: JSON.stringify({
+            id: packet.id,
+            result:
+              packet.method === "Debugger.getScriptSource"
+                ? { scriptSource: known.source }
+                : {},
+          }),
+        })
+        if (packet.method === "Runtime.runIfWaitingForDebugger") {
+          page.emit("pageerror", new TypeError(known.message.slice(11)))
+          emitChild("Runtime.exceptionThrown", {
+            exceptionDetails: {
+              executionContextId: 9,
+              exception: { description: known.message },
+              stackTrace: { callFrames: [{ scriptId: "path-init" }] },
+            },
+          })
+          client.emit("child-exception-observed")
+        }
+      })
+    }
+    return {}
+  }
+  client.detach = async () => {}
+  page.context = () => ({ newCDPSession: async () => client })
+  const scope = await scopedRuntimeErrors(page)
+  await completed
+  const result = await scope.stop()
+  assert.deepEqual(result.errors, [])
+  assert.equal(result.embeddedFrameworkErrors.length, 1)
+  assert.equal(result.embeddedFrameworkErrors[0].frameId, "office")
+  assert.ok(
+    commands.indexOf("Debugger.enable") <
+      commands.indexOf("Runtime.runIfWaitingForDebugger")
+  )
+  assert.ok(commands.includes("Debugger.getScriptSource"))
+  assert.equal(client.listenerCount("Target.receivedMessageFromTarget"), 0)
 })
