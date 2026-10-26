@@ -22,6 +22,7 @@ test("only the exact Tauri path initializer in a confirmed child frame is classi
   for (const change of [
     { mainFrame: true },
     { mainFrame: null },
+    { source: undefined },
     { source: "app.plugins.start()" },
     { source: `${known.source} throw new Error('app');` },
     { message: "TypeError: actual document conversion failure" },

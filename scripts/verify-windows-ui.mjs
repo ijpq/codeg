@@ -1472,6 +1472,7 @@ try {
   child.stdout.pipe(serverLog)
   child.stderr.pipe(serverLog)
   let browser
+  let serverErrors
   try {
     const api = async (command, args = {}) => {
       const response = await fetch(`http://127.0.0.1:${port}/api/${command}`, {
@@ -1506,6 +1507,7 @@ try {
     }, token)
     const page = await context.newPage()
     await page.goto(`http://127.0.0.1:${port}/workspace`)
+    serverErrors = await scopedRuntimeErrors(page)
     await actualPage(page, "server-web-frontend", options.baseline !== "true")
     if (options.baseline !== "true")
       await completedConversationPage(page, api, conversation, "server-web")
@@ -1561,7 +1563,15 @@ try {
           )
         ),
       })
+    const runtimeErrors = await serverErrors.stop()
+    report.checks.push({
+      name: "server-web-application-errors",
+      passed: runtimeErrors.errors.length === 0,
+      ...runtimeErrors,
+    })
+    assert.deepEqual(runtimeErrors.errors, [], "Server application page errors")
   } finally {
+    await serverErrors?.stop()
     await browser?.close()
     await stopOwnedProcess(child)
     serverLog.end()

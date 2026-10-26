@@ -16,6 +16,7 @@ export function isEmbeddedTauriPathError(error) {
     error.mainFrame === false &&
     error.message ===
       "TypeError: Cannot read properties of undefined (reading 'plugins')" &&
+    typeof error.source === "string" &&
     normalize(error.source) === pathInitializer
   )
 }

@@ -9,6 +9,10 @@
   restored old app renders its actual current tail; missing history still fails.
 - Scope frontend error observations to the page check and snapshot their results,
   so later isolated scroll-harness navigation cannot mutate earlier evidence.
+- Correlate runtime exceptions with CDP frame identity and initializer source.
+  Preserve the exact Tauri path-initializer child-frame exception separately;
+  application, unknown and uncorrelated errors still fail package acceptance.
+  Keep isolated test authentication out of sandboxed document frames.
 - Retain Windows/shared CI and full Server/Setup installation, upgrade, restart,
   rollback, native protocol and post-publication download verification gates.
 
