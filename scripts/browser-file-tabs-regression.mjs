@@ -121,8 +121,21 @@ try {
           // attached for measurement; current hit targets still have to pass
           // the browser's real visibility checks when clicked below.
           await tab.waitFor({ state: "attached" })
-          await page.waitForTimeout(80)
           const close = tab.getByRole("button", { name: "Close file tab" })
+          // Reorder animates between the preceding fixture's widths. Wait for
+          // the same stable, unobstructed target a real click requires before
+          // measuring; a fixed delay can sample an intermediate scale transform.
+          let actionReady = false
+          let actionError = null
+          try {
+            await close.click({
+              trial: true,
+              timeout: variant === "baseline" ? 1200 : 5000,
+            })
+            actionReady = true
+          } catch (error) {
+            actionError = String(error).split("\n")[0]
+          }
           const geometry = await close.evaluate((button) => {
             const rect = button.getBoundingClientRect()
             const strip = button
@@ -135,10 +148,16 @@ try {
               y = rect.y + rect.height / 2
             return {
               tabWidth: item.width,
+              minimumWidth: getComputedStyle(
+                button.closest("[data-file-tab-id]")
+              ).minWidth,
               closeLeft: rect.left,
               closeRight: rect.right,
               stripLeft: strip.left,
               stripRight: strip.right,
+              fullyContained:
+                rect.left >= strip.left - 0.5 &&
+                rect.right <= strip.right + 0.5,
               hit: button.contains(document.elementFromPoint(x, y)),
             }
           })
@@ -147,7 +166,7 @@ try {
               path: join(output, `${variant}-narrow.png`),
             })
           let clicked = false
-          if (geometry.hit) {
+          if (actionReady && geometry.hit) {
             const before = await page.evaluate(
               () => window.fileTabsFixture.closed.length
             )
@@ -161,14 +180,23 @@ try {
               { before, active }
             )
           }
-          results.push({ variant, width, count, active, ...geometry, clicked })
+          results.push({
+            variant,
+            width,
+            count,
+            active,
+            ...geometry,
+            actionReady,
+            actionError,
+            clicked,
+          })
         }
       }
     }
   }
   assert.deepEqual(errors, [])
   const failed = results.filter(
-    (row) => row.variant === "current" && !row.clicked
+    (row) => row.variant === "current" && (!row.clicked || !row.fullyContained)
   )
   assert.equal(failed.length, 0, JSON.stringify(failed))
   if (baseline) {
