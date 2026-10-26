@@ -117,7 +117,10 @@ try {
           const tab = page.locator(
             `[data-file-tab-id="file:/fixture/office-review-${active}.docx"]`
           )
-          await tab.waitFor()
+          // The baseline bug can collapse the tab to zero width. It must be
+          // attached for measurement; current hit targets still have to pass
+          // the browser's real visibility checks when clicked below.
+          await tab.waitFor({ state: "attached" })
           await page.waitForTimeout(80)
           const close = tab.getByRole("button", { name: "Close file tab" })
           const geometry = await close.evaluate((button) => {
