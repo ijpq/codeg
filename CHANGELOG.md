@@ -1,6 +1,25 @@
 # Changelog
 
-## 0.40.0-fix3 — 2026-10-26
+## 0.40.0-fix4 — 2026-10-27
+
+- Retain the stable Codex/Claude/Pi business conversation, external delivery,
+  service-tier, whole-task timing, native Plan/Goal, scrolling, deliverable and
+  completed Office review changes from the quarantined fix3 package.
+- Prevent the isolated Office converter from updating or installing itself.
+  Verify its exact executable path and SHA256 before and after actual use;
+  changes affect test children only, preserving users' runtime configuration.
+- Require converter-integrity regressions in Windows package acceptance both
+  before and after publication, without invalidating the unrelated pinned
+  Codex native-build cache. Keep Windows and shared-logic release gates.
+- Preserve the failed fix3 release and its evidence as a quarantined prerelease.
+  Three optimized allocation-traced full Setup/Server runs did not reproduce
+  its one observed 32 GiB allocation failure; three further original-package
+  runs with the fixed converter also passed. The cause remains unconfirmed;
+  no speculative application change or claim of a memory fix is included.
+
+See [release notes](docs/releases/v0.40.0-fix4.md).
+
+## 0.40.0-fix3 — 2026-10-26 (quarantined prerelease)
 
 - Deliver the Pi/business conversation, external delivery, service tier, artifact,
   Office review and SQLite writer fixes accumulated in the unpublished fix2 candidate.
