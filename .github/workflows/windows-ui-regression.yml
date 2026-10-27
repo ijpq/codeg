@@ -27,6 +27,10 @@ on:
         description: Repeat the pinned original dual packages three times without compiling a traced binary
         type: boolean
         default: false
+      allocation_annotation_only:
+        description: Only annotate the quarantined failed fix3 release, without building or running packages
+        type: boolean
+        default: false
       diagnose_fix2:
         description: Verify the corrected harness against the unchanged unpublished b9c6baeae Windows packages
         type: boolean
@@ -277,17 +281,20 @@ jobs:
         with:
           fetch-depth: 0
       - uses: pnpm/action-setup@v4
+        if: ${{ !inputs.allocation_annotation_only }}
       - uses: actions/setup-node@v4
+        if: ${{ !inputs.allocation_annotation_only }}
         with:
           node-version: 24
           cache: pnpm
       - uses: actions/setup-python@v5
+        if: ${{ !inputs.allocation_annotation_only }}
         with:
           python-version: "3.12"
       - uses: dtolnay/rust-toolchain@stable
-        if: ${{ !inputs.allocation_original_only }}
+        if: ${{ !inputs.allocation_original_only && !inputs.allocation_annotation_only }}
       - uses: swatinem/rust-cache@v2
-        if: ${{ !inputs.allocation_original_only }}
+        if: ${{ !inputs.allocation_original_only && !inputs.allocation_annotation_only }}
         with:
           workspaces: "./src-tauri -> target"
           shared-key: server-x86_64-pc-windows-msvc
@@ -304,8 +311,20 @@ jobs:
           New-Item -ItemType Directory $root | Out-Null
           $release=gh api repos/$env:GITHUB_REPOSITORY/releases/tags/v0.40.0-fix3 | ConvertFrom-Json
           if ($LASTEXITCODE -ne 0 -or $release.tag_name -ne 'v0.40.0-fix3') { throw 'Wrong diagnostic release' }
-          gh api --method PATCH repos/$env:GITHUB_REPOSITORY/releases/$($release.id) -F prerelease=true -f make_latest=false | Out-Null
+          $failed=gh api repos/$env:GITHUB_REPOSITORY/actions/runs/40449537644 | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $failed.head_sha -ne '81836e25d1d21d6627eb8062441c2505d4eaf3ea' -or $failed.conclusion -ne 'failure') { throw 'Failed release evidence does not match' }
+          $body=$release.body
+          if (-not $body.Contains('发布后验收未通过')) {
+            $body="> **发布后验收未通过：本版本已隔离为预发布。** Windows Server 在发布后隔离复验中出现 32 GiB 分配失败并退出；原因仍在诊断。草稿阶段的通过结果不代表最终交付成功。此版本不作为本次已验收交付，现有 tag 和资产保留用于诊断。`n> 失败证据：https://github.com/ijpq/codeg/actions/runs/40449537644`n`n"+$body
+          }
+          $payload=Join-Path $root 'quarantine-note.json'
+          @{prerelease=$true;make_latest='false';body=$body} | ConvertTo-Json | Set-Content $payload -Encoding utf8
+          gh api --method PATCH repos/$env:GITHUB_REPOSITORY/releases/$($release.id) --input $payload | Out-Null
           if ($LASTEXITCODE -ne 0) { throw 'Failed to quarantine unverified release' }
+          $updated=gh api repos/$env:GITHUB_REPOSITORY/releases/tags/v0.40.0-fix3 | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or -not $updated.prerelease -or $updated.body -cne $body) { throw 'Quarantine note did not persist' }
+          if (Compare-Object @($release.assets | ForEach-Object { "$($_.id):$($_.name):$($_.digest)" }) @($updated.assets | ForEach-Object { "$($_.id):$($_.name):$($_.digest)" })) { throw 'Release assets changed during annotation' }
+          if ('${{ inputs.allocation_annotation_only }}' -eq 'true') { exit 0 }
           gh release download v0.40.0-fix3 --repo $env:GITHUB_REPOSITORY --dir $root --pattern codeg-server-windows-x64.zip
           if ($LASTEXITCODE -ne 0) { throw 'Diagnostic package download failed' }
           $archive=Join-Path $root 'codeg-server-windows-x64.zip'
@@ -329,7 +348,9 @@ jobs:
           "DIAG_ROOT=$root" >> $env:GITHUB_ENV
           "DIAG_SERVER=$server" >> $env:GITHUB_ENV
       - run: pnpm install --frozen-lockfile
+        if: ${{ !inputs.allocation_annotation_only }}
       - name: Prepare isolated protocol and browser harness
+        if: ${{ !inputs.allocation_annotation_only }}
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -340,6 +361,7 @@ jobs:
           python -B scripts/prepare-office-preview-test.py --output $tools
           if ($LASTEXITCODE -ne 0) { throw 'Office test converter failed' }
       - name: Exercise original dual packages in the failed Windows 2022 environment
+        if: ${{ !inputs.allocation_annotation_only }}
         shell: pwsh
         run: |
           $count=if ('${{ inputs.allocation_original_only }}' -eq 'true') { 3 } else { 1 }
@@ -351,6 +373,7 @@ jobs:
           }
           exit 0
       - uses: actions/upload-artifact@v4
+        if: ${{ !inputs.allocation_annotation_only }}
         with:
           name: original-windows-2022-diagnosis
           path: |
@@ -360,7 +383,7 @@ jobs:
             ${{ runner.temp }}/allocation-diagnosis/original-server-*/**/*.png
           retention-days: 14
       - name: Build a diagnostic binary with symbolized bounded allocation tracing
-        if: ${{ !inputs.allocation_original_only }}
+        if: ${{ !inputs.allocation_original_only && !inputs.allocation_annotation_only }}
         shell: pwsh
         run: |
           Get-Content scripts/diagnostic-allocation-trace.rs -Raw | Add-Content src-tauri/src/bin/codeg_server.rs
@@ -372,7 +395,7 @@ jobs:
           Copy-Item src-tauri/target/x86_64-pc-windows-msvc/release/codeg_server.pdb $env:DIAG_SERVER -ErrorAction SilentlyContinue
           Copy-Item src-tauri/target/x86_64-pc-windows-msvc/release/codeg-server.pdb $env:DIAG_SERVER -ErrorAction SilentlyContinue
       - name: Reproduce with allocation call stacks and fresh isolated profiles
-        if: ${{ !inputs.allocation_original_only }}
+        if: ${{ !inputs.allocation_original_only && !inputs.allocation_annotation_only }}
         shell: pwsh
         run: |
           foreach ($i in 1..3) {
@@ -383,7 +406,7 @@ jobs:
           }
           exit 0
       - uses: actions/upload-artifact@v4
-        if: ${{ always() && !inputs.allocation_original_only }}
+        if: ${{ always() && !inputs.allocation_original_only && !inputs.allocation_annotation_only }}
         with:
           name: server-allocation-diagnostics
           path: |
