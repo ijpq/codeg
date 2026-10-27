@@ -229,6 +229,9 @@ jobs:
 
   codex-recovery:
     name: Codex recovery on ${{ matrix.os }}
+    permissions:
+      contents: read
+      actions: read
     strategy:
       fail-fast: false
       matrix:
@@ -255,6 +258,7 @@ jobs:
           python -B scripts/test-codex-runtime-migrations.py
           python -B scripts/test-codex-runtime-cache.py
           python -B scripts/test-codex-resume-comparison.py
+          python -B scripts/test-reuse-tested-codex-build.py
       - name: Install native build prerequisites
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libssl-dev libcap-dev pkg-config cmake clang strace
@@ -263,15 +267,24 @@ jobs:
           node-version: 24
       - name: Install isolated reference CLI
         run: npm install --prefix "$RUNNER_TEMP/codeg-codex-reference" --ignore-scripts --no-audit --no-fund @openai/codex@0.162.1
+      - name: Reuse an identical originally tested Windows runtime
+        id: codex-build
+        if: github.repository == 'ijpq/codeg' && runner.os == 'Windows'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python -B scripts/reuse-tested-codex-build.py --output-dir "$RUNNER_TEMP/codeg-codex-runtime"
       - name: Prepare exact pinned runtime source
+        if: steps.codex-build.outputs.reused != 'true'
         run: python -B scripts/build-codex-runtime.py --source-dir "$RUNNER_TEMP/codeg-codex-source" --output-dir "$RUNNER_TEMP/codeg-codex-runtime" --prepare-only
       - uses: swatinem/rust-cache@v2
+        if: steps.codex-build.outputs.reused != 'true'
         with:
           workspaces: "${{ runner.temp }}/codeg-codex-source/codex-rs -> ../../codeg-codex-target"
           shared-key: codex-recovery-target-v3-${{ matrix.os }}-${{ hashFiles('vendor/codex-runtime/**', 'scripts/build-codex-runtime.py', '.github/workflows/test.yml') }}
           cache-workspace-crates: true
           cache-on-failure: true
       - name: Test and build pinned recovery runtime
+        if: steps.codex-build.outputs.reused != 'true'
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/codeg-codex-target
         run: python -B scripts/build-codex-runtime.py --source-dir "$RUNNER_TEMP/codeg-codex-source" --output-dir "$RUNNER_TEMP/codeg-codex-runtime"

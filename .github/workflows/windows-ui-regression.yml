@@ -169,19 +169,22 @@ jobs:
           $ErrorActionPreference='Stop'
           $root=Join-Path $env:RUNNER_TEMP 'ui-baseline'
           New-Item -ItemType Directory -Force $root | Out-Null
-          gh release download v0.36.0-fix1 --repo $env:GITHUB_REPOSITORY --dir $root
+          $baselineTag=if ($env:CANDIDATE_UI -eq 'true') { 'v0.40.0-fix4' } else { 'v0.36.0-fix1' }
+          $baselineVersion=$baselineTag.TrimStart('v')
+          $baselineSetup="codeg_${baselineVersion}_x64-setup.exe"
+          gh release download $baselineTag --repo $env:GITHUB_REPOSITORY --dir $root
           if ($LASTEXITCODE -ne 0) { throw 'Baseline download failed' }
-          foreach ($file in @('codeg_0.36.0-fix1_x64-setup.exe','codeg-server-windows-x64.zip')) {
+          foreach ($file in @($baselineSetup,'codeg-server-windows-x64.zip')) {
             $hash=((Get-Content (Join-Path $root "$file.sha256") -Raw).Trim() -split '\s+')[0].ToLower()
             if ((Get-FileHash (Join-Path $root $file) -Algorithm SHA256).Hash.ToLower() -ne $hash) { throw 'Baseline hash mismatch' }
           }
           Expand-Archive (Join-Path $root 'codeg-server-windows-x64.zip') (Join-Path $root 'server')
-          $setup=Join-Path $root 'codeg_0.36.0-fix1_x64-setup.exe'
+          $setup=Join-Path $root $baselineSetup
           $previous=$setup
           $server=Join-Path $root 'server/codeg-server-windows-x64'
           $previousServer=$server
           $extra=@('--baseline','true')
-          $version='0.36.0-fix1'
+          $version=$baselineVersion
           if ($env:CANDIDATE_UI -eq 'true') {
             $version=(Get-Content package.json -Raw | ConvertFrom-Json).version
             $setup=(Get-Item "src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/codeg_${version}_x64-setup.exe").FullName

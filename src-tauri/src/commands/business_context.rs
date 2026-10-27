@@ -196,7 +196,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let skill = selected.join("skills/documents");
+        let skill = selected.join("skills").join("documents");
         tokio::fs::create_dir_all(&skill).await.unwrap();
         tokio::fs::write(skill.join("SKILL.md"), "---\ndescription: Official document template and acceptance\n---\nPRIVATE_BODY_NOT_AUTOMATICALLY_LOADED").await.unwrap();
         let env = BTreeMap::from([
