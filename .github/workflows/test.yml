@@ -89,6 +89,9 @@ jobs:
       - name: Custom Windows CI scope regression
         run: node --test scripts/test-custom-ci-scope.mjs
 
+      - name: Isolated Office converter integrity regression
+        run: node --test scripts/test-office-test-runtime.mjs
+
       - name: Web handlers must route through commands/*_core
         working-directory: src-tauri
         run: |

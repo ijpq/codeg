@@ -45,7 +45,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Verify isolated profiles with the Windows Known Folder API
-        run: node --test scripts/test-windows-ui-profile.mjs
+        run: node --test scripts/test-windows-ui-profile.mjs scripts/test-office-test-runtime.mjs
   setup-ui:
     if: ${{ !inputs.diagnose_fix2 && !inputs.diagnose_allocation }}
     runs-on: windows-2022

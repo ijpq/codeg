@@ -4,7 +4,8 @@ import { execFile } from "node:child_process"
 import { promisify } from "node:util"
 import { createHash, randomUUID } from "node:crypto"
 import { readFile, writeFile } from "node:fs/promises"
-import { join } from "node:path"
+import { join, resolve } from "node:path"
+import { verifyOfficeTestRuntime } from "./office-test-runtime.mjs"
 const execute = promisify(execFile)
 const delay = (ms) => new Promise((done) => setTimeout(done, ms))
 async function until(read, accepts, label) {
@@ -35,8 +36,22 @@ export async function officeDeliveryChecks({
     converter.installed && !converter.runtimeError,
     "The isolated real Office converter must run"
   )
-  const office = (...args) =>
-    execute(converter.path, args, { env: f.env, timeout: 30000 })
+  const pinned = f.officeTestRuntime
+  if (pinned) {
+    assert.equal(
+      resolve(converter.path).toLowerCase(),
+      pinned.path.toLowerCase(),
+      "Preview must use the pinned isolated converter"
+    )
+    await verifyOfficeTestRuntime(pinned)
+  }
+  const office = async (...args) => {
+    try {
+      return await execute(converter.path, args, { env: f.env, timeout: 30000 })
+    } finally {
+      if (pinned) await verifyOfficeTestRuntime(pinned)
+    }
+  }
   const makeDoc = async (file, text) => {
     const path = join(f.cwd, file)
     await office("create", path, "--force")
@@ -285,6 +300,9 @@ export async function officeDeliveryChecks({
       name: `${name}-office-delivery-preview`,
       passed: true,
       realConverter: converter.version,
+      ...(pinned
+        ? { converterSha256: pinned.sha256, converterUnchanged: true }
+        : {}),
       completionAndSettlementOnly: true,
       finalReplaceAndClear: true,
       immutableReview: true,
@@ -298,5 +316,6 @@ export async function officeDeliveryChecks({
     })
   } finally {
     piModel.holdOffice(false)
+    if (pinned) await verifyOfficeTestRuntime(pinned)
   }
 }

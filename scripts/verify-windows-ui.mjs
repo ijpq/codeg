@@ -13,6 +13,7 @@ import { startBusinessModel } from "./business-model-fixture.mjs"
 import { startPiModel } from "./pi-native-model-fixture.mjs"
 import { piCapabilityChecks } from "./pi-capability-checks.mjs"
 import { prepareWindowsProfile } from "./windows-ui-profile.mjs"
+import { prepareOfficeTestRuntime } from "./office-test-runtime.mjs"
 import { retainedHistory, scopedPageErrors } from "./release-history-check.mjs"
 import { scopedRuntimeErrors } from "./runtime-page-errors.mjs"
 import {
@@ -57,6 +58,10 @@ async function enableNativeAgent(f) {
   const pathKey =
     Object.keys(f.env).find((key) => key.toLowerCase() === "path") ?? "PATH"
   f.env[pathKey] = `${resolve(options["native-tools"])};${f.env[pathKey] ?? ""}`
+  f.officeTestRuntime = await prepareOfficeTestRuntime(
+    f.env,
+    resolve(options["native-tools"])
+  )
   f.env.CODEX_PATH = join(resolve(options.server), "runtime", "codex.exe")
   f.env.CLAUDE_CONFIG_DIR = join(f.root, "claude")
   await mkdir(f.env.CLAUDE_CONFIG_DIR, { recursive: true })
