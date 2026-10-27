@@ -54,7 +54,7 @@ export async function startPiModel() {
     }
     const marker = [
       ...latestUser.matchAll(
-        /PI_SCENARIO_(publish|delegate|cancel|office|officeclear)_([a-z0-9]+)/g
+        /PI_SCENARIO_(publish|delegate|cancel|office|officeclear|officeobserve)_([a-z0-9]+)/g
       ),
     ].at(-1)
     let text = isChild
@@ -109,6 +109,9 @@ export async function startPiModel() {
           text = "PI_OFFICE_COMPLETED"
           state.done = true
         }
+      } else if (kind === "officeobserve") {
+        text = "PI_OFFICE_OBSERVED"
+        state.done = true
       } else if (kind === "publish") {
         if (state.stage === 0)
           tool("write", {

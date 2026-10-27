@@ -23,6 +23,22 @@ use crate::models::{
 pub const SOURCE_DECLARED: &str = "declared";
 pub const SOURCE_INFERRED: &str = "inferred";
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TurnSetSource {
+    Declared,
+    Inferred,
+    Unattributed,
+}
+
+impl TurnSetSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Declared => SOURCE_DECLARED,
+            Self::Inferred | Self::Unattributed => SOURCE_INFERRED,
+        }
+    }
+}
+
 fn run_has_authoritative_declaration(run: &conversation_turn_run::Model) -> bool {
     matches!(
         run.declaration_status.as_str(),
@@ -45,6 +61,100 @@ fn retain_authoritative_associations(
                 || association.source == SOURCE_DECLARED
         })
         .collect()
+}
+
+fn has_trusted_file_change_owner(change: &conversation_turn_file_change::Model) -> bool {
+    change.attribution == "exclusive"
+        || (change.source == "agent_file_change_report" && change.attribution == "reported")
+}
+
+/// Older inference admitted ambiguous workspace observations as turn-owned
+/// files. Reject only associations contradicted by that persisted evidence;
+/// declarations remain authoritative. Query the already requested runs in
+/// bounded batches, without loading messages or inspecting file contents.
+async fn ambiguous_inferred_associations(
+    conn: &DatabaseConnection,
+    associations: &[conversation_turn_deliverable::Model],
+    models: &HashMap<String, conversation_deliverable::Model>,
+) -> Result<HashSet<String>, DbError> {
+    let mut candidates = HashMap::new();
+    let mut roots = HashMap::new();
+    for association in associations {
+        if association.source != SOURCE_INFERRED {
+            continue;
+        }
+        let Some(model) = models.get(&association.deliverable_id) else {
+            continue;
+        };
+        roots.insert(association.turn_run_id.clone(), model.root_path.clone());
+        candidates.insert(
+            (
+                association.turn_run_id.clone(),
+                normalized_deliverable_path_key(&model.root_path, &model.path),
+            ),
+            association.id.clone(),
+        );
+    }
+    let run_ids = roots.keys().cloned().collect::<Vec<_>>();
+    let mut ambiguous = HashSet::new();
+    for chunk in run_ids.chunks(500) {
+        let changes = conversation_turn_file_change::Entity::find()
+            .filter(conversation_turn_file_change::Column::TurnRunId.is_in(chunk.to_vec()))
+            .filter(conversation_turn_file_change::Column::Attribution.ne("exclusive"))
+            .all(conn)
+            .await?;
+        for change in changes {
+            if has_trusted_file_change_owner(&change) {
+                continue;
+            }
+            let Some(root) = roots.get(&change.turn_run_id) else {
+                continue;
+            };
+            let key = (
+                change.turn_run_id,
+                normalized_deliverable_path_key(root, &change.path),
+            );
+            if let Some(id) = candidates.get(&key) {
+                ambiguous.insert(id.clone());
+            }
+        }
+    }
+    Ok(ambiguous)
+}
+
+/// Review snapshots may outlive their source files. Validate only provenance,
+/// so legacy misattribution cannot reopen a different business's review while
+/// a genuine delivered snapshot remains readable after the source is changed.
+pub(super) async fn has_trusted_turn_association(
+    conn: &DatabaseConnection,
+    conversation_id: i32,
+    turn_run_id: &str,
+    deliverable_id: &str,
+) -> Result<bool, DbError> {
+    let association = conversation_turn_deliverable::Entity::find()
+        .filter(conversation_turn_deliverable::Column::ConversationId.eq(conversation_id))
+        .filter(conversation_turn_deliverable::Column::TurnRunId.eq(turn_run_id))
+        .filter(conversation_turn_deliverable::Column::DeliverableId.eq(deliverable_id))
+        .one(conn)
+        .await?;
+    let Some(association) = association else {
+        return Ok(false);
+    };
+    if association.source == SOURCE_DECLARED {
+        return Ok(true);
+    }
+    let Some(model) = conversation_deliverable::Entity::find_by_id(deliverable_id)
+        .one(conn)
+        .await?
+    else {
+        return Ok(false);
+    };
+    let models = HashMap::from([(model.id.clone(), model)]);
+    Ok(
+        ambiguous_inferred_associations(conn, &[association], &models)
+            .await?
+            .is_empty(),
+    )
 }
 
 /// A declaration that has already passed workspace containment and filesystem
@@ -362,14 +472,13 @@ async fn save_turn_set(
     conn: &DatabaseConnection,
     conversation_id: i32,
     turn_run_id: &str,
-    source: &str,
+    source: TurnSetSource,
     items: Vec<VerifiedDeliverable>,
     require_running: bool,
     replace_existing: bool,
 ) -> Result<Vec<ConversationDeliverable>, DbError> {
-    if source != SOURCE_DECLARED && source != SOURCE_INFERRED {
-        return Err(DbError::Validation("invalid deliverable source".into()));
-    }
+    let attributed = source != TurnSetSource::Unattributed;
+    let source = source.as_str();
     let txn = conversation_write_transaction(conn, conversation_id).await?;
     if conversation::Entity::find_by_id(conversation_id)
         .filter(conversation::Column::DeletedAt.is_null())
@@ -443,10 +552,15 @@ async fn save_turn_set(
         let position = position_offset.saturating_add(i32::try_from(position).unwrap_or(i32::MAX));
         let normalized_path = deliverable_path_identity(&item.root_path, &item.path);
         let existing = known_by_path.get(&normalized_path.identity).cloned();
+        // Observing an overlapping workspace is not evidence of task ownership.
+        // Keep a previously registered file's provenance, role and hidden state.
+        if !attributed && existing.is_some() {
+            continue;
+        }
 
         let model = if let Some(existing) = existing {
             let mut active = existing.into_active_model();
-            active.turn_run_id = Set(Some(turn_run_id.to_string()));
+            active.turn_run_id = Set(attributed.then(|| turn_run_id.to_string()));
             active.kind = Set(item.kind.clone());
             active.title = Set(item.title.clone());
             active.description = Set(item.description.clone());
@@ -470,7 +584,7 @@ async fn save_turn_set(
             conversation_deliverable::ActiveModel {
                 id: Set(uuid::Uuid::new_v4().to_string()),
                 conversation_id: Set(conversation_id),
-                turn_run_id: Set(Some(turn_run_id.to_string())),
+                turn_run_id: Set(attributed.then(|| turn_run_id.to_string())),
                 root_path: Set(normalized_path.storage_root),
                 path: Set(normalized_path.storage_path),
                 kind: Set(item.kind),
@@ -498,6 +612,10 @@ async fn save_turn_set(
         };
         known_by_path.insert(normalized_path.identity, model.clone());
         retained_ids.insert(model.id.clone());
+        if !attributed {
+            saved_pairs.push((model, None));
+            continue;
+        }
         let existing_association = if replace_existing {
             None
         } else {
@@ -538,7 +656,7 @@ async fn save_turn_set(
             .insert(&txn)
             .await?
         };
-        saved_pairs.push((model, association));
+        saved_pairs.push((model, Some(association)));
     }
 
     // A second declaration replaces only this turn. Remove aggregate rows that
@@ -581,7 +699,10 @@ async fn save_turn_set(
     txn.commit().await?;
     Ok(saved_pairs
         .into_iter()
-        .map(|(model, association)| to_info(model, Some(&association), Some(&run)))
+        .map(|(model, association)| {
+            let run = association.as_ref().map(|_| &run);
+            to_info(model, association.as_ref(), run)
+        })
         .collect())
 }
 
@@ -596,7 +717,7 @@ pub async fn save_declared_for_turn(
         conn,
         conversation_id,
         turn_run_id,
-        SOURCE_DECLARED,
+        TurnSetSource::Declared,
         items,
         true,
         replace_existing,
@@ -953,6 +1074,7 @@ pub async fn infer_for_turn(
         .collect::<HashSet<_>>();
 
     let mut inferred = Vec::new();
+    let mut unattributed = Vec::new();
     let mut observed_paths = HashSet::new();
     for change in &changes {
         observed_paths.insert(change.path.clone());
@@ -964,23 +1086,20 @@ pub async fn infer_for_turn(
         // Preserve source changes in the inclusive internal ledger for failed
         // declaration recovery, but expose only filtered standalone outputs as
         // user-facing inferred deliverables (see is_user_visible_deliverable).
-        let ambiguous_standalone_candidate = change.kind != ConversationTurnFileChangeKind::Deleted
+        let standalone_candidate = change.kind != ConversationTurnFileChangeKind::Deleted
             && standalone_output_extension(extension.as_deref());
-        let expected_code_recovery = expectation.expects_code_changes
-            && explicitly_expected
-            && !ambiguous_standalone_candidate;
+        let expected_code_recovery =
+            expectation.expects_code_changes && explicitly_expected && !standalone_candidate;
         if !matches!(
             change.source.as_str(),
             "watcher" | "agent_file_change_report"
-        ) || (change.attribution != "exclusive"
-            && !explicitly_expected
-            && !ambiguous_standalone_candidate)
+        ) || (change.attribution != "exclusive" && !explicitly_expected && !standalone_candidate)
             || existing_paths.contains(&change.path)
             || (inputs.contains(&change.path)
                 && change.kind == ConversationTurnFileChangeKind::Created)
             || !inference_path_hard_allowed(&change.path)
-            || (!ambiguous_standalone_candidate && !expected_code_recovery)
-            || (ambiguous_standalone_candidate && !inference_path_allowed(&change.path))
+            || (!standalone_candidate && !expected_code_recovery)
+            || (standalone_candidate && !inference_path_allowed(&change.path))
         {
             continue;
         }
@@ -1030,7 +1149,7 @@ pub async fn infer_for_turn(
         } else {
             "code_change"
         };
-        inferred.push(VerifiedDeliverable {
+        let item = VerifiedDeliverable {
             root_path: run.root_path.clone(),
             path: change.path.clone(),
             kind: "file".into(),
@@ -1054,7 +1173,12 @@ pub async fn infer_for_turn(
             modified_at,
             is_valid,
             invalid_reason,
-        });
+        };
+        if has_trusted_file_change_owner(change) {
+            inferred.push(item);
+        } else {
+            unattributed.push(item);
+        }
     }
 
     let expected_candidates = inferred
@@ -1083,20 +1207,34 @@ pub async fn infer_for_turn(
         inferred[index].role = "primary".into();
     }
 
-    let saved = if inferred.is_empty() {
+    let mut saved = if inferred.is_empty() {
         Vec::new()
     } else {
         save_turn_set(
             conn,
             conversation_id,
             turn_run_id,
-            SOURCE_INFERRED,
+            TurnSetSource::Inferred,
             inferred,
             false,
             false,
         )
         .await?
     };
+    if !unattributed.is_empty() {
+        saved.extend(
+            save_turn_set(
+                conn,
+                conversation_id,
+                turn_run_id,
+                TurnSetSource::Unattributed,
+                unattributed,
+                false,
+                false,
+            )
+            .await?,
+        );
+    }
     let mut missing_expected_paths = expected_paths
         .difference(&observed_paths)
         .filter(|path| !existing_paths.contains(*path))
@@ -1265,12 +1403,21 @@ async fn history_groups_for_conversation(
         )
         .collect::<HashSet<_>>();
     let associations = retain_authoritative_associations(associations, &authoritative_run_ids);
+    let ambiguous = ambiguous_inferred_associations(conn, &associations, &model_map).await?;
+    let unlinked_ids = associations
+        .iter()
+        .filter(|association| ambiguous.contains(&association.id))
+        .map(|association| association.deliverable_id.clone())
+        .collect::<HashSet<_>>();
     let run_map = runs
         .into_iter()
         .map(|run| (run.id.clone(), run))
         .collect::<HashMap<_, _>>();
     let mut grouped: HashMap<String, Vec<ConversationDeliverable>> = HashMap::new();
     for association in associations {
+        if ambiguous.contains(&association.id) {
+            continue;
+        }
         let Some(model) = model_map.get(&association.deliverable_id).cloned() else {
             continue;
         };
@@ -1281,6 +1428,21 @@ async fn history_groups_for_conversation(
         }
         let key = normalized_deliverable_path_key(&item.root_path, &item.path);
         grouped.entry(key).or_default().push(item);
+    }
+    for model in model_map.values() {
+        if model.turn_run_id.is_some() && !unlinked_ids.contains(&model.id) {
+            continue;
+        }
+        let mut model = model.clone();
+        model.turn_run_id = None;
+        if model.source == SOURCE_INFERRED {
+            model.role = "supporting".into();
+        }
+        let item = to_info(model, None, None);
+        if is_user_visible_deliverable(&item) {
+            let key = normalized_deliverable_path_key(&item.root_path, &item.path);
+            grouped.entry(key).or_insert_with(|| vec![item]);
+        }
     }
 
     let mut groups = grouped
@@ -1394,8 +1556,10 @@ pub async fn list_for_turn(
         HashSet::new()
     };
     let associations = retain_authoritative_associations(associations, &authoritative_run_ids);
+    let ambiguous = ambiguous_inferred_associations(conn, &associations, &model_map).await?;
     Ok(associations
         .into_iter()
+        .filter(|association| !ambiguous.contains(&association.id))
         .filter_map(|association| {
             model_map
                 .get(&association.deliverable_id)
@@ -1449,8 +1613,12 @@ async fn build_sets_for_runs(
         )
         .collect::<HashSet<_>>();
     let associations = retain_authoritative_associations(associations, &authoritative_run_ids);
+    let ambiguous = ambiguous_inferred_associations(conn, &associations, &model_map).await?;
     let mut by_run: HashMap<String, Vec<conversation_turn_deliverable::Model>> = HashMap::new();
     for association in associations {
+        if ambiguous.contains(&association.id) {
+            continue;
+        }
         by_run
             .entry(association.turn_run_id.clone())
             .or_default()
@@ -2672,7 +2840,7 @@ mod tests {
             &db.conn,
             conversation_id,
             "run-declared-authoritative",
-            SOURCE_INFERRED,
+            TurnSetSource::Inferred,
             vec![
                 script,
                 verified(workspace.path(), "qa_page_1.png", "QA page 1"),
@@ -2752,7 +2920,7 @@ mod tests {
             &db.conn,
             conversation_id,
             "run-legacy-noise",
-            SOURCE_INFERRED,
+            TurnSetSource::Inferred,
             vec![
                 verified(workspace.path(), "final.pdf", "Final"),
                 verified(workspace.path(), "_probe.pdf", "Probe"),
@@ -3237,6 +3405,7 @@ mod tests {
         assert_eq!(settled.len(), 1);
         assert_eq!(settled[0].category, "code_change");
         assert_eq!(settled[0].role, "supporting");
+        assert!(settled[0].turn_run_id.is_none());
         assert!(
             list_for_turn(&db.conn, conversation_id, "run-ambiguous-expected")
                 .await
@@ -3246,7 +3415,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_unambiguous_standalone_fallback_may_be_primary() {
+    async fn one_exclusive_standalone_fallback_may_be_primary() {
         let db = crate::db::test_helpers::fresh_in_memory_db().await;
         let workspace = tempfile::tempdir().unwrap();
         std::fs::write(workspace.path().join("report.pdf"), b"report").unwrap();
@@ -3269,7 +3438,7 @@ mod tests {
             vec![PendingFileChange {
                 path: "report.pdf".into(),
                 kind: ConversationTurnFileChangeKind::Created,
-                attribution: "ambiguous".into(),
+                attribution: "exclusive".into(),
             }],
         )
         .await
@@ -3304,6 +3473,10 @@ mod tests {
         assert_eq!(settled.len(), 1);
         assert_eq!(settled[0].category, "standalone_output");
         assert_eq!(settled[0].role, "primary");
+        assert_eq!(
+            settled[0].turn_run_id.as_deref(),
+            Some("run-ambiguous-output")
+        );
     }
 
     #[tokio::test]

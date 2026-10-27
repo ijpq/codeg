@@ -41,6 +41,13 @@ pub async fn get(
     run_id: &str,
 ) -> Result<Option<OfficeDeliveryPreview>, DbError> {
     let row = conn.query_one(statement("SELECT p.*, r.rowid AS run_sequence FROM office_delivery_preview p JOIN conversation_turn_run r ON r.id=p.turn_run_id JOIN conversation c ON c.id=p.conversation_id WHERE p.conversation_id=? AND p.turn_run_id=? AND c.deleted_at IS NULL AND r.status='completed' AND r.completed_at IS NOT NULL AND r.settlement_status<>'pending'", vec![cid.into(), run_id.into()])).await?;
+    if let Some(row) = &row {
+        if let Some(id) = row.try_get::<Option<String>>("", "deliverable_id")? {
+            if !deliverable_service::has_trusted_turn_association(conn, cid, run_id, &id).await? {
+                return Ok(None);
+            }
+        }
+    }
     row.map(|row| {
         Ok(OfficeDeliveryPreview {
             conversation_id: row.try_get("", "conversation_id")?,
@@ -292,11 +299,14 @@ mod tests {
             }
         }
         async fn run(&self, id: &str) {
+            self.run_for(self.cid, id).await;
+        }
+        async fn run_for(&self, cid: i32, id: &str) {
             artifact_service::create_run(
                 &self.db.conn,
                 artifact_service::NewTurnRun {
                     id: id.into(),
-                    conversation_id: self.cid,
+                    conversation_id: cid,
                     connection_id: format!("conn-{id}"),
                     client_message_id: Some(format!("msg-{id}")),
                     prompt_fingerprint: None,
@@ -336,6 +346,33 @@ mod tests {
                 .await
                 .unwrap();
         }
+        async fn observe(&self, run: &str, file: &VerifiedDeliverable, attribution: &str) {
+            artifact_service::upsert_changes(
+                &self.db.conn,
+                run,
+                vec![artifact_service::PendingFileChange {
+                    path: file.path.clone(),
+                    kind: crate::db::entities::conversation_turn_file_change::ConversationTurnFileChangeKind::Created,
+                    attribution: attribution.into(),
+                }],
+            )
+            .await
+            .unwrap();
+            let change = artifact_service::list_changes_for_run(&self.db.conn, run)
+                .await
+                .unwrap()
+                .pop()
+                .unwrap();
+            artifact_service::update_final_state(
+                &self.db.conn,
+                change,
+                true,
+                file.size_bytes,
+                None,
+            )
+            .await
+            .unwrap();
+        }
         async fn finish(&self, run: &str) -> OfficeDeliveryPreview {
             artifact_service::finish_run(
                 &self.db.conn,
@@ -350,6 +387,179 @@ mod tests {
                 .unwrap();
             get(&self.db.conn, self.cid, run).await.unwrap().unwrap()
         }
+    }
+
+    #[tokio::test]
+    async fn ambiguous_workspace_output_is_not_a_turn_delivery_or_office_review() {
+        let f = Fixture::new().await;
+        let other = test_helpers::seed_conversation(&f.db, f.folder, AgentType::Codex).await;
+        // The other business started first. A newer-task-only snapshot check
+        // cannot establish who produced a file while both tasks are running.
+        f.run_for(other, "other-business").await;
+        f.run("current-business").await;
+        let file = f.file("report.docx", "other business output", "supporting");
+        f.observe("current-business", &file, "ambiguous").await;
+
+        let preview = f.finish("current-business").await;
+        assert_eq!(preview.status, "none", "An ambiguous file cannot auto-open");
+        assert!(
+            deliverable_service::list_for_turn(&f.db.conn, f.cid, "current-business")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let ledger = deliverable_service::list_for_conversation(&f.db.conn, f.cid)
+            .await
+            .unwrap();
+        assert_eq!(
+            ledger.len(),
+            1,
+            "Retain the observed file in the total list"
+        );
+        assert!(
+            ledger[0].turn_run_id.is_none(),
+            "Do not invent a turn owner"
+        );
+        assert_eq!(ledger[0].role, "supporting");
+        assert!(
+            deliverable_service::list_sets_for_conversation(&f.db.conn, f.cid)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let page = deliverable_service::list_history_page(&f.db.conn, f.cid, 0, 1)
+            .await
+            .unwrap();
+        assert_eq!(page.total, 1);
+        assert!(page.items[0].latest.turn_run_id.is_none());
+        deliverable_service::infer_for_turn(&f.db.conn, f.cid, "current-business")
+            .await
+            .unwrap();
+        let repeated = deliverable_service::list_for_conversation(&f.db.conn, f.cid)
+            .await
+            .unwrap();
+        assert_eq!(repeated.len(), 1);
+        assert_eq!(repeated[0].id, ledger[0].id);
+        assert!(repeated[0].turn_run_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn exclusive_inference_and_explicit_claims_still_produce_review_copies() {
+        for declared in [false, true] {
+            let f = Fixture::new().await;
+            f.run("owned-output").await;
+            let file = f.file("review.docx", "owned delivery", "primary");
+            f.observe(
+                "owned-output",
+                &file,
+                if declared { "ambiguous" } else { "exclusive" },
+            )
+            .await;
+            if declared {
+                f.declare("owned-output", vec![file]).await;
+            }
+            let preview = f.finish("owned-output").await;
+            assert_eq!(preview.status, "ready");
+            assert_eq!(
+                std::fs::read_to_string(preview.snapshot_path.unwrap()).unwrap(),
+                "owned delivery"
+            );
+            assert_eq!(
+                deliverable_service::list_for_turn(&f.db.conn, f.cid, "owned-output")
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_ambiguous_association_is_read_as_unlinked_without_deleting_evidence() {
+        let f = Fixture::new().await;
+        f.run("legacy").await;
+        let file = f.file("legacy.docx", "legacy bytes", "primary");
+        f.declare("legacy", vec![file.clone()]).await;
+        let preview = f.finish("legacy").await;
+        assert_eq!(preview.status, "ready");
+        // Recreate the old persisted inference shape, including its preview.
+        for sql in [
+            "UPDATE conversation_deliverable SET source='inferred'",
+            "UPDATE conversation_turn_deliverable SET source='inferred'",
+        ] {
+            f.db.conn.execute(statement(sql, vec![])).await.unwrap();
+        }
+        f.observe("legacy", &file, "ambiguous").await;
+        assert!(get(&f.db.conn, f.cid, "legacy").await.unwrap().is_none());
+        assert!(
+            deliverable_service::list_for_turn(&f.db.conn, f.cid, "legacy")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            deliverable_service::list_sets_for_conversation(&f.db.conn, f.cid)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let total = deliverable_service::list_history_page(&f.db.conn, f.cid, 0, 25)
+            .await
+            .unwrap();
+        assert_eq!(total.total, 1);
+        assert_eq!(total.items[0].versions.len(), 1);
+        assert!(total.items[0].latest.turn_run_id.is_none());
+        assert_eq!(total.items[0].latest.role, "supporting");
+        let evidence =
+            f.db.conn
+                .query_one(statement(
+                    "SELECT turn_run_id FROM conversation_turn_deliverable",
+                    vec![],
+                ))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            evidence.try_get::<String>("", "turn_run_id").unwrap(),
+            "legacy"
+        );
+        assert_eq!(
+            std::fs::read_to_string(preview.snapshot_path.unwrap()).unwrap(),
+            "legacy bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn ambiguous_later_observation_cannot_overwrite_a_declared_files_provenance() {
+        let f = Fixture::new().await;
+        f.run("declared").await;
+        f.declare(
+            "declared",
+            vec![f.file("report.docx", "delivered v1", "primary")],
+        )
+        .await;
+        let first = f.finish("declared").await;
+        f.run("ambiguous-later").await;
+        let file = f.file("report.docx", "unknown workspace writer", "supporting");
+        f.observe("ambiguous-later", &file, "ambiguous").await;
+        assert_eq!(f.finish("ambiguous-later").await.status, "none");
+        let total = deliverable_service::list_history_page(&f.db.conn, f.cid, 0, 25)
+            .await
+            .unwrap();
+        assert_eq!(total.total, 1);
+        assert_eq!(total.items[0].versions.len(), 1);
+        assert_eq!(
+            total.items[0].latest.turn_run_id.as_deref(),
+            Some("declared")
+        );
+        assert_eq!(total.items[0].latest.source, "declared");
+        assert_eq!(total.items[0].latest.role, "primary");
+        std::fs::remove_file(f.root.join("report.docx")).unwrap();
+        assert!(get(&f.db.conn, f.cid, "declared").await.unwrap().is_some());
+        assert_eq!(
+            std::fs::read_to_string(first.snapshot_path.unwrap()).unwrap(),
+            "delivered v1"
+        );
     }
 
     #[tokio::test]

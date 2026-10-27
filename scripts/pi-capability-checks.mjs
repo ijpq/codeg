@@ -284,6 +284,7 @@ export async function piCapabilityChecks({
       api,
       f,
       cid,
+      folderId,
       page,
       piModel,
       submit,

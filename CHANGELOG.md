@@ -5,6 +5,10 @@
 - Retain the stable Codex/Claude/Pi business conversation, external delivery,
   service-tier, whole-task timing, native Plan/Goal, scrolling, deliverable and
   completed Office review changes from the quarantined fix3 package.
+- Keep ambiguous same-workspace observations unlinked in the total deliverable
+  list, instead of assigning them to an answer or auto-opening an Office review.
+  Filter evidenced legacy misattribution without deleting records or files;
+  retain explicit declarations, valid review copies and normal inferred previews.
 - Prevent the isolated Office converter from updating or installing itself.
   Verify its exact executable path and SHA256 before and after actual use;
   changes affect test children only, preserving users' runtime configuration.

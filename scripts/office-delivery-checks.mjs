@@ -22,6 +22,7 @@ export async function officeDeliveryChecks({
   api,
   f,
   cid,
+  folderId,
   page,
   piModel,
   submit,
@@ -178,6 +179,148 @@ export async function officeDeliveryChecks({
     )
   }
   try {
+    // Exercise actual tracker attribution with two native Pi sessions in the
+    // same workspace. The other business starts first; a newer-run-only copy
+    // guard cannot protect the currently visible, later-started business.
+    const other = await api("create_conversation", {
+      folderId,
+      agentType: "pi",
+      title: "Isolated overlapping Office producer",
+    })
+    const otherConnection = await api("acp_connect", {
+      agentType: "pi",
+      workingDir: f.cwd,
+    })
+    const otherState = () =>
+      api("acp_get_session_snapshot", { connectionId: otherConnection })
+    try {
+      await until(otherState, (s) => s?.selectors_ready, "Other Pi ready")
+      await api("acp_set_config_option", {
+        connectionId: otherConnection,
+        configId: "model",
+        valueId: "fixture/gpt-5.4",
+      })
+      piModel.holdOffice(true)
+      await api("acp_prompt", {
+        connectionId: otherConnection,
+        conversationId: other,
+        folderId,
+        clientMessageId: randomUUID(),
+        blocks: [
+          {
+            type: "text",
+            text: `BUSINESS_PI_USER PI_SCENARIO_officeobserve_${randomUUID().replaceAll("-", "")}`,
+          },
+        ],
+      })
+      await until(
+        otherState,
+        (s) => s.status === "prompting",
+        "Other Pi running"
+      )
+      const observed = await submit({
+        blocks: [
+          {
+            type: "text",
+            text: `BUSINESS_PI_USER PI_SCENARIO_officeobserve_${randomUUID().replaceAll("-", "")}`,
+          },
+        ],
+      })
+      await until(
+        snapshot,
+        (s) => s.status === "prompting",
+        "Current Pi running"
+      )
+      await makeDoc("office-overlap.docx", "AMBIGUOUS_OTHER_BUSINESS_OUTPUT")
+      const detail = await until(
+        () =>
+          api("get_folder_conversation", {
+            conversationId: cid,
+            userTurnLimit: 25,
+          }),
+        (d) =>
+          d.artifact_runs?.some(
+            (r) =>
+              r.client_message_id === observed.clientMessageId &&
+              r.changes.some(
+                (c) =>
+                  c.path === "office-overlap.docx" &&
+                  c.attribution === "ambiguous"
+              )
+          ),
+        "Actual overlapping workspace change is ambiguous"
+      )
+      const run = detail.artifact_runs.find(
+        (r) => r.client_message_id === observed.clientMessageId
+      )
+      const otherDetail = await until(
+        () =>
+          api("get_folder_conversation", {
+            conversationId: other,
+            userTurnLimit: 25,
+          }),
+        (d) =>
+          d.artifact_runs?.some((r) =>
+            r.changes.some(
+              (c) =>
+                c.path === "office-overlap.docx" &&
+                c.attribution === "ambiguous"
+            )
+          ),
+        "Both running Pi tasks observe the overlapping workspace change"
+      )
+      const otherRun = otherDetail.artifact_runs.find((r) =>
+        r.changes.some((c) => c.path === "office-overlap.docx")
+      )
+      const settled = await complete(observed)
+      assert.equal(
+        settled.status,
+        "none",
+        "Ambiguous fallback cannot open an Office review"
+      )
+      await until(
+        otherState,
+        (s) => s.status === "connected",
+        "Other Pi settled"
+      )
+      const otherReview = await until(
+        () =>
+          api("get_office_delivery_preview", {
+            conversationId: other,
+            turnRunId: otherRun.id,
+          }),
+        Boolean,
+        "Other workspace capture settled before the next Office task"
+      )
+      assert.equal(otherReview.status, "none")
+      const files = await api("list_conversation_deliverables", {
+        conversationId: cid,
+      })
+      const file = files.find((item) => item.path === "office-overlap.docx")
+      assert.ok(file, "The total list retains the observed file")
+      assert.equal(
+        file.turn_run_id ?? null,
+        null,
+        "Do not invent an owning turn"
+      )
+      assert.equal(file.role, "supporting")
+      const inline = await api("list_turn_deliverables", {
+        conversationId: cid,
+        turnRunId: run.id,
+      })
+      assert.ok(!inline.some((item) => item.path === "office-overlap.docx"))
+      if (page) {
+        assert.equal(await visible().count(), 0)
+        assert.equal(
+          await page.locator(`[data-deliverable-run="${run.id}"]`).count(),
+          0
+        )
+      }
+    } finally {
+      piModel.holdOffice(false)
+      await api("acp_disconnect", { connectionId: otherConnection })
+    }
+
     const firstTask = await begin("office-review.docx")
     if (page)
       assert.equal(
@@ -224,6 +367,51 @@ export async function officeDeliveryChecks({
         third.turn_run_id,
         "A withdrawn declaration never replaces the last delivered review"
       )
+
+    piModel.holdOffice(true)
+    const exclusive = await submit({
+      blocks: [
+        {
+          type: "text",
+          text: `BUSINESS_PI_USER PI_SCENARIO_officeobserve_${randomUUID().replaceAll("-", "")}`,
+        },
+      ],
+    })
+    await until(
+      snapshot,
+      (s) => s.status === "prompting",
+      "Exclusive Pi running"
+    )
+    const exclusiveBytes = await makeDoc(
+      "office-exclusive.docx",
+      "OFFICE_EXCLUSIVE_DELIVERY"
+    )
+    await until(
+      () =>
+        api("get_folder_conversation", {
+          conversationId: cid,
+          userTurnLimit: 25,
+        }),
+      (d) =>
+        d.artifact_runs?.some(
+          (r) =>
+            r.client_message_id === exclusive.clientMessageId &&
+            r.changes.some(
+              (c) =>
+                c.path === "office-exclusive.docx" &&
+                c.attribution === "exclusive"
+            )
+        ),
+      "Actual single-task workspace attribution is exclusive"
+    )
+    const fallback = await complete(exclusive)
+    assert.equal(
+      fallback.status,
+      "ready",
+      "Reliable fallback must continue to preview"
+    )
+    assert.equal(fallback.sha256, hash(exclusiveBytes))
+    await show(fallback, "OFFICE_EXCLUSIVE_DELIVERY")
 
     // The same existing renderer handles all three native OpenXML formats.
     for (const extension of ["xlsx", "pptx"]) {
@@ -304,6 +492,9 @@ export async function officeDeliveryChecks({
         ? { converterSha256: pinned.sha256, converterUnchanged: true }
         : {}),
       completionAndSettlementOnly: true,
+      ambiguousWorkspaceNotAutoOpened: true,
+      ambiguousOutputUnlinkedInTotal: true,
+      exclusiveFallbackStillPreviews: true,
       finalReplaceAndClear: true,
       immutableReview: true,
       samePathUpdated: true,
