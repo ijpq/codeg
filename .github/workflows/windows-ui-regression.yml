@@ -314,6 +314,8 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Prepare isolated protocol and browser harness
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           $tools=Join-Path $env:DIAG_ROOT 'native-agent-tools'
           npm install --prefix $tools --global --include=optional --ignore-scripts --no-audit --no-fund '@agentclientprotocol/codex-acp@2.2.2' '@agentclientprotocol/claude-agent-acp@0.94.0'
