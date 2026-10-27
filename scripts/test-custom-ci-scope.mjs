@@ -85,6 +85,15 @@ test("Windows still verifies native Plan and Goal and both release packages", ()
   }
   assert.ok(release.jobs["verify-draft-assets"])
   assert.ok(release.jobs["verify-published-assets"])
+  for (const stage of ["verify-draft-assets", "verify-published-assets"]) {
+    assert.ok(
+      release.jobs[stage].steps.some(
+        (step) =>
+          step.run === "node --test scripts/test-office-test-runtime.mjs"
+      ),
+      "Converter integrity remains a Windows gate before and after publication"
+    )
+  }
   const ui = workflow("windows-ui-regression.yml").jobs
   assert.equal(ui["setup-ui"]["runs-on"], "windows-2022")
   assert.ok(

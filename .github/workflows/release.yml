@@ -1338,6 +1338,8 @@ jobs:
         with:
           python-version: "3.12"
       - run: pnpm install --frozen-lockfile
+      - name: Verify isolated Office converter integrity guards
+        run: node --test scripts/test-office-test-runtime.mjs
       - uses: actions/download-artifact@v4
         with:
           name: release-windows-setup-evidence
@@ -1557,6 +1559,8 @@ jobs:
         with:
           python-version: "3.12"
       - run: pnpm install --frozen-lockfile
+      - name: Verify isolated Office converter integrity guards
+        run: node --test scripts/test-office-test-runtime.mjs
       - uses: actions/download-artifact@v4
         with:
           name: release-windows-setup-evidence
