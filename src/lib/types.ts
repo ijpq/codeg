@@ -4135,6 +4135,12 @@ export interface RestoredConversationConnectionInfo {
 // ACP agent info returned by acp_list_agents
 export interface AcpAgentInfo {
   agent_type: AgentType
+  selected_runtime?: {
+    source: "bundled" | "custom"
+    adapter_path: string
+    adapter_version: string | null
+    available: boolean
+  } | null
   /**
    * Whether this agent has a codeg-known skill store — every built-in, and
    * custom agents that declared the shared `.agents/skills` store. Gates the

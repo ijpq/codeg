@@ -1679,7 +1679,9 @@
       "upgradeAvailable": "{versionText}. تتوفر ترقية.",
       "recommendedUnavailable": "{versionText}. لا يتوفر إصدار موصى به.",
       "latest": "{versionText}. أنت على أحدث إصدار.",
-      "unreviewedAvailable": "{versionText}. يتوفر إصدار أحدث غير مُراجَع."
+      "unreviewedAvailable": "{versionText}. يتوفر إصدار أحدث غير مُراجَع.",
+      "bundledRuntime": "CodeG bundled ACP: {localVersion} · {path}. Updated with the matching CodeG release.",
+      "customRuntime": "Selected custom ACP: {localVersion} · {path}. Managed at the configured runtime path."
     },
     "adapter": {
       "label": "محوّل ACP",
@@ -4461,7 +4463,14 @@
         "project": "This project",
         "global": "Global preferences",
         "loadRule": "Confirmed memory is loaded into the next accepted prompt within its context budget; omitted items are explicitly marked. Native private memory stays engine-specific. Save only confirmed facts and requirements.",
-        "save": "Save"
+        "save": "Save",
+        "succeeded": "Handoff complete",
+        "phases": {
+          "capturing_history": "Saving history and work rules…",
+          "starting_target": "Starting the target Agent…",
+          "verifying_target": "Verifying the target session…",
+          "activating": "Activating the business session…"
+        }
       }
     },
     "diffPreview": {

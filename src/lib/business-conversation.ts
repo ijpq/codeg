@@ -30,6 +30,7 @@ export interface BusinessConversationState {
   pendingAgent: AgentType | null
   switchStatus: string | null
   switchError: string | null
+  switchPhase?: string | null
   taskState: BusinessTaskState
   sessions: BusinessAgentSession[]
   lastSequence: number
@@ -59,7 +60,7 @@ export const switchBusinessAgent = (request: {
   getTransport().call<BusinessConversationState>(
     "switch_business_agent",
     { request },
-    { timeoutMs: 1_830_000 }
+    { timeoutMs: 120_000 }
   )
 export const updateBusinessTaskState = (
   conversationId: number,

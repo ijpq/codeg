@@ -500,6 +500,9 @@ fn adapter_version(bundle: &Path) -> Option<String> {
     let package_json = bundle.parent()?.parent()?.join("package.json");
     let value: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(package_json).ok()?).ok()?;
+    if value.get("name")?.as_str()? != "@agentclientprotocol/codex-acp" {
+        return None;
+    }
     value.get("version")?.as_str().map(str::to_string)
 }
 
@@ -520,8 +523,14 @@ fn has_upstream_steering(version: &str) -> bool {
 
 fn module_search_path(bundle: &Path, prefix: Option<&Path>) -> String {
     let mut paths = Vec::<PathBuf>::new();
-    if let Some(package_root) = bundle.parent().and_then(Path::parent) {
-        paths.push(package_root.join("node_modules"));
+    // A derived script has a different import.meta.url. Reproduce the original
+    // file's Node lookup chain, including hoisted dependencies and local/pnpm
+    // launchers, rather than assuming one npm-global prefix layout.
+    for ancestor in bundle.parent().into_iter().flat_map(Path::ancestors) {
+        let candidate = ancestor.join("node_modules");
+        if !paths.contains(&candidate) {
+            paths.push(candidate);
+        }
     }
     if let Some(prefix) = prefix {
         #[cfg(windows)]
@@ -549,19 +558,20 @@ pub async fn prepare(
     // Prefer the prefix implied by the launcher so the bundle we patch is the
     // same one Codeg would otherwise execute. The canonical path covers the
     // usual POSIX npm symlink directly into `dist/index.js`.
-    let current_prefix = crate::commands::acp::cached_npm_global_prefix().await;
     let mut candidates = Vec::<(PathBuf, Option<PathBuf>)>::new();
-    if let Some(prefix) = npm_prefix_from_launcher(resolved_launcher) {
-        candidates.push((package_bundle_from_prefix(&prefix), Some(prefix)));
-    }
-    if let Some(prefix) = crate::process::user_npm_prefix() {
-        candidates.push((package_bundle_from_prefix(&prefix), Some(prefix)));
-    }
-    if let Some(prefix) = current_prefix {
-        candidates.push((package_bundle_from_prefix(&prefix), Some(prefix)));
+    if let Some(parent) = resolved_launcher.parent() {
+        candidates.push((
+            parent.join("node_modules/@agentclientprotocol/codex-acp/dist/index.js"),
+            None,
+        ));
     }
     if let Ok(canonical) = std::fs::canonicalize(resolved_launcher) {
-        candidates.push((canonical, None));
+        if adapter_version(&canonical).is_some() {
+            candidates.push((canonical, None));
+        }
+    }
+    if let Some(prefix) = npm_prefix_from_launcher(resolved_launcher) {
+        candidates.push((package_bundle_from_prefix(&prefix), Some(prefix)));
     }
     let selected = candidates
         .into_iter()
@@ -674,7 +684,12 @@ pub async fn prepare(
         }
     }
 
-    let Some(node) = crate::commands::acp::resolve_npx_command("node").await else {
+    let node = crate::acp::pi_runtime::bundled_node();
+    let node = match node {
+        Some(node) => Some(node),
+        None => crate::commands::acp::resolve_npx_command("node").await,
+    };
+    let Some(node) = node else {
         return Err(AcpError::SdkNotInstalled(
             "Node.js is not installed. Please install it in Agent Settings.".into(),
         ));
@@ -684,6 +699,8 @@ pub async fn prepare(
         version = version.as_deref().unwrap_or_default(),
         patch_kind,
         citation_bridge_active = patch_kind == "native_fork",
+        original_bundle = %bundle.display(),
+        node_path = %node.display(),
         derived_script = %script.display(),
         "[ACP][Codex] launching verified derived adapter"
     );
@@ -698,6 +715,35 @@ pub async fn prepare(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_adapter_resolves_the_original_hoisted_cli_without_an_explicit_codex_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let modules = dir.path().join("node_modules");
+        let bundle = modules.join("@agentclientprotocol/codex-acp/dist/index.js");
+        let cli = modules.join("@openai/codex/bin/codex.js");
+        std::fs::create_dir_all(bundle.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(cli.parent().unwrap()).unwrap();
+        std::fs::write(&cli, "// existing user CLI").unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let derived = cache.path().join("adapter.mjs");
+        std::fs::write(&derived, "import { createRequire } from 'node:module'; console.log(createRequire(import.meta.url).resolve('@openai/codex/bin/codex.js'))").unwrap();
+        let output = std::process::Command::new("node")
+            .arg(&derived)
+            .env_remove("CODEX_PATH")
+            .env("NODE_PATH", module_search_path(&bundle, None))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            PathBuf::from(String::from_utf8_lossy(&output.stdout).trim()),
+            cli
+        );
+    }
 
     #[test]
     fn native_goal_snapshot_patch_is_exact_and_idempotence_is_refused() {

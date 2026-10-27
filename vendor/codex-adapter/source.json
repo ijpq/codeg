@@ -1,0 +1,8 @@
+{
+  "package": "@agentclientprotocol/codex-acp",
+  "version": "2.2.2",
+  "tarball": "https://registry.npmjs.org/@agentclientprotocol/codex-acp/-/codex-acp-2.2.2.tgz",
+  "sha256": "5f4fa33c94959c928db11687376a050e9a5e7b72dba51963b571fa55ddb86168",
+  "nodeVersion": "24.16.0",
+  "license": "Apache-2.0"
+}

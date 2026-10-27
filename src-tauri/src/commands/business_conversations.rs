@@ -131,6 +131,7 @@ async fn switch_agent_inner(
         .await
         .map_err(error)?;
     drop(guard);
+    conversations::emit_conversation_upsert(&emitter, &db.conn, cid).await;
     ensure_switch_worker(cid, manager, db, data_dir, emitter).await;
     business::state(&db.conn, cid)
         .await
@@ -175,6 +176,19 @@ pub async fn ensure_switch_worker(
                 }
                 Err(e) => {
                     tracing::error!(conversation_id=cid,error=%e,"[business] switch supervisor failed");
+                    // A lock/read/preparation error must become an observable,
+                    // durable terminal result, rather than a permanently
+                    // pending request restarted by every client's next poll.
+                    if let Ok(Some(request)) = business::pending_request(&db.conn, cid).await {
+                        let _ = business::set_switch_status(
+                            &db.conn,
+                            &request,
+                            "failed",
+                            Some(e.to_string()),
+                        )
+                        .await;
+                        conversations::emit_conversation_upsert(&emitter, &db.conn, cid).await;
+                    }
                     break;
                 }
             }
@@ -218,8 +232,12 @@ async fn advance_switch(
     if let Some(id) = old.as_deref() {
         if let Some(state) = manager.get_state(id).await {
             let state = state.read().await;
-            if state.turn_in_flight
-                || state.status == crate::acp::types::ConnectionStatus::Prompting
+            if !matches!(
+                state.status,
+                crate::acp::types::ConnectionStatus::Error
+                    | crate::acp::types::ConnectionStatus::Disconnected
+            ) && (state.turn_in_flight
+                || state.status == crate::acp::types::ConnectionStatus::Prompting)
             {
                 return Ok(true);
             }
@@ -228,6 +246,7 @@ async fn advance_switch(
     business::set_switch_status(&db.conn, &request, "preparing", None)
         .await
         .map_err(error)?;
+    conversations::emit_conversation_upsert(emitter, &db.conn, cid).await;
     let result =
         prepare_and_activate(&request, old.as_deref(), manager, db, data_dir, emitter).await;
     if let Err(e) = result {
@@ -240,6 +259,33 @@ async fn advance_switch(
     // Check again after releasing this lock. A later request may already be
     // waiting to queue; the API also starts a worker when the current one exits.
     Ok(false)
+}
+
+async fn switch_phase(
+    request: &AgentSwitchRequest,
+    db: &AppDatabase,
+    emitter: &EventEmitter,
+    phase: &str,
+) -> Result<(), AcpError> {
+    business::set_switch_phase(&db.conn, request, phase)
+        .await
+        .map_err(error)?;
+    conversations::emit_conversation_upsert(emitter, &db.conn, request.conversation_id).await;
+    Ok(())
+}
+
+async fn capture_saved_tail(db: &AppDatabase, cid: i32) -> Result<(), AcpError> {
+    if let Err(cause) = conversations::capture_business_tail(&db.conn, cid).await {
+        if business::state(&db.conn, cid)
+            .await
+            .map_err(error)?
+            .is_none_or(|s| s.last_sequence == 0)
+        {
+            return Err(error(cause));
+        }
+        tracing::warn!(conversation_id=cid,error=%cause,"[business] native source unavailable; handoff uses the saved canonical history");
+    }
+    Ok(())
 }
 
 async fn prepare_and_activate(
@@ -302,9 +348,8 @@ async fn prepare_and_activate(
                 .map_err(error)?;
         }
     }
-    conversations::capture_business_tail(&db.conn, cid)
-        .await
-        .map_err(error)?;
+    switch_phase(request, db, emitter, "capturing_history").await?;
+    capture_saved_tail(db, cid).await?;
     if summary.agent_type == request.target_agent {
         return business::activate(
             &db.conn,
@@ -321,6 +366,16 @@ async fn prepare_and_activate(
         .await
         .map_err(error)?
         .ok_or_else(|| error("Business workspace is missing"))?;
+    let source_env = super::acp::business_rule_env(db, summary.agent_type).await?;
+    let rules = super::business_context::capture_rules(
+        Path::new(&folder.path),
+        summary.agent_type,
+        &source_env,
+    )
+    .await;
+    business::save_rule_context(&db.conn, cid, summary.agent_type, &rules)
+        .await
+        .map_err(error)?;
     let target = business::find_session(&db.conn, cid, request.target_agent)
         .await
         .map_err(error)?;
@@ -346,6 +401,7 @@ async fn prepare_and_activate(
         .as_ref()
         .map(|s| s.config_values.clone())
         .unwrap_or_else(|| request.preferred_config_values.clone());
+    switch_phase(request, db, emitter, "starting_target").await?;
     verify_agent_installed(request.target_agent).await?;
     let runtime_env =
         build_session_runtime_env(db, request.target_agent, external.as_deref(), data_dir).await?;
@@ -362,7 +418,8 @@ async fn prepare_and_activate(
         )
         .await?;
     let id = spawned.connection_id;
-    let prepared = async {
+    let ready = tokio::time::timeout(manager.restore_timeout(), async {
+        switch_phase(request, db, emitter, "verifying_target").await?;
         manager
             .wait_for_prompt_ready(&id, external.as_deref())
             .await?;
@@ -383,9 +440,18 @@ async fn prepare_and_activate(
         // no user prompt is sent during preparation.
         // Re-read the outgoing tail after preparation, allowing the native
         // terminal metadata to flush before the active mapping changes.
-        conversations::capture_business_tail(&db.conn, cid)
-            .await
-            .map_err(error)?;
+        capture_saved_tail(db, cid).await?;
+        Ok((target_state, external))
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err(error("Target agent preparation timed out; original session retained. Retry when the target is available"))
+    });
+    // The timeout applies to preparation only. Cancelling an activation after
+    // its SQLite commit could disconnect the newly active, successful writer.
+    let prepared = async {
+        let (target_state, external) = ready?;
+        switch_phase(request, db, emitter, "activating").await?;
         manager
             .activate_business_conversation(&id, summary.folder_id, &external, db, request)
             .await?;
@@ -412,9 +478,11 @@ async fn prepare_and_activate(
                     .collect::<BTreeMap<_, _>>()
             })
             .unwrap_or_default();
-        business::save_session_settings(&db.conn, cid, request.target_agent, mode, &config)
-            .await
-            .map_err(error)?;
+        if let Err(cause) = business::save_session_settings(&db.conn, cid, request.target_agent, mode, &config).await {
+            // Activation is already committed. Do not report a successful
+            // switch as a failed preparation because its optional mirror failed.
+            tracing::warn!(conversation_id=cid,error=%cause,"[business] committed session settings mirror failed");
+        }
         Ok(())
     }
     .await;
@@ -574,14 +642,18 @@ pub async fn prepare_prompt(
             &db.conn,
             cid,
             session.id,
-            delivered_through.unwrap_or(session.seen_sequence),
+            delivered_through
+                .unwrap_or(session.seen_sequence)
+                .max(session.last_bridge_sequence),
             state.last_sequence,
         )
         .await
         .map_err(error)?;
         if let Some(bridge) = context.as_mut() {
             let mut text = String::from("Recent task boundary (an excerpt; older undispatched history remains retrievable and is not acknowledged by this window):\n");
-            for (sequence, turn) in recent {
+            let mut recent_records = Vec::new();
+            let mut recent_bytes = 0;
+            for (sequence, turn) in recent.into_iter().rev() {
                 if matches!(turn.role, crate::models::message::TurnRole::System) {
                     continue;
                 }
@@ -589,7 +661,7 @@ pub async fn prepare_prompt(
                     .blocks
                     .iter()
                     .filter_map(|block| match block {
-                        ContentBlock::Text { text } => Some(clip(text, 900)),
+                        ContentBlock::Text { text } => Some(clip(text, 4000)),
                         ContentBlock::Image { uri: Some(uri), .. } => {
                             Some(format!("[image reference: {}]", clip(uri, 200)))
                         }
@@ -597,15 +669,42 @@ pub async fn prepare_prompt(
                     })
                     .collect::<Vec<_>>()
                     .join("\n");
-                text.push_str(&format!(
+                let record = format!(
                     "[sequence {sequence}, {:?}] {}\n",
                     turn.role,
-                    clip(&prose, 900)
-                ));
+                    clip(&prose, 4000)
+                );
+                if recent_bytes + record.len() <= 24_576 {
+                    recent_bytes += record.len();
+                    recent_records.push(record);
+                }
             }
-            if let Some(end) = bridge.rfind("</codeg-business-context>") {
-                bridge.insert_str(end, &text);
+            for record in recent_records.into_iter().rev() {
+                text.push_str(&record);
             }
+            if let Some(position) = bridge.find("Unseen cross-agent history:") {
+                bridge.insert_str(position, &text);
+            }
+        }
+    }
+    if !increment.is_empty() || session.last_bridge_sequence == 0 {
+        let rules = business::rule_context(&db.conn, cid).await.map_err(error)?;
+        let mut loaded = std::collections::BTreeSet::new();
+        let mut rules_text = String::from("Saved applicable business rules and skill sources (per source instance; latest task/user requirements take precedence over historical excerpts):\n");
+        for (source, snapshot) in rules {
+            if !snapshot.is_empty() && loaded.insert(snapshot.clone()) {
+                rules_text.push_str(&format!("[{source}]\n{snapshot}\n"));
+            }
+        }
+        if !loaded.is_empty() {
+            let bridge = context.get_or_insert_with(|| {
+                "<codeg-business-context>\n</codeg-business-context>".into()
+            });
+            let position = bridge
+                .find("Unseen cross-agent history:")
+                .or_else(|| bridge.rfind("</codeg-business-context>"))
+                .unwrap_or(0);
+            bridge.insert_str(position, &rules_text);
         }
     }
     if let Some(folder) = folder_service::get_folder_by_id(&db.conn, summary.folder_id)
@@ -711,7 +810,9 @@ pub fn handoff_envelope(
                 break;
             }
         }
-        if out.len() + text.len() > 48000 {
+        // Reserve room for the recent boundary; old chronological history must
+        // not consume the budget needed for current decisions and requirements.
+        if out.len() + text.len() > 32_000 {
             out.push_str("[Bridge budget reached. More original history remains available in CodeG; request it before assuming details.]\n");
             break;
         }
@@ -913,6 +1014,98 @@ mod tests {
             preferred_config_values: BTreeMap::new(),
         }
     }
+    #[tokio::test]
+    async fn business_failed_source_writer_settles_target_failure_instead_of_waiting_forever() {
+        let (db, manager, cid, _folder, _old, _target, dir) = fixture().await;
+        let old = manager.get_state("codex").await.unwrap();
+        {
+            let mut old = old.write().await;
+            old.status = ConnectionStatus::Error;
+            old.turn_in_flight = true; // stale flag from an aborted startup
+        }
+        use crate::db::service::agent_setting_service as settings;
+        settings::ensure_defaults(
+            &db.conn,
+            &[settings::AgentDefaultInput {
+                agent_type: AgentType::ClaudeCode,
+                registry_id: "claude-acp".into(),
+                default_sort_order: 0,
+            }],
+        )
+        .await
+        .unwrap();
+        settings::update(
+            &db.conn,
+            AgentType::ClaudeCode,
+            settings::AgentSettingsUpdate {
+                enabled: false,
+                env_json: None,
+                model_provider_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let request = request(cid, "failed-source", AgentType::ClaudeCode, 0);
+        business::queue_switch(&db.conn, &request).await.unwrap();
+        assert!(
+            !advance_switch(cid, &manager, &db, dir.path(), &EventEmitter::Noop)
+                .await
+                .unwrap()
+        );
+        let state = business::state(&db.conn, cid).await.unwrap().unwrap();
+        assert_eq!(state.switch_status.as_deref(), Some("failed"));
+        assert_eq!(state.switch_phase.as_deref(), Some("starting_target"));
+        assert!(state.switch_error.is_some());
+        assert_eq!(state.active_agent, AgentType::Codex);
+        assert_eq!(state.sessions.len(), 1);
+        assert!(business::pending_request(&db.conn, cid)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn business_saved_rules_reach_the_actual_target_prompt_without_changing_visible_history()
+    {
+        let (db, manager, cid, folder, _old, mut target, _dir) = fixture().await;
+        business::save_rule_context(&db.conn, cid, AgentType::Codex, "Read the custom ledger and subledger before work; never restart the production Server. Skill: shared/official-document/SKILL.md; auto-select and maintain its acceptance rules.").await.unwrap();
+        let request = request(cid, "rules-target", AgentType::ClaudeCode, 0);
+        business::queue_switch(&db.conn, &request).await.unwrap();
+        manager
+            .activate_business_conversation(
+                "claude",
+                folder,
+                "native-claude-business",
+                &db,
+                &request,
+            )
+            .await
+            .unwrap();
+        manager
+            .send_prompt_linked_with_message_id(
+                &db,
+                "claude",
+                vec![PromptInputBlock::Text {
+                    text: "continue".into(),
+                }],
+                Some(folder),
+                Some(cid),
+                None,
+                Some("rules-message".into()),
+            )
+            .await
+            .unwrap();
+        let Some(ConnectionCommand::Prompt { blocks, .. }) = target.recv().await else {
+            panic!("actual target prompt missing")
+        };
+        let received = format!("{blocks:?}");
+        assert!(received.contains("Read the custom ledger and subledger"));
+        assert!(received.contains("never restart the production Server"));
+        assert!(received.contains("shared/official-document/SKILL.md"));
+        let (history, _) = business::history(&db.conn, cid, None, 25).await.unwrap();
+        assert!(!format!("{history:?}").contains("Saved applicable business rules"));
+    }
+
     #[tokio::test]
     async fn business_pi_source_accepts_queued_switch_without_interrupting_native_writer() {
         let db = fresh_in_memory_db().await;

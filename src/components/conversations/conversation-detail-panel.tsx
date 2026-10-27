@@ -3330,12 +3330,32 @@ const ConversationTabView = memo(function ConversationTabView({
         getSentHistory={getSentHistory}
         topBanner={
           <>
+            {dbConversationId != null &&
+              supportsBusinessHandoff(selectedAgent) && (
+                <div
+                  className="shrink-0 border-b px-3 py-2 sm:px-4"
+                  data-business-agent-toolbar
+                >
+                  <BusinessAgentControl
+                    key={dbConversationId}
+                    conversationId={dbConversationId}
+                    folderId={folderId}
+                    agent={selectedAgent}
+                    business={business}
+                  />
+                </div>
+              )}
             <SessionConfigStaleBanner contextKey={tabId} />
             <PiProjectTrustBanner
               contextKey={tabId}
               agentType={selectedAgent}
               workingDir={workingDirForConnection}
             />
+            {acpLoadErrorBanner && (
+              <div className="shrink-0 px-3 py-2 sm:px-4">
+                {acpLoadErrorBanner}
+              </div>
+            )}
           </>
         }
         status={isCancelling ? "cancelling" : connStatus}
@@ -3390,21 +3410,6 @@ const ConversationTabView = memo(function ConversationTabView({
         hideInput={isWelcomeMode || Boolean(acpLoadError)}
         injectContent={composerInject}
         onInjectConsumed={handleComposerInjectConsumed}
-        composerBanner={
-          <>
-            {dbConversationId != null &&
-              supportsBusinessHandoff(selectedAgent) && (
-                <BusinessAgentControl
-                  key={dbConversationId}
-                  conversationId={dbConversationId}
-                  folderId={folderId}
-                  agent={selectedAgent}
-                  business={business}
-                />
-              )}
-            {acpLoadErrorBanner ?? null}
-          </>
-        }
         feedbackList={
           feedback.showList ? (
             <FeedbackNotesDisplay

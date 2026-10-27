@@ -636,7 +636,7 @@ describe("ConversationDetailPanel send-path hardening", () => {
 describe("ConversationDetailPanel session-load failure surface", () => {
   // When session/load fails on a conversation whose transcript already
   // rendered (e.g. its folder was deleted), the history must STAY readable;
-  // the failure surfaces as a banner docked at the composer, not as a
+  // the failure surfaces beside the always-accessible Agent toolbar, not as a
   // full-page error over the message area.
   it("escalates the ACP load error to full-page only when nothing is renderable", () => {
     expect(messageListViewSource).toContain(
@@ -644,14 +644,19 @@ describe("ConversationDetailPanel session-load failure surface", () => {
     )
   })
 
-  it("docks the load error at the composer with the recovery actions", () => {
+  it("keeps Agent handoff and load recovery visible when the composer is hidden", () => {
     // The composer input stays hidden (a send can't reach the dead session)…
     expect(source).toContain(
       "hideInput={isWelcomeMode || Boolean(acpLoadError)}"
     )
-    // …and the banner takes its place, explaining why and offering recovery.
-    expect(source).toContain("composerBanner={")
-    expect(source).toContain("acpLoadErrorBanner ??")
+    // Recovery and switching must remain usable when the source cannot start.
+    const toolbar = source.slice(
+      source.indexOf("topBanner={"),
+      source.indexOf("status={isCancelling")
+    )
+    expect(toolbar).toContain("data-business-agent-toolbar")
+    expect(toolbar).toContain("<BusinessAgentControl")
+    expect(toolbar).toContain("{acpLoadErrorBanner}")
     const bannerStart = source.indexOf("const acpLoadErrorBanner")
     expect(bannerStart).toBeGreaterThan(-1)
     const bannerEnd = source.indexOf("const goalControlValue", bannerStart)
@@ -676,12 +681,6 @@ describe("ConversationDetailPanel session-load failure surface", () => {
     // were already there.
     expect(banner).toContain("flex w-full flex-wrap items-center")
     expect(banner).toContain("min-w-40 flex-1 overflow-hidden")
-    // The shell renders the banner inside the composer dock, constrained to
-    // the same message-column width as the input it replaces.
-    const dockIdx = conversationShellSource.indexOf("{composerBanner && (")
-    expect(dockIdx).toBeGreaterThan(-1)
-    const dock = conversationShellSource.slice(dockIdx, dockIdx + 200)
-    expect(dock).toContain("mx-auto w-full chat-content-w")
   })
 
   it("never clears a resolved session id when the persisted detail is absent", () => {

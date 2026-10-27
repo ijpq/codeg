@@ -209,6 +209,7 @@ jobs:
     name: Build ${{ matrix.name }}
     permissions:
       contents: write
+      actions: read
     strategy:
       fail-fast: false
       matrix:
@@ -371,6 +372,17 @@ jobs:
         run: |
           pnpm pi:prepare-runtime
           pnpm tauri:prepare-sidecars --target ${{ matrix.target }}
+
+      - name: Stage the exact tested private Codex group for Windows Setup
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python -B scripts/fetch-tested-codex-runtime.py --output-dir dist/codex-runtime
+          if ($LASTEXITCODE -ne 0) { throw 'Setup tested Codex runtime provenance failed' }
+          python -B scripts/build-codex-adapter.py --output-dir dist/codex-runtime
+          if ($LASTEXITCODE -ne 0) { throw 'Setup private Codex ACP staging failed' }
 
       - name: Verify sidecars landed
         shell: bash
@@ -810,6 +822,16 @@ jobs:
             $relative=$file.FullName.Substring($piRoot.Length+1)
             $files += @{ path="pi-runtime/$relative"; sha256=(Get-FileHash $file.FullName -Algorithm SHA256).Hash.ToLower() }
           }
+          python -B scripts/build-codex-adapter.py --output-dir (Join-Path $dest 'runtime') --verify
+          if ($LASTEXITCODE -ne 0) { throw 'Setup Codex adapter inventory failed' }
+          $runtimeRoot=(Resolve-Path dist/codex-runtime).Path
+          foreach ($file in (Get-ChildItem $runtimeRoot -Recurse -File)) {
+            $relative=$file.FullName.Substring($runtimeRoot.Length+1)
+            $hash=(Get-FileHash $file.FullName -Algorithm SHA256).Hash.ToLower()
+            $installed=Join-Path $dest "runtime/$relative"
+            if (-not (Test-Path $installed -PathType Leaf) -or (Get-FileHash $installed -Algorithm SHA256).Hash.ToLower() -ne $hash) { throw "Setup Codex runtime resource mismatch: $relative" }
+            $files += @{ path="runtime/$relative"; sha256=$hash }
+          }
           if (Get-ChildItem $dest -Recurse -File | Where-Object { $_.Name -in @('auth.json','tokens.json','config.toml','.env') -or $_.Extension -in @('.db','.sqlite','.sqlite3','.pdb','.key') }) { throw 'Unexpected data/build files in Setup' }
           New-Item -ItemType Directory -Force setup-evidence | Out-Null
           @{ version=$version; commit=$env:GITHUB_SHA; files=$files } | ConvertTo-Json -Depth 5 | Set-Content setup-evidence/payload.json
@@ -1085,6 +1107,8 @@ jobs:
           Copy-Item src-tauri/target/${{ matrix.target }}/release/codeg-server.exe dist/${{ matrix.artifact }}/
           Copy-Item src-tauri/target/${{ matrix.target }}/release/codeg-mcp.exe dist/${{ matrix.artifact }}/
           Copy-Item src-tauri/target/${{ matrix.target }}/release/codeg-cli.exe dist/${{ matrix.artifact }}/
+          python -B scripts/build-codex-adapter.py --output-dir dist/codex-runtime
+          if ($LASTEXITCODE -ne 0) { throw 'Server private Codex ACP staging failed' }
           Copy-Item -Recurse dist/codex-runtime "dist/${{ matrix.artifact }}/runtime"
           python -B scripts/build-pi-runtime.py --output-dir dist/pi-runtime
           if ($LASTEXITCODE -ne 0) { throw 'Private Pi runtime build failed' }

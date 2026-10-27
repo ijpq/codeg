@@ -27,7 +27,7 @@ export function useBusinessConversation(
   } | null>(null)
   const generation = useRef(0)
   const activeId = useRef(conversationId)
-  const requestInFlight = useRef(new Set<number>())
+  const requestInFlight = useRef(new Map<number, string>())
   activeId.current = conversationId
   const invalidate = useCallback(() => {
     generation.current++
@@ -47,7 +47,9 @@ export function useBusinessConversation(
   }, [])
   const refresh = useCallback(async () => {
     if (conversationId == null) return
-    const token = ++generation.current
+    // A later poll/event is not a newer business revision. Invalidating every
+    // outstanding read can starve a slow remote client indefinitely.
+    const token = generation.current
     const next = await getBusinessState(conversationId)
     if (activeId.current === conversationId && token === generation.current)
       accept(next)
@@ -89,11 +91,29 @@ export function useBusinessConversation(
       window.removeEventListener("focus", onFocus)
     }
   }, [conversationId, invalidate, refresh, visible])
+  useEffect(() => {
+    if (
+      state &&
+      state.pendingRequestId ===
+        requestInFlight.current.get(state.conversationId) &&
+      (state.switchStatus === "succeeded" || state.switchStatus === "failed")
+    ) {
+      // The durable result also settles a lost/slow HTTP acknowledgement.
+      requestInFlight.current.delete(state.conversationId)
+      setError((current) =>
+        current?.conversationId === state.conversationId ? null : current
+      )
+      setSubmitting((current) =>
+        current === state.conversationId ? null : current
+      )
+    }
+  }, [state])
   const switchAgent = useCallback(
     async (targetAgent: AgentType) => {
       if (conversationId == null || requestInFlight.current.has(conversationId))
         return
-      requestInFlight.current.add(conversationId)
+      const requestId = crypto.randomUUID()
+      requestInFlight.current.set(conversationId, requestId)
       const cid = conversationId
       setSubmitting(cid)
       setError(null)
@@ -117,7 +137,7 @@ export function useBusinessConversation(
         const preferences = getSavedPrefsForConnect(targetAgent)
         const next = await switchBusinessAgent({
           conversationId: cid,
-          requestId: crypto.randomUUID(),
+          requestId,
           targetAgent,
           expectedRevision: latest?.revision ?? null,
           preferredModeId: preferences.modeId,
@@ -125,15 +145,20 @@ export function useBusinessConversation(
         })
         if (activeId.current === cid) accept(next)
       } catch (e) {
-        if (activeId.current === cid)
+        if (
+          activeId.current === cid &&
+          requestInFlight.current.get(cid) === requestId
+        )
           setError({
             conversationId: cid,
             message: toErrorMessage(e),
           })
         await refresh().catch(() => {})
       } finally {
-        requestInFlight.current.delete(cid)
-        setSubmitting((current) => (current === cid ? null : current))
+        if (requestInFlight.current.get(cid) === requestId) {
+          requestInFlight.current.delete(cid)
+          setSubmitting((current) => (current === cid ? null : current))
+        }
       }
     },
     [accept, conversationId, refresh, state]

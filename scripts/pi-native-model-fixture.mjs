@@ -33,6 +33,10 @@ export async function startPiModel() {
       fromClaude: input.includes("BUSINESS_CLAUDE_COMPLETED"),
       fromPi: input.includes("BUSINESS_PI_COMPLETED"),
       user: input.includes("BUSINESS_PI_USER"),
+      rules:
+        input.includes("BUSINESS_SAFE_BOUNDARY") &&
+        input.includes("BUSINESS_SOURCE_INSTANCE_RULES"),
+      ledger: input.includes("custom-ledger.md"),
       image: input.includes('"input_image"'),
       steer: input.includes("PI_NATIVE_GUIDANCE"),
       childContext: input.includes("PI_CHILD_CONTEXT"),

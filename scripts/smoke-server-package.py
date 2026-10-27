@@ -61,6 +61,8 @@ def main():
     if args.require_runtime and not runtime.is_file():
         raise RuntimeError("The release is missing its pinned Codex recovery runtime")
     if runtime.is_file():
+        subprocess.run([sys.executable, '-B', str(Path(__file__).with_name('build-codex-adapter.py')),
+                        '--output-dir', str(runtime.parent), '--verify'], check=True)
         manifest = json.loads((runtime.parent / "source.json").read_text())
         if args.require_runtime:
             pinned = Path(__file__).resolve().parents[1] / "vendor/codex-runtime/source.json"

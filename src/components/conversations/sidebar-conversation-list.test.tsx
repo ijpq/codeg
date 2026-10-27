@@ -1181,8 +1181,8 @@ describe("SidebarConversationList — Recent section", () => {
     expect(document.body.textContent).not.toContain("conv-13")
   })
 
-  it("shows five recent conversations initially and reveals the rest on demand", () => {
-    const conversations = Array.from({ length: 7 }, (_, index) => {
+  it("shows ten recent conversations initially and reveals the rest on demand", () => {
+    const conversations = Array.from({ length: 12 }, (_, index) => {
       const timestamp = new Date(FIXED + index * MINUTE).toISOString()
       return conv(20 + index, 1, {
         created_at: timestamp,
@@ -1193,10 +1193,10 @@ describe("SidebarConversationList — Recent section", () => {
 
     render(recentTree(true))
 
-    // All seven have one canonical Folder row. Only the newest five initially
+    // All twelve have one canonical Folder row. Only the newest ten initially
     // get a second copy in Recent; the two oldest wait behind Show more.
     expect(
-      document.querySelectorAll('[data-conversation-id="26"]')
+      document.querySelectorAll('[data-conversation-id="31"]')
     ).toHaveLength(2)
     expect(
       document.querySelectorAll('[data-conversation-id="22"]')

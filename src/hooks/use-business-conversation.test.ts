@@ -48,6 +48,73 @@ afterEach(() => {
   vi.clearAllMocks()
 })
 describe("business agent handoff client", () => {
+  it("settles from persisted success even if the HTTP acknowledgement is lost", async () => {
+    let resolve!: (value: BusinessConversationState) => void
+    api.switch.mockImplementation(
+      () =>
+        new Promise((done) => {
+          resolve = done
+        })
+    )
+    const { result } = renderHook(() => useBusinessConversation(1))
+    await waitFor(() => expect(result.current.state).not.toBeNull())
+    let pending!: Promise<void>
+    act(() => {
+      pending = result.current.switchAgent("pi")
+    })
+    await waitFor(() => expect(api.switch).toHaveBeenCalledTimes(1))
+    const done = {
+      ...state(1, 5, "pi"),
+      switchStatus: "succeeded",
+      pendingRequestId: api.switch.mock.calls[0][0].requestId,
+    }
+    api.get.mockResolvedValue(done)
+    await act(async () => {
+      await result.current.refresh()
+    })
+    expect(result.current.state?.activeAgent).toBe("pi")
+    expect(result.current.pending).toBe(false)
+    await act(async () => {
+      resolve(done)
+      await pending
+    })
+    expect(api.switch).toHaveBeenCalledTimes(1)
+  })
+  it("accepts a completed snapshot while a newer refresh is still slow", async () => {
+    const { result } = renderHook(() => useBusinessConversation(1))
+    await waitFor(() => expect(result.current.state).not.toBeNull())
+    let resolveFirst!: (value: BusinessConversationState) => void
+    let resolveSecond!: (value: BusinessConversationState) => void
+    api.get
+      .mockImplementationOnce(
+        () =>
+          new Promise((done) => {
+            resolveFirst = done
+          })
+      )
+      .mockImplementationOnce(
+        () =>
+          new Promise((done) => {
+            resolveSecond = done
+          })
+      )
+    let first!: Promise<void>
+    let second!: Promise<void>
+    act(() => {
+      first = result.current.refresh()
+      second = result.current.refresh()
+    })
+    await act(async () => {
+      resolveFirst({ ...state(1, 4, "pi"), switchStatus: "succeeded" })
+      await first
+    })
+    expect(result.current.state?.activeAgent).toBe("pi")
+    await act(async () => {
+      resolveSecond({ ...state(1, 2), switchStatus: "preparing" })
+      await second
+    })
+    expect(result.current.state?.activeAgent).toBe("pi")
+  })
   it("restores Pi settings independently and keeps its native session after refresh", async () => {
     localStorage.setItem(
       "codeg:selector-prefs",

@@ -128,7 +128,13 @@ jobs:
       - name: Build isolated candidate Setup and Server
         if: inputs.candidate && !inputs.reuse_candidate
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          python -B scripts/fetch-tested-codex-runtime.py --output-dir dist/codex-runtime
+          if ($LASTEXITCODE -ne 0) { throw 'Candidate tested Codex runtime fetch failed' }
+          python -B scripts/build-codex-adapter.py --output-dir dist/codex-runtime
+          if ($LASTEXITCODE -ne 0) { throw 'Candidate private Codex ACP staging failed' }
           pnpm tauri:prepare-sidecars --target x86_64-pc-windows-msvc
           if ($LASTEXITCODE -ne 0) { throw 'Candidate sidecar build failed' }
           $env:CODEG_SKIP_SIDECAR='1'
@@ -151,6 +157,7 @@ jobs:
             src-tauri/target/x86_64-pc-windows-msvc/release/codeg-cli.exe
             out/
             dist/pi-runtime/
+            dist/codex-runtime/
           if-no-files-found: error
           retention-days: 7
       - name: Download verified published baseline into the runner
@@ -172,6 +179,7 @@ jobs:
           $setup=Join-Path $root 'codeg_0.36.0-fix1_x64-setup.exe'
           $previous=$setup
           $server=Join-Path $root 'server/codeg-server-windows-x64'
+          $previousServer=$server
           $extra=@('--baseline','true')
           $version='0.36.0-fix1'
           if ($env:CANDIDATE_UI -eq 'true') {
@@ -180,13 +188,13 @@ jobs:
             $candidate=Join-Path $env:RUNNER_TEMP 'candidate-server'
             New-Item -ItemType Directory -Force $candidate | Out-Null
             Copy-Item -Recurse out (Join-Path $candidate 'web')
-            Copy-Item -Recurse (Join-Path $server 'runtime') (Join-Path $candidate 'runtime')
+            Copy-Item -Recurse dist/codex-runtime (Join-Path $candidate 'runtime')
             Copy-Item -Recurse dist/pi-runtime (Join-Path $candidate 'pi-runtime')
             foreach ($binary in @('codeg-server','codeg-mcp','codeg-computer-helper','codeg-cli')) {
               Copy-Item "src-tauri/target/x86_64-pc-windows-msvc/release/$binary.exe" $candidate
             }
-            # The unchanged private CLI is a test input from the checksum-verified
-            # baseline, never substituted for a candidate CodeG/MCP executable.
+            # Use the candidate commit's ordinary-CI tested CLI and pinned ACP,
+            # exactly as the Setup and release Server packaging paths do.
             $originalSha=$env:GITHUB_SHA
             try {
               if ($env:CODEG_CANDIDATE_SHA) { $env:GITHUB_SHA=$env:CODEG_CANDIDATE_SHA }
@@ -201,7 +209,7 @@ jobs:
             $server=$candidate
             $extra=@('--native-tools',$tools)
           }
-          node scripts/verify-windows-ui.mjs --setup $setup --previous $previous --server $server --output (Join-Path $env:RUNNER_TEMP 'ui-evidence') --version $version @extra
+          node scripts/verify-windows-ui.mjs --setup $setup --previous $previous --server $server --previous-server $previousServer --output (Join-Path $env:RUNNER_TEMP 'ui-evidence') --version $version @extra
           if ($LASTEXITCODE -ne 0) { throw 'Isolated UI verification failed' }
           if ($env:CANDIDATE_UI -eq 'true') {
             python -B scripts/verify-windows-dependencies.py (Join-Path $env:RUNNER_TEMP 'ui-evidence/upgraded-installation') --report (Join-Path $env:RUNNER_TEMP 'ui-evidence/setup-windows-dependencies.json')

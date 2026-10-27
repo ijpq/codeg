@@ -74,6 +74,7 @@ mod m20261022_000001_tool_approval;
 pub(crate) mod m20261025_000001_business_agent_sessions;
 mod m20261026_000001_business_delivery;
 mod m20261026_000002_office_delivery_previews;
+mod m20261027_000001_business_handoff_context;
 pub struct Migrator;
 
 #[async_trait::async_trait]
@@ -154,6 +155,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261025_000001_business_agent_sessions::Migration),
             Box::new(m20261026_000001_business_delivery::Migration),
             Box::new(m20261026_000002_office_delivery_previews::Migration),
+            Box::new(m20261027_000001_business_handoff_context::Migration),
         ]
     }
 }

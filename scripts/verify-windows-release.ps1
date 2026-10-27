@@ -52,6 +52,8 @@ python -B scripts/release-resources.py verify (Join-Path $installed 'web') $vers
 if ($LASTEXITCODE -ne 0) { throw 'Installed frontend/migration inventory failed' }
 python -B scripts/build-pi-runtime.py --output-dir (Join-Path $installed 'pi-runtime') --verify
 if ($LASTEXITCODE -ne 0) { throw 'Installed Pi runtime inventory failed' }
+python -B scripts/build-codex-adapter.py --output-dir (Join-Path $installed 'runtime') --verify
+if ($LASTEXITCODE -ne 0) { throw 'Installed Codex adapter inventory failed' }
 $mcpVersion = (& (Join-Path $installed 'codeg-mcp.exe') --version | Out-String).Trim()
 if ($LASTEXITCODE -ne 0 -or $mcpVersion -ne $version) { throw 'Installed MCP version mismatch' }
 python -B scripts/verify-windows-dependencies.py $installed --report (Join-Path $Destination 'setup-windows-dependencies.json')
@@ -60,10 +62,14 @@ $previous = Join-Path $Destination 'previous-release'
 New-Item -ItemType Directory -Force $previous | Out-Null
 $oldVersion = $UpgradeFromTag.TrimStart('v')
 $oldSetup = "codeg_${oldVersion}_x64-setup.exe"
-gh release download $UpgradeFromTag --repo $Repository --dir $previous --pattern $oldSetup --pattern "$oldSetup.sha256"
+gh release download $UpgradeFromTag --repo $Repository --dir $previous --pattern $oldSetup --pattern "$oldSetup.sha256" --pattern 'codeg-server-windows-x64.zip' --pattern 'codeg-server-windows-x64.zip.sha256'
 if ($LASTEXITCODE -ne 0) { throw 'Could not download upgrade baseline' }
 $oldHash = ((Get-Content (Join-Path $previous "$oldSetup.sha256") -Raw).Trim() -split '\s+')[0].ToLower()
 if ((Get-FileHash (Join-Path $previous $oldSetup) -Algorithm SHA256).Hash.ToLower() -ne $oldHash) { throw 'Upgrade baseline checksum mismatch' }
+$oldServerHash=((Get-Content (Join-Path $previous 'codeg-server-windows-x64.zip.sha256') -Raw).Trim() -split '\s+')[0].ToLower()
+if ((Get-FileHash (Join-Path $previous 'codeg-server-windows-x64.zip') -Algorithm SHA256).Hash.ToLower() -ne $oldServerHash) { throw 'Server upgrade baseline checksum mismatch' }
+Expand-Archive (Join-Path $previous 'codeg-server-windows-x64.zip') (Join-Path $previous 'server')
+$previousServer=Join-Path $previous 'server/codeg-server-windows-x64'
 $nativeTools = Join-Path $Destination 'native-agent-tools'
 npm install --prefix $nativeTools --global --include=optional --ignore-scripts --no-audit --no-fund '@agentclientprotocol/codex-acp@2.2.2' '@agentclientprotocol/claude-agent-acp@0.94.0'
 if ($LASTEXITCODE -ne 0) { throw 'Isolated ACP installation failed' }
@@ -71,7 +77,7 @@ python -B scripts/prepare-office-preview-test.py --output $nativeTools
 if ($LASTEXITCODE -ne 0) { throw 'Isolated Office converter checksum verification failed' }
 node scripts/test-pi-service-tier.mjs --output (Join-Path $Destination 'pi-service-tier') --pi (Join-Path $root 'pi-runtime/pi.cmd') --adapter (Join-Path $root 'pi-runtime/node_modules/pi-acp/dist/index.js')
 if ($LASTEXITCODE -ne 0) { throw 'Packaged Pi service-tier protocol verification failed' }
-node scripts/verify-windows-ui.mjs --setup (Join-Path $Destination $setupName) --previous (Join-Path $previous $oldSetup) --server $root --output (Join-Path $Destination 'ui') --version $version --native-tools $nativeTools
+node scripts/verify-windows-ui.mjs --setup (Join-Path $Destination $setupName) --previous (Join-Path $previous $oldSetup) --server $root --previous-server $previousServer --output (Join-Path $Destination 'ui') --version $version --native-tools $nativeTools
 if ($LASTEXITCODE -ne 0) { throw 'Setup upgrade/startup or actual Server/Desktop UI verification failed' }
 @{ tag=$ReleaseTag; commit=$env:GITHUB_SHA; published=(-not $release.isDraft); assets=$evidence; installation='passed'; server_startup='passed'; setup_startup='passed'; upgrade='passed'; actual_ui='passed'; installed_files=$manifest.files.Count } | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $Destination 'verification.json')
 Get-Content (Join-Path $Destination 'verification.json')

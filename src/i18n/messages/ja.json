@@ -1679,7 +1679,9 @@
       "upgradeAvailable": "{versionText}。アップグレード可能です。",
       "recommendedUnavailable": "{versionText}。推奨バージョンはありません。",
       "latest": "{versionText}。すでに最新です。",
-      "unreviewedAvailable": "{versionText}。未レビューの新しいリリースがあります。"
+      "unreviewedAvailable": "{versionText}。未レビューの新しいリリースがあります。",
+      "bundledRuntime": "CodeG bundled ACP: {localVersion} · {path}. Updated with the matching CodeG release.",
+      "customRuntime": "Selected custom ACP: {localVersion} · {path}. Managed at the configured runtime path."
     },
     "adapter": {
       "label": "ACP アダプター",
@@ -4461,7 +4463,14 @@
         "project": "This project",
         "global": "Global preferences",
         "loadRule": "Confirmed memory is loaded into the next accepted prompt within its context budget; omitted items are explicitly marked. Native private memory stays engine-specific. Save only confirmed facts and requirements.",
-        "save": "Save"
+        "save": "Save",
+        "succeeded": "Handoff complete",
+        "phases": {
+          "capturing_history": "Saving history and work rules…",
+          "starting_target": "Starting the target Agent…",
+          "verifying_target": "Verifying the target session…",
+          "activating": "Activating the business session…"
+        }
       }
     },
     "diffPreview": {

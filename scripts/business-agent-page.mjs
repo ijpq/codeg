@@ -2,7 +2,7 @@
 // model endpoints. No live model login or reasoning is claimed by this check.
 import assert from "node:assert/strict"
 import { mkdir, writeFile } from "node:fs/promises"
-import { join } from "node:path"
+import { join, dirname } from "node:path"
 import { randomUUID } from "node:crypto"
 
 const delay = (ms) => new Promise((done) => setTimeout(done, ms))
@@ -40,6 +40,153 @@ export async function openBusiness(page, api, cid, folderId, agent) {
     .waitFor({ timeout: 90_000 })
 }
 
+export async function unavailableSourcePage({
+  page,
+  api,
+  f,
+  folderId,
+  goalModel,
+  report,
+  name,
+  output,
+}) {
+  if (!goalModel) return
+  const setting = (await api("acp_list_agents")).find(
+    (agent) => agent.agent_type === "codex"
+  )
+  goalModel.business(true)
+  const cid = await api("create_conversation", {
+    folderId,
+    agentType: "codex",
+    title: "Unavailable source recovery",
+  })
+  const readHistory = async () => {
+    try {
+      return await api("get_folder_conversation", {
+        conversationId: cid,
+        userTurnLimit: 25,
+      })
+    } catch (error) {
+      if (
+        error?.code === "not_found" ||
+        /Conversation not found/.test(String(error?.message ?? error))
+      )
+        return { turns: [] }
+      throw error
+    }
+  }
+  try {
+    const connectionId = await api("acp_connect", {
+      agentType: "codex",
+      workingDir: f.cwd,
+    })
+    await until(
+      () => api("acp_get_session_snapshot", { connectionId }),
+      (s) => s.selectors_ready && s.external_id,
+      "Fresh Codex prompt ready"
+    )
+    await api("acp_prompt", {
+      connectionId,
+      folderId,
+      conversationId: cid,
+      clientMessageId: randomUUID(),
+      blocks: [{ type: "text", text: "BUSINESS_CODEX_FIRST" }],
+    })
+    const original = await until(
+      readHistory,
+      (d) => JSON.stringify(d.turns).includes("BUSINESS_CODEX_COMPLETED"),
+      "Source history was actually saved"
+    )
+    await until(
+      () => api("acp_get_session_snapshot", { connectionId }),
+      (s) => s.status === "connected" && !s.turn_in_flight,
+      "Source round has completed before disconnect"
+    )
+    await api("acp_disconnect", { connectionId })
+    const resumed = await api("acp_restore_conversation", {
+      conversationId: cid,
+    })
+    await until(
+      () =>
+        api("acp_get_session_snapshot", { connectionId: resumed.connectionId }),
+      (s) =>
+        s.selectors_ready && s.external_id === original.summary.external_id,
+      "Default packaged Codex resumes its actual saved native session"
+    )
+    await api("acp_disconnect", { connectionId: resumed.connectionId })
+    await api("acp_update_agent_env", {
+      agentType: "codex",
+      enabled: true,
+      env: {
+        ...setting.env,
+        CODEG_CODEX_ACP_PATH: join(
+          f.root,
+          "intentionally-missing-codex-acp.cmd"
+        ),
+      },
+      modelProviderId: setting.model_provider_id ?? null,
+    })
+    await assert.rejects(
+      api("acp_restore_conversation", { conversationId: cid }),
+      /not found|not installed|spawn|cannot|failed|no such|系统找不到/i,
+      "Source must actually fail to start"
+    )
+    await openBusiness(page, api, cid, folderId, "codex")
+    const selector = page
+      .locator("[data-business-agent-toolbar]:visible select")
+      .first()
+    assert.equal(
+      await selector.isEnabled(),
+      true,
+      "Source startup failure must leave the Agent switch usable"
+    )
+    await page.screenshot({
+      path: join(output, `${name}-unavailable-source.png`),
+    })
+    await selector.selectOption("pi")
+    const current = await until(
+      () => api("get_business_conversation_state", { conversationId: cid }),
+      (s) => {
+        if (s?.switchStatus === "failed") throw Error(s.switchError)
+        return s?.activeAgent === "pi" && s.switchStatus === "succeeded"
+      },
+      "Switch from unavailable source to verified Pi"
+    )
+    assert.equal(
+      current.sessions.find((s) => s.agentType === "codex").externalId,
+      original.summary.external_id
+    )
+    await until(
+      () => selector.inputValue(),
+      (v) => v === "pi",
+      "Successful offline-source switch is visible without restart"
+    )
+    const after = await readHistory()
+    assert.equal(
+      after.turns.filter((t) => t.role === "user").length,
+      original.turns.filter((t) => t.role === "user").length
+    )
+    assert.ok(JSON.stringify(after.turns).includes("BUSINESS_CODEX_COMPLETED"))
+    report.checks.push({
+      name: `${name}-unavailable-source-switch`,
+      passed: true,
+      originalSessionRetained: true,
+      defaultCodexNewAndResume: true,
+      targetVerifiedReady: true,
+      historyRetained: true,
+      uiUpdatedWithoutRestart: true,
+    })
+  } finally {
+    await api("acp_update_agent_env", {
+      agentType: "codex",
+      enabled: setting.enabled,
+      env: setting.env,
+      modelProviderId: setting.model_provider_id ?? null,
+    })
+    goalModel.business(false)
+  }
+}
+
 export async function businessAgentPage({
   page,
   api,
@@ -55,6 +202,20 @@ export async function businessAgentPage({
   if (!goalModel || !claudeModel || !piModel) return null
   goalModel.business(true)
   const folderId = conversation.folder_id
+  await writeFile(
+    join(f.cwd, "AGENTS.md"),
+    "BUSINESS_WORKSPACE_RULE: preserve existing business templates and acceptance rules.\n"
+  )
+  // Only the source engine's private instruction entry knows these rules.
+  // Target-native workspace discovery alone cannot satisfy this assertion.
+  await writeFile(
+    join(f.env.CODEX_HOME, "AGENTS.md"),
+    `BUSINESS_SOURCE_INSTANCE_RULES / BUSINESS_SAFE_BOUNDARY: never restart the production Server. Read ${join(f.cwd, "custom-ledger.md")} and its subledger before work. Automatically choose and maintain the existing .agents/skills/official-document/SKILL.md and preserve its acceptance rules.\n`
+  )
+  await writeFile(
+    join(f.cwd, "custom-ledger.md"),
+    "Isolated ledger fixture; production instances must remain untouched.\n"
+  )
   const cid = await api("create_conversation", {
     folderId,
     agentType: "codex",
@@ -63,6 +224,7 @@ export async function businessAgentPage({
   const state = () =>
     api("get_business_conversation_state", { conversationId: cid })
   const switchResponses = []
+  let observer = null
   let businessTitle = null
   const recordSwitch = async (response) => {
     if (!response.url().endsWith("/api/switch_business_agent")) return
@@ -190,6 +352,32 @@ export async function businessAgentPage({
     )
     const originalExternal = first.summary.external_id
     await openBusiness(page, api, cid, folderId, "codex")
+    const toolbar = page
+      .locator("[data-business-agent-toolbar]:visible")
+      .first()
+    await toolbar.waitFor()
+    const viewport = page.viewportSize()
+    await page.setViewportSize({ width: 390, height: 844 })
+    const bounds = await toolbar.boundingBox()
+    assert.ok(
+      bounds &&
+        bounds.width > 150 &&
+        bounds.x >= 0 &&
+        bounds.x + bounds.width <= 391,
+      "Agent toolbar fits a narrow conversation"
+    )
+    await page.screenshot({
+      path: join(output, `${name}-agent-toolbar-narrow.png`),
+    })
+    if (viewport) await page.setViewportSize(viewport)
+    if (name.startsWith("server")) {
+      observer = await page.context().newPage()
+      await observer.goto(page.url())
+      await observer
+        .locator("[data-business-agent-toolbar]:visible select")
+        .first()
+        .waitFor({ timeout: 90_000 })
+    }
     const otherBefore = (await api("list_all_conversations")).find(
       (c) => c.id === conversation.id
     )
@@ -229,6 +417,26 @@ export async function businessAgentPage({
       "Queued Claude handoff completes"
     )
     assert.equal(current.sessions.length, 2)
+    await until(
+      () =>
+        page
+          .locator("[data-business-agent-toolbar]:visible select")
+          .first()
+          .inputValue(),
+      (agent) => agent === "claude_code",
+      "Initiating page receives committed handoff without reload"
+    )
+    if (observer) {
+      await until(
+        () =>
+          observer
+            .locator("[data-business-agent-toolbar]:visible select")
+            .first()
+            .inputValue(),
+        (agent) => agent === "claude_code",
+        "Second Server client receives committed handoff without reload"
+      )
+    }
     businessTitle = (await history()).summary.title
     assert.ok(
       businessTitle && !businessTitle.includes("<codeg-business-context>")
@@ -278,7 +486,14 @@ export async function businessAgentPage({
         .evidence()
         .slice(claudeBefore)
         .some(
-          (r) => r.taskState && r.memory && r.skill && r.previousAgent && r.user
+          (r) =>
+            r.taskState &&
+            r.memory &&
+            r.skill &&
+            r.previousAgent &&
+            r.user &&
+            r.rules &&
+            r.ledger
         ),
       "Actual Claude model request did not receive task state/memory/skill/increment"
     )
@@ -318,7 +533,14 @@ export async function businessAgentPage({
       () => goalModel.businessEvidence().slice(codexBefore),
       (rs) =>
         rs.some(
-          (r) => r.taskState && r.memory && r.skill && r.previousAgent && r.user
+          (r) =>
+            r.taskState &&
+            r.memory &&
+            r.skill &&
+            r.previousAgent &&
+            r.user &&
+            r.rules &&
+            r.ledger
         ),
       "Actual Codex return request includes Claude increment"
     )
@@ -366,6 +588,19 @@ export async function businessAgentPage({
     assert.equal(failedPi.activeAgent, "codex")
     assert.equal(failedPi.sessions.length, 2)
     assert.match(failedPi.switchError, /Pi is not installed/)
+    await until(
+      () =>
+        page
+          .locator("[data-business-agent-control]:visible select")
+          .first()
+          .isEnabled(),
+      Boolean,
+      "Failed handoff releases the UI for retry"
+    )
+    await page
+      .locator("[data-business-agent-control]:visible [role=alert]")
+      .filter({ hasText: "Pi is not installed" })
+      .waitFor()
     assert.equal(
       failedPi.sessions.find((s) => s.agentType === "codex").externalId,
       originalExternal
@@ -403,7 +638,9 @@ export async function businessAgentPage({
             r.skill &&
             r.previousAgent &&
             r.fromClaude &&
-            r.user
+            r.user &&
+            r.rules &&
+            r.ledger
         ),
       "Actual Pi model receives shared state, Skill and both engines' increments"
     )
@@ -420,7 +657,7 @@ export async function businessAgentPage({
     )
     await until(
       () => goalModel.businessEvidence().slice(codexAfterPi),
-      (rs) => rs.some((r) => r.fromPi && r.user),
+      (rs) => rs.some((r) => r.fromPi && r.user && r.rules && r.ledger),
       "Codex receives Pi increment"
     )
     await switchTo("claude_code")
@@ -506,6 +743,31 @@ export async function businessAgentPage({
       final.turns.map((t) => t.id)
     )
     await page.screenshot({ path: join(output, `${name}-business-agent.png`) })
+    const agents = await api("acp_list_agents")
+    const piRuntime = agents.find((agent) => agent.agent_type === "pi")
+    assert.equal(piRuntime.installed_version, "0.0.34-codeg.2")
+    assert.equal(piRuntime.selected_runtime?.source, "bundled")
+    assert.match(
+      piRuntime.selected_runtime.adapter_path,
+      /pi-runtime[\\/]pi-acp\.cmd$/
+    )
+    assert.equal(
+      await api("acp_detect_agent_local_version", { agentType: "pi" }),
+      "0.0.34-codeg.2"
+    )
+    assert.equal(
+      (await api("acp_get_agent_status", { agentType: "pi" }))
+        .installed_version,
+      "0.0.34-codeg.2"
+    )
+    await assert.rejects(
+      api("acp_uninstall_agent", { agentType: "pi", taskId: randomUUID() }),
+      /matching CodeG runtime group/,
+      "Selected private Pi adapter cannot be overwritten by a global npm action"
+    )
+    const codexRuntime = agents.find((agent) => agent.agent_type === "codex")
+    assert.equal(codexRuntime.selected_runtime?.source, "bundled")
+    assert.equal(codexRuntime.selected_runtime.adapter_version, "2.2.2")
     report.checks.push({
       name: `${name}-business-agent-roundtrip`,
       passed: true,
@@ -527,6 +789,10 @@ export async function businessAgentPage({
       concurrentCas: true,
       historyAfterReload: true,
       otherBusinessUnaffected: true,
+      selectedRuntimeVersion: true,
+      sourceRulesAndLedgerActuallyReceived: true,
+      serverSecondClientSync: Boolean(observer),
+      narrowToolbar: true,
     })
     return {
       cid,
@@ -561,9 +827,89 @@ export async function businessAgentPage({
     )
     throw error
   } finally {
+    await observer?.close()
     page.off("response", recordSwitch)
     goalModel.business(false)
   }
+}
+
+// Delay only the disposable child launcher, then terminate the owned app tree.
+// On restart the same durable request launches the actual pinned native ACP.
+export async function stageInterruptedHandoff(api, f, saved) {
+  if (!saved) return null
+  const setting = (await api("acp_list_agents")).find(
+    (a) => a.agent_type === "codex"
+  )
+  const actual = setting.selected_runtime.adapter_path
+  const node = join(dirname(actual), "../pi-runtime/node.exe")
+  const flag = join(f.root, "release-handoff.flag")
+  const wrapper = join(f.root, "delayed-codex-acp.cmd")
+  await writeFile(
+    wrapper,
+    `@echo off\r\nif not exist "${flag}" "${node}" -e "setTimeout(() => {}, 300000)"\r\ncall "${actual}" %*\r\nexit /b %errorlevel%\r\n`
+  )
+  await api("acp_update_agent_env", {
+    agentType: "codex",
+    enabled: true,
+    env: { ...setting.env, CODEG_CODEX_ACP_PATH: wrapper },
+    modelProviderId: setting.model_provider_id ?? null,
+  })
+  const before = await api("get_business_conversation_state", {
+    conversationId: saved.cid,
+  })
+  assert.equal(before.activeAgent, "pi")
+  const requestId = randomUUID()
+  await api("switch_business_agent", {
+    request: {
+      conversationId: saved.cid,
+      requestId,
+      targetAgent: "codex",
+      expectedRevision: before.revision,
+    },
+  })
+  await until(
+    () => api("get_business_conversation_state", { conversationId: saved.cid }),
+    (s) => {
+      if (s?.switchStatus === "failed") throw Error(s.switchError)
+      return (
+        s?.switchPhase === "verifying_target" && s.switchStatus === "preparing"
+      )
+    },
+    "Persisted target preparation is in progress before process interruption"
+  )
+  return { flag, requestId, setting, cid: saved.cid, sessions: before.sessions }
+}
+
+export async function finishInterruptedHandoff(api, pending, report, name) {
+  if (!pending) return
+  const state = await until(
+    () =>
+      api("get_business_conversation_state", { conversationId: pending.cid }),
+    (s) => {
+      if (s?.switchStatus === "failed") throw Error(s.switchError)
+      return s?.switchStatus === "succeeded"
+    },
+    "Restart automatically resumes the persisted handoff"
+  )
+  assert.equal(state.pendingRequestId, pending.requestId)
+  assert.equal(state.activeAgent, "codex")
+  assert.deepEqual(
+    state.sessions.map((s) => s.externalId),
+    pending.sessions.map((s) => s.externalId)
+  )
+  await api("acp_update_agent_env", {
+    agentType: "codex",
+    enabled: pending.setting.enabled,
+    env: pending.setting.env,
+    modelProviderId: pending.setting.model_provider_id ?? null,
+  })
+  report.checks.push({
+    name: `${name}-interrupted-handoff-auto-recovery`,
+    passed: true,
+    sameRequest: true,
+    sameNativeSessions: true,
+    actualTargetReady: true,
+  })
 }
 
 export async function restoredBusinessPage(page, api, saved, report, name) {

@@ -325,6 +325,11 @@ pub(crate) fn apply_custom_version_to_url(
 /// global prefix, then the agent vendor's own native install. The fallbacks
 /// handle GUI environments that don't inherit the user's shell PATH.
 pub(crate) async fn is_cmd_available(agent_type: AgentType, cmd: &str) -> bool {
+    if agent_type == AgentType::Codex
+        && crate::acp::codex_runtime::adapter(&Default::default()).is_some_and(|p| p.is_file())
+    {
+        return true;
+    }
     if agent_type == AgentType::Pi
         && crate::acp::pi_runtime::adapter(&Default::default()).is_some_and(|p| p.is_file())
     {
@@ -6493,7 +6498,7 @@ const CHILD_HOME_KEY: &str = "HOME";
 
 /// What `os.homedir()` answers in the pi child of a launch with `runtime_env` —
 /// the home pi expands `~` against and puts its default `.pi/agent` under.
-fn pi_child_home(runtime_env: &BTreeMap<String, String>) -> PathBuf {
+pub(super) fn pi_child_home(runtime_env: &BTreeMap<String, String>) -> PathBuf {
     pi_child_home_from(runtime_env, std::env::var_os(CHILD_HOME_KEY))
 }
 
@@ -6860,11 +6865,13 @@ async fn pi_runtime_env_from_db(db: &AppDatabase) -> Result<BTreeMap<String, Str
             ))
         })?;
     let local_config_json = load_agent_local_config_json(AgentType::Pi);
-    Ok(build_runtime_env_from_setting(
+    let mut env = build_runtime_env_from_setting(
         AgentType::Pi,
         setting.as_ref(),
         local_config_json.as_deref(),
-    ))
+    );
+    crate::acp::pi_runtime::apply(&mut env);
+    Ok(env)
 }
 
 /// Settings have no workspace, and a relative agent dir names a different
@@ -11789,6 +11796,22 @@ pub(crate) async fn build_session_runtime_env(
     build_runtime_env_for_agent(db, agent_type, session_id, data_dir, false).await
 }
 
+/// Read only this instance's selected source profile. Handoff must not require
+/// starting an unavailable/disabled source engine or preparing credentials.
+pub(crate) async fn business_rule_env(
+    db: &AppDatabase,
+    agent: AgentType,
+) -> Result<BTreeMap<String, String>, AcpError> {
+    let setting = agent_setting_service::get_by_agent_type(&db.conn, agent)
+        .await
+        .map_err(|e| AcpError::protocol(e.to_string()))?;
+    Ok(build_runtime_env_from_setting(
+        agent,
+        setting.as_ref(),
+        load_agent_local_config_json(agent).as_deref(),
+    ))
+}
+
 /// Settings may inspect Pi's local model catalog while the agent is disabled.
 /// Reuse the exact launch environment, bypassing only the connection permission
 /// gate; this path starts no ACP session and sends no prompt.
@@ -11817,6 +11840,12 @@ async fn build_runtime_env_for_agent(
         build_runtime_env_from_setting(agent_type, setting.as_ref(), local_config_json.as_deref());
     if agent_type == AgentType::Codex {
         crate::acp::codex_runtime::apply(&mut runtime_env);
+        if crate::acp::codex_runtime::adapter(&runtime_env).is_some()
+            && !runtime_env.contains_key("CODEX_PATH")
+            && std::env::var_os("CODEX_PATH").is_none()
+        {
+            return Err(AcpError::SdkNotInstalled("The selected Codex CLI is unavailable. Enable the bundled CLI or configure CODEX_PATH to your existing installation; no user configuration was changed".into()));
+        }
     }
     if agent_type == AgentType::Pi {
         crate::acp::pi_runtime::apply(&mut runtime_env);
@@ -13459,6 +13488,62 @@ pub async fn acp_find_connection_for_conversation(
     .await
 }
 
+fn selected_private_runtime(
+    agent: AgentType,
+    env: &BTreeMap<String, String>,
+) -> Option<crate::acp::types::SelectedAcpRuntime> {
+    let (key, path, package) = match agent {
+        AgentType::Pi => (
+            "CODEG_PI_ACP_PATH",
+            crate::acp::pi_runtime::adapter(env)?,
+            "pi-acp",
+        ),
+        AgentType::Codex => (
+            "CODEG_CODEX_ACP_PATH",
+            crate::acp::codex_runtime::adapter(env)?,
+            "@agentclientprotocol/codex-acp",
+        ),
+        _ => return None,
+    };
+    let custom = env
+        .get(key)
+        .cloned()
+        .or_else(|| std::env::var(key).ok())
+        .is_some_and(|v| !v.trim().is_empty());
+    let version = if agent == AgentType::Pi {
+        crate::acp::pi_runtime::adapter_version(&path)
+    } else {
+        path.parent()
+            .and_then(|parent| {
+                fs::read(
+                    parent
+                        .join("node_modules")
+                        .join(package)
+                        .join("package.json"),
+                )
+                .ok()
+            })
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .and_then(|v| v.get("version").and_then(|v| v.as_str()).map(str::to_owned))
+    };
+    Some(crate::acp::types::SelectedAcpRuntime {
+        source: if custom { "custom" } else { "bundled" }.into(),
+        adapter_path: path.display().to_string(),
+        adapter_version: version,
+        available: path.is_file(),
+    })
+}
+
+async fn guard_selected_runtime_mutation(
+    db: &AppDatabase,
+    agent: AgentType,
+) -> Result<(), AcpError> {
+    if selected_private_runtime(agent, &business_rule_env(db, agent).await?).is_some() {
+        return Err(AcpError::protocol("The selected ACP is bundled with CodeG or explicitly configured. Upgrade the matching CodeG runtime group, or change its explicit runtime path; global npm install/uninstall would not update the selected adapter"));
+    }
+    Ok(())
+}
+
 pub(crate) async fn acp_get_agent_status_core(
     agent_type: AgentType,
     db: &AppDatabase,
@@ -13532,8 +13617,12 @@ pub(crate) async fn acp_get_agent_status_core(
         }
     };
 
-    if agent_type == AgentType::Pi && crate::acp::pi_runtime::bundled_root().is_some() {
-        installed_version = Some("0.0.34-codeg.2".into());
+    if let Some(runtime) =
+        selected_private_runtime(agent_type, &business_rule_env(db, agent_type).await?)
+    {
+        installed_version = runtime
+            .adapter_version
+            .or_else(|| runtime.available.then(|| "unknown".into()));
     }
     Ok(crate::acp::types::AcpAgentStatus {
         agent_type,
@@ -13581,7 +13670,7 @@ pub(crate) async fn acp_list_agents_core(db: &AppDatabase) -> Result<Vec<AcpAgen
     for (idx, agent_type) in agent_types.into_iter().enumerate() {
         let setting = settings_map.get(&agent_type);
         let meta = registry::get_agent_meta(agent_type);
-        let (available, dist_type, local_installed_version) = match &meta.distribution {
+        let (available, dist_type, mut local_installed_version) = match &meta.distribution {
             registry::AgentDistribution::Npx { cmd, package, .. } => {
                 // Keep the list path bounded: each list request probes npm
                 // global prefix at most once, then reuses the result across
@@ -13671,6 +13760,13 @@ pub(crate) async fn acp_list_agents_core(db: &AppDatabase) -> Result<Vec<AcpAgen
             }
         }
         let sort_order = setting.map(|m| m.sort_order).unwrap_or(idx as i32);
+        let selected_runtime = selected_private_runtime(agent_type, &env);
+        if let Some(runtime) = &selected_runtime {
+            local_installed_version = runtime
+                .adapter_version
+                .clone()
+                .or_else(|| runtime.available.then(|| "unknown".into()));
+        }
         // Persist detected version to DB for binary and system agents (npx
         // written during install/upgrade). Both are probed on every list, so
         // the probe is the authority and the row only mirrors it.
@@ -13785,6 +13881,7 @@ pub(crate) async fn acp_list_agents_core(db: &AppDatabase) -> Result<Vec<AcpAgen
             enabled: setting.map(|m| m.enabled).unwrap_or(true),
             sort_order,
             installed_version: local_installed_version,
+            selected_runtime,
             host_tools_agent_mode: !crate::acp::host_tools_policy::HostToolsPolicy::from_env(&env)
                 .hosts_channels(),
             env,
@@ -15300,6 +15397,21 @@ pub(crate) async fn acp_detect_agent_local_version_core(
         .flatten()
         .and_then(|m| m.installed_version);
 
+    let setting = agent_setting_service::get_by_agent_type(conn, agent_type)
+        .await
+        .map_err(|e| AcpError::protocol(e.to_string()))?;
+    let env = build_runtime_env_from_setting(
+        agent_type,
+        setting.as_ref(),
+        load_agent_local_config_json(agent_type).as_deref(),
+    );
+    if let Some(runtime) = selected_private_runtime(agent_type, &env) {
+        // This metadata describes what connect actually chooses. The global
+        // install row remains untouched so opting back to it preserves it.
+        return Ok(runtime
+            .adapter_version
+            .or_else(|| runtime.available.then(|| "unknown".into())));
+    }
     let detected = detect_local_version(agent_type).await;
     if let Some(version) = detected.clone() {
         let _ =
@@ -15396,6 +15508,7 @@ pub(crate) async fn acp_prepare_npx_agent_core(
     db: &AppDatabase,
     emitter: &EventEmitter,
 ) -> Result<String, AcpError> {
+    guard_selected_runtime_mutation(db, agent_type).await?;
     emit_agent_install_event(emitter, &task_id, AgentInstallEventKind::Started, "");
 
     let meta = registry::get_agent_meta(agent_type);
@@ -15639,6 +15752,7 @@ pub(crate) async fn acp_uninstall_agent_core(
     db: &AppDatabase,
     emitter: &EventEmitter,
 ) -> Result<(), AcpError> {
+    guard_selected_runtime_mutation(db, agent_type).await?;
     emit_agent_install_event(emitter, &task_id, AgentInstallEventKind::Started, "");
 
     let meta = registry::get_agent_meta(agent_type);

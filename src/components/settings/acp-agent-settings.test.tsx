@@ -859,6 +859,24 @@ describe("getAgentChecks adapter ordering", () => {
 })
 
 describe("buildVersionCheck", () => {
+  it("shows the selected bundled Pi ACP and offers no global upgrade", () => {
+    const check = buildVersionCheck(
+      makeAgent({
+        agent_type: "pi",
+        installed_version: "0.0.34",
+        registry_version: "0.0.34",
+        selected_runtime: {
+          source: "bundled",
+          adapter_path: "C:/isolated/codeg/pi-runtime/pi-acp.cmd",
+          adapter_version: "0.0.34-codeg.2",
+          available: true,
+        },
+      })
+    )
+    expect(check?.status).toBe("pass")
+    expect(check?.fixes).toEqual([])
+    expect(check?.message).toContain("bundled ACP")
+  })
   // A manually written definition has no registry behind it — its stored
   // version is user-typed — so the check must show the local side alone and
   // never manufacture an "upgrade available" against that noise.

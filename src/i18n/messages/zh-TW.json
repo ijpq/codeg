@@ -1679,7 +1679,9 @@
       "upgradeAvailable": "{versionText}。發現可升級版本。",
       "recommendedUnavailable": "{versionText}。暫無建議版本。",
       "latest": "{versionText}。已是最新版本。",
-      "unreviewedAvailable": "{versionText}。有未經審查的較新版本。"
+      "unreviewedAvailable": "{versionText}。有未經審查的較新版本。",
+      "bundledRuntime": "CodeG 隨附 ACP：{localVersion} · {path}。隨對應的 CodeG 版本整組更新。",
+      "customRuntime": "已選取自訂 ACP：{localVersion} · {path}。由設定的執行環境路徑管理。"
     },
     "adapter": {
       "label": "ACP 轉接器",
@@ -4461,7 +4463,14 @@
         "project": "This project",
         "global": "Global preferences",
         "loadRule": "已確認的記憶依上下文預算載入下一次接納的請求，超出部分會明確標示未載入。私有記憶仍由各引擎管理。只儲存已確認的事實與要求。",
-        "save": "Save"
+        "save": "Save",
+        "succeeded": "交接已完成",
+        "phases": {
+          "capturing_history": "正在儲存歷史與工作規則…",
+          "starting_target": "正在啟動目標 Agent…",
+          "verifying_target": "正在驗證目標工作階段可用性…",
+          "activating": "正在切換業務對話…"
+        }
       }
     },
     "diffPreview": {

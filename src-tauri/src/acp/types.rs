@@ -1747,6 +1747,14 @@ pub struct RestoredConversationConnectionInfo {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct SelectedAcpRuntime {
+    pub source: String,
+    pub adapter_path: String,
+    pub adapter_version: Option<String>,
+    pub available: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct AcpAgentInfo {
     pub agent_type: crate::models::agent::AgentType,
     /// Whether this agent has a codeg-known skill store — every built-in, and
@@ -1795,6 +1803,8 @@ pub struct AcpAgentInfo {
     pub enabled: bool,
     pub sort_order: i32,
     pub installed_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected_runtime: Option<SelectedAcpRuntime>,
     pub env: BTreeMap<String, String>,
     /// The RESOLVED `CODEG_ACP_HOST_TOOLS` verdict for this agent — whether the
     /// next launch hands the `fs/*` + `terminal/*` channels (and, with them,

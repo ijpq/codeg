@@ -86,6 +86,7 @@ pub struct BusinessConversationState {
     pub pending_agent: Option<AgentType>,
     pub switch_status: Option<String>,
     pub switch_error: Option<String>,
+    pub switch_phase: Option<String>,
     pub task_state: BusinessTaskState,
     pub sessions: Vec<BusinessAgentSession>,
     pub last_sequence: i64,
@@ -112,6 +113,10 @@ pub async fn state(
     conn: &DatabaseConnection,
     cid: i32,
 ) -> Result<Option<BusinessConversationState>, DbError> {
+    // A single SQLite read snapshot prevents mixing an old projection/revision
+    // with the final receipt from a concurrent activation on another client.
+    let tx = conn.begin().await?;
+    let conn = &tx;
     let Some(row)=conn.query_one(stmt("SELECT b.*,c.agent_type FROM business_conversation_state b JOIN conversation c ON c.id=b.conversation_id WHERE b.conversation_id=? AND b.enabled=1",vec![cid.into()])).await? else {return Ok(None)};
     let pending: Option<String> = row.try_get("", "pending_request_id")?;
     let request = if let Some(id) = &pending {
@@ -146,7 +151,7 @@ pub async fn state(
         .await?
         .unwrap()
         .try_get("", "n")?;
-    Ok(Some(BusinessConversationState {
+    let result = BusinessConversationState {
         conversation_id: cid,
         revision: row.try_get("", "revision")?,
         active_agent: decode(&format!("\"{}\"", row.try_get::<String>("", "agent_type")?))?,
@@ -161,10 +166,17 @@ pub async fn state(
             .map(|r| r.try_get("", "error"))
             .transpose()?
             .flatten(),
+        switch_phase: request
+            .as_ref()
+            .map(|r| r.try_get("", "phase"))
+            .transpose()?
+            .flatten(),
         task_state: decode(&row.try_get::<String>("", "task_state")?)?,
         sessions,
         last_sequence: last,
-    }))
+    };
+    tx.commit().await?;
+    Ok(Some(result))
 }
 
 pub async fn initialize(
@@ -399,6 +411,46 @@ pub async fn set_switch_status(
     }
     tx.commit().await?;
     Ok(())
+}
+
+pub async fn set_switch_phase(
+    conn: &DatabaseConnection,
+    request: &AgentSwitchRequest,
+    phase: &str,
+) -> Result<(), DbError> {
+    let tx = conn.begin().await?;
+    let changed = tx.execute(stmt("UPDATE business_agent_switch SET phase=?,updated_at=CURRENT_TIMESTAMP WHERE request_id=? AND status='preparing' AND (phase IS NULL OR phase<>?)", vec![phase.into(), request.request_id.clone().into(), phase.into()])).await?;
+    if changed.rows_affected() > 0 {
+        tx.execute(stmt("UPDATE business_conversation_state SET revision=revision+1,updated_at=CURRENT_TIMESTAMP WHERE conversation_id=? AND pending_request_id=?",vec![request.conversation_id.into(),request.request_id.clone().into()])).await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn save_rule_context(
+    conn: &DatabaseConnection,
+    cid: i32,
+    agent: AgentType,
+    context: &str,
+) -> Result<(), DbError> {
+    // Only one snapshot per engine, never a chain of handoff summaries.
+    conn.execute(stmt("UPDATE business_conversation_state SET rule_context=json_set(rule_context,?,?) WHERE conversation_id=?",vec![format!("$.{}", agent_key(agent)?).into(),context.into(),cid.into()])).await?;
+    Ok(())
+}
+
+pub async fn rule_context(
+    conn: &DatabaseConnection,
+    cid: i32,
+) -> Result<BTreeMap<String, String>, DbError> {
+    let row = conn
+        .query_one(stmt(
+            "SELECT rule_context FROM business_conversation_state WHERE conversation_id=?",
+            vec![cid.into()],
+        ))
+        .await?;
+    row.map(|r| decode(&r.try_get::<String>("", "rule_context")?))
+        .transpose()
+        .map(|r| r.unwrap_or_default())
 }
 
 pub async fn activate(
@@ -1461,6 +1513,20 @@ mod tests {
             .id;
         let req = request(cid, "recover-after-restart", AgentType::Pi, None);
         queue_switch(&db.conn, &req).await.unwrap();
+        set_switch_status(&db.conn, &req, "preparing", None)
+            .await
+            .unwrap();
+        set_switch_phase(&db.conn, &req, "verifying_target")
+            .await
+            .unwrap();
+        save_rule_context(
+            &db.conn,
+            cid,
+            AgentType::Codex,
+            "Keep selected instance safety boundaries and ledger reading requirements",
+        )
+        .await
+        .unwrap();
         let blocks = vec![crate::acp::types::PromptInputBlock::Text {
             text: "retained once".into(),
         }];
@@ -1486,6 +1552,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(pending_conversations(&db.conn).await.unwrap(), vec![cid]);
+        let recovered = state(&db.conn, cid).await.unwrap().unwrap();
+        assert_eq!(recovered.switch_status.as_deref(), Some("preparing"));
+        assert_eq!(recovered.switch_phase.as_deref(), Some("verifying_target"));
+        assert!(rule_context(&db.conn, cid).await.unwrap()["codex"].contains("ledger reading"));
         assert!(is_switch_retry(&db.conn, &req).await.unwrap());
         assert_eq!(
             pending_request(&db.conn, cid)

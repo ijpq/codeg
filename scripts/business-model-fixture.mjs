@@ -34,6 +34,10 @@ export async function startBusinessModel(agent = "claude") {
       fromClaude: input.includes("BUSINESS_CLAUDE_COMPLETED"),
       fromPi: input.includes("BUSINESS_PI_COMPLETED"),
       user: input.includes(`BUSINESS_${agent.toUpperCase()}_USER`),
+      rules:
+        input.includes("BUSINESS_SAFE_BOUNDARY") &&
+        input.includes("BUSINESS_SOURCE_INSTANCE_RULES"),
+      ledger: input.includes("custom-ledger.md"),
     })
     const text =
       agent === "pi"

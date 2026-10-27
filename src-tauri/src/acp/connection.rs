@@ -2129,6 +2129,8 @@ async fn build_agent(
             }
             let resolved_launcher = if agent_type == AgentType::Pi {
                 crate::acp::pi_runtime::adapter(runtime_env)
+            } else if agent_type == AgentType::Codex {
+                crate::acp::codex_runtime::adapter(runtime_env)
             } else { None };
             let resolved_launcher = match resolved_launcher {
                 Some(path) => path,

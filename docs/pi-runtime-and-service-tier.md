@@ -1,6 +1,6 @@
 # Pi 运行组件与 Fast / Speed
 
-本次固定 CodeG `0.40.0-fix4`、定制 `pi-acp 0.0.34-codeg.2`、Pi `1.4.0` 和 Node
+本次固定 CodeG `0.40.0-fix5`、定制 `pi-acp 0.0.34-codeg.2`、Pi `1.4.0` 和 Node
 `24.16.0`。适配器源码 commit、tarball SHA256 与依赖锁保存在 `vendor/pi-runtime/`。
 Server ZIP 和 Setup 都携带私有 `pi-runtime`，无需全局 npm 或开发机 PATH。上游 MIT
 许可证、Pi 及依赖许可证和 Node LICENSE 随运行组保留。
@@ -23,6 +23,10 @@ workspace 和路径。ACP session ID 可以是旧别名，显式映射到独立�
 不是同一个 ID 时也不改写 header。恢复旧 map 时只根据其明确文件指针和真实 header
 修复别名，不凭文件名猜测。缺文件、冲突或无映射返回错误，不偷偷新建并沿用旧绑定。
 空会话在首次发送前已经持久化，初始化失败保留文件，迟到恢复不能覆盖成功的新状态。
+
+设置页的版本和升级判断使用实际选中的 ACP 路径及其包元数据，不再借用全局 `pi-acp` 的版本。
+随包或自定义 ACP 不提供全局 npm 覆盖/卸载动作；随包组件通过匹配 CodeG 版本整组更新。
+未知自定义包装器的版本标为未知，不伪装探测成功。
 
 `_pi/identity.runtime` 查询实际用于 RPC 的可执行路径及有界探测的版本。查询失败标为
 未验证，不借用全局 Pi 的版本或变更日志；定制版移除了全局 npm 升级提示。

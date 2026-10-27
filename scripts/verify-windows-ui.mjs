@@ -19,6 +19,9 @@ import { scopedRuntimeErrors } from "./runtime-page-errors.mjs"
 import {
   businessAgentPage,
   restoredBusinessPage,
+  unavailableSourcePage,
+  stageInterruptedHandoff,
+  finishInterruptedHandoff,
 } from "./business-agent-page.mjs"
 const options = Object.fromEntries(
   process.argv.slice(2).reduce((pairs, arg, i, all) => {
@@ -62,7 +65,10 @@ async function enableNativeAgent(f) {
     f.env,
     resolve(options["native-tools"])
   )
-  f.env.CODEX_PATH = join(resolve(options.server), "runtime", "codex.exe")
+  // Exercise each installed form's own default runtime selection. Injecting
+  // the Server CLI here previously concealed missing Setup dependencies.
+  delete f.env.CODEX_PATH
+  delete f.env.CODEG_CODEX_ACP_PATH
   f.env.CLAUDE_CONFIG_DIR = join(f.root, "claude")
   await mkdir(f.env.CLAUDE_CONFIG_DIR, { recursive: true })
   f.env.ANTHROPIC_BASE_URL = claudeModel.url
@@ -328,6 +334,56 @@ async function stopDesktop(app) {
   await stopOwnedProcess(app.child)
   await delay(1000)
   app.log.end()
+}
+async function startServer(installation, f, name) {
+  const port = await reservePort(),
+    token = randomBytes(24).toString("hex")
+  const log = createWriteStream(join(output, `${name}.log`))
+  const child = spawn(join(resolve(installation), "codeg-server.exe"), [], {
+    env: {
+      ...f.env,
+      CODEG_HOST: "127.0.0.1",
+      CODEG_PORT: String(port),
+      CODEG_TOKEN: token,
+      CODEG_STATIC_DIR: join(resolve(installation), "web"),
+    },
+    cwd: resolve(installation),
+    stdio: ["ignore", "pipe", "pipe"],
+  })
+  child.stdout.pipe(log)
+  child.stderr.pipe(log)
+  const api = async (command, args = {}) => {
+    const response = await fetch(`http://127.0.0.1:${port}/api/${command}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify(args),
+    })
+    if (!response.ok)
+      throw Error(`${command}: ${response.status} ${await response.text()}`)
+    return response.json()
+  }
+  try {
+    for (let i = 0; i < 120; i++) {
+      if (child.exitCode !== null) throw Error(`${name} exited`)
+      try {
+        await api("health")
+        return { child, log, port, token, api }
+      } catch {}
+      await delay(500)
+    }
+    throw Error(`${name} did not become ready`)
+  } catch (error) {
+    await stopOwnedProcess(child)
+    log.end()
+    throw error
+  }
+}
+async function stopServer(server) {
+  await stopOwnedProcess(server.child)
+  server.log.end()
 }
 function desktopApi(page) {
   return async (command, args = {}) => {
@@ -1250,6 +1306,32 @@ async function nativeDraftGoalPage(page, api, name) {
   }
 }
 try {
+  if (goalModel) {
+    const fresh = await fixture("setup-fresh")
+    const installation = join(output, "fresh-installation")
+    await install(options.setup, installation)
+    await enableNativeAgent(fresh)
+    const app = await startDesktop(installation, fresh, "fresh-startup")
+    try {
+      const saved = await importAndOpen(desktopApi(app.page), fresh)
+      await unavailableSourcePage({
+        page: app.page,
+        api: desktopApi(app.page),
+        f: fresh,
+        folderId: saved.folder_id,
+        goalModel,
+        report,
+        name: "setup-fresh",
+        output,
+      })
+      report.checks.push({
+        name: "setup-fresh-default-runtime-first-send-and-resume",
+        passed: true,
+      })
+    } finally {
+      await stopDesktop(app)
+    }
+  }
   const f = await fixture("setup-upgrade")
   const installation = join(output, "upgraded-installation")
   await install(options.previous, installation)
@@ -1291,6 +1373,7 @@ try {
   app = await startDesktop(installation, f, "upgraded-startup")
   const upgradedErrors = await scopedRuntimeErrors(app.page)
   let businessSaved
+  let setupInterrupted
   try {
     const conversations = await desktopApi(app.page)("list_all_conversations")
     assert.ok(
@@ -1337,6 +1420,16 @@ try {
       report,
       output,
     })
+    await unavailableSourcePage({
+      page: app.page,
+      api: desktopApi(app.page),
+      f,
+      folderId: saved.folder_id,
+      goalModel,
+      report,
+      name: "setup",
+      output,
+    })
     await piCapabilityChecks({
       api: desktopApi(app.page),
       page: app.page,
@@ -1363,6 +1456,11 @@ try {
       ...runtimeErrors,
     })
     assert.deepEqual(runtimeErrors.errors, [], "Setup application page errors")
+    setupInterrupted = await stageInterruptedHandoff(
+      desktopApi(app.page),
+      f,
+      businessSaved
+    )
     // The scroll harness navigates and closes this isolated WebView. Finish
     // the app checks first; restart below to verify persisted business state.
     await run(process.execPath, ["scripts/browser-scroll-regression.mjs"], {
@@ -1374,8 +1472,16 @@ try {
     await upgradedErrors.stop()
     await stopDesktop(app)
   }
+  if (setupInterrupted)
+    await writeFile(setupInterrupted.flag, "resume same durable request")
   app = await startDesktop(installation, f, "business-restart")
   try {
+    await finishInterruptedHandoff(
+      desktopApi(app.page),
+      setupInterrupted,
+      report,
+      "setup"
+    )
     await restoredBusinessPage(
       app.page,
       desktopApi(app.page),
@@ -1458,49 +1564,56 @@ try {
     upgradedDataRetained: true,
   })
   const s = await fixture("server-web")
-  await enableNativeAgent(s)
-  const port = await reservePort(),
-    token = randomBytes(24).toString("hex")
-  const env = {
-    ...s.env,
-    CODEG_HOST: "127.0.0.1",
-    CODEG_PORT: String(port),
-    CODEG_TOKEN: token,
-    CODEG_STATIC_DIR: join(resolve(options.server), "web"),
+  let previousServerConversation
+  if (options["previous-server"]) {
+    const previousServer = await startServer(
+      options["previous-server"],
+      s,
+      "server-previous"
+    )
+    try {
+      previousServerConversation = await importAndOpen(previousServer.api, s)
+    } finally {
+      await stopServer(previousServer)
+    }
+    await cp(s.data, join(s.root, "preupgrade-data-backup"), {
+      recursive: true,
+      errorOnExist: true,
+    })
   }
-  const serverLog = createWriteStream(join(output, "server-ui.log"))
-  const child = spawn(join(resolve(options.server), "codeg-server.exe"), [], {
-    env,
-    cwd: resolve(options.server),
-    stdio: ["ignore", "pipe", "pipe"],
-  })
-  child.stdout.pipe(serverLog)
-  child.stderr.pipe(serverLog)
+  const serverRolloutHash = createHash("sha256")
+    .update(await readFile(s.rollout))
+    .digest("hex")
+  await enableNativeAgent(s)
+  const server = await startServer(options.server, s, "server-ui")
+  const { api, port, token } = server
   let browser
   let serverErrors
+  let serverBusinessSaved
+  let serverInterrupted
   try {
-    const api = async (command, args = {}) => {
-      const response = await fetch(`http://127.0.0.1:${port}/api/${command}`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify(args),
+    const conversation =
+      previousServerConversation ?? (await importAndOpen(api, s))
+    if (previousServerConversation) {
+      const restored = (await api("list_all_conversations")).find(
+        (c) => c.id === conversation.id
+      )
+      assert.equal(restored?.external_id, s.id)
+      assert.equal(
+        createHash("sha256")
+          .update(await readFile(s.rollout))
+          .digest("hex"),
+        serverRolloutHash
+      )
+      assert.equal(
+        await readFile(join(s.data, "upgrade-retention-marker.txt"), "utf8"),
+        s.id
+      )
+      report.checks.push({
+        name: "server-independent-upgrade-data-retention",
+        passed: true,
       })
-      if (!response.ok)
-        throw Error(`${command}: ${response.status} ${await response.text()}`)
-      return response.json()
     }
-    for (let i = 0; i < 120; i++) {
-      if (child.exitCode !== null) throw Error("Isolated server quit")
-      try {
-        await api("health")
-        break
-      } catch {}
-      await delay(500)
-    }
-    const conversation = await importAndOpen(api, s)
     browser = await chromium.launch({ channel: "msedge", headless: true })
     const context = await browser.newContext({
       viewport: { width: 1200, height: 900 },
@@ -1520,7 +1633,7 @@ try {
       await allDeliverablesPage(page, api, s, conversation, "server-web")
     await nativeGoalPage(page, api, s, conversation, "server-web")
     await nativeDraftGoalPage(page, api, "server-web")
-    await businessAgentPage({
+    serverBusinessSaved = await businessAgentPage({
       page,
       api,
       f: s,
@@ -1530,6 +1643,16 @@ try {
       claudeModel,
       piModel,
       report,
+      output,
+    })
+    await unavailableSourcePage({
+      page,
+      api,
+      f: s,
+      folderId: conversation.folder_id,
+      goalModel,
+      report,
+      name: "server",
       output,
     })
     await piCapabilityChecks({
@@ -1575,11 +1698,51 @@ try {
       ...runtimeErrors,
     })
     assert.deepEqual(runtimeErrors.errors, [], "Server application page errors")
+    serverInterrupted = await stageInterruptedHandoff(
+      api,
+      s,
+      serverBusinessSaved
+    )
   } finally {
     await serverErrors?.stop()
     await browser?.close()
-    await stopOwnedProcess(child)
-    serverLog.end()
+    await stopServer(server)
+  }
+  if (serverInterrupted)
+    await writeFile(serverInterrupted.flag, "resume same durable request")
+  const restartedServer = await startServer(options.server, s, "server-restart")
+  let restartBrowser
+  try {
+    await finishInterruptedHandoff(
+      restartedServer.api,
+      serverInterrupted,
+      report,
+      "server-web"
+    )
+    restartBrowser = await chromium.launch({
+      channel: "msedge",
+      headless: true,
+    })
+    const context = await restartBrowser.newContext()
+    await context.addInitScript((token) => {
+      if (window === window.top) localStorage.setItem("codeg_token", token)
+    }, restartedServer.token)
+    const page = await context.newPage()
+    await page.goto(`http://127.0.0.1:${restartedServer.port}/workspace`)
+    await restoredBusinessPage(
+      page,
+      restartedServer.api,
+      serverBusinessSaved,
+      report,
+      "server-web"
+    )
+    report.checks.push({
+      name: "server-process-restart-with-native-session",
+      passed: true,
+    })
+  } finally {
+    await restartBrowser?.close()
+    await stopServer(restartedServer)
   }
   report.passed = true
 } catch (error) {

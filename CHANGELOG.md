@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.40.0-fix5 — 2026-10-27
+
+- Ship the same pinned private Codex CLI and self-contained ACP in Windows Setup
+  and Server; resolve cached adapters from the selected original package layout
+  and use the packaged Node. Preserve explicit runtime paths and user profiles.
+- Persist handoff phases and terminal failures, synchronize revision snapshots
+  across clients, accept slow valid refreshes, and keep switching available when
+  the original engine cannot start. Bound target preparation before activation.
+- Transfer the latest task boundary and source-attributed instance/workspace
+  instructions, ledger reading requirements and Skill catalog within budgets;
+  retain original history and avoid copying credentials or private memory stores.
+- Report the selected Pi ACP version/path instead of an unrelated global package;
+  prevent global npm actions from replacing the private/custom runtime group.
+- Put the current Agent and handoff state at the conversation top; show ten recent
+  conversations by default. Retain virtualized history, normal scrolling and all
+  previous timing, delivery, Office review, Pi and native execution changes.
+- Test each package with its own default runtime: fresh Setup, upgrade, native
+  resume, unavailable-source handoff, narrow layout, Server independent data
+  upgrade/restart and two-client synchronization. Retain Windows/shared gates.
+
+See [release notes](docs/releases/v0.40.0-fix5.md).
+
 ## 0.40.0-fix4 — 2026-10-27
 
 - Retain the stable Codex/Claude/Pi business conversation, external delivery,

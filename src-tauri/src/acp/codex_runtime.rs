@@ -1,5 +1,34 @@
 //! Select the release's private CLI without changing installed CLIs or user configuration.
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
+
+pub(crate) fn adapter(env: &BTreeMap<String, String>) -> Option<PathBuf> {
+    if let Some(path) = env
+        .get("CODEG_CODEX_ACP_PATH")
+        .cloned()
+        .or_else(|| std::env::var("CODEG_CODEX_ACP_PATH").ok())
+        .filter(|p| !p.trim().is_empty())
+    {
+        return Some(PathBuf::from(path));
+    }
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    select(dir, None, false)?;
+    let root = dir.join("runtime");
+    let actual: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("adapter-source.json")).ok()?).ok()?;
+    let expected: serde_json::Value =
+        serde_json::from_str(include_str!("../../../vendor/codex-adapter/source.json")).ok()?;
+    let path = root.join(if cfg!(windows) {
+        "codex-acp.cmd"
+    } else {
+        "codex-acp"
+    });
+    (actual == expected && path.is_file() && crate::acp::pi_runtime::bundled_node().is_some())
+        .then_some(path)
+}
 
 pub(crate) fn apply(env: &mut BTreeMap<String, String>) {
     let Ok(exe) = std::env::current_exe() else {
@@ -23,8 +52,17 @@ pub(crate) fn apply(env: &mut BTreeMap<String, String>) {
             });
         tracing::info!(
             runtime_version = "0.162.1-codeg.1",
+            runtime_path = %path.display(),
             "[ACP][restore] private Codex runtime selected"
         );
+    } else if !env.get("CODEX_PATH").is_some_and(|p| !p.trim().is_empty())
+        && !inherited.is_some_and(|p| !p.trim().is_empty())
+    {
+        // A deliberately disabled private CLI still uses the user's selected
+        // installation, not a missing npm dependency relative to a cached ACP.
+        if let Some(path) = crate::commands::acp::resolve_system_agent_binary("codex") {
+            env.insert("CODEX_PATH".into(), path.display().to_string());
+        }
     }
 }
 

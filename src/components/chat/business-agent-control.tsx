@@ -15,6 +15,13 @@ import {
   type SharedBusinessMemory,
 } from "@/lib/business-conversation"
 
+const PHASE_KEYS = {
+  capturing_history: "phases.capturing_history",
+  starting_target: "phases.starting_target",
+  verifying_target: "phases.verifying_target",
+  activating: "phases.activating",
+} as const
+
 export function BusinessAgentControl({
   conversationId,
   folderId,
@@ -37,6 +44,11 @@ export function BusinessAgentControl({
   const [editorError, setEditorError] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
   const state = business.state
+  const phase = state?.switchPhase
+  const phaseKey =
+    phase && Object.prototype.hasOwnProperty.call(PHASE_KEYS, phase)
+      ? PHASE_KEYS[phase as keyof typeof PHASE_KEYS]
+      : null
   const toggle = async () => {
     if (open) {
       setOpen(false)
@@ -127,7 +139,16 @@ export function BusinessAgentControl({
         )}
         {business.pending && (
           <span role="status" className="text-muted-foreground">
-            {state?.switchStatus === "queued" ? t("queued") : t("preparing")}
+            {state?.switchStatus === "queued"
+              ? t("queued")
+              : phaseKey
+                ? t(phaseKey)
+                : t("preparing")}
+          </span>
+        )}
+        {!business.pending && state?.switchStatus === "succeeded" && (
+          <span role="status" className="text-muted-foreground">
+            {t("succeeded")}
           </span>
         )}
         {state?.switchStatus === "failed" && (
@@ -149,7 +170,7 @@ export function BusinessAgentControl({
         </p>
       )}
       {open && task && (
-        <div className="grid gap-2 rounded border p-2">
+        <div className="grid max-h-[45dvh] gap-2 overflow-y-auto rounded border p-2">
           <label>
             {t("objective")}
             <input

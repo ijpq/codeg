@@ -1679,7 +1679,9 @@
       "upgradeAvailable": "{versionText}。发现可升级版本。",
       "recommendedUnavailable": "{versionText}。暂无推荐版本。",
       "latest": "{versionText}。已是最新版本。",
-      "unreviewedAvailable": "{versionText}。有未经审查的更新版本。"
+      "unreviewedAvailable": "{versionText}。有未经审查的更新版本。",
+      "bundledRuntime": "CodeG 随包 ACP：{localVersion} · {path}。随匹配的 CodeG 版本整组更新。",
+      "customRuntime": "已选择自定义 ACP：{localVersion} · {path}。由配置的运行时路径管理。"
     },
     "adapter": {
       "label": "ACP 适配器",
@@ -4461,7 +4463,14 @@
         "project": "当前项目",
         "global": "全局偏好",
         "loadRule": "已确认的记忆按上下文预算加载到下一次接纳的请求，超出部分会明确标记未加载。私有记忆仍由各引擎管理。只保存已确认的事实与要求。",
-        "save": "保存"
+        "save": "保存",
+        "succeeded": "交接已完成",
+        "phases": {
+          "capturing_history": "正在保存历史与工作规则…",
+          "starting_target": "正在启动目标 Agent…",
+          "verifying_target": "正在验证目标会话可用性…",
+          "activating": "正在切换业务会话…"
+        }
       }
     },
     "diffPreview": {
