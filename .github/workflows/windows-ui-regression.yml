@@ -265,9 +265,8 @@ jobs:
       actions: read
     env:
       RUST_BACKTRACE: full
-      CARGO_PROFILE_DEV_DEBUG: line-tables-only
       PYTHONUTF8: "1"
-    runs-on: windows-latest
+    runs-on: windows-2022
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
@@ -285,7 +284,7 @@ jobs:
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: "./src-tauri -> target"
-          shared-key: test-windows-latest-server
+          shared-key: server-x86_64-pc-windows-msvc
           cache-on-failure: true
       - name: Pin and quarantine the failed release; download diagnostic assets
         shell: pwsh
@@ -305,6 +304,17 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Diagnostic package download failed' }
           $archive=Join-Path $root 'codeg-server-windows-x64.zip'
           if ((Get-FileHash $archive -Algorithm SHA256).Hash.ToLower() -ne 'd55a7b1b4b921f13a1f8d435274ddbc1ebfc14c15f34bd9a2c4c24abb15dc485') { throw 'Diagnostic asset hash mismatch' }
+          gh release download v0.40.0-fix3 --repo $env:GITHUB_REPOSITORY --dir $root --pattern codeg_0.40.0-fix3_x64-setup.exe
+          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic Setup download failed' }
+          $setup=Join-Path $root 'codeg_0.40.0-fix3_x64-setup.exe'
+          if ((Get-FileHash $setup -Algorithm SHA256).Hash.ToLower() -ne 'ec68cf7cba444e2b8ff5955ca7343baf6acea0c6803a26ad57648c3f0e039d56') { throw 'Diagnostic Setup hash mismatch' }
+          gh release download v0.36.0-fix1 --repo $env:GITHUB_REPOSITORY --dir $root --pattern codeg_0.36.0-fix1_x64-setup.exe --pattern codeg_0.36.0-fix1_x64-setup.exe.sha256
+          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic baseline download failed' }
+          $previous=Join-Path $root 'codeg_0.36.0-fix1_x64-setup.exe'
+          $hash=((Get-Content "$previous.sha256" -Raw).Trim() -split '\s+')[0].ToLower()
+          if ((Get-FileHash $previous -Algorithm SHA256).Hash.ToLower() -ne $hash) { throw 'Diagnostic baseline hash mismatch' }
+          "DIAG_SETUP=$setup" >> $env:GITHUB_ENV
+          "DIAG_PREVIOUS=$previous" >> $env:GITHUB_ENV
           Expand-Archive $archive (Join-Path $root 'expanded')
           $server=Join-Path $root 'expanded/codeg-server-windows-x64'
           $manifest=Get-Content (Join-Path $server 'web/codeg-release-manifest.json') -Raw | ConvertFrom-Json
@@ -323,36 +333,37 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Isolated adapter install failed' }
           python -B scripts/prepare-office-preview-test.py --output $tools
           if ($LASTEXITCODE -ne 0) { throw 'Office test converter failed' }
-          @'
-          from pathlib import Path
-          p = Path('scripts/verify-windows-ui.mjs')
-          s = p.read_text(encoding="utf-8")
-          start = s.index('  const f = await fixture("setup-upgrade")')
-          end = s.index('  const s = await fixture("server-web")', start)
-          p.write_text(s[:start] + s[end:], encoding="utf-8")
-          '@ | python -B -
-          if ($LASTEXITCODE -ne 0) { throw 'Server-only diagnostic harness preparation failed' }
-      - name: Exercise original published Server before instrumentation
+      - name: Exercise original dual packages in the failed Windows 2022 environment
         shell: pwsh
         run: |
-          node scripts/verify-windows-ui.mjs --server $env:DIAG_SERVER --output (Join-Path $env:DIAG_ROOT 'original-server') --version 0.40.0-fix3 --native-tools (Join-Path $env:DIAG_ROOT 'native-agent-tools')
+          node scripts/verify-windows-ui.mjs --setup $env:DIAG_SETUP --previous $env:DIAG_PREVIOUS --server $env:DIAG_SERVER --output (Join-Path $env:DIAG_ROOT 'original-server') --version 0.40.0-fix3 --native-tools (Join-Path $env:DIAG_ROOT 'native-agent-tools')
           $result=$LASTEXITCODE
           @{ diagnostic=$true; instrumented=$false; exit_code=$result } | ConvertTo-Json | Set-Content (Join-Path $env:DIAG_ROOT 'original-result.json')
           exit 0
+      - uses: actions/upload-artifact@v4
+        with:
+          name: original-windows-2022-diagnosis
+          path: |
+            ${{ runner.temp }}/allocation-diagnosis/original-result.json
+            ${{ runner.temp }}/allocation-diagnosis/original-server/**/*.json
+            ${{ runner.temp }}/allocation-diagnosis/original-server/**/*.log
+          retention-days: 14
       - name: Build a diagnostic binary with symbolized bounded allocation tracing
         shell: pwsh
         run: |
           Get-Content scripts/diagnostic-allocation-trace.rs -Raw | Add-Content src-tauri/src/bin/codeg_server.rs
-          cargo build --manifest-path src-tauri/Cargo.toml --no-default-features --features server-bin --bin codeg-server
+          # Keep the library's real Release optimization. Symbols are added only
+          # to this executable, leaving dependency compilation flags unchanged.
+          cargo rustc --manifest-path src-tauri/Cargo.toml --release --target x86_64-pc-windows-msvc --no-default-features --features server-bin --bin codeg-server -- -C debuginfo=line-tables-only
           if ($LASTEXITCODE -ne 0) { throw 'Diagnostic build failed' }
-          Copy-Item src-tauri/target/debug/codeg-server.exe $env:DIAG_SERVER -Force
-          Copy-Item src-tauri/target/debug/codeg_server.pdb $env:DIAG_SERVER -ErrorAction SilentlyContinue
-          Copy-Item src-tauri/target/debug/codeg-server.pdb $env:DIAG_SERVER -ErrorAction SilentlyContinue
+          Copy-Item src-tauri/target/x86_64-pc-windows-msvc/release/codeg-server.exe $env:DIAG_SERVER -Force
+          Copy-Item src-tauri/target/x86_64-pc-windows-msvc/release/codeg_server.pdb $env:DIAG_SERVER -ErrorAction SilentlyContinue
+          Copy-Item src-tauri/target/x86_64-pc-windows-msvc/release/codeg-server.pdb $env:DIAG_SERVER -ErrorAction SilentlyContinue
       - name: Reproduce with allocation call stacks and fresh isolated profiles
         shell: pwsh
         run: |
           foreach ($i in 1..3) {
-            node scripts/verify-windows-ui.mjs --server $env:DIAG_SERVER --output (Join-Path $env:DIAG_ROOT "traced-server-$i") --version 0.40.0-fix3 --native-tools (Join-Path $env:DIAG_ROOT 'native-agent-tools')
+            node scripts/verify-windows-ui.mjs --setup $env:DIAG_SETUP --previous $env:DIAG_PREVIOUS --server $env:DIAG_SERVER --output (Join-Path $env:DIAG_ROOT "traced-server-$i") --version 0.40.0-fix3 --native-tools (Join-Path $env:DIAG_ROOT 'native-agent-tools')
             $result=$LASTEXITCODE
             @{ diagnostic=$true; instrumented=$true; exit_code=$result } | ConvertTo-Json | Set-Content (Join-Path $env:DIAG_ROOT "traced-result-$i.json")
             if ($result -ne 0) { break }
