@@ -266,6 +266,7 @@ jobs:
     env:
       RUST_BACKTRACE: full
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      PYTHONUTF8: "1"
     runs-on: windows-latest
     timeout-minutes: 90
     steps:
@@ -325,10 +326,10 @@ jobs:
           @'
           from pathlib import Path
           p = Path('scripts/verify-windows-ui.mjs')
-          s = p.read_text()
+          s = p.read_text(encoding="utf-8")
           start = s.index('  const f = await fixture("setup-upgrade")')
           end = s.index('  const s = await fixture("server-web")', start)
-          p.write_text(s[:start] + s[end:])
+          p.write_text(s[:start] + s[end:], encoding="utf-8")
           '@ | python -B -
           if ($LASTEXITCODE -ne 0) { throw 'Server-only diagnostic harness preparation failed' }
       - name: Exercise original published Server before instrumentation
