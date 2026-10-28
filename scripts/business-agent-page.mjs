@@ -396,20 +396,31 @@ export async function businessAgentPage({
       .locator("[data-business-agent-toolbar]:visible")
       .first()
     await toolbar.waitFor()
-    const viewport = page.viewportSize()
-    await page.setViewportSize({ width: 390, height: 844 })
-    const bounds = await toolbar.boundingBox()
-    assert.ok(
-      bounds &&
-        bounds.width > 150 &&
-        bounds.x >= 0 &&
-        bounds.x + bounds.width <= 391,
-      "Agent toolbar fits a narrow conversation"
-    )
-    await page.screenshot({
-      path: join(output, `${name}-agent-toolbar-narrow.png`),
-    })
-    if (viewport) await page.setViewportSize(viewport)
+    // A native WebView attached through CDP has no emulated viewport, so
+    // viewportSize() is null. Restore its actual dimensions after the narrow
+    // check as well, before later desktop-tab navigation and assertions.
+    const viewport =
+      page.viewportSize() ??
+      (await page.evaluate(() => ({
+        width: window.innerWidth,
+        height: window.innerHeight,
+      })))
+    try {
+      await page.setViewportSize({ width: 390, height: 844 })
+      const bounds = await toolbar.boundingBox()
+      assert.ok(
+        bounds &&
+          bounds.width > 150 &&
+          bounds.x >= 0 &&
+          bounds.x + bounds.width <= 391,
+        "Agent toolbar fits a narrow conversation"
+      )
+      await page.screenshot({
+        path: join(output, `${name}-agent-toolbar-narrow.png`),
+      })
+    } finally {
+      await page.setViewportSize(viewport)
+    }
     if (name.startsWith("server")) {
       observer = await page.context().newPage()
       await observer.goto(page.url())

@@ -12,6 +12,8 @@
   retain actual native restore, target readiness, history and UI assertions.
 - Select the exact business tab in page acceptance when a device-local draft
   retains focus after reload; retain screenshots and state on source-failure tests.
+- Restore the native WebView's real dimensions after narrow-screen acceptance,
+  including CDP pages without an emulated viewport.
 - Preflight the entire native Windows suite on the source-pinned fix5 packages
   without calling it acceptance of newer binaries. New Server/Setup assets still
   require their own full draft and published acceptance, hashes and inventories.
