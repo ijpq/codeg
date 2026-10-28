@@ -57,7 +57,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Verify isolated profiles with the Windows Known Folder API
-        run: node --test scripts/test-windows-ui-profile.mjs scripts/test-office-test-runtime.mjs
+        run: node --test scripts/test-windows-ui-profile.mjs scripts/test-office-test-runtime.mjs scripts/test-verification-progress.mjs
   setup-ui:
     if: ${{ !inputs.diagnose_fix2 && !inputs.diagnose_fix5 && !inputs.diagnose_allocation }}
     runs-on: windows-2022
@@ -251,6 +251,7 @@ jobs:
           python-version: "3.12"
       - run: pnpm install --frozen-lockfile
       - name: Preflight the complete suite with pinned unpublished fix5 packages
+        timeout-minutes: 30
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -277,6 +278,7 @@ jobs:
           name: diagnostic-fix5-verifier-evidence
           path: |
             ${{ runner.temp }}/fix5-verifier-diagnosis/**/verification.json
+            ${{ runner.temp }}/fix5-verifier-diagnosis/**/verification-progress.json
             ${{ runner.temp }}/fix5-verifier-diagnosis/**/*.log
             ${{ runner.temp }}/fix5-verifier-diagnosis/**/*.png
             ${{ runner.temp }}/fix5-verifier-diagnosis/**/scroll-results.json

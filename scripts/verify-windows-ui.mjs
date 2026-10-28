@@ -4,7 +4,7 @@ import { chromium } from "playwright-core"
 import { spawn, execFileSync } from "node:child_process"
 import { createServer } from "node:http"
 import { cp, mkdir, readFile, writeFile } from "node:fs/promises"
-import { createWriteStream } from "node:fs"
+import { createWriteStream, writeFileSync } from "node:fs"
 import { resolve, join, relative, isAbsolute } from "node:path"
 import { randomUUID, randomBytes, createHash } from "node:crypto"
 import assert from "node:assert/strict"
@@ -12,6 +12,7 @@ import { startGoalModel } from "./native-codex-model-fixture.mjs"
 import { startBusinessModel } from "./business-model-fixture.mjs"
 import { startPiModel } from "./pi-native-model-fixture.mjs"
 import { piCapabilityChecks } from "./pi-capability-checks.mjs"
+import { verificationProgress } from "./verification-progress.mjs"
 import { prepareWindowsProfile } from "./windows-ui-profile.mjs"
 import { prepareOfficeTestRuntime } from "./office-test-runtime.mjs"
 import { retainedHistory, scopedPageErrors } from "./release-history-check.mjs"
@@ -45,6 +46,23 @@ const report = {
   checks: [],
   errors: [],
 }
+const progress = verificationProgress(output, report)
+const heartbeat = setInterval(
+  () => progress.record("heartbeat", "Windows UI"),
+  30_000
+)
+heartbeat.unref()
+const watchdog = setTimeout(() => {
+  report.passed = false
+  report.errors.push("Windows UI suite exceeded its 20 minute deadline")
+  progress.record("failed", "suite deadline")
+  writeFileSync(
+    join(output, "verification.json"),
+    JSON.stringify(report, null, 2)
+  )
+  process.exit(1)
+}, 20 * 60_000)
+watchdog.unref()
 const delay = (ms) => new Promise((done) => setTimeout(done, ms))
 async function reservePort() {
   const server = createServer()
@@ -245,14 +263,24 @@ async function fixture(name) {
 }
 async function run(command, args, env = process.env) {
   const child = spawn(command, args, { env, stdio: "inherit" })
-  await new Promise((done, fail) => {
-    child.on("error", fail)
-    child.on("exit", (code) =>
-      code === 0 ? done() : fail(Error(`${command} exited ${code}`))
+  try {
+    await progress.run(
+      `child:${command}`,
+      () =>
+        new Promise((done, fail) => {
+          child.on("error", fail)
+          child.on("exit", (code) =>
+            code === 0 ? done() : fail(Error(`${command} exited ${code}`))
+          )
+        }),
+      8 * 60_000
     )
-  })
+  } finally {
+    await stopOwnedProcess(child)
+  }
 }
 async function install(setup, path) {
+  progress.record("phase", `install:${path}`)
   await run(resolve(setup), ["/S", `/D=${path}`])
   assert.ok((await readFile(join(path, "codeg.exe"))).length > 1_000_000)
 }
@@ -280,6 +308,7 @@ async function stopOwnedProcess(child) {
   })
 }
 async function startDesktop(installDir, f, name) {
+  progress.record("phase", `desktop:${name}`)
   const port = await reservePort()
   const env = {
     ...f.env,
@@ -330,12 +359,17 @@ async function startDesktop(installDir, f, name) {
   }
 }
 async function stopDesktop(app) {
-  await app.browser.close().catch(() => {})
-  await stopOwnedProcess(app.child)
+  progress.record("phase", "stop isolated desktop")
+  try {
+    await progress.run("desktop:disconnect", () => app.browser.close(), 15_000)
+  } finally {
+    await stopOwnedProcess(app.child)
+  }
   await delay(1000)
   app.log.end()
 }
 async function startServer(installation, f, name) {
+  progress.record("phase", `server:${name}`)
   const port = await reservePort(),
     token = randomBytes(24).toString("hex")
   const log = createWriteStream(join(output, `${name}.log`))
@@ -352,19 +386,21 @@ async function startServer(installation, f, name) {
   })
   child.stdout.pipe(log)
   child.stderr.pipe(log)
-  const api = async (command, args = {}) => {
-    const response = await fetch(`http://127.0.0.1:${port}/api/${command}`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
-      },
-      body: JSON.stringify(args),
+  const api = async (command, args = {}) =>
+    progress.run(`server:${command}`, async () => {
+      const response = await fetch(`http://127.0.0.1:${port}/api/${command}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify(args),
+        signal: AbortSignal.timeout(120_000),
+      })
+      if (!response.ok)
+        throw Error(`${command}: ${response.status} ${await response.text()}`)
+      return response.json()
     })
-    if (!response.ok)
-      throw Error(`${command}: ${response.status} ${await response.text()}`)
-    return response.json()
-  }
   try {
     for (let i = 0; i < 120; i++) {
       if (child.exitCode !== null) throw Error(`${name} exited`)
@@ -386,32 +422,36 @@ async function stopServer(server) {
   server.log.end()
 }
 function desktopApi(page) {
-  return async (command, args = {}) => {
-    // Playwright otherwise turns a structured Tauri rejection into just
-    // "Object", losing the code needed for bounded missing-rollout retries.
-    const result = await page.evaluate(
-      async ({ command, args }) => {
-        try {
-          return {
-            ok: true,
-            value: await window.__TAURI_INTERNALS__.invoke(command, args),
+  return async (command, args = {}) =>
+    progress.run(`desktop:${command}`, async () => {
+      // Playwright otherwise turns a structured Tauri rejection into just
+      // "Object", losing the code needed for bounded missing-rollout retries.
+      const result = await page.evaluate(
+        async ({ command, args }) => {
+          try {
+            return {
+              ok: true,
+              value: await window.__TAURI_INTERNALS__.invoke(command, args),
+            }
+          } catch (error) {
+            return {
+              ok: false,
+              error:
+                error && typeof error === "object"
+                  ? {
+                      ...error,
+                      message: error.message ?? JSON.stringify(error),
+                    }
+                  : { message: String(error) },
+            }
           }
-        } catch (error) {
-          return {
-            ok: false,
-            error:
-              error && typeof error === "object"
-                ? { ...error, message: error.message ?? JSON.stringify(error) }
-                : { message: String(error) },
-          }
-        }
-      },
-      { command, args }
-    )
-    if (!result.ok)
-      throw Object.assign(new Error(result.error.message), result.error)
-    return result.value
-  }
+        },
+        { command, args }
+      )
+      if (!result.ok)
+        throw Object.assign(new Error(result.error.message), result.error)
+      return result.value
+    })
 }
 async function importAndOpen(api, f) {
   await api("scan_importable_sessions")
@@ -1752,13 +1792,22 @@ try {
   report.errors.push(String(error.stack ?? error))
   throw error
 } finally {
-  await goalModel?.close()
-  await claudeModel?.close()
-  await piModel?.close()
-  await writeFile(
-    join(output, "verification.json"),
-    JSON.stringify(report, null, 2)
-  )
+  try {
+    await progress.run("close:codex model", () => goalModel?.close(), 15_000)
+    await progress.run("close:claude model", () => claudeModel?.close(), 15_000)
+    await progress.run("close:pi model", () => piModel?.close(), 15_000)
+  } catch (error) {
+    report.passed = false
+    report.errors.push(String(error.stack ?? error))
+    throw error
+  } finally {
+    clearTimeout(watchdog)
+    clearInterval(heartbeat)
+    await writeFile(
+      join(output, "verification.json"),
+      JSON.stringify(report, null, 2)
+    )
+  }
 }
 console.log(
   JSON.stringify({ passed: true, checks: report.checks.map((c) => c.name) })
