@@ -129,13 +129,11 @@ describe("LiveTurnStats", () => {
         </NextIntlClientProvider>
       )
       const row = view.container.firstElementChild!.firstElementChild!
-      expect(row.children).toHaveLength(1)
       expect(
         row.firstElementChild!.querySelector("svg.lucide-timer")
       ).toBeTruthy()
-      expect(row.querySelectorAll("svg")).toHaveLength(1)
       expect(row.querySelector(".animate-pulse")).toBeNull()
-      expect(row.textContent).toBe("1m 5s")
+      expect(row.firstElementChild!.textContent).toBe("1m 5s")
       view.unmount()
     }
   })

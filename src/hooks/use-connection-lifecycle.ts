@@ -1,5 +1,6 @@
 "use client"
 
+import { supportsAtomicConversationRestore } from "@/lib/session-restore"
 import { useCallback, useEffect, useRef, useState } from "react"
 import { useTranslations } from "next-intl"
 import { toast } from "sonner"
@@ -269,11 +270,11 @@ export function useConnectionLifecycle({
     if (!workingDir) return
     let cancelled = false
     const generation = ++restoreGenerationRef.current
-    const restoringPersistedCodex =
-      agentType === "codex" &&
+    const restoringPersistedSession =
+      supportsAtomicConversationRestore(agentType) &&
       conversationIdRef.current != null &&
       conversationIdRef.current > 0
-    if (restoringPersistedCodex) {
+    if (restoringPersistedSession) {
       queueMicrotask(() => {
         if (!cancelled && restoreGenerationRef.current === generation) {
           setRestorePending(true)
@@ -464,6 +465,13 @@ export function useConnectionLifecycle({
     }
   }, [removeTask, clearSelectorTask])
 
+  const identityReady =
+    (conn.agentType == null || conn.agentType === agentType) &&
+    (!sessionId || conn.sessionId === sessionId) &&
+    (!conversationId ||
+      !supportsAtomicConversationRestore(agentType) ||
+      conn.conversationId === conversationId)
+
   const handleFocus = useCallback(() => {
     // Respect the caller's readiness gate — e.g. historical conversations
     // set isActive=false until the session's external_id resolves, to
@@ -478,7 +486,7 @@ export function useConnectionLifecycle({
       // re-run the idempotent atomic restore. The backend normally reuses the
       // same ready connection in a few milliseconds; the authoritative result
       // then repairs promptReady even if no WebSocket ready event is replayed.
-      (status === "connected" && !promptReady)
+      (status === "connected" && (!promptReady || !identityReady))
     ) {
       setLastAutoConnectError(null)
       connConnect(agentType, workingDir, sessionId, conversationId).catch(
@@ -497,6 +505,7 @@ export function useConnectionLifecycle({
     conversationId,
     status,
     promptReady,
+    identityReady,
     connConnect,
     contextKey,
     touchActivity,
@@ -512,7 +521,8 @@ export function useConnectionLifecycle({
   const publishedConnectError =
     conn.connectError?.agentType === agentType ? conn.connectError : null
   const autoConnectError =
-    status === "connected" || status === "prompting"
+    (status === "connected" && promptReady && identityReady) ||
+    status === "prompting"
       ? null
       : lastAutoConnectError?.contextKey === contextKey &&
           lastAutoConnectError.agentType === agentType

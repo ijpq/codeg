@@ -366,16 +366,7 @@ async fn prepare_and_activate(
         .await
         .map_err(error)?
         .ok_or_else(|| error("Business workspace is missing"))?;
-    let source_env = super::acp::business_rule_env(db, summary.agent_type).await?;
-    let rules = super::business_context::capture_rules(
-        Path::new(&folder.path),
-        summary.agent_type,
-        &source_env,
-    )
-    .await;
-    business::save_rule_context(&db.conn, cid, summary.agent_type, &rules)
-        .await
-        .map_err(error)?;
+    refresh_rule_context(db, cid, Path::new(&folder.path), Some(request.target_agent)).await?;
     let target = business::find_session(&db.conn, cid, request.target_agent)
         .await
         .map_err(error)?;
@@ -551,6 +542,17 @@ pub async fn validate_goal_context(db: &AppDatabase, cid: i32) -> Result<(), Acp
     {
         return Err(error("Shared business context has not been delivered to this engine. Send a regular message before starting or resuming a native Goal"));
     }
+    let summary = conversation_service::get_by_id(&db.conn, cid)
+        .await
+        .map_err(error)?;
+    let folder = folder_service::get_folder_by_id(&db.conn, summary.folder_id)
+        .await
+        .map_err(error)?
+        .ok_or_else(|| error("Business workspace is missing"))?;
+    let rules = refresh_rule_context(db, cid, Path::new(&folder.path), None).await?;
+    if session.delivered_rule_digest != super::business_context::rule_digest(&rules) {
+        return Err(error("Shared business context rules have not been fully delivered to this engine. Send a regular message before starting or resuming a native Goal"));
+    }
     Ok(())
 }
 
@@ -592,12 +594,65 @@ pub(crate) async fn persist_connection_settings(
     business::save_session_settings(conn, cid, agent, mode, &config).await
 }
 
+async fn refresh_rule_context(
+    db: &AppDatabase,
+    cid: i32,
+    workspace: &Path,
+    target: Option<crate::models::AgentType>,
+) -> Result<BTreeMap<String, String>, AcpError> {
+    let state = business::state(&db.conn, cid)
+        .await
+        .map_err(error)?
+        .ok_or_else(|| error("Business state is missing"))?;
+    let mut agents = state
+        .sessions
+        .iter()
+        .map(|s| s.agent_type)
+        .collect::<Vec<_>>();
+    if let Some(agent) = target {
+        if !agents.contains(&agent) {
+            agents.push(agent);
+        }
+    }
+    let existing = business::rule_context(&db.conn, cid).await.map_err(error)?;
+    let mut refreshed = BTreeMap::new();
+    // Rebuild legacy truncated snapshots too, even when the history cursor is
+    // already delivered. The source is the instance's controlled config, not
+    // a path parsed out of untrusted prose in a historical snapshot.
+    for agent in agents {
+        let env = super::acp::business_rule_env(db, agent).await?;
+        let context = super::business_context::capture_rules(workspace, agent, &env).await?;
+        let key = serde_json::to_value(agent)
+            .map_err(error)?
+            .as_str()
+            .ok_or_else(|| error("Unsupported rules source engine"))?
+            .to_owned();
+        refreshed.insert(key, context);
+    }
+    if refreshed.values().map(String::len).sum::<usize>()
+        > super::business_context::MAX_RULE_CONTEXT_BYTES
+    {
+        return Err(error("Combined applicable rules exceed the complete-context limit; no partial rules were delivered"));
+    }
+    for (key, context) in &refreshed {
+        if existing.get(key) != Some(context) {
+            let agent =
+                serde_json::from_value(serde_json::Value::String(key.clone())).map_err(error)?;
+            business::save_rule_context(&db.conn, cid, agent, context)
+                .await
+                .map_err(error)?;
+        }
+    }
+    Ok(refreshed)
+}
+
 pub struct PromptAdmission {
     pub conversation_id: i32,
     pub message_id: String,
     pub session_id: i64,
     pub context_sequence: i64,
     pub context_boundary: i64,
+    pub rules_digest: String,
     pub send: bool,
     pub context: Option<String>,
 }
@@ -687,10 +742,18 @@ pub async fn prepare_prompt(
             }
         }
     }
-    if !increment.is_empty() || session.last_bridge_sequence == 0 {
-        let rules = business::rule_context(&db.conn, cid).await.map_err(error)?;
+    let folder = folder_service::get_folder_by_id(&db.conn, summary.folder_id)
+        .await
+        .map_err(error)?
+        .ok_or_else(|| error("Business workspace is missing"))?;
+    let rules = refresh_rule_context(db, cid, Path::new(&folder.path), None).await?;
+    let rules_digest = super::business_context::rule_digest(&rules);
+    // Admission is not proof of model execution. A native failure/cancellation
+    // can happen after enqueue but before the engine consumed the context.
+    // Retry ordinary prompts with complete rules rather than trusting that ack.
+    if session.delivered_rule_digest != rules_digest || summary.status == "cancelled" {
         let mut loaded = std::collections::BTreeSet::new();
-        let mut rules_text = String::from("Saved applicable business rules and skill sources (per source instance; latest task/user requirements take precedence over historical excerpts):\n");
+        let mut rules_text = format!("Complete applicable business rules v{}; digest {} (per source instance; latest task/user requirements take precedence over historical excerpts):\n", super::business_context::RULE_CONTEXT_VERSION, rules_digest);
         for (source, snapshot) in rules {
             if !snapshot.is_empty() && loaded.insert(snapshot.clone()) {
                 rules_text.push_str(&format!("[{source}]\n{snapshot}\n"));
@@ -736,6 +799,7 @@ pub async fn prepare_prompt(
         session_id: session.id,
         context_sequence,
         context_boundary: state.last_sequence,
+        rules_digest,
         send,
         context,
     }))
@@ -1015,6 +1079,160 @@ mod tests {
         }
     }
     #[tokio::test]
+    async fn existing_handoff_repairs_truncated_rules_once_and_updates_on_revision() {
+        let (db, manager, cid, folder, _old, _target, dir) = fixture().await;
+        let source = dir.path().join("AGENTS.md");
+        let rules = format!(
+            "{}\n小弟必须真实委派；生成材料只呈现修改结果。",
+            "instructions\n".repeat(2000)
+        );
+        tokio::fs::write(&source, &rules).await.unwrap();
+        business::save_rule_context(
+            &db.conn,
+            cid,
+            AgentType::Codex,
+            "old truncated prefix [Excerpt only]",
+        )
+        .await
+        .unwrap();
+        let request = request(cid, "existing-rules", AgentType::ClaudeCode, 0);
+        business::queue_switch(&db.conn, &request).await.unwrap();
+        manager
+            .activate_business_conversation(
+                "claude",
+                folder,
+                "native-claude-business",
+                &db,
+                &request,
+            )
+            .await
+            .unwrap();
+        let blocks = [PromptInputBlock::Text {
+            text: "继续处理".into(),
+        }];
+        let first = prepare_prompt(&db, cid, Some("first"), &blocks)
+            .await
+            .unwrap()
+            .unwrap();
+        business::accept_prompt(
+            &db.conn,
+            cid,
+            "first",
+            first.session_id,
+            first.context_sequence,
+            first.context_boundary,
+            None,
+        )
+        .await
+        .unwrap();
+        // Reproduce a previously bridged conversation upgraded from an old
+        // release: no new history, and no v2 rule-delivery receipt exists.
+        let repaired = prepare_prompt(&db, cid, Some("repair"), &blocks)
+            .await
+            .unwrap()
+            .unwrap();
+        let actual_context = repaired.context.as_deref().unwrap();
+        assert!(actual_context.contains("小弟必须真实委派"));
+        assert!(actual_context.contains("生成材料只呈现修改结果"));
+        assert!(!actual_context.contains("old truncated prefix"));
+        business::accept_prompt(
+            &db.conn,
+            cid,
+            "repair",
+            repaired.session_id,
+            repaired.context_sequence,
+            repaired.context_boundary,
+            Some(&repaired.rules_digest),
+        )
+        .await
+        .unwrap();
+        let again = prepare_prompt(&db, cid, Some("again"), &blocks)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!again
+            .context
+            .unwrap_or_default()
+            .contains("Complete applicable business rules"));
+        business::release_unsent_prompt(&db.conn, cid, "again")
+            .await
+            .unwrap();
+        tokio::fs::write(&source, format!("{rules}\nREVISION_B_RULE_AT_END"))
+            .await
+            .unwrap();
+        let updated = prepare_prompt(&db, cid, Some("updated"), &blocks)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(updated
+            .context
+            .as_deref()
+            .unwrap()
+            .contains("REVISION_B_RULE_AT_END"));
+        assert_ne!(updated.rules_digest, repaired.rules_digest);
+        // An unaccepted send and an old duplicate acknowledgement cannot
+        // suppress the next rule delivery or overwrite a newer receipt.
+        business::release_unsent_prompt(&db.conn, cid, "updated")
+            .await
+            .unwrap();
+        let retry = prepare_prompt(&db, cid, Some("updated"), &blocks)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(retry
+            .context
+            .as_deref()
+            .unwrap()
+            .contains("REVISION_B_RULE_AT_END"));
+        business::accept_prompt(
+            &db.conn,
+            cid,
+            "updated",
+            retry.session_id,
+            retry.context_sequence,
+            retry.context_boundary,
+            Some(&retry.rules_digest),
+        )
+        .await
+        .unwrap();
+        business::accept_prompt(
+            &db.conn,
+            cid,
+            "repair",
+            repaired.session_id,
+            repaired.context_sequence,
+            repaired.context_boundary,
+            Some(&repaired.rules_digest),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            business::find_session(&db.conn, cid, AgentType::ClaudeCode)
+                .await
+                .unwrap()
+                .unwrap()
+                .delivered_rule_digest,
+            retry.rules_digest
+        );
+        conversation_service::update_status(
+            &db.conn,
+            cid,
+            crate::db::entities::conversation::ConversationStatus::Cancelled,
+        )
+        .await
+        .unwrap();
+        let failed_retry = prepare_prompt(&db, cid, Some("native-failure-retry"), &blocks)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(failed_retry
+            .context
+            .as_deref()
+            .unwrap()
+            .contains("REVISION_B_RULE_AT_END"));
+    }
+
+    #[tokio::test]
     async fn business_failed_source_writer_settles_target_failure_instead_of_waiting_forever() {
         let (db, manager, cid, _folder, _old, _target, dir) = fixture().await;
         let old = manager.get_state("codex").await.unwrap();
@@ -1067,7 +1285,8 @@ mod tests {
     #[tokio::test]
     async fn business_saved_rules_reach_the_actual_target_prompt_without_changing_visible_history()
     {
-        let (db, manager, cid, folder, _old, mut target, _dir) = fixture().await;
+        let (db, manager, cid, folder, _old, mut target, dir) = fixture().await;
+        tokio::fs::write(dir.path().join("AGENTS.md"), "Read the custom ledger and subledger before work; never restart the production Server. Skill: shared/official-document/SKILL.md; auto-select and maintain its acceptance rules.").await.unwrap();
         business::save_rule_context(&db.conn, cid, AgentType::Codex, "Read the custom ledger and subledger before work; never restart the production Server. Skill: shared/official-document/SKILL.md; auto-select and maintain its acceptance rules.").await.unwrap();
         let request = request(cid, "rules-target", AgentType::ClaudeCode, 0);
         business::queue_switch(&db.conn, &request).await.unwrap();
@@ -2111,6 +2330,7 @@ mod tests {
             admission.session_id,
             admission.context_sequence,
             admission.context_boundary,
+            Some(&admission.rules_digest),
         )
         .await
         .unwrap();

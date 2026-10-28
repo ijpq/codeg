@@ -250,7 +250,7 @@ export async function businessAgentPage({
   // Target-native workspace discovery alone cannot satisfy this assertion.
   await writeFile(
     join(f.env.CODEX_HOME, "AGENTS.md"),
-    `BUSINESS_SOURCE_INSTANCE_RULES / BUSINESS_SAFE_BOUNDARY: never restart the production Server. Read ${join(f.cwd, "custom-ledger.md")} and its subledger before work. Automatically choose and maintain the existing .agents/skills/official-document/SKILL.md and preserve its acceptance rules.\n`
+    `BUSINESS_SOURCE_INSTANCE_RULES / BUSINESS_SAFE_BOUNDARY: never restart the production Server. Read ${join(f.cwd, "custom-ledger.md")} and its subledger before work. Automatically choose and maintain the existing .agents/skills/official-document/SKILL.md and preserve its acceptance rules.\n${"Existing business instruction.\n".repeat(1500)}BUSINESS_RULE_TAIL_DELEGATION: 小弟必须通过真实委派工具执行。\nBUSINESS_RULE_TAIL_MATERIAL: 生成材料只呈现修改结果。\n`
   )
   await writeFile(
     join(f.cwd, "custom-ledger.md"),
@@ -775,6 +775,21 @@ export async function businessAgentPage({
         `Duplicate cross-engine user round: ${marker}`
       )
     }
+    await writeFile(
+      join(f.env.CODEX_HOME, "AGENTS.md"),
+      `${await readFile(join(f.env.CODEX_HOME, "AGENTS.md"), "utf8")}BUSINESS_RULE_REVISION_B_AT_TAIL\n`
+    )
+    const revisionStart = piModel.evidence().length
+    await sendUi(
+      "BUSINESS_PI_USER_RULE_REVISION",
+      "BUSINESS_PI_COMPLETED agenda-v3.md"
+    )
+    await until(
+      () => piModel.evidence().slice(revisionStart),
+      (rs) => rs.some((r) => r.rules && r.rulesRevisionB),
+      "Previously handed-off Pi receives the updated tail without another switch"
+    )
+    final = await history()
     // Two independent clients race with one CAS revision. Only one may queue.
     current = await state()
     const race = await Promise.allSettled(
@@ -860,6 +875,8 @@ export async function businessAgentPage({
       otherBusinessUnaffected: true,
       selectedRuntimeVersion: true,
       sourceRulesAndLedgerActuallyReceived: true,
+      completeRuleTailActuallyReceived: true,
+      existingTargetRuleRevisionReceived: true,
       serverSecondClientSync: Boolean(observer),
       narrowToolbar: true,
     })
@@ -1018,7 +1035,14 @@ export async function finishInterruptedHandoff(api, pending, report, name) {
   })
 }
 
-export async function restoredBusinessPage(page, api, saved, report, name) {
+export async function restoredBusinessPage(
+  page,
+  api,
+  saved,
+  report,
+  name,
+  goalModel
+) {
   if (!saved) return
   const state = await api("get_business_conversation_state", {
     conversationId: saved.cid,
@@ -1051,4 +1075,323 @@ export async function restoredBusinessPage(page, api, saved, report, name) {
     `${name}: native session resumes after process restart`
   )
   report.checks.push({ name: `${name}-business-restart-restore`, passed: true })
+  if (goalModel && saved.composer?.length) {
+    goalModel.business(true)
+    try {
+      for (const prior of saved.composer) {
+        await openBusiness(page, api, prior.cid, prior.folderId, prior.agent)
+        const markers = []
+        for (let round = 1; round <= 2; round++) {
+          const text = `COMPOSER_RESTART_${prior.agent.toUpperCase()}_${round}_${randomUUID()}`
+          markers.push(text)
+          const input = page
+            .locator('[contenteditable="true"]')
+            .filter({ visible: true })
+            .last()
+          await input.waitFor({ timeout: 90_000 })
+          await input.fill(text)
+          await input.press("Enter")
+          const response =
+            prior.agent === "codex"
+              ? "BUSINESS_CODEX_COMPLETED"
+              : "BUSINESS_PI_COMPLETED"
+          await until(
+            () =>
+              api("get_folder_conversation", {
+                conversationId: prior.cid,
+                userTurnLimit: 25,
+              }),
+            (history) => {
+              const index = history.turns.findIndex(
+                (t) =>
+                  t.role === "user" && JSON.stringify(t.blocks).includes(text)
+              )
+              return (
+                index >= 0 &&
+                history.turns
+                  .slice(index + 1)
+                  .some(
+                    (t) =>
+                      t.role === "assistant" &&
+                      JSON.stringify(t.blocks).includes(response)
+                  )
+              )
+            },
+            `${name}: ${prior.agent} actual composer after process restart, round ${round}`
+          )
+        }
+        const history = await api("get_folder_conversation", {
+          conversationId: prior.cid,
+          userTurnLimit: 25,
+        })
+        assert.equal(
+          history.summary.external_id,
+          prior.externalId,
+          "Process restart retains the same native session"
+        )
+        for (const marker of markers)
+          assert.equal(
+            history.turns.filter(
+              (t) =>
+                t.role === "user" && JSON.stringify(t.blocks).includes(marker)
+            ).length,
+            1
+          )
+        report.checks.push({
+          name: `${name}-${prior.agent}-composer-after-process-restart`,
+          passed: true,
+          rounds: 2,
+          sameNativeSession: true,
+          actualComposer: true,
+          protocol: "Native runtime and ACP; synthetic local model provider",
+        })
+      }
+    } finally {
+      goalModel.business(false)
+    }
+  }
+}
+
+export async function consecutiveComposerPage({
+  page,
+  api,
+  folderId,
+  f,
+  goalModel,
+  piModel,
+  report,
+  name,
+  other,
+}) {
+  if (!goalModel || !piModel) return []
+  const conversations = []
+  goalModel.business(true)
+  try {
+    for (const agent of ["codex", "pi"]) {
+      const cid = await api("create_conversation", {
+        folderId,
+        agentType: agent,
+        title: `Composer recovery ${agent}`,
+      })
+      await openBusiness(page, api, cid, folderId, agent)
+      const read = async () => {
+        try {
+          return await api("get_folder_conversation", {
+            conversationId: cid,
+            userTurnLimit: 25,
+          })
+        } catch (e) {
+          if (
+            e?.code === "not_found" ||
+            /Conversation not found/.test(String(e?.message ?? e))
+          )
+            return { turns: [] }
+          throw e
+        }
+      }
+      const markers = []
+      for (let round = 1; round <= 5; round++) {
+        if (round === 3 && other) {
+          const current = await api("get_business_conversation_state", {
+            conversationId: other.cid,
+          })
+          await openBusiness(
+            page,
+            api,
+            other.cid,
+            other.folderId,
+            current.activeAgent
+          )
+          await openBusiness(page, api, cid, folderId, agent)
+        }
+        if (round === 4) await page.reload()
+        if (round === 5) {
+          const history = await read()
+          const connection = await api("acp_find_connection_for_conversation", {
+            conversationId: cid,
+            agentType: agent,
+            sessionId: history.summary.external_id,
+          })
+          assert.ok(
+            connection?.connection_id,
+            "Disposable idle connection exists before disconnect"
+          )
+          await until(
+            () =>
+              api("acp_get_session_snapshot", {
+                connectionId: connection.connection_id,
+              }),
+            (snapshot) =>
+              snapshot?.status === "connected" && snapshot?.selectors_ready,
+            `${name}: ${agent} round is idle before simulated connection loss`
+          )
+          await api("acp_disconnect", {
+            connectionId: connection.connection_id,
+          })
+        }
+        const text = `COMPOSER_${agent.toUpperCase()}_${round}_${randomUUID()}`
+        markers.push(text)
+        const input = page
+          .locator('[contenteditable="true"]')
+          .filter({ visible: true })
+          .last()
+        await input.waitFor({ timeout: 90_000 })
+        await input.fill(text)
+        await input.press("Enter")
+        const response =
+          agent === "codex"
+            ? "BUSINESS_CODEX_COMPLETED"
+            : "BUSINESS_PI_COMPLETED"
+        await until(
+          read,
+          (history) => {
+            const index = history.turns.findIndex(
+              (t) =>
+                t.role === "user" && JSON.stringify(t.blocks).includes(text)
+            )
+            return (
+              index >= 0 &&
+              history.turns
+                .slice(index + 1)
+                .some(
+                  (t) =>
+                    t.role === "assistant" &&
+                    JSON.stringify(t.blocks).includes(response)
+                )
+            )
+          },
+          `${name}: ${agent} composer round ${round}`
+        )
+        await page
+          .locator(".chat-scroll-port:visible")
+          .last()
+          .getByText(response, { exact: false })
+          .last()
+          .waitFor({ timeout: 90_000 })
+      }
+      if (f) {
+        const setting = (await api("acp_list_agents")).find(
+          (a) => a.agent_type === agent
+        )
+        const history = await read()
+        const connection = await api("acp_find_connection_for_conversation", {
+          conversationId: cid,
+          agentType: agent,
+          sessionId: history.summary.external_id,
+        })
+        assert.ok(connection?.connection_id)
+        await until(
+          () =>
+            api("acp_get_session_snapshot", {
+              connectionId: connection.connection_id,
+            }),
+          (snapshot) =>
+            snapshot?.status === "connected" && !snapshot.turn_in_flight,
+          `${name}: idle before failed-restore test`
+        )
+        await api("acp_disconnect", { connectionId: connection.connection_id })
+        const update = (env) =>
+          api("acp_update_agent_env", {
+            agentType: agent,
+            enabled: setting.enabled,
+            env,
+            modelProviderId: setting.model_provider_id ?? null,
+          })
+        try {
+          await update({
+            ...setting.env,
+            [agent === "codex" ? "CODEG_CODEX_ACP_PATH" : "CODEG_PI_ACP_PATH"]:
+              join(f.root, `intentionally-missing-${agent}-restore.cmd`),
+          })
+          await page.reload()
+          const input = page
+            .locator('[contenteditable="true"]')
+            .filter({ visible: true })
+            .last()
+          await input.waitFor({ timeout: 90_000 })
+          const text = `COMPOSER_FAILED_RESTORE_${agent.toUpperCase()}_${randomUUID()}`
+          markers.push(text)
+          await input.fill(text)
+          await input.press("Enter")
+          const retry = page.locator('button[title="Retry"]:visible').last()
+          await retry.waitFor({ timeout: 90_000 })
+          assert.equal(
+            (await read()).turns.filter(
+              (t) =>
+                t.role === "user" && JSON.stringify(t.blocks).includes(text)
+            ).length,
+            0,
+            "Failed restore must not execute the retained message"
+          )
+          await update(setting.env)
+          await retry.click()
+          const response =
+            agent === "codex"
+              ? "BUSINESS_CODEX_COMPLETED"
+              : "BUSINESS_PI_COMPLETED"
+          await until(
+            read,
+            (history) => {
+              const index = history.turns.findIndex(
+                (t) =>
+                  t.role === "user" && JSON.stringify(t.blocks).includes(text)
+              )
+              return (
+                index >= 0 &&
+                history.turns
+                  .slice(index + 1)
+                  .some(
+                    (t) =>
+                      t.role === "assistant" &&
+                      JSON.stringify(t.blocks).includes(response)
+                  )
+              )
+            },
+            `${name}: failed ${agent} restore retries its retained queue exactly once`
+          )
+          report.checks.push({
+            name: `${name}-${agent}-failed-restore-retained-queue-retry`,
+            passed: true,
+            failedQueueVisible: true,
+            noExecutionBeforeRetry: true,
+            actualComposer: true,
+          })
+        } finally {
+          await update(setting.env)
+        }
+      }
+      const final = await read()
+      conversations.push({
+        cid,
+        folderId,
+        agent,
+        externalId: final.summary.external_id,
+      })
+      for (const marker of markers)
+        assert.equal(
+          final.turns.filter(
+            (t) =>
+              t.role === "user" && JSON.stringify(t.blocks).includes(marker)
+          ).length,
+          1
+        )
+      report.checks.push({
+        name: `${name}-${agent}-consecutive-composer-recovery`,
+        passed: true,
+        actualComposer: true,
+        rounds: 5,
+        noRestoreWarmup: true,
+        afterFirstReply: true,
+        afterTabSwitch: true,
+        afterReload: true,
+        afterConnectionLoss: true,
+        noDuplicateUserRounds: true,
+        protocol: "Native runtime and ACP; synthetic local model provider",
+        conversationId: cid,
+      })
+    }
+  } finally {
+    goalModel.business(false)
+  }
+  return conversations
 }

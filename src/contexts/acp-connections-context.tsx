@@ -1,5 +1,6 @@
 "use client"
 
+import { supportsAtomicConversationRestore } from "@/lib/session-restore"
 import {
   createContext,
   useCallback,
@@ -2062,14 +2063,17 @@ function connectionsReducer(
       if (!current || current.connectionId !== action.connectionId) {
         return state
       }
-      const durableReady = action.lifecycleState === "ready"
+      const durableReady =
+        action.lifecycleState === "ready" ||
+        action.lifecycleState === "pending_first_prompt"
       const activeTurnAttached =
         action.lifecycleState === "active_turn_attached"
-      const nextStatus = durableReady
-        ? "connected"
-        : activeTurnAttached
-          ? "prompting"
-          : current.status
+      const nextStatus =
+        durableReady && current.status !== "prompting"
+          ? "connected"
+          : activeTurnAttached
+            ? "prompting"
+            : current.status
       const nextSelectorsReady = current.selectorsReady || durableReady
       const nextPromptReady = current.promptReady || durableReady
       if (
@@ -4151,6 +4155,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   // protocol (web + remote-desktop). Used to (a) detach on disconnect /
   // tab close, and (b) re-attach with the current cursor when a connection
   // is rekeyed (orphan rescue) so handlers reference the new contextKey.
+  const attachGenerationsRef = useRef(new Map<string, number>())
   const attachSubscriptionsRef = useRef(
     new Map<string, EventStreamSubscription>()
   )
@@ -6813,9 +6818,16 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       const stream = getEventStream()
       if (!stream) return null
 
+      const generation = (attachGenerationsRef.current.get(contextKey) ?? 0) + 1
+      attachGenerationsRef.current.set(contextKey, generation)
+      const isCurrent = () =>
+        attachGenerationsRef.current.get(contextKey) === generation &&
+        storeRef.current.connections.get(contextKey)?.connectionId ===
+          connectionId
       let activeSub: EventStreamSubscription | null = null
       const handlers: AttachHandlers = {
         onAttaching: () => {
+          if (!isCurrent()) return
           dispatch({
             type: "PROMPT_READINESS_CHANGED",
             contextKey,
@@ -6823,6 +6835,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           })
         },
         onSnapshot: (snapshot) => {
+          if (!isCurrent()) return
           // Land anything still coalescing BEFORE the snapshot replaces the
           // live message. This handler also runs on an attach-stream
           // RECONNECT, mid-turn, so deltas from before the drop can still be
@@ -6862,6 +6875,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           )
         },
         onReplay: (events) => {
+          if (!isCurrent()) return
           // Catching up on a gap (reconnect / lagged detach) re-delivers events
           // that already happened. They belong in the UI, but replaying them
           // must not fire a burst of cues for turns that finished minutes ago.
@@ -6890,9 +6904,11 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           })
         },
         onEvent: (envelope) => {
+          if (!isCurrent()) return
           applyMappedEnvelope(contextKey, envelope)
         },
         onDetached: (reason) => {
+          if (!isCurrent()) return
           if (reason === "lagged" || reason === "server_shutdown") {
             // Transient: re-attach with the latest cursor so we either
             // replay the gap (small) or hydrate fresh (large). For
@@ -6974,6 +6990,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   // legacy (Tauri) connections that never went through
   // `setupAttachSubscription`.
   const teardownAttachSubscription = useCallback((contextKey: string) => {
+    attachGenerationsRef.current.set(
+      contextKey,
+      (attachGenerationsRef.current.get(contextKey) ?? 0) + 1
+    )
     const sub = attachSubscriptionsRef.current.get(contextKey)
     if (!sub) return
     attachSubscriptionsRef.current.delete(contextKey)
@@ -7514,7 +7534,9 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       // `reconnect()` has nothing else to go on.
       lastConnectParamsRef.current.set(contextKey, request)
       const shouldRestorePersisted =
-        agentType === "codex" && conversationId != null && conversationId > 0
+        supportsAtomicConversationRestore(agentType) &&
+        conversationId != null &&
+        conversationId > 0
       desiredConnectRequestsRef.current.set(contextKey, request)
       if (connectingKeysRef.current.has(contextKey)) {
         // Parked: the call in flight runs this next, unless a newer request
@@ -7680,6 +7702,12 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           if (
             boundRequest &&
             sameConnectRequest(boundRequest, request) &&
+            existing.agentType === agentType &&
+            existing.workingDir === nextWorkingDir &&
+            (existing.status === "prompting" ||
+              ((!sessionId || existing.sessionId === sessionId) &&
+                (!shouldRestorePersisted ||
+                  existing.conversationId === conversationId))) &&
             existing.status !== "disconnected" &&
             existing.status !== "error" &&
             // `connected` is not sufficient for a persisted restore: an
@@ -8058,7 +8086,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           if (
             restoredConversationId != null &&
             restoredExternalSessionId != null &&
-            restoredLifecycleState === "ready"
+            (restoredLifecycleState === "ready" ||
+              restoredLifecycleState === "pending_first_prompt")
           ) {
             dispatch({
               type: "RESTORE_CONFIRMED",
@@ -8186,7 +8215,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         if (
           restoredConversationId != null &&
           restoredExternalSessionId != null &&
-          restoredLifecycleState === "ready"
+          (restoredLifecycleState === "ready" ||
+            restoredLifecycleState === "pending_first_prompt")
         ) {
           dispatch({
             type: "RESTORE_CONFIRMED",

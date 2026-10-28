@@ -6785,6 +6785,7 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
         },
         AgentType::MiniMaxCode => AcpAgentMeta {
             agent_type,
+            supports_steer: false,
             supports_mcp: true,
             name: "MiniMax Code",
             description: "MiniMax's terminal coding agent (native ACP via mcode acp)",

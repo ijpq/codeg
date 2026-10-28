@@ -3265,6 +3265,7 @@ impl ConnectionManager {
                         admission.session_id,
                         admission.context_sequence,
                         admission.context_boundary,
+                        Some(&admission.rules_digest),
                     )
                     .await
                     .map_err(|e| AcpError::protocol(e.to_string()))?;

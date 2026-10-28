@@ -1,3 +1,7 @@
+/** Engines with a verified, business-ID keyed atomic restore contract. */
+export const supportsAtomicConversationRestore = (agent: string) =>
+  agent === "codex" || agent === "pi"
+
 /**
  * A runtime fork/rollover id is newer than a polled business snapshot. After
  * an engine handoff, however, the old engine's runtime id must never become
@@ -105,14 +109,14 @@ export function shouldAwaitHistoricalSessionDetail(args: {
   detailLoading: boolean
   detailError: string | null
 }): boolean {
-  // Codex restore is keyed by durable conversation id and the backend reads
+  // Business-agent restore is keyed by durable conversation id and the backend reads
   // the authoritative external session itself. It no longer needs the large
   // transcript/detail response to finish first, so history rendering and ACP
   // resume can run in parallel. Cline retains its existing immediate path.
   if (
     !args.usesPersistedDetailIdentity ||
     args.agentType === "cline" ||
-    args.agentType === "codex"
+    supportsAtomicConversationRestore(args.agentType)
   ) {
     return false
   }
