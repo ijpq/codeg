@@ -1472,6 +1472,7 @@ try {
         report,
         name: "setup",
         other: businessSaved,
+        output,
       })
     }
     await unavailableSourcePage({
@@ -1714,6 +1715,7 @@ try {
         report,
         name: "server-web",
         other: serverBusinessSaved,
+        output,
       })
     }
     await unavailableSourcePage({
