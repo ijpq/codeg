@@ -10,6 +10,8 @@
   Keep real timeouts, interruptions and recoverable warnings distinct.
 - Verify unavailable-source rejection without matching localized OS wording;
   retain actual native restore, target readiness, history and UI assertions.
+- Select the exact business tab in page acceptance when a device-local draft
+  retains focus after reload; retain screenshots and state on source-failure tests.
 - Preflight the entire native Windows suite on the source-pinned fix5 packages
   without calling it acceptance of newer binaries. New Server/Setup assets still
   require their own full draft and published acceptance, hashes and inventories.

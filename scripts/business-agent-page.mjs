@@ -34,6 +34,19 @@ export async function openBusiness(page, api, cid, folderId, agent) {
   })
   assert.equal(saved.accepted, true)
   await page.reload()
+  // Draft focus is device-local and deliberately survives a remote tab save.
+  // Select this business through its real tab before inspecting its controls,
+  // just as actualPage does for an imported conversation.
+  const tab = page.locator(
+    `[data-tab-id="conv-${folderId}-${agent}-${cid}"] [role="tab"]`
+  )
+  await tab.waitFor({ timeout: 30_000 })
+  await tab.click()
+  await until(
+    () => tab.getAttribute("aria-selected"),
+    (selected) => selected === "true",
+    "Requested business tab is actually selected"
+  )
   await page
     .locator("[data-business-agent-control]:visible select")
     .first()
@@ -179,6 +192,30 @@ export async function unavailableSourcePage({
       historyRetained: true,
       uiUpdatedWithoutRestart: true,
     })
+  } catch (error) {
+    await page
+      .screenshot({
+        path: join(output, `${name}-unavailable-source-failure.png`),
+      })
+      .catch(() => {})
+    await writeFile(
+      join(output, `${name}-unavailable-source-failure.json`),
+      JSON.stringify(
+        {
+          conversationId: cid,
+          path: new URL(page.url()).pathname,
+          error: String(error.stack ?? error),
+          tabs: await api("list_opened_tabs").catch(() => null),
+          business: await api("get_business_conversation_state", {
+            conversationId: cid,
+          }).catch(() => null),
+          body: (await page.locator("body").innerText()).slice(-12000),
+        },
+        null,
+        2
+      )
+    )
+    throw error
   } finally {
     await api("acp_update_agent_env", {
       agentType: "codex",
