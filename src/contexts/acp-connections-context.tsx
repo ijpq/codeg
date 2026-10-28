@@ -625,6 +625,8 @@ type Action =
       conversationId: number
       externalSessionId: string
       lifecycleState: string | null
+      /** Backend observation cursor, or pre-request cursor for older servers. */
+      observedEventSeq: number
       codegMcpAvailable: boolean
       mcpServerCount: number
     }
@@ -2068,10 +2070,15 @@ function connectionsReducer(
         action.lifecycleState === "pending_first_prompt"
       const activeTurnAttached =
         action.lifecycleState === "active_turn_attached"
+      // Restore is an RPC, not an ordered event. A terminal event can overtake
+      // its active-turn receipt; still repair the durable identity, but never
+      // resurrect that completed turn from the older observation.
+      const canApplyActiveStatus =
+        activeTurnAttached && current.lastAppliedSeq <= action.observedEventSeq
       const nextStatus =
         durableReady && current.status !== "prompting"
           ? "connected"
-          : activeTurnAttached
+          : canApplyActiveStatus
             ? "prompting"
             : current.status
       const nextSelectorsReady = current.selectorsReady || durableReady
@@ -7938,9 +7945,11 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         let restoredMcpServerCount = 0
         let restoredLifecycleState: string | null = null
         let restoredExternalSessionId: string | null = null
+        let restoredObservedEventSeq = 0
         let backendReplacedConnectionIds: string[] = []
 
         if (shouldRestorePersisted && conversationId != null) {
+          const beforeRestore = storeRef.current.connections.get(contextKey)
           let restored: Awaited<
             ReturnType<typeof acpRestoreConversation>
           > | null = null
@@ -7991,6 +8000,11 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             )
           } else {
             connectionId = restored.connectionId
+            if (restored.eventSeq != null) {
+              restoredObservedEventSeq = restored.eventSeq
+            } else if (beforeRestore?.connectionId === connectionId) {
+              restoredObservedEventSeq = beforeRestore.lastAppliedSeq
+            }
             restoredConversationId = conversationId
             restoredCodegMcpAvailable = restored.codegMcpAvailable
             restoredMcpServerCount = restored.mcpServerCount
@@ -8074,6 +8088,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           // nevertheless authoritative: `ready` means the backend verified the
           // exact durable session and prompt latch. Fold that result into the
           // existing entry so a missed attach-ready frame cannot strand the UI.
+          // An active-turn receipt also confirms identity and MCP, including
+          // the fresh first-prompt connection which started out unbound.
           boundConnectRequestsRef.current.set(contextKey, request)
           if (!attachSubscriptionsRef.current.has(contextKey)) {
             const attach = setupAttachSubscription(
@@ -8087,7 +8103,8 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             restoredConversationId != null &&
             restoredExternalSessionId != null &&
             (restoredLifecycleState === "ready" ||
-              restoredLifecycleState === "pending_first_prompt")
+              restoredLifecycleState === "pending_first_prompt" ||
+              restoredLifecycleState === "active_turn_attached")
           ) {
             dispatch({
               type: "RESTORE_CONFIRMED",
@@ -8096,6 +8113,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
               conversationId: restoredConversationId,
               externalSessionId: restoredExternalSessionId,
               lifecycleState: restoredLifecycleState,
+              observedEventSeq: restoredObservedEventSeq,
               codegMcpAvailable: restoredCodegMcpAvailable,
               mcpServerCount: restoredMcpServerCount,
             })
@@ -8211,12 +8229,14 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
         // pessimistically clears promptReady. This lets an idle `ready`
         // connection accept prompts immediately even if the one-shot snapshot
         // or replay frame is delayed/lost. Transport health remains a separate
-        // gate in the composer, so a disconnected WebSocket still queues.
+        // gate in the composer, so a disconnected WebSocket still queues. An
+        // active receipt repairs identity without opening the prompt latch.
         if (
           restoredConversationId != null &&
           restoredExternalSessionId != null &&
           (restoredLifecycleState === "ready" ||
-            restoredLifecycleState === "pending_first_prompt")
+            restoredLifecycleState === "pending_first_prompt" ||
+            restoredLifecycleState === "active_turn_attached")
         ) {
           dispatch({
             type: "RESTORE_CONFIRMED",
@@ -8225,6 +8245,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             conversationId: restoredConversationId,
             externalSessionId: restoredExternalSessionId,
             lifecycleState: restoredLifecycleState,
+            observedEventSeq: restoredObservedEventSeq,
             codegMcpAvailable: restoredCodegMcpAvailable,
             mcpServerCount: restoredMcpServerCount,
           })

@@ -12302,6 +12302,7 @@ async fn prepare_provisional_snapshot_branch(
                 replaced_connection_ids: Vec::new(),
                 lifecycle_state: "pending_first_prompt".into(),
                 durable_session: false,
+                event_seq: Some(state.event_seq),
             }));
         }
     }
@@ -12398,6 +12399,7 @@ async fn prepare_provisional_snapshot_branch(
             replaced_connection_ids: activation.replaced_connection_ids,
             lifecycle_state: "pending_first_prompt".into(),
             durable_session: false,
+            event_seq: None,
         })
     }
     .await;
@@ -12653,12 +12655,13 @@ async fn acp_restore_conversation_inner(
                         state.codeg_mcp_available,
                         state.mcp_server_count,
                         state.status.clone(),
+                        state.event_seq,
                     ))
                 } else {
                     None
                 }
             };
-            let Some((codeg_mcp_available, mcp_server_count, status)) = active else {
+            let Some((codeg_mcp_available, mcp_server_count, status, event_seq)) = active else {
                 continue;
             };
 
@@ -12685,6 +12688,7 @@ async fn acp_restore_conversation_inner(
                 replaced_connection_ids: Vec::new(),
                 lifecycle_state: "active_turn_attached".into(),
                 durable_session: true,
+                event_seq: Some(event_seq),
             });
         }
 
@@ -13048,6 +13052,7 @@ async fn acp_restore_conversation_inner(
         replaced_connection_ids: activation.replaced_connection_ids,
         lifecycle_state: "ready".into(),
         durable_session: true,
+        event_seq: None,
     })
 }
 
@@ -17169,6 +17174,7 @@ mod tests {
             replaced_connection_ids: Vec::new(),
             lifecycle_state: "ready".into(),
             durable_session: true,
+            event_seq: None,
         };
         leader.result.send_replace(Some(Ok(expected.clone())));
         receiver.changed().await.unwrap();

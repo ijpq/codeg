@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.41.1-fix2 — 2026-10-28
+
+- Repair the verified business binding when atomic restore attaches to an active
+  first turn, so subsequent composer messages can execute after it completes.
+  Retain queue IDs and the running writer in both Windows Setup and Server.
+- Return the active lifecycle observation cursor and ignore its older status
+  when a newer terminal event has already arrived; preserve snapshot readiness.
+- Cover fresh Codex/Pi first-turn binding through Web and desktop events, late
+  restore receipts, multi-round sending and recovery. Retain bounded failure
+  diagnostics in isolated packaged UI acceptance.
+- Include fix1's full rule handoff and packaged-runtime corrections. The fix1
+  draft did not pass composer acceptance and was never published.
+
+See [release notes](docs/releases/v0.41.1-fix2.md).
+
 ## 0.41.1-fix1 — 2026-10-28
 
 - Rebase the Windows fork onto upstream v0.41.1, retaining the released business

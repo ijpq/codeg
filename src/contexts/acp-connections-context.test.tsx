@@ -2093,6 +2093,255 @@ describe("prompt connection loss classification", () => {
 })
 
 describe("persisted business readiness across engines and transports", () => {
+  it.each([
+    ["codex", true],
+    ["codex", false],
+    ["pi", true],
+    ["pi", false],
+  ] as const)(
+    "%s links a first-prompt connection restored during its active turn (web=%s)",
+    async (agent, web) => {
+      if (!web) h.eventStreamValue = null
+      h.acpRestoreConversation.mockRejectedValueOnce(
+        new Error("Conversation has no external session")
+      )
+      await mountProvider()
+      await act(async () => {
+        await h.actions!.connect("business-42", agent, "/tmp/x", undefined, 42)
+      })
+      const deliver = (event: EventEnvelope) => {
+        if (web) {
+          emitAcpEvent(latestAttachHandlers(), event)
+        } else {
+          const listener = vi.mocked(subscribe).mock.calls.at(-1)![1] as (
+            value: EventEnvelope
+          ) => void
+          act(() => listener(event))
+        }
+      }
+      if (web) act(() => latestAttachHandlers().onReplay([], 0))
+      expect(h.store!.getConnection("business-42")?.conversationId).toBeNull()
+      await act(async () => {
+        await h.actions!.sendPrompt(
+          "business-42",
+          [{ type: "text", text: "first round" }],
+          { folderId: 1, conversationId: 42, clientMessageId: "first-once" }
+        )
+      })
+      deliver({
+        seq: 1,
+        connection_id: "spawned-conn",
+        type: "session_started",
+        session_id: "first-native-session",
+      })
+      deliver({
+        seq: 2,
+        connection_id: "spawned-conn",
+        type: "status_changed",
+        status: "prompting",
+      })
+      h.acpRestoreConversation.mockResolvedValueOnce({
+        connectionId: "spawned-conn",
+        externalSessionId: "first-native-session",
+        reusedExisting: true,
+        codegMcpAvailable: true,
+        mcpServerCount: 1,
+        replacedConnectionIds: [],
+        lifecycleState: "active_turn_attached",
+        durableSession: true,
+      })
+      await act(async () => {
+        await h.actions!.connect(
+          "business-42",
+          agent,
+          "/tmp/x",
+          "first-native-session",
+          42
+        )
+      })
+      expect(h.store!.getConnection("business-42")).toMatchObject({
+        conversationId: 42,
+        sessionId: "first-native-session",
+        codegMcpAvailable: true,
+        status: "prompting",
+        promptReady: true,
+      })
+      deliver({
+        seq: 3,
+        connection_id: "spawned-conn",
+        type: "turn_complete",
+        session_id: "first-native-session",
+        stop_reason: "end_turn",
+      })
+      expect(h.store!.getConnection("business-42")).toMatchObject({
+        conversationId: 42,
+        status: "connected",
+        promptReady: true,
+      })
+      await act(async () => {
+        await h.actions!.sendPrompt(
+          "business-42",
+          [{ type: "text", text: "second round" }],
+          { folderId: 1, conversationId: 42, clientMessageId: "second-once" }
+        )
+      })
+      expect(h.acpPrompt.mock.calls.map((call) => call[4])).toEqual([
+        "first-once",
+        "second-once",
+      ])
+      expect(h.acpConnect).toHaveBeenCalledTimes(1)
+      expect(h.acpDisconnect).not.toHaveBeenCalled()
+    }
+  )
+
+  it.each([true, false])(
+    "repairs identity without reviving a turn completed before its restore receipt (web=%s)",
+    async (web) => {
+      if (!web) h.eventStreamValue = null
+      h.acpRestoreConversation.mockRejectedValueOnce(
+        new Error("Conversation has no external session")
+      )
+      await mountProvider()
+      await act(async () => {
+        await h.actions!.connect(
+          "business-42",
+          "codex",
+          "/tmp/x",
+          undefined,
+          42
+        )
+      })
+      const deliver = (event: EventEnvelope) => {
+        if (web) {
+          emitAcpEvent(latestAttachHandlers(), event)
+        } else {
+          const listener = vi.mocked(subscribe).mock.calls.at(-1)![1] as (
+            value: EventEnvelope
+          ) => void
+          act(() => listener(event))
+        }
+      }
+      if (web) act(() => latestAttachHandlers().onReplay([], 0))
+      deliver({
+        seq: 1,
+        connection_id: "spawned-conn",
+        type: "session_started",
+        session_id: "first-native-session",
+      })
+      deliver({
+        seq: 2,
+        connection_id: "spawned-conn",
+        type: "status_changed",
+        status: "prompting",
+      })
+      let resolveRestore!: (value: unknown) => void
+      h.acpRestoreConversation.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveRestore = resolve
+          })
+      )
+      let restoring: Promise<void>
+      await act(async () => {
+        restoring = h.actions!.connect(
+          "business-42",
+          "codex",
+          "/tmp/x",
+          "first-native-session",
+          42
+        )
+      })
+      deliver({
+        seq: 3,
+        connection_id: "spawned-conn",
+        type: "turn_complete",
+        session_id: "first-native-session",
+        stop_reason: "end_turn",
+      })
+      await act(async () => {
+        resolveRestore({
+          connectionId: "spawned-conn",
+          externalSessionId: "first-native-session",
+          reusedExisting: true,
+          codegMcpAvailable: true,
+          mcpServerCount: 1,
+          replacedConnectionIds: [],
+          lifecycleState: "active_turn_attached",
+          durableSession: true,
+        })
+        await restoring!
+      })
+      expect(h.store!.getConnection("business-42")).toMatchObject({
+        conversationId: 42,
+        sessionId: "first-native-session",
+        status: "connected",
+        promptReady: true,
+        codegMcpAvailable: true,
+      })
+    }
+  )
+
+  it("does not revive a terminal turn when joining an older restore flight", async () => {
+    h.acpRestoreConversation.mockResolvedValueOnce({
+      connectionId: "verified-business-connection",
+      externalSessionId: "native-business-session",
+      reusedExisting: false,
+      codegMcpAvailable: true,
+      mcpServerCount: 1,
+      replacedConnectionIds: [],
+      lifecycleState: "ready",
+      durableSession: true,
+    })
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(
+        "business-42",
+        "codex",
+        "/tmp/x",
+        "native-business-session",
+        42
+      )
+    })
+    const handlers = latestAttachHandlers()
+    emitAcpEvent(handlers, {
+      seq: 2,
+      connection_id: "verified-business-connection",
+      type: "turn_complete",
+      session_id: "native-business-session",
+      stop_reason: "end_turn",
+    })
+    // A second surface can join a shared restore flight whose backend
+    // observation preceded the terminal frame already seen by this client.
+    act(() => handlers.onAttaching?.())
+    h.acpRestoreConversation.mockResolvedValueOnce({
+      connectionId: "verified-business-connection",
+      externalSessionId: "native-business-session",
+      reusedExisting: true,
+      codegMcpAvailable: true,
+      mcpServerCount: 1,
+      replacedConnectionIds: [],
+      lifecycleState: "active_turn_attached",
+      durableSession: true,
+      eventSeq: 1,
+    })
+    await act(async () => {
+      await h.actions!.connect(
+        "business-42",
+        "codex",
+        "/tmp/x",
+        "native-business-session",
+        42
+      )
+    })
+    expect(h.store!.getConnection("business-42")).toMatchObject({
+      status: "connected",
+      conversationId: 42,
+      lastAppliedSeq: 2,
+      // Active attachment does not bypass a missing transport replay.
+      promptReady: false,
+    })
+  })
+
   it.each(["codex", "pi"] as const)(
     "%s restores the business binding and permits consecutive sends without replay",
     async (agent) => {

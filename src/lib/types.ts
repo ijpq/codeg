@@ -4168,6 +4168,8 @@ export interface RestoredConversationConnectionInfo {
   replacedConnectionIds: string[]
   lifecycleState?: string
   durableSession?: boolean
+  /** Event cursor observed atomically with the lifecycle, when available. */
+  eventSeq?: number | null
 }
 
 // ACP agent info returned by acp_list_agents
