@@ -51,8 +51,8 @@ pub struct CodexRuntime {
     /// runtime never makes a snapshot count as fresh for a confirmed version,
     /// and never reads as "the runtime changed".
     pub confirmed: bool,
-    /// `@openai/codex/bin/codex.js`, run with node. `None` when no codex-acp
-    /// install could be found, which is also when nothing can be judged.
+    /// CLI entry point (legacy field name): a native private binary runs
+    /// directly; an npm codex.js runs with Node. None means no judgeable CLI.
     pub codex_js: Option<PathBuf>,
     /// The codex-acp package's own version, for status and logs.
     pub adapter_version: Option<String>,
@@ -98,8 +98,11 @@ impl ValidatedRuntime {
         if !codex_js.is_file() {
             return None;
         }
-        let version = codex_package_dir_of(&codex_js)
-            .and_then(|dir| read_package_version(&dir, CODEX_PACKAGE))?;
+        let version =
+            crate::acp::codex_bundled_runtime::binary_version(&codex_js).or_else(|| {
+                codex_package_dir_of(&codex_js)
+                    .and_then(|dir| read_package_version(&dir, CODEX_PACKAGE))
+            })?;
         Some(ValidatedRuntime {
             version,
             codex_js: self.codex_js.clone(),
@@ -129,6 +132,29 @@ pub async fn current() -> CodexRuntime {
     #[cfg(test)]
     if let Some(runtime) = test_hooks::runtime() {
         return runtime;
+    }
+    let mut launch_env = std::collections::BTreeMap::new();
+    crate::acp::codex_bundled_runtime::apply(&mut launch_env);
+    if let Some(path) = launch_env
+        .get("CODEX_PATH")
+        .cloned()
+        .or_else(|| std::env::var("CODEX_PATH").ok())
+        .map(PathBuf::from)
+    {
+        if let Some(version) = crate::acp::codex_bundled_runtime::binary_version(&path) {
+            let adapter_version = path.parent().and_then(|root| {
+                read_package_version(
+                    &root.join("node_modules/@agentclientprotocol/codex-acp"),
+                    CODEX_ACP_PACKAGE,
+                )
+            });
+            return CodexRuntime {
+                version,
+                confirmed: true,
+                codex_js: Some(path),
+                adapter_version,
+            };
+        }
     }
     let command =
         crate::commands::acp::resolve_npx_command_for(AgentType::Codex, CODEX_ACP_CMD).await;
@@ -394,7 +420,6 @@ pub async fn judge(codex_js: &Path, catalog: &[u8]) -> Result<usize, JudgeError>
         .and_then(serde_json::Value::as_array)
         .map(Vec::len)
         .ok_or_else(|| JudgeError::Rejected("the catalog has no models array".into()))?;
-    let node = which::which("node").map_err(|_| JudgeError::NotInstalled)?;
     if !codex_js.is_file() {
         return Err(JudgeError::NotInstalled);
     }
@@ -415,14 +440,29 @@ pub async fn judge(codex_js: &Path, catalog: &[u8]) -> Result<usize, JudgeError>
         Ok(Err(e)) => return Err(JudgeError::Io(format!("write judge file: {e}"))),
         Err(e) => return Err(JudgeError::Io(format!("write judge file: {e}"))),
     }
-    let result = run_judge(&node, codex_js, &file, &home, expected).await;
+    let result = run_judge(codex_js, &file, &home, expected).await;
     let _ = tokio::fs::remove_file(&file).await;
     let _ = tokio::fs::remove_dir_all(&home).await;
     result
 }
 
+fn catalog_command(path: &Path) -> Result<tokio::process::Command, JudgeError> {
+    if matches!(
+        path.extension().and_then(|s| s.to_str()),
+        Some("js" | "mjs" | "cjs")
+    ) {
+        let node = crate::acp::pi_runtime::bundled_node()
+            .or_else(|| which::which("node").ok())
+            .ok_or(JudgeError::NotInstalled)?;
+        let mut cmd = crate::process::tokio_command(node);
+        cmd.arg(path);
+        Ok(cmd)
+    } else {
+        Ok(crate::process::tokio_command(path))
+    }
+}
+
 async fn run_judge(
-    node: &Path,
     codex_js: &Path,
     file: &Path,
     home: &Path,
@@ -431,9 +471,8 @@ async fn run_judge(
     // A TOML basic string, escaped the way codex's `-c` parser reads it, so
     // a Windows path's backslashes survive.
     let value = toml_edit::Value::from(file.to_string_lossy().into_owned()).to_string();
-    let mut cmd = crate::process::tokio_command(node);
-    cmd.arg(codex_js)
-        .arg("debug")
+    let mut cmd = catalog_command(codex_js)?;
+    cmd.arg("debug")
         .arg("models")
         .arg("-c")
         .arg(format!("model_catalog_json={}", value.trim()))
@@ -489,10 +528,8 @@ fn codex_complaint(stderr: &[u8]) -> String {
 /// Run `codex_js debug models --bundled`: the official catalog compiled into
 /// this codex, in file order.
 pub async fn bundled_catalog_output(codex_js: &Path) -> Option<String> {
-    let node = which::which("node").ok()?;
-    let mut cmd = crate::process::tokio_command(&node);
-    cmd.arg(codex_js)
-        .arg("debug")
+    let mut cmd = catalog_command(codex_js).ok()?;
+    cmd.arg("debug")
         .arg("models")
         .arg("--bundled")
         .kill_on_drop(true);
@@ -575,6 +612,14 @@ pub(crate) mod test_hooks {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn native_catalog_judge_does_not_resolve_an_npm_codex_entry() {
+        let path = Path::new("private-runtime/codex.exe");
+        let command = catalog_command(path).unwrap();
+        assert_eq!(command.as_std().get_program(), path.as_os_str());
+        assert_eq!(command.as_std().get_args().count(), 0);
+    }
 
     pub(crate) fn write_package(dir: &Path, name: &str, version: &str) {
         std::fs::create_dir_all(dir).unwrap();

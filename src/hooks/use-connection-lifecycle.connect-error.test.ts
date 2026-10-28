@@ -29,6 +29,7 @@ vi.mock("@/contexts/task-context", () => {
 
 const conn = vi.hoisted(() => ({
   status: null as string | null,
+  promptReady: false,
   connectError: null as ConnectErrorInfo | null,
 }))
 
@@ -39,6 +40,7 @@ vi.mock("@/hooks/use-connection", () => {
   return {
     useConnection: () => ({
       status: conn.status,
+      promptReady: conn.promptReady,
       agentType: null,
       connectError: conn.connectError,
       selectorsReady: false,
@@ -74,6 +76,7 @@ function renderDraft() {
 describe("useConnectionLifecycle autoConnectError", () => {
   beforeEach(() => {
     conn.status = null
+    conn.promptReady = false
     conn.connectError = null
   })
 
@@ -117,6 +120,7 @@ describe("useConnectionLifecycle autoConnectError", () => {
 
   it("stays quiet once the session is up", () => {
     conn.status = "connected"
+    conn.promptReady = true
     conn.connectError = {
       agentType: "codex",
       title: "connectFailedTitle",
@@ -125,5 +129,20 @@ describe("useConnectionLifecycle autoConnectError", () => {
     }
     const { result } = renderDraft()
     expect(result.current.autoConnectError).toBeNull()
+  })
+
+  it("shows a restore failure while the old connection is not prompt ready", () => {
+    conn.status = "connected"
+    conn.connectError = {
+      agentType: "codex",
+      title: "connectFailedTitle",
+      detail: "Native session restore failed; retry",
+      opensAgentSettings: false,
+    }
+    const { result } = renderDraft()
+    expect(result.current.autoConnectError).toBe(
+      "Native session restore failed; retry"
+    )
+    expect(result.current.restorePending).toBe(false)
   })
 })

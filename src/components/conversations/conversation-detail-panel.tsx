@@ -4,7 +4,15 @@ import {
   shouldSeedConversation,
   useFolderTabsStore,
 } from "@/stores/folder-tabs-store"
-import { memo, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react"
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react"
 import {
   getWebConnectionServerSnapshot,
   getWebConnectionSnapshot,
@@ -977,9 +985,11 @@ const ConversationTabView = memo(function ConversationTabView({
     ? selectedAgentNotInstalled
       ? "disconnected"
       : "connecting"
-    : restorePending || (connStatus === "connected" && !connectionReady)
-      ? "connecting"
-      : connStatus
+    : autoConnectError && !restorePending && connStatus !== "prompting"
+      ? "error"
+      : restorePending || (connStatus === "connected" && !connectionReady)
+        ? "connecting"
+        : connStatus
   const connectionModes = useMemo(
     () => effectiveModes?.available_modes ?? [],
     [effectiveModes]

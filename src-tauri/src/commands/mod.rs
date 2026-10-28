@@ -69,8 +69,6 @@ pub mod opencode_credentials;
 pub mod open_in;
 #[cfg(feature = "tauri-runtime")]
 pub mod notification;
-pub mod office_tools;
-pub mod open_in;
 pub mod pet;
 pub mod project_boot;
 pub mod question;

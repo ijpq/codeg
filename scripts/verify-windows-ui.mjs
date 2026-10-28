@@ -19,6 +19,7 @@ import { retainedHistory, scopedPageErrors } from "./release-history-check.mjs"
 import { scopedRuntimeErrors } from "./runtime-page-errors.mjs"
 import {
   businessAgentPage,
+  consecutiveComposerPage,
   restoredBusinessPage,
   unavailableSourcePage,
   stageInterruptedHandoff,
@@ -1460,6 +1461,19 @@ try {
       report,
       output,
     })
+    if (businessSaved) {
+      businessSaved.composer = await consecutiveComposerPage({
+        page: app.page,
+        api: desktopApi(app.page),
+        folderId: saved.folder_id,
+        f,
+        goalModel,
+        piModel,
+        report,
+        name: "setup",
+        other: businessSaved,
+      })
+    }
     await unavailableSourcePage({
       page: app.page,
       api: desktopApi(app.page),
@@ -1523,7 +1537,8 @@ try {
       desktopApi(app.page),
       businessSaved,
       report,
-      "setup"
+      "setup",
+      goalModel
     )
     // This harness navigates and closes the isolated WebView, so run it after
     // the business restart assertions and before disposing this app process.
@@ -1688,6 +1703,19 @@ try {
       report,
       output,
     })
+    if (serverBusinessSaved) {
+      serverBusinessSaved.composer = await consecutiveComposerPage({
+        page,
+        api,
+        folderId: conversation.folder_id,
+        f: s,
+        goalModel,
+        piModel,
+        report,
+        name: "server-web",
+        other: serverBusinessSaved,
+      })
+    }
     await unavailableSourcePage({
       page,
       api,
@@ -1777,7 +1805,8 @@ try {
       restartedServer.api,
       serverBusinessSaved,
       report,
-      "server-web"
+      "server-web",
+      goalModel
     )
     report.checks.push({
       name: "server-process-restart-with-native-session",

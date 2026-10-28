@@ -87,7 +87,7 @@ function CurrentRound({
   completed,
 }: {
   parts: AdaptedContentPart[]
-  durationMs?: number
+  durationMs?: number | null
   completed: boolean
 }) {
   const [open, setOpen] = useState(true)
@@ -103,7 +103,10 @@ function CurrentRound({
   )
 }
 
-function renderSettled(parts: AdaptedContentPart[], durationMs = 214000) {
+function renderSettled(
+  parts: AdaptedContentPart[],
+  durationMs: number | null = 214000
+) {
   return renderTurn(
     <CurrentRound parts={parts} durationMs={durationMs} completed />
   )
@@ -963,7 +966,7 @@ describe("activity timeline: where the rail ends", () => {
   })
 
   it("says the steps alone with no time to give, and the process with no steps to count", () => {
-    const view = renderSettled(partsOf(MOCKUP_ASSISTANT_TURN), 0)
+    const view = renderSettled(partsOf(MOCKUP_ASSISTANT_TURN), null)
     expect(foldOf(list())).toHaveAccessibleName("Collapse 14 steps")
     view.unmount()
     // A thought is no step: a reply that only thought before it answered
@@ -977,7 +980,7 @@ describe("activity timeline: where the rail ends", () => {
         { type: "text", text: "Use the short one." },
       ],
     }
-    const bare = renderSettled(partsOf(THOUGHT_ONLY), 0)
+    const bare = renderSettled(partsOf(THOUGHT_ONLY), null)
     expect(foldOf(list())).toHaveAccessibleName("Collapse Activity")
     bare.unmount()
     renderSettled(partsOf(THOUGHT_ONLY), 5000)

@@ -47,7 +47,12 @@ export async function startGoalModel() {
         user: input.includes("BUSINESS_CODEX_RETURN"),
         rules:
           input.includes("BUSINESS_SAFE_BOUNDARY") &&
-          input.includes("BUSINESS_SOURCE_INSTANCE_RULES"),
+          input.includes("BUSINESS_SOURCE_INSTANCE_RULES") &&
+          input.includes("BUSINESS_RULE_TAIL_DELEGATION") &&
+          input.includes("小弟必须通过真实委派工具执行") &&
+          input.includes("BUSINESS_RULE_TAIL_MATERIAL") &&
+          input.includes("生成材料只呈现修改结果"),
+        rulesRevisionB: input.includes("BUSINESS_RULE_REVISION_B_AT_TAIL"),
         ledger: input.includes("custom-ledger.md"),
       })
     }

@@ -163,6 +163,7 @@ beforeEach(() => {
 })
 
 vi.mock("@/lib/api", () => ({
+  invalidateFolderConversationCache: vi.fn(),
   acpGetAgentStatus: vi.fn(),
   acpFindConnectionForConversation: vi.fn(),
   acpConnect: vi.fn(),
@@ -5220,12 +5221,13 @@ it("retains mobile conversation identity, connection and runtime through A(files
   expect(api.acpConnect).toHaveBeenCalledOnce()
   expect(api.acpDisconnect).not.toHaveBeenCalled()
   expect(filesUnmounted).toHaveBeenCalledTimes(2)
-  // A real teardown still releases both resources after the retained view closes.
+  // A real teardown releases the local runtime. A durable business connection
+  // remains available to other clients and external senders after a tab closes.
   await act(async () => {
     view.unmount()
   })
   expect(unmounted).toHaveBeenCalledOnce()
-  expect(api.acpDisconnect).toHaveBeenCalledWith("mobile-connection")
+  expect(api.acpDisconnect).not.toHaveBeenCalled()
   expect(useConversationRuntimeStore.getState().byConversationId.has(42)).toBe(
     false
   )

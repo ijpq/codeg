@@ -434,6 +434,7 @@ mod tests {
             model: Some("gpt-5.6-sol".to_string()),
             completed_at: Some(at(end)),
             agent_message_id: None,
+            native_task_id: None,
         }
     }
 
