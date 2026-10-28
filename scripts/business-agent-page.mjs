@@ -407,6 +407,24 @@ export async function businessAgentPage({
       })))
     try {
       await page.setViewportSize({ width: 390, height: 844 })
+      // Resizing an open desktop sidebar creates the mobile navigation Drawer.
+      // Dismiss it as a user would, then prove the Agent control is reachable;
+      // a bounding box behind an overlay is not a narrow-layout acceptance.
+      await page.keyboard.press("Escape")
+      await until(
+        () =>
+          toolbar.locator("select").evaluate((select) => {
+            const bounds = select.getBoundingClientRect()
+            return select.contains(
+              document.elementFromPoint(
+                bounds.x + bounds.width / 2,
+                bounds.y + bounds.height / 2
+              )
+            )
+          }),
+        Boolean,
+        "Narrow Agent selector is reachable without an overlay"
+      )
       const bounds = await toolbar.boundingBox()
       assert.ok(
         bounds &&
