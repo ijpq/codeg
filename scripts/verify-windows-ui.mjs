@@ -1461,13 +1461,9 @@ try {
       f,
       businessSaved
     )
-    // The scroll harness navigates and closes this isolated WebView. Finish
-    // the app checks first; restart below to verify persisted business state.
-    await run(process.execPath, ["scripts/browser-scroll-regression.mjs"], {
-      ...process.env,
-      CODEG_TEST_WEBVIEW_CDP: `http://127.0.0.1:${app.port}`,
-      CODEG_BROWSER_EVIDENCE: join(output, "webview-scroll"),
-    })
+    // Stop immediately while the target handshake is still blocked. Running
+    // the scroll suite here would consume the native handshake deadline and
+    // turn this interruption test into an ordinary initialization timeout.
   } finally {
     await upgradedErrors.stop()
     await stopDesktop(app)
@@ -1489,6 +1485,13 @@ try {
       report,
       "setup"
     )
+    // This harness navigates and closes the isolated WebView, so run it after
+    // the business restart assertions and before disposing this app process.
+    await run(process.execPath, ["scripts/browser-scroll-regression.mjs"], {
+      ...process.env,
+      CODEG_TEST_WEBVIEW_CDP: `http://127.0.0.1:${app.port}`,
+      CODEG_BROWSER_EVIDENCE: join(output, "webview-scroll"),
+    })
   } finally {
     await stopDesktop(app)
   }
