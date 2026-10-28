@@ -36176,7 +36176,7 @@ mod tests {
             SessionId::new("codex-session".to_string()),
             &cwd,
             vec![companion],
-            false,
+            &ClaudeSessionOptions::new(false),
         );
 
         assert_eq!(req.mcp_servers.len(), 1);

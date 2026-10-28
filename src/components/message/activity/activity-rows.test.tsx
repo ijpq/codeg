@@ -412,20 +412,20 @@ describe("long replies", () => {
     )
     const view = renderUi(live(150))
     expect(screen.getAllByText("Edited")).toHaveLength(150)
-    expect(screen.queryByRole("button", { name: /more step/ })).toBeNull()
+    expect(screen.queryByText(/Show \d+ more step/)).toBeNull()
     const late = rowOf("f149.ts")
     // Past the fold, the oldest row past the head goes, not a whole chunk —
     // and the rows that stay are the same rows, not drawn again.
     view.rerender(withProviders(live(151)))
     expect(
-      screen.getByRole("button", { name: "Show 1 more step" })
-    ).toBeTruthy()
+      screen.getByText("Show 1 more step").closest("button")
+    ).toHaveAccessibleName("Show 1 more step")
     expect(screen.getAllByText("Edited")).toHaveLength(150)
     expect(rowOf("f149.ts")).toBe(late)
     view.rerender(withProviders(live(152)))
     expect(
-      screen.getByRole("button", { name: "Show 2 more steps" })
-    ).toBeTruthy()
+      screen.getByText("Show 2 more steps").closest("button")
+    ).toHaveAccessibleName("Show 2 more steps")
     expect(screen.getAllByText("Edited")).toHaveLength(150)
   })
 })

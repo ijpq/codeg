@@ -80,6 +80,22 @@ fn select(dir: &Path, explicit: Option<&str>, disabled: bool) -> Option<std::pat
     (path.is_file() && actual == expected).then_some(path)
 }
 
+/// Provenance for the exact private binary, also used by catalog validation.
+/// A same-named binary beside an unrelated manifest is never confirmed.
+pub(crate) fn binary_version(path: &Path) -> Option<String> {
+    let root = path.parent()?.parent()?;
+    if select(root, None, false)?.canonicalize().ok()? != path.canonicalize().ok()? {
+        return None;
+    }
+    serde_json::from_str::<serde_json::Value>(include_str!(
+        "../../../vendor/codex-runtime/source.json"
+    ))
+    .ok()?
+    .get("version")?
+    .as_str()
+    .map(str::to_owned)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,8 +113,11 @@ mod tests {
             include_bytes!("../../../vendor/codex-runtime/source.json"),
         )
         .unwrap();
-        assert_eq!(select(dir.path(), None, false), Some(path));
+        assert_eq!(select(dir.path(), None, false), Some(path.clone()));
+        assert_eq!(binary_version(&path).as_deref(), Some("0.162.1-codeg.1"));
         assert!(select(dir.path(), Some("user-pinned-codex"), false).is_none());
         assert!(select(dir.path(), None, true).is_none());
+        std::fs::write(runtime.join("source.json"), b"{}").unwrap();
+        assert!(binary_version(&path).is_none());
     }
 }

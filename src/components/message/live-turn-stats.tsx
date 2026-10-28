@@ -321,7 +321,10 @@ export function extractLiveEditStats(message: LiveMessage): LiveEditStats {
  * turning ring at the foot of its rail), so this row carries neither a word
  * for it nor a pulsing mark.
  */
-export function LiveTurnStats({ message, agentType = "claude_code" }: LiveTurnStatsProps) {
+export function LiveTurnStats({
+  message,
+  agentType = "claude_code",
+}: LiveTurnStatsProps) {
   const locale = useLocale()
   const t = useTranslations("Folder.chat.liveTurnStats")
   const [elapsed, setElapsed] = useState(() => Date.now() - message.startedAt)
@@ -345,11 +348,8 @@ export function LiveTurnStats({ message, agentType = "claude_code" }: LiveTurnSt
 
   const elapsedLabel = formatElapsedLabel(elapsed, t)
   const waitingForFirstEvent = message.content.length === 0
-  const activityLabel = waitingForFirstEvent
-    ? elapsed >= 10_000
-      ? t("stillProcessing")
-      : t("backendProcessing")
-    : t("streaming")
+  const activityLabel =
+    elapsed >= 10_000 ? t("stillProcessing") : t("backendProcessing")
 
   // --- Streaming diagnostics: is data flowing, and is the link up? ----------
   // "Time since the live message last advanced": a stall (network OR model)
@@ -417,16 +417,16 @@ export function LiveTurnStats({ message, agentType = "claude_code" }: LiveTurnSt
       <div className="flex min-h-8 flex-wrap items-center justify-center gap-x-3 gap-y-1 px-4 py-1 text-xs leading-none text-muted-foreground">
         {waitingForFirstEvent && (
           <>
-        <AgentIcon
-          agentType={agentType}
-          className="h-3.5 w-3.5 animate-pulse"
-        />
-        <span>
-          {waitingForFirstEvent
-            ? `${t("sent")} · ${activityLabel}`
-            : activityLabel}
-        </span>
-        <span className="text-border leading-none">|</span>
+            <AgentIcon
+              agentType={agentType}
+              className="h-3.5 w-3.5 animate-pulse"
+            />
+            <span>
+              {waitingForFirstEvent
+                ? `${t("sent")} · ${activityLabel}`
+                : activityLabel}
+            </span>
+            <span className="text-border leading-none">|</span>
           </>
         )}
         <span className="inline-flex items-center gap-1 leading-none">

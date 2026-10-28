@@ -81,6 +81,8 @@ vi.mock("@/contexts/tab-context", () => ({
 }))
 
 vi.mock("@/stores/tab-store", () => ({
+  useVisibleConversationTabs: () => mocks.tabState.tabs,
+  useVisibleConversationLayout: () => mocks.tabState.groupLayout,
   groupOfTab: (
     groupOf: Record<string, string>,
     layout: {

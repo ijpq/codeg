@@ -74,6 +74,8 @@ pub struct BusinessAgentSession {
     /// forces the whole original transcript into the model before Goal use.
     #[serde(skip)]
     pub last_bridge_sequence: i64,
+    #[serde(skip)]
+    pub delivered_rule_digest: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,6 +104,7 @@ fn session(row: QueryResult) -> Result<BusinessAgentSession, DbError> {
         config_values: decode(&row.try_get::<String>("", "config_values")?)?,
         seen_sequence: row.try_get("", "seen_sequence")?,
         last_bridge_sequence: row.try_get("", "last_bridge_sequence")?,
+        delivered_rule_digest: row.try_get("", "delivered_rule_digest")?,
     })
 }
 
@@ -673,10 +676,13 @@ pub async fn accept_prompt(
     sid: i64,
     sequence: i64,
     bridge_boundary: i64,
+    rules_digest: Option<&str>,
 ) -> Result<(), DbError> {
     let tx = conn.begin().await?;
-    tx.execute(stmt("UPDATE business_prompt_receipt SET status='accepted' WHERE conversation_id=? AND message_id=? AND session_id=?",vec![cid.into(),id.into(),sid.into()])).await?;
-    tx.execute(stmt("UPDATE conversation_agent_session SET seen_sequence=MAX(seen_sequence,?),last_bridge_sequence=MAX(last_bridge_sequence,?) WHERE id=? AND conversation_id=?",vec![sequence.into(),bridge_boundary.into(),sid.into(),cid.into()])).await?;
+    let changed = tx.execute(stmt("UPDATE business_prompt_receipt SET status='accepted' WHERE conversation_id=? AND message_id=? AND session_id=? AND status='reserved'",vec![cid.into(),id.into(),sid.into()])).await?;
+    if changed.rows_affected() > 0 {
+        tx.execute(stmt("UPDATE conversation_agent_session SET seen_sequence=MAX(seen_sequence,?),last_bridge_sequence=MAX(last_bridge_sequence,?),delivered_rule_digest=COALESCE(?,delivered_rule_digest) WHERE id=? AND conversation_id=? AND last_bridge_sequence<=?",vec![sequence.into(),bridge_boundary.into(),rules_digest.map(str::to_owned).into(),sid.into(),cid.into(),bridge_boundary.into()])).await?;
+    }
     tx.commit().await?;
     Ok(())
 }
@@ -910,7 +916,7 @@ pub async fn bind_managed_external_if_current(
         return Ok(());
     }
     tx.execute(stmt("INSERT INTO business_agent_session_alias(agent_type,external_id,session_id) SELECT agent_type,external_id,id FROM conversation_agent_session WHERE conversation_id=? AND agent_type=? ON CONFLICT(agent_type,external_id) DO NOTHING",vec![cid.into(),key.clone().into()])).await?;
-    tx.execute(stmt("UPDATE conversation_agent_session SET external_id=? WHERE conversation_id=? AND agent_type=?",vec![external.into(),cid.into(),key.clone().into()])).await?;
+    tx.execute(stmt("UPDATE conversation_agent_session SET external_id=?,delivered_rule_digest='' WHERE conversation_id=? AND agent_type=?",vec![external.into(),cid.into(),key.clone().into()])).await?;
     tx.execute(stmt("INSERT INTO business_agent_session_alias(agent_type,external_id,session_id) SELECT agent_type,external_id,id FROM conversation_agent_session WHERE conversation_id=? AND agent_type=? ON CONFLICT(agent_type,external_id) DO NOTHING",vec![cid.into(),key.into()])).await?;
     tx.execute(stmt("UPDATE business_conversation_state SET revision=revision+1,updated_at=CURRENT_TIMESTAMP WHERE conversation_id=?",vec![cid.into()])).await?;
     tx.commit().await?;
@@ -1143,6 +1149,7 @@ mod tests {
             claude.id,
             unseen.last().unwrap().0,
             unseen.last().unwrap().0,
+            None,
         )
         .await
         .unwrap();
@@ -1251,7 +1258,7 @@ mod tests {
         assert!(reserve_prompt(&db.conn, cid, "msg", sid, &blocks, 2)
             .await
             .is_err());
-        accept_prompt(&db.conn, cid, "msg", sid, 2, 2)
+        accept_prompt(&db.conn, cid, "msg", sid, 2, 2, None)
             .await
             .unwrap();
         assert!(!reserve_prompt(&db.conn, cid, "msg", sid, &blocks, 2)

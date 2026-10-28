@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.41.1-fix1 — 2026-10-28
+
+- Rebase the Windows fork onto upstream v0.41.1, retaining the released business
+  Agent, Pi, external delivery, timing, artifacts, Office review and scroll fixes.
+- Restore Codex and Pi by stable business conversation identity. Accept verified
+  provisional first-prompt readiness and ignore replaced attach callbacks, so
+  successive prompts can resume without restarting the app. Show restore errors
+  instead of leaving the composer in a waiting state.
+- Transfer complete, versioned applicable rule snapshots and repair previously
+  truncated handoffs. Advance the delivery receipt only after prompt acceptance;
+  resend changed rules and reject unreadable or oversized partial handoffs.
+- Validate model catalogs using the packaged native Codex runtime without
+  resolving a missing npm codex.js entry; preserve explicit runtime overrides.
+- Extend both Windows forms’ isolated acceptance with actual-composer multi-round
+  sending, page switches, reload, connection loss and process-restart recovery,
+  plus independent checks for long rule tails and updates to existing handoffs.
+
+See [release notes](docs/releases/v0.41.1-fix1.md).
+
 ## 0.40.0-fix6 — 2026-10-28
 
 - Retain fix5's packaged Codex, recoverable business handoff, selected Pi version,

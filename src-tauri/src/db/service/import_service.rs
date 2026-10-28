@@ -706,7 +706,7 @@ mod tests {
         business::activate(&db.conn, &request, "business-claude").await.unwrap();
         assert_eq!(import_one_skip(&db.conn, folder, &AgentType::Codex, &source).await.unwrap(), ImportOutcome::Skipped);
         conversation_service::soft_delete(&db.conn, cid).await.unwrap();
-        assert_eq!(import_one(&db.conn, folder, &AgentType::Codex, &source, DeletedPolicy::Restore).await.unwrap(), ImportOutcome::Restored);
+        assert_eq!(import_one(&db.conn, folder, &AgentType::Codex, &source, DeletedPolicy::Restore, &HashSet::new()).await.unwrap(), ImportOutcome::Restored);
         let restored = conversation_service::get_by_id(&db.conn, cid).await.unwrap();
         assert_eq!(restored.agent_type, AgentType::ClaudeCode);
         assert_eq!(restored.external_id.as_deref(), Some("business-claude"));

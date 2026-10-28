@@ -2092,6 +2092,168 @@ describe("prompt connection loss classification", () => {
   })
 })
 
+describe("persisted business readiness across engines and transports", () => {
+  it.each(["codex", "pi"] as const)(
+    "%s restores the business binding and permits consecutive sends without replay",
+    async (agent) => {
+      h.acpRestoreConversation.mockResolvedValue({
+        connectionId: "verified-business-connection",
+        externalSessionId: "native-business-session",
+        reusedExisting: false,
+        codegMcpAvailable: true,
+        mcpServerCount: 1,
+        replacedConnectionIds: [],
+        lifecycleState: "ready",
+        durableSession: true,
+      })
+      await mountProvider()
+      await act(async () => {
+        await h.actions!.connect(
+          "business-42",
+          agent,
+          "/tmp/x",
+          "native-business-session",
+          42
+        )
+      })
+      expect(h.acpRestoreConversation).toHaveBeenCalledWith(42, undefined, {})
+      expect(h.acpConnect).not.toHaveBeenCalled()
+      expect(h.store!.getConnection("business-42")).toMatchObject({
+        agentType: agent,
+        conversationId: 42,
+        sessionId: "native-business-session",
+        promptReady: true,
+        status: "connected",
+      })
+      const handlers = latestAttachHandlers()
+      for (let round = 1; round <= 3; round++) {
+        await act(async () => {
+          await h.actions!.sendPrompt(
+            "business-42",
+            [{ type: "text", text: `round ${round}` }],
+            {
+              folderId: 1,
+              conversationId: 42,
+              clientMessageId: `business-round-${round}`,
+            }
+          )
+        })
+        emitAcpEvent(handlers, {
+          seq: round,
+          connection_id: "verified-business-connection",
+          type: "turn_complete",
+          session_id: "native-business-session",
+          stop_reason: "end_turn",
+        })
+      }
+      expect(h.acpPrompt).toHaveBeenCalledTimes(3)
+      expect(h.acpPrompt.mock.calls.map((call) => call[4])).toEqual([
+        "business-round-1",
+        "business-round-2",
+        "business-round-3",
+      ])
+    }
+  )
+
+  it.each([true, false])(
+    "accepts verified provisional readiness before replay (web=%s)",
+    async (web) => {
+      if (!web) h.eventStreamValue = null
+      h.acpRestoreConversation.mockResolvedValueOnce({
+        connectionId: "ephemeral-ready",
+        externalSessionId: "ephemeral-native-id",
+        reusedExisting: false,
+        codegMcpAvailable: true,
+        mcpServerCount: 1,
+        replacedConnectionIds: [],
+        lifecycleState: "pending_first_prompt",
+        durableSession: false,
+      })
+      await mountProvider()
+      await act(async () => {
+        await h.actions!.connect(
+          "business-42",
+          "codex",
+          "/tmp/x",
+          undefined,
+          42
+        )
+      })
+      expect(h.store!.getConnection("business-42")).toMatchObject({
+        connectionId: "ephemeral-ready",
+        conversationId: 42,
+        sessionId: "ephemeral-native-id",
+        promptReady: true,
+        selectorsReady: true,
+        status: "connected",
+      })
+      await act(async () => {
+        await h.actions!.sendPrompt(
+          "business-42",
+          [{ type: "text", text: "你好" }],
+          {
+            folderId: 1,
+            conversationId: 42,
+            clientMessageId: "first-message-once",
+          }
+        )
+      })
+      expect(h.acpPrompt).toHaveBeenCalledTimes(1)
+    }
+  )
+
+  it("ignores callbacks from a detached subscription after a replacement is ready", async () => {
+    const restored = {
+      externalSessionId: "native-business-session",
+      reusedExisting: false,
+      codegMcpAvailable: true,
+      mcpServerCount: 1,
+      replacedConnectionIds: [],
+      lifecycleState: "ready",
+      durableSession: true,
+    }
+    h.acpRestoreConversation.mockResolvedValueOnce({
+      ...restored,
+      connectionId: "old-ready",
+    })
+    await mountProvider()
+    await act(async () => {
+      await h.actions!.connect(
+        "business-42",
+        "codex",
+        "/tmp/x",
+        "native-business-session",
+        42
+      )
+    })
+    const oldHandlers = latestAttachHandlers()
+    act(() => oldHandlers.onAttaching?.())
+    h.acpRestoreConversation.mockResolvedValueOnce({
+      ...restored,
+      connectionId: "new-ready",
+    })
+    await act(async () => {
+      await h.actions!.connect(
+        "business-42",
+        "codex",
+        "/tmp/x",
+        "native-business-session",
+        42
+      )
+    })
+    const current = h.store!.getConnection("business-42")
+    expect(current).toMatchObject({
+      connectionId: "new-ready",
+      promptReady: true,
+    })
+    act(() => {
+      oldHandlers.onAttaching?.()
+      oldHandlers.onDetached("connection_gone")
+    })
+    expect(h.store!.getConnection("business-42")).toEqual(current)
+  })
+})
+
 describe("AcpConnectionsProvider persisted Codex restore lifecycle", () => {
   const CODEX_TAB = "conv-1-codex-42"
 
