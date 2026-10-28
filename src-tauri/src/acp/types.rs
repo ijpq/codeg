@@ -1747,6 +1747,10 @@ pub struct RestoredConversationConnectionInfo {
     /// connection whose id must not yet be treated as a rollout.
     pub lifecycle_state: String,
     pub durable_session: bool,
+    /// Event cursor read under the same lock as the lifecycle observation.
+    /// Clients must not overwrite newer terminal events with a delayed receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_seq: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -1162,6 +1162,7 @@ export async function consecutiveComposerPage({
   report,
   name,
   other,
+  output,
 }) {
   if (!goalModel || !piModel) return []
   const conversations = []
@@ -1242,26 +1243,99 @@ export async function consecutiveComposerPage({
           agent === "codex"
             ? "BUSINESS_CODEX_COMPLETED"
             : "BUSINESS_PI_COMPLETED"
-        await until(
-          read,
-          (history) => {
-            const index = history.turns.findIndex(
-              (t) =>
-                t.role === "user" && JSON.stringify(t.blocks).includes(text)
+        try {
+          await until(
+            read,
+            (history) => {
+              const index = history.turns.findIndex(
+                (t) =>
+                  t.role === "user" && JSON.stringify(t.blocks).includes(text)
+              )
+              return (
+                index >= 0 &&
+                history.turns
+                  .slice(index + 1)
+                  .some(
+                    (t) =>
+                      t.role === "assistant" &&
+                      JSON.stringify(t.blocks).includes(response)
+                  )
+              )
+            },
+            `${name}: ${agent} composer round ${round}`
+          )
+        } catch (error) {
+          if (output) {
+            const history = await read().catch(() => null)
+            const connection = await api(
+              "acp_find_connection_for_conversation",
+              {
+                conversationId: cid,
+                agentType: agent,
+                sessionId: history?.summary?.external_id,
+              }
+            ).catch(() => null)
+            const snapshot = connection?.connection_id
+              ? await api("acp_get_session_snapshot", {
+                  connectionId: connection.connection_id,
+                }).catch(() => null)
+              : null
+            const ui = await page
+              .evaluate(() => ({
+                queues: Object.keys(localStorage)
+                  .filter((key) => key.startsWith("codeg:msg-queue:v1:"))
+                  .map((key) => ({
+                    key,
+                    items: JSON.parse(localStorage.getItem(key) || "[]").map(
+                      ({ id, clientMessageId, intent, state }) => ({
+                        id,
+                        clientMessageId,
+                        intent,
+                        state,
+                      })
+                    ),
+                  })),
+                buttons: [...document.querySelectorAll("button")]
+                  .filter((button) => button.getClientRects().length)
+                  .map((button) => ({
+                    title: button.title,
+                    label: button.getAttribute("aria-label"),
+                    disabled: button.disabled,
+                  })),
+              }))
+              .catch(() => null)
+            const prefix = join(
+              output,
+              `${name}-${agent}-composer-${round}-failure`
             )
-            return (
-              index >= 0 &&
-              history.turns
-                .slice(index + 1)
-                .some(
-                  (t) =>
-                    t.role === "assistant" &&
-                    JSON.stringify(t.blocks).includes(response)
-                )
+            await writeFile(
+              `${prefix}.json`,
+              JSON.stringify(
+                {
+                  conversationId: cid,
+                  agent,
+                  round,
+                  userTurns: history?.turns?.filter(
+                    (turn) => turn.role === "user"
+                  ).length,
+                  connectionId: connection?.connection_id,
+                  backend: snapshot && {
+                    status: snapshot.status,
+                    selectorsReady: snapshot.selectors_ready,
+                    turnInFlight: snapshot.turn_in_flight,
+                    conversationId: snapshot.conversation_id,
+                    eventSeq: snapshot.event_seq,
+                  },
+                  ui,
+                },
+                null,
+                2
+              ) + "\n"
             )
-          },
-          `${name}: ${agent} composer round ${round}`
-        )
+            await page.screenshot({ path: `${prefix}.png` }).catch(() => {})
+          }
+          throw error
+        }
         await page
           .locator(".chat-scroll-port:visible")
           .last()
