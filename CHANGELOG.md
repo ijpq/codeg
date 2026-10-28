@@ -14,6 +14,9 @@
   retains focus after reload; retain screenshots and state on source-failure tests.
 - Restore the native WebView's real dimensions after narrow-screen acceptance,
   including CDP pages without an emulated viewport.
+- Interrupt a deliberately blocked native launcher at its actual startup phase,
+  after confirming its child process started; verify the same persisted request
+  and native sessions recover after the isolated app restarts.
 - Preflight the entire native Windows suite on the source-pinned fix5 packages
   without calling it acceptance of newer binaries. New Server/Setup assets still
   require their own full draft and published acceptance, hashes and inventories.

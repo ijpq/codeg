@@ -1,7 +1,7 @@
 // Exercises the packaged app and real ACP adapters against deterministic local
 // model endpoints. No live model login or reasoning is claimed by this check.
 import assert from "node:assert/strict"
-import { mkdir, writeFile } from "node:fs/promises"
+import { access, mkdir, readFile, writeFile } from "node:fs/promises"
 import { join, dirname } from "node:path"
 import { randomUUID } from "node:crypto"
 
@@ -894,10 +894,18 @@ export async function stageInterruptedHandoff(api, f, saved) {
   const actual = setting.selected_runtime.adapter_path
   const node = join(dirname(actual), "../pi-runtime/node.exe")
   const flag = join(f.root, "release-handoff.flag")
+  const started = join(f.root, "delayed-handoff-started.json")
+  const blocker = join(f.root, "delay-handoff.cjs")
   const wrapper = join(f.root, "delayed-codex-acp.cmd")
+  await access(actual)
+  await access(node)
+  await writeFile(
+    blocker,
+    `require("node:fs").writeFileSync(${JSON.stringify(started)}, JSON.stringify({pid: process.pid})); setTimeout(() => {}, 300000)\n`
+  )
   await writeFile(
     wrapper,
-    `@echo off\r\nif not exist "${flag}" "${node}" -e "setTimeout(() => {}, 300000)"\r\ncall "${actual}" %*\r\nexit /b %errorlevel%\r\n`
+    `@echo off\r\nif not exist "${flag}" "${node}" "${blocker}"\r\ncall "${actual}" %*\r\nexit /b %errorlevel%\r\n`
   )
   await api("acp_update_agent_env", {
     agentType: "codex",
@@ -918,15 +926,44 @@ export async function stageInterruptedHandoff(api, f, saved) {
       expectedRevision: before.revision,
     },
   })
-  await until(
-    () => api("get_business_conversation_state", { conversationId: saved.cid }),
-    (s) => {
+  const staged = await until(
+    async () => {
+      const [state, marker] = await Promise.all([
+        api("get_business_conversation_state", { conversationId: saved.cid }),
+        readFile(started, "utf8").catch((error) => {
+          if (error.code === "ENOENT") return null
+          throw error
+        }),
+      ])
+      return { state, marker: marker && JSON.parse(marker) }
+    },
+    ({ state: s, marker }) => {
       if (s?.switchStatus === "failed") throw Error(s.switchError)
+      // spawn_agent_with_outcome waits for the native session handshake.
+      // A deliberately blocked launcher therefore remains at starting_target;
+      // verifying_target is reached only after that handshake has succeeded.
       return (
-        s?.switchPhase === "verifying_target" && s.switchStatus === "preparing"
+        s?.switchPhase === "starting_target" &&
+        s.switchStatus === "preparing" &&
+        Number.isInteger(marker?.pid) &&
+        marker.pid > 0
       )
     },
-    "Persisted target preparation is in progress before process interruption"
+    "Persisted target preparation and blocked child confirmed before interruption"
+  )
+  assert.equal(staged.state.pendingRequestId, requestId)
+  assert.equal(staged.state.activeAgent, "pi")
+  assert.deepEqual(
+    staged.state.sessions.map(({ id, agentType, externalId }) => ({
+      id,
+      agentType,
+      externalId,
+    })),
+    before.sessions.map(({ id, agentType, externalId }) => ({
+      id,
+      agentType,
+      externalId,
+    }))
   )
   return { flag, requestId, setting, cid: saved.cid, sessions: before.sessions }
 }
