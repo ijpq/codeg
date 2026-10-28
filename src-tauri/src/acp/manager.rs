@@ -405,13 +405,15 @@ fn restore_timeout_from_env() -> Duration {
 
 /// Outcome of the `spawn_agent` dedup wait. Logged so production can audit
 /// how often the timeout fires vs. the agent handshake completes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum HandshakeWaitOutcome {
     /// `SessionStarted` applied; `external_id` is now set on the state.
     Ready,
     /// Sender was dropped before SessionStarted fired (typically the
     /// connection died during init — `run_connection` returned Err).
     Aborted,
+    /// The connection reported its terminal initialization error before cleanup.
+    Failed(String),
     /// Timeout elapsed before either of the above. Releases the dedup lock
     /// so the next caller can proceed; the slow agent is no worse off.
     TimedOut,
@@ -439,11 +441,28 @@ pub(crate) struct ConversationActivationOutcome {
 }
 
 impl HandshakeWaitOutcome {
-    fn as_str(self) -> &'static str {
+    fn as_str(&self) -> &'static str {
         match self {
             HandshakeWaitOutcome::Ready => "ready",
             HandshakeWaitOutcome::Aborted => "aborted",
+            HandshakeWaitOutcome::Failed(_) => "failed",
             HandshakeWaitOutcome::TimedOut => "timeout",
+        }
+    }
+
+    fn failure(&self, context: &str, timeout: Duration) -> Option<AcpError> {
+        match self {
+            Self::Ready => None,
+            Self::Failed(detail) => Some(AcpError::protocol(format!(
+                "{context} initialization failed: {detail}"
+            ))),
+            Self::Aborted => Some(AcpError::protocol(format!(
+                "{context} initialization was interrupted before SessionStarted"
+            ))),
+            Self::TimedOut => Some(AcpError::protocol(format!(
+                "{context} did not finish resume/load within {} seconds",
+                timeout.as_secs()
+            ))),
         }
     }
 }
@@ -452,12 +471,13 @@ impl HandshakeWaitOutcome {
 /// Extracted so the outcome enum can be unit-tested without spawning a
 /// real agent process.
 async fn wait_for_session_started(
-    rx: tokio::sync::oneshot::Receiver<()>,
+    rx: tokio::sync::oneshot::Receiver<Result<(), String>>,
     timeout: Duration,
 ) -> (HandshakeWaitOutcome, Duration) {
     let start = std::time::Instant::now();
     let outcome = match tokio::time::timeout(timeout, rx).await {
-        Ok(Ok(())) => HandshakeWaitOutcome::Ready,
+        Ok(Ok(Ok(()))) => HandshakeWaitOutcome::Ready,
+        Ok(Ok(Err(detail))) => HandshakeWaitOutcome::Failed(detail),
         Ok(Err(_)) => HandshakeWaitOutcome::Aborted,
         Err(_) => HandshakeWaitOutcome::TimedOut,
     };
@@ -1309,12 +1329,9 @@ impl ConnectionManager {
             elapsed_ms = elapsed.as_millis() as u64,
             "[ACP][branch] isolated source session initialized"
         );
-        if !matches!(outcome, HandshakeWaitOutcome::Ready) {
+        if let Some(error) = outcome.failure("isolated branch source", self.spawn_handshake_timeout) {
             let _ = self.disconnect(&connection_id).await;
-            return Err(AcpError::protocol(format!(
-                "isolated branch source did not become ready ({})",
-                outcome.as_str()
-            )));
+            return Err(error);
         }
         if let Err(error) = self
             .wait_for_prompt_ready(&connection_id, Some(&session_id))
@@ -1578,13 +1595,11 @@ impl ConnectionManager {
                 elapsed.as_millis(),
                 timeout.as_millis(),
             );
-            if target_conversation_id.is_some() && !matches!(outcome, HandshakeWaitOutcome::Ready) {
-                let _ = self.disconnect_and_wait(&connection_id).await;
-                return Err(AcpError::protocol(format!(
-                    "persisted ACP session did not finish resume/load within {} seconds ({})",
-                    timeout.as_secs(),
-                    outcome.as_str()
-                )));
+            if target_conversation_id.is_some() {
+                if let Some(error) = outcome.failure("persisted ACP session", timeout) {
+                    let _ = self.disconnect_and_wait(&connection_id).await;
+                    return Err(error);
+                }
             }
         }
         // session_started_rx (in the no-dedup branch) is dropped here. tx
@@ -13132,7 +13147,7 @@ mod tests {
         // Fire immediately on a separate task so the wait future actually
         // gets to register.
         tokio::spawn(async move {
-            let _ = tx.send(());
+            let _ = tx.send(Ok(()));
         });
         let (outcome, elapsed) = wait_for_session_started(rx, Duration::from_millis(500)).await;
         assert_eq!(outcome, HandshakeWaitOutcome::Ready);
@@ -13144,7 +13159,7 @@ mod tests {
 
     #[tokio::test]
     async fn wait_for_session_started_returns_aborted_when_sender_drops() {
-        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
         // Drop the sender — emulates "connection died before SessionStarted",
         // i.e. SessionState's tx was dropped during cleanup.
         drop(tx);
@@ -13157,8 +13172,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wait_for_session_started_preserves_terminal_cause_without_timeout() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tx.send(Err(
+            "agent process failed to spawn: missing test runtime".into()
+        ))
+        .unwrap();
+        let timeout = Duration::from_secs(300);
+        let (outcome, elapsed) = wait_for_session_started(rx, timeout).await;
+        assert_eq!(
+            outcome,
+            HandshakeWaitOutcome::Failed(
+                "agent process failed to spawn: missing test runtime".into()
+            )
+        );
+        let message = outcome
+            .failure("persisted ACP session", timeout)
+            .unwrap()
+            .to_string();
+        assert!(message.contains("missing test runtime"));
+        assert!(!message.contains("300 seconds"));
+        assert!(elapsed < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn initialization_abort_and_deadline_have_distinct_diagnostics() {
+        let timeout = Duration::from_secs(300);
+        assert!(HandshakeWaitOutcome::Ready
+            .failure("persisted ACP session", timeout)
+            .is_none());
+        let aborted = HandshakeWaitOutcome::Aborted
+            .failure("persisted ACP session", timeout)
+            .unwrap()
+            .to_string();
+        assert!(aborted.contains("interrupted"));
+        assert!(!aborted.contains("300 seconds"));
+        let timed_out = HandshakeWaitOutcome::TimedOut
+            .failure("persisted ACP session", timeout)
+            .unwrap()
+            .to_string();
+        assert!(timed_out.contains("300 seconds"));
+        let sanitized =
+            HandshakeWaitOutcome::Failed("missing /home/example/private-runtime".into())
+                .failure("persisted ACP session", timeout)
+                .unwrap()
+                .to_string();
+        assert!(!sanitized.contains("/home/example"));
+    }
+
+    #[tokio::test]
     async fn wait_for_session_started_returns_timed_out_when_neither_happens() {
-        let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let (_tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
         // Hold the sender alive but never fire and never drop. Tight
         // timeout so the test stays fast; production timeout is 60s.
         let (outcome, elapsed) = wait_for_session_started(rx, Duration::from_millis(40)).await;

@@ -2625,7 +2625,7 @@ pub async fn spawn_agent_connection(
     terminal_shell_config: TerminalShellRuntimeConfig,
     cli_root: Option<crate::cli_run::RootSeed>,
     restore_conversation_id: Option<i32>,
-) -> Result<tokio::sync::oneshot::Receiver<()>, AcpError> {
+) -> Result<tokio::sync::oneshot::Receiver<Result<(), String>>, AcpError> {
     // Use the same cwd for launch settings, the subprocess and session/new.
     let launch_cwd = resolve_working_dir(working_dir.as_deref());
     // Create the authoritative session state up front. Subsequent emit_with_state

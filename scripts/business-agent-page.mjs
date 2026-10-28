@@ -128,7 +128,10 @@ export async function unavailableSourcePage({
     })
     await assert.rejects(
       api("acp_restore_conversation", { conversationId: cid }),
-      /not found|not installed|spawn|cannot|failed|no such|系统找不到/i,
+      // The same failed native initialization can be wrapped as ACP Protocol
+      // on Windows. Prove rejection after a successful native resume and the
+      // deliberately missing launcher; do not depend on localized OS wording.
+      /ACP protocol error:|not found|not installed|spawn|cannot|failed|no such|系统找不到/i,
       "Source must actually fail to start"
     )
     await openBusiness(page, api, cid, folderId, "codex")

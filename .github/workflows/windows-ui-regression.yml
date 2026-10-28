@@ -35,6 +35,10 @@ on:
         description: Verify the corrected harness against the unchanged unpublished b9c6baeae Windows packages
         type: boolean
         default: false
+      diagnose_fix5:
+        description: Preflight the harness against unpublished fix5 assets; not fix6 acceptance
+        type: boolean
+        default: false
 env:
   CARGO_BUILD_JOBS: 1
   RUST_BACKTRACE: short
@@ -55,7 +59,7 @@ jobs:
       - name: Verify isolated profiles with the Windows Known Folder API
         run: node --test scripts/test-windows-ui-profile.mjs scripts/test-office-test-runtime.mjs
   setup-ui:
-    if: ${{ !inputs.diagnose_fix2 && !inputs.diagnose_allocation }}
+    if: ${{ !inputs.diagnose_fix2 && !inputs.diagnose_fix5 && !inputs.diagnose_allocation }}
     runs-on: windows-2022
     permissions:
       contents: read
@@ -226,6 +230,59 @@ jobs:
             ${{ runner.temp }}/ui-evidence/**/*.json
             ${{ runner.temp }}/ui-evidence/**/*.log
             ${{ runner.temp }}/ui-evidence/**/*.png
+          retention-days: 14
+  diagnose-fix5:
+    if: inputs.diagnose_fix5
+    needs: profile-paths
+    runs-on: windows-2022
+    permissions:
+      actions: read
+      # Read the unpublished source-pinned draft, never publish or replace it.
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pnpm install --frozen-lockfile
+      - name: Preflight the complete suite with pinned unpublished fix5 packages
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference='Stop'
+          $source='db14cf8a6dcf4df5fe28006740474f437127967d'
+          $run=gh api repos/$env:GITHUB_REPOSITORY/actions/runs/40612364134 | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $run.head_sha -ne $source) { throw 'Diagnostic package workflow source mismatch' }
+          $jobs=gh api repos/$env:GITHUB_REPOSITORY/actions/runs/40612364134/jobs | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot verify diagnostic build provenance' }
+          foreach ($name in @('Build Windows x64','Server Windows x64')) {
+            if (-not ($jobs.jobs | Where-Object { $_.name -eq $name -and $_.conclusion -eq 'success' })) { throw 'Diagnostic binary build did not pass' }
+          }
+          gh run download 40612364134 --repo $env:GITHUB_REPOSITORY --name release-windows-setup-evidence --dir setup-evidence
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned Setup manifest download failed' }
+          # Source and verifier identities remain separate in every report.
+          # This does not validate or publish the newer application commit.
+          $env:CODEG_VERIFIER_SHA=$env:GITHUB_SHA
+          $env:GITHUB_SHA=$source
+          ./scripts/verify-windows-release.ps1 -ReleaseTag v0.40.0-fix5 -Repository $env:GITHUB_REPOSITORY -Destination "$env:RUNNER_TEMP/fix5-verifier-diagnosis" -SetupManifest setup-evidence/payload.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: diagnostic-fix5-verifier-evidence
+          path: |
+            ${{ runner.temp }}/fix5-verifier-diagnosis/**/verification.json
+            ${{ runner.temp }}/fix5-verifier-diagnosis/**/*.log
+            ${{ runner.temp }}/fix5-verifier-diagnosis/**/*.png
+            ${{ runner.temp }}/fix5-verifier-diagnosis/**/scroll-results.json
+            ${{ runner.temp }}/fix5-verifier-diagnosis/**/*-failure.json
+            ${{ runner.temp }}/fix5-verifier-diagnosis/**/resources-and-migrations.json
+            ${{ runner.temp }}/fix5-verifier-diagnosis/**/*dependencies.json
           retention-days: 14
   diagnose-fix2:
     if: inputs.diagnose_fix2

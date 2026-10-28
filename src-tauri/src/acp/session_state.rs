@@ -519,8 +519,9 @@ pub struct SessionState {
     /// live `AcpEvent::Error` can still surface the latest agent failure.
     pub last_error: Option<SessionLastError>,
 
-    /// Single-fire signal that fires when `SessionStarted` applies (i.e.
-    /// `external_id` transitioned from None → Some). `ConnectionManager::
+    /// Single-fire result when `SessionStarted` applies (i.e. `external_id`
+    /// transitioned from None → Some), or initialization fails terminally.
+    /// `ConnectionManager::
     /// spawn_agent` holds the per-(agent, working_dir, session_id) dedup
     /// lock until this fires (or times out), so a concurrent acp_connect
     /// for the same logical session sees the populated `external_id` and
@@ -529,7 +530,7 @@ pub struct SessionState {
     /// SessionStarted`; `None` thereafter (the signal is one-shot per
     /// connection). Lives only on the in-memory `SessionState`; not
     /// transmitted on the wire (`LiveSessionSnapshot` doesn't include it).
-    pub(crate) session_started_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    pub(crate) session_started_tx: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
 
     // 事件锚点
     pub event_seq: u64,
@@ -1026,7 +1027,9 @@ impl SessionState {
     /// more than once on the same state replaces the previous sender,
     /// silently dropping it — the contract is "exactly one install per
     /// connection lifetime" and that's what `spawn_agent_connection` does.
-    pub fn install_session_started_signal(&mut self) -> tokio::sync::oneshot::Receiver<()> {
+    pub fn install_session_started_signal(
+        &mut self,
+    ) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.session_started_tx = Some(tx);
         rx
@@ -1091,7 +1094,7 @@ impl SessionState {
                 // Err only when the receiver dropped (timeout already
                 // fired in spawn_agent) — also a no-op.
                 if let Some(tx) = self.session_started_tx.take() {
-                    let _ = tx.send(());
+                    let _ = tx.send(Ok(()));
                 }
                 if let Some(conversation_id) = self.restore_conversation_id {
                     tracing::info!(
@@ -1710,6 +1713,7 @@ impl SessionState {
                 message,
                 code,
                 details,
+                terminal,
                 ..
             } => {
                 // Capture so post-mortem readers (probe path, debug
@@ -1722,6 +1726,15 @@ impl SessionState {
                     code: code.clone(),
                     details: details.clone(),
                 });
+                // The connection and its map entry may disappear before the
+                // restore waiter can read last_error. Carry the actual terminal
+                // initialization failure on the one-shot instead of reducing
+                // it to a dropped sender or a misleading timeout.
+                if *terminal {
+                    if let Some(tx) = self.session_started_tx.take() {
+                        let _ = tx.send(Err(message.clone()));
+                    }
+                }
             }
             AcpEvent::DelegationStarted {
                 parent_tool_use_id,
@@ -4383,7 +4396,7 @@ mod tests {
         // never hang if the signal logic regresses.
         let result = tokio::time::timeout(std::time::Duration::from_millis(50), rx).await;
         assert!(
-            matches!(result, Ok(Ok(()))),
+            matches!(result, Ok(Ok(Ok(())))),
             "rx must fire on SessionStarted; got {result:?}"
         );
     }
@@ -4401,7 +4414,50 @@ mod tests {
         });
         // The first send delivered; rx is consumed.
         let result = tokio::time::timeout(std::time::Duration::from_millis(50), rx).await;
-        assert!(matches!(result, Ok(Ok(()))));
+        assert!(matches!(result, Ok(Ok(Ok(())))));
+    }
+
+    #[tokio::test]
+    async fn session_started_signal_preserves_terminal_failure_after_cleanup() {
+        let rx = {
+            let mut s = fresh_state();
+            let rx = s.install_session_started_signal();
+            s.apply_event(&AcpEvent::Error {
+                message: "agent process failed to spawn: missing test runtime".into(),
+                agent_type: "codex".into(),
+                code: Some("spawn_failed".into()),
+                details: None,
+                terminal: true,
+            });
+            assert!(s.session_started_tx.is_none());
+            rx
+        };
+        let result = tokio::time::timeout(std::time::Duration::from_millis(50), rx)
+            .await
+            .expect("failure cannot wait for the initialization deadline")
+            .expect("cleanup must not discard the agent failure");
+        assert_eq!(
+            result,
+            Err("agent process failed to spawn: missing test runtime".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn session_started_signal_ignores_recoverable_errors() {
+        let mut s = fresh_state();
+        let rx = s.install_session_started_signal();
+        s.apply_event(&AcpEvent::Error {
+            message: "recoverable selector warning".into(),
+            agent_type: "codex".into(),
+            code: None,
+            details: None,
+            terminal: false,
+        });
+        assert!(s.session_started_tx.is_some());
+        s.apply_event(&AcpEvent::SessionStarted {
+            session_id: "valid-after-warning".into(),
+        });
+        assert_eq!(rx.await.unwrap(), Ok(()));
     }
 
     #[tokio::test]

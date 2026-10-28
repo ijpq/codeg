@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.40.0-fix6 — 2026-10-28
+
+- Retain fix5's packaged Codex, recoverable business handoff, selected Pi version,
+  source-instance rules/Skill transfer and conversation-toolbar fixes in both
+  Windows forms. The unpublished fix5 tag is preserved for diagnosis.
+- Carry terminal initialization failures across connection cleanup, so restoring
+  or switching shows the native cause instead of a misleading 300-second timeout.
+  Keep real timeouts, interruptions and recoverable warnings distinct.
+- Verify unavailable-source rejection without matching localized OS wording;
+  retain actual native restore, target readiness, history and UI assertions.
+- Preflight the entire native Windows suite on the source-pinned fix5 packages
+  without calling it acceptance of newer binaries. New Server/Setup assets still
+  require their own full draft and published acceptance, hashes and inventories.
+
+See [release notes](docs/releases/v0.40.0-fix6.md).
+
 ## 0.40.0-fix5 — 2026-10-27
 
 - Ship the same pinned private Codex CLI and self-contained ACP in Windows Setup
