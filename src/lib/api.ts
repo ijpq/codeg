@@ -232,12 +232,10 @@ import type {
   TokenUsageSyncStatus,
 } from "./types"
 
-let acpLifecycleGeneration = 0
-
-function nextAcpLifecycleGeneration(): number {
-  acpLifecycleGeneration += 1
-  return acpLifecycleGeneration
-}
+import {
+  nextAcpLifecycleGeneration,
+  type AcpDisconnectSource,
+} from "./acp-lifecycle"
 
 export async function listConversations(params?: {
   agent_type?: AgentType | null
@@ -593,10 +591,13 @@ export async function acpAnswerPlanApproval(
   })
 }
 
-export async function acpDisconnect(connectionId: string): Promise<void> {
+export async function acpDisconnect(
+  connectionId: string,
+  requestSource: AcpDisconnectSource = "frontend_disconnect"
+): Promise<void> {
   return getTransport().call("acp_disconnect", {
     connectionId,
-    requestSource: "frontend_disconnect",
+    requestSource,
     frontendGeneration: nextAcpLifecycleGeneration(),
   })
 }

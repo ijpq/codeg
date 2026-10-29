@@ -11,9 +11,13 @@ import assert from "node:assert/strict"
 import { startGoalModel } from "./native-codex-model-fixture.mjs"
 import { startBusinessModel } from "./business-model-fixture.mjs"
 import { startPiModel } from "./pi-native-model-fixture.mjs"
+import { piMultiProviderPage } from "./pi-multi-provider-page.mjs"
 import { piCapabilityChecks } from "./pi-capability-checks.mjs"
 import { verificationProgress } from "./verification-progress.mjs"
-import { prepareWindowsProfile } from "./windows-ui-profile.mjs"
+import {
+  isolatedCodegEnv,
+  prepareWindowsProfile,
+} from "./windows-ui-profile.mjs"
 import { prepareOfficeTestRuntime } from "./office-test-runtime.mjs"
 import { retainedHistory, scopedPageErrors } from "./release-history-check.mjs"
 import { scopedRuntimeErrors } from "./runtime-page-errors.mjs"
@@ -79,6 +83,9 @@ async function reservePort() {
 const goalModel = options["native-tools"] ? await startGoalModel() : null
 const claudeModel = options["native-tools"] ? await startBusinessModel() : null
 const piModel = options["native-tools"] ? await startPiModel() : null
+const piOpusModel = options["native-tools"]
+  ? await startBusinessModel("pi")
+  : null
 async function enableNativeAgent(f) {
   if (!goalModel) return
   const pathKey =
@@ -120,6 +127,21 @@ async function enableNativeAgent(f) {
             {
               id: "gpt-5.4",
               name: "Isolated Pi",
+              reasoning: true,
+              input: ["text", "image"],
+              contextWindow: 128000,
+              maxTokens: 4096,
+            },
+          ],
+        },
+        "magpie-claude": {
+          baseUrl: piOpusModel.url,
+          api: "anthropic-messages",
+          apiKey: "isolated-opus-synthetic-provider-only",
+          models: [
+            {
+              id: "claude/claude-opus-5-5",
+              name: "Isolated Opus",
               reasoning: true,
               input: ["text", "image"],
               contextWindow: 128000,
@@ -254,8 +276,7 @@ async function fixture(name) {
     id,
     cwd,
     rollout,
-    env: {
-      ...process.env,
+    env: isolatedCodegEnv(process.env, {
       CODEG_DATA_DIR: data,
       CODEG_HOME: data,
       CODEX_HOME: codex,
@@ -263,7 +284,7 @@ async function fixture(name) {
       XDG_DATA_HOME: join(root, "share"),
       XDG_CACHE_HOME: join(root, "cache"),
       WEBVIEW2_USER_DATA_FOLDER: join(root, "webview"),
-    },
+    }),
   }
 }
 async function run(command, args, env = process.env) {
@@ -1417,6 +1438,22 @@ async function legacyBusinessUpgradeChecks() {
           output,
           restarted,
         })
+        await piMultiProviderPage({
+          page,
+          api,
+          f,
+          folderId: saved.folderId,
+          piModel,
+          piOpusModel,
+          report,
+          name: `${name}-legacy-${phase}`,
+          output,
+          saved: {
+            cid: saved.cid,
+            externalId: saved.sessions.find((s) => s.agentType === "pi")
+              .externalId,
+          },
+        })
         assert.equal(
           await readFile(join(f.data, "upgrade-retention-marker.txt"), "utf8"),
           f.id
@@ -1499,6 +1536,7 @@ try {
   const upgradedErrors = await scopedRuntimeErrors(app.page)
   let businessSaved
   let setupInterrupted
+  let setupPiProviders
   try {
     const conversations = await desktopApi(app.page)("list_all_conversations")
     assert.ok(
@@ -1559,6 +1597,17 @@ try {
         output,
       })
     }
+    setupPiProviders = await piMultiProviderPage({
+      page: app.page,
+      api: desktopApi(app.page),
+      f,
+      folderId: saved.folder_id,
+      piModel,
+      piOpusModel,
+      report,
+      name: "setup",
+      output,
+    })
     await unavailableSourcePage({
       page: app.page,
       api: desktopApi(app.page),
@@ -1625,6 +1674,19 @@ try {
       "setup",
       goalModel
     )
+    if (setupPiProviders)
+      await piMultiProviderPage({
+        page: app.page,
+        api: desktopApi(app.page),
+        f,
+        folderId: saved.folder_id,
+        piModel,
+        piOpusModel,
+        report,
+        name: "setup-restart",
+        output,
+        saved: setupPiProviders,
+      })
     // This harness navigates and closes the isolated WebView, so run it after
     // the business restart assertions and before disposing this app process.
     await run(process.execPath, ["scripts/browser-scroll-regression.mjs"], {
@@ -1734,6 +1796,7 @@ try {
   let serverErrors
   let serverBusinessSaved
   let serverInterrupted
+  let serverPiProviders
   try {
     const conversation =
       previousServerConversation ?? (await importAndOpen(api, s))
@@ -1802,6 +1865,17 @@ try {
         output,
       })
     }
+    serverPiProviders = await piMultiProviderPage({
+      page,
+      api,
+      f: s,
+      folderId: conversation.folder_id,
+      piModel,
+      piOpusModel,
+      report,
+      name: "server-web",
+      output,
+    })
     await unavailableSourcePage({
       page,
       api,
@@ -1894,6 +1968,19 @@ try {
       "server-web",
       goalModel
     )
+    if (serverPiProviders)
+      await piMultiProviderPage({
+        page,
+        api: restartedServer.api,
+        f: s,
+        folderId: conversation.folder_id,
+        piModel,
+        piOpusModel,
+        report,
+        name: "server-web-restart",
+        output,
+        saved: serverPiProviders,
+      })
     report.checks.push({
       name: "server-process-restart-with-native-session",
       passed: true,
@@ -1911,6 +1998,11 @@ try {
     await progress.run("close:codex model", () => goalModel?.close(), 15_000)
     await progress.run("close:claude model", () => claudeModel?.close(), 15_000)
     await progress.run("close:pi model", () => piModel?.close(), 15_000)
+    await progress.run(
+      "close:pi opus model",
+      () => piOpusModel?.close(),
+      15_000
+    )
   } catch (error) {
     report.passed = false
     report.errors.push(String(error.stack ?? error))

@@ -4,7 +4,35 @@ import { mkdtemp, rm, stat } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join, relative, isAbsolute } from "node:path"
 import { test } from "node:test"
-import { prepareWindowsProfile } from "./windows-ui-profile.mjs"
+import {
+  isolatedCodegEnv,
+  prepareWindowsProfile,
+} from "./windows-ui-profile.mjs"
+
+test("Server overrides cannot escape into the isolated Setup child", () => {
+  const parent = {
+    PATH: "kept",
+    PI_CODING_AGENT_DIR: "native-pi-profile",
+    CODEG_DATA_DIR: "production-data",
+    codeg_home: "production-home",
+    CODEG_PORT: "production-port",
+    CODEG_STATIC_DIR: "production-web",
+    CODEG_PI_ACP_PATH: "production-adapter",
+    CODEG_TOKEN: "synthetic-secret-do-not-inherit",
+  }
+  const child = isolatedCodegEnv(parent, {
+    CODEG_DATA_DIR: "fixture-data",
+    CODEG_HOME: "fixture-home",
+  })
+  assert.deepEqual(child, {
+    PATH: "kept",
+    PI_CODING_AGENT_DIR: "native-pi-profile",
+    CODEG_DATA_DIR: "fixture-data",
+    CODEG_HOME: "fixture-home",
+  })
+  assert.equal(parent.CODEG_DATA_DIR, "production-data")
+  assert.ok(parent.CODEG_TOKEN)
+})
 
 function nativeDirectories(env) {
   return JSON.parse(

@@ -59,4 +59,14 @@ describe("ACP lifecycle request audit metadata", () => {
     }
     expect(second.frontendGeneration).toBeGreaterThan(first.frontendGeneration)
   })
+
+  it("preserves the teardown call site for backend diagnosis", async () => {
+    await acpDisconnect("conn-model-rebind", "frontend_target_changed")
+
+    expect(mocks.call).toHaveBeenCalledWith("acp_disconnect", {
+      connectionId: "conn-model-rebind",
+      requestSource: "frontend_target_changed",
+      frontendGeneration: expect.any(Number),
+    })
+  })
 })

@@ -397,6 +397,7 @@ export function AgentSelector({
               <button
                 ref={setItemRef(agent.agent_type)}
                 data-slot="agent-pill"
+                data-agent-type={agent.agent_type}
                 aria-pressed={isSelected}
                 disabled={disabled || !agent.available}
                 onClick={() => handleSelect(agent.agent_type)}
@@ -498,6 +499,7 @@ export function AgentSelector({
                     key={agent.agent_type}
                     type="button"
                     data-slot="agent-option"
+                    data-agent-type={agent.agent_type}
                     disabled={disabled || !agent.available}
                     title={
                       notInstalled

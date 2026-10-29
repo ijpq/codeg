@@ -1,6 +1,7 @@
 "use client"
 
 import { supportsAtomicConversationRestore } from "@/lib/session-restore"
+import type { AcpDisconnectSource } from "@/lib/acp-lifecycle"
 import {
   createContext,
   useCallback,
@@ -3698,7 +3699,10 @@ export interface AcpActionsValue {
    * reason and the agent process may still be alive. Callers that report a
    * restart to the user gate on it; fire-and-forget teardowns ignore it.
    */
-  disconnect(contextKey: string): Promise<boolean>
+  disconnect(
+    contextKey: string,
+    requestSource?: AcpDisconnectSource
+  ): Promise<boolean>
   /**
    * Detach one frontend surface without stopping its backend agent. Used for
    * component/tab lifecycle cleanup, where unmount is not user intent to
@@ -7312,7 +7316,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       }
 
       for (const { contextKey, connectionId } of toDisconnect) {
-        acpDisconnect(connectionId).catch(() => {})
+        acpDisconnect(connectionId, "frontend_idle_sweep").catch(() => {})
         releaseConnectionRoute(connectionId, contextKey)
         teardownAttachSubscription(contextKey)
         lastActivityRef.current.delete(contextKey)
@@ -7704,9 +7708,18 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           conversationId > 0 &&
           Boolean(sessionId)
         if (existing) {
+          // A session/new connection initially has no caller-supplied native
+          // id. SessionStarted then publishes that very connection's id and
+          // the surface's lifecycle effect runs again with the resolved id.
+          // Compare the actual binding as well as the original request: this
+          // identity enrichment must not restart an already-running draft.
+          const sameResolvedTarget =
+            sessionId != null &&
+            existing.sessionId === sessionId &&
+            existing.conversationId === (conversationId ?? null)
           if (
             boundRequest &&
-            sameConnectRequest(boundRequest, request) &&
+            (sameConnectRequest(boundRequest, request) || sameResolvedTarget) &&
             existing.agentType === agentType &&
             existing.workingDir === nextWorkingDir &&
             (existing.status === "prompting" ||
@@ -7722,6 +7735,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             (existing.status === "prompting" || existing.promptReady) &&
             (!requiresHistoricalCodegMcp || existing.codegMcpAvailable)
           ) {
+            boundConnectRequestsRef.current.set(contextKey, request)
             return
           }
           if (
@@ -7733,7 +7747,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             // acpDisconnect (that would kill the owner's agent). Owners are
             // disconnected normally before re-spawning under new params.
             if (!existing.isViewer) {
-              await acpDisconnect(existing.connectionId).catch(() => {})
+              await acpDisconnect(
+                existing.connectionId,
+                "frontend_target_changed"
+              ).catch(() => {})
             }
             releaseConnectionRoute(existing.connectionId, contextKey)
             teardownAttachSubscription(contextKey)
@@ -8047,7 +8064,9 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             !isViewer &&
             !isConnectionReferencedLocally(connectionId)
           ) {
-            acpDisconnect(connectionId).catch(() => {})
+            acpDisconnect(connectionId, "frontend_abandoned_connect").catch(
+              () => {}
+            )
           }
           return
         }
@@ -8058,7 +8077,9 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             !isViewer &&
             !isConnectionReferencedLocally(connectionId)
           ) {
-            acpDisconnect(connectionId).catch(() => {})
+            acpDisconnect(connectionId, "frontend_superseded_connect").catch(
+              () => {}
+            )
           }
           return
         }
@@ -8073,7 +8094,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             !currentExisting.isViewer &&
             !backendReplacedConnectionIds.includes(currentExisting.connectionId)
           ) {
-            await acpDisconnect(currentExisting.connectionId).catch(() => {})
+            await acpDisconnect(
+              currentExisting.connectionId,
+              "frontend_replaced_connection"
+            ).catch(() => {})
           }
           releaseConnectionRoute(currentExisting.connectionId, contextKey)
           teardownAttachSubscription(contextKey)
@@ -8391,7 +8415,10 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
   connectRef.current = connect
 
   const disconnect = useCallback(
-    async (contextKey: string): Promise<boolean> => {
+    async (
+      contextKey: string,
+      requestSource: AcpDisconnectSource = "frontend_disconnect_action"
+    ): Promise<boolean> => {
       pendingConnectRequestsRef.current.delete(contextKey)
       // Whatever the surface does next — close, switch agent, reconnect — the
       // last attempt's failure no longer describes it.
@@ -8457,11 +8484,16 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       // the follow-up connect can re-attach to the process it believed it had
       // replaced. Report which happened and let the caller decide.
       let tornDown = true
-      await acpDisconnect(conn.connectionId).catch((error: unknown) => {
-        if (isConnectionGoneError(error)) return
-        console.warn("[Acp] backend teardown failed, releasing locally:", error)
-        tornDown = false
-      })
+      await acpDisconnect(conn.connectionId, requestSource).catch(
+        (error: unknown) => {
+          if (isConnectionGoneError(error)) return
+          console.warn(
+            "[Acp] backend teardown failed, releasing locally:",
+            error
+          )
+          tornDown = false
+        }
+      )
       releaseConnectionRoute(conn.connectionId, contextKey)
       teardownAttachSubscription(contextKey)
       lastActivityRef.current.delete(contextKey)
@@ -8534,7 +8566,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       // Capture identity BEFORE teardown. `sessionId` is what makes the new
       // process resume this conversation (session/load) rather than start fresh.
       const { agentType, workingDir, sessionId, conversationId } = conn
-      const tornDown = await disconnect(contextKey)
+      const tornDown = await disconnect(contextKey, "frontend_config_reapply")
       await connect(
         contextKey,
         agentType,
@@ -8659,7 +8691,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       // is released either way, and refusing to reconnect would strand the user
       // on the dead connection this button exists to replace.
       if (storeRef.current.connections.has(contextKey)) {
-        await disconnect(contextKey)
+        await disconnect(contextKey, "frontend_user_reconnect")
       }
       await connect(
         contextKey,
@@ -8700,7 +8732,11 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       // read-only subscription but never acpDisconnect (that would kill the
       // owner's agent). Owners are torn down normally.
       if (!conn.isViewer) {
-        promises.push(acpDisconnect(conn.connectionId).catch(() => {}))
+        promises.push(
+          acpDisconnect(conn.connectionId, "frontend_disconnect_all").catch(
+            () => {}
+          )
+        )
       }
       teardownAttachSubscription(contextKey)
       pendingUnmappedEventsRef.current.delete(conn.connectionId)
