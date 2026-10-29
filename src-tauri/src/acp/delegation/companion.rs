@@ -47,6 +47,7 @@ use tokio::sync::{oneshot, Mutex};
 use crate::acp::chat_authoring::{
     NewAutomationSpec, NewWorkTaskSpec, MAX_PROMPT_CHARS, MAX_TITLE_CHARS,
 };
+use crate::acp::delegation::assistants::{roster_for_schema, AssistantRosterEntry};
 use crate::acp::delegation::transport::{
     client_ask_round_trip, client_browser_act_round_trip, client_browser_capture_round_trip,
     client_browser_console_round_trip, client_browser_eval_round_trip,
@@ -57,9 +58,21 @@ use crate::acp::delegation::transport::{
     client_computer_launch_round_trip, client_computer_snapshot_round_trip,
     client_computer_verify_round_trip, client_computer_windows_round_trip,
     client_create_automation_round_trip, client_create_work_task_round_trip,
-    client_feedback_round_trip, client_list_assistants_round_trip, client_ping, client_result_schema_round_trip, client_resume_task_round_trip, client_round_trip, client_session_round_trip, client_status_round_trip, client_submit_result_round_trip, client_task_complete_round_trip, client_task_progress_round_trip, BrokerAskRequest, BrokerBrowserActRequest, BrokerBrowserCaptureRequest, BrokerBrowserConsoleRequest, BrokerBrowserEvalRequest, BrokerBrowserSnapshotRequest, BrokerBrowserTabOpRequest, BrokerBrowserTabsRequest, BrokerCancelRequest, BrokerCancelTaskRequest, BrokerCommitFeedbackRequest, BrokerComputerActRequest, BrokerComputerAppsRequest, BrokerComputerCaptureRequest, BrokerComputerClipboardRequest, BrokerComputerLaunchRequest, BrokerComputerSnapshotRequest, BrokerComputerVerifyRequest, BrokerComputerWindowsRequest, BrokerCreateAutomationRequest, BrokerCreateWorkTaskRequest, BrokerFeedbackRequest, BrokerListAssistantsRequest, BrokerRequest, BrokerResponse, BrokerResultSchemaRequest, BrokerResumeTaskRequest, BrokerSessionRequest, BrokerStatusRequest, BrokerSubmitResultRequest, BrokerTaskCompleteRequest, BrokerTaskProgressRequest, client_deliverables_round_trip, BrokerDeliverablesRequest,
+    client_deliverables_round_trip, client_feedback_round_trip, client_list_assistants_round_trip,
+    client_ping, client_result_schema_round_trip, client_resume_task_round_trip, client_round_trip,
+    client_session_round_trip, client_status_round_trip, client_submit_result_round_trip,
+    client_task_complete_round_trip, client_task_progress_round_trip, BrokerAskRequest,
+    BrokerBrowserActRequest, BrokerBrowserCaptureRequest, BrokerBrowserConsoleRequest,
+    BrokerBrowserEvalRequest, BrokerBrowserSnapshotRequest, BrokerBrowserTabOpRequest,
+    BrokerBrowserTabsRequest, BrokerCancelRequest, BrokerCancelTaskRequest,
+    BrokerCommitFeedbackRequest, BrokerComputerActRequest, BrokerComputerAppsRequest,
+    BrokerComputerCaptureRequest, BrokerComputerClipboardRequest, BrokerComputerLaunchRequest,
+    BrokerComputerSnapshotRequest, BrokerComputerVerifyRequest, BrokerComputerWindowsRequest,
+    BrokerCreateAutomationRequest, BrokerCreateWorkTaskRequest, BrokerDeliverablesRequest,
+    BrokerFeedbackRequest, BrokerListAssistantsRequest, BrokerRequest, BrokerResponse,
+    BrokerResultSchemaRequest, BrokerResumeTaskRequest, BrokerSessionRequest, BrokerStatusRequest,
+    BrokerSubmitResultRequest, BrokerTaskCompleteRequest, BrokerTaskProgressRequest,
 };
-use crate::acp::delegation::assistants::{roster_for_schema, AssistantRosterEntry};
 use crate::acp::deliverables::PublishDeliverablesArgs;
 #[cfg(test)]
 use crate::acp::deliverables::MAX_DELIVERABLES_PER_CALL;
@@ -1103,10 +1116,24 @@ async fn build_tools_call_spawn(
             // Default to a modest recent-message window; `0` means metadata-only.
             // Robust against stringified / oversized values (see helper).
             let max_messages = parse_max_messages(&arguments);
+            let history_cursor = match arguments.get("history_cursor") {
+                None => None,
+                Some(Value::String(cursor)) if !cursor.is_empty() && cursor.len() <= 512 => {
+                    Some(cursor.clone())
+                }
+                _ => {
+                    return LineAction::Respond(err(
+                        id,
+                        -32602,
+                        "history_cursor must be a nonempty string of at most 512 bytes",
+                    ))
+                }
+            };
             let req = BrokerSessionRequest {
                 token: ctx.token.clone(),
                 session_id,
                 max_messages: Some(max_messages),
+                history_cursor,
             };
             // No external_handle: a read-only lookup has nothing to cancel
             // broker-side — canceling only suppresses the response.
@@ -4567,6 +4594,11 @@ fn render_session_summary_text(o: &Value) -> String {
                 out.push('\n');
             }
         }
+    }
+    if let Some(page) = o.get("history_page") {
+        out.push_str("\nOriginal business prose page (raw tools, reasoning and image bytes excluded; follow next_cursor for the remaining original text):\n");
+        out.push_str(&serde_json::to_string_pretty(page).unwrap_or_default());
+        out.push('\n');
     }
     out
 }
@@ -8605,7 +8637,11 @@ mod tests {
         assert_eq!(*seen.lock().await, vec!["ping"], "never forwarded");
 
         // A plain agent call is forwarded as always, without another probe.
-        let result = drive_call(&ctx, &assistant_call(json!({"agent_type": "codex", "task": "x"}))).await;
+        let result = drive_call(
+            &ctx,
+            &assistant_call(json!({"agent_type": "codex", "task": "x"})),
+        )
+        .await;
         assert_eq!(result["structuredContent"]["status"], "running");
         assert_eq!(*seen.lock().await, vec!["ping", "call"]);
     }
@@ -8636,7 +8672,11 @@ mod tests {
     #[tokio::test]
     async fn an_assistant_call_with_no_answer_from_the_parent_is_retryable() {
         // The default test socket does not exist: no answer at all.
-        let result = drive_call(&ctx(), &assistant_call(json!({"assistant_id": 3, "task": "x"}))).await;
+        let result = drive_call(
+            &ctx(),
+            &assistant_call(json!({"assistant_id": 3, "task": "x"})),
+        )
+        .await;
         assert_eq!(result["isError"], true);
         assert_eq!(
             result["structuredContent"]["error_code"],

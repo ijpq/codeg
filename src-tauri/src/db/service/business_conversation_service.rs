@@ -2,6 +2,9 @@
 //! Native transcripts and credentials remain exclusively engine-owned.
 
 use crate::db::error::DbError;
+use crate::models::business_context::{
+    history_prose, projection_digest, HistoryDelivery, HistoryRecord,
+};
 use crate::models::conversation::ConversationOutputTurnRef;
 use crate::models::{AgentType, DbConversationSummary, MessageTurn};
 use chrono::Utc;
@@ -300,7 +303,7 @@ async fn persist_turns_with_refs<C: ConnectionTrait>(
             turn: incoming,
             codeg_prompt_fingerprint: fingerprint,
         };
-        conn.execute(stmt("INSERT INTO business_message(conversation_id,session_id,native_turn_id,role,turn_json) VALUES(?,?,?,?,?) ON CONFLICT(conversation_id,session_id,native_turn_id) DO UPDATE SET turn_json=excluded.turn_json",vec![cid.into(),sid.into(),native_key.into(),role.into(),json(&stored)?.into()])).await?;
+        conn.execute(stmt("INSERT INTO business_message(conversation_id,session_id,native_turn_id,role,turn_json,context_digest) VALUES(?,?,?,?,?,?) ON CONFLICT(conversation_id,session_id,native_turn_id) DO UPDATE SET turn_json=excluded.turn_json,role=excluded.role,context_digest=excluded.context_digest",vec![cid.into(),sid.into(),native_key.into(),role.into(),json(&stored)?.into(),projection_digest(&stored.turn).into()])).await?;
     }
     conn.execute(stmt("UPDATE business_conversation_state SET message_count=message_count+? WHERE conversation_id=?",vec![inserted.into(),cid.into()])).await?;
     conn.execute(stmt("UPDATE conversation SET message_count=(SELECT message_count FROM business_conversation_state WHERE conversation_id=?) WHERE id=?",vec![cid.into(),cid.into()])).await?;
@@ -652,8 +655,20 @@ pub async fn reserve_prompt(
     blocks: &[crate::acp::types::PromptInputBlock],
     context_sequence: i64,
 ) -> Result<bool, DbError> {
+    reserve_prompt_context(conn, cid, id, sid, blocks, context_sequence, &[]).await
+}
+
+pub async fn reserve_prompt_context(
+    conn: &DatabaseConnection,
+    cid: i32,
+    id: &str,
+    sid: i64,
+    blocks: &[crate::acp::types::PromptInputBlock],
+    context_sequence: i64,
+    delivery: &[HistoryDelivery],
+) -> Result<bool, DbError> {
     let digest = digest_blocks(blocks)?;
-    let result=conn.execute(stmt("INSERT INTO business_prompt_receipt(conversation_id,message_id,session_id,body_digest,original_blocks,context_sequence,status) VALUES(?,?,?,?,?,?,'reserved') ON CONFLICT(conversation_id,message_id) DO NOTHING",vec![cid.into(),id.into(),sid.into(),digest.clone().into(),json(&blocks)?.into(),context_sequence.into()])).await?;
+    let result=conn.execute(stmt("INSERT INTO business_prompt_receipt(conversation_id,message_id,session_id,body_digest,original_blocks,context_sequence,status,history_delivery_json) VALUES(?,?,?,?,?,?,'reserved',?) ON CONFLICT(conversation_id,message_id) DO NOTHING",vec![cid.into(),id.into(),sid.into(),digest.clone().into(),json(&blocks)?.into(),context_sequence.into(),json(&delivery)?.into()])).await?;
     if result.rows_affected() == 1 {
         return Ok(true);
     }
@@ -681,6 +696,35 @@ pub async fn accept_prompt(
     let tx = conn.begin().await?;
     let changed = tx.execute(stmt("UPDATE business_prompt_receipt SET status='accepted' WHERE conversation_id=? AND message_id=? AND session_id=? AND status='reserved'",vec![cid.into(),id.into(),sid.into()])).await?;
     if changed.rows_affected() > 0 {
+        let manifest = tx.query_one(stmt("SELECT history_delivery_json FROM business_prompt_receipt WHERE conversation_id=? AND message_id=?", vec![cid.into(),id.into()])).await?.unwrap();
+        let deliveries: Vec<HistoryDelivery> =
+            decode(&manifest.try_get::<String>("", "history_delivery_json")?)?;
+        for mut delivery in deliveries {
+            // A delayed acceptance cannot acknowledge revised source prose.
+            // Duration/usage-only backfills intentionally keep the same digest.
+            let Some(row) = tx.query_one(stmt("SELECT turn_json FROM business_message WHERE conversation_id=? AND sequence=? AND session_id<>?", vec![cid.into(),delivery.sequence.into(),sid.into()])).await? else {continue};
+            let turn: MessageTurn = decode(&row.try_get::<String>("", "turn_json")?)?;
+            let prose = history_prose(&turn);
+            if prose.len() != delivery.total_bytes || projection_digest(&turn) != delivery.digest {
+                continue;
+            }
+            if let Some(old) = tx.query_one(stmt("SELECT digest,ranges_json FROM business_history_delivery WHERE session_id=? AND sequence=?", vec![sid.into(),delivery.sequence.into()])).await? {
+                if old.try_get::<String>("", "digest")? == delivery.digest {
+                    delivery.ranges.extend(decode::<Vec<[usize;2]>>(&old.try_get::<String>("", "ranges_json")?)?);
+                }
+            }
+            delivery.normalize();
+            tx.execute(stmt("INSERT INTO business_history_delivery(session_id,sequence,digest,total_bytes,ranges_json,complete) VALUES(?,?,?,?,?,?) ON CONFLICT(session_id,sequence) DO UPDATE SET digest=excluded.digest,total_bytes=excluded.total_bytes,ranges_json=excluded.ranges_json,complete=excluded.complete",vec![sid.into(),delivery.sequence.into(),delivery.digest.clone().into(),(delivery.total_bytes as i64).into(),json(&delivery.ranges)?.into(),delivery.complete().into()])).await?;
+        }
+        // This v2 contiguous cursor has exact range evidence behind it. Its
+        // indexed lower bound avoids rescanning all accepted history on every
+        // prompt in a long business conversation.
+        let first_missing = tx.query_one(stmt("SELECT m.sequence FROM business_message m LEFT JOIN business_history_delivery d ON d.sequence=m.sequence AND d.session_id=? WHERE m.conversation_id=? AND m.session_id<>? AND m.sequence>(SELECT history_sequence FROM conversation_agent_session WHERE id=?) AND m.sequence<=? AND COALESCE(d.complete,0)=0 ORDER BY m.sequence LIMIT 1", vec![sid.into(),cid.into(),sid.into(),sid.into(),bridge_boundary.into()])).await?;
+        let verified_through = match first_missing {
+            Some(row) => row.try_get::<i64>("", "sequence")? - 1,
+            None => bridge_boundary,
+        };
+        tx.execute(stmt("UPDATE conversation_agent_session SET history_sequence=MAX(history_sequence,?) WHERE id=? AND conversation_id=?", vec![verified_through.into(),sid.into(),cid.into()])).await?;
         tx.execute(stmt("UPDATE conversation_agent_session SET seen_sequence=MAX(seen_sequence,?),last_bridge_sequence=MAX(last_bridge_sequence,?),delivered_rule_digest=COALESCE(?,delivered_rule_digest) WHERE id=? AND conversation_id=? AND last_bridge_sequence<=?",vec![sequence.into(),bridge_boundary.into(),rules_digest.map(str::to_owned).into(),sid.into(),cid.into(),bridge_boundary.into()])).await?;
     }
     tx.commit().await?;
@@ -731,6 +775,54 @@ pub async fn context_increment(
         .collect()
 }
 
+/// Read only bounded chronological/recent candidates. Legacy scalar cursors
+/// did not distinguish excerpts from whole turns, so they are not proof of
+/// delivery. The v2 range receipts repair that once without altering history.
+pub enum HistoryWindow {
+    Chronological,
+    Recent,
+    UserRequirements,
+}
+
+pub async fn history_candidates(
+    conn: &DatabaseConnection,
+    cid: i32,
+    sid: i64,
+    through: i64,
+    window: HistoryWindow,
+) -> Result<Vec<HistoryRecord>, DbError> {
+    let (role, order) = match window {
+        HistoryWindow::Chronological => ("", "ASC LIMIT 129"),
+        HistoryWindow::Recent => ("", "DESC LIMIT 8"),
+        HistoryWindow::UserRequirements => ("AND m.role='user'", "ASC LIMIT 128"),
+    };
+    let rows = conn.query_all(stmt(&format!("SELECT m.sequence,m.turn_json,d.digest,d.ranges_json FROM business_message m LEFT JOIN business_history_delivery d ON d.sequence=m.sequence AND d.session_id=? WHERE m.conversation_id=? AND m.session_id<>? AND m.sequence>(SELECT history_sequence FROM conversation_agent_session WHERE id=?) AND m.sequence<=? {role} AND COALESCE(d.complete,0)=0 ORDER BY m.sequence {order}"), vec![sid.into(),cid.into(),sid.into(),sid.into(),through.into()])).await?;
+    let mut result = Vec::new();
+    for row in rows {
+        let turn: MessageTurn = decode(&row.try_get::<String>("", "turn_json")?)?;
+        let prose = history_prose(&turn);
+        let digest = projection_digest(&turn);
+        let ranges = if row.try_get::<Option<String>>("", "digest")?.as_ref() == Some(&digest) {
+            decode(&row.try_get::<String>("", "ranges_json")?)?
+        } else {
+            Vec::new()
+        };
+        result.push(HistoryRecord {
+            turn,
+            delivery: HistoryDelivery {
+                sequence: row.try_get("", "sequence")?,
+                digest,
+                total_bytes: prose.len(),
+                ranges,
+            },
+        });
+    }
+    if matches!(window, HistoryWindow::Recent) {
+        result.reverse();
+    }
+    Ok(result)
+}
+
 pub async fn has_unseen_context(
     conn: &DatabaseConnection,
     cid: i32,
@@ -738,6 +830,17 @@ pub async fn has_unseen_context(
     after: i64,
 ) -> Result<bool, DbError> {
     Ok(conn.query_one(stmt("SELECT sequence FROM business_message WHERE conversation_id=? AND session_id<>? AND sequence>? AND role IN ('user','assistant') LIMIT 1",vec![cid.into(),sid.into(),after.into()])).await?.is_some())
+}
+
+/// A native autonomous Goal has no content parameter. Its latest user boundary
+/// and latest result must have whole-prose evidence before starting; declared
+/// older gaps may remain available on demand without forcing a full archive.
+pub async fn latest_context_incomplete(
+    conn: &DatabaseConnection,
+    cid: i32,
+    sid: i64,
+) -> Result<bool, DbError> {
+    Ok(conn.query_one(stmt("SELECT m.sequence FROM business_message m LEFT JOIN business_history_delivery d ON d.sequence=m.sequence AND d.session_id=? WHERE m.conversation_id=? AND m.session_id<>? AND m.sequence IN (SELECT MAX(sequence) FROM business_message WHERE conversation_id=? AND role IN ('user','assistant') GROUP BY role) AND COALESCE(d.complete,0)=0 LIMIT 1", vec![sid.into(),cid.into(),sid.into(),cid.into()])).await?.is_some())
 }
 
 /// A small recent window accompanies a budget-limited chronological bridge.

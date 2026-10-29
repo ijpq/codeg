@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.41.1-fix4 — 2026-10-29
+
+- Preserve business discussion, revision tails, decision reasons, failed attempts
+  and file references in bounded cross-Agent context. Record the actual UTF-8
+  ranges included in accepted requests; partial turns no longer advance a
+  whole-record acknowledgement. Recent context has a reserved budget, and
+  accepted ranges are not repeatedly injected while older gaps are completed.
+- Add authenticated, snapshot-bounded original business-prose pagination to
+  `get_session_info`, including resuming within a long message. Retain the
+  legacy compact view, original native sessions and private reasoning/tools.
+- Retain the complete applicable-rule bridge needed by existing handoffs, with
+  digest deduplication. Do not migrate local Pi infrastructure, change Codex
+  profiles/history or add automatic cross-Agent base-configuration syncing.
+- Pin Pi ACP 0.0.34-codeg.3 with Pi 1.4.0 and Node 24.16.0 in both packages.
+  Its optional native skill-path contract is not automatically configured by
+  CodeG; Pi-native rule/skill/memory/ledger setup remains a separate task.
+- Retain fix3's restore/readiness and durable composer queue fixes and require
+  real fix6 old-business upgrades and multi-round replies in both final Windows
+  packages. Keep all prior Pi, external-delivery, duration, artifact, Office,
+  native Plan/Goal and virtualized-scroll acceptance gates.
+
+See [release notes](docs/releases/v0.41.1-fix4.md).
+
 ## 0.41.1-fix3 — 2026-10-29
 
 - Read structured Web and desktop restore errors through the shared error

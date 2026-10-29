@@ -2,6 +2,7 @@ pub mod agent;
 pub mod assistant;
 pub mod automation;
 pub mod background;
+pub mod business_context;
 pub mod canvas;
 pub mod chat_channel;
 pub mod codex_quota;
@@ -32,7 +33,7 @@ pub use codex_quota::{CodexQuotaSnapshot, CodexQuotaWindow};
 pub use conversation::{
     AgentConversationCount, AgentStats, ConversationBranchTag, ConversationDeliverable,
     ConversationDeliverableHistoryGroup, ConversationDeliverableHistoryPage, ConversationDetail,
-    ConversationOutline, ConversationHistoryPage, ConversationSummary, ConversationTagDetail,
+    ConversationHistoryPage, ConversationOutline, ConversationSummary, ConversationTagDetail,
     ConversationTurnArtifactRun, ConversationTurnDeliverableSet, ConversationTurnFileChange,
     ConversationTurnsPage, DbConversationDetail, DbConversationSummary, FolderInfo,
     ImportFolderOutcome, ImportResult, ImportSelectedResult, ScanFolder, ScanResult, ScanSession,

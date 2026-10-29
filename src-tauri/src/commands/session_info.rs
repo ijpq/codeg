@@ -17,12 +17,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use sea_orm::DatabaseConnection;
+use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement};
 use serde::{Deserialize, Serialize};
 
 use crate::acp::session_info::{
-    SessionInfo, SessionInfoAccess, SessionInfoConfig, SessionInfoRuntimeConfig, SessionMessageItem,
-    SessionMessages, MAX_SESSION_MESSAGES,
+    SessionHistoryItem, SessionHistoryPage, SessionInfo, SessionInfoAccess, SessionInfoConfig,
+    SessionInfoRuntimeConfig, SessionMessageItem, SessionMessages, MAX_SESSION_MESSAGES,
 };
 use crate::app_error::AppCommandError;
 use crate::commands::conversations::get_folder_conversation_core;
@@ -124,6 +124,7 @@ impl SessionInfoAccess for DbSessionInfoLookup {
             is_delegation_child: summary.parent_id.is_some(),
             stats: None,
             messages: None,
+            history_page: None,
             note: None,
         };
 
@@ -138,13 +139,26 @@ impl SessionInfoAccess for DbSessionInfoLookup {
         // whole tool call.
         let conn_owned = self.db.conn.clone();
         let parse = async move {
-            if crate::db::service::business_conversation_service::is_managed(&conn_owned,session_id).await.map_err(AppCommandError::from)? {
+            if crate::db::service::business_conversation_service::is_managed(
+                &conn_owned,
+                session_id,
+            )
+            .await
+            .map_err(AppCommandError::from)?
+            {
                 crate::commands::conversations::get_folder_conversation_page_core(
-                    &conn_owned,session_id,crate::commands::conversations::ConversationHistoryRequest {
-                        before_cursor:None,user_turn_limit:max.clamp(1,100),cancellation:None,
+                    &conn_owned,
+                    session_id,
+                    crate::commands::conversations::ConversationHistoryRequest {
+                        before_cursor: None,
+                        user_turn_limit: max.clamp(1, 100),
+                        cancellation: None,
                     },
-                ).await
-            } else {get_folder_conversation_core(&conn_owned, session_id).await}
+                )
+                .await
+            } else {
+                get_folder_conversation_core(&conn_owned, session_id).await
+            }
         };
         match bounded_parse(self.parse_limit.clone(), PARSE_TIMEOUT, parse).await {
             ParseSlot::Ready(Ok((detail, parsed_title))) => {
@@ -180,6 +194,173 @@ impl SessionInfoAccess for DbSessionInfoLookup {
         }
         info
     }
+
+    async fn resolve_history(
+        &self,
+        session_id: i32,
+        max_messages: u32,
+        cursor: &str,
+    ) -> SessionInfo {
+        let mut info = self.resolve(session_id, 0).await;
+        if !info.found {
+            return info;
+        }
+        let conn = self.db.conn.clone();
+        let cursor = cursor.to_owned();
+        match bounded_parse(self.parse_limit.clone(), PARSE_TIMEOUT, async move {
+            read_business_history(&conn, session_id, max_messages, &cursor).await
+        })
+        .await
+        {
+            ParseSlot::Ready(Ok(page)) => info.history_page = Some(page),
+            ParseSlot::Ready(Err(e)) => info.note = Some(e),
+            ParseSlot::Busy => {
+                info.note = Some("Business history reads are busy; retry the same cursor.".into())
+            }
+            ParseSlot::TimedOut => {
+                info.note = Some("Business history read timed out; retry the same cursor.".into())
+            }
+        }
+        info
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct ProseCursor {
+    version: u8,
+    conversation: i32,
+    through: i64,
+    sequence: i64,
+    offset: usize,
+    digest: String,
+}
+
+async fn read_business_history(
+    conn: &DatabaseConnection,
+    cid: i32,
+    max_messages: u32,
+    raw: &str,
+) -> Result<SessionHistoryPage, String> {
+    use crate::db::service::business_conversation_service as business;
+    use crate::models::business_context::{history_prose, projection_digest};
+    if !business::is_managed(conn, cid)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        return Err("Original prose pagination requires canonical business history; the legacy recent-message view remains available.".into());
+    }
+    if raw.len() > 512 {
+        return Err("Invalid history cursor.".into());
+    }
+    let query = |sql: &str, values: Vec<sea_orm::Value>| {
+        Statement::from_sql_and_values(DbBackend::Sqlite, sql, values)
+    };
+    let last: i64 = conn
+        .query_one(query(
+            "SELECT COALESCE(MAX(sequence),0) AS n FROM business_message WHERE conversation_id=?",
+            vec![cid.into()],
+        ))
+        .await
+        .map_err(|e| e.to_string())?
+        .unwrap()
+        .try_get("", "n")
+        .map_err(|e| e.to_string())?;
+    let cursor = if raw == "start" {
+        ProseCursor {
+            version: 1,
+            conversation: cid,
+            through: last,
+            sequence: 0,
+            offset: 0,
+            digest: String::new(),
+        }
+    } else if let Some(sequence) = raw.strip_prefix("sequence:") {
+        let sequence: i64 = sequence.parse().map_err(|_| "Invalid sequence cursor.")?;
+        if sequence <= 0 || sequence > last {
+            return Err("History sequence is outside this conversation.".into());
+        }
+        ProseCursor {
+            version: 1,
+            conversation: cid,
+            through: sequence,
+            sequence,
+            offset: 0,
+            digest: String::new(),
+        }
+    } else {
+        serde_json::from_str::<ProseCursor>(raw).map_err(|_| "Invalid history cursor.")?
+    };
+    if cursor.version != 1
+        || cursor.conversation != cid
+        || cursor.sequence < 0
+        || cursor.through > last
+        || cursor.sequence > cursor.through
+    {
+        return Err("History cursor does not match this conversation/snapshot.".into());
+    }
+    let max = max_messages.clamp(1, 50) as usize;
+    let rows = conn.query_all(query("SELECT sequence,role,turn_json FROM business_message WHERE conversation_id=? AND sequence>=? AND sequence<=? ORDER BY sequence LIMIT ?", vec![cid.into(),cursor.sequence.into(),cursor.through.into(),((max+1) as i64).into()])).await.map_err(|e| e.to_string())?;
+    let mut budget = OVERALL_CHARS; // bytes, so UTF-8 cannot inflate the frame
+    let mut items = Vec::new();
+    let mut next_cursor = None;
+    for row in rows {
+        let seq: i64 = row.try_get("", "sequence").map_err(|e| e.to_string())?;
+        let turn: MessageTurn = serde_json::from_str(
+            &row.try_get::<String>("", "turn_json")
+                .map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+        let prose = history_prose(&turn);
+        let digest = projection_digest(&turn);
+        let start = if seq == cursor.sequence {
+            cursor.offset
+        } else {
+            0
+        };
+        if start > prose.len()
+            || !prose.is_char_boundary(start)
+            || (start > 0 && cursor.digest != digest)
+        {
+            return Err(format!("History record {seq} changed or its cursor is invalid; restart with sequence:{seq}."));
+        }
+        let next = |offset| {
+            serde_json::to_string(&ProseCursor {
+                version: 1,
+                conversation: cid,
+                through: cursor.through,
+                sequence: seq,
+                offset,
+                digest: digest.clone(),
+            })
+            .map_err(|e| e.to_string())
+        };
+        if items.len() >= max || budget < 4 {
+            next_cursor = Some(next(start)?);
+            break;
+        }
+        let mut end = start.saturating_add(budget).min(prose.len());
+        while !prose.is_char_boundary(end) {
+            end -= 1;
+        }
+        budget -= end - start;
+        items.push(SessionHistoryItem {
+            sequence: seq,
+            role: row.try_get("", "role").map_err(|e| e.to_string())?,
+            text: prose[start..end].into(),
+            start_byte: start,
+            end_byte: end,
+            total_bytes: prose.len(),
+        });
+        if end < prose.len() {
+            next_cursor = Some(next(end)?);
+            break;
+        }
+    }
+    Ok(SessionHistoryPage {
+        snapshot_through: cursor.through,
+        items,
+        next_cursor,
+    })
 }
 
 /// Outcome of a permit-gated, timeout-bounded parse (see [`bounded_parse`]).
@@ -257,12 +438,8 @@ fn compact_turns(turns: &[MessageTurn], max: u32) -> SessionMessages {
         let item = compact_turn(turn);
         // Charge BOTH the text and the (bounded) tool names against the budget so
         // a turn can't smuggle an oversized payload through `tools`.
-        let cost = item.text.chars().count()
-            + item
-                .tools
-                .iter()
-                .map(|t| t.chars().count())
-                .sum::<usize>();
+        let cost =
+            item.text.chars().count() + item.tools.iter().map(|t| t.chars().count()).sum::<usize>();
         // Always keep the newest turn; stop once the budget can't fit the next.
         if !items.is_empty() && cost > budget {
             break;
@@ -444,8 +621,8 @@ pub async fn set_session_info_settings(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
     use crate::models::message::ContentBlock;
+    use chrono::Utc;
 
     fn turn(role: TurnRole, blocks: Vec<ContentBlock>) -> MessageTurn {
         MessageTurn {
@@ -457,8 +634,8 @@ mod tests {
             duration_ms: None,
             model: None,
             completed_at: None,
-        agent_message_id: None,
-        native_task_id: None,
+            agent_message_id: None,
+            native_task_id: None,
         }
     }
 
@@ -467,7 +644,9 @@ mod tests {
         let item = compact_turn(&turn(
             TurnRole::Assistant,
             vec![
-                ContentBlock::Text { text: "hello".into() },
+                ContentBlock::Text {
+                    text: "hello".into(),
+                },
                 ContentBlock::ToolUse {
                     tool_use_id: None,
                     tool_name: "Read".into(),
@@ -569,8 +748,7 @@ mod tests {
             .items
             .iter()
             .map(|i| {
-                i.text.chars().count()
-                    + i.tools.iter().map(|t| t.chars().count()).sum::<usize>()
+                i.text.chars().count() + i.tools.iter().map(|t| t.chars().count()).sum::<usize>()
             })
             .sum();
         assert!(total_chars <= OVERALL_CHARS + PER_TURN_CHARS);
@@ -582,7 +760,9 @@ mod tests {
     fn compact_turns_not_truncated_when_all_fit() {
         let turns = vec![turn(
             TurnRole::User,
-            vec![ContentBlock::Text { text: "only".into() }],
+            vec![ContentBlock::Text {
+                text: "only".into(),
+            }],
         )];
         let out = compact_turns(&turns, 20);
         assert_eq!(out.total, 1);
@@ -615,8 +795,7 @@ mod tests {
     async fn bounded_parse_reports_busy_when_no_slot_free() {
         // A semaphore with zero permits → no slot → Busy, work never starts.
         let sem = Arc::new(tokio::sync::Semaphore::new(0));
-        let out: ParseSlot<i32> =
-            bounded_parse(sem, Duration::from_secs(5), async { 1 }).await;
+        let out: ParseSlot<i32> = bounded_parse(sem, Duration::from_secs(5), async { 1 }).await;
         assert!(matches!(out, ParseSlot::Busy));
     }
 
