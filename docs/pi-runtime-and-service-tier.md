@@ -1,6 +1,6 @@
 # Pi 运行组件与 Fast / Speed
 
-本次固定 CodeG `0.41.1-fix4`、定制 `pi-acp 0.0.34-codeg.3`、Pi `1.4.0` 和 Node
+本次固定 CodeG `0.41.2-fix1`、定制 `pi-acp 0.0.34-codeg.3`、Pi `1.4.0` 和 Node
 `24.16.0`。适配器源码 commit、tarball SHA256 与依赖锁保存在 `vendor/pi-runtime/`。
 Server ZIP 和 Setup 都携带私有 `pi-runtime`，无需全局 npm 或开发机 PATH。上游 MIT
 许可证、Pi 及依赖许可证和 Node LICENSE 随运行组保留。
@@ -71,20 +71,17 @@ reported。返回与请求不同的档位照实显示，不推断速度。脱敏
 [Responses create 的 service_tier](https://developers.openai.com/api/reference/resources/responses/methods/create)。
 官方接受的别名和计费描述不等于任意中转的合同。
 
-## 独立于交接的共享入口
+## Pi 原生基础设施与业务交接
 
-新建 Pi 与尚未切换的原生对话也在首轮前获得本实例选中 Codex profile 的完整公开规则
-及共享 Skill 入口；不需要先建立 Codex session 或启用业务共享历史。原有 Pi/Claude
-规则继续按各自选中配置读取。规则 v3/digest 仅在实际轮次成功结束后确认，源文件更新、
-失败、取消、恢复和新进程会重新检查；不复制账本、模板、Skill 或认证。
+Pi 规则、Skill、记忆、账本与扩展的原生迁入、配置和维护另行处理。本轮不改变本机
+Codex 配置或历史，不添加跨 Agent 基础配置同步层，也不自动让新建 Pi 对话加载
+Codex 的全局配置。业务交接保留当前仍然必要的完整规则兼容桥，不能在 Pi 尚未配置
+相应约束时提前删除。规则按来源及目标原生 session 的 digest 回执去重；Skill 和账本
+继续引用原始源文件，不复制成另一套长期维护内容。正文是否进入请求、文件是否实际
+读取与模型是否自主遵循分别验收。
 
-ACP 0.0.34-codeg.3 接受启动环境 `CODEG_SHARED_SKILL_PATHS_JSON`，将同一份原始目录
-通过 Pi 1.4.0 原生 `--skill` 加载。Pi 实际目录、原生 read/bash 输出和模板产物分别验收。
-普通用户可按用途触发模型选用目录中的 Skill；CodeG 显式 `$skill` 仍从同源按需加载。
-账本的总账/分账读取要求来自完整源规则，正文通过实际文件工具按需读取。测试响应服务
-可验证真实工具链，但无认证模型环境时不宣称自主选用或遵循规则的行为已通过。
-
-Pi ACP .3 另提供可选启动参数`CODEG_SHARED_SKILL_PATHS_JSON`，仅通过Pi原生`--skill`
-加载调用者明确配置的原始路径。CodeG本轮不自动生成此变量，不迁移Codex配置、不复制
-认证/私有记忆/扩展，也不承诺直接新建Pi会话已经配置了Codex的全部基础能力。Pi原生
-基础设施迁入单独维护，现有业务交接仍保留尚必要的完整规则。
+ACP 0.0.34-codeg.3 另提供可选启动环境 `CODEG_SHARED_SKILL_PATHS_JSON`，仅通过
+Pi 1.4.0 原生 `--skill` 加载调用者明确配置的原始路径。CodeG 本轮不自动生成此变量，
+不迁移认证、私有记忆或扩展，也不承诺直接新建 Pi 已配置 Codex 的全部基础能力。
+可选适配器入口已验证原生 read/bash 的真实文件和 Skill 脚本调用；该独立协议测试
+不代表 CodeG 自动完成迁移，也不代表真实账号模型已自主选择 Skill 或遵循文稿规则。

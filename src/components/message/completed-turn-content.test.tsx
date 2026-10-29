@@ -236,7 +236,9 @@ describe("CompletedTurnContent", () => {
       const view = renderWithIntl(
         <CompletedTurnContent parts={adapt(false)} completed={false} />
       )
-      expect(screen.getByText("SYNTHETIC NATIVE GOAL RESPONSE")).toBeVisible()
+      expect(
+        screen.getByText(writing("SYNTHETIC NATIVE GOAL RESPONSE"))
+      ).toBeVisible()
       view.rerender(
         <NextIntlClientProvider locale="en" messages={enMessages}>
           <CompletedTurnContent parts={adapt(true)} completed />
