@@ -357,7 +357,7 @@ describe("AcpConnectionsProvider cross-client viewer lifecycle", () => {
       const deliver = (event: EventEnvelope) => {
         if (web) emitAcpEvent(latestAttachHandlers(), event)
         else {
-          const listener = vi.mocked(subscribe).mock.calls.at(-1)![1] as (
+          const listener = vi.mocked(subscribe).mock.calls.slice(-1)[0]![1] as (
             value: EventEnvelope
           ) => void
           act(() => listener(event))
@@ -2307,7 +2307,7 @@ describe("persisted business readiness across engines and transports", () => {
         if (web) {
           emitAcpEvent(latestAttachHandlers(), event)
         } else {
-          const listener = vi.mocked(subscribe).mock.calls.at(-1)![1] as (
+          const listener = vi.mocked(subscribe).mock.calls.slice(-1)[0]![1] as (
             value: EventEnvelope
           ) => void
           act(() => listener(event))
@@ -2409,7 +2409,7 @@ describe("persisted business readiness across engines and transports", () => {
         if (web) {
           emitAcpEvent(latestAttachHandlers(), event)
         } else {
-          const listener = vi.mocked(subscribe).mock.calls.at(-1)![1] as (
+          const listener = vi.mocked(subscribe).mock.calls.slice(-1)[0]![1] as (
             value: EventEnvelope
           ) => void
           act(() => listener(event))

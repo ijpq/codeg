@@ -1,6 +1,27 @@
 # Changelog
 
-## 0.41.2-fix3 — 2026-10-29
+## 0.41.2-fix4 — 2026-10-29
+
+- Retain the complete unpublished recovery, draft-identity and multi-provider
+  fixes, with independent business/native Agent bindings and durable queues.
+- Preserve owned-process exit codes, signals and explicit cleanup reasons in
+  Windows package acceptance; drain stdout and stderr before closing logs and
+  collect only scoped OS crash metadata, without process-memory dumps.
+- Submit a new unbound Pi draft once through the actual usable Send control;
+  record its initial disabled state instead of treating Enter on a disabled
+  composer as an accepted input. Historical restoration still tests real input
+  during delayed initialization and requires exactly one durable reply.
+- Wait for the responsive navigation drawer to mount before dismissing it in
+  narrow-layout acceptance, retain the strict hit test and capture failures
+  before restoring desktop dimensions.
+- Keep the failed fix3 tag and original Server connection-refused evidence.
+  Two later diagnostics passed that old-business Server path, but have not explained
+  the original process loss. Diagnostic passes do not replace final downloaded
+  Server and Setup acceptance for this new commit.
+
+See [release notes](docs/releases/v0.41.2-fix4.md).
+
+## 0.41.2-fix3 — 2026-10-29 (unpublished candidate)
 
 - Keep a draft's live connection when its own native session ID becomes known;
   identity enrichment no longer triggers a destructive target-change restart.
