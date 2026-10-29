@@ -14,6 +14,10 @@
 - Wait for the responsive navigation drawer to mount before dismissing it in
   narrow-layout acceptance, retain the strict hit test and capture failures
   before restoring desktop dimensions.
+- Distinguish sudden app interruption from child-first shutdown during handoff
+  acceptance. Freeze only the verified CI-owned app writer before terminating
+  its tree; native Windows tests retain actual child-failure and pending-request
+  recovery as separate states instead of silently retrying a terminal failure.
 - Keep the failed fix3 tag and original Server connection-refused evidence.
   Two later diagnostics passed that old-business Server path, but have not explained
   the original process loss. Diagnostic passes do not replace final downloaded
