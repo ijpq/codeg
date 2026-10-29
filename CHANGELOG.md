@@ -1,6 +1,10 @@
 # Changelog
 
-## 0.41.1-fix4 — 2026-10-29
+## 0.41.2-fix1 — 2026-10-29
+
+- Rebase onto upstream v0.41.2 while retaining the custom Windows runtime group,
+  business features and all unpublished recovery fixes. Revalidate the merged
+  streaming reply layout with the virtualized scroll and delivery gates.
 
 - Preserve business discussion, revision tails, decision reasons, failed attempts
   and file references in bounded cross-Agent context. Record the actual UTF-8
@@ -21,9 +25,9 @@
   packages. Keep all prior Pi, external-delivery, duration, artifact, Office,
   native Plan/Goal and virtualized-scroll acceptance gates.
 
-See [release notes](docs/releases/v0.41.1-fix4.md).
+See [release notes](docs/releases/v0.41.2-fix1.md).
 
-## 0.41.1-fix3 — 2026-10-29
+## 0.41.1-fix3 — 2026-10-29 (unpublished candidate)
 
 - Read structured Web and desktop restore errors through the shared error
   decoder. Empty business conversations can reach session creation; saved

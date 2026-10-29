@@ -49129,6 +49129,8 @@ mod tests {
             blocks: vec![PromptInputBlock::Text { text: text.into() }],
             user_message: None,
             internal_suffix: Vec::new(),
+            agent_file_change_report_request_id: None,
+            expected_settings: None,
         }
     }
 
@@ -49152,8 +49154,8 @@ mod tests {
         });
         // Other commands go through and leave the Stop pending.
         assert!(matches!(
-            hold_for_codebuddy_cancel(Some(ConnectionCommand::Cancel), &mut pending),
-            Admitted::Run(Some(ConnectionCommand::Cancel))
+            hold_for_codebuddy_cancel(Some(ConnectionCommand::Cancel { reply: None }), &mut pending),
+            Admitted::Run(Some(ConnectionCommand::Cancel { .. }))
         ));
         assert!(matches!(
             hold_for_codebuddy_cancel(None, &mut pending),
@@ -49288,7 +49290,10 @@ mod tests {
             )
             .await;
             lp.open_turn("one", "working, ").await;
-            lp.cmd_tx.send(ConnectionCommand::Cancel).await.unwrap();
+            lp.cmd_tx
+                .send(ConnectionCommand::Cancel { reply: None })
+                .await
+                .unwrap();
             let stopped = lp
                 .until("cancelled", |e| {
                     matches!(e, AcpEvent::TurnComplete { stop_reason, .. } if stop_reason == "cancelled")
@@ -49347,14 +49352,20 @@ mod tests {
             )
             .await;
             lp.open_turn("one", "working, ").await;
-            lp.cmd_tx.send(ConnectionCommand::Cancel).await.unwrap();
+            lp.cmd_tx
+                .send(ConnectionCommand::Cancel { reply: None })
+                .await
+                .unwrap();
             lp.until("the first stop", |e| {
                 matches!(e, AcpEvent::TurnComplete { stop_reason, .. } if stop_reason == "cancelled")
             })
             .await;
             lp.state.write().await.turn_in_flight = true;
             lp.cmd_tx.send(prompt_command("two")).await.unwrap();
-            lp.cmd_tx.send(ConnectionCommand::Cancel).await.unwrap();
+            lp.cmd_tx
+                .send(ConnectionCommand::Cancel { reply: None })
+                .await
+                .unwrap();
             lp.respond.notify_one();
             let prompting = lp
                 .until("the held prompt", |e| {
