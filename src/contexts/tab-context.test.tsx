@@ -1037,7 +1037,7 @@ describe("TabProvider cross-client sync", () => {
     await waitFor(() => expect(saveOpenedTabsMock).toHaveBeenCalled(), {
       timeout: 2000,
     })
-    const [items, expectedVersion] = saveOpenedTabsMock.mock.calls.at(-1)!
+    const [items, expectedVersion] = saveOpenedTabsMock.mock.calls.slice(-1)[0]!
     expect(
       (items as OpenedTab[]).find((it) => it.is_active)?.conversation_id
     ).toBe(1)
