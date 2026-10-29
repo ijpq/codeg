@@ -387,13 +387,10 @@ let runtime: TabRuntime = defaultRuntime()
 // ── Cross-client / coordination state (non-reactive; see original TabProvider) ──
 // `version` — last workspace tab version this client observed/applied; every
 //   save sends it as the CAS `expected_version`.
-// `applyingRemote` — one-shot guard so applying a remote snapshot does not echo
-//   back as a save.
 // `pendingRemote` — a remote change that beat hydration; applied once hydrated.
 // `lastSavedPayload` — JSON of the last persisted payload; draft-only changes
 //   match it and skip the save.
 let version = 0
-let applyingRemote = false
 let remoteActivationPending = false
 let pendingRemote: TabsChanged | null = null
 let lastSavedPayload: string | null = null
@@ -2667,15 +2664,11 @@ export const useTabStore = create<TabStoreState>()((set, get) => ({
     const st = get()
     if (!st.tabsHydrated) return
 
-    // A remote snapshot just mutated rawTabs/focus — consume the one-shot guard
-    // so we don't echo it back (which would re-broadcast and ping-pong).
-    if (applyingRemote) {
-      applyingRemote = false
-      return
-    }
-
     const items = buildPersistItems(st.rawTabs, st.activeTabId)
     const payload = JSON.stringify(items)
+    // Remote snapshots seed this exact baseline. Compare the payload rather
+    // than skipping the next effect: React can batch a later local switch into
+    // that same render, and its new focus must still be saved.
     // Reverted to the last-saved state → cancel any save still armed.
     if (payload === lastSavedPayload) {
       if (saveTimer) {
@@ -3254,7 +3247,6 @@ export function resetTabStore() {
     groupPersistTimer = null
   }
   version = 0
-  applyingRemote = false
   remoteActivationPending = false
   pendingRemote = null
   lastSavedPayload = null
@@ -3337,14 +3329,13 @@ function applyRemoteSnapshot(change: TabsChanged) {
     return !snapshotKeys.has(key) && !ancestorKeys.has(key)
   })
   // Our set is ahead of the server's in at least one direction, so this apply
-  // must NOT arm the echo guard or seed the no-op baseline — the save effect has
+  // must NOT seed the no-op baseline — the save effect has
   // to push the merged set (against the version we just learned) or the
   // divergence never converges.
   const diverged =
     unsyncedLocal.length > 0 || convItems.length !== snapshotItems.length
 
   const remoteActive = convItems.find((it) => it.is_active)
-  applyingRemote = !diverged
 
   const prevById = new Map(prev.rawTabs.map((tb) => [tb.id, tb]))
   const remoteTabs: TabItemInternal[] = convItems.map((it) => {
@@ -3468,7 +3459,7 @@ function applyRemoteSnapshot(change: TabsChanged) {
     remoteActivationPending = true
   }
   // Seed the last-saved payload from the state we're about to commit so the
-  // guarded save-effect run is a confirmed no-op AND a passive focus fallback
+  // save-effect run is a confirmed no-op AND a passive focus fallback
   // never propagates to yank another client. When the merge diverged from the
   // server there is nothing to seed — clearing the baseline is what lets the
   // save effect push the difference back.

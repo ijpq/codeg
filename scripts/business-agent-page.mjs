@@ -4,6 +4,7 @@ import assert from "node:assert/strict"
 import { access, mkdir, readFile, writeFile } from "node:fs/promises"
 import { join, dirname } from "node:path"
 import { randomUUID } from "node:crypto"
+import { businessComposer, reloadBusiness } from "./business-composer-page.mjs"
 
 const delay = (ms) => new Promise((done) => setTimeout(done, ms))
 async function until(read, accepts, label) {
@@ -1214,7 +1215,12 @@ export async function consecutiveComposerPage({
           )
           await openBusiness(page, api, cid, folderId, agent)
         }
-        if (round === 4) await page.reload()
+        if (round === 4)
+          await reloadBusiness(page, api, {
+            conversationId: cid,
+            folderId,
+            agent,
+          })
         if (round === 5) {
           const history = await read()
           const connection = await api("acp_find_connection_for_conversation", {
@@ -1241,11 +1247,10 @@ export async function consecutiveComposerPage({
         }
         const text = `COMPOSER_${agent.toUpperCase()}_${round}_${randomUUID()}`
         markers.push(text)
-        const input = page
-          .locator('[contenteditable="true"]')
-          .filter({ visible: true })
-          .last()
-        await input.waitFor({ timeout: 90_000 })
+        const input = await businessComposer(page, {
+          conversationId: cid,
+          agent,
+        })
         await input.fill(text)
         await input.press("Enter")
         const response =
@@ -1386,12 +1391,11 @@ export async function consecutiveComposerPage({
             [agent === "codex" ? "CODEG_CODEX_ACP_PATH" : "CODEG_PI_ACP_PATH"]:
               join(f.root, `intentionally-missing-${agent}-restore.cmd`),
           })
-          await page.reload()
-          const input = page
-            .locator('[contenteditable="true"]')
-            .filter({ visible: true })
-            .last()
-          await input.waitFor({ timeout: 90_000 })
+          const input = await reloadBusiness(page, api, {
+            conversationId: cid,
+            folderId,
+            agent,
+          })
           const text = `COMPOSER_FAILED_RESTORE_${agent.toUpperCase()}_${randomUUID()}`
           markers.push(text)
           await input.fill(text)

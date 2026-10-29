@@ -86,6 +86,9 @@ jobs:
       - name: Draft release reuse regression
         run: node --test scripts/test-release-draft.mjs
 
+      - name: Packaged business composer identity regression
+        run: node --test scripts/test-business-composer-page.mjs
+
       - name: Custom Windows CI scope regression
         run: node --test scripts/test-custom-ci-scope.mjs
 

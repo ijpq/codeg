@@ -1016,6 +1016,34 @@ describe("TabProvider cross-client sync", () => {
     expect(active?.conversation_id).toBe(2)
   })
 
+  it("persists a local focus change batched after a remote snapshot", async () => {
+    listOpenedTabsMock.mockResolvedValue({
+      items: [tabItem(1, 1, true), tabItem(1, 2)],
+      version: 1,
+    })
+    await renderHydrated()
+    saveOpenedTabsMock.mockClear()
+
+    act(() => {
+      tabsChangedHandler?.({
+        version: 2,
+        origin: "another-client",
+        tabs: [tabItem(1, 1), tabItem(1, 2, true)],
+      })
+      latestContext?.switchTab("conv-1-codex-1")
+    })
+
+    expect(screen.getByTestId("active")).toHaveTextContent("conv-1-codex-1")
+    await waitFor(() => expect(saveOpenedTabsMock).toHaveBeenCalled(), {
+      timeout: 2000,
+    })
+    const [items, expectedVersion] = saveOpenedTabsMock.mock.calls.at(-1)!
+    expect(
+      (items as OpenedTab[]).find((it) => it.is_active)?.conversation_id
+    ).toBe(1)
+    expect(expectedVersion).toBe(2)
+  })
+
   it("restores the focused tab from is_active on hydrate", async () => {
     listOpenedTabsMock.mockResolvedValue({
       items: [tabItem(1, 1), tabItem(1, 2, true)],
