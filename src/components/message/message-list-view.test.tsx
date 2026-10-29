@@ -1362,6 +1362,19 @@ describe("dedupeCompactionItems", () => {
   const full = { preTokens: 108716, postTokens: 4462, durationMs: 92728 }
   const keys = (items: ThreadItem[]) => items.map((i) => i.key)
 
+  it("correlates a Pi live call with its proven native entry without guessing from timing", () => {
+    const items = [
+      divider("history", { eventId: "native-entry" }, "native-entry"),
+      divider(
+        "live",
+        { eventId: "native-entry", durationMs: 35000 },
+        "live-uuid"
+      ),
+      divider("unrelated", { eventId: "another-entry" }, "other"),
+    ]
+    expect(keys(dedupeCompactionItems(items))).toEqual(["history", "unrelated"])
+  })
+
   // The live ACP tool_call and the transcript-derived divider are the same
   // compaction under two ids, and mid-turn both are in the timeline at once.
   it("keeps the first of two renderings of one compaction", () => {

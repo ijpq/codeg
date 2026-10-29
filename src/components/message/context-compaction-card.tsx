@@ -38,7 +38,7 @@
  * or a stray reply.
  */
 
-import { useId, useState } from "react"
+import { useEffect, useId, useState } from "react"
 import { useTranslations } from "next-intl"
 import { Archive, ChevronDown, ChevronUp } from "lucide-react"
 
@@ -175,15 +175,33 @@ export function ContextCompactionCard({ state, meta, summary }: Props) {
   const t = useTranslations("Folder.chat.contextCompaction")
   const [summaryOpen, setSummaryOpen] = useState(false)
   const summaryId = useId()
-  const isRunning = state === "input-streaming" || state === "input-available"
   const payload = contextCompactionPayload(meta)
+  const status = readText(payload, "status")
+  const cancelled = status === "cancelled"
+  const terminal = cancelled || status === "failed" || status === "completed"
+  const isRunning =
+    !terminal && (state === "input-streaming" || state === "input-available")
+  const startedAt = readNumber(payload, "startedAt")
+  const [now, setNow] = useState<number | null>(null)
+  useEffect(() => {
+    if (!isRunning || startedAt === null) return
+    const timer = setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(timer)
+  }, [isRunning, startedAt])
   const before =
     readNumber(meta, "tokensBefore") ?? readNumber(payload, "preTokens")
   const after =
     readNumber(meta, "tokensAfter") ?? readNumber(payload, "postTokens")
   const errorText = readText(payload, "error")
-  const failed = errorText !== null || state === "output-error"
-  const duration = formatDuration(readNumber(payload, "durationMs"))
+  const failed =
+    !cancelled &&
+    (status === "failed" ||
+      (!terminal && (errorText !== null || state === "output-error")))
+  const duration = formatDuration(
+    isRunning && startedAt !== null && now !== null
+      ? Math.max(0, now - startedAt)
+      : readNumber(payload, "durationMs")
+  )
   // Trigger and error ride in the tooltip rather than inline prose — they
   // answer "why did this happen", which is a second-order question next to the
   // delta. Only the two shared triggers are translated; anything else is an
@@ -195,23 +213,37 @@ export function ContextCompactionCard({ state, meta, summary }: Props) {
   // Only show the delta when it's a real reduction — a no-op (before === after)
   // would read as a bug, so fall back to the plain label there and for codex
   // (which sends no counts).
-  const label = failed
-    ? t("failed")
-    : isRunning
-      ? t("compacting")
-      : before !== null && after !== null && before !== after
-        ? t("compactedTokens", {
-            before: before.toLocaleString(),
-            after: after.toLocaleString(),
-          })
-        : t("compacted")
+  const label = cancelled
+    ? t("cancelled")
+    : failed
+      ? t("failed")
+      : isRunning
+        ? t("compacting")
+        : before !== null && after !== null && before !== after
+          ? t("compactedTokens", {
+              before: before.toLocaleString(),
+              after: after.toLocaleString(),
+            })
+          : t("compacted")
   const summaryText =
     typeof summary === "string" && summary.trim().length > 0 ? summary : null
   // `ws-msg-scope`: its hairlines are the transcript's, which a workspace
   // background image darkens (globals.css) — it sits between messages, not in
   // one.
   const divider = (
-    <div className="ws-msg-scope flex items-center gap-3 py-1 text-xs text-muted-foreground/80 select-none">
+    <div
+      data-testid="context-compaction"
+      data-compaction-status={
+        cancelled
+          ? "cancelled"
+          : failed
+            ? "failed"
+            : isRunning
+              ? "in_progress"
+              : "completed"
+      }
+      className="ws-msg-scope flex items-center gap-3 py-1 text-xs text-muted-foreground/80 select-none"
+    >
       <div className="h-px flex-1 bg-gradient-to-r from-transparent to-border/70" />
       <div
         className={`flex shrink-0 items-center gap-1.5${failed ? " text-destructive/80" : ""}`}
@@ -219,7 +251,10 @@ export function ContextCompactionCard({ state, meta, summary }: Props) {
       >
         <Archive className="size-3.5" />
         <span className={isRunning ? "animate-pulse" : undefined}>{label}</span>
-        {!failed && !isRunning && duration ? (
+        {isRunning && readText(payload, "phase") === "summarizing" ? (
+          <span>{t("summarizing")}</span>
+        ) : null}
+        {duration ? (
           <span className="text-muted-foreground/60">· {duration}</span>
         ) : null}
       </div>

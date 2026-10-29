@@ -4380,7 +4380,9 @@
         "failed": "컨텍스트 압축 실패",
         "summary": "요약",
         "triggerManual": "수동 실행",
-        "triggerAutomatic": "자동 실행"
+        "triggerAutomatic": "자동 실행",
+        "cancelled": "컨텍스트 압축 취소됨",
+        "summarizing": "기록 요약 중"
       },
       "sessionFailure": {
         "category": {

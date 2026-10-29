@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.41.2-fix6 — 2026-10-29
+
+- Fix Pi 1.4 preflight compaction being mistaken for a failed prompt after 30 seconds. Admission waits while native state confirms active compaction; real transport failures stop the native task before reporting their original cause.
+- Handle current and legacy native compaction events with one shared status card for real stage, elapsed time, completion, cancellation and failure. Correlate successful live records with native history IDs and retain the native summary without editing session files.
+- Put manual compaction through the same task queue and cancellation lifecycle; successful provider retries no longer retain an earlier transient failure.
+- Bundle Pi ACP 0.0.34-codeg.4 with Pi 1.4.0 and Node 24.16.0 for Windows Server and Setup. Keep existing Plan/Goal, scrolling, business handoff/recovery, multi-provider, deliverable and Office acceptance gates.
+- Add final-package composer checks for native long-history compaction over 30 seconds, next-round replies, active-page reattachment, cancellation, failure/retry and process restart. Deterministic isolated provider tests do not claim verification of a user relay or authenticated model reasoning.
+
 ## 0.41.2-fix5 — 2026-10-29
 
 - Resume the Server multi-provider page check from its persisted business folder

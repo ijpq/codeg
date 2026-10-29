@@ -4380,7 +4380,9 @@
         "failed": "Échec de la compaction du contexte",
         "summary": "Résumé",
         "triggerManual": "Déclenchée manuellement",
-        "triggerAutomatic": "Déclenchée automatiquement"
+        "triggerAutomatic": "Déclenchée automatiquement",
+        "cancelled": "Compression du contexte annulée",
+        "summarizing": "Résumé de l’historique"
       },
       "sessionFailure": {
         "category": {

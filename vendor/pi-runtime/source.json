@@ -1,8 +1,8 @@
 {
-  "adapterVersion": "0.0.34-codeg.3",
+  "adapterVersion": "0.0.34-codeg.4",
   "adapterRepository": "https://github.com/ijpq/pi-acp",
-  "adapterCommit": "f42ee21c0a4bb79d0fd2c33b399ba2bd7f7fb70c",
+  "adapterCommit": "d5e7fd87ef4c277e3db46986adc21789076659f2",
   "piVersion": "1.4.0",
   "nodeVersion": "24.16.0",
-  "adapterTarballSha256": "0f63da06b8dc5f54dd77a46c6d92abb38810d1987b38f3842a6a043d03549767"
+  "adapterTarballSha256": "6cc9532d7976052572628c5687cc81a61e84fd7a069309f66293aefbf0478a15"
 }

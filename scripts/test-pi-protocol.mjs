@@ -242,7 +242,7 @@ try {
   const result = {
     passed: true,
     runtime: "pi@1.4.0",
-    adapter: "pi-acp@0.0.34-codeg.3",
+    adapter: "pi-acp@0.0.34-codeg.4",
     sessionId: session.sessionId,
     capabilities,
     requests: model.evidence(),

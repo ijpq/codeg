@@ -4380,7 +4380,9 @@
         "failed": "Kontextkomprimierung fehlgeschlagen",
         "summary": "Zusammenfassung",
         "triggerManual": "Manuell ausgelöst",
-        "triggerAutomatic": "Automatisch ausgelöst"
+        "triggerAutomatic": "Automatisch ausgelöst",
+        "cancelled": "Kontextkomprimierung abgebrochen",
+        "summarizing": "Verlauf wird zusammengefasst"
       },
       "sessionFailure": {
         "category": {

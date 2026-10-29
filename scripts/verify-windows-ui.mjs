@@ -11,6 +11,7 @@ import assert from "node:assert/strict"
 import { startGoalModel } from "./native-codex-model-fixture.mjs"
 import { startBusinessModel } from "./business-model-fixture.mjs"
 import { startPiModel } from "./pi-native-model-fixture.mjs"
+import { piCompactionPage } from "./pi-compaction-page.mjs"
 import { piMultiProviderPage } from "./pi-multi-provider-page.mjs"
 import { piCapabilityChecks } from "./pi-capability-checks.mjs"
 import { verificationProgress } from "./verification-progress.mjs"
@@ -1557,6 +1558,7 @@ try {
   const upgradedErrors = await scopedRuntimeErrors(app.page)
   let businessSaved
   let setupInterrupted
+  let setupPiCompaction
   let setupPiProviders
   try {
     const conversations = await desktopApi(app.page)("list_all_conversations")
@@ -1618,6 +1620,15 @@ try {
         output,
       })
     }
+    setupPiCompaction = await piCompactionPage({
+      page: app.page,
+      api: desktopApi(app.page),
+      folderId: saved.folder_id,
+      piModel,
+      report,
+      name: "setup",
+      output,
+    })
     setupPiProviders = await piMultiProviderPage({
       page: app.page,
       api: desktopApi(app.page),
@@ -1695,6 +1706,17 @@ try {
       "setup",
       goalModel
     )
+    if (setupPiCompaction)
+      await piCompactionPage({
+        page: app.page,
+        api: desktopApi(app.page),
+        folderId: saved.folder_id,
+        piModel,
+        report,
+        name: "setup",
+        output,
+        saved: setupPiCompaction,
+      })
     if (setupPiProviders)
       await piMultiProviderPage({
         page: app.page,
@@ -1817,6 +1839,7 @@ try {
   let serverErrors
   let serverBusinessSaved
   let serverInterrupted
+  let serverPiCompaction
   let serverPiProviders
   try {
     const conversation =
@@ -1886,6 +1909,15 @@ try {
         output,
       })
     }
+    serverPiCompaction = await piCompactionPage({
+      page,
+      api,
+      folderId: conversation.folder_id,
+      piModel,
+      report,
+      name: "server-web",
+      output,
+    })
     serverPiProviders = await piMultiProviderPage({
       page,
       api,
@@ -1989,6 +2021,17 @@ try {
       "server-web",
       goalModel
     )
+    if (serverPiCompaction)
+      await piCompactionPage({
+        page,
+        api: restartedServer.api,
+        folderId: serverPiProviders.folderId,
+        piModel,
+        report,
+        name: "server-web",
+        output,
+        saved: serverPiCompaction,
+      })
     if (serverPiProviders)
       await piMultiProviderPage({
         page,

@@ -4380,7 +4380,9 @@
         "failed": "Falha ao compactar o contexto",
         "summary": "Resumo",
         "triggerManual": "Acionada manualmente",
-        "triggerAutomatic": "Acionada automaticamente"
+        "triggerAutomatic": "Acionada automaticamente",
+        "cancelled": "Compactação de contexto cancelada",
+        "summarizing": "Resumindo histórico"
       },
       "sessionFailure": {
         "category": {

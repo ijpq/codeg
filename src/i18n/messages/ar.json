@@ -4380,7 +4380,9 @@
         "failed": "فشل ضغط السياق",
         "summary": "الملخص",
         "triggerManual": "تم التشغيل يدويًا",
-        "triggerAutomatic": "تم التشغيل تلقائيًا"
+        "triggerAutomatic": "تم التشغيل تلقائيًا",
+        "cancelled": "تم إلغاء ضغط السياق",
+        "summarizing": "جارٍ تلخيص السجل"
       },
       "sessionFailure": {
         "category": {

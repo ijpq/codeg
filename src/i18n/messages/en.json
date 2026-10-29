@@ -4380,7 +4380,9 @@
         "failed": "Context compaction failed",
         "summary": "Summary",
         "triggerManual": "Manually triggered",
-        "triggerAutomatic": "Automatically triggered"
+        "triggerAutomatic": "Automatically triggered",
+        "cancelled": "Context compaction cancelled",
+        "summarizing": "Summarizing history"
       },
       "sessionFailure": {
         "category": {

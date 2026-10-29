@@ -24907,6 +24907,15 @@ fn session_compaction_event(dispatch: &Dispatch) -> Option<AcpEvent> {
             }
             meta.entry("contextCompaction")
                 .or_insert_with(|| serde_json::json!({"version": 1}));
+            if let Some(payload) = meta
+                .get_mut("contextCompaction")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                payload.insert(
+                    "status".to_string(),
+                    serde_json::Value::String(status.clone()),
+                );
+            }
             meta.insert(
                 COMPACTION_SUMMARY_META_KEY.to_string(),
                 serde_json::Value::Bool(true),
@@ -34619,6 +34628,11 @@ mod tests {
                     status: got, meta, ..
                 } => {
                     assert_eq!(got.as_deref(), Some(status));
+                    assert_eq!(
+                        meta.as_ref().and_then(|m| m.pointer("/contextCompaction/status")).and_then(|v| v.as_str()),
+                        Some(status),
+                        "the shared card must retain cancelled/completed independently of generic tool state"
+                    );
                     assert!(
                         meta.as_ref()
                             .and_then(|m| m.get("contextCompaction"))

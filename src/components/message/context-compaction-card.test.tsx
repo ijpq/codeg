@@ -1,6 +1,6 @@
-import { fireEvent, render, screen } from "@testing-library/react"
+import { act, fireEvent, render, screen } from "@testing-library/react"
 import { NextIntlClientProvider } from "next-intl"
-import { describe, expect, it } from "vitest"
+import { describe, expect, it, vi } from "vitest"
 
 import { ContextCompactionCard } from "./context-compaction-card"
 import enMessages from "@/i18n/messages/en.json"
@@ -23,6 +23,60 @@ function renderCard(props: {
 }
 
 describe("ContextCompactionCard", () => {
+  it("keeps native compaction completion when the later generation fails", () => {
+    renderCard({
+      state: "output-error",
+      meta: { contextCompaction: { version: 1, status: "completed" } },
+    })
+    expect(screen.getByText("Context compacted")).toBeInTheDocument()
+    expect(
+      screen.queryByText("Context compaction failed")
+    ).not.toBeInTheDocument()
+  })
+  it("shows a real stage and elapsed time, including after a mid-compaction attach", () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(100_000)
+    try {
+      const { rerender, unmount } = renderCard({
+        state: "input-available",
+        meta: {
+          contextCompaction: {
+            version: 1,
+            startedAt: 60_000,
+            phase: "summarizing",
+            status: "in_progress",
+          },
+        },
+      })
+      act(() => vi.advanceTimersByTime(1000))
+      expect(screen.getByText("Summarizing history")).toBeInTheDocument()
+      expect(screen.getByText("· 41s")).toBeInTheDocument()
+      expect(screen.queryByText(/%/)).not.toBeInTheDocument()
+      rerender(
+        <NextIntlClientProvider locale="en" messages={enMessages}>
+          <ContextCompactionCard
+            state="input-available"
+            meta={{
+              contextCompaction: {
+                version: 1,
+                status: "cancelled",
+                durationMs: 41000,
+              },
+            }}
+          />
+        </NextIntlClientProvider>
+      )
+      expect(
+        screen.getByText("Context compaction cancelled")
+      ).toBeInTheDocument()
+      expect(screen.queryByText("Compacting context…")).not.toBeInTheDocument()
+      unmount()
+      expect(vi.getTimerCount()).toBe(0)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it("shows the token delta from grok's top-level boolean-marker fields", () => {
     renderCard({
       state: "output-available",

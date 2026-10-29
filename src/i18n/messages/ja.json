@@ -4380,7 +4380,9 @@
         "failed": "コンテキストの圧縮に失敗しました",
         "summary": "要約",
         "triggerManual": "手動で実行",
-        "triggerAutomatic": "自動で実行"
+        "triggerAutomatic": "自動で実行",
+        "cancelled": "コンテキスト圧縮をキャンセルしました",
+        "summarizing": "履歴を要約中"
       },
       "sessionFailure": {
         "category": {
