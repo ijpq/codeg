@@ -886,7 +886,7 @@ export async function businessAgentPage({
     await page.screenshot({ path: join(output, `${name}-business-agent.png`) })
     const agents = await api("acp_list_agents")
     const piRuntime = agents.find((agent) => agent.agent_type === "pi")
-    assert.equal(piRuntime.installed_version, "0.0.34-codeg.3")
+    assert.equal(piRuntime.installed_version, "0.0.34-codeg.4")
     assert.equal(piRuntime.selected_runtime?.source, "bundled")
     assert.match(
       piRuntime.selected_runtime.adapter_path,
@@ -894,12 +894,12 @@ export async function businessAgentPage({
     )
     assert.equal(
       await api("acp_detect_agent_local_version", { agentType: "pi" }),
-      "0.0.34-codeg.3"
+      "0.0.34-codeg.4"
     )
     assert.equal(
       (await api("acp_get_agent_status", { agentType: "pi" }))
         .installed_version,
-      "0.0.34-codeg.3"
+      "0.0.34-codeg.4"
     )
     await assert.rejects(
       api("acp_uninstall_agent", { agentType: "pi", taskId: randomUUID() }),

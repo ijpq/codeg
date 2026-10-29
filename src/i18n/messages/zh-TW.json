@@ -4378,7 +4378,9 @@
         "failed": "上下文壓縮失敗",
         "summary": "摘要",
         "triggerManual": "手動觸發",
-        "triggerAutomatic": "自動觸發"
+        "triggerAutomatic": "自動觸發",
+        "cancelled": "上下文壓縮已取消",
+        "summarizing": "正在整理歷史"
       },
       "sessionFailure": {
         "category": {

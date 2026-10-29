@@ -944,10 +944,9 @@ fn assistant_error_text(message: &Value) -> Option<String> {
 /// Claude Code's `compact_boundary`). Without it, pi's context compaction leaves
 /// no mark at all in history and the conversation appears to lose its middle.
 ///
-/// `tokensBefore` becomes `preTokens`; pi records no post-compaction count, and
-/// the card degrades to its plain "compacted" label when either side is missing.
-/// `fromHook` is pi's (legacy-named) flag for "an extension generated this",
-/// which is the closest thing it has to a manual trigger.
+/// `tokensBefore` becomes `preTokens`; native history has no trustworthy
+/// duration, post-compaction count or trigger. Keep those absent, and retain
+/// the native entry identity and summary without guessing from `fromHook`.
 ///
 /// The ToolUse needs its paired ToolResult or the card reads as a call still
 /// running, and the id is the entry's own so re-parsing is stable.
@@ -958,14 +957,9 @@ fn parse_compaction(sp: &mut SessionParse, value: &Value, ts: DateTime<Utc>, idx
 
     let mut marker = serde_json::Map::new();
     marker.insert("version".to_string(), Value::from(1));
-    let from_hook = value
-        .get("fromHook")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    marker.insert(
-        "trigger".to_string(),
-        Value::from(if from_hook { "manual" } else { "automatic" }),
-    );
+    marker.insert("eventId".to_string(), Value::from(tool_use_id.clone()));
+    marker.insert("status".to_string(), Value::from("completed"));
+    // fromHook identifies the summary's author, not the manual/automatic trigger.
     if let Some(before) = value.get("tokensBefore").and_then(Value::as_u64) {
         marker.insert("preTokens".to_string(), Value::from(before));
     }
@@ -981,14 +975,20 @@ fn parse_compaction(sp: &mut SessionParse, value: &Value, ts: DateTime<Utc>, idx
                 input_preview: None,
                 status: None,
                 meta: Some(Value::Object(
-                    [("contextCompaction".to_string(), Value::Object(marker))]
-                        .into_iter()
-                        .collect(),
+                    [
+                        ("contextCompaction".to_string(), Value::Object(marker)),
+                        (
+                            super::COMPACTION_SUMMARY_META_KEY.to_string(),
+                            Value::Bool(true),
+                        ),
+                    ]
+                    .into_iter()
+                    .collect(),
                 )),
             },
             ContentBlock::ToolResult {
                 tool_use_id: Some(tool_use_id),
-                output_preview: None,
+                output_preview: string_field(value, "summary").map(String::from),
                 is_error: false,
                 agent_stats: None,
                 images: Vec::new(),
@@ -2739,9 +2739,15 @@ mod tests {
             Some(&json!(50000))
         );
         assert_eq!(
-            meta.pointer("/contextCompaction/trigger"),
-            Some(&json!("automatic"))
+            meta.pointer("/contextCompaction/eventId"),
+            Some(&json!("c1"))
         );
+        assert_eq!(meta.pointer("/contextCompaction/status"), Some(&json!("completed")));
+        assert!(meta.pointer("/contextCompaction/trigger").is_none());
+        assert_eq!(meta.get(super::super::COMPACTION_SUMMARY_META_KEY), Some(&json!(true)));
+        assert!(detail.turns.iter().flat_map(|t| &t.blocks).any(|b| matches!(b,
+            ContentBlock::ToolResult { output_preview: Some(summary), .. } if summary == "earlier work"
+        )));
         assert!(
             detail.turns.iter().flat_map(|t| &t.blocks).any(|b| matches!(
                 b,

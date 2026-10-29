@@ -6,7 +6,10 @@ export async function startPiModel() {
     scenarios = new Map()
   let responseDelay = 50,
     rejectTier = false,
-    officeHeld = false
+    officeHeld = false,
+    compactionDelay = 50,
+    compactionFailure = false,
+    reportedTokens = 42
   const officeWaiters = new Set()
   const server = createServer(async (req, res) => {
     if (req.method !== "POST") {
@@ -20,9 +23,16 @@ export async function startPiModel() {
     const latestUser = JSON.stringify(
       (body.input ?? []).findLast((i) => i.role === "user") ?? {}
     )
+    const compaction =
+      input.includes("<conversation>") &&
+      /structured (?:context checkpoint )?summary|structured context checkpoint/.test(
+        input
+      )
     const isChild = latestUser.includes("PI_CHILD_TASK")
     const tools = body.tools ?? []
     requests.push({
+      compaction,
+      receivedAt: Date.now(),
       frontendMarker:
         [...latestUser.matchAll(/PI_FRONTEND_[A-Z0-9_]+_[a-f0-9-]{36}/g)].at(
           -1
@@ -60,6 +70,18 @@ export async function startPiModel() {
         .map((t) => t.name)
         .filter((n) => /publish_deliverables|delegat/.test(n ?? "")),
     })
+    if (compaction) {
+      await pause(compactionDelay)
+      if (res.destroyed) return
+      if (compactionFailure) {
+        res.writeHead(403, { "Content-Type": "application/json" }).end(
+          JSON.stringify({
+            error: { message: "Isolated compaction denied: policy 403" },
+          })
+        )
+        return
+      }
+    }
     if (rejectTier) {
       res.writeHead(400, { "Content-Type": "application/json" }).end(
         JSON.stringify({
@@ -79,6 +101,9 @@ export async function startPiModel() {
     let text = isChild
       ? "PI_CHILD_COMPLETED PI_CHILD_CONTEXT"
       : "BUSINESS_PI_COMPLETED agenda-v3.md"
+    if (compaction)
+      text =
+        "# Retained business context\nPI_COMPACTION_RETAINED requirements, completed work and pending review.\n"
     let call
     if (marker && !isChild) {
       const key = marker[0],
@@ -226,9 +251,9 @@ export async function startPiModel() {
       service_tier: body.service_tier ?? "default",
       output: [item],
       usage: {
-        input_tokens: 42,
+        input_tokens: compaction ? 42 : reportedTokens,
         output_tokens: 12,
-        total_tokens: 54,
+        total_tokens: (compaction ? 42 : reportedTokens) + 12,
         input_tokens_details: { cached_tokens: 0 },
         output_tokens_details: { reasoning_tokens: 0 },
       },
@@ -280,6 +305,13 @@ export async function startPiModel() {
   return {
     url: `http://127.0.0.1:${server.address().port}/v1`,
     evidence: () => [...requests],
+    compaction: (delayMs, failure = false) => {
+      compactionDelay = delayMs
+      compactionFailure = failure
+    },
+    tokens: (value) => {
+      reportedTokens = value
+    },
     delay: (value) => {
       responseDelay = value
     },

@@ -1067,6 +1067,9 @@ function compactionEventKey(
 ): string | null {
   const payload = contextCompactionPayload(meta)
   if (!payload) return null
+  if (typeof payload.eventId === "string" && payload.eventId) {
+    return `call:${payload.eventId}`
+  }
   const nums = ["preTokens", "postTokens", "durationMs"].map((k) => {
     const v = payload[k]
     return typeof v === "number" && Number.isFinite(v) ? v : null
