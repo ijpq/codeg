@@ -49,3 +49,34 @@ export function markOwnedProcessStop(child, reason) {
   entry.state.stopReason ??= reason
   entry.record("stop-requested")
 }
+
+export function captureOwnedProcessLog(child, log) {
+  // Ending stdout does not mean stderr has drained (and vice versa). In
+  // particular a fatal runtime error can be the last write to stderr.
+  child.stdout.pipe(log, { end: false })
+  child.stderr.pipe(log, { end: false })
+  let closeLog
+  const drained = new Promise((resolve) => {
+    closeLog = () => log.end(resolve)
+    child.once("close", closeLog)
+  })
+  return async () => {
+    let timer
+    try {
+      await Promise.race([
+        drained,
+        new Promise((resolve) => {
+          timer = setTimeout(() => {
+            observed.get(child)?.record("output-drain-timeout")
+            child.removeListener("close", closeLog)
+            child.stdout.unpipe(log)
+            child.stderr.unpipe(log)
+            log.end(resolve)
+          }, 3000)
+        }),
+      ])
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+}

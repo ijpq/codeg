@@ -302,6 +302,7 @@ jobs:
             ${{ runner.temp }}/package-verifier-diagnosis/**/owned-process-windows-events.json
             ${{ runner.temp }}/package-verifier-diagnosis/**/scroll-results.json
             ${{ runner.temp }}/package-verifier-diagnosis/**/*-failure.json
+            ${{ runner.temp }}/package-verifier-diagnosis/**/*-pi-multi-provider.json
             ${{ runner.temp }}/package-verifier-diagnosis/**/resources-and-migrations.json
             ${{ runner.temp }}/package-verifier-diagnosis/**/*dependencies.json
           retention-days: 14

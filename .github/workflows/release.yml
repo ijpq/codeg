@@ -1576,6 +1576,7 @@ jobs:
           path: |
             ${{ runner.temp }}/draft-verification/**/verification.json
             ${{ runner.temp }}/draft-verification/**/verification-progress.json
+            ${{ runner.temp }}/draft-verification/**/owned-process-windows-events.json
             ${{ runner.temp }}/draft-verification/**/*.log
             ${{ runner.temp }}/draft-verification/**/*.png
             ${{ runner.temp }}/draft-verification/**/scroll-results.json
@@ -1800,6 +1801,7 @@ jobs:
           path: |
             ${{ runner.temp }}/published-verification/**/verification.json
             ${{ runner.temp }}/published-verification/**/verification-progress.json
+            ${{ runner.temp }}/published-verification/**/owned-process-windows-events.json
             ${{ runner.temp }}/published-verification/**/*.log
             ${{ runner.temp }}/published-verification/**/*.png
             ${{ runner.temp }}/published-verification/**/scroll-results.json

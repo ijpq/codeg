@@ -87,7 +87,7 @@ jobs:
         run: node --test scripts/test-release-draft.mjs
 
       - name: Packaged business composer identity regression
-        run: node --test scripts/test-business-composer-page.mjs scripts/test-windows-ui-profile.mjs
+        run: node --test scripts/test-business-composer-page.mjs scripts/test-windows-ui-profile.mjs scripts/test-owned-process-lifecycle.mjs
 
       - name: Custom Windows CI scope regression
         run: node --test scripts/test-custom-ci-scope.mjs
