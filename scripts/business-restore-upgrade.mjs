@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto"
 import { access, appendFile, writeFile } from "node:fs/promises"
 import { dirname, join } from "node:path"
 import { openBusiness } from "./business-agent-page.mjs"
+import { businessComposer, reloadBusiness } from "./business-composer-page.mjs"
 
 const pause = (ms) => new Promise((done) => setTimeout(done, ms))
 async function until(read, accepts, label) {
@@ -265,11 +266,10 @@ export async function legacyPiComposerPage({
       const marker = `LEGACY_COMPOSER_${label}_${randomUUID()}`
       markers.push(marker)
       agents.set(marker, agent)
-      const input = page
-        .locator('[contenteditable="true"]')
-        .filter({ visible: true })
-        .last()
-      await input.waitFor({ timeout: 90_000 })
+      const input = await businessComposer(page, {
+        conversationId: saved.cid,
+        agent,
+      })
       await recordPageState(`${label}:before-input`)
       await input.fill(marker)
       await input.press("Enter")
@@ -399,7 +399,11 @@ export async function legacyPiComposerPage({
         )
       }
       await send("pi", "after-tab-switch")
-      await page.reload()
+      await reloadBusiness(page, api, {
+        conversationId: saved.cid,
+        folderId: saved.folderId,
+        agent: "pi",
+      })
       await send("pi", "after-reload")
       const live = await api("acp_find_connection_for_conversation", {
         conversationId: saved.cid,

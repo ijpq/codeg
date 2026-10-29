@@ -1,6 +1,21 @@
 # Changelog
 
-## 0.41.2-fix1 — 2026-10-29
+## 0.41.2-fix2 — 2026-10-29
+
+- Preserve the user's local tab selection when React batches it after a remote
+  tab snapshot. Deduplicate saves by their payload instead of dropping the next
+  save effect, so later reloads and clients can recover the selected business.
+- Strengthen packaged Setup and Server composer acceptance: verify the visible
+  business/Agent before sending, establish persisted focus before reload, and
+  retain native requests, exact-once replies and delayed-restore queue checks.
+  This does not wait for native readiness or warm a connection before input.
+- Retain all unpublished recovery, context and runtime-group fixes below.
+  The fix1 draft was blocked by full downloaded-package acceptance; its built
+  packages and failed evidence are not treated as a completed release.
+
+See [release notes](docs/releases/v0.41.2-fix2.md).
+
+## 0.41.2-fix1 — 2026-10-29 (unpublished candidate)
 
 - Rebase onto upstream v0.41.2 while retaining the custom Windows runtime group,
   business features and all unpublished recovery fixes. Revalidate the merged
