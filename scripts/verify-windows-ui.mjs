@@ -15,6 +15,7 @@ import { piMultiProviderPage } from "./pi-multi-provider-page.mjs"
 import { piCapabilityChecks } from "./pi-capability-checks.mjs"
 import { verificationProgress } from "./verification-progress.mjs"
 import {
+  captureOwnedProcessLog,
   markOwnedProcessStop,
   observeOwnedProcess,
 } from "./owned-process-lifecycle.mjs"
@@ -353,8 +354,7 @@ async function startDesktop(installDir, f, name) {
     stdio: ["ignore", "pipe", "pipe"],
   })
   observeOwnedProcess(child, { output, name: `desktop:${name}` })
-  child.stdout.pipe(log)
-  child.stderr.pipe(log)
+  const flushLog = captureOwnedProcessLog(child, log)
   let browser
   try {
     for (let i = 0; i < 120; i++) {
@@ -383,11 +383,11 @@ async function startDesktop(installDir, f, name) {
       () => Boolean(window.__TAURI_INTERNALS__?.invoke),
       { timeout: 30_000 }
     )
-    return { child, browser, page, port, log }
+    return { child, browser, page, port, flushLog }
   } catch (error) {
     await browser?.close().catch(() => {})
     if (child.pid) await stopOwnedProcess(child, "desktop-startup-failed")
-    log.end()
+    await flushLog()
     throw error
   }
 }
@@ -399,7 +399,7 @@ async function stopDesktop(app) {
     await stopOwnedProcess(app.child, "desktop-test-finished")
   }
   await delay(1000)
-  app.log.end()
+  await app.flushLog()
 }
 async function startServer(installation, f, name) {
   progress.record("phase", `server:${name}`)
@@ -418,8 +418,7 @@ async function startServer(installation, f, name) {
     stdio: ["ignore", "pipe", "pipe"],
   })
   observeOwnedProcess(child, { output, name: `server:${name}` })
-  child.stdout.pipe(log)
-  child.stderr.pipe(log)
+  const flushLog = captureOwnedProcessLog(child, log)
   const api = async (command, args = {}) =>
     progress.run(`server:${command}`, async () => {
       const response = await fetch(`http://127.0.0.1:${port}/api/${command}`, {
@@ -440,20 +439,20 @@ async function startServer(installation, f, name) {
       if (child.exitCode !== null) throw Error(`${name} exited`)
       try {
         await api("health")
-        return { child, log, port, token, api }
+        return { child, flushLog, port, token, api }
       } catch {}
       await delay(500)
     }
     throw Error(`${name} did not become ready`)
   } catch (error) {
     await stopOwnedProcess(child, "server-startup-failed")
-    log.end()
+    await flushLog()
     throw error
   }
 }
 async function stopServer(server) {
   await stopOwnedProcess(server.child, "server-test-finished")
-  server.log.end()
+  await server.flushLog()
 }
 function desktopApi(page) {
   return async (command, args = {}) =>
