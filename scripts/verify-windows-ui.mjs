@@ -15,6 +15,10 @@ import { piMultiProviderPage } from "./pi-multi-provider-page.mjs"
 import { piCapabilityChecks } from "./pi-capability-checks.mjs"
 import { verificationProgress } from "./verification-progress.mjs"
 import {
+  markOwnedProcessStop,
+  observeOwnedProcess,
+} from "./owned-process-lifecycle.mjs"
+import {
   isolatedCodegEnv,
   prepareWindowsProfile,
 } from "./windows-ui-profile.mjs"
@@ -289,6 +293,7 @@ async function fixture(name) {
 }
 async function run(command, args, env = process.env) {
   const child = spawn(command, args, { env, stdio: "inherit" })
+  observeOwnedProcess(child, { output, name: "harness-command" })
   try {
     await progress.run(
       `child:${command}`,
@@ -302,7 +307,7 @@ async function run(command, args, env = process.env) {
       8 * 60_000
     )
   } finally {
-    await stopOwnedProcess(child)
+    await stopOwnedProcess(child, "command-finally")
   }
 }
 async function install(setup, path) {
@@ -310,7 +315,8 @@ async function install(setup, path) {
   await run(resolve(setup), ["/S", `/D=${path}`])
   assert.ok((await readFile(join(path, "codeg.exe"))).length > 1_000_000)
 }
-async function stopOwnedProcess(child) {
+async function stopOwnedProcess(child, reason) {
+  markOwnedProcessStop(child, reason)
   if (child.exitCode !== null || child.signalCode !== null) return
   // WebView2 children can exit while taskkill enumerates the tree. Windows
   // then returns 128 even after killing the owned root. Observe that process's
@@ -346,6 +352,7 @@ async function startDesktop(installDir, f, name) {
     cwd: installDir,
     stdio: ["ignore", "pipe", "pipe"],
   })
+  observeOwnedProcess(child, { output, name: `desktop:${name}` })
   child.stdout.pipe(log)
   child.stderr.pipe(log)
   let browser
@@ -379,7 +386,7 @@ async function startDesktop(installDir, f, name) {
     return { child, browser, page, port, log }
   } catch (error) {
     await browser?.close().catch(() => {})
-    if (child.pid) await stopOwnedProcess(child)
+    if (child.pid) await stopOwnedProcess(child, "desktop-startup-failed")
     log.end()
     throw error
   }
@@ -389,7 +396,7 @@ async function stopDesktop(app) {
   try {
     await progress.run("desktop:disconnect", () => app.browser.close(), 15_000)
   } finally {
-    await stopOwnedProcess(app.child)
+    await stopOwnedProcess(app.child, "desktop-test-finished")
   }
   await delay(1000)
   app.log.end()
@@ -410,6 +417,7 @@ async function startServer(installation, f, name) {
     cwd: resolve(installation),
     stdio: ["ignore", "pipe", "pipe"],
   })
+  observeOwnedProcess(child, { output, name: `server:${name}` })
   child.stdout.pipe(log)
   child.stderr.pipe(log)
   const api = async (command, args = {}) =>
@@ -438,13 +446,13 @@ async function startServer(installation, f, name) {
     }
     throw Error(`${name} did not become ready`)
   } catch (error) {
-    await stopOwnedProcess(child)
+    await stopOwnedProcess(child, "server-startup-failed")
     log.end()
     throw error
   }
 }
 async function stopServer(server) {
-  await stopOwnedProcess(server.child)
+  await stopOwnedProcess(server.child, "server-test-finished")
   server.log.end()
 }
 function desktopApi(page) {
