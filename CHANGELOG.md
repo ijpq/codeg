@@ -1,6 +1,23 @@
 # Changelog
 
-## 0.41.2-fix4 — 2026-10-29
+## 0.41.2-fix5 — 2026-10-29
+
+- Resume the Server multi-provider page check from its persisted business folder
+  after process restart, instead of referencing a variable scoped to the earlier
+  running process. The fix4 downloaded-package gate caught this harness error
+  after 66 checks; its draft was never published and its evidence is retained.
+- Enable undefined-variable checking for plain JavaScript release/test scripts.
+  The TypeScript preset had disabled this rule globally while tsc did not check
+  those scripts. Ordinary CI now tests the actual harness and the failed lexical
+  scope pattern, before any Windows package build.
+- Retain all application recovery, multi-provider, business context, Pi/runtime,
+  delivery, duration, artifact, Office, native Plan/Goal and scroll fixes. Both
+  Windows packages still require same-commit installation, upgrade, real-page
+  replies and post-publication download verification; no failed tag is moved.
+
+See [release notes](docs/releases/v0.41.2-fix5.md).
+
+## 0.41.2-fix4 — 2026-10-29 (unpublished candidate)
 
 - Retain the complete unpublished recovery, draft-identity and multi-provider
   fixes, with independent business/native Agent bindings and durable queues.
