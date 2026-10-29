@@ -7,7 +7,10 @@ import { toast } from "sonner"
 import { useAcpActions } from "@/contexts/acp-connections-context"
 import { useTaskContext } from "@/contexts/task-context"
 import { useConnection, type UseConnectionReturn } from "@/hooks/use-connection"
-import { extractAppCommandError } from "@/lib/app-error"
+import {
+  extractAppCommandError,
+  toErrorMessage as normalizeErrorMessage,
+} from "@/lib/app-error"
 import { notify } from "@/lib/notify"
 import { isNetworkOrOfflineError } from "@/lib/network-error"
 import { isSessionRestorePendingError } from "@/lib/session-restore"
@@ -120,11 +123,6 @@ export function shouldReleaseSurfaceOnUnmount(args: {
   transientUnmount?: boolean
 }): boolean {
   return !args.transientUnmount
-}
-
-function normalizeErrorMessage(error: unknown): string {
-  if (error instanceof Error) return error.message
-  return String(error)
 }
 
 function isExpectedConnectError(error: unknown): boolean {

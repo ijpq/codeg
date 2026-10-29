@@ -22,7 +22,10 @@ import {
   inferLiveToolName,
 } from "@/lib/tool-call-normalization"
 import { isTurnInProgressRejection } from "@/lib/turn-busy"
-import { extractAppCommandError } from "@/lib/app-error"
+import {
+  extractAppCommandError,
+  toErrorMessage as normalizeErrorMessage,
+} from "@/lib/app-error"
 import {
   toolStatusTerminal,
   toolStatusUnsettled,
@@ -3979,11 +3982,6 @@ function getAffectedKey(action: Action): string | null {
   if (action.type === "STREAM_BATCH") return null
   if ("contextKey" in action) return action.contextKey
   return null
-}
-
-function normalizeErrorMessage(error: unknown): string {
-  if (error instanceof Error) return error.message
-  return String(error)
 }
 
 /** A deterministic pre-accept failure: unlike a timeout/network loss, these

@@ -2094,6 +2094,91 @@ describe("prompt connection loss classification", () => {
 
 describe("persisted business readiness across engines and transports", () => {
   it.each([
+    ["codex", false],
+    ["codex", true],
+    ["pi", false],
+    ["pi", true],
+  ] as const)(
+    "%s starts an empty conversation after a structured Web restore rejection (detail=%s)",
+    async (agent, withDetail) => {
+      const missing = "conversation 42 has no external session to restore"
+      h.acpRestoreConversation.mockRejectedValueOnce(
+        withDetail
+          ? {
+              code: "internal_error",
+              message: "ACP protocol error",
+              detail: missing,
+            }
+          : { code: "internal_error", message: missing }
+      )
+      await mountProvider()
+      await act(async () => {
+        await h.actions!.connect("business-42", agent, "/tmp/x", undefined, 42)
+      })
+      expect(h.acpConnect).toHaveBeenCalledTimes(1)
+      expect(h.store!.getConnection("business-42")?.connectionId).toBe(
+        "spawned-conn"
+      )
+      const handlers = latestAttachHandlers()
+      emitAcpEvent(handlers, {
+        seq: 1,
+        connection_id: "spawned-conn",
+        type: "session_started",
+        session_id: "new-native-session",
+      })
+      h.denormalizeSnapshot.mockReturnValue({
+        ...snapshotBase(),
+        sessionId: "new-native-session",
+        selectorsReady: true,
+        codegMcpAvailable: true,
+        mcpServerCount: 1,
+      })
+      hydrateSnapshot(handlers, {
+        connection_id: "spawned-conn",
+        external_id: "new-native-session",
+        event_seq: 1,
+      } as unknown as LiveSessionSnapshot)
+      act(() => handlers.onReplay([], 1))
+      await act(async () => {
+        await h.actions!.sendPrompt(
+          "business-42",
+          [{ type: "text", text: "你好" }],
+          { folderId: 1, conversationId: 42, clientMessageId: "new-web-once" }
+        )
+      })
+      expect(h.acpPrompt).toHaveBeenCalledTimes(1)
+      expect(h.acpPrompt.mock.calls[0][4]).toBe("new-web-once")
+    }
+  )
+
+  it.each(["codex", "pi"] as const)(
+    "%s never replaces saved history on a structured restore failure",
+    async (agent) => {
+      h.acpRestoreConversation.mockRejectedValueOnce({
+        code: "internal_error",
+        message: "ACP protocol error",
+        detail: "conversation 42 has no external session to restore",
+      })
+      await mountProvider()
+      await act(async () => {
+        await expect(
+          h.actions!.connect(
+            "business-42",
+            agent,
+            "/tmp/x",
+            "saved-session",
+            42
+          )
+        ).rejects.toThrow()
+      })
+      expect(h.acpConnect).not.toHaveBeenCalled()
+      expect(h.store!.getConnectError("business-42")?.detail).toContain(
+        "conversation 42 has no external session to restore"
+      )
+    }
+  )
+
+  it.each([
     ["codex", true],
     ["codex", false],
     ["pi", true],

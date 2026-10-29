@@ -25,6 +25,10 @@ import {
   stageInterruptedHandoff,
   finishInterruptedHandoff,
 } from "./business-agent-page.mjs"
+import {
+  prepareLegacyPiBusiness,
+  legacyPiComposerPage,
+} from "./business-restore-upgrade.mjs"
 const options = Object.fromEntries(
   process.argv.slice(2).reduce((pairs, arg, i, all) => {
     if (arg.startsWith("--")) pairs.push([arg.slice(2), all[i + 1]])
@@ -55,14 +59,14 @@ const heartbeat = setInterval(
 heartbeat.unref()
 const watchdog = setTimeout(() => {
   report.passed = false
-  report.errors.push("Windows UI suite exceeded its 20 minute deadline")
+  report.errors.push("Windows UI suite exceeded its 25 minute deadline")
   progress.record("failed", "suite deadline")
   writeFileSync(
     join(output, "verification.json"),
     JSON.stringify(report, null, 2)
   )
   process.exit(1)
-}, 20 * 60_000)
+}, 25 * 60_000)
 watchdog.unref()
 const delay = (ms) => new Promise((done) => setTimeout(done, ms))
 async function reservePort() {
@@ -1346,7 +1350,87 @@ async function nativeDraftGoalPage(page, api, name) {
     throw error
   }
 }
+async function legacyBusinessUpgradeChecks() {
+  if (!options["legacy-previous"] && !options["legacy-previous-server"]) return
+  assert.ok(
+    goalModel && piModel,
+    "Old business verification requires native tools"
+  )
+  for (const name of ["setup", "server-web"]) {
+    const f = await fixture(`legacy-business-${name}`)
+    await enableNativeAgent(f)
+    const installation = join(output, `legacy-${name}-installation`)
+    if (name === "setup")
+      await install(options["legacy-previous"], installation)
+    const previous =
+      name === "setup"
+        ? await startDesktop(installation, f, "legacy-setup-previous")
+        : await startServer(
+            options["legacy-previous-server"],
+            f,
+            "legacy-server-previous"
+          )
+    let saved
+    try {
+      const api = name === "setup" ? desktopApi(previous.page) : previous.api
+      const folder = await importAndOpen(api, f)
+      saved = await prepareLegacyPiBusiness({
+        api,
+        f,
+        folderId: folder.folder_id,
+        goalModel,
+      })
+    } finally {
+      if (name === "setup") await stopDesktop(previous)
+      else await stopServer(previous)
+    }
+    if (name === "setup") await install(options.setup, installation)
+    for (const restarted of [false, true]) {
+      const phase = restarted ? "restart" : "upgrade"
+      const current =
+        name === "setup"
+          ? await startDesktop(installation, f, `legacy-setup-${phase}`)
+          : await startServer(options.server, f, `legacy-server-${phase}`)
+      let browser
+      try {
+        let page = current.page
+        const api = name === "setup" ? desktopApi(page) : current.api
+        if (name === "server-web") {
+          browser = await chromium.launch({ channel: "msedge", headless: true })
+          const context = await browser.newContext()
+          await context.addInitScript((token) => {
+            if (window === window.top)
+              localStorage.setItem("codeg_token", token)
+          }, current.token)
+          page = await context.newPage()
+          await page.goto(`http://127.0.0.1:${current.port}/workspace`)
+        }
+        await legacyPiComposerPage({
+          page,
+          api,
+          f,
+          saved,
+          goalModel,
+          piModel,
+          report,
+          name,
+          output,
+          restarted,
+        })
+        assert.equal(
+          await readFile(join(f.data, "upgrade-retention-marker.txt"), "utf8"),
+          f.id
+        )
+      } finally {
+        await browser?.close()
+        if (name === "setup") await stopDesktop(current)
+        else await stopServer(current)
+      }
+    }
+  }
+}
 try {
+  await legacyBusinessUpgradeChecks()
   if (goalModel) {
     const fresh = await fixture("setup-fresh")
     const installation = join(output, "fresh-installation")
