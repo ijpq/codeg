@@ -1,5 +1,7 @@
 import { appendFileSync } from "node:fs"
+import { execFileSync } from "node:child_process"
 import { join } from "node:path"
+import { fileURLToPath } from "node:url"
 
 const observed = new WeakMap()
 
@@ -48,6 +50,37 @@ export function markOwnedProcessStop(child, reason) {
   }
   entry.state.stopReason ??= reason
   entry.record("stop-requested")
+}
+
+export function interruptOwnedProcess(child) {
+  const entry = observed.get(child)
+  if (!entry || !entry.state.stopReason)
+    throw Error("Abrupt interruption requires an explicitly stopped owned root")
+  const proof = JSON.parse(
+    execFileSync(
+      "powershell.exe",
+      [
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        fileURLToPath(
+          new URL("./interrupt-owned-process.ps1", import.meta.url)
+        ),
+        "-RootProcessId",
+        String(child.pid),
+        "-ExpectedExecutable",
+        child.spawnfile,
+        "-OwnedStartedAt",
+        entry.state.startedAt,
+      ],
+      { encoding: "utf8", timeout: 30_000 }
+    )
+  )
+  if (!proof.suspendedRoot || !proof.rootExited || proof.rootPid !== child.pid)
+    throw Error("Owned root interruption was not confirmed")
+  entry.record("abrupt-root-interruption", proof)
 }
 
 export function captureOwnedProcessLog(child, log) {

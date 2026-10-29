@@ -16,6 +16,7 @@ import { piCapabilityChecks } from "./pi-capability-checks.mjs"
 import { verificationProgress } from "./verification-progress.mjs"
 import {
   captureOwnedProcessLog,
+  interruptOwnedProcess,
   markOwnedProcessStop,
   observeOwnedProcess,
 } from "./owned-process-lifecycle.mjs"
@@ -316,7 +317,7 @@ async function install(setup, path) {
   await run(resolve(setup), ["/S", `/D=${path}`])
   assert.ok((await readFile(join(path, "codeg.exe"))).length > 1_000_000)
 }
-async function stopOwnedProcess(child, reason) {
+async function stopOwnedProcess(child, reason, abrupt = false) {
   markOwnedProcessStop(child, reason)
   if (child.exitCode !== null || child.signalCode !== null) return
   // WebView2 children can exit while taskkill enumerates the tree. Windows
@@ -326,15 +327,20 @@ async function stopOwnedProcess(child, reason) {
     let killError
     const onExit = () => {
       clearTimeout(timer)
-      done()
+      if (abrupt && killError) fail(killError)
+      else done()
     }
-    const timer = setTimeout(() => {
-      child.removeListener("exit", onExit)
-      fail(killError ?? Error(`Owned process ${child.pid} did not exit`))
-    }, 10_000)
+    const timer = setTimeout(
+      () => {
+        child.removeListener("exit", onExit)
+        fail(killError ?? Error(`Owned process ${child.pid} did not exit`))
+      },
+      abrupt ? 40_000 : 10_000
+    )
     child.once("exit", onExit)
     try {
-      execFileSync("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"])
+      if (abrupt) interruptOwnedProcess(child)
+      else execFileSync("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"])
     } catch (error) {
       killError = error
     }
@@ -391,12 +397,16 @@ async function startDesktop(installDir, f, name) {
     throw error
   }
 }
-async function stopDesktop(app) {
+async function stopDesktop(app, abrupt = false) {
   progress.record("phase", "stop isolated desktop")
   try {
     await progress.run("desktop:disconnect", () => app.browser.close(), 15_000)
   } finally {
-    await stopOwnedProcess(app.child, "desktop-test-finished")
+    await stopOwnedProcess(
+      app.child,
+      abrupt ? "desktop-interrupted-handoff" : "desktop-test-finished",
+      abrupt
+    )
   }
   await delay(1000)
   await app.flushLog()
@@ -450,8 +460,12 @@ async function startServer(installation, f, name) {
     throw error
   }
 }
-async function stopServer(server) {
-  await stopOwnedProcess(server.child, "server-test-finished")
+async function stopServer(server, abrupt = false) {
+  await stopOwnedProcess(
+    server.child,
+    abrupt ? "server-interrupted-handoff" : "server-test-finished",
+    abrupt
+  )
   await server.flushLog()
 }
 function desktopApi(page) {
@@ -1661,7 +1675,7 @@ try {
     // turn this interruption test into an ordinary initialization timeout.
   } finally {
     await upgradedErrors.stop()
-    await stopDesktop(app)
+    await stopDesktop(app, Boolean(setupInterrupted))
   }
   if (setupInterrupted)
     await writeFile(setupInterrupted.flag, "resume same durable request")
@@ -1944,7 +1958,7 @@ try {
   } finally {
     await serverErrors?.stop()
     await browser?.close()
-    await stopServer(server)
+    await stopServer(server, Boolean(serverInterrupted))
   }
   if (serverInterrupted)
     await writeFile(serverInterrupted.flag, "resume same durable request")
