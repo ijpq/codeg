@@ -73,6 +73,15 @@ const eslintConfig = defineConfig([
     },
   },
   {
+    // TypeScript's preset disables no-undef globally because tsc checks TS.
+    // Node release harnesses are plain JS: check their lexical bindings before
+    // a missing variable can abort a downloaded-package restart scenario.
+    files: ["scripts/**/*.{js,cjs,mjs}"],
+    rules: {
+      "no-undef": "error",
+    },
+  },
+  {
     // Conversation render path: the aggregate workspace hook subscribes to
     // the high-frequency fileTabs slice, so any consumer here would
     // re-render on every keystroke / watcher reload in the file editor.

@@ -1994,7 +1994,7 @@ try {
         page,
         api: restartedServer.api,
         f: s,
-        folderId: conversation.folder_id,
+        folderId: serverPiProviders.folderId,
         piModel,
         piOpusModel,
         report,
