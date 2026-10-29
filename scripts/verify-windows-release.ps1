@@ -7,6 +7,7 @@ param(
   [switch]$RequirePublished
 )
 $ErrorActionPreference = 'Stop'
+$LegacyBusinessTag = 'v0.40.0-fix6'
 $version = $ReleaseTag.TrimStart('v')
 $setupName = "codeg_${version}_x64-setup.exe"
 $expectedNames = @($setupName, "$setupName.sha256", 'codeg-server-windows-x64.zip', 'codeg-server-windows-x64.zip.sha256') | Sort-Object
@@ -70,6 +71,19 @@ $oldServerHash=((Get-Content (Join-Path $previous 'codeg-server-windows-x64.zip.
 if ((Get-FileHash (Join-Path $previous 'codeg-server-windows-x64.zip') -Algorithm SHA256).Hash.ToLower() -ne $oldServerHash) { throw 'Server upgrade baseline checksum mismatch' }
 Expand-Archive (Join-Path $previous 'codeg-server-windows-x64.zip') (Join-Path $previous 'server')
 $previousServer=Join-Path $previous 'server/codeg-server-windows-x64'
+$legacy = Join-Path $Destination 'legacy-business-release'
+New-Item -ItemType Directory -Force $legacy | Out-Null
+$legacyVersion = $LegacyBusinessTag.TrimStart('v')
+$legacySetup = "codeg_${legacyVersion}_x64-setup.exe"
+gh release download $LegacyBusinessTag --repo $Repository --dir $legacy --pattern $legacySetup --pattern "$legacySetup.sha256" --pattern 'codeg-server-windows-x64.zip' --pattern 'codeg-server-windows-x64.zip.sha256'
+if ($LASTEXITCODE -ne 0) { throw 'Could not download legacy business upgrade baseline' }
+foreach ($name in @($legacySetup, 'codeg-server-windows-x64.zip')) {
+  $path = Join-Path $legacy $name
+  $hash = ((Get-Content "$path.sha256" -Raw).Trim() -split '\s+')[0].ToLower()
+  if ($hash -notmatch '^[a-f0-9]{64}$' -or (Get-FileHash $path -Algorithm SHA256).Hash.ToLower() -ne $hash) { throw "Legacy baseline checksum mismatch: $name" }
+}
+Expand-Archive (Join-Path $legacy 'codeg-server-windows-x64.zip') (Join-Path $legacy 'server')
+$legacyServer = Join-Path $legacy 'server/codeg-server-windows-x64'
 $nativeTools = Join-Path $Destination 'native-agent-tools'
 npm install --prefix $nativeTools --global --include=optional --ignore-scripts --no-audit --no-fund '@agentclientprotocol/codex-acp@2.2.2' '@agentclientprotocol/claude-agent-acp@0.94.0'
 if ($LASTEXITCODE -ne 0) { throw 'Isolated ACP installation failed' }
@@ -77,7 +91,7 @@ python -B scripts/prepare-office-preview-test.py --output $nativeTools
 if ($LASTEXITCODE -ne 0) { throw 'Isolated Office converter checksum verification failed' }
 node scripts/test-pi-service-tier.mjs --output (Join-Path $Destination 'pi-service-tier') --pi (Join-Path $root 'pi-runtime/pi.cmd') --adapter (Join-Path $root 'pi-runtime/node_modules/pi-acp/dist/index.js')
 if ($LASTEXITCODE -ne 0) { throw 'Packaged Pi service-tier protocol verification failed' }
-node scripts/verify-windows-ui.mjs --setup (Join-Path $Destination $setupName) --previous (Join-Path $previous $oldSetup) --server $root --previous-server $previousServer --output (Join-Path $Destination 'ui') --version $version --native-tools $nativeTools
+node scripts/verify-windows-ui.mjs --setup (Join-Path $Destination $setupName) --previous (Join-Path $previous $oldSetup) --server $root --previous-server $previousServer --legacy-previous (Join-Path $legacy $legacySetup) --legacy-previous-server $legacyServer --output (Join-Path $Destination 'ui') --version $version --native-tools $nativeTools
 if ($LASTEXITCODE -ne 0) { throw 'Setup upgrade/startup or actual Server/Desktop UI verification failed' }
 @{ tag=$ReleaseTag; commit=$env:GITHUB_SHA; published=(-not $release.isDraft); assets=$evidence; installation='passed'; server_startup='passed'; setup_startup='passed'; upgrade='passed'; actual_ui='passed'; installed_files=$manifest.files.Count } | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $Destination 'verification.json')
 Get-Content (Join-Path $Destination 'verification.json')

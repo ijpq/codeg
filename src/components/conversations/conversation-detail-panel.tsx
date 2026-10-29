@@ -3345,6 +3345,31 @@ const ConversationTabView = memo(function ConversationTabView({
                 <div
                   className="shrink-0 border-b px-3 py-2 sm:px-4"
                   data-business-agent-toolbar
+                  data-session-readiness={JSON.stringify({
+                    schemaVersion: 1,
+                    contextKey: tabId,
+                    conversationId: dbConversationId,
+                    selectedAgent,
+                    expectedSessionId: externalId ?? null,
+                    expectedWorkingDir: workingDirForConnection ?? null,
+                    connectionId: conn.connectionId,
+                    connectedAgent: conn.agentType,
+                    connectedSessionId: conn.sessionId,
+                    connectedConversationId: conn.conversationId,
+                    connectedWorkingDir: conn.connectedWorkingDir ?? null,
+                    status: connStatus,
+                    promptReady: conn.promptReady,
+                    selectorsReady: conn.selectorsReady,
+                    codegMcpAvailable: conn.codegMcpAvailable,
+                    restorePending,
+                    businessPending,
+                    businessSwitchStatus: business.state?.switchStatus ?? null,
+                    restoredIdentityReady,
+                    connectionReady,
+                    webConnectionState: webConnState,
+                    runtimeSyncState,
+                    queueSteerInFlight,
+                  })}
                 >
                   <BusinessAgentControl
                     key={dbConversationId}

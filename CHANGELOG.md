@@ -1,6 +1,27 @@
 # Changelog
 
-## 0.41.1-fix2 — 2026-10-28
+## 0.41.1-fix3 — 2026-10-29
+
+- Read structured Web and desktop restore errors through the shared error
+  decoder. Empty business conversations can reach session creation; saved
+  sessions retain readable failures and are never silently replaced.
+- Retain the verified business/session binding, active-turn cursor and complete
+  rule handoff fixes from the unpublished fix1/fix2 candidates.
+- Add separate native-runtime upgrades from fix6 data already switched from
+  Codex to Pi, in both Setup and Server. Exercise input queued during delayed
+  restore, actual replies, subsequent rounds, focus/reload/disconnect, two-way
+  handoff and process restart without a programmatic restore warm-up.
+- Record the installed page's actual identity/readiness gates and redacted
+  persistent-queue states before and after recovery; require the same waiting
+  message ID to reach the selected engine once and finish with an empty queue.
+- Keep fix4 upgrade/whole-group rollback and all prior business, Pi, delivery,
+  duration, Office, native Plan/Goal and virtualized-scroll acceptance. Publish
+  only after both downloaded packages pass actual-composer acceptance; retain
+  failed draft evidence instead of treating successful builds as acceptance.
+
+See [release notes](docs/releases/v0.41.1-fix3.md).
+
+## 0.41.1-fix2 — 2026-10-28 (unpublished candidate)
 
 - Repair the verified business binding when atomic restore attaches to an active
   first turn, so subsequent composer messages can execute after it completes.
@@ -15,7 +36,7 @@
 
 See [release notes](docs/releases/v0.41.1-fix2.md).
 
-## 0.41.1-fix1 — 2026-10-28
+## 0.41.1-fix1 — 2026-10-28 (unpublished candidate)
 
 - Rebase the Windows fork onto upstream v0.41.1, retaining the released business
   Agent, Pi, external delivery, timing, artifacts, Office review and scroll fixes.
