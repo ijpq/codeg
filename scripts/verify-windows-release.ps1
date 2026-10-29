@@ -91,7 +91,11 @@ python -B scripts/prepare-office-preview-test.py --output $nativeTools
 if ($LASTEXITCODE -ne 0) { throw 'Isolated Office converter checksum verification failed' }
 node scripts/test-pi-service-tier.mjs --output (Join-Path $Destination 'pi-service-tier') --pi (Join-Path $root 'pi-runtime/pi.cmd') --adapter (Join-Path $root 'pi-runtime/node_modules/pi-acp/dist/index.js')
 if ($LASTEXITCODE -ne 0) { throw 'Packaged Pi service-tier protocol verification failed' }
-node scripts/verify-windows-ui.mjs --setup (Join-Path $Destination $setupName) --previous (Join-Path $previous $oldSetup) --server $root --previous-server $previousServer --legacy-previous (Join-Path $legacy $legacySetup) --legacy-previous-server $legacyServer --output (Join-Path $Destination 'ui') --version $version --native-tools $nativeTools
-if ($LASTEXITCODE -ne 0) { throw 'Setup upgrade/startup or actual Server/Desktop UI verification failed' }
+try {
+  node scripts/verify-windows-ui.mjs --setup (Join-Path $Destination $setupName) --previous (Join-Path $previous $oldSetup) --server $root --previous-server $previousServer --legacy-previous (Join-Path $legacy $legacySetup) --legacy-previous-server $legacyServer --output (Join-Path $Destination 'ui') --version $version --native-tools $nativeTools
+  if ($LASTEXITCODE -ne 0) { throw 'Setup upgrade/startup or actual Server/Desktop UI verification failed' }
+} finally {
+  & "$PSScriptRoot/collect-owned-process-events.ps1" -EvidenceDirectory (Join-Path $Destination 'ui')
+}
 @{ tag=$ReleaseTag; commit=$env:GITHUB_SHA; published=(-not $release.isDraft); assets=$evidence; installation='passed'; server_startup='passed'; setup_startup='passed'; upgrade='passed'; actual_ui='passed'; installed_files=$manifest.files.Count } | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $Destination 'verification.json')
 Get-Content (Join-Path $Destination 'verification.json')

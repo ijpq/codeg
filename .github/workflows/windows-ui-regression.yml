@@ -39,6 +39,14 @@ on:
         description: Preflight the harness against unpublished fix5 assets; not fix6 acceptance
         type: boolean
         default: false
+      diagnose_release_tag:
+        description: Read-only diagnosis of existing Windows packages; requires their original Release run ID
+        type: string
+        default: ""
+      diagnose_release_run:
+        description: Original Release workflow run containing both successful Windows builds
+        type: string
+        default: ""
 env:
   CARGO_BUILD_JOBS: 1
   RUST_BACKTRACE: short
@@ -57,9 +65,9 @@ jobs:
         with:
           python-version: "3.12"
       - name: Verify isolated profiles with the Windows Known Folder API
-        run: node --test scripts/test-windows-ui-profile.mjs scripts/test-office-test-runtime.mjs scripts/test-verification-progress.mjs scripts/test-business-composer-page.mjs
+        run: node --test scripts/test-windows-ui-profile.mjs scripts/test-office-test-runtime.mjs scripts/test-verification-progress.mjs scripts/test-business-composer-page.mjs scripts/test-owned-process-lifecycle.mjs
   setup-ui:
-    if: ${{ !inputs.diagnose_fix2 && !inputs.diagnose_fix5 && !inputs.diagnose_allocation }}
+    if: ${{ !inputs.diagnose_fix2 && !inputs.diagnose_fix5 && !inputs.diagnose_allocation && !inputs.diagnose_release_tag }}
     runs-on: windows-2022
     permissions:
       contents: read
@@ -232,7 +240,7 @@ jobs:
             ${{ runner.temp }}/ui-evidence/**/*.png
           retention-days: 14
   diagnose-fix5:
-    if: inputs.diagnose_fix5
+    if: inputs.diagnose_fix5 || inputs.diagnose_release_tag != ''
     needs: profile-paths
     runs-on: windows-2022
     permissions:
@@ -241,6 +249,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
@@ -250,41 +260,50 @@ jobs:
         with:
           python-version: "3.12"
       - run: pnpm install --frozen-lockfile
-      - name: Preflight the complete suite with pinned unpublished fix5 packages
+      - name: Diagnose the complete suite with source-pinned existing packages
         timeout-minutes: 30
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          DIAGNOSTIC_TAG: ${{ inputs.diagnose_release_tag }}
+          DIAGNOSTIC_RUN: ${{ inputs.diagnose_release_run }}
         run: |
           $ErrorActionPreference='Stop'
-          $source='db14cf8a6dcf4df5fe28006740474f437127967d'
-          $run=gh api repos/$env:GITHUB_REPOSITORY/actions/runs/40612364134 | ConvertFrom-Json
-          if ($LASTEXITCODE -ne 0 -or $run.head_sha -ne $source) { throw 'Diagnostic package workflow source mismatch' }
-          $jobs=gh api repos/$env:GITHUB_REPOSITORY/actions/runs/40612364134/jobs | ConvertFrom-Json
+          $tag=if ($env:DIAGNOSTIC_TAG) { $env:DIAGNOSTIC_TAG } else { 'v0.40.0-fix5' }
+          $runId=if ($env:DIAGNOSTIC_TAG) { $env:DIAGNOSTIC_RUN } else { '40612364134' }
+          if ($tag -notmatch '^v\d+\.\d+\.\d+-fix\d+$' -or $runId -notmatch '^\d+$') { throw 'Invalid diagnostic tag or original run ID' }
+          $source=git rev-parse "$tag^{}"
+          if ($LASTEXITCODE -ne 0 -or $source -notmatch '^[a-f0-9]{40}$') { throw 'Cannot resolve original package tag' }
+          git diff --exit-code $source HEAD -- src src-tauri/src src-tauri/Cargo.toml src-tauri/Cargo.lock src-tauri/tauri.conf.json public vendor i18n package.json pnpm-lock.yaml next.config.ts
+          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic application source differs from the pinned packages' }
+          $run=gh api repos/$env:GITHUB_REPOSITORY/actions/runs/$runId | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $run.head_sha -ne $source -or $run.path -ne '.github/workflows/release.yml') { throw 'Diagnostic package workflow source mismatch' }
+          $jobs=gh api "repos/$env:GITHUB_REPOSITORY/actions/runs/$runId/jobs?per_page=100" | ConvertFrom-Json
           if ($LASTEXITCODE -ne 0) { throw 'Cannot verify diagnostic build provenance' }
           foreach ($name in @('Build Windows x64','Server Windows x64')) {
             if (-not ($jobs.jobs | Where-Object { $_.name -eq $name -and $_.conclusion -eq 'success' })) { throw 'Diagnostic binary build did not pass' }
           }
-          gh run download 40612364134 --repo $env:GITHUB_REPOSITORY --name release-windows-setup-evidence --dir setup-evidence
+          gh run download $runId --repo $env:GITHUB_REPOSITORY --name release-windows-setup-evidence --dir setup-evidence
           if ($LASTEXITCODE -ne 0) { throw 'Pinned Setup manifest download failed' }
           # Source and verifier identities remain separate in every report.
           # This does not validate or publish the newer application commit.
           $env:CODEG_VERIFIER_SHA=$env:GITHUB_SHA
           $env:GITHUB_SHA=$source
-          ./scripts/verify-windows-release.ps1 -ReleaseTag v0.40.0-fix5 -Repository $env:GITHUB_REPOSITORY -Destination "$env:RUNNER_TEMP/fix5-verifier-diagnosis" -SetupManifest setup-evidence/payload.json
+          ./scripts/verify-windows-release.ps1 -ReleaseTag $tag -Repository $env:GITHUB_REPOSITORY -Destination "$env:RUNNER_TEMP/package-verifier-diagnosis" -SetupManifest setup-evidence/payload.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: diagnostic-fix5-verifier-evidence
+          name: diagnostic-package-verifier-evidence
           path: |
-            ${{ runner.temp }}/fix5-verifier-diagnosis/**/verification.json
-            ${{ runner.temp }}/fix5-verifier-diagnosis/**/verification-progress.json
-            ${{ runner.temp }}/fix5-verifier-diagnosis/**/*.log
-            ${{ runner.temp }}/fix5-verifier-diagnosis/**/*.png
-            ${{ runner.temp }}/fix5-verifier-diagnosis/**/scroll-results.json
-            ${{ runner.temp }}/fix5-verifier-diagnosis/**/*-failure.json
-            ${{ runner.temp }}/fix5-verifier-diagnosis/**/resources-and-migrations.json
-            ${{ runner.temp }}/fix5-verifier-diagnosis/**/*dependencies.json
+            ${{ runner.temp }}/package-verifier-diagnosis/**/verification.json
+            ${{ runner.temp }}/package-verifier-diagnosis/**/verification-progress.json
+            ${{ runner.temp }}/package-verifier-diagnosis/**/*.log
+            ${{ runner.temp }}/package-verifier-diagnosis/**/*.png
+            ${{ runner.temp }}/package-verifier-diagnosis/**/owned-process-windows-events.json
+            ${{ runner.temp }}/package-verifier-diagnosis/**/scroll-results.json
+            ${{ runner.temp }}/package-verifier-diagnosis/**/*-failure.json
+            ${{ runner.temp }}/package-verifier-diagnosis/**/resources-and-migrations.json
+            ${{ runner.temp }}/package-verifier-diagnosis/**/*dependencies.json
           retention-days: 14
   diagnose-fix2:
     if: inputs.diagnose_fix2
