@@ -23,6 +23,10 @@ export async function startPiModel() {
     const isChild = latestUser.includes("PI_CHILD_TASK")
     const tools = body.tools ?? []
     requests.push({
+      composerMarker:
+        [...latestUser.matchAll(/LEGACY_COMPOSER_[a-z-]+_[a-f0-9-]{36}/g)].at(
+          -1
+        )?.[0] ?? null,
       model: body.model,
       tier: body.service_tier ?? null,
       effort: body.reasoning?.effort ?? null,

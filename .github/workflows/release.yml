@@ -1562,7 +1562,7 @@ jobs:
           name: release-windows-setup-evidence
           path: setup-evidence
       - name: Download, verify, install, and start packages
-        timeout-minutes: 30
+        timeout-minutes: 35
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -1785,7 +1785,7 @@ jobs:
           name: release-windows-setup-evidence
           path: setup-evidence
       - name: Verify official assets after publication
-        timeout-minutes: 30
+        timeout-minutes: 35
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}

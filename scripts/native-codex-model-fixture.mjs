@@ -38,7 +38,14 @@ export async function startGoalModel() {
     requests++
     if (businessMode) {
       const input = JSON.stringify(body.input ?? [])
+      const latestUser = JSON.stringify(
+        (body.input ?? []).findLast((item) => item.role === "user") ?? {}
+      )
       businessRequests.push({
+        composerMarker:
+          [...latestUser.matchAll(/LEGACY_COMPOSER_[a-z-]+_[a-f0-9-]{36}/g)].at(
+            -1
+          )?.[0] ?? null,
         taskState: input.includes("BUSINESS_VERIFIED_STATE"),
         memory: input.includes("BUSINESS_VERIFIED_MEMORY"),
         skill: input.includes("BUSINESS_SHARED_SKILL_BODY"),
