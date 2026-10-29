@@ -98,7 +98,7 @@ pub(crate) fn apply(env: &mut BTreeMap<String, String>) {
         .get("PI_ACP_PI_COMMAND")
         .cloned()
         .or_else(|| std::env::var("PI_ACP_PI_COMMAND").ok());
-    tracing::info!(runtime_source=%root.display(),pi_command=?selected_pi,bundled_pi_version="1.4.0",adapter_version="0.0.34-codeg.2","[Pi] runtime group and selected Pi command; native identity diagnostics verify custom runtime versions");
+    tracing::info!(runtime_source=%root.display(),pi_command=?selected_pi,bundled_pi_version="1.4.0",adapter_version="0.0.34-codeg.3","[Pi] runtime group and selected Pi command; native identity diagnostics verify custom runtime versions");
 }
 
 #[cfg(test)]
@@ -112,16 +112,16 @@ mod tests {
         std::fs::create_dir_all(package.join("dist")).unwrap();
         std::fs::write(
             package.join("package.json"),
-            r#"{"name":"pi-acp","version":"0.0.34-codeg.2"}"#,
+            r#"{"name":"pi-acp","version":"0.0.34-codeg.3"}"#,
         )
         .unwrap();
         assert_eq!(
             adapter_version(&root.join("pi-acp.cmd")).as_deref(),
-            Some("0.0.34-codeg.2")
+            Some("0.0.34-codeg.3")
         );
         assert_eq!(
             adapter_version(&package.join("dist/index.js")).as_deref(),
-            Some("0.0.34-codeg.2")
+            Some("0.0.34-codeg.3")
         );
         assert_eq!(
             adapter_version(&root.join("unrelated-custom-wrapper.cmd")),

@@ -60,6 +60,25 @@ pub struct SessionMessages {
     pub items: Vec<SessionMessageItem>,
 }
 
+/// Original protocol-neutral prose, not a summary. Byte ranges make long turns
+/// resumable without truncation, raw tool payloads or full-history loading.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionHistoryItem {
+    pub sequence: i64,
+    pub role: String,
+    pub text: String,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub total_bytes: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionHistoryPage {
+    pub snapshot_through: i64,
+    pub items: Vec<SessionHistoryItem>,
+    pub next_cursor: Option<String>,
+}
+
 /// The resolved session description handed back to the `get_session_info` tool.
 /// `found == false` is a soft "no such session" result the LLM reads (not an
 /// error), produced via [`SessionInfo::not_found`].
@@ -101,6 +120,8 @@ pub struct SessionInfo {
     pub stats: Option<SessionStats>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub messages: Option<SessionMessages>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub history_page: Option<SessionHistoryPage>,
     /// Human-readable note for a not-found result, or a partial one (e.g. the
     /// transcript parse timed out so `messages` is absent). `None` on a clean
     /// full result.
@@ -136,6 +157,21 @@ pub trait SessionInfoAccess: Send + Sync {
     /// most recent compacted turns (capped at [`MAX_SESSION_MESSAGES`]). A
     /// missing / deleted id yields [`SessionInfo::not_found`].
     async fn resolve(&self, session_id: i32, max_messages: u32) -> SessionInfo;
+
+    /// Optional canonical history cursor; default preserves existing adapters
+    /// while making unsupported pagination explicit instead of ignoring it.
+    async fn resolve_history(
+        &self,
+        session_id: i32,
+        _max_messages: u32,
+        _cursor: &str,
+    ) -> SessionInfo {
+        let mut info = self.resolve(session_id, 0).await;
+        if info.found {
+            info.note = Some("Original prose pagination is unavailable for this session.".into());
+        }
+        info
+    }
 }
 
 /// The hot-swappable feature config read at MCP injection time. Kept tiny and

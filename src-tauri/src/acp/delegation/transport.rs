@@ -205,6 +205,8 @@ pub struct BrokerSessionRequest {
     /// [`crate::acp::session_info::MAX_SESSION_MESSAGES`] by the resolver.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_messages: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_cursor: Option<String>,
 }
 
 /// Report a progress milestone for the work task driving the parent session.
@@ -1085,6 +1087,7 @@ mod tests {
             token: "tok".into(),
             session_id: 42,
             max_messages: Some(20),
+            history_cursor: None,
         });
         write_frame(&mut a, &msg).await.unwrap();
         let got: BrokerMessage = read_frame(&mut b).await.unwrap();

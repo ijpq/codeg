@@ -5398,8 +5398,8 @@ pub fn get_agent_meta(agent_type: AgentType) -> AcpAgentMeta {
             name: "Pi",
             description: "Pi with verified sessions, native MCP and steering",
             distribution: AgentDistribution::Npx {
-                version: "0.0.34-codeg.2",
-                package: "pi-acp@https://github.com/ijpq/pi-acp/releases/download/v0.0.34-codeg.2/pi-acp-0.0.34-codeg.2.tgz",
+                version: "0.0.34-codeg.3",
+                package: "pi-acp@https://github.com/ijpq/pi-acp/releases/download/v0.0.34-codeg.3/pi-acp-0.0.34-codeg.3.tgz",
                 cmd: "pi-acp",
                 args: &[],
                 env: &[("PI_ACP_ENABLE_EMBEDDED_CONTEXT", "true")],
@@ -7353,7 +7353,7 @@ mod tests {
             "@agentclientprotocol/codex-acp@2.5.0",
             Some("20.3.0"),
         );
-        assert_npx_version(AgentType::Pi, "0.0.34-codeg.2", "pi-acp@https://github.com/ijpq/pi-acp/releases/download/v0.0.34-codeg.2/pi-acp-0.0.34-codeg.2.tgz", Some("22.19.0"));
+        assert_npx_version(AgentType::Pi, "0.0.34-codeg.3", "pi-acp@https://github.com/ijpq/pi-acp/releases/download/v0.0.34-codeg.3/pi-acp-0.0.34-codeg.3.tgz", Some("22.19.0"));
         assert_npx_version(
             AgentType::Grok,
             "1.0.70",

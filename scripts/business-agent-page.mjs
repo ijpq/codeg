@@ -384,7 +384,10 @@ export async function businessAgentPage({
       (s) => s?.selectors_ready && s?.external_id,
       "Initial Codex session"
     )
-    await prompt(initial, "BUSINESS_CODEX_FIRST")
+    await prompt(
+      initial,
+      `BUSINESS_CODEX_FIRST BUSINESS_REVISION_START ${"Business discussion. ".repeat(320)} BUSINESS_REVISION_TAIL: keep template B because template A failed validation; preserve the production Server; continue agenda-v2.md.`
+    )
     const first = await until(
       history,
       (d) => JSON.stringify(d.turns).includes("BUSINESS_CODEX_COMPLETED"),
@@ -694,7 +697,7 @@ export async function businessAgentPage({
     })
     const piBefore = piModel.evidence().length
     await sendUi(
-      "BUSINESS_PI_USER_FIRST $official-document",
+      `BUSINESS_PI_USER_FIRST $official-document PI_REVISION_START ${"Pi business discussion. ".repeat(290)} PI_REVISION_TAIL: retain the user correction and its reason; preserve production; use agenda-v3.md.`,
       "BUSINESS_PI_COMPLETED agenda-v3.md"
     )
     await until(
@@ -706,6 +709,7 @@ export async function businessAgentPage({
             r.memory &&
             r.skill &&
             r.previousAgent &&
+            r.businessRevisionTail &&
             r.fromClaude &&
             r.user &&
             r.rules &&
@@ -726,7 +730,10 @@ export async function businessAgentPage({
     )
     await until(
       () => goalModel.businessEvidence().slice(codexAfterPi),
-      (rs) => rs.some((r) => r.fromPi && r.user && r.rules && r.ledger),
+      (rs) =>
+        rs.some(
+          (r) => r.fromPi && r.piRevisionTail && r.user && r.rules && r.ledger
+        ),
       "Codex receives Pi increment"
     )
     await switchTo("claude_code")
@@ -829,7 +836,7 @@ export async function businessAgentPage({
     await page.screenshot({ path: join(output, `${name}-business-agent.png`) })
     const agents = await api("acp_list_agents")
     const piRuntime = agents.find((agent) => agent.agent_type === "pi")
-    assert.equal(piRuntime.installed_version, "0.0.34-codeg.2")
+    assert.equal(piRuntime.installed_version, "0.0.34-codeg.3")
     assert.equal(piRuntime.selected_runtime?.source, "bundled")
     assert.match(
       piRuntime.selected_runtime.adapter_path,
@@ -837,12 +844,12 @@ export async function businessAgentPage({
     )
     assert.equal(
       await api("acp_detect_agent_local_version", { agentType: "pi" }),
-      "0.0.34-codeg.2"
+      "0.0.34-codeg.3"
     )
     assert.equal(
       (await api("acp_get_agent_status", { agentType: "pi" }))
         .installed_version,
-      "0.0.34-codeg.2"
+      "0.0.34-codeg.3"
     )
     await assert.rejects(
       api("acp_uninstall_agent", { agentType: "pi", taskId: randomUUID() }),
@@ -858,6 +865,8 @@ export async function businessAgentPage({
       protocol: "Real native runtimes/ACP; synthetic local model providers",
       queuedAtBoundary: true,
       sharedContextActuallyReceived: true,
+      businessRevisionTailActuallyReceived: true,
+      reversePiRevisionTailActuallyReceived: true,
       piNativeContextAndIncrement: true,
       piPreparationFailureRetainsOriginal: true,
       piMcpSupported: true,

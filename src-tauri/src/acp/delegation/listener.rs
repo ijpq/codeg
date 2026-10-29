@@ -25,23 +25,22 @@ use crate::acp::computer_tools::{
     ComputerActOutcome, ComputerAppsOutcome, ComputerCaptureOutcome, ComputerSnapshotOutcome,
     ComputerToolAccess, ComputerVerifyOutcome, ComputerWindowsOutcome, ERROR_NO_SUCH_TARGET,
 };
+use crate::acp::delegation::assistants::assistant_not_found_message;
 use crate::acp::delegation::broker::{DelegationBroker, StatusWait};
 use crate::acp::delegation::transport::BrokerDeliverablesRequest;
 use crate::acp::delegation::transport::{
     read_frame, write_frame, BrokerAskRequest, BrokerBrowserActRequest,
     BrokerBrowserCaptureRequest, BrokerBrowserConsoleRequest, BrokerBrowserEvalRequest,
     BrokerBrowserSnapshotRequest, BrokerBrowserTabOpRequest, BrokerBrowserTabsRequest,
-    BrokerCancelRequest, BrokerCancelTaskRequest, BrokerComputerActRequest,
-    BrokerComputerAppsRequest, BrokerComputerCaptureRequest, BrokerComputerLaunchRequest,
-    BrokerComputerSnapshotRequest,
-    BrokerComputerVerifyRequest, BrokerComputerWindowsRequest, BrokerCommitFeedbackRequest,
+    BrokerCancelRequest, BrokerCancelTaskRequest, BrokerCommitFeedbackRequest,
+    BrokerComputerActRequest, BrokerComputerAppsRequest, BrokerComputerCaptureRequest,
+    BrokerComputerLaunchRequest, BrokerComputerSnapshotRequest, BrokerComputerVerifyRequest,
+    BrokerComputerWindowsRequest, BrokerCreateAutomationRequest, BrokerCreateWorkTaskRequest,
     BrokerFeedbackRequest, BrokerListAssistantsRequest, BrokerMessage, BrokerRequest,
-    BrokerCreateAutomationRequest, BrokerCreateWorkTaskRequest, BrokerResponse,
-    BrokerResultSchemaRequest, BrokerResumeTaskRequest, BrokerSessionRequest,
+    BrokerResponse, BrokerResultSchemaRequest, BrokerResumeTaskRequest, BrokerSessionRequest,
     BrokerStatusRequest, BrokerSubmitResultRequest, BrokerTaskCompleteRequest,
     BrokerTaskProgressRequest,
 };
-use crate::acp::delegation::assistants::assistant_not_found_message;
 use crate::acp::delegation::types::{
     delegation_target_from_args, DelegationRequest, DelegationTarget, DelegationTargetError,
     DelegationTaskReport, ResumeDelegationRequest, TaskStatus,
@@ -52,9 +51,9 @@ use crate::acp::deliverables::{
 };
 use crate::acp::feedback::{PendingFeedback, SessionFeedbackAccess};
 use crate::acp::question::{QuestionOutcome, SessionQuestionAccess};
+use crate::acp::result_tool::ResultToolAccess;
 #[cfg(unix)]
 use crate::acp::scratch_dir::{is_inside_sweep_scope, SUN_PATH_CAP};
-use crate::acp::result_tool::ResultToolAccess;
 use crate::acp::session_info::{SessionInfo, SessionInfoAccess};
 use crate::acp::work_task_tools::{TaskReportAck, WorkTaskToolAccess};
 use serde_json::Value;
@@ -912,9 +911,15 @@ impl DelegationListener {
         if self.tokens.lookup(&req.token).await.is_none() {
             return SessionInfo::not_found(req.session_id);
         }
-        self.session_info
-            .resolve(req.session_id, req.max_messages.unwrap_or(0))
-            .await
+        if let Some(cursor) = req.history_cursor {
+            self.session_info
+                .resolve_history(req.session_id, req.max_messages.unwrap_or(20), &cursor)
+                .await
+        } else {
+            self.session_info
+                .resolve(req.session_id, req.max_messages.unwrap_or(0))
+                .await
+        }
     }
 
     /// Validate the token and list the browser tabs an agent may know about.
@@ -1815,16 +1820,16 @@ pub fn default_socket_path(_temp_dir: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(unix)]
-    use crate::acp::scratch_dir::short_root;
     use crate::acp::browser_tools::{NoBrowserTabs, ERROR_GRANT_REQUIRED};
     use crate::acp::computer_tools::NoComputerDesktop;
     use crate::acp::delegation::broker::{ConversationDepthLookup, DelegationConfig};
-    use crate::models::AgentType;
     use crate::acp::delegation::spawner::{
         mock::MockSpawner, ConnectionSpawner, ResumedSpawn, SpawnerError,
     };
     use crate::acp::delegation::types::{DelegationError, DelegationOutcome, DelegationSuccess};
+    #[cfg(unix)]
+    use crate::acp::scratch_dir::short_root;
+    use crate::models::AgentType;
     use serde_json::json;
     use std::time::Duration;
     use tokio::io::duplex;
@@ -3156,6 +3161,7 @@ mod tests {
             token: "tok".into(),
             session_id: 42,
             max_messages: Some(15),
+            history_cursor: None,
         });
         write_frame(&mut client, &msg).await.unwrap();
         let resp: BrokerResponse = read_frame(&mut client).await.unwrap();
@@ -3199,6 +3205,7 @@ mod tests {
                 token: "tok".into(),
                 session_id: id,
                 max_messages: Some(0),
+                history_cursor: None,
             });
             write_frame(&mut client, &msg).await.unwrap();
             let resp: BrokerResponse = read_frame(&mut client).await.unwrap();
@@ -3228,6 +3235,7 @@ mod tests {
             token: "bogus".into(),
             session_id: 42,
             max_messages: None,
+            history_cursor: None,
         });
         write_frame(&mut client, &msg).await.unwrap();
         let resp: BrokerResponse = read_frame(&mut client).await.unwrap();
@@ -4404,7 +4412,9 @@ mod tests {
                 mock as Arc<dyn ConnectionSpawner>,
                 Arc::new(AlwaysRootLookup) as Arc<dyn ConversationDepthLookup>,
             )
-            .with_assistants(Arc::new(StubAssistants(vec![assistant_info(3, "Reviewer")]))),
+            .with_assistants(Arc::new(StubAssistants(vec![assistant_info(
+                3, "Reviewer",
+            )]))),
         );
         broker
             .set_config(DelegationConfig {
@@ -4477,7 +4487,11 @@ mod tests {
     async fn an_unusable_assistant_is_refused_with_the_usable_roster() {
         let mock = Arc::new(MockSpawner::new());
         let (listener, _tokens) = assistant_listener(mock.clone()).await;
-        let refusal = serve(listener.clone(), call(json!({"assistant_id": 9, "task": "x"}))).await;
+        let refusal = serve(
+            listener.clone(),
+            call(json!({"assistant_id": 9, "task": "x"})),
+        )
+        .await;
         assert_eq!(refusal["status"], "failed");
         assert_eq!(refusal["error_code"], "assistant_not_found");
         let message = refusal["message"].as_str().unwrap();

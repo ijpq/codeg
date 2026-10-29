@@ -39,7 +39,7 @@ def verify(root):
     for name, digest in expected.items():
         path = (root / name).resolve(strict=True)
         assert path.is_relative_to(root.resolve()) and sha(path) == digest, 'Pi runtime checksum mismatch: ' + name
-    assert json.loads((root / 'node_modules/pi-acp/package.json').read_text())['version'] == '0.0.34-codeg.2'
+    assert json.loads((root / 'node_modules/pi-acp/package.json').read_text())['version'] == '0.0.34-codeg.3'
     assert json.loads((root / 'node_modules/@earendil-works/pi-coding-agent/package.json').read_text())['version'] == '1.4.0'
     for name in ('node_modules/pi-acp/dist/pi-mcp-extension.js', 'NODE-LICENSE', 'node_modules/pi-acp/LICENSE'):
         assert (root / name).is_file(), 'Pi runtime missing ' + name
@@ -83,7 +83,7 @@ def build(root):
     target_node.parent.mkdir(exist_ok=True)
     shutil.copy2(node, target_node)
     shutil.copy2(source / 'LICENSE', root / 'NODE-LICENSE')
-    for name in ('package.json', 'package-lock.json', 'source.json', 'pi-acp-0.0.34-codeg.2.tgz'):
+    for name in ('package.json', 'package-lock.json', 'source.json', 'pi-acp-0.0.34-codeg.3.tgz'):
         shutil.copy2(VENDOR / name, root / name)
     env = {**os.environ, 'PATH': str(node.parent) + os.pathsep + os.environ.get('PATH', '')}
     subprocess.run([str(node), str(npm), 'ci', '--omit=dev', '--include=optional', '--ignore-scripts', '--no-audit', '--no-fund'], cwd=root, env=env, check=True)

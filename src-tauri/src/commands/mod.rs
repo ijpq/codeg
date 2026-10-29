@@ -93,6 +93,7 @@ pub mod workspace_windows;
 
 pub mod business_conversations;
 pub mod business_context;
+pub(crate) mod business_history;
 pub(crate) mod business_skills;
 
 pub mod business_delivery;
