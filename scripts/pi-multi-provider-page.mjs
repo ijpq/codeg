@@ -75,6 +75,7 @@ export async function piMultiProviderPage({
   let cid = saved?.cid ?? null
   let externalId = saved?.externalId ?? null
   let connectionId
+  let draftSubmission
   const rounds = []
   try {
     if (saved) {
@@ -149,7 +150,27 @@ export async function piMultiProviderPage({
               .filter({ visible: true })
               .first()
       await editor.fill(marker)
-      await editor.press("Enter")
+      if (cid == null) {
+        const send = page
+          .getByRole("button", { name: /^(Send|发送|傳送|發送)$/ })
+          .filter({ visible: true })
+          .first()
+        draftSubmission = {
+          sendDisabledWhenFilled: await send.isDisabled(),
+          draftStillContainsInput: (await editor.innerText()).includes(marker),
+          selectedAgent: "pi",
+        }
+        // An unbound draft deliberately disables submission while its native
+        // selector/connection initializes. Enter during that disabled state is
+        // not an accepted message. Click the real affordance exactly once;
+        // Playwright waits for it to be usable, with no API connect/restore or
+        // pre-created business. Persisted recovery still uses Enter below and
+        // is separately tested while its native session is explicitly blocked.
+        await send.click({ timeout: 90_000 })
+        draftSubmission.clickedSendOnce = true
+      } else {
+        await editor.press("Enter")
+      }
       if (cid == null) {
         cid = (
           await until(
@@ -252,7 +273,7 @@ export async function piMultiProviderPage({
     await page.screenshot({
       path: join(output, `${name}-pi-multi-provider.png`),
     })
-    const result = { cid, externalId, folderId, rounds }
+    const result = { cid, externalId, folderId, draftSubmission, rounds }
     await writeFile(
       join(output, `${name}-pi-multi-provider.json`),
       JSON.stringify(result, null, 2)
@@ -284,6 +305,7 @@ export async function piMultiProviderPage({
           error: String(error.stack ?? error),
           cid,
           rounds,
+          draftSubmission,
           identity: await visibleIdentity(page).catch(() => null),
           providerRequests: evidence()
             .filter((request) => request.frontendMarker)
