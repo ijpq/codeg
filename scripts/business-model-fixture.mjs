@@ -26,7 +26,15 @@ export async function startBusinessModel(agent = "claude") {
       return
     }
     const input = JSON.stringify(body.messages ?? [])
+    const latestUser = JSON.stringify(
+      (body.messages ?? []).findLast((item) => item.role === "user") ?? {}
+    )
     requests.push({
+      model: body.model,
+      frontendMarker:
+        [...latestUser.matchAll(/PI_FRONTEND_[A-Z0-9_]+_[a-f0-9-]{36}/g)].at(
+          -1
+        )?.[0] ?? null,
       taskState: input.includes("BUSINESS_VERIFIED_STATE"),
       memory: input.includes("BUSINESS_VERIFIED_MEMORY"),
       skill: input.includes("BUSINESS_SHARED_SKILL_BODY"),

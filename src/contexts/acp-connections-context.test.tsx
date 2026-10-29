@@ -341,6 +341,97 @@ function snapshotBase() {
 }
 
 describe("AcpConnectionsProvider cross-client viewer lifecycle", () => {
+  it.each([
+    ["pi", true],
+    ["pi", false],
+    ["codex", true],
+    ["codex", false],
+  ] as const)(
+    "%s keeps a running draft when its native identity becomes available (web=%s)",
+    async (agent, web) => {
+      if (!web) h.eventStreamValue = null
+      await mountProvider()
+      await act(async () => {
+        await h.actions!.connect("draft-native-identity", agent, "/tmp/x")
+      })
+      const deliver = (event: EventEnvelope) => {
+        if (web) emitAcpEvent(latestAttachHandlers(), event)
+        else {
+          const listener = vi.mocked(subscribe).mock.calls.at(-1)![1] as (
+            value: EventEnvelope
+          ) => void
+          act(() => listener(event))
+        }
+      }
+      if (web) act(() => latestAttachHandlers().onReplay([], 0))
+      deliver({
+        seq: 1,
+        connection_id: "spawned-conn",
+        type: "session_started",
+        session_id: "actual-native-identity",
+      })
+      deliver({
+        seq: 2,
+        connection_id: "spawned-conn",
+        type: "status_changed",
+        status: "prompting",
+      })
+      // The same native connection has published its identity. This is a
+      // lifecycle dependency update, not a request to start another session.
+      await act(async () => {
+        await h.actions!.connect(
+          "draft-native-identity",
+          agent,
+          "/tmp/x",
+          "actual-native-identity"
+        )
+      })
+      expect(h.acpDisconnect).not.toHaveBeenCalled()
+      expect(h.acpConnect).toHaveBeenCalledTimes(1)
+      expect(h.store!.getConnection("draft-native-identity")).toMatchObject({
+        connectionId: "spawned-conn",
+        sessionId: "actual-native-identity",
+        status: "prompting",
+      })
+    }
+  )
+
+  it.each([
+    ["pi", "/tmp/x", "other-native-session"],
+    ["pi", "/tmp/other-workspace", "actual-native-identity"],
+    ["claude_code", "/tmp/x", "actual-native-identity"],
+  ] as const)(
+    "replaces a draft for an actual target change (%s, %s, %s)",
+    async (agent, cwd, sessionId) => {
+      await mountProvider()
+      await act(async () => {
+        await h.actions!.connect("draft-native-identity", "pi", "/tmp/x")
+      })
+      const handlers = latestAttachHandlers()
+      act(() => handlers.onReplay([], 0))
+      emitAcpEvent(handlers, {
+        seq: 1,
+        connection_id: "spawned-conn",
+        type: "session_started",
+        session_id: "actual-native-identity",
+      })
+      emitAcpEvent(handlers, {
+        seq: 2,
+        connection_id: "spawned-conn",
+        type: "status_changed",
+        status: "prompting",
+      })
+      await act(async () => {
+        await h.actions!.connect("draft-native-identity", agent, cwd, sessionId)
+      })
+      expect(h.acpDisconnect).toHaveBeenCalledWith(
+        "spawned-conn",
+        "frontend_target_changed"
+      )
+      expect(h.acpConnect).toHaveBeenCalledTimes(2)
+    }
+  )
+
   it("attaches as a viewer (no spawn) when a live connection is discovered", async () => {
     h.acpFindConnectionForConversation.mockResolvedValue({
       connection_id: "owner-conn",
@@ -510,7 +601,10 @@ describe("AcpConnectionsProvider cross-client viewer lifecycle", () => {
       await h.actions!.disconnect(TAB)
     })
 
-    expect(h.acpDisconnect).toHaveBeenCalledWith("spawned-conn")
+    expect(h.acpDisconnect).toHaveBeenCalledWith(
+      "spawned-conn",
+      "frontend_disconnect_action"
+    )
   })
 
   it("surface release drops local routing without stopping the backend owner", async () => {
@@ -653,7 +747,10 @@ describe("AcpConnectionsProvider cross-client viewer lifecycle", () => {
       "optimistic-stable-id"
     )
     expect(h.store!.getConnection(TAB)?.connectionId).toBe("recovered-conn")
-    expect(h.acpDisconnect).not.toHaveBeenCalledWith("owner-conn")
+    expect(h.acpDisconnect).not.toHaveBeenCalledWith(
+      "owner-conn",
+      expect.anything()
+    )
   })
 
   it("desktop viewer torn down DURING snapshot fetch does not seed delegations or route", async () => {
@@ -1565,7 +1662,10 @@ describe("AcpConnectionsProvider reconnect (status-icon button)", () => {
     })
 
     expect(result).toBe(true)
-    expect(h.acpDisconnect).toHaveBeenCalledWith("spawned-conn")
+    expect(h.acpDisconnect).toHaveBeenCalledWith(
+      "spawned-conn",
+      "frontend_user_reconnect"
+    )
     // Same agent / cwd / session — the point is a fresh PROCESS, not new params,
     // which is exactly what connect()'s "nothing changed" fast path would skip.
     expect(h.acpConnect).toHaveBeenLastCalledWith(
@@ -1783,7 +1883,10 @@ describe("AcpConnectionsProvider reconnect (status-icon button)", () => {
 
     expect(await reconnectResult).toBe(true)
     // Waited for the hung attempt to settle, then rebuilt what it produced.
-    expect(h.acpDisconnect).toHaveBeenCalledWith("spawned-conn")
+    expect(h.acpDisconnect).toHaveBeenCalledWith(
+      "spawned-conn",
+      "frontend_user_reconnect"
+    )
     expect(h.acpConnect).toHaveBeenLastCalledWith(
       "claude_code",
       "/tmp/x",
@@ -1991,7 +2094,10 @@ describe("AcpConnectionsProvider disconnect teardown confirmation", () => {
     })
 
     expect(confirmed).toBe(true)
-    expect(h.acpDisconnect).toHaveBeenCalledWith("spawned-conn")
+    expect(h.acpDisconnect).toHaveBeenCalledWith(
+      "spawned-conn",
+      "frontend_disconnect_action"
+    )
   })
 })
 
@@ -2069,7 +2175,10 @@ describe("AcpConnectionsProvider abandoned connect tears down only what it creat
       await connectPromise
     })
 
-    expect(h.acpDisconnect).toHaveBeenCalledWith("fresh-conn")
+    expect(h.acpDisconnect).toHaveBeenCalledWith(
+      "fresh-conn",
+      "frontend_abandoned_connect"
+    )
   })
 })
 
@@ -2991,7 +3100,10 @@ describe("AcpConnectionsProvider persisted Codex restore lifecycle", () => {
     })
 
     expect(h.acpRestoreConversation).toHaveBeenCalledWith(42, undefined, {})
-    expect(h.acpDisconnect).not.toHaveBeenCalledWith("legacy-codex-conn")
+    expect(h.acpDisconnect).not.toHaveBeenCalledWith(
+      "legacy-codex-conn",
+      expect.anything()
+    )
     expect(h.store!.getConnection(CODEX_TAB)).toMatchObject({
       connectionId: "restored-codex-conn",
       conversationId: 42,
@@ -3120,7 +3232,10 @@ describe("AcpConnectionsProvider persisted Codex restore lifecycle", () => {
     expect(h.store!.getConnection(CODEX_TAB)?.connectionId).toBe(
       "legacy-codex-conn"
     )
-    expect(h.acpDisconnect).not.toHaveBeenCalledWith("legacy-codex-conn")
+    expect(h.acpDisconnect).not.toHaveBeenCalledWith(
+      "legacy-codex-conn",
+      expect.anything()
+    )
 
     await expect(
       h.actions!.sendPrompt(
@@ -3194,7 +3309,10 @@ describe("AcpConnectionsProvider persisted Codex restore lifecycle", () => {
     await act(async () => {
       await h.actions!.disconnect(CODEX_TAB)
     })
-    expect(h.acpDisconnect).not.toHaveBeenCalledWith("other-client-codex")
+    expect(h.acpDisconnect).not.toHaveBeenCalledWith(
+      "other-client-codex",
+      expect.anything()
+    )
   })
 
   it("co-controls native execution after restore without owning process teardown", async () => {
@@ -3222,7 +3340,10 @@ describe("AcpConnectionsProvider persisted Codex restore lifecycle", () => {
     await act(async () => {
       await h.actions!.disconnect(CODEX_TAB)
     })
-    expect(h.acpDisconnect).not.toHaveBeenCalledWith("shared-codex-goal")
+    expect(h.acpDisconnect).not.toHaveBeenCalledWith(
+      "shared-codex-goal",
+      expect.anything()
+    )
   })
 
   it("restores distinct conversations to distinct connection ids", async () => {
@@ -7100,7 +7221,10 @@ describe("Claude Code's Remote Control (claude-agent-acp 0.93.0)", () => {
           CONNECTION_IDLE_TIMEOUT_MS + IDLE_SWEEP_INTERVAL_MS + 1000
         )
       })
-      expect(h.acpDisconnect).toHaveBeenCalledWith("spawned-conn")
+      expect(h.acpDisconnect).toHaveBeenCalledWith(
+        "spawned-conn",
+        "frontend_idle_sweep"
+      )
     } finally {
       vi.useRealTimers()
     }
@@ -8792,7 +8916,10 @@ describe("live surfaces that are not tabs", () => {
       await connectOwner()
       h.actions!.setActiveKey("some-other-surface")
       await sweepPastIdleTimeout()
-      expect(h.acpDisconnect).toHaveBeenCalledWith("spawned-conn")
+      expect(h.acpDisconnect).toHaveBeenCalledWith(
+        "spawned-conn",
+        "frontend_idle_sweep"
+      )
     } finally {
       vi.useRealTimers()
     }
@@ -8812,7 +8939,10 @@ describe("live surfaces that are not tabs", () => {
       // the connection goes back to being sweepable.
       h.actions!.registerLiveSurfaceKeys("canvas", new Set())
       await sweepPastIdleTimeout()
-      expect(h.acpDisconnect).toHaveBeenCalledWith("spawned-conn")
+      expect(h.acpDisconnect).toHaveBeenCalledWith(
+        "spawned-conn",
+        "frontend_idle_sweep"
+      )
     } finally {
       vi.useRealTimers()
     }
@@ -9231,7 +9361,10 @@ describe("a switch that lands while another agent is still connecting", () => {
     await act(async () => {})
 
     // The abandoned attempt is torn down and never registered...
-    expect(h.acpDisconnect).toHaveBeenCalledWith("claude_code-conn")
+    expect(h.acpDisconnect).toHaveBeenCalledWith(
+      "claude_code-conn",
+      "frontend_superseded_connect"
+    )
     expect(h.store!.getConnection(TAB)).toBeUndefined()
     // ...and the newest request is the one actually connecting now.
     expect(h.acpConnect).toHaveBeenCalledTimes(2)
@@ -9259,7 +9392,10 @@ describe("a switch that lands while another agent is still connecting", () => {
     await act(async () => {
       await h.actions!.connect(TAB, "codex", "/tmp/x")
     })
-    expect(h.acpDisconnect).toHaveBeenCalledWith("starting-claude")
+    expect(h.acpDisconnect).toHaveBeenCalledWith(
+      "starting-claude",
+      "frontend_target_changed"
+    )
     expect(h.acpConnect).toHaveBeenCalledTimes(2)
     expect(h.store!.getConnection(TAB)?.agentType).toBe("codex")
     expect(h.store!.getConnection(TAB)?.status).toBe("connecting")
