@@ -409,12 +409,20 @@ export async function businessAgentPage({
         width: window.innerWidth,
         height: window.innerHeight,
       })))
+    const sidebarWasOpen =
+      (await page
+        .getByRole("button", { name: "Hide Sidebar", exact: true })
+        .filter({ visible: true })
+        .count()) > 0
     try {
       await page.setViewportSize({ width: 390, height: 844 })
       // Resizing an open desktop sidebar creates the mobile navigation Drawer.
-      // Dismiss it as a user would, then prove the Agent control is reachable;
-      // a bounding box behind an overlay is not a narrow-layout acceptance.
+      // Wait for that responsive render before Escape; a key sent before its
+      // mount cannot dismiss it and leaves the check hidden under navigation.
+      const sidebar = page.getByRole("dialog", { name: "Sidebar", exact: true })
+      if (sidebarWasOpen) await sidebar.waitFor({ state: "visible" })
       await page.keyboard.press("Escape")
+      await sidebar.waitFor({ state: "hidden" })
       await until(
         () =>
           toolbar.locator("select").evaluate((select) => {
@@ -440,6 +448,47 @@ export async function businessAgentPage({
       await page.screenshot({
         path: join(output, `${name}-agent-toolbar-narrow.png`),
       })
+    } catch (error) {
+      // Capture while still narrow. The outer catch runs after the finally
+      // restores desktop dimensions and would erase the actual occlusion.
+      await page.screenshot({
+        path: join(output, `${name}-agent-toolbar-narrow-failure.png`),
+      })
+      await writeFile(
+        join(output, `${name}-agent-toolbar-narrow-failure.json`),
+        JSON.stringify(
+          await toolbar.locator("select").evaluate((select) => {
+            const bounds = select.getBoundingClientRect()
+            const hit = document.elementFromPoint(
+              bounds.x + bounds.width / 2,
+              bounds.y + bounds.height / 2
+            )
+            return {
+              viewport: {
+                width: window.innerWidth,
+                height: window.innerHeight,
+              },
+              bounds: bounds.toJSON(),
+              hit: hit && {
+                tag: hit.tagName,
+                slot: hit.getAttribute("data-slot"),
+                role: hit.getAttribute("role"),
+                classes: hit.className,
+              },
+              dialogs: [...document.querySelectorAll('[role="dialog"]')].map(
+                (node) => ({
+                  slot: node.getAttribute("data-slot"),
+                  open: node.getAttribute("data-open"),
+                  closed: node.getAttribute("data-closed"),
+                })
+              ),
+            }
+          }),
+          null,
+          2
+        )
+      )
+      throw error
     } finally {
       await page.setViewportSize(viewport)
     }
