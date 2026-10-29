@@ -1,6 +1,26 @@
 # Changelog
 
-## 0.41.2-fix2 — 2026-10-29
+## 0.41.2-fix3 — 2026-10-29
+
+- Keep a draft's live connection when its own native session ID becomes known;
+  identity enrichment no longer triggers a destructive target-change restart.
+  Genuine session, workspace and Agent changes retain their existing gates.
+- Record fixed disconnect call sites and one lifecycle generation across Web
+  and desktop APIs, without prompt bodies or credentials.
+- Add installed Setup and Server Web composer acceptance with independent GPT
+  Responses and Opus Messages Providers: true draft first input, multiple rounds,
+  UI model selection, page changes, refresh, restart and fix6 old-business upgrade.
+  Assert actual endpoint/model, durable replies, stable session and exact-once input.
+- Strip inherited CODEG_* overrides from isolated test children. Preserve both
+  Provider configurations and the complete previously unpublished recovery,
+  context, runtime, delivery, artifact, Office, duration and scroll fixes.
+- Retain failed/cancelled candidate tags. Publication requires fresh dual-package
+  inventory, runtime, upgrade, frontend and checksum acceptance for this commit.
+
+See [release notes](docs/releases/v0.41.2-fix3.md) and the
+[diagnosis](docs/diagnostics/pi-frontend-lifecycle-20261029.md).
+
+## 0.41.2-fix2 — 2026-10-29 (cancelled candidate)
 
 - Preserve the user's local tab selection when React batches it after a remote
   tab snapshot. Deduplicate saves by their payload instead of dropping the next
