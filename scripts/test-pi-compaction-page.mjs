@@ -4,9 +4,34 @@ import { startPiModel } from "./pi-native-model-fixture.mjs"
 import {
   assertCompletedCompactionAdvance,
   compactionHistoryRecords,
+  dismissCompactionFailureNotice,
   piCompactionPage,
   submitCompactionComposer,
 } from "./pi-compaction-page.mjs"
+
+test("expected provider failure is dismissed through the visible Close button before retry", async () => {
+  const actions = []
+  const notice = {
+    filter: ({ hasText }) => {
+      assert.ok(
+        hasText.test(
+          "Pi needs you to sign in again before it can run this turn"
+        )
+      )
+      assert.equal(hasText.test("An unrelated transport failure"), false)
+      return notice
+    },
+    count: async () => 1,
+    getByRole: (role, { name }) => {
+      assert.equal(role, "button")
+      assert.equal(name, "Close toast")
+      return { click: async () => actions.push("close-expected-notice") }
+    },
+    waitFor: async ({ state }) => actions.push(state),
+  }
+  await dismissCompactionFailureNotice({ locator: () => notice })
+  assert.deepEqual(actions, ["close-expected-notice", "detached"])
+})
 
 const historyWithCompactions = (...ids) => ({
   turns: ids.map((eventId, i) => ({
