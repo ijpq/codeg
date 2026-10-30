@@ -30,6 +30,7 @@ vi.mock("@/contexts/task-context", () => {
 const conn = vi.hoisted(() => ({
   status: null as string | null,
   promptReady: false,
+  connectedWorkingDir: "/tmp/proj" as string | null,
   connectError: null as ConnectErrorInfo | null,
 }))
 
@@ -41,6 +42,7 @@ vi.mock("@/hooks/use-connection", () => {
     useConnection: () => ({
       status: conn.status,
       promptReady: conn.promptReady,
+      connectedWorkingDir: conn.connectedWorkingDir,
       agentType: null,
       connectError: conn.connectError,
       selectorsReady: false,
@@ -77,6 +79,7 @@ describe("useConnectionLifecycle autoConnectError", () => {
   beforeEach(() => {
     conn.status = null
     conn.promptReady = false
+    conn.connectedWorkingDir = "/tmp/proj"
     conn.connectError = null
   })
 
@@ -129,6 +132,22 @@ describe("useConnectionLifecycle autoConnectError", () => {
     }
     const { result } = renderDraft()
     expect(result.current.autoConnectError).toBeNull()
+  })
+
+  it("does not hide a failed restore while its directory identity is missing", () => {
+    conn.status = "connected"
+    conn.promptReady = true
+    conn.connectedWorkingDir = null
+    conn.connectError = {
+      agentType: "codex",
+      title: "connectFailedTitle",
+      detail: "Folder identity could not be restored; retry",
+      opensAgentSettings: false,
+    }
+    const { result } = renderDraft()
+    expect(result.current.autoConnectError).toBe(
+      "Folder identity could not be restored; retry"
+    )
   })
 
   it("shows a restore failure while the old connection is not prompt ready", () => {
