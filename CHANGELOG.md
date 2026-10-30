@@ -1,6 +1,8 @@
 # Changelog
 
-## 0.41.3-fix2 — 2026-10-30
+## 0.41.3-fix2 — 2026-10-30 (quarantined; postpublication verification failed)
+
+- Postpublication retesting caught a Server allocation failure in the old-data frontend restore flow. This release is quarantined as a prerelease; its original tag, packages and diagnostics are retained. Earlier prepublication passes do not make it an accepted delivery.
 
 - Retain the Pi native compaction admission, cancellation and shared lifecycle display fixes from the unpublished fix1 candidate, including ordered MCP readiness updates for early-attached clients.
 - Fix a cold-page restore race shared by Setup and Server: composer focus could restore by business id before the folder query loaded, and the later same-connection restore never filled the missing local working directory. Focus now waits for the folder and a confirmed restore fills only missing identity, keeping the live connection and strict send gate. Six Pi/Codex, Web/desktop regressions fail before the fix and pass afterward.
