@@ -2,9 +2,77 @@ import assert from "node:assert/strict"
 import { test } from "node:test"
 import { startPiModel } from "./pi-native-model-fixture.mjs"
 import {
+  assertCompletedCompactionAdvance,
+  compactionHistoryRecords,
   piCompactionPage,
   submitCompactionComposer,
 } from "./pi-compaction-page.mjs"
+
+const historyWithCompactions = (...ids) => ({
+  turns: ids.map((eventId, i) => ({
+    id: `turn-${i}`,
+    blocks: [
+      {
+        type: "tool_use",
+        tool_use_id: eventId,
+        meta: {
+          contextCompaction: { version: 1, eventId, status: "completed" },
+        },
+      },
+      {
+        type: "tool_result",
+        tool_use_id: eventId,
+        output_preview: "summary text is not an event identity",
+      },
+    ],
+  })),
+})
+
+test("a retry has its own persisted native identity even when older cards are virtualized", () => {
+  const before = compactionHistoryRecords(
+    historyWithCompactions("native-first")
+  )
+  const after = compactionHistoryRecords(
+    historyWithCompactions("native-first", "native-retry")
+  )
+  // Only the latest card is mounted. Its DOM count cannot count native history.
+  const visibleCards = ["native-retry"]
+  assert.equal(visibleCards.length, 1)
+  const added = assertCompletedCompactionAdvance(before, after)
+  assert.equal(added.eventId, visibleCards[0])
+  assert.equal(added.turnId, "turn-1")
+})
+
+test("a retry cannot reuse an old identity, invent a second completion or discard earlier history", () => {
+  const before = compactionHistoryRecords(
+    historyWithCompactions("native-first")
+  )
+  const records = (...ids) =>
+    compactionHistoryRecords(historyWithCompactions(...ids))
+  for (const after of [
+    before,
+    records("native-first", "native-first"),
+    records("native-first", "native-retry", "native-retry"),
+    records("native-first", "native-retry", "unexpected-extra"),
+    records("native-retry"),
+    records("native-first", null),
+  ]) {
+    assert.throws(() => assertCompletedCompactionAdvance(before, after))
+  }
+})
+
+test("failure diagnostics retain only compaction identity, state and turn without transcript bodies", () => {
+  const history = historyWithCompactions("native-first")
+  history.turns[0].blocks.push({ type: "text", text: "unrelated long body" })
+  assert.deepEqual(compactionHistoryRecords(history), [
+    {
+      eventId: "native-first",
+      status: "completed",
+      turnId: "turn-0",
+    },
+  ])
+  assert.deepEqual(compactionHistoryRecords(null), [])
+})
 
 test("manual compaction clicks Send once instead of selecting a slash suggestion with Enter", async () => {
   const actions = []
