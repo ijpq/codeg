@@ -1,6 +1,14 @@
 # Changelog
 
-## 0.41.3-fix3 — 2026-10-30
+## 0.41.3-fix4 — 2026-10-30
+
+- Keep the authoritative compaction lifecycle when a page reload or passive client adapts an unmatched historical tool as settled. An active native operation now continues to show its real summarizing phase and elapsed time, instead of falsely displaying completion or failure; terminal native outcomes still take precedence.
+- The fix3 final-package frontend gate caught this remaining shared rendering defect before publication: the backend snapshot and durable history both correctly reported `in_progress`. Three new regressions fail before the fix; an additional history-adapter-to-renderer case covers cold attachment without a live subscription.
+- Retain all Pi admission/cancellation/persistence fixes and the exact Pi ACP 0.0.34-codeg.5 / Pi 1.4.0 / Node 24.16.0 group, independent native sessions, reliable recovery, multi-provider settings, native Plan/Goal, duration, deliverables, Office review and virtualized scrolling. Both new Windows packages must pass the complete downloaded-package UI suite and postpublication redownload checks; fix3's successful builds do not replace this acceptance.
+
+See [release notes](docs/releases/v0.41.3-fix4.md).
+
+## 0.41.3-fix3 — 2026-10-30 (unpublished candidate)
 
 - Keep one native Pi prompt alive through preflight compaction beyond the ordinary 30-second acknowledgement deadline while bounded native health checks prove execution is active. Handle current and legacy compaction events; real failures and Stop settle owned native execution before the turn ends.
 - Bundle Pi ACP 0.0.34-codeg.5 with Pi 1.4.0 / Node 24.16.0. Fix the fallback that could terminate only a launcher while its native descendant continued; unconfirmed shutdown is a structured terminal error.

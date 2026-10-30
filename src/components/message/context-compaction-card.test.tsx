@@ -23,6 +23,44 @@ function renderCard(props: {
 }
 
 describe("ContextCompactionCard", () => {
+  it.each<ToolCallState | undefined>([
+    undefined,
+    "output-available",
+    "output-error",
+  ])(
+    "keeps restored compaction running with generic tool state %s",
+    (state) => {
+      vi.useFakeTimers()
+      vi.setSystemTime(100_000)
+      try {
+        const { unmount } = renderCard({
+          state,
+          meta: {
+            contextCompaction: {
+              version: 1,
+              status: "in_progress",
+              phase: "summarizing",
+              startedAt: 60_000,
+            },
+          },
+        })
+        expect(screen.getByTestId("context-compaction")).toHaveAttribute(
+          "data-compaction-status",
+          "in_progress"
+        )
+        expect(screen.getByText("Compacting context…")).toBeInTheDocument()
+        expect(screen.getByText("Summarizing history")).toBeInTheDocument()
+        expect(screen.queryByText("Context compacted")).not.toBeInTheDocument()
+        act(() => vi.advanceTimersByTime(1000))
+        expect(screen.getByText("· 41s")).toBeInTheDocument()
+        unmount()
+        expect(vi.getTimerCount()).toBe(0)
+      } finally {
+        vi.useRealTimers()
+      }
+    }
+  )
+
   it("keeps native compaction completion when the later generation fails", () => {
     renderCard({
       state: "output-error",

@@ -29,6 +29,7 @@ vi.mock("@/components/ai-elements/message", () => ({
 
 import { ContentPartsRenderer } from "./content-parts-renderer"
 import enMessages from "@/i18n/messages/en.json"
+import { adaptMessageTurn } from "@/lib/adapters/ai-elements-adapter"
 import type { AdaptedContentPart } from "@/lib/adapters/ai-elements-adapter"
 import { COMPACTION_SUMMARY_META_KEY } from "@/lib/context-compaction"
 
@@ -56,6 +57,46 @@ function renderParts(parts: AdaptedContentPart[]) {
 }
 
 describe("compaction summary in a live turn", () => {
+  it("keeps restored native compaction active without a live tool subscription", () => {
+    const adapted = adaptMessageTurn(
+      {
+        id: "codeg-compaction:pi-session:operation",
+        role: "assistant",
+        timestamp: "2026-10-30T22:04:53.332Z",
+        blocks: [
+          {
+            type: "tool_use",
+            tool_use_id: "operation",
+            tool_name: "context_compaction",
+            input_preview: null,
+            status: "in_progress",
+            meta: {
+              contextCompaction: {
+                version: 1,
+                status: "in_progress",
+                phase: "summarizing",
+                eventId: "operation",
+              },
+            },
+          },
+        ],
+      },
+      {
+        attachedResources: "Attached resources",
+        toolCallFailed: "Tool failed",
+        pageHandoffName: () => "Continue here",
+      }
+    )
+    renderParts(adapted.content)
+    expect(screen.getByTestId("context-compaction")).toHaveAttribute(
+      "data-compaction-status",
+      "in_progress"
+    )
+    expect(screen.getByText("Compacting context…")).toBeInTheDocument()
+    expect(screen.getByText("Summarizing history")).toBeInTheDocument()
+    expect(screen.queryByText("Context compacted")).not.toBeInTheDocument()
+  })
+
   it("offers the summary the backend claimed", () => {
     renderParts([
       compactionPart(

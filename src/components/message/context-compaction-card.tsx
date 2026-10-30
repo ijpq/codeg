@@ -179,8 +179,12 @@ export function ContextCompactionCard({ state, meta, summary }: Props) {
   const status = readText(payload, "status")
   const cancelled = status === "cancelled"
   const terminal = cancelled || status === "failed" || status === "completed"
+  // Restored history can give an unmatched tool a generic settled state.
+  // The persisted native lifecycle still describes the same active operation;
+  // use that state before the legacy tool-state fallback, as for terminal data.
   const isRunning =
-    !terminal && (state === "input-streaming" || state === "input-available")
+    status === "in_progress" ||
+    (!terminal && (state === "input-streaming" || state === "input-available"))
   const startedAt = readNumber(payload, "startedAt")
   const [now, setNow] = useState<number | null>(null)
   useEffect(() => {
@@ -196,7 +200,9 @@ export function ContextCompactionCard({ state, meta, summary }: Props) {
   const failed =
     !cancelled &&
     (status === "failed" ||
-      (!terminal && (errorText !== null || state === "output-error")))
+      (!terminal &&
+        status !== "in_progress" &&
+        (errorText !== null || state === "output-error")))
   const duration = formatDuration(
     isRunning && startedAt !== null && now !== null
       ? Math.max(0, now - startedAt)
