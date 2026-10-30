@@ -21,6 +21,22 @@ export async function submitCompactionComposer(page, editor, text) {
     await editor.press("Enter")
   }
 }
+export async function dismissCompactionFailureNotice(page) {
+  // The deliberately rejected 403 can produce an authentication notification.
+  // Dismiss that expected notice through its real UI before clicking Retry;
+  // never force-click through it or discard unrelated application errors.
+  const notice = page
+    .locator('[data-sonner-toast][data-type="error"]:visible')
+    .filter({
+      hasText: /Pi needs you to sign in again|403|Isolated compaction denied/,
+    })
+  const count = await notice.count()
+  assert.ok(count <= 1, "One failure does not duplicate its notification")
+  if (count) {
+    await notice.getByRole("button", { name: "Close toast" }).click()
+    await notice.waitFor({ state: "detached", timeout: 5000 })
+  }
+}
 async function until(read, accepts, label) {
   let value
   const deadline = Date.now() + 90_000
@@ -380,6 +396,7 @@ export async function piCompactionPage({
         /403|denied/
       )
       checks.push("native-compaction-failure-retains-provider-reason")
+      await dismissCompactionFailureNotice(page)
       const beforeRetry = compactionHistoryRecords(await history())
       assert.deepEqual(
         beforeRetry
