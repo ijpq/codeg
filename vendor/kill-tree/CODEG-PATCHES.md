@@ -14,7 +14,8 @@ A synthetic cycle reproduces the independent defect without enumerating or
 terminating real processes. The published fix2 Server allocation failure is
 not proven to originate here. This patch is not evidence of that attribution.
 
-The existing killer implementations use the trait's opaque return type to avoid
-refining_impl_trait warnings on the supported Rust toolchain; behavior is unchanged.
+The existing killer implementations retain their concrete owned return type.
+A local lint allowance documents that intentional trait refinement; using an
+opaque type here would capture the delegated builder's short-lived borrow.
 
 Vendored source/docs use normalized LF and trailing whitespace; LICENSE is unchanged.

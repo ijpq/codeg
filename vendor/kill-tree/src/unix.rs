@@ -70,8 +70,9 @@ impl Killable for Killer {
 
 pub(crate) struct KillerBuilder {}
 
+#[allow(refining_impl_trait)]
 impl KillableBuildable for KillerBuilder {
-    fn new_killable(&self, config: &Config) -> Result<impl Killable> {
+    fn new_killable(&self, config: &Config) -> Result<Killer> {
         let signal = config.signal.parse()?;
         Ok(Killer { signal })
     }
