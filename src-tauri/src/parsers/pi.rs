@@ -988,7 +988,7 @@ fn parse_compaction(sp: &mut SessionParse, value: &Value, ts: DateTime<Utc>, idx
             },
             ContentBlock::ToolResult {
                 tool_use_id: Some(tool_use_id),
-                output_preview: string_field(value, "summary").map(String::from),
+                output_preview: string_field(value, "summary"),
                 is_error: false,
                 agent_stats: None,
                 images: Vec::new(),
