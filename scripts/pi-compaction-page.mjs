@@ -220,6 +220,28 @@ export async function piCompactionPage({
     page.locator(
       `[data-testid="context-compaction"][data-compaction-status="${status}"]:visible`
     )
+  const latestCompletionSummary = async () => {
+    const expected = piModel
+      .evidence()
+      .findLast((r) => r.compaction)?.compactionSummaryMarker
+    assert.ok(expected, "The native summary has a unique verification marker")
+    const toggle = cards("completed")
+      .last()
+      .getByRole("button", { name: /^(Summary|摘要)$/ })
+    await toggle.click()
+    const summaryId = await until(
+      () => toggle.getAttribute("aria-controls"),
+      (value) => !!value,
+      "The latest completion opens its actual retained summary"
+    )
+    assert.ok(
+      (await page.locator(`[id="${summaryId}"]`).innerText()).includes(
+        expected
+      ),
+      "The visible completion belongs to the new native event, not an older mounted card"
+    )
+    await toggle.click()
+  }
   const checks = []
   const completedEvents = []
   try {
@@ -330,6 +352,7 @@ export async function piCompactionPage({
         "Live/native history converge to one completed record"
       )
       assert.equal(await cards("in_progress").count(), 0)
+      await latestCompletionSummary()
       checks.push(
         "long-native-preflight-over-30s-reply-once",
         "switch-away-return-reload-active-phase",
@@ -376,6 +399,7 @@ export async function piCompactionPage({
       completedEvents.push(retryCompletion.record)
       await cards("completed").last().waitFor({ timeout: 15000 })
       assert.equal(await cards("in_progress").count(), 0)
+      await latestCompletionSummary()
       checks.push("explicit-retry-persists-one-distinct-native-completion")
       await addHistory()
       piModel.compaction(35000)

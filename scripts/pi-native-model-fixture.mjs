@@ -1,5 +1,6 @@
 // Deterministic provider used with the actual Pi, native tools and CodeG MCP.
 import { createServer } from "node:http"
+import { randomUUID } from "node:crypto"
 const pause = (ms) => new Promise((done) => setTimeout(done, ms))
 export async function startPiModel() {
   const requests = [],
@@ -31,8 +32,12 @@ export async function startPiModel() {
       )
     const isChild = latestUser.includes("PI_CHILD_TASK")
     const tools = body.tools ?? []
+    const compactionSummaryMarker = compaction
+      ? `PI_COMPACTION_SUMMARY_${randomUUID()}`
+      : null
     requests.push({
       compaction,
+      compactionSummaryMarker,
       receivedAt: Date.now(),
       inputBytes: Buffer.byteLength(input),
       compactionMarker:
@@ -109,7 +114,9 @@ export async function startPiModel() {
       : "BUSINESS_PI_COMPLETED agenda-v3.md" + longReply
     if (compaction)
       text =
-        "# Retained business context\nPI_COMPACTION_RETAINED requirements, completed work and pending review.\n"
+        "# Retained business context\nPI_COMPACTION_RETAINED requirements, completed work and pending review.\n" +
+        compactionSummaryMarker +
+        "\n"
     let call
     if (marker && !isChild) {
       const key = marker[0],

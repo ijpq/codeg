@@ -236,8 +236,16 @@ test("long history is real native provider output while compaction summaries and
         "</conversation> structured context checkpoint summary"
     )
     assert.ok(summary.length < 1000)
+    assert.ok(summary.includes(model.evidence().at(-1).compactionSummaryMarker))
     assert.ok(model.evidence().at(-1).compaction)
     assert.ok(model.evidence().at(-1).inputBytes > 86000)
+    const retriedSummary = await send(
+      "<conversation>previous summary</conversation> structured context checkpoint summary"
+    )
+    assert.notEqual(retriedSummary, summary)
+    assert.ok(
+      retriedSummary.includes(model.evidence().at(-1).compactionSummaryMarker)
+    )
     model.historyReply(false)
     assert.ok((await send("next round")).length < 1000)
   } finally {
