@@ -172,13 +172,17 @@ mod tests {
 
     #[test]
     fn error_display_invalid_cast() {
+        // Standard-library diagnostics vary by toolchain. Verify the crate
+        // preserves the real source rather than requiring one Rust wording.
+        let source = u32::try_from(-1_i32).unwrap_err();
+        let source_message = source.to_string();
         let error = Error::InvalidCast {
             reason: "reason".to_string(),
-            source: u32::try_from(-1).unwrap_err(),
+            source,
         };
         assert_eq!(
             format!("{error}"),
-            "Invalid cast. Reason: reason. Source: out of range integral type conversion attempted"
+            format!("Invalid cast. Reason: reason. Source: {source_message}")
         );
     }
 

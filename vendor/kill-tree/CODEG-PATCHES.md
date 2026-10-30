@@ -18,4 +18,8 @@ The existing killer implementations retain their concrete owned return type.
 A local lint allowance documents that intentional trait refinement; using an
 opaque type here would capture the delegated builder's short-lived borrow.
 
+The existing error-display test compares against the actual standard-library
+source diagnostic, whose wording changed in Rust 1.99, instead of hardcoding
+an older Rust message. Production error handling is unchanged.
+
 Vendored source/docs use normalized LF and trailing whitespace; LICENSE is unchanged.
