@@ -395,7 +395,31 @@ export async function piCompactionPage({
         await cards("failed").last().locator("[title]").getAttribute("title"),
         /403|denied/
       )
-      checks.push("native-compaction-failure-retains-provider-reason")
+      const failedRecords = compactionHistoryRecords(await history()).filter(
+        (record) => record.status === "failed"
+      )
+      assert.equal(
+        failedRecords.length,
+        1,
+        "Failure is durable independently of the live card"
+      )
+      await dismissCompactionFailureNotice(page)
+      await reloadBusiness(page, api, target)
+      await cards("failed").last().waitFor({ timeout: 15000 })
+      assert.match(
+        await cards("failed").last().locator("[title]").getAttribute("title"),
+        /403|denied/
+      )
+      assert.deepEqual(
+        compactionHistoryRecords(await history()).filter(
+          (r) => r.status === "failed"
+        ),
+        failedRecords,
+        "Reload does not lose or duplicate the real failed operation"
+      )
+      checks.push(
+        "native-compaction-failure-retains-provider-reason-after-reload"
+      )
       await dismissCompactionFailureNotice(page)
       const beforeRetry = compactionHistoryRecords(await history())
       assert.deepEqual(
@@ -435,6 +459,14 @@ export async function piCompactionPage({
       await reply(retry)
       await reloadBusiness(page, api, target)
       assert.equal(await cards("in_progress").count(), 0)
+      const cancelledRecords = compactionHistoryRecords(await history()).filter(
+        (r) => r.status === "cancelled"
+      )
+      assert.equal(
+        cancelledRecords.length,
+        1,
+        "Cancellation is a distinct durable operation"
+      )
       await idle(await submit("/autocompact on"))
       checks.push(
         "stop-native-compaction-no-ghost-execution",
@@ -500,6 +532,19 @@ export async function piCompactionPage({
       JSON.stringify(
         {
           message: String(error),
+          cards: await page
+            .locator('[data-testid="context-compaction"]')
+            .evaluateAll((nodes) =>
+              nodes.map((node) => ({
+                status: node.getAttribute("data-compaction-status"),
+                text: node.textContent,
+                reasons: [...node.querySelectorAll("[title]")].map((item) =>
+                  item.getAttribute("title")
+                ),
+                visible: node.getClientRects().length > 0,
+              }))
+            )
+            .catch(() => null),
           editor,
           compactionRecords: compactionHistoryRecords(
             await history().catch(() => null)

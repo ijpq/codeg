@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.41.3-fix3 — 2026-10-30
+
+- Keep one native Pi prompt alive through preflight compaction beyond the ordinary 30-second acknowledgement deadline while bounded native health checks prove execution is active. Handle current and legacy compaction events; real failures and Stop settle owned native execution before the turn ends.
+- Bundle Pi ACP 0.0.34-codeg.5 with Pi 1.4.0 / Node 24.16.0. Fix the fallback that could terminate only a launcher while its native descendant continued; unconfirmed shutdown is a structured terminal error.
+- Persist Pi compaction lifecycle and actual errors in an additive CodeG ledger. Capture the original business/session/connection identity before asynchronous processing; authoritative native or business history reloads retain failed/cancelled records and enrich successful native records once, without rewriting JSONL or inventing task durations. Interrupted startup state remains explicitly unknown/failed.
+- Reject cyclic or ambiguous process-tree snapshots before any kill, preventing the independently reproduced unbounded traversal and protecting the current process. This does not establish the cause of fix2's Server allocation crash. Upstream license and source provenance are retained in both packages.
+- Keep the unified compaction phase/elapsed/outcome card, native Plan/Goal, bounded history and virtualized scrolling, business handoff/recovery, providers, external deliveries, duration, deliverables and Office review. Final installed Setup and Server frontend acceptance now also checks failed compaction after reload and durable cancellation.
+- Quarantine a published candidate automatically if final downloaded-package acceptance fails or is cancelled. A failed release retains its tag/assets and cannot count as accepted delivery; fix2 remains quarantined.
+
+See [release notes](docs/releases/v0.41.3-fix3.md).
+
 ## 0.41.3-fix2 — 2026-10-30 (quarantined; postpublication verification failed)
 
 - Postpublication retesting caught a Server allocation failure in the old-data frontend restore flow. This release is quarantined as a prerelease; its original tag, packages and diagnostics are retained. Earlier prepublication passes do not make it an accepted delivery.

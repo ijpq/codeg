@@ -78,6 +78,7 @@ mod m20261026_000002_office_delivery_previews;
 mod m20261027_000001_business_handoff_context;
 mod m20261028_000001_business_rule_delivery;
 mod m20261029_000001_business_history_delivery;
+mod m20261030_000001_pi_compaction_lifecycle;
 pub struct Migrator;
 
 #[async_trait::async_trait]
@@ -162,6 +163,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261027_000001_business_handoff_context::Migration),
             Box::new(m20261028_000001_business_rule_delivery::Migration),
             Box::new(m20261029_000001_business_history_delivery::Migration),
+            Box::new(m20261030_000001_pi_compaction_lifecycle::Migration),
         ]
     }
 }

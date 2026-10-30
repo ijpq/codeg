@@ -1150,7 +1150,7 @@ checksum = "c3e64b0cc0439b12df2fa678eae89a1c56a529fd067a9115f7827f1fffd22b32"
 
 [[package]]
 name = "codeg"
-version = "0.41.3-fix2"
+version = "0.41.3-fix3"
 dependencies = [
  "aes-gcm",
  "agent-client-protocol",
@@ -3545,8 +3545,6 @@ dependencies = [
 [[package]]
 name = "kill_tree"
 version = "0.2.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3879339076ac4da142cc852d91693462927cbc99773b5ea422e4834e68c4ff2"
 dependencies = [
  "bindgen",
  "nix 0.27.1",

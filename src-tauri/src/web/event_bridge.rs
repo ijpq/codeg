@@ -594,9 +594,10 @@ where
 {
     let (envelope_arc, stream, evicted) = {
         let mut s = state.write().await;
-        let Some(payload) = build(&mut s) else {
+        let Some(mut payload) = build(&mut s) else {
             return false;
         };
+        crate::acp::compaction::stamp_binding(&mut payload, &s);
         s.apply_event(&payload);
         s.event_seq += 1;
         let envelope = Arc::new(EventEnvelope {

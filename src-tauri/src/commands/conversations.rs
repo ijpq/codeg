@@ -2642,6 +2642,15 @@ async fn get_folder_conversation_raw_impl(
     conversation_id: i32,
     history_request: Option<ConversationHistoryRequest>,
 ) -> Result<(DbConversationDetail, Option<String>), AppCommandError> {
+    get_folder_conversation_raw_with_compactions(conn, conversation_id, history_request, true).await
+}
+
+async fn get_folder_conversation_raw_with_compactions(
+    conn: &sea_orm::DatabaseConnection,
+    conversation_id: i32,
+    history_request: Option<ConversationHistoryRequest>,
+    include_compactions: bool,
+) -> Result<(DbConversationDetail, Option<String>), AppCommandError> {
     let total_started = std::time::Instant::now();
     let db_started = std::time::Instant::now();
     let summary = conversation_service::get_by_id(conn, conversation_id)
@@ -2659,6 +2668,7 @@ async fn get_folder_conversation_raw_impl(
         transcript_watermark,
         history_page,
         history_read_metrics,
+        compaction_before,
     ) = if let Some(ref ext_id) = summary.external_id {
         let at = summary.agent_type;
         let eid = ext_id.clone();
@@ -2749,12 +2759,19 @@ async fn get_folder_conversation_raw_impl(
                             index_status: page.index_status,
                             indexed_through_offset: page.indexed_through_offset,
                         }),
+                        None,
                     ));
                 }
             }
             let parser = build_agent_parser(at, &agent_env);
             match parser.get_conversation(&eid) {
                 Ok(mut d) => {
+                    let compaction_before = history_request_for_parse
+                        .as_ref()
+                        .and_then(|r| r.before_cursor.as_deref())
+                        .and_then(|c| c.strip_prefix("turn:"))
+                        .and_then(|c| c.parse::<usize>().ok())
+                        .and_then(|end| d.turns.get(end).map(|t| t.timestamp));
                     let resolved = (d.summary.id != eid).then(|| d.summary.id.clone());
                     let page = history_request_for_parse
                         .as_ref()
@@ -2769,6 +2786,7 @@ async fn get_folder_conversation_raw_impl(
                         d.transcript_watermark,
                         page,
                         None,
+                        compaction_before,
                     ))
                 }
                 Err(crate::parsers::ParseError::ConversationNotFound(_)) => {
@@ -2816,12 +2834,13 @@ async fn get_folder_conversation_raw_impl(
                                         d.transcript_watermark,
                                         page,
                                         None,
+                                        None,
                                     ));
                                 }
                             }
                         }
                     }
-                    Ok((vec![], None, None, None, None, None, None, None))
+                    Ok((vec![], None, None, None, None, None, None, None, None))
                 }
                 Err(e) => Err(parse_error_to_app_error(e)),
             }
@@ -2847,6 +2866,7 @@ async fn get_folder_conversation_raw_impl(
                 loaded_turns: 0,
                 ..ConversationHistoryPage::default()
             }),
+            None,
             None,
         )
     };
@@ -3054,6 +3074,22 @@ async fn get_folder_conversation_raw_impl(
         }
     }
     let merge_db_elapsed_ms = merge_db_started.elapsed().as_millis() as u64;
+    if include_compactions && summary.agent_type == AgentType::Pi {
+        let from = history_page
+            .as_ref()
+            .filter(|p| p.has_more)
+            .and_then(|_| turns.first().map(|t| t.timestamp));
+        crate::db::service::compaction_service::merge_history(
+            conn,
+            conversation_id,
+            summary.external_id.as_deref(),
+            from,
+            compaction_before,
+            &mut turns,
+        )
+        .await
+        .map_err(AppCommandError::from)?;
+    }
     let output_turn_refs = turns
         .iter()
         .map(VisibleConversationTurnRef::from)
@@ -4737,7 +4773,7 @@ pub(crate) async fn capture_business_tail(
     else {
         return Ok(());
     };
-    let (detail, _) = get_folder_conversation_raw_impl(
+    let (detail, _) = get_folder_conversation_raw_with_compactions(
         conn,
         cid,
         Some(ConversationHistoryRequest {
@@ -4745,6 +4781,7 @@ pub(crate) async fn capture_business_tail(
             user_turn_limit: 25,
             cancellation: None,
         }),
+        false,
     )
     .await?;
     let current = conversation_service::get_by_id(conn, cid)
@@ -4793,7 +4830,7 @@ async fn get_business_conversation_detail(
             tracing::warn!(conversation_id=cid,error=%e,"[business] native tail not available; serving durable history")
         }
     }
-    let (turns, next, output_turn_refs) = business::history_with_output_refs(
+    let (mut turns, next, output_turn_refs) = business::history_with_output_refs(
         conn,
         cid,
         before,
@@ -4801,6 +4838,34 @@ async fn get_business_conversation_detail(
             .as_ref()
             .map(|r| r.user_turn_limit as usize)
             .unwrap_or(usize::MAX),
+    )
+    .await
+    .map_err(AppCommandError::from)?;
+    let compaction_before = if let Some(sequence) = before {
+        use sea_orm::{ConnectionTrait, DbBackend, Statement};
+        let row = conn
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT turn_json FROM business_message WHERE conversation_id=? AND sequence=?",
+                [cid.into(), sequence.into()],
+            ))
+            .await
+            .map_err(crate::db::error::DbError::from)
+            .map_err(AppCommandError::from)?;
+        row.map(|row| row.try_get::<String>("", "turn_json"))
+            .transpose()
+            .map_err(crate::db::error::DbError::from)
+            .map_err(AppCommandError::from)?
+            .map(|body| serde_json::from_str::<MessageTurn>(&body))
+            .transpose()
+            .map_err(|error| AppCommandError::task_execution_failed("Invalid business history boundary").with_detail(error.to_string()))?
+            .map(|turn| turn.timestamp)
+    } else {
+        None
+    };
+    let compaction_from = next.and_then(|_| turns.first().map(|turn| turn.timestamp));
+    crate::db::service::compaction_service::merge_history(
+        conn, cid, None, compaction_from, compaction_before, &mut turns,
     )
     .await
     .map_err(AppCommandError::from)?;
@@ -4893,6 +4958,47 @@ async fn get_business_conversation_detail(
 mod tests {
     use super::*;
     use crate::db::test_helpers::{fresh_in_memory_db, seed_folder};
+
+    #[tokio::test]
+    async fn pi_failed_compaction_survives_native_and_managed_business_detail_refresh() {
+        use crate::acp::{compaction::stamp_binding, session_state::SessionState, types::{AcpEvent, EventEnvelope}};
+        use crate::db::{service::{business_conversation_service as business, compaction_service}, test_helpers::seed_conversation};
+        for managed in [false, true] {
+            let db = fresh_in_memory_db().await;
+            let folder = seed_folder(&db, "/isolated/pi-compaction-history").await;
+            let cid = seed_conversation(&db, folder, AgentType::Pi).await;
+            let external = "no-native-failed-compaction-fixture";
+            conversation_service::bind_external_id(&db.conn, cid, external, &[]).await.unwrap();
+            if managed {
+                let summary = conversation_service::get_by_id(&db.conn, cid).await.unwrap();
+                let user: MessageTurn = serde_json::from_value(serde_json::json!({
+                    "id": "original-user", "role": "user", "blocks": [{"type": "text", "text": "continue"}],
+                    "timestamp": chrono::Utc::now() - chrono::Duration::seconds(1)
+                })).unwrap();
+                business::initialize(&db.conn, &summary, &[user]).await.unwrap();
+            }
+            let mut state = SessionState::new("owned-pi".into(), AgentType::Pi, None, "main".into(), Some(folder));
+            state.conversation_id = Some(cid);
+            state.external_id = Some(external.into());
+            let mut payload: AcpEvent = serde_json::from_value(serde_json::json!({
+                "type": "tool_call_update", "tool_call_id": "failed-event", "status": "failed",
+                "meta": {"contextCompaction": {"version": 1,"status": "failed","error": "HTTP 403: denied"}}
+            })).unwrap();
+            stamp_binding(&mut payload, &state);
+            compaction_service::persist(&db.conn, &EventEnvelope {connection_id: "owned-pi".into(), seq: 2, payload}).await.unwrap();
+            for _ in 0..3 {
+                let (detail, _) = get_folder_conversation_page_core(&db.conn, cid, ConversationHistoryRequest {
+                    before_cursor: None, user_turn_limit: 2, cancellation: None,
+                }).await.unwrap();
+                let cards = detail.turns.iter().flat_map(|t| &t.blocks).filter_map(|b| match b {
+                    ContentBlock::ToolUse {meta: Some(meta), ..} => meta.get("contextCompaction"), _ => None,
+                }).collect::<Vec<_>>();
+                assert_eq!(cards.len(), 1, "managed={managed}");
+                assert_eq!(cards[0]["status"], "failed");
+                assert_eq!(cards[0]["error"], "HTTP 403: denied");
+            }
+        }
+    }
 
     /// Serializes every test that touches the process-global [`IMPORT_GUARD`].
     ///

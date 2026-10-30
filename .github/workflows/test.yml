@@ -222,6 +222,11 @@ jobs:
         working-directory: src-tauri
         run: cargo test ${{ matrix.cargo_args }} ${{ (matrix.os == 'windows-latest' && matrix.mode == 'desktop') && '--no-run' || '' }}
 
+      - name: Process tree traversal safety regression
+        if: matrix.mode == 'server' && matrix.os == 'windows-latest'
+        working-directory: src-tauri
+        run: cargo test --manifest-path ../vendor/kill-tree/Cargo.toml --lib --locked
+
       - name: cargo clippy
         # Clippy on each (os, mode) cell — desktop covers tauri-only code
         # paths plus integration tests, server covers cfg-gated server-only

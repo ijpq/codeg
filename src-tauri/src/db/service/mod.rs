@@ -10,6 +10,7 @@ pub mod chat_channel_service;
 pub mod conversation_branch_service;
 pub mod conversation_branch_task_service;
 pub mod conversation_service;
+pub(crate) mod compaction_service;
 pub mod conversation_tag_service;
 pub mod custom_agent_service;
 pub(crate) mod deliverable_path;

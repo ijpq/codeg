@@ -18,6 +18,7 @@ pub mod codex_model_catalog;
 pub mod codex_runtime;
 pub(crate) mod codex_bundled_runtime;
 pub mod command_code;
+pub(crate) mod compaction;
 pub mod computer_tools;
 pub mod codex_steer_adapter;
 pub mod connection;

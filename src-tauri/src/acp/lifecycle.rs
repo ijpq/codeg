@@ -54,7 +54,9 @@ const WORKER_QUEUE_CAPACITY: usize = 64;
 /// TurnComplete in the worker mailbox: only events that may write the DB
 /// or update the per-connection cache enter the queue.
 ///
-/// `ToolCall`/`ToolCallUpdate` are deliberately NOT in the accept list.
+/// Ordinary `ToolCall`/`ToolCallUpdate` are deliberately NOT in the accept list.
+/// The rare, owner-stamped Pi compaction lifecycle is persisted separately:
+/// failed/cancelled operations do not exist in Pi's native transcript.
 /// Delegation correlation (capturing `delegate_to_agent` tool_call_ids for
 /// the broker's pending queue) used to ride the worker's `ToolCall` arm, but
 /// that coupled a latency-critical, lossless registration to the DB-stalling
@@ -65,7 +67,7 @@ const WORKER_QUEUE_CAPACITY: usize = 64;
 /// `register_delegation_tool_call_from_event`, so these high-frequency events
 /// never need to reach a worker.
 fn is_lifecycle_relevant(event: &AcpEvent) -> bool {
-    matches!(
+    crate::acp::compaction::lifecycle_meta(event).is_some() || matches!(
         event,
         AcpEvent::SessionStarted { .. }
             | AcpEvent::SessionModes { .. }
@@ -156,6 +158,14 @@ const HANDLE_EVENT_RETRY_BACKOFFS: &[Duration] =
 ///
 /// Final failure is logged at ERROR — this is the only signal the
 /// subscriber is dropping correctness on the floor, so it must be noisy.
+fn lifecycle_event_diagnostic(event: &AcpEvent) -> String {
+    if crate::acp::compaction::lifecycle_meta(event).is_some() {
+        "Pi compaction lifecycle (content omitted)".to_owned()
+    } else {
+        format!("{event:?}")
+    }
+}
+
 async fn handle_event_with_retry(
     db_conn: &DatabaseConnection,
     manager: &ConnectionManager,
@@ -167,7 +177,7 @@ async fn handle_event_with_retry(
         Err(e) => {
             tracing::warn!(
                 "[lifecycle][WARN] handle_event failed (attempt 1, will retry) for {:?}: {e}",
-                envelope.payload
+                lifecycle_event_diagnostic(&envelope.payload)
             );
         }
     }
@@ -187,7 +197,7 @@ async fn handle_event_with_retry(
                     } else {
                         ", will retry"
                     },
-                    envelope.payload
+                    lifecycle_event_diagnostic(&envelope.payload)
                 );
             }
         }
@@ -380,6 +390,10 @@ pub(crate) async fn handle_event(
         }
     }
     match &envelope.payload {
+        AcpEvent::ToolCall { .. } | AcpEvent::ToolCallUpdate { .. }
+            if crate::acp::compaction::lifecycle_meta(&envelope.payload).is_some() => {
+            crate::db::service::compaction_service::persist(db_conn, envelope).await
+        }
         AcpEvent::SessionModes { .. } | AcpEvent::SessionConfigOptions { .. } => {
             crate::commands::business_conversations::persist_connection_settings(
                 db_conn, manager, &envelope.connection_id,
@@ -493,6 +507,10 @@ pub(crate) async fn handle_event(
             Ok(())
         }
         AcpEvent::TurnComplete { stop_reason, .. } => {
+            crate::db::service::compaction_service::interrupt_connection(
+                db_conn, &envelope.connection_id, stop_reason.starts_with("cancel"),
+                "The agent ended the turn without recording a compaction outcome.",
+            ).await?;
             let artifact_status = match stop_reason.as_str() {
                 "end_turn" => ArtifactTurnFinishStatus::Completed,
                 "cancelled" | "cancel_timeout" | "cancel_command_channel_closed" => {
@@ -3470,6 +3488,12 @@ async fn connection_worker_loop(
                 if terminal_dispatched {
                     continue;
                 }
+                if let Err(error) = crate::db::service::compaction_service::interrupt_connection(
+                    &db, &connection_id, false,
+                    "The agent connection closed before the compaction outcome was recorded.",
+                ).await {
+                    tracing::error!(connection_id, %error, "[compaction] disconnect persistence failed");
+                }
                 manager
                     .finish_artifact_turn(
                         &connection_id,
@@ -3509,6 +3533,11 @@ async fn connection_worker_loop(
                 }
                 if terminal_dispatched {
                     continue;
+                }
+                if let Err(error) = crate::db::service::compaction_service::interrupt_connection(
+                    &db, &connection_id, false, message,
+                ).await {
+                    tracing::error!(connection_id, %error, "[compaction] failure persistence failed");
                 }
                 manager
                     .finish_artifact_turn(
@@ -5051,6 +5080,27 @@ mod tests {
             meta: None,
             images: None,
         }));
+    }
+
+    #[test]
+    fn pi_compaction_lifecycle_is_persisted_without_admitting_ordinary_tool_traffic() {
+        let mut state = SessionState::new("pi-owned".into(), crate::models::AgentType::Pi, None, "main".into(), None);
+        state.conversation_id = Some(7);
+        state.external_id = Some("native-pi".into());
+        let mut event = AcpEvent::ToolCallUpdate {
+            tool_call_id: "compaction-uuid".into(), title: None,
+            status: Some("failed".into()), content: None, raw_input: None,
+            raw_output: None, raw_output_append: None, locations: None,
+            meta: Some(serde_json::json!({"contextCompaction": {
+                "version": 1, "status": "failed", "error": "HTTP 403: denied"
+            }})), images: None,
+        };
+        crate::acp::compaction::stamp_binding(&mut event, &state);
+        assert!(is_lifecycle_relevant(&event), "the old blanket ToolCallUpdate filter lost this final state");
+        if let AcpEvent::ToolCallUpdate { meta, .. } = &mut event {
+            *meta = None;
+        }
+        assert!(!is_lifecycle_relevant(&event));
     }
 
     /// Dispatcher must drop the per-connection worker sender on either

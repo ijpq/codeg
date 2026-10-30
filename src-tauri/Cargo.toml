@@ -1,6 +1,6 @@
 [package]
 name = "codeg"
-version = "0.41.3-fix2"
+version = "0.41.3-fix3"
 description = "Agent Code Generation App"
 authors = ["feitao"]
 edition = "2021"
@@ -233,7 +233,8 @@ toml_edit = "0.19"
 serde_yaml = "0.9"
 notify = "6"
 base64 = "0.22"
-kill_tree = { version = "0.2", features = ["tokio"] }
+# Preserve upstream 0.2.4 with a bounded, fail-closed PID-graph traversal.
+kill_tree = { path = "../vendor/kill-tree", version = "0.2.4", features = ["tokio"] }
 which = "7"
 open = { version = "5", features = ["shellexecute-on-windows"] }
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"], optional = true }
