@@ -3,6 +3,7 @@
 ## 0.41.3-fix2 — 2026-10-30
 
 - Retain the Pi native compaction admission, cancellation and shared lifecycle display fixes from the unpublished fix1 candidate, including ordered MCP readiness updates for early-attached clients.
+- Fix a cold-page restore race shared by Setup and Server: composer focus could restore by business id before the folder query loaded, and the later same-connection restore never filled the missing local working directory. Focus now waits for the folder and a confirmed restore fills only missing identity, keeping the live connection and strict send gate. Six Pi/Codex, Web/desktop regressions fail before the fix and pass afterward.
 - Match the sidebar toggle's actual accessible name, including its configured shortcut, before testing the mobile Drawer. Wait for its responsive mount before one Escape and retain phase evidence; the toolbar must still be unobscured and reachable. The prior selector fails two timing regressions; the corrected five-case regression runs in ordinary and Windows package CI.
 - Keep the exact bundled Pi ACP 0.0.34-codeg.4 / Pi 1.4.0 / Node 24.16.0 group and all existing business, recovery, provider, Plan/Goal, deliverable, Office, duration and scrolling checks. Both final Windows packages must pass downloaded installation, upgrade, frontend compaction/reply, restart, rollback and checksum gates.
 - fix1 was blocked before publication by the Server narrow-layout gate. Its partial Setup evidence is retained and cannot replace this release's full two-package verification.

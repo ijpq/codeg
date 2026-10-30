@@ -466,6 +466,7 @@ export function useConnectionLifecycle({
   const identityReady =
     (conn.agentType == null || conn.agentType === agentType) &&
     (!sessionId || conn.sessionId === sessionId) &&
+    (conn.connectedWorkingDir ?? null) === (workingDir ?? null) &&
     (!conversationId ||
       !supportsAtomicConversationRestore(agentType) ||
       conn.conversationId === conversationId)
@@ -474,7 +475,9 @@ export function useConnectionLifecycle({
     // Respect the caller's readiness gate — e.g. historical conversations
     // set isActive=false until the session's external_id resolves, to
     // avoid connecting with sessionId=undefined and orphaning context.
-    if (!isActive) return
+    // Focus can precede the folder query on a cold page. Like auto-connect,
+    // wait for the concrete directory rather than creating a partial binding.
+    if (!isActive || !workingDir) return
     touchActivity(contextKey)
     if (
       !status ||

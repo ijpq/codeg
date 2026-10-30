@@ -628,6 +628,8 @@ type Action =
       connectionId: string
       conversationId: number
       externalSessionId: string
+      /** Concrete directory from this completed restore request, if loaded. */
+      workingDir: string | null
       lifecycleState: string | null
       /** Backend observation cursor, or pre-request cursor for older servers. */
       observedEventSeq: number
@@ -2093,9 +2095,15 @@ function connectionsReducer(
             : current.status
       const nextSelectorsReady = current.selectorsReady || durableReady
       const nextPromptReady = current.promptReady || durableReady
+      // An early focus may restore by business id before its folder loads.
+      // A later same-id restore must fill that missing local identity without
+      // replacing the live connection or relaxing the composer's cwd check.
+      // Never overwrite a concrete (possibly conflicting) directory here.
+      const nextWorkingDir = current.workingDir ?? action.workingDir
       if (
         current.conversationId === action.conversationId &&
         current.sessionId === action.externalSessionId &&
+        current.workingDir === nextWorkingDir &&
         current.status === nextStatus &&
         current.selectorsReady === nextSelectorsReady &&
         current.promptReady === nextPromptReady &&
@@ -2111,6 +2119,7 @@ function connectionsReducer(
         ...current,
         conversationId: action.conversationId,
         sessionId: action.externalSessionId,
+        workingDir: nextWorkingDir,
         status: nextStatus,
         selectorsReady: nextSelectorsReady,
         promptReady: nextPromptReady,
@@ -8165,6 +8174,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
               connectionId,
               conversationId: restoredConversationId,
               externalSessionId: restoredExternalSessionId,
+              workingDir: nextWorkingDir,
               lifecycleState: restoredLifecycleState,
               observedEventSeq: restoredObservedEventSeq,
               codegMcpAvailable: restoredCodegMcpAvailable,
@@ -8297,6 +8307,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             connectionId,
             conversationId: restoredConversationId,
             externalSessionId: restoredExternalSessionId,
+            workingDir: nextWorkingDir,
             lifecycleState: restoredLifecycleState,
             observedEventSeq: restoredObservedEventSeq,
             codegMcpAvailable: restoredCodegMcpAvailable,

@@ -92,6 +92,7 @@ interface HarnessProps {
   conversationId?: number
   agentType?: AgentType
   showFocusInput?: boolean
+  workingDir?: string | null
 }
 
 function Harness({
@@ -99,12 +100,13 @@ function Harness({
   conversationId,
   agentType = "codex",
   showFocusInput = false,
+  workingDir = "/workspace",
 }: HarnessProps) {
   const lifecycle = useConnectionLifecycle({
     contextKey: "codex-tab",
     agentType,
     isActive: true,
-    workingDir: "/workspace",
+    workingDir: workingDir ?? undefined,
     sessionId,
     conversationId,
   })
@@ -170,6 +172,31 @@ describe("useConnectionLifecycle persisted identity changes", () => {
     await Promise.resolve()
     expect(h.connect).toHaveBeenCalledTimes(1)
   })
+
+  it.each(["pi", "codex"] as const)(
+    "%s focus waits for the folder before restoring an existing conversation",
+    async (agentType) => {
+      const props = {
+        agentType,
+        conversationId: 42,
+        sessionId: "native-session-42",
+        showFocusInput: true,
+      }
+      const view = render(<Harness {...props} workingDir={null} />)
+      fireEvent.focus(screen.getByLabelText("prompt"))
+      await Promise.resolve()
+      expect(h.connect).not.toHaveBeenCalled()
+
+      view.rerender(<Harness {...props} workingDir="/workspace" />)
+      await waitFor(() => expect(h.connect).toHaveBeenCalledTimes(1))
+      expect(h.connect).toHaveBeenCalledWith(
+        agentType,
+        "/workspace",
+        "native-session-42",
+        42
+      )
+    }
+  )
 
   it("revalidates an idle connection whose local prompt-ready latch is stale", async () => {
     h.status = "connected"

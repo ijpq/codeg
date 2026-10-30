@@ -2902,6 +2902,63 @@ describe("AcpConnectionsProvider persisted Codex restore lifecycle", () => {
     )
   })
 
+  it.each([
+    ["pi", true],
+    ["pi", false],
+    ["codex", true],
+    ["codex", false],
+  ] as const)(
+    "%s repairs a directoryless early attachment without replacing its ready connection (web=%s)",
+    async (agent, web) => {
+      if (!web) h.eventStreamValue = null
+      h.acpRestoreConversation.mockResolvedValue({
+        connectionId: "early-focus-connection",
+        externalSessionId: "sess-1",
+        reusedExisting: true,
+        codegMcpAvailable: true,
+        mcpServerCount: 1,
+        replacedConnectionIds: [],
+        lifecycleState: "ready",
+        durableSession: true,
+      })
+      await mountProvider()
+      // Focus can precede folder loading on a cold page. The server can
+      // restore by business id, but its receipt cannot leave the client's
+      // directory identity permanently empty when the folder later arrives.
+      await act(async () => {
+        await h.actions!.connect("business-42", agent, undefined, "sess-1", 42)
+      })
+      expect(h.store!.getConnection("business-42")?.workingDir).toBeNull()
+      await act(async () => {
+        await h.actions!.connect("business-42", agent, "/tmp/x", "sess-1", 42)
+      })
+      expect(h.store!.getConnection("business-42")).toMatchObject({
+        connectionId: "early-focus-connection",
+        conversationId: 42,
+        sessionId: "sess-1",
+        workingDir: "/tmp/x",
+        status: "connected",
+        promptReady: true,
+      })
+      expect(h.acpRestoreConversation).toHaveBeenCalledTimes(2)
+      expect(h.acpConnect).not.toHaveBeenCalled()
+      expect(h.acpDisconnect).not.toHaveBeenCalled()
+      await act(async () => {
+        await h.actions!.sendPrompt(
+          "business-42",
+          [{ type: "text", text: "continue after folder resolves" }],
+          {
+            folderId: 1,
+            conversationId: 42,
+            clientMessageId: "folder-ready-once",
+          }
+        )
+      })
+      expect(h.acpPrompt).toHaveBeenCalledTimes(1)
+      expect(h.acpPrompt.mock.calls[0]?.[4]).toBe("folder-ready-once")
+    }
+  )
+
   it("repairs stale prompt readiness when restore reuses the same connection id", async () => {
     h.acpRestoreConversation
       .mockResolvedValueOnce({
