@@ -3932,7 +3932,7 @@ impl ConnectionManager {
         frontend_generation: Option<u64>,
     ) -> Result<AcpCancelResult, AcpError> {
         let prompt_lock = self.clone_prompt_lock(conn_id).await?;
-        let _cancel_guard = prompt_lock.lock_owned().await;
+        let cancel_guard = prompt_lock.lock_owned().await;
         let (cmd_tx, state_arc) = {
             let connections = self.connections.lock().await;
             let conn = connections
@@ -3947,6 +3947,7 @@ impl ConnectionManager {
             folder_id,
             root_path,
             turn_in_flight,
+            await_native_cancel,
         ) = {
             let state = state_arc.read().await;
             (
@@ -3963,6 +3964,7 @@ impl ConnectionManager {
                     .map(|path| path.to_string_lossy().to_string())
                     .unwrap_or_default(),
                 state.turn_in_flight,
+                state.agent_type == AgentType::Pi,
             )
         };
         let cancel_request_id = uuid::Uuid::new_v4().to_string();
@@ -4070,6 +4072,7 @@ impl ConnectionManager {
                 .await
                 .is_err()
             {
+                drop(cancel_guard);
                 if let Some(run_id) = run_id.as_deref() {
                     self.force_finish_cancelled_run(
                         db,
@@ -4098,7 +4101,7 @@ impl ConnectionManager {
                         .to_string(),
                 ),
             };
-            if let Some(acknowledgment_error) = acknowledgment_error {
+            if acknowledgment_error.is_some() || await_native_cancel {
                 let manager = self.clone_ref();
                 let db = db.clone();
                 let connection_id = conn_id.to_string();
@@ -4125,19 +4128,21 @@ impl ConnectionManager {
                         }
                     }
                 });
+            }
+            if let Some(acknowledgment_error) = acknowledgment_error {
                 return Err(AcpError::protocol(format!(
                     "{acknowledgment_error}; targeted recovery is scheduled"
                 )));
             }
 
-            if let Some(run_id) = run_id.as_deref() {
+            if let Some(run_id) = run_id.as_deref().filter(|_| !await_native_cancel) {
                 self.force_finish_cancelled_run(db, conn_id, run_id, "cancelled", false)
                     .await?;
             }
         }
 
         Ok(AcpCancelResult {
-            outcome: if disposition == "cancel_requested" {
+            outcome: if disposition == "cancel_requested" && !await_native_cancel {
                 "cancelled".to_string()
             } else {
                 disposition.to_string()
@@ -4157,6 +4162,24 @@ impl ConnectionManager {
         stop_reason: &str,
         disconnect: bool,
     ) -> Result<bool, AcpError> {
+        let state_and_emitter = self.get_state_and_emitter(connection_id).await;
+        let pi_disconnect = if let Some((state, _)) = state_and_emitter.as_ref() {
+            disconnect && state.read().await.agent_type == AgentType::Pi
+        } else {
+            false
+        };
+        // Serialize the timeout's identity check and teardown with new prompt
+        // admission. A delayed timer must never stop a newer business turn.
+        let _pi_cancel_guard = if pi_disconnect {
+            Some(
+                self.clone_prompt_lock(connection_id)
+                    .await?
+                    .lock_owned()
+                    .await,
+            )
+        } else {
+            None
+        };
         let Some(run) = conversation_turn_run::Entity::find_by_id(run_id.to_string())
             .one(db)
             .await
@@ -4171,6 +4194,33 @@ impl ConnectionManager {
                 "turn run {run_id} belongs to another connection"
             )));
         }
+        if !matches!(
+            run.status,
+            ConversationTurnRunStatus::Running | ConversationTurnRunStatus::Cancelling
+        ) {
+            return Ok(false);
+        }
+        if pi_disconnect {
+            let (state, _) = state_and_emitter
+                .as_ref()
+                .expect("Pi connection was observed");
+            let snapshot = state.read().await;
+            if snapshot
+                .active_turn_run_id
+                .as_deref()
+                .is_some_and(|active| active != run_id)
+            {
+                return Ok(false);
+            }
+            let still_running = snapshot.turn_in_flight;
+            drop(snapshot);
+            if still_running {
+                // A cancellation deadline is not native stop confirmation.
+                // Reap this connection's process tree before durable/UI terminal
+                // state; an unconfirmed stop remains an explicit error.
+                self.disconnect_and_wait(connection_id).await?;
+            }
+        }
 
         let finalized = artifact_service::finalize_turn_state(
             db,
@@ -4183,8 +4233,10 @@ impl ConnectionManager {
         )
         .await
         .map_err(|error| AcpError::protocol(error.to_string()))?;
+        if !finalized {
+            return Ok(false);
+        }
 
-        let state_and_emitter = self.get_state_and_emitter(connection_id).await;
         if let Some((state, emitter)) = state_and_emitter.as_ref() {
             let (session_id, agent_type) = {
                 let snapshot = state.read().await;
@@ -4242,7 +4294,7 @@ impl ConnectionManager {
             connection_cleanup_requested = disconnect,
             "[ACP][cancel] forced single-turn cancellation finalization"
         );
-        if disconnect {
+        if disconnect && !pi_disconnect {
             let _ = self.disconnect(connection_id).await;
         }
         Ok(finalized)
@@ -8954,6 +9006,196 @@ mod tests {
             1
         );
         assert!(rx.try_recv().is_err(), "duplicate cancel reached the agent");
+    }
+
+    #[tokio::test]
+    async fn pi_cancel_delivery_does_not_finalize_the_native_execution() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let mgr = ConnectionManager::new();
+        let mut rx = insert_live_connection(&mgr, "pi-cancel-pending", AgentType::Pi, None).await;
+        let (_, run_id) = seed_live_turn_run(&db, &mgr, "pi-cancel-pending").await;
+        let cancel_manager = mgr.clone_ref();
+        let cancel_db = db.conn.clone();
+        let pending =
+            tokio::spawn(
+                async move { cancel_manager.cancel(&cancel_db, "pi-cancel-pending").await },
+            );
+        match rx.recv().await.unwrap() {
+            ConnectionCommand::Cancel { reply } => {
+                reply.unwrap().send(Ok(())).unwrap();
+            }
+            _ => panic!("one native cancel notification"),
+        }
+        assert_eq!(pending.await.unwrap().unwrap().outcome, "cancel_requested");
+        let run = conversation_turn_run::Entity::find_by_id(run_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.status, ConversationTurnRunStatus::Cancelling);
+        assert!(run.completed_at.is_none());
+        assert!(
+            mgr.get_state("pi-cancel-pending")
+                .await
+                .unwrap()
+                .read()
+                .await
+                .turn_in_flight
+        );
+        let duplicate = mgr.cancel(&db.conn, "pi-cancel-pending").await.unwrap();
+        assert_eq!(duplicate.outcome, "already_cancelling");
+        assert!(
+            rx.try_recv().is_err(),
+            "a repeated Stop must not restart native cancellation"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pi_cancel_timeout_confirms_owned_process_exit_before_terminal_state() {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let mgr = ConnectionManager::new();
+        let mut rx = insert_live_connection(&mgr, "pi-stop-timeout", AgentType::Pi, None).await;
+        let _neighbor = insert_live_connection(&mgr, "pi-stop-neighbor", AgentType::Pi, None).await;
+        let (_, run_id) = seed_live_turn_run(&db, &mgr, "pi-stop-timeout").await;
+        let (_, neighbor_run_id) = seed_live_turn_run(&db, &mgr, "pi-stop-neighbor").await;
+        let state = mgr.get_state("pi-stop-timeout").await.unwrap();
+        let child_pid = mgr.connections.lock().await["pi-stop-timeout"]
+            .child_pid
+            .clone();
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", "exec sleep 30"])
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        child_pid.store(child.id().unwrap(), SeqCst);
+        let (exited, exit) = tokio::sync::oneshot::channel();
+        let (release, reaped) = tokio::sync::oneshot::channel();
+        let reap = tokio::spawn(async move {
+            child.wait().await.unwrap();
+            exited.send(()).unwrap();
+            // Hold the real reap acknowledgement so the assertion cannot race
+            // teardown, regardless of the database or scheduler's speed.
+            reaped.await.unwrap();
+            child_pid.store(0, SeqCst);
+        });
+        let stop_manager = mgr.clone_ref();
+        let stop_db = db.conn.clone();
+        let stop_run_id = run_id.clone();
+        let stop = tokio::spawn(async move {
+            stop_manager
+                .force_finish_cancelled_run(
+                    &stop_db,
+                    "pi-stop-timeout",
+                    &stop_run_id,
+                    "cancel_timeout",
+                    true,
+                )
+                .await
+        });
+        assert!(matches!(
+            rx.recv().await,
+            Some(ConnectionCommand::Disconnect)
+        ));
+        tokio::time::timeout(Duration::from_secs(5), exit)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !stop.is_finished(),
+            "native process reaping still owns cancellation"
+        );
+        let run = conversation_turn_run::Entity::find_by_id(run_id.clone())
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            run.completed_at.is_none(),
+            "no durable terminal state before stop confirmation"
+        );
+        assert!(
+            state.read().await.turn_in_flight,
+            "no UI terminal event before stop confirmation"
+        );
+        release.send(()).unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(5), stop)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap());
+        reap.await.unwrap();
+        let run = conversation_turn_run::Entity::find_by_id(run_id.clone())
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.status, ConversationTurnRunStatus::Cancelled);
+        assert!(run.completed_at.is_some());
+        assert!(!state.read().await.turn_in_flight);
+        assert!(
+            !mgr.force_finish_cancelled_run(
+                &db.conn,
+                "pi-stop-timeout",
+                &run_id,
+                "cancel_timeout",
+                true,
+            )
+            .await
+            .unwrap(),
+            "a duplicate deadline does not emit another terminal event"
+        );
+        let neighbor = conversation_turn_run::Entity::find_by_id(neighbor_run_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(neighbor.status, ConversationTurnRunStatus::Running);
+        assert!(
+            mgr.get_state("pi-stop-neighbor")
+                .await
+                .unwrap()
+                .read()
+                .await
+                .turn_in_flight
+        );
+    }
+
+    #[tokio::test]
+    async fn pi_cancel_deadline_cannot_interrupt_a_newer_turn() {
+        let db = crate::db::test_helpers::fresh_in_memory_db().await;
+        let mgr = ConnectionManager::new();
+        let mut rx = insert_live_connection(&mgr, "pi-old-stop", AgentType::Pi, None).await;
+        let (_, old_run_id) = seed_live_turn_run(&db, &mgr, "pi-old-stop").await;
+        let state = mgr.get_state("pi-old-stop").await.unwrap();
+        state.write().await.active_turn_run_id = Some("new-pi-turn".into());
+        assert!(!mgr
+            .force_finish_cancelled_run(
+                &db.conn,
+                "pi-old-stop",
+                &old_run_id,
+                "cancel_timeout",
+                true,
+            )
+            .await
+            .unwrap());
+        assert!(
+            rx.try_recv().is_err(),
+            "an obsolete timeout must not disconnect the new writer"
+        );
+        assert!(state.read().await.turn_in_flight);
+        assert!(mgr.get_state("pi-old-stop").await.is_some());
+        let old = conversation_turn_run::Entity::find_by_id(old_run_id)
+            .one(&db.conn)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            old.completed_at.is_none(),
+            "the timeout cannot settle the newer business state"
+        );
     }
 
     #[tokio::test]

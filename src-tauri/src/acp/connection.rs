@@ -16304,11 +16304,10 @@ async fn run_conversation_loop(
                                     // next prompt either.
                                     // Also cancel any pending permission requests
                                     // (queued ones included), clearing the card
-                                    // that was on screen, and immediately emit
-                                    // TurnComplete so the frontend transitions out
-                                    // of "prompting" and the user can send new
-                                    // messages. Don't wait for the agent -- it may
-                                    // be slow to respond or not respond at all.
+                                    // that was on screen. Most adapters release
+                                    // the frontend at once; Pi must keep the turn
+                                    // until native idle and compaction settlement
+                                    // are confirmed by the prompt response.
                                     // One critical section for the same reason as
                                     // the turn-end exits: a request admitted
                                     // between the two would be published and then
@@ -16317,18 +16316,27 @@ async fn run_conversation_loop(
                                     // permission requests gated are closed
                                     // here for an agent that leaves them open
                                     // (see `stopped_call_reports`).
-                                    drain_permissions_on_stop_then_emit(
-                                        perms,
-                                        state,
-                                        emitter,
-                                        agent_type,
-                                        AcpEvent::TurnComplete {
-                                            session_id: sid.0.to_string(),
-                                            stop_reason: "cancelled".into(),
-                                            agent_type: agent_type.to_string(),
-                                        },
-                                    )
-                                    .await;
+                                    let await_native_cancel = agent_type == AgentType::Pi;
+                                    if await_native_cancel {
+                                        // Pi confirms native idle before answering its prompt.
+                                        // Keep pumping the cancelled compaction's final frames
+                                        // while it stops; ending now strands them on the idle
+                                        // loop and releases the next business message early.
+                                        drain_permissions(perms, state, emitter).await;
+                                    } else {
+                                        drain_permissions_on_stop_then_emit(
+                                            perms,
+                                            state,
+                                            emitter,
+                                            agent_type,
+                                            AcpEvent::TurnComplete {
+                                                session_id: sid.0.to_string(),
+                                                stop_reason: "cancelled".into(),
+                                                agent_type: agent_type.to_string(),
+                                            },
+                                        )
+                                        .await;
+                                    }
                                     if let Some(reply) = reply {
                                         let _ = reply.send(cancel_result);
                                     }
@@ -16356,7 +16364,7 @@ async fn run_conversation_loop(
                                     // the slow child teardown internally, so the
                                     // user-visible Cancel path doesn't wait on
                                     // (potentially slow) child agent teardown.
-                                    // The user already saw the parent's
+                                    // Non-Pi parents already emitted
                                     // TurnComplete above, and the broker's
                                     // drain-first lock guarantees no double
                                     // DelegationCompleted emit.
@@ -16382,6 +16390,9 @@ async fn run_conversation_loop(
                                         inj.plan_approvals
                                             .cancel_plan_approvals_by_parent(conn_id)
                                             .await;
+                                    }
+                                    if await_native_cancel {
+                                        continue;
                                     }
                                     // Keep awaiting the prompt response, in the
                                     // background: the agent still owes its
@@ -48977,6 +48988,75 @@ mod tests {
             assert!(raw.entries.iter().rev().find(|e| e.k==crate::acp_transcript::EntryKind::TurnEnd).unwrap().p.get("usage").is_none());
             lp.shutdown().await;
         }).await;
+    }
+
+    #[tokio::test]
+    async fn pi_cancel_waits_for_native_compaction_settlement_before_ending_the_turn() {
+        use agent_client_protocol::schema::v1::PromptResponse;
+        let compact = |status: &str| {
+            custom_update(serde_json::json!({
+                "sessionUpdate": "compaction_update", "compactionId": "native-compacting",
+                "status": status, "_meta": {"contextCompaction": {
+                    "version": 1, "status": status, "phase": "summarizing"
+                }}
+            }))
+        };
+        let mut lp = CustomLoop::start_with_responses(
+            AgentType::Pi,
+            vec![
+                vec![
+                    compact("in_progress"),
+                    custom_text("native compaction is running"),
+                ],
+                vec![custom_text("one next reply")],
+            ],
+            vec![
+                PromptResponse::new(StopReason::Cancelled),
+                PromptResponse::new(StopReason::EndTurn),
+            ],
+        )
+        .await;
+        lp.open_turn("continue", "native compaction is running")
+            .await;
+        let (reply, ack) = oneshot::channel();
+        lp.cmd_tx
+            .send(ConnectionCommand::Cancel { reply: Some(reply) })
+            .await
+            .unwrap();
+        ack.await
+            .expect("notification delivery answered")
+            .expect("cancel sent");
+        lp.agent_sends(vec![grok_barrier()]);
+        lp.until_barrier().await;
+        assert!(
+            lp.state.read().await.turn_in_flight,
+            "sending cancel is not proof of native idle"
+        );
+        assert!(
+            !lp.seen
+                .iter()
+                .any(|e| matches!(e, AcpEvent::TurnComplete { .. })),
+            "the UI must remain stopping while Pi still owns the execution"
+        );
+        lp.agent_sends(vec![compact("cancelled"), grok_barrier()]);
+        lp.until_barrier().await;
+        lp.respond.notify_one();
+        let end = lp.until("confirmed native cancellation", |e|
+            matches!(e, AcpEvent::TurnComplete { stop_reason, .. } if stop_reason == "cancelled")
+        ).await;
+        assert!(lp.seen[..end].iter().any(|e| matches!(e,
+            AcpEvent::ToolCallUpdate { meta: Some(meta), .. }
+            if meta.pointer("/contextCompaction/status").and_then(|v| v.as_str()) == Some("cancelled")
+        )), "native cancelled compaction arrives before the turn ends");
+        lp.run_turn("next", "one next reply").await;
+        assert_eq!(
+            lp.seen
+                .iter()
+                .filter(|e| matches!(e, AcpEvent::TurnComplete { .. }))
+                .count(),
+            2
+        );
+        lp.shutdown().await;
     }
 
     /// A Stop while a permission request is pending, run the way codeg runs it:
