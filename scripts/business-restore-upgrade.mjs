@@ -171,7 +171,7 @@ export async function legacyPiComposerPage({
     (agent) => agent.agent_type === "pi"
   )
   assert.equal(settings.selected_runtime?.source, "bundled")
-  assert.equal(settings.selected_runtime?.adapter_version, "0.0.34-codeg.4")
+  assert.equal(settings.selected_runtime?.adapter_version, "0.0.34-codeg.5")
   const updatePi = (env) =>
     api("acp_update_agent_env", {
       agentType: "pi",

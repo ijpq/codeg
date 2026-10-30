@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "dependencies": {
-    "pi-acp": "file:pi-acp-0.0.34-codeg.4.tgz",
+    "pi-acp": "file:pi-acp-0.0.34-codeg.5.tgz",
     "@earendil-works/pi-coding-agent": "1.4.0"
   }
 }

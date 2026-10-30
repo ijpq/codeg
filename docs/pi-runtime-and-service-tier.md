@@ -1,7 +1,7 @@
 # Pi 运行组件与 Fast / Speed
 
-本次固定 CodeG `0.41.2-fix5`、定制 `pi-acp 0.0.34-codeg.3`、Pi `1.4.0` 和 Node
-`24.16.0`。适配器源码 commit、tarball SHA256 与依赖锁保存在 `vendor/pi-runtime/`。
+本轮候选运行组固定定制 `pi-acp 0.0.34-codeg.5`、Pi `1.4.0` 和 Node `24.16.0`。
+CodeG 版本及 commit 以最终发布清单为准，未通过双包下载验收前不视为已交付。适配器源码 commit、tarball SHA256 与依赖锁保存在 `vendor/pi-runtime/`。
 Server ZIP 和 Setup 都携带私有 `pi-runtime`，无需全局 npm 或开发机 PATH。上游 MIT
 许可证、Pi 及依赖许可证和 Node LICENSE 随运行组保留。
 
@@ -80,8 +80,21 @@ Codex 的全局配置。业务交接保留当前仍然必要的完整规则兼�
 继续引用原始源文件，不复制成另一套长期维护内容。正文是否进入请求、文件是否实际
 读取与模型是否自主遵循分别验收。
 
-ACP 0.0.34-codeg.3 另提供可选启动环境 `CODEG_SHARED_SKILL_PATHS_JSON`，仅通过
+ACP 0.0.34-codeg.5 保留可选启动环境 `CODEG_SHARED_SKILL_PATHS_JSON`，仅通过
 Pi 1.4.0 原生 `--skill` 加载调用者明确配置的原始路径。CodeG 本轮不自动生成此变量，
 不迁移认证、私有记忆或扩展，也不承诺直接新建 Pi 已配置 Codex 的全部基础能力。
 可选适配器入口已验证原生 read/bash 的真实文件和 Skill 脚本调用；该独立协议测试
 不代表 CodeG 自动完成迁移，也不代表真实账号模型已自主选择 Skill 或遵循文稿规则。
+
+## 压缩与停止的状态边界
+
+Pi 1.4 的 `prompt` 确认位于 preflight 压缩之后。适配器同时接收当前
+`compaction_start/end` 与旧 `auto_compaction_start/end`，超过普通 30 秒确认期限时，
+仅在有界 `get_state` 确认原生仍在压缩后继续等待原请求，不重发用户消息。
+压缩卡片以同一 ID 展示真实阶段、耗时及完成、失败或取消；不制造百分比，不改写 JSONL。
+
+受理失败先清空原生队列并 abort。若 RPC 停止失败，Windows 对本实例拥有的启动器
+及其子进程执行进程树终止并等待退出；Unix 使用创建 Pi 时分配的独立进程组。
+不能仅因 `.cmd` 或 shell 包装器退出就宣称原生任务结束。无法确认停止时返回结构化
+`PI_STOP_UNCONFIRMED`；匹配 CodeG 会结束并清理该 ACP 连接后再发布终态，保留受理及
+停止的具体错误。已确认停止的普通供应商失败仍保留 session 以便重试。

@@ -14397,7 +14397,7 @@ const SESSION_GONE_MARKERS: &[&str] = &["process exited", "session has ended", "
 /// #659). Tearing the agent down for those is pure self-harm — the user waits
 /// out a full respawn for a turn that merely failed.
 ///
-/// Only five families stay terminal:
+/// Only six families stay terminal:
 ///  - `ResourceNotFound` — the agent has no record of the session id codeg
 ///    just prompted on, so the handle this connection holds is void.
 ///  - [`kimi_session_stale`] — Kimi Code's word that another process wrote the
@@ -14416,6 +14416,9 @@ const SESSION_GONE_MARKERS: &[&str] = &["process exited", "session has ended", "
 ///    app-server and goes through.
 ///  - [`lost_the_connection`] — the ACP runtime's own word that no answer can
 ///    arrive at all: the transport, not the turn, is what died.
+///  - Pi's structured `PI_STOP_UNCONFIRMED` — native execution could not be
+///    confirmed idle. Unwind the owned process guard before publishing failure;
+///    keeping this connection would let native work outlive its frontend task.
 ///
 /// `AuthRequired` short-circuits ahead of all of them: it was unconditionally
 /// turn-scoped before this classifier existed, and the message checks below
@@ -14433,6 +14436,14 @@ fn prompt_rejection_is_terminal(e: &agent_client_protocol::Error) -> bool {
         e.code,
         agent_client_protocol::schema::v1::ErrorCode::ResourceNotFound
     ) {
+        return true;
+    }
+    if e.data
+        .as_ref()
+        .and_then(|data| data.get("code"))
+        .and_then(serde_json::Value::as_str)
+        == Some("PI_STOP_UNCONFIRMED")
+    {
         return true;
     }
     if kimi_session_stale(e) {
@@ -35911,6 +35922,18 @@ mod tests {
         ] {
             assert!(!prompt_rejection_is_terminal(&e), "{e}");
         }
+    }
+
+    #[test]
+    fn an_unconfirmed_pi_stop_tears_down_owned_execution_before_failure() {
+        let error = |code: &str| {
+            agent_client_protocol::Error::internal_error().data(serde_json::json!({"code":code}))
+        };
+        assert!(prompt_rejection_is_terminal(&error("PI_STOP_UNCONFIRMED")));
+        assert!(!prompt_rejection_is_terminal(&error("PI_EXECUTION_FAILED")));
+        assert!(!prompt_rejection_is_terminal(
+            &agent_client_protocol::Error::internal_error().data("provider quoted PI_STOP_UNCONFIRMED")
+        ));
     }
 
     /// The three families that stay terminal. Anything looser here would leave
