@@ -16,7 +16,7 @@ on:
         type: boolean
         default: false
       reuse_candidate:
-        description: Diagnose verification scripts using the pinned 29df14a0c candidate binaries
+        description: Diagnose verification scripts using the pinned 931bd7d0d candidate binaries; not final release acceptance
         type: boolean
         default: false
       diagnose_allocation:
@@ -65,7 +65,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Verify isolated profiles with the Windows Known Folder API
-        run: node --test scripts/test-windows-ui-profile.mjs scripts/test-office-test-runtime.mjs scripts/test-verification-progress.mjs scripts/test-business-composer-page.mjs scripts/test-owned-process-lifecycle.mjs
+        run: node --test scripts/test-windows-ui-profile.mjs scripts/test-office-test-runtime.mjs scripts/test-verification-progress.mjs scripts/test-business-composer-page.mjs scripts/test-pi-compaction-page.mjs scripts/test-owned-process-lifecycle.mjs
   setup-ui:
     if: ${{ !inputs.diagnose_fix2 && !inputs.diagnose_fix5 && !inputs.diagnose_allocation && !inputs.diagnose_release_tag }}
     runs-on: windows-2022
@@ -97,9 +97,9 @@ jobs:
           import hashlib, json, os, subprocess, zipfile
           from pathlib import Path
           repo = os.environ['GITHUB_REPOSITORY']
-          run_id, artifact_id = 40162274216, 12589902658
-          source = '29df14a0cf0991f0f873ffe20abcb486f453a2a3'
-          digest = 'fbc1672513d3c9105f73ead628dcf24adf987782c450c840d23f46693b77b5c1'
+          run_id, artifact_id = 40980677919, 12950447392
+          source = '931bd7d0df3ffd2f0dd56aaa2b5294df21f5a630'
+          digest = '52787c63592c3f33e709150ecf189769e9c267bd4b28e051b3edb038a8e26a93'
           def api(path):
               return json.loads(subprocess.check_output(['gh', 'api', f'repos/{repo}/{path}']))
           run = api(f'actions/runs/{run_id}')
