@@ -31,6 +31,65 @@ async function until(read, accepts, label) {
   } while (Date.now() < deadline)
   assert.fail(`${label}: ${JSON.stringify(value)}`)
 }
+// A long native transcript virtualizes older cards. Verify persisted identities
+// independently of how many historical cards happen to be mounted in the DOM.
+export function compactionHistoryRecords(history) {
+  return (history?.turns ?? []).flatMap((turn) =>
+    (turn.blocks ?? []).flatMap((block) => {
+      const compaction = block.meta?.contextCompaction
+      if (block.type !== "tool_use" || !compaction) return []
+      return [
+        {
+          eventId: compaction.eventId ?? null,
+          status: compaction.status ?? null,
+          turnId: turn.id ?? null,
+        },
+      ]
+    })
+  )
+}
+export function assertCompletedCompactionAdvance(before, after) {
+  const completed = (records) => records.filter((r) => r.status === "completed")
+  const previous = completed(before)
+  const current = completed(after)
+  assert.ok(
+    current.every(
+      (record) => typeof record.eventId === "string" && record.eventId
+    ),
+    "Completed native compactions have stable event identities"
+  )
+  const beforeIds = new Set(previous.map((record) => record.eventId))
+  const afterIds = new Set(current.map((record) => record.eventId))
+  assert.ok(
+    [...beforeIds].every((id) => afterIds.has(id)),
+    "The bounded test history retains earlier native compactions"
+  )
+  const added = current.filter((record) => !beforeIds.has(record.eventId))
+  assert.equal(
+    added.length,
+    1,
+    "Exactly one new native compaction is persisted"
+  )
+  assert.equal(afterIds.size, beforeIds.size + 1)
+  return added[0]
+}
+async function completedCompactionAdvance(history, before) {
+  const previous = new Set(
+    before.filter((r) => r.status === "completed").map((r) => r.eventId)
+  )
+  const after = await until(
+    async () => compactionHistoryRecords(await history()),
+    (records) =>
+      records.some(
+        (r) => r.status === "completed" && r.eventId && !previous.has(r.eventId)
+      ),
+    "A new completed native compaction is persisted"
+  )
+  return {
+    record: assertCompletedCompactionAdvance(before, after),
+    records: after,
+  }
+}
 export async function piCompactionPage({
   page,
   api,
@@ -162,6 +221,7 @@ export async function piCompactionPage({
       `[data-testid="context-compaction"][data-compaction-status="${status}"]:visible`
     )
   const checks = []
+  const completedEvents = []
   try {
     if (saved) {
       assert.equal(
@@ -191,6 +251,7 @@ export async function piCompactionPage({
       await idle(await submit("/autocompact on"))
       piModel.tokens(42)
       piModel.compaction(35000)
+      const beforeCompaction = compactionHistoryRecords(await history())
       const started = Date.now(),
         marker = `PI_COMPACTION_CONTINUE_${randomUUID()}`
       const seq = await submit(marker)
@@ -254,6 +315,11 @@ export async function piCompactionPage({
       })
       await reply(marker)
       await idle(seq)
+      const initialCompletion = await completedCompactionAdvance(
+        history,
+        beforeCompaction
+      )
+      completedEvents.push(initialCompletion.record)
       assert.ok(
         piModel.evidence().some((r) => r.compaction && r.inputBytes > 120000),
         "Native summarization received the actual accumulated long history"
@@ -291,13 +357,26 @@ export async function piCompactionPage({
         /403|denied/
       )
       checks.push("native-compaction-failure-retains-provider-reason")
+      const beforeRetry = compactionHistoryRecords(await history())
+      assert.deepEqual(
+        beforeRetry
+          .filter((r) => r.status === "completed")
+          .map((r) => r.eventId),
+        initialCompletion.records
+          .filter((r) => r.status === "completed")
+          .map((r) => r.eventId),
+        "Failed native compaction does not fabricate a successful record"
+      )
       piModel.compaction(1000)
       await idle(await submit("/compact"))
-      await until(
-        () => cards("completed").count(),
-        (n) => n === 2,
-        "Explicit retry completes once"
+      const retryCompletion = await completedCompactionAdvance(
+        history,
+        beforeRetry
       )
+      completedEvents.push(retryCompletion.record)
+      await cards("completed").last().waitFor({ timeout: 15000 })
+      assert.equal(await cards("in_progress").count(), 0)
+      checks.push("explicit-retry-persists-one-distinct-native-completion")
       await addHistory()
       piModel.compaction(35000)
       const cancelSeq = await submit("/compact")
@@ -339,6 +418,8 @@ export async function piCompactionPage({
         {
           checks,
           conversationId: cid,
+          completedEvents,
+          compactionRecords: compactionHistoryRecords(await history()),
           requests: piModel
             .evidence()
             .filter((r) => r.compaction || r.compactionMarker),
@@ -379,6 +460,9 @@ export async function piCompactionPage({
         {
           message: String(error),
           editor,
+          compactionRecords: compactionHistoryRecords(
+            await history().catch(() => null)
+          ),
           snapshot: await snapshot().catch(() => null),
           requests: piModel.evidence(),
         },
