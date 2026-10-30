@@ -49018,6 +49018,8 @@ mod tests {
                         }],
                         user_message: None,
                         internal_suffix: Vec::new(),
+                        expected_settings: None,
+                        agent_file_change_report_request_id: None,
                     })
                     .await
                     .expect("the loop is running");
@@ -49025,7 +49027,10 @@ mod tests {
                     matches!(e, AcpEvent::PermissionRequest { .. })
                 })
                 .await;
-                lp.cmd_tx.send(ConnectionCommand::Cancel).await.unwrap();
+                lp.cmd_tx
+                    .send(ConnectionCommand::Cancel { reply: None })
+                    .await
+                    .unwrap();
                 let end = lp
                     .until("the stopped turn's end", |e| {
                         matches!(e, AcpEvent::TurnComplete { stop_reason, .. } if stop_reason == "cancelled")
