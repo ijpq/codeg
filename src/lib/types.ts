@@ -3389,6 +3389,11 @@ export type AcpEvent =
       type: "selectors_ready"
     }
   | {
+      type: "mcp_configured"
+      codeg_mcp_available: boolean
+      mcp_server_count: number
+    }
+  | {
       type: "prompt_capabilities"
       prompt_capabilities: PromptCapabilitiesInfo
     }

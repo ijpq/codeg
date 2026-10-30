@@ -610,6 +610,12 @@ pub enum AcpEvent {
     },
     /// Initial selector payloads (modes/config options) have been emitted
     SelectorsReady,
+    /// Launch-time MCP configuration is known. Publish in-band as well as in
+    /// snapshots: clients can attach before initialize has prepared it.
+    McpConfigured {
+        codeg_mcp_available: bool,
+        mcp_server_count: u32,
+    },
     /// Prompt capabilities for this connection
     PromptCapabilities {
         prompt_capabilities: PromptCapabilitiesInfo,

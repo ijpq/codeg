@@ -2202,6 +2202,99 @@ describe("prompt connection loss classification", () => {
 })
 
 describe("persisted business readiness across engines and transports", () => {
+  it.each([true, false])(
+    "keeps first-turn MCP readiness after an early snapshot (web=%s)",
+    async (web) => {
+      if (!web) h.eventStreamValue = null
+      h.acpRestoreConversation.mockRejectedValueOnce(
+        new Error("conversation 42 has no external session to restore")
+      )
+      // The first snapshot is legitimately taken before initialize finishes.
+      h.denormalizeSnapshot.mockReturnValue({
+        ...snapshotBase(),
+        status: "connecting",
+        eventSeq: 0,
+        conversationId: null,
+        codegMcpAvailable: false,
+        mcpServerCount: 0,
+      })
+      h.acpGetSessionSnapshot.mockResolvedValue({} as LiveSessionSnapshot)
+      await mountProvider()
+      await act(async () => {
+        await h.actions!.connect(
+          "business-42",
+          "codex",
+          "/tmp/x",
+          undefined,
+          42
+        )
+      })
+      const deliver = (event: EventEnvelope) => {
+        if (web) emitAcpEvent(latestAttachHandlers(), event)
+        else {
+          const listener = vi.mocked(subscribe).mock.calls.slice(-1)[0]![1] as (
+            value: EventEnvelope
+          ) => void
+          act(() => listener(event))
+        }
+      }
+      if (web) {
+        hydrateSnapshot(latestAttachHandlers(), {} as LiveSessionSnapshot)
+        act(() => latestAttachHandlers().onReplay([], 0))
+      }
+      deliver({
+        seq: 1,
+        connection_id: "spawned-conn",
+        type: "mcp_configured",
+        codeg_mcp_available: true,
+        mcp_server_count: 1,
+      })
+      deliver({
+        seq: 2,
+        connection_id: "spawned-conn",
+        type: "session_started",
+        session_id: "first-native-session",
+      })
+      deliver({
+        seq: 3,
+        connection_id: "spawned-conn",
+        type: "conversation_linked",
+        conversation_id: 42,
+        folder_id: 1,
+      })
+      deliver({
+        seq: 4,
+        connection_id: "spawned-conn",
+        type: "selectors_ready",
+      })
+      deliver({
+        seq: 5,
+        connection_id: "spawned-conn",
+        type: "status_changed",
+        status: "connected",
+      })
+      expect(h.store!.getConnection("business-42")).toMatchObject({
+        conversationId: 42,
+        sessionId: "first-native-session",
+        codegMcpAvailable: true,
+        mcpServerCount: 1,
+      })
+      // A late early snapshot cannot revoke a capability published in-band.
+      if (web)
+        hydrateSnapshot(latestAttachHandlers(), {} as LiveSessionSnapshot)
+      await act(async () => {
+        await h.actions!.sendPrompt(
+          "business-42",
+          [{ type: "text", text: "second round after first binding" }],
+          { conversationId: 42, clientMessageId: "second-after-mcp" }
+        )
+      })
+      expect(h.acpPrompt).toHaveBeenCalledTimes(1)
+      expect(h.acpConnect).toHaveBeenCalledTimes(1)
+      expect(h.acpDisconnect).not.toHaveBeenCalled()
+    }
+  )
+
   it.each([
     ["codex", false],
     ["codex", true],

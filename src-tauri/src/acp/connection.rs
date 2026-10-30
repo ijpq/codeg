@@ -9410,8 +9410,6 @@ async fn run_connection(
                     s.goal_control_method = method;
                 }
                 s.goal_actions = Some(goal_actions);
-                s.codeg_mcp_available = codeg_mcp_available;
-                s.mcp_server_count = mcp_server_count;
                 if let Some(ref injected) = delegate_injection {
                     s.delegation_token = Some(injected.token.clone());
                     s.delegation_enabled = injected.delegation_enabled;
@@ -9430,6 +9428,15 @@ async fn run_connection(
                     s.result_tool_available = false;
                 }
             }
+            emit_with_state(
+                &state,
+                &emitter_clone,
+                AcpEvent::McpConfigured {
+                    codeg_mcp_available,
+                    mcp_server_count,
+                },
+            )
+            .await;
             let conversation_id_for_log = state.read().await.conversation_id;
             tracing::info!(
                 conversation_id = ?conversation_id_for_log,

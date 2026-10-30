@@ -844,6 +844,12 @@ type Action =
       contextKey: string
     }
   | {
+      type: "MCP_CONFIGURED"
+      contextKey: string
+      codegMcpAvailable: boolean
+      mcpServerCount: number
+    }
+  | {
       type: "PROMPT_CAPABILITIES"
       contextKey: string
       promptCapabilities: PromptCapabilitiesInfo
@@ -3145,6 +3151,23 @@ function connectionsReducer(
       next.set(action.contextKey, {
         ...conn,
         configStaleDismissed: true,
+      })
+      return next
+    }
+
+    case "MCP_CONFIGURED": {
+      const conn = state.get(action.contextKey)
+      if (
+        !conn ||
+        (conn.codegMcpAvailable === action.codegMcpAvailable &&
+          conn.mcpServerCount === action.mcpServerCount)
+      )
+        return state
+      const next = new Map(state)
+      next.set(action.contextKey, {
+        ...conn,
+        codegMcpAvailable: action.codegMcpAvailable,
+        mcpServerCount: action.mcpServerCount,
       })
       return next
     }
@@ -5975,6 +5998,14 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
           })
           break
         }
+        case "mcp_configured":
+          dispatch({
+            type: "MCP_CONFIGURED",
+            contextKey,
+            codegMcpAvailable: e.codeg_mcp_available,
+            mcpServerCount: e.mcp_server_count,
+          })
+          break
         case "selectors_ready": {
           flushStreamingQueue(contextKey)
           dispatch({

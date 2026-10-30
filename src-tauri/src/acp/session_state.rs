@@ -1718,6 +1718,13 @@ impl SessionState {
                 // `LiveSessionSnapshot`. Listed explicitly (rather than swept
                 // up by the catchall) so the no-op is intentional and grep-able.
             }
+            AcpEvent::McpConfigured {
+                codeg_mcp_available,
+                mcp_server_count,
+            } => {
+                self.codeg_mcp_available = *codeg_mcp_available;
+                self.mcp_server_count = *mcp_server_count;
+            }
             AcpEvent::SelectorsReady => {
                 // Latches once. Snapshot exposes this so a fresh frontend (e.g.
                 // after browser refresh) can tell the initial handshake is
@@ -4294,6 +4301,29 @@ mod tests {
             s.latest_live_reply(100).as_deref(),
             Some("Answer continues here")
         );
+    }
+
+    #[test]
+    fn mcp_configuration_is_published_to_early_and_late_clients() {
+        let mut s = fresh_state();
+        assert!(!s.to_snapshot().codeg_mcp_available);
+        let event = AcpEvent::McpConfigured {
+            codeg_mcp_available: true,
+            mcp_server_count: 2,
+        };
+        let wire = serde_json::to_value(&event).unwrap();
+        assert_eq!(wire["type"], "mcp_configured");
+        assert_eq!(wire["codeg_mcp_available"], true);
+        s.apply_event(&event);
+        assert!(s.to_snapshot().codeg_mcp_available);
+        assert_eq!(s.to_snapshot().mcp_server_count, 2);
+        // A connection without an injected companion must remain unavailable.
+        s.apply_event(&AcpEvent::McpConfigured {
+            codeg_mcp_available: false,
+            mcp_server_count: 0,
+        });
+        assert!(!s.to_snapshot().codeg_mcp_available);
+        assert_eq!(s.to_snapshot().mcp_server_count, 0);
     }
 
     #[test]
