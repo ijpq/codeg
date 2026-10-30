@@ -461,6 +461,15 @@ jobs:
           if ((Get-FileHash $previous -Algorithm SHA256).Hash.ToLower() -ne $hash) { throw 'Diagnostic baseline hash mismatch' }
           "DIAG_SETUP=$setup" >> $env:GITHUB_ENV
           "DIAG_PREVIOUS=$previous" >> $env:GITHUB_ENV
+          $previousRoot=Join-Path $root 'legacy-server-assets'
+          New-Item -ItemType Directory $previousRoot | Out-Null
+          gh release download v0.40.0-fix6 --repo $env:GITHUB_REPOSITORY --dir $previousRoot --pattern codeg-server-windows-x64.zip --pattern codeg-server-windows-x64.zip.sha256
+          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic old-data Server baseline download failed' }
+          $previousArchive=Join-Path $previousRoot 'codeg-server-windows-x64.zip'
+          $previousHash=((Get-Content "$previousArchive.sha256" -Raw).Trim() -split '\s+')[0].ToLower()
+          if ((Get-FileHash $previousArchive -Algorithm SHA256).Hash.ToLower() -ne $previousHash) { throw 'Old-data Server checksum mismatch' }
+          Expand-Archive $previousArchive (Join-Path $previousRoot 'expanded')
+          "DIAG_PREVIOUS_SERVER=$(Join-Path $previousRoot 'expanded/codeg-server-windows-x64')" >> $env:GITHUB_ENV
           Expand-Archive $archive (Join-Path $root 'expanded')
           $server=Join-Path $root 'expanded/codeg-server-windows-x64'
           $manifest=Get-Content (Join-Path $server 'web/codeg-release-manifest.json') -Raw | ConvertFrom-Json
@@ -487,7 +496,7 @@ jobs:
         run: |
           $count=if ('${{ inputs.allocation_original_only }}' -eq 'true') { 3 } else { 1 }
           foreach ($i in 1..$count) {
-            node scripts/verify-windows-ui.mjs --setup $env:DIAG_SETUP --previous $env:DIAG_PREVIOUS --server $env:DIAG_SERVER --output (Join-Path $env:DIAG_ROOT "original-server-$i") --version 0.41.3-fix2 --native-tools (Join-Path $env:DIAG_ROOT 'native-agent-tools')
+            node scripts/verify-windows-ui.mjs --setup $env:DIAG_SETUP --previous $env:DIAG_PREVIOUS --legacy-previous $env:DIAG_PREVIOUS --legacy-previous-server $env:DIAG_PREVIOUS_SERVER --server $env:DIAG_SERVER --output (Join-Path $env:DIAG_ROOT "original-server-$i") --version 0.41.3-fix2 --native-tools (Join-Path $env:DIAG_ROOT 'native-agent-tools')
             $result=$LASTEXITCODE
             @{ diagnostic=$true; instrumented=$false; exit_code=$result } | ConvertTo-Json | Set-Content (Join-Path $env:DIAG_ROOT "original-result-$i.json")
             if ($result -ne 0) { break }
@@ -520,7 +529,7 @@ jobs:
         shell: pwsh
         run: |
           foreach ($i in 1..3) {
-            node scripts/verify-windows-ui.mjs --setup $env:DIAG_SETUP --previous $env:DIAG_PREVIOUS --server $env:DIAG_SERVER --output (Join-Path $env:DIAG_ROOT "traced-server-$i") --version 0.41.3-fix2 --native-tools (Join-Path $env:DIAG_ROOT 'native-agent-tools')
+            node scripts/verify-windows-ui.mjs --setup $env:DIAG_SETUP --previous $env:DIAG_PREVIOUS --legacy-previous $env:DIAG_PREVIOUS --legacy-previous-server $env:DIAG_PREVIOUS_SERVER --server $env:DIAG_SERVER --output (Join-Path $env:DIAG_ROOT "traced-server-$i") --version 0.41.3-fix2 --native-tools (Join-Path $env:DIAG_ROOT 'native-agent-tools')
             $result=$LASTEXITCODE
             @{ diagnostic=$true; instrumented=$true; exit_code=$result } | ConvertTo-Json | Set-Content (Join-Path $env:DIAG_ROOT "traced-result-$i.json")
             if ($result -ne 0) { break }
