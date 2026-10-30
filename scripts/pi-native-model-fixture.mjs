@@ -9,7 +9,8 @@ export async function startPiModel() {
     officeHeld = false,
     compactionDelay = 50,
     compactionFailure = false,
-    reportedTokens = 42
+    reportedTokens = 42,
+    longReply = ""
   const officeWaiters = new Set()
   const server = createServer(async (req, res) => {
     if (req.method !== "POST") {
@@ -33,6 +34,7 @@ export async function startPiModel() {
     requests.push({
       compaction,
       receivedAt: Date.now(),
+      inputBytes: Buffer.byteLength(input),
       compactionMarker:
         [...latestUser.matchAll(/PI_COMPACTION_[A-Z_]+_[a-f0-9-]{36}/g)].at(
           -1
@@ -104,7 +106,7 @@ export async function startPiModel() {
     ].at(-1)
     let text = isChild
       ? "PI_CHILD_COMPLETED PI_CHILD_CONTEXT"
-      : "BUSINESS_PI_COMPLETED agenda-v3.md"
+      : "BUSINESS_PI_COMPLETED agenda-v3.md" + longReply
     if (compaction)
       text =
         "# Retained business context\nPI_COMPACTION_RETAINED requirements, completed work and pending review.\n"
@@ -312,6 +314,14 @@ export async function startPiModel() {
     compaction: (delayMs, failure = false) => {
       compactionDelay = delayMs
       compactionFailure = failure
+    },
+    historyReply: (enabled) => {
+      longReply = enabled
+        ? "\n" +
+          "Business requirements, reviewed edits and decisions must remain available. ".repeat(
+            1200
+          )
+        : ""
     },
     tokens: (value) => {
       reportedTokens = value
