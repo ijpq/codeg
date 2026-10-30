@@ -22,6 +22,28 @@ async function until(read, accepts, label) {
   }
   throw Error(`${label}: ${JSON.stringify(value)}`)
 }
+
+export async function resizeAndDismissSidebar(page, viewport, trace = []) {
+  const sidebarWasOpen =
+    (await page
+      .getByRole("button", { name: /^Hide Sidebar(?: \(|$)/ })
+      .filter({ visible: true })
+      .count()) > 0
+  trace.push({ phase: "before-resize", sidebarWasOpen })
+  await page.setViewportSize(viewport)
+  const sidebar = page.getByRole("dialog", { name: "Sidebar", exact: true })
+  // Resizing an open desktop sidebar mounts the mobile navigation Drawer.
+  // An Escape sent before that mount cannot dismiss it.
+  if (sidebarWasOpen) await sidebar.waitFor({ state: "visible" })
+  trace.push({
+    phase: "before-escape",
+    sidebarVisible: await sidebar.isVisible(),
+  })
+  await page.keyboard.press("Escape")
+  await sidebar.waitFor({ state: "hidden" })
+  trace.push({ phase: "dismissed" })
+}
+
 export async function openBusiness(page, api, cid, folderId, agent) {
   const tabs = await api("list_opened_tabs")
   const saved = await api("save_opened_tabs", {
@@ -415,20 +437,13 @@ export async function businessAgentPage({
         width: window.innerWidth,
         height: window.innerHeight,
       })))
-    const sidebarWasOpen =
-      (await page
-        .getByRole("button", { name: "Hide Sidebar", exact: true })
-        .filter({ visible: true })
-        .count()) > 0
+    const narrowSidebarTrace = []
     try {
-      await page.setViewportSize({ width: 390, height: 844 })
-      // Resizing an open desktop sidebar creates the mobile navigation Drawer.
-      // Wait for that responsive render before Escape; a key sent before its
-      // mount cannot dismiss it and leaves the check hidden under navigation.
-      const sidebar = page.getByRole("dialog", { name: "Sidebar", exact: true })
-      if (sidebarWasOpen) await sidebar.waitFor({ state: "visible" })
-      await page.keyboard.press("Escape")
-      await sidebar.waitFor({ state: "hidden" })
+      await resizeAndDismissSidebar(
+        page,
+        { width: 390, height: 844 },
+        narrowSidebarTrace
+      )
       await until(
         () =>
           toolbar.locator("select").evaluate((select) => {
@@ -463,33 +478,36 @@ export async function businessAgentPage({
       await writeFile(
         join(output, `${name}-agent-toolbar-narrow-failure.json`),
         JSON.stringify(
-          await toolbar.locator("select").evaluate((select) => {
-            const bounds = select.getBoundingClientRect()
-            const hit = document.elementFromPoint(
-              bounds.x + bounds.width / 2,
-              bounds.y + bounds.height / 2
-            )
-            return {
-              viewport: {
-                width: window.innerWidth,
-                height: window.innerHeight,
-              },
-              bounds: bounds.toJSON(),
-              hit: hit && {
-                tag: hit.tagName,
-                slot: hit.getAttribute("data-slot"),
-                role: hit.getAttribute("role"),
-                classes: hit.className,
-              },
-              dialogs: [...document.querySelectorAll('[role="dialog"]')].map(
-                (node) => ({
-                  slot: node.getAttribute("data-slot"),
-                  open: node.getAttribute("data-open"),
-                  closed: node.getAttribute("data-closed"),
-                })
-              ),
-            }
-          }),
+          {
+            narrowSidebarTrace,
+            ...(await toolbar.locator("select").evaluate((select) => {
+              const bounds = select.getBoundingClientRect()
+              const hit = document.elementFromPoint(
+                bounds.x + bounds.width / 2,
+                bounds.y + bounds.height / 2
+              )
+              return {
+                viewport: {
+                  width: window.innerWidth,
+                  height: window.innerHeight,
+                },
+                bounds: bounds.toJSON(),
+                hit: hit && {
+                  tag: hit.tagName,
+                  slot: hit.getAttribute("data-slot"),
+                  role: hit.getAttribute("role"),
+                  classes: hit.className,
+                },
+                dialogs: [...document.querySelectorAll('[role="dialog"]')].map(
+                  (node) => ({
+                    slot: node.getAttribute("data-slot"),
+                    open: node.getAttribute("data-open"),
+                    closed: node.getAttribute("data-closed"),
+                  })
+                ),
+              }
+            })),
+          },
           null,
           2
         )
@@ -944,6 +962,7 @@ export async function businessAgentPage({
       existingTargetRuleRevisionReceived: true,
       serverSecondClientSync: Boolean(observer),
       narrowToolbar: true,
+      narrowSidebarTrace,
     })
     return {
       cid,
