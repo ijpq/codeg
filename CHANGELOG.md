@@ -8,6 +8,7 @@
 - Reject cyclic or ambiguous process-tree snapshots before any kill, preventing the independently reproduced unbounded traversal and protecting the current process. This does not establish the cause of fix2's Server allocation crash. Upstream license and source provenance are retained in both packages.
 - Keep the unified compaction phase/elapsed/outcome card, native Plan/Goal, bounded history and virtualized scrolling, business handoff/recovery, providers, external deliveries, duration, deliverables and Office review. Final installed Setup and Server frontend acceptance now also checks failed compaction after reload and durable cancellation.
 - Quarantine a published candidate automatically if final downloaded-package acceptance fails or is cancelled. A failed release retains its tag/assets and cannot count as accepted delivery; fix2 remains quarantined.
+- Retry transient GitHub build-proof reads within a fixed budget and skip an unavailable historical proof instead of abandoning all other candidates. Source, original build/test provenance and runtime checksums remain mandatory; application and native protocol checks still run for the release commit.
 
 See [release notes](docs/releases/v0.41.3-fix3.md).
 

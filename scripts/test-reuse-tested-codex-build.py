@@ -5,7 +5,9 @@ import json
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 import unittest
+from unittest import mock
 import zipfile
 
 spec = importlib.util.spec_from_file_location('reuse', Path(__file__).with_name('reuse-tested-codex-build.py'))
@@ -14,6 +16,45 @@ spec.loader.exec_module(reuse)
 
 
 class NativeBuildReuseTests(unittest.TestCase):
+    def test_transient_github_read_retries_without_weakening_build_proof(self):
+        args = ['gh', 'api', 'repos/fixture/actions/jobs']
+        unavailable = subprocess.CalledProcessError(1, args, stderr=b'gh: Server Error (HTTP 502)')
+        with mock.patch.object(reuse.subprocess, 'check_output', side_effect=[unavailable, b'{"jobs": []}']) as read, mock.patch.object(time, 'sleep'):
+            self.assertEqual(reuse.json_command(args), {'jobs': []})
+            self.assertEqual(read.call_count, 2)
+
+    def test_permission_errors_and_invalid_proof_are_never_retried_as_network_failures(self):
+        args = ['gh', 'api', 'repos/fixture/actions/jobs']
+        denied = subprocess.CalledProcessError(1, args, stderr=b'gh: Forbidden (HTTP 403)')
+        with mock.patch.object(reuse.subprocess, 'check_output', side_effect=denied) as read, mock.patch.object(time, 'sleep'):
+            with self.assertRaises(subprocess.CalledProcessError):
+                reuse.json_command(args)
+            self.assertEqual(read.call_count, 1)
+        with mock.patch.object(reuse.subprocess, 'check_output', return_value=b'invalid JSON') as read:
+            with self.assertRaises(ValueError):
+                reuse.json_command(args)
+            self.assertEqual(read.call_count, 1)
+
+    def test_persistent_github_failure_has_a_bounded_retry_budget(self):
+        args = ['gh', 'api', 'repos/fixture/actions/jobs']
+        unavailable = subprocess.CalledProcessError(1, args, stderr='gh: Server Error (HTTP 502)')
+        with mock.patch.object(reuse.subprocess, 'check_output', side_effect=unavailable) as read, mock.patch.object(time, 'sleep') as sleep:
+            with self.assertRaises(subprocess.CalledProcessError):
+                reuse.json_command(args)
+            self.assertEqual(read.call_count, 3)
+            self.assertEqual(sleep.call_count, 2)
+
+    def test_unavailable_candidate_is_never_accepted_and_later_candidates_are_checked(self):
+        args = ['gh', 'api', 'repos/fixture/actions/jobs']
+        unavailable = subprocess.CalledProcessError(1, args, stderr='gh: Server Error (HTTP 502)')
+        runs = [{'databaseId': 1, 'headSha': 'a' * 40}, {'databaseId': 2, 'headSha': 'b' * 40}]
+        details = {'head_sha': 'b' * 40, 'event': 'push', 'head_branch': 'main',
+                   'head_repository': {'full_name': 'fixture/repo'},
+                   'path': '.github/workflows/test.yml', 'conclusion': 'success'}
+        with mock.patch.object(reuse, 'json_command', side_effect=[runs, unavailable, details, {'jobs': []}]) as read, mock.patch.object(reuse, 'matching_inputs', return_value=True), mock.patch.object(reuse.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)):
+            self.assertFalse(reuse.reuse('fixture/repo', self.root / 'runtime'))
+            self.assertEqual(read.call_count, 4)
+            self.assertFalse((self.root / 'runtime').exists())
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='codeg-build-reuse-test-')
         self.addCleanup(self.temp.cleanup)

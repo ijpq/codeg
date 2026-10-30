@@ -14,6 +14,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -31,8 +32,23 @@ METADATA = {
 }
 
 
+def transient_read_error(cause):
+    error = cause.stderr or ''
+    if isinstance(error, bytes):
+        error = error.decode('utf-8', errors='replace')
+    return re.search(r'\bHTTP (?:500|502|503|504)\b', error) is not None
+
+
 def json_command(args):
-    return json.loads(subprocess.check_output(args, text=True, cwd=ROOT))
+    for attempt in range(3):
+        try:
+            return json.loads(subprocess.check_output(args, text=True, cwd=ROOT,
+                                                     stderr=subprocess.PIPE))
+        except subprocess.CalledProcessError as cause:
+            if not transient_read_error(cause) or attempt == 2:
+                raise
+            print('Temporary GitHub read failure; retrying build proof lookup', flush=True)
+            time.sleep(attempt + 1)
 
 
 def digest(path):
@@ -112,14 +128,20 @@ def reuse(repo, output):
             subprocess.run(['git', 'fetch', '--no-tags', '--depth=1', 'origin', sha], cwd=ROOT, check=True)
         if not matching_inputs(sha):
             continue
-        details = json_command(['gh', 'api', f"repos/{repo}/actions/runs/{run['databaseId']}"])
-        assert details['head_sha'] == sha and details['event'] == 'push' and details['head_branch'] == 'main'
-        assert details['head_repository']['full_name'].lower() == repo.lower()
-        assert details['path'] == '.github/workflows/test.yml' and details['conclusion'] == 'success'
-        jobs = json_command(['gh', 'api', f"repos/{repo}/actions/runs/{run['databaseId']}/jobs?per_page=100"])
-        if not build_proved(jobs['jobs']):
-            continue  # Never substitute an unverified/chained reuse for original build proof.
-        artifacts = json_command(['gh', 'api', f"repos/{repo}/actions/runs/{run['databaseId']}/artifacts?per_page=100"])
+        try:
+            details = json_command(['gh', 'api', f"repos/{repo}/actions/runs/{run['databaseId']}"])
+            assert details['head_sha'] == sha and details['event'] == 'push' and details['head_branch'] == 'main'
+            assert details['head_repository']['full_name'].lower() == repo.lower()
+            assert details['path'] == '.github/workflows/test.yml' and details['conclusion'] == 'success'
+            jobs = json_command(['gh', 'api', f"repos/{repo}/actions/runs/{run['databaseId']}/jobs?per_page=100"])
+            if not build_proved(jobs['jobs']):
+                continue  # Never substitute an unverified/chained reuse for original build proof.
+            artifacts = json_command(['gh', 'api', f"repos/{repo}/actions/runs/{run['databaseId']}/artifacts?per_page=100"])
+        except subprocess.CalledProcessError as cause:
+            if not transient_read_error(cause):
+                raise
+            print('Skipping unavailable build proof:', run['databaseId'], flush=True)
+            continue  # No readable proof means this candidate can never be reused.
         artifact = next((a for a in artifacts['artifacts'] if not a['expired']
                          and a['name'] == 'tested-codex-runtime-Windows-X64'), None)
         if not artifact:
