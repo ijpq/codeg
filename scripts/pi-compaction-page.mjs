@@ -164,18 +164,17 @@ export async function piCompactionPage({
     } else {
       await idle(await submit("/autocompact off"))
       piModel.tokens(120000)
+      // Accumulate actual native history via four real composer turns and long
+      // provider replies. Do not make giant multiline editor injection a
+      // precondition for testing preflight compaction.
+      piModel.historyReply(true)
       for (let round = 0; round < 4; round++) {
         const marker = `PI_COMPACTION_SEED_${randomUUID()}`
-        const seq = await submit(
-          marker +
-            "\n" +
-            "Business requirements, reviewed edits and decisions must remain available.\n".repeat(
-              1200
-            )
-        )
+        const seq = await submit(marker)
         await reply(marker)
         await idle(seq)
       }
+      piModel.historyReply(false)
       await idle(await submit("/autocompact on"))
       piModel.tokens(42)
       piModel.compaction(35000)
@@ -242,6 +241,10 @@ export async function piCompactionPage({
       })
       await reply(marker)
       await idle(seq)
+      assert.ok(
+        piModel.evidence().some((r) => r.compaction && r.inputBytes > 120000),
+        "Native summarization received the actual accumulated long history"
+      )
       await until(
         () => cards("completed").count(),
         (n) => n === 1,
@@ -258,19 +261,13 @@ export async function piCompactionPage({
       await reply(next)
       await idle(await submit("/autocompact off"))
       const addHistory = async () => {
+        piModel.historyReply(true)
         for (let round = 0; round < 2; round++) {
           const marker = `PI_COMPACTION_REVIEW_${randomUUID()}`
-          await idle(
-            await submit(
-              marker +
-                "\n" +
-                "Retain reviewed business requirements and decisions.\n".repeat(
-                  1800
-                )
-            )
-          )
+          await idle(await submit(marker))
           await reply(marker)
         }
+        piModel.historyReply(false)
       }
       await addHistory()
       piModel.compaction(500, true)
@@ -340,11 +337,35 @@ export async function piCompactionPage({
     )
     return { cid }
   } catch (error) {
+    const editor = await page
+      .locator('[contenteditable="true"]')
+      .filter({ visible: true })
+      .first()
+      .evaluate(
+        (element) => ({
+          textLength: element.textContent?.length ?? 0,
+          editable: element.getAttribute("contenteditable"),
+          disabled: element.getAttribute("aria-disabled"),
+          ready: [...document.querySelectorAll("[data-session-readiness]")]
+            .filter((node) => node.getClientRects().length > 0)
+            .map((node) => node.getAttribute("data-session-readiness")),
+        }),
+        undefined,
+        { timeout: 5000 }
+      )
+      .catch(() => null)
+    await page
+      .screenshot({
+        path: join(output, `${name}-compaction-failure.png`),
+        timeout: 5000,
+      })
+      .catch(() => null)
     await writeFile(
       join(output, `${name}-compaction-failure.json`),
       JSON.stringify(
         {
           message: String(error),
+          editor,
           snapshot: await snapshot().catch(() => null),
           requests: piModel.evidence(),
         },
@@ -354,6 +375,7 @@ export async function piCompactionPage({
     )
     throw error
   } finally {
+    piModel.historyReply(false)
     piModel.tokens(42)
     piModel.compaction(50)
   }

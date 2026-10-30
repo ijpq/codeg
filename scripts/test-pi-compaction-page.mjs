@@ -1,5 +1,6 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
+import { startPiModel } from "./pi-native-model-fixture.mjs"
 import { piCompactionPage } from "./pi-compaction-page.mjs"
 
 // This adapter deliberately creates a binding only after a composer send.
@@ -104,4 +105,44 @@ test("restored compaction business does not replay the initial message", async (
   const { calls } = await runAdmission({ cid: 7 })
   assert.equal(calls.includes("composer-send"), false)
   assert.equal(calls.includes("create_conversation"), false)
+})
+
+test("long history is real native provider output while compaction summaries and later replies stay bounded", async () => {
+  const model = await startPiModel()
+  const send = async (text) => {
+    const response = await fetch(model.url + "/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "gpt-5.4",
+        input: [{ role: "user", content: text }],
+      }),
+    })
+    const frames = (await response.text())
+      .split("\n\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line.slice(6)))
+    return frames.find((event) => event.type === "response.completed").response
+      .output[0].content[0].text
+  }
+  try {
+    model.historyReply(true)
+    const history = await send(
+      "PI_COMPACTION_SEED_11111111-1111-1111-1111-111111111111"
+    )
+    assert.ok(history.length > 86000)
+    assert.match(history, /^BUSINESS_PI_COMPLETED/)
+    const summary = await send(
+      "<conversation>" +
+        history +
+        "</conversation> structured context checkpoint summary"
+    )
+    assert.ok(summary.length < 1000)
+    assert.ok(model.evidence().at(-1).compaction)
+    assert.ok(model.evidence().at(-1).inputBytes > 86000)
+    model.historyReply(false)
+    assert.ok((await send("next round")).length < 1000)
+  } finally {
+    await model.close()
+  }
 })
