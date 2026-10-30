@@ -1,6 +1,16 @@
 # Changelog
 
-## 0.41.2-fix6 — 2026-10-29
+## 0.41.3-fix1 — 2026-10-30
+
+- Rebase the complete custom feature set and Pi compaction lifecycle fixes onto upstream v0.41.3. Retain the private Codex Plan/Goal runtime, independent business sessions, recovery queues, multi-provider settings, duration, deliverables, Office review and virtualized scroll behavior.
+- Bundle Pi ACP 0.0.34-codeg.4 with Pi 1.4.0 and Node 24.16.0. Native preflight compaction can outlive the ordinary prompt acknowledgement deadline while a bounded native health check proves it is active; real failures and Stop first settle the owned native execution.
+- Show a single compaction record from the actual phase and elapsed time through completion, cancellation or failure; correlate native history without editing session files or fabricating progress.
+- Establish empty-business bindings through the actual composer in package acceptance. Keep complete runtime inventory checks, including hidden dependency files, and record application and verifier commits separately in reused diagnostic evidence.
+- Keep Windows Setup and Server installation, old-data upgrade, actual-page replies, long native compaction, restart, rollback and downloaded-asset verification as release gates. The earlier fix6 candidate was not published; its diagnostic evidence does not stand in for this version’s final packages.
+
+See [release notes](docs/releases/v0.41.3-fix1.md).
+
+## 0.41.2-fix6 — 2026-10-29 (unpublished candidate)
 
 - Fix Pi 1.4 preflight compaction being mistaken for a failed prompt after 30 seconds. Admission waits while native state confirms active compaction; real transport failures stop the native task before reporting their original cause.
 - Handle current and legacy native compaction events with one shared status card for real stage, elapsed time, completion, cancellation and failure. Correlate successful live records with native history IDs and retain the native summary without editing session files.

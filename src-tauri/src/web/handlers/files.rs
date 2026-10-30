@@ -848,7 +848,15 @@ pub async fn upload_attachment(
     // Cleanup goes through `upload_jail::remove_staging_best_effort` so the
     // unlink itself can't be redirected by a swap of `.tmp` between
     // streaming and cleanup.
-    let result = stream_and_finalize(&mut multipart, &uploads_root, &tmp_dir, &staging_name, per_file_cap, quota_total).await;
+    let result = stream_and_finalize(
+        &mut multipart,
+        &uploads_root,
+        &tmp_dir,
+        &staging_name,
+        per_file_cap,
+        quota_total,
+    )
+    .await;
     if result.is_err() {
         upload_jail::remove_staging_best_effort(&tmp_dir, &staging_name).await;
     }
