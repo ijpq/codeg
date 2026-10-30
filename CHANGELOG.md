@@ -1,6 +1,15 @@
 # Changelog
 
-## 0.41.3-fix1 — 2026-10-30
+## 0.41.3-fix2 — 2026-10-30
+
+- Retain the Pi native compaction admission, cancellation and shared lifecycle display fixes from the unpublished fix1 candidate, including ordered MCP readiness updates for early-attached clients.
+- Match the sidebar toggle's actual accessible name, including its configured shortcut, before testing the mobile Drawer. Wait for its responsive mount before one Escape and retain phase evidence; the toolbar must still be unobscured and reachable. The prior selector fails two timing regressions; the corrected five-case regression runs in ordinary and Windows package CI.
+- Keep the exact bundled Pi ACP 0.0.34-codeg.4 / Pi 1.4.0 / Node 24.16.0 group and all existing business, recovery, provider, Plan/Goal, deliverable, Office, duration and scrolling checks. Both final Windows packages must pass downloaded installation, upgrade, frontend compaction/reply, restart, rollback and checksum gates.
+- fix1 was blocked before publication by the Server narrow-layout gate. Its partial Setup evidence is retained and cannot replace this release's full two-package verification.
+
+See [release notes](docs/releases/v0.41.3-fix2.md).
+
+## 0.41.3-fix1 — 2026-10-30 (unpublished candidate)
 
 - Rebase the complete custom feature set and Pi compaction lifecycle fixes onto upstream v0.41.3. Retain the private Codex Plan/Goal runtime, independent business sessions, recovery queues, multi-provider settings, duration, deliverables, Office review and virtualized scroll behavior.
 - Bundle Pi ACP 0.0.34-codeg.4 with Pi 1.4.0 and Node 24.16.0. Native preflight compaction can outlive the ordinary prompt acknowledgement deadline while a bounded native health check proves it is active; real failures and Stop first settle the owned native execution.
