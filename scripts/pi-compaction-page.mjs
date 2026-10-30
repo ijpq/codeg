@@ -260,6 +260,7 @@ export async function piCompactionPage({
   }
   const checks = []
   const completedEvents = []
+  const settlementSamples = []
   try {
     if (saved) {
       assert.equal(
@@ -271,7 +272,29 @@ export async function piCompactionPage({
       const seq = await submit(marker)
       await reply(marker)
       await idle(seq)
+      // The native/provider assertions above cannot prove that the rendered
+      // optimistic and parsed copies converged. Inspect the real composer
+      // echo after completion, without refetching or changing page state.
+      const observedAt = Date.now()
+      do {
+        settlementSamples.push({
+          elapsedMs: Date.now() - observedAt,
+          visibleEchoes: await page
+            .locator(".chat-scroll-port:visible")
+            .last()
+            .getByText(marker, { exact: true })
+            .count(),
+        })
+        await pause(100)
+      } while (Date.now() - observedAt < 10000)
+      const finalSamples = settlementSamples.filter((s) => s.elapsedMs >= 8000)
+      assert.ok(
+        finalSamples.length >= 5 &&
+          finalSamples.every((s) => s.visibleEchoes === 1),
+        `Restarted composer echo must settle to one rendered message: ${JSON.stringify(settlementSamples)}`
+      )
       checks.push("restart-native-history-and-next-composer-reply")
+      checks.push("restart-single-rendered-echo-after-reconciliation")
     } else {
       await idle(await submit("/autocompact off"))
       piModel.tokens(120000)
@@ -452,6 +475,7 @@ export async function piCompactionPage({
       checks,
       conversationId: cid,
       provider: "isolated deterministic HTTP; native packaged compaction",
+      ...(saved ? { settlementSamples } : {}),
     })
     await writeFile(
       join(output, `${name}-pi-compaction${saved ? "-restart" : ""}.json`),
@@ -460,6 +484,7 @@ export async function piCompactionPage({
           checks,
           conversationId: cid,
           completedEvents,
+          ...(saved ? { settlementSamples } : {}),
           compactionRecords: compactionHistoryRecords(await history()),
           requests: piModel
             .evidence()
