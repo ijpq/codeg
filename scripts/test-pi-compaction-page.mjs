@@ -1,7 +1,37 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
 import { startPiModel } from "./pi-native-model-fixture.mjs"
-import { piCompactionPage } from "./pi-compaction-page.mjs"
+import {
+  piCompactionPage,
+  submitCompactionComposer,
+} from "./pi-compaction-page.mjs"
+
+test("manual compaction clicks Send once instead of selecting a slash suggestion with Enter", async () => {
+  const actions = []
+  const button = {
+    filter: () => button,
+    last: () => button,
+    click: async () => actions.push("send-button"),
+  }
+  const page = { getByRole: () => button }
+  const editor = {
+    fill: async (text) => actions.push(text),
+    // Enter deliberately only selects a command in this real UI state.
+    press: async () => actions.push("slash-selection"),
+  }
+  await submitCompactionComposer(page, editor, "/compact")
+  assert.deepEqual(actions, ["/compact", "send-button"])
+})
+
+test("ordinary compaction follow-up still uses one actual Enter submission", async () => {
+  const actions = []
+  const editor = {
+    fill: async (text) => actions.push(text),
+    press: async (key) => actions.push(key),
+  }
+  await submitCompactionComposer({}, editor, "continue after compaction")
+  assert.deepEqual(actions, ["continue after compaction", "Enter"])
+})
 
 // This adapter deliberately creates a binding only after a composer send.
 // Looking for a ready native session first reproduced the failed Windows gate.

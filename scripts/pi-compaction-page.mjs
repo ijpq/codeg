@@ -7,6 +7,20 @@ import { randomUUID } from "node:crypto"
 import { openBusiness } from "./business-agent-page.mjs"
 import { businessComposer, reloadBusiness } from "./business-composer-page.mjs"
 const pause = (ms) => new Promise((done) => setTimeout(done, ms))
+export async function submitCompactionComposer(page, editor, text) {
+  await editor.fill(text)
+  if (text.startsWith("/")) {
+    // Enter accepts the slash-menu suggestion; it is not a send receipt.
+    // Click the real composer affordance once, without a second Enter/retry.
+    await page
+      .getByRole("button", { name: /^(Send|发送|傳送)$/ })
+      .filter({ visible: true })
+      .last()
+      .click()
+  } else {
+    await editor.press("Enter")
+  }
+}
 async function until(read, accepts, label) {
   let value
   const deadline = Date.now() + 90_000
@@ -99,8 +113,7 @@ export async function piCompactionPage({
   const submit = async (text) => {
     const before = await snapshot()
     const editor = await businessComposer(page, target)
-    await editor.fill(text)
-    await editor.press("Enter")
+    await submitCompactionComposer(page, editor, text)
     return before.event_seq
   }
   const idle = (seq) =>
