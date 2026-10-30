@@ -37,6 +37,35 @@ export async function piCompactionPage({
     }))
   const target = { conversationId: cid, folderId, agent: "pi" }
   await openBusiness(page, api, cid, folderId, "pi")
+  const history = () =>
+    api("get_folder_conversation", { conversationId: cid, userTurnLimit: 25 })
+  if (!saved) {
+    // An empty business has no native session to find yet. Its first real
+    // composer submission establishes that binding; never prewarm it via ACP.
+    const marker = `PI_COMPACTION_BOOTSTRAP_${randomUUID()}`
+    const editor = await businessComposer(page, target)
+    await editor.fill(marker)
+    await editor.press("Enter")
+    await until(
+      history,
+      (h) => {
+        const index = h.turns.findIndex(
+          (t) => t.role === "user" && JSON.stringify(t.blocks).includes(marker)
+        )
+        return (
+          index >= 0 &&
+          h.turns
+            .slice(index + 1)
+            .some(
+              (t) =>
+                t.role === "assistant" &&
+                JSON.stringify(t.blocks).includes("BUSINESS_PI_COMPLETED")
+            )
+        )
+      },
+      "First composer message establishes a real Pi business session"
+    )
+  }
   const live = await until(
     () =>
       api("acp_find_connection_for_conversation", {
@@ -67,8 +96,6 @@ export async function piCompactionPage({
     configId: "model",
     valueId: gpt.value,
   })
-  const history = () =>
-    api("get_folder_conversation", { conversationId: cid, userTurnLimit: 25 })
   const submit = async (text) => {
     const before = await snapshot()
     const editor = await businessComposer(page, target)
