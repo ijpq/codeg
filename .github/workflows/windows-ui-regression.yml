@@ -123,6 +123,36 @@ jobs:
               assert all((root / name).resolve().is_relative_to(root) for name in bundle.namelist())
               bundle.extractall(root)
           assert json.loads((root / 'out/codeg-release-manifest.json').read_text())['commit'] == source
+          # Old Actions artifacts excluded dotfiles even though NSIS bundled
+          # them correctly. Recover ONLY missing inventoried dotfiles from the
+          # checksum-pinned installer, and verify every recovered byte. Never
+          # weaken the normal runtime inventory check or regenerate its hash.
+          runtime = root / 'dist/pi-runtime'
+          inventory = json.loads((runtime / 'runtime-files.json').read_text())
+          missing = [name for name in inventory if not (runtime / name).is_file()]
+          if missing:
+              import shutil
+              assert all(any(part.startswith('.') for part in Path(name).parts) for name in missing)
+              version = json.loads((root / 'package.json').read_text())['version']
+              setup = root / f'src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/codeg_{version}_x64-setup.exe'
+              installed = Path(os.environ['RUNNER_TEMP']) / 'pinned-candidate-runtime-recovery'
+              child_env = dict(os.environ, CODEG_DIAGNOSTIC_SETUP=str(setup), CODEG_DIAGNOSTIC_INSTALL=str(installed))
+              subprocess.run(['pwsh', '-NoProfile', '-Command',
+                              '$p=Start-Process -FilePath $env:CODEG_DIAGNOSTIC_SETUP -ArgumentList "/S",("/D="+$env:CODEG_DIAGNOSTIC_INSTALL) -Wait -PassThru; if($p.ExitCode -ne 0){throw "Pinned installer failed"}'],
+                             env=child_env, check=True)
+              for name in missing:
+                  original = (installed / 'pi-runtime' / name).resolve(strict=True)
+                  assert original.is_relative_to(installed.resolve())
+                  assert hashlib.sha256(original.read_bytes()).hexdigest() == inventory[name], name
+                  target = (runtime / name).resolve()
+                  assert target.is_relative_to(runtime.resolve())
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  shutil.copyfile(original, target)
+              evidence = Path(os.environ['RUNNER_TEMP']) / 'ui-evidence'
+              evidence.mkdir(exist_ok=True)
+              (evidence / 'candidate-runtime-recovery.json').write_text(json.dumps({
+                  'sourceCommit': source, 'installerSha256': hashlib.sha256(setup.read_bytes()).hexdigest(),
+                  'recoveredDotfiles': missing, 'allRecoveredBytesMatchOriginalInventory': True}, indent=2))
           with open(os.environ['GITHUB_ENV'], 'a') as output:
               output.write('CODEG_CANDIDATE_SHA=' + source + '\n')
           print('Testing the checksum-pinned diagnostic application commit', source)
@@ -171,6 +201,7 @@ jobs:
             dist/pi-runtime/
             dist/codex-runtime/
           if-no-files-found: error
+          include-hidden-files: true
           retention-days: 7
       - name: Download verified published baseline into the runner
         shell: pwsh

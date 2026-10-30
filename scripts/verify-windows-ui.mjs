@@ -57,7 +57,7 @@ assert.ok(
 await mkdir(output, { recursive: true })
 const report = {
   version: options.version,
-  sourceCommit: process.env.GITHUB_SHA,
+  sourceCommit: process.env.CODEG_CANDIDATE_SHA ?? process.env.GITHUB_SHA,
   verifierCommit: process.env.CODEG_VERIFIER_SHA ?? process.env.GITHUB_SHA,
   checks: [],
   errors: [],
