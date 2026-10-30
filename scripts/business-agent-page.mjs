@@ -1,7 +1,13 @@
 // Exercises the packaged app and real ACP adapters against deterministic local
 // model endpoints. No live model login or reasoning is claimed by this check.
 import assert from "node:assert/strict"
-import { access, mkdir, readFile, writeFile } from "node:fs/promises"
+import {
+  access,
+  appendFile,
+  mkdir,
+  readFile,
+  writeFile,
+} from "node:fs/promises"
 import { join, dirname } from "node:path"
 import { randomUUID } from "node:crypto"
 import { businessComposer, reloadBusiness } from "./business-composer-page.mjs"
@@ -1250,6 +1256,25 @@ export async function consecutiveComposerPage({
         }
       }
       const markers = []
+      const recordReadiness = async (round, phase) => {
+        if (!output) return
+        const gates = await page.evaluate(() =>
+          [...document.querySelectorAll("[data-session-readiness]")]
+            .filter((node) => node.getClientRects().length)
+            .map((node) =>
+              JSON.parse(node.getAttribute("data-session-readiness"))
+            )
+        )
+        await appendFile(
+          join(output, `${name}-${agent}-composer-readiness.log`),
+          JSON.stringify({
+            at: new Date().toISOString(),
+            round,
+            phase,
+            gates,
+          }) + "\n"
+        )
+      }
       for (let round = 1; round <= 5; round++) {
         if (round === 3 && other) {
           const current = await api("get_business_conversation_state", {
@@ -1300,6 +1325,7 @@ export async function consecutiveComposerPage({
           conversationId: cid,
           agent,
         })
+        await recordReadiness(round, "before-input")
         await input.fill(text)
         await input.press("Enter")
         const response =
@@ -1327,6 +1353,7 @@ export async function consecutiveComposerPage({
             },
             `${name}: ${agent} composer round ${round}`
           )
+          await recordReadiness(round, "reply-persisted")
         } catch (error) {
           if (output) {
             const history = await read().catch(() => null)
@@ -1345,6 +1372,13 @@ export async function consecutiveComposerPage({
               : null
             const ui = await page
               .evaluate(() => ({
+                readiness: [
+                  ...document.querySelectorAll("[data-session-readiness]"),
+                ]
+                  .filter((node) => node.getClientRects().length)
+                  .map((node) =>
+                    JSON.parse(node.getAttribute("data-session-readiness"))
+                  ),
                 queues: Object.keys(localStorage)
                   .filter((key) => key.startsWith("codeg:msg-queue:v1:"))
                   .map((key) => ({
@@ -1387,6 +1421,9 @@ export async function consecutiveComposerPage({
                     selectorsReady: snapshot.selectors_ready,
                     turnInFlight: snapshot.turn_in_flight,
                     conversationId: snapshot.conversation_id,
+                    externalSessionId: snapshot.external_id,
+                    codegMcpAvailable: snapshot.codeg_mcp_available,
+                    mcpServerCount: snapshot.mcp_server_count,
                     eventSeq: snapshot.event_seq,
                   },
                   ui,
