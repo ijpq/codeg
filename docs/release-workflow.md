@@ -213,6 +213,10 @@ Windows 候选双包、正式双包、安装启动、升级/回滚、资源依�
 
 ## CI 失败后的规则
 
+- 自用版在正式下载包复验未通过或被取消时，独立 job 自动将本轮对应 Release 隔离为
+  prerelease 并写入验收链接，不移动 tag、不替换或删除资产。隔离前核对 release ID、
+  tag 和 workflow commit，不能修改其他版本。修复后必须使用新版本重新走完整门禁，
+  不把隔离版本的旧构建通过记录当成已验收发布。
 - 只是 GitHub runner、下载源等瞬时基础设施问题且代码未变，可以重跑同一 SHA 的 workflow。
 - 任何修复导致 commit 变化，都必须更新 `EXPECTED_SHA`，重新推分支、等待普通 CI，再触发与
   新 commit 对应的发布。

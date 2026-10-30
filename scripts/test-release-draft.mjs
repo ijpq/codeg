@@ -7,6 +7,7 @@ import { test } from "node:test"
 import "./test-release-history-check.mjs"
 import "./test-runtime-page-errors.mjs"
 import "./test-release-harness-lint.mjs"
+import "./test-release-quarantine.mjs"
 
 const workflow = readFileSync(
   process.env.CODEG_RELEASE_WORKFLOW_FIXTURE ??

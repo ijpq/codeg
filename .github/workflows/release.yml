@@ -1814,3 +1814,53 @@ jobs:
             ${{ runner.temp }}/published-verification/**/*dependencies.json
           if-no-files-found: warn
           retention-days: 14
+
+  quarantine-failed-release:
+    needs: [create-draft-release, publish-release, verify-published-assets]
+    if: >-
+      always() && github.event_name == 'push' &&
+      github.repository == 'ijpq/codeg' && github.ref_name != 'v0.30.7-fix1' &&
+      needs.publish-release.result == 'success' &&
+      needs.verify-published-assets.result != 'success'
+    name: Quarantine a release that failed downloaded-package acceptance
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/github-script@v7
+        env:
+          RELEASE_ID: ${{ needs.create-draft-release.outputs.release_id }}
+          VERIFICATION_RESULT: ${{ needs.verify-published-assets.result }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const releaseId = Number(process.env.RELEASE_ID);
+            const tag = context.ref.replace(/^refs\/tags\//, "");
+            if (!Number.isSafeInteger(releaseId) || releaseId <= 0 || !tag.startsWith("v")) {
+              throw new Error("Missing release identity; refusing to edit another release");
+            }
+            const { data: release } = await github.rest.repos.getRelease({
+              owner, repo, release_id: releaseId,
+            });
+            if (release.tag_name !== tag || release.draft) {
+              throw new Error("Published release identity does not match this run");
+            }
+            const { data: ref } = await github.rest.git.getRef({
+              owner, repo, ref: `tags/${tag}`,
+            });
+            const commit = ref.object.type === "tag"
+              ? (await github.rest.git.getTag({ owner, repo, tag_sha: ref.object.sha })).data.object.sha
+              : ref.object.sha;
+            if (commit !== context.sha) {
+              throw new Error("Release tag no longer names this run; refusing to edit it");
+            }
+            const marker = "发布后验收未通过";
+            const url = `https://github.com/${owner}/${repo}/actions/runs/${context.runId}`;
+            const body = (release.body ?? "").includes(marker)
+              ? release.body
+              : `> **${marker}：本版本已隔离为预发布。** 下载包复验结果为 ${process.env.VERIFICATION_RESULT}，不能作为已验收交付。原 tag、发布资产和诊断证据保留。\n> 验收记录：${url}\n\n${release.body ?? ""}`;
+            await github.rest.repos.updateRelease({
+              owner, repo, release_id: releaseId,
+              prerelease: true, make_latest: "false", body,
+            });
+            core.info(`Quarantined ${tag}; published bytes and tag were preserved`);
