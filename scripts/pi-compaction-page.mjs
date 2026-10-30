@@ -109,6 +109,13 @@ export async function piCompactionPage({
       ).length,
       1
     )
+    assert.equal(
+      piModel
+        .evidence()
+        .filter((r) => !r.compaction && r.compactionMarker === marker).length,
+      1,
+      "The native provider received this composer message exactly once"
+    )
   }
   const cards = (status) =>
     page.locator(
@@ -278,7 +285,10 @@ export async function piCompactionPage({
       )
     }
     await page.screenshot({
-      path: join(output, `${name}-compaction-settled.png`),
+      path: join(
+        output,
+        `${name}-compaction-settled${saved ? "-restart" : ""}.png`
+      ),
     })
     report.checks.push({
       name: `${name}-native-compaction-composer${saved ? "-restart" : ""}`,
@@ -287,12 +297,14 @@ export async function piCompactionPage({
       provider: "isolated deterministic HTTP; native packaged compaction",
     })
     await writeFile(
-      join(output, `${name}-pi-compaction.json`),
+      join(output, `${name}-pi-compaction${saved ? "-restart" : ""}.json`),
       JSON.stringify(
         {
           checks,
           conversationId: cid,
-          requests: piModel.evidence().filter((r) => r.compaction),
+          requests: piModel
+            .evidence()
+            .filter((r) => r.compaction || r.compactionMarker),
           snapshot: await snapshot(),
         },
         null,

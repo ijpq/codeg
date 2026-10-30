@@ -33,6 +33,10 @@ export async function startPiModel() {
     requests.push({
       compaction,
       receivedAt: Date.now(),
+      compactionMarker:
+        [...latestUser.matchAll(/PI_COMPACTION_[A-Z_]+_[a-f0-9-]{36}/g)].at(
+          -1
+        )?.[0] ?? null,
       frontendMarker:
         [...latestUser.matchAll(/PI_FRONTEND_[A-Z0-9_]+_[a-f0-9-]{36}/g)].at(
           -1

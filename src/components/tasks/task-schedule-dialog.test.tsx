@@ -55,6 +55,11 @@ const saveButton = () => screen.getByRole("button", { name: "Save" })
  */
 async function pickDay(day: Date) {
   await userEvent.click(dateTrigger())
+  // Two days ahead may be outside the current month's grid (e.g. Oct 30 ->
+  // Nov 1). Navigate as a user would instead of depending on outside days.
+  if (day.getMonth() !== new Date().getMonth()) {
+    await userEvent.click(screen.getByRole("button", { name: /next month/i }))
+  }
   const cell = await waitFor(() => {
     const found = document.querySelector<HTMLButtonElement>(
       `button[data-day="${day.toLocaleDateString()}"]`
