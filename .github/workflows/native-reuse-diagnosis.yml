@@ -9,24 +9,56 @@ jobs:
   diagnose:
     runs-on: windows-2022
     timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_BUILD_JOBS: 1
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      PYTHONUTF8: "1"
     steps:
       - uses: actions/checkout@v4
         with:
           ref: 4e452bb15e0c94cb966aed2ad5339798c7112c4f
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: clippy
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Run unchanged reuse selector with normal job permissions
-        shell: pwsh
+      - name: Verify runtime build regressions
+        run: |
+          python -B scripts/test-codex-runtime-migrations.py
+          python -B scripts/test-codex-runtime-cache.py
+          python -B scripts/test-codex-resume-comparison.py
+          python -B scripts/test-reuse-tested-codex-build.py
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install isolated reference CLI
+        run: npm install --prefix "$RUNNER_TEMP/codeg-codex-reference" --ignore-scripts --no-audit --no-fund @openai/codex@0.162.1
+      - name: Reuse with the unchanged Bash prerequisites and step output
+        id: codex-build
         env:
           GH_TOKEN: ${{ github.token }}
-          PYTHONUTF8: "1"
         run: |
-          New-Item -ItemType Directory -Force evidence | Out-Null
-          python -u -B scripts/reuse-tested-codex-build.py --output-dir "$env:RUNNER_TEMP/native-proof" 2>&1 | Tee-Object evidence/reuse.log
-          if ($LASTEXITCODE -ne 0) { throw 'Reuse diagnostic exited unexpectedly' }
-          if (-not (Test-Path "$env:RUNNER_TEMP/native-proof/build-reuse.json")) { throw 'Selector rejected the unchanged original build; inspect reuse.log' }
-          Copy-Item "$env:RUNNER_TEMP/native-proof/build-reuse.json" evidence/
+          mkdir -p evidence
+          python -u -B scripts/reuse-tested-codex-build.py --output-dir "$RUNNER_TEMP/codeg-codex-runtime" 2>&1 | tee evidence/reuse.log
+      - name: Verify reuse proof and output agree
+        env:
+          REUSED: ${{ steps.codex-build.outputs.reused }}
+        run: |
+          python - <<'CHECK'
+          import json,os
+          from pathlib import Path
+          proof=Path(os.environ['RUNNER_TEMP'])/'codeg-codex-runtime/build-reuse.json'
+          report={'reusedOutput':os.environ.get('REUSED'),'proofExists':proof.is_file(),'applicationCommit':'4e452bb15e0c94cb966aed2ad5339798c7112c4f'}
+          if proof.is_file():report['proof']=json.loads(proof.read_text())
+          Path('evidence/output.json').write_text(json.dumps(report,indent=2)+'\n')
+          print(json.dumps(report))
+          assert report['reusedOutput']=='true' and report['proofExists'], 'Selector or step-output propagation failed; inspect reuse.log and output.json'
+          CHECK
       - name: Preserve narrow read-only evidence
         if: always()
         uses: actions/upload-artifact@v4
