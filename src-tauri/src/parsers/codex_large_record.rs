@@ -28,10 +28,25 @@ pub(crate) struct CheckedReader<'a> {
     hash: Sha256,
     cancelled: Option<&'a AtomicBool>,
     max_read_bytes: usize,
+    utf8_tail: Vec<u8>,
+}
+
+fn pending_utf8(bytes: &[u8]) -> std::io::Result<Vec<u8>> {
+    match std::str::from_utf8(bytes) {
+        Ok(_) => Ok(Vec::new()),
+        Err(error) if error.error_len().is_none() => Ok(bytes[error.valid_up_to()..].to_vec()),
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Native history contains invalid UTF-8",
+        )),
+    }
 }
 
 impl Read for CheckedReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
         if self
             .cancelled
             .is_some_and(|flag| flag.load(Ordering::Relaxed))
@@ -40,6 +55,22 @@ impl Read for CheckedReader<'_> {
         }
         let cap = buf.len().min(CHUNK_BYTES);
         let read = self.source.read(&mut buf[..cap])?;
+        // IgnoredAny validates JSON syntax but skips UTF-8 validation inside
+        // ignored strings. Check every byte, including beyond the preview,
+        // retaining only an unfinished codepoint (at most three bytes).
+        if !self.utf8_tail.is_empty() {
+            if read == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Native history ends with incomplete UTF-8",
+                ));
+            }
+            let mut joined = std::mem::take(&mut self.utf8_tail);
+            joined.extend_from_slice(&buf[..read]);
+            self.utf8_tail = pending_utf8(&joined)?;
+        } else {
+            self.utf8_tail = pending_utf8(&buf[..read])?;
+        }
         self.max_read_bytes = self.max_read_bytes.max(read);
         self.hash.update(&buf[..read]);
         Ok(read)
@@ -76,6 +107,7 @@ fn source<'a>(
         hash: Sha256::new(),
         cancelled,
         max_read_bytes: 0,
+        utf8_tail: Vec::new(),
     })
 }
 
@@ -247,6 +279,27 @@ mod tests {
             .unwrap()
             .to_string()
             .contains("HISTORY_SOURCE_CHANGED"));
+    }
+
+    #[test]
+    fn invalid_utf8_beyond_the_preview_cannot_pass_stream_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("native.jsonl");
+        let mut bytes = b"{\"text\":\"".to_vec();
+        bytes.extend(vec![b'x'; STRING_BYTES + 100]);
+        bytes.push(255);
+        bytes.extend(b"\"}\n");
+        std::fs::write(&path, &bytes).unwrap();
+        let error = read(&path, 0, bytes.len() as u64, None).err().unwrap();
+        assert!(error.to_string().contains("HISTORY_PARSE_FAILED"));
+        assert!(error.to_string().contains("UTF-8"));
+        // A real codepoint may cross a physical read boundary.
+        bytes = b"{\"text\":\"".to_vec();
+        bytes.extend(vec![b'x'; CHUNK_BYTES - bytes.len() - 1]);
+        bytes.extend("😀".as_bytes());
+        bytes.extend(b"\"}\n");
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(read(&path, 0, bytes.len() as u64, None).is_ok());
     }
 
     #[test]
