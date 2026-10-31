@@ -3,6 +3,7 @@
 ## 0.41.3-fix5 — 2026-10-31
 
 - Resolve repeated compaction records across restored history, standalone dividers and inline reply steps. A proven terminal native lifecycle takes precedence over an earlier start; explicit running state still overrides generic tool settlement. Correlation uses event/call identities, preserving unrelated events and reply content without loading full history.
+- Retain a host-owned lifecycle alias alongside the native completion ID, including existing ledger rows. Reattached clients can reconcile a restored start with terminal history even when they missed the live identity bridge, without timestamp matching or transcript edits.
 - Retain atomic DOM transition evidence in final-package frontend verification. fix4 was blocked before publication when the Server page briefly retained an active card after completion; its builds and partial passes do not qualify as accepted release evidence. New before/after regressions cover stale starts, inline duplicates, native identity bridges and actual card rendering.
 - Carry all Pi compaction admission, cancellation, persistence and restored-lifecycle fixes, with Pi ACP 0.0.34-codeg.5 / Pi 1.4.0 / Node 24.16.0. Preserve business sessions, recovery queues, providers, native Plan/Goal, duration, deliverables, Office review and virtualized scrolling. Both exact Windows packages require full downloaded installation, upgrade, frontend and postpublication SHA256 acceptance.
 

@@ -54,6 +54,10 @@ pub(crate) fn stamp_binding(event: &mut AcpEvent, state: &SessionState) {
     // the durable event identity; successful operations retain the proven
     // native entry id supplied by the adapter.
     marker.entry("eventId").or_insert_with(|| json!(id));
+    // The native entry id can replace eventId on completion. Retain the host
+    // call identity so a reattached viewer can reconcile an earlier start even
+    // if it missed the live event that bridged these two identities.
+    marker.insert("lifecycleId".into(), json!(id));
     if let Some(meta) = meta.as_object_mut() {
         meta.insert(
             BINDING_KEY.into(),

@@ -1125,9 +1125,13 @@ export function dedupeCompactionItems(
     callId: string | undefined,
     state: ToolCallState | undefined
   ) => {
+    const lifecycleId = contextCompactionPayload(meta)?.lifecycleId
     const keys = [
       compactionEventKey(meta),
       callId ? `call:${callId}` : null,
+      typeof lifecycleId === "string" && lifecycleId
+        ? `call:${lifecycleId}`
+        : null,
     ].filter((key): key is string => key !== null)
     if (!keys.length) return
     const status = contextCompactionPayload(meta)?.status

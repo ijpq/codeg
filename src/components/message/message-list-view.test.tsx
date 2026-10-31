@@ -1390,6 +1390,24 @@ describe("dedupeCompactionItems", () => {
     expect(dedupeCompactionItems([completed, running])).toEqual([completed])
   })
 
+  it("correlates terminal history with an older restored start after missing the live completion", () => {
+    const start = divider(
+      "restored",
+      { eventId: "acp-operation", status: "in_progress" },
+      "acp-operation"
+    )
+    const completed = divider(
+      "native",
+      {
+        eventId: "native-entry",
+        lifecycleId: "acp-operation",
+        status: "completed",
+      },
+      "native-entry"
+    )
+    expect(dedupeCompactionItems([start, completed])).toEqual([completed])
+  })
+
   it.each(["completed", "failed", "cancelled"])(
     "uses the native identity bridge to collapse three copies into one %s outcome",
     (status) => {

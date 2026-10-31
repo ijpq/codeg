@@ -82,8 +82,14 @@ pub(crate) async fn merge_history(
         let id: String = row.try_get("", "compaction_id")?;
         let external: String = row.try_get("", "external_id")?;
         let status: String = row.try_get("", "status")?;
-        let meta: Json = serde_json::from_str(&row.try_get::<String>("", "meta_json")?)
+        let mut meta: Json = serde_json::from_str(&row.try_get::<String>("", "meta_json")?)
             .map_err(|e| DbError::Validation(e.to_string()))?;
+        // The ledger's primary key is the original host ACP call id, including
+        // rows written before lifecycleId was exposed. Do not infer this link
+        // from timestamps or rewrite the native transcript to recover it.
+        if let Some(marker) = meta["contextCompaction"].as_object_mut() {
+            marker.insert("lifecycleId".into(), json!(id));
+        }
         let Some(timestamp) =
             DateTime::<Utc>::from_timestamp_millis(row.try_get("", "started_at_ms")?)
         else {
@@ -344,6 +350,12 @@ mod tests {
         )
         .await
         .unwrap();
+        // Simulate an existing ledger row written before the host exposed its
+        // stable operation alias; the native entry itself still has another id.
+        db.conn.execute(stmt(
+            "UPDATE conversation_compaction SET meta_json=json_remove(meta_json,'$.contextCompaction.lifecycleId') WHERE conversation_id=?",
+            vec![cid.into()],
+        )).await.unwrap();
         let mut native = vec![MessageTurn {
             id: "turn-4".into(),
             role: TurnRole::Assistant,
@@ -380,6 +392,8 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(native.len(), 1);
+        assert_eq!(marker(&native[0])["eventId"], "native-entry");
+        assert_eq!(marker(&native[0])["lifecycleId"], "live-id");
         assert_eq!(marker(&native[0])["preTokens"], 8000);
         assert_eq!(marker(&native[0])["trigger"], "manual");
         assert!(
