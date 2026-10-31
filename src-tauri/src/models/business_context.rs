@@ -17,6 +17,10 @@ pub fn history_prose(turn: &MessageTurn) -> String {
                 uri.as_deref()
                     .unwrap_or("available in original CodeG history")
             )),
+            ContentBlock::ToolUse { meta: Some(meta), .. } if meta.get("codeg.nativeRecord").is_some() => Some(format!(
+                "[Oversized native history record: bounded preview only, original content not fully delivered. Original source and exact byte range (read on demand with native file tools): {}]",
+                meta["codeg.nativeRecord"]
+            )),
             _ => None,
         })
         .collect::<Vec<_>>()

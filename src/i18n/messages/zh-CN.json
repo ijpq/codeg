@@ -3902,7 +3902,12 @@
         },
         "worked": "工作已结束",
         "workedFor": "工作了 {duration}",
-        "working": "正在工作中..."
+        "working": "正在工作中...",
+        "partialHistoryBuilding": "历史索引尚未覆盖安全的记录边界。请等待索引完成后重试。",
+        "partialHistoryRebuilding": "历史索引正在重建，原始历史已保留。请等待重建完成后重试。",
+        "partialHistoryIndexLimited": "历史索引已达到记录容量上限，原始历史已保留。请检查诊断信息后重试。",
+        "partialHistoryParseFailed": "原始历史记录解析失败。请检查诊断中的字节范围；未启用不完整的交接。",
+        "partialHistoryBudget": "本页达到安全读取预算，尚未找到完整边界。原始历史已保留；请在索引就绪后重试，或反馈诊断信息。"
       },
       "liveTurnStats": {
         "elapsedHours": "{value} 小时",

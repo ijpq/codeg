@@ -96,14 +96,12 @@ async fn switch_agent_inner(
             ))
             .await
             .map_err(error)?;
-            if detail
+            if let Some(page) = detail
                 .history_page
                 .as_ref()
-                .is_some_and(|p| p.page_complete == Some(false))
+                .filter(|p| p.page_complete == Some(false))
             {
-                return Err(error(
-                    "The original history index is still building; retry when its page is complete",
-                ));
+                return Err(incomplete_history_error(page));
             }
             let path = archive.path().join(format!("{}.json", paths.len()));
             let page = business::BusinessHistoryArchivePage {
@@ -137,6 +135,24 @@ async fn switch_agent_inner(
         .await
         .map_err(error)?
         .ok_or_else(|| error("Business state is missing"))
+}
+
+fn incomplete_history_error(page: &crate::models::ConversationHistoryPage) -> AcpError {
+    let issue = page.read_issue.as_deref().unwrap_or("page_budget_limited");
+    let message = match issue {
+        "index_building" => "HISTORY_INDEX_BUILDING: A complete record boundary is not indexed yet. Wait for indexing, then retry the switch.",
+        "index_rebuilding" => "HISTORY_INDEX_REBUILDING: The original index was stale or corrupt and is being rebuilt. Retry after rebuilding completes.",
+        "index_capacity_limited" => "HISTORY_INDEX_LIMITED: The index reached its record capacity. Original history and Agent were preserved; inspect index diagnostics before retrying.",
+        value if value.contains("HISTORY_PARSE_FAILED") => value,
+        _ => "HISTORY_PAGE_BUDGET_LIMIT: A safe complete record boundary could not be selected within the page budget. Retry after indexing completes; if it is already ready, report the byte-range diagnostics.",
+    };
+    error(format!(
+        "{message} No handoff was activated. [index={}, mode={}, bytes={:?}..{:?}]",
+        page.index_status.as_deref().unwrap_or("unknown"),
+        page.read_mode.as_deref().unwrap_or("unknown"),
+        page.read_start_offset,
+        page.read_end_offset
+    ))
 }
 
 /// One process-local supervisor per durable business. SQLite request IDs and
@@ -980,6 +996,115 @@ mod tests {
     fn turn(id: &str, role: TurnRole, text: &str) -> MessageTurn {
         serde_json::from_value(serde_json::json!({"id":id,"role":role,"blocks":[{"type":"text","text":text}],"timestamp":"2026-10-25T01:00:00Z","usage":null,"duration_ms":null,"model":null})).unwrap()
     }
+
+    #[tokio::test]
+    async fn business_native_history_parse_failure_cannot_activate_handoff_or_replace_original() {
+        use crate::db::service::agent_setting_service::{
+            self, AgentDefaultInput, AgentSettingsUpdate,
+        };
+        use sea_orm::{ConnectionTrait, DbBackend, Statement};
+        let db = fresh_in_memory_db().await;
+        let manager = ConnectionManager::new();
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir(&sessions).unwrap();
+        let folder = seed_folder(&db, dir.path().to_str().unwrap()).await;
+        let cid = seed_conversation(&db, folder, AgentType::Codex).await;
+        let external = "01a0098a-7e8a-72d3-b7c0-2df130c84063";
+        conversation_service::bind_external_id(&db.conn, cid, external, &[])
+            .await
+            .unwrap();
+        agent_setting_service::ensure_defaults(
+            &db.conn,
+            &[AgentDefaultInput {
+                agent_type: AgentType::Codex,
+                registry_id: "codex".into(),
+                default_sort_order: 0,
+            }],
+        )
+        .await
+        .unwrap();
+        agent_setting_service::update(
+            &db.conn,
+            AgentType::Codex,
+            AgentSettingsUpdate {
+                enabled: true,
+                env_json: Some(serde_json::json!({"CODEX_HOME":dir.path()}).to_string()),
+                model_provider_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        let path = sessions.join(format!("rollout-2026-10-29T00-00-00-{external}.jsonl"));
+        let source = format!(
+            "{}\n{{INVALID_NATIVE_JSON}}\n",
+            serde_json::json!({"type":"session_meta","timestamp":"2026-10-29T00:00:00Z","payload":{"id":external,"cwd":dir.path()}})
+        );
+        std::fs::write(&path, &source).unwrap();
+        let error = switch_agent_core(
+            request(cid, "bad-history", AgentType::Pi, 0),
+            &manager,
+            &db,
+            dir.path(),
+            EventEmitter::Noop,
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(
+            error.to_string().contains("HISTORY_PARSE_FAILED"),
+            "{error}"
+        );
+        let original = conversation_service::get_by_id(&db.conn, cid)
+            .await
+            .unwrap();
+        assert_eq!(original.agent_type, AgentType::Codex);
+        assert_eq!(original.external_id.as_deref(), Some(external));
+        assert!(!business::is_managed(&db.conn, cid).await.unwrap());
+        let row = db
+            .conn
+            .query_one(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT COUNT(*) AS n FROM business_agent_switch WHERE conversation_id=?",
+                vec![cid.into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.try_get::<i64>("", "n").unwrap(), 0);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), source);
+    }
+
+    #[test]
+    fn business_incomplete_history_errors_distinguish_index_from_budget() {
+        use crate::models::ConversationHistoryPage;
+        for (issue, expected) in [
+            ("index_building", "HISTORY_INDEX_BUILDING"),
+            ("index_rebuilding", "HISTORY_INDEX_REBUILDING"),
+            ("index_capacity_limited", "HISTORY_INDEX_LIMITED"),
+            ("record_boundary_unavailable", "HISTORY_PAGE_BUDGET_LIMIT"),
+            (
+                "HISTORY_PARSE_FAILED: bad native record",
+                "HISTORY_PARSE_FAILED",
+            ),
+        ] {
+            let page = ConversationHistoryPage {
+                page_complete: Some(false),
+                index_status: Some("ready".into()),
+                read_mode: Some("bounded_scan".into()),
+                read_issue: Some(issue.into()),
+                read_start_offset: Some(100),
+                read_end_offset: Some(200),
+                ..Default::default()
+            };
+            let error = incomplete_history_error(&page).to_string();
+            assert!(error.contains(expected), "{error}");
+            assert!(error.contains("No handoff was activated"));
+            if issue == "record_boundary_unavailable" {
+                assert!(!error.contains("HISTORY_INDEX_BUILDING"));
+            }
+        }
+    }
     async fn fixture() -> (
         AppDatabase,
         ConnectionManager,
@@ -1040,6 +1165,7 @@ mod tests {
             preferred_config_values: BTreeMap::new(),
         }
     }
+
     #[tokio::test]
     async fn existing_handoff_repairs_truncated_rules_once_and_updates_on_revision() {
         let (db, manager, cid, folder, _old, _target, dir) = fixture().await;

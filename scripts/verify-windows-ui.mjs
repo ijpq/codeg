@@ -11,6 +11,7 @@ import assert from "node:assert/strict"
 import { startGoalModel } from "./native-codex-model-fixture.mjs"
 import { startBusinessModel } from "./business-model-fixture.mjs"
 import { startPiModel } from "./pi-native-model-fixture.mjs"
+import { longHistoryHandoffPage } from "./long-history-handoff-page.mjs"
 import { piCompactionPage } from "./pi-compaction-page.mjs"
 import { piMultiProviderPage } from "./pi-multi-provider-page.mjs"
 import { piCapabilityChecks } from "./pi-capability-checks.mjs"
@@ -1594,6 +1595,16 @@ try {
       )
       report.checks.push({ name: "setup-migrations", ...migration })
     }
+    if (options.baseline !== "true")
+      await longHistoryHandoffPage({
+        page: app.page,
+        api: desktopApi(app.page),
+        f: f,
+        name: "setup",
+        piModel,
+        report,
+        output,
+      })
     businessSaved = await businessAgentPage({
       page: app.page,
       api: desktopApi(app.page),
@@ -1883,6 +1894,16 @@ try {
       await allDeliverablesPage(page, api, s, conversation, "server-web")
     await nativeGoalPage(page, api, s, conversation, "server-web")
     await nativeDraftGoalPage(page, api, "server-web")
+    if (options.baseline !== "true")
+      await longHistoryHandoffPage({
+        page: page,
+        api: api,
+        f: s,
+        name: "server-web",
+        piModel,
+        report,
+        output,
+      })
     serverBusinessSaved = await businessAgentPage({
       page,
       api,

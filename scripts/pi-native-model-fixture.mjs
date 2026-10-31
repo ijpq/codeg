@@ -25,6 +25,10 @@ export async function startPiModel() {
     const latestUser = JSON.stringify(
       (body.input ?? []).findLast((i) => i.role === "user") ?? {}
     )
+    const longHistorySend =
+      [...latestUser.matchAll(/LONG_HISTORY_SEND_[a-f0-9-]{36}/g)].at(
+        -1
+      )?.[0] ?? null
     const compaction =
       input.includes("<conversation>") &&
       /structured (?:context checkpoint )?summary|structured context checkpoint/.test(
@@ -52,6 +56,13 @@ export async function startPiModel() {
         [...latestUser.matchAll(/LEGACY_COMPOSER_[a-z-]+_[a-f0-9-]{36}/g)].at(
           -1
         )?.[0] ?? null,
+      longHistorySend,
+      longHistoryFirst: input.includes("LONG_HISTORY_FIRST"),
+      longHistoryLatest: input.includes("LONG_HISTORY_LATEST"),
+      longHistoryReason: input.includes(
+        "keep template B because A failed validation"
+      ),
+      longHistoryBoundary: input.includes("preserve production"),
       model: body.model,
       tier: body.service_tier ?? null,
       effort: body.reasoning?.effort ?? null,
@@ -111,7 +122,11 @@ export async function startPiModel() {
     ].at(-1)
     let text = isChild
       ? "PI_CHILD_COMPLETED PI_CHILD_CONTEXT"
-      : "BUSINESS_PI_COMPLETED agenda-v3.md" + longReply
+      : "BUSINESS_PI_COMPLETED agenda-v3.md" +
+        longReply +
+        (longHistorySend
+          ? "\n" + longHistorySend.replace("_SEND_", "_REPLY_")
+          : "")
     if (compaction)
       text =
         "# Retained business context\nPI_COMPACTION_RETAINED requirements, completed work and pending review.\n" +

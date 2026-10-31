@@ -1585,6 +1585,7 @@ jobs:
             ${{ runner.temp }}/draft-verification/**/*-pi-multi-provider.json
             ${{ runner.temp }}/draft-verification/**/*-pi-compaction*.json
             ${{ runner.temp }}/draft-verification/**/*-compaction-transition.json
+            ${{ runner.temp }}/draft-verification/**/*-handoff.json
             ${{ runner.temp }}/draft-verification/**/resources-and-migrations.json
             ${{ runner.temp }}/draft-verification/**/*dependencies.json
           if-no-files-found: warn
@@ -1812,6 +1813,7 @@ jobs:
             ${{ runner.temp }}/published-verification/**/*-pi-multi-provider.json
             ${{ runner.temp }}/published-verification/**/*-pi-compaction*.json
             ${{ runner.temp }}/published-verification/**/*-compaction-transition.json
+            ${{ runner.temp }}/published-verification/**/*-handoff.json
             ${{ runner.temp }}/published-verification/**/resources-and-migrations.json
             ${{ runner.temp }}/published-verification/**/*dependencies.json
           if-no-files-found: warn

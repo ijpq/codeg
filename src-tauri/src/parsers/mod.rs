@@ -7,6 +7,7 @@ pub mod codebuddy;
 pub mod codex;
 mod codex_task_timing;
 pub mod codex_code_mode;
+mod codex_large_record;
 mod codex_desktop_attachments;
 mod codex_file_citations;
 pub mod codex_quota;

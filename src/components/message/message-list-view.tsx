@@ -1,5 +1,7 @@
 "use client"
 
+import { historyReadStatus } from "@/lib/history-read-status"
+
 import {
   memo,
   useCallback,
@@ -2714,7 +2716,7 @@ export function MessageListView({
               role="status"
               className="shrink-0 border-b border-border/40 px-3 py-2 text-xs text-muted-foreground"
             >
-              {t("partialHistory")}
+              {t(historyReadStatus(session.detail.history_page))}
             </p>
           ) : null}
           <AutoScrollOnSend signal={sendSignal} />

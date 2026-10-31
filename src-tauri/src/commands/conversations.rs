@@ -1741,6 +1741,10 @@ async fn get_snapshot_branch_page(
             has_more: source_page.as_ref().is_some_and(|page| page.has_more),
             loaded_turns: branch_detail.turns.len() as u32,
             page_complete: source_page.as_ref().and_then(|page| page.page_complete),
+            read_mode: source_page.as_ref().and_then(|page| page.read_mode.clone()),
+            read_issue: source_page
+                .as_ref()
+                .and_then(|page| page.read_issue.clone()),
             source_version: source_page
                 .as_ref()
                 .and_then(|page| page.source_version.clone()),
@@ -1935,8 +1939,17 @@ fn defer_heavy_tool_outputs(
     window: HistoryReadMetrics,
 ) {
     for turn in turns {
-        for result_index in 0..turn.blocks.len() {
-            let (tool_use_id, content_sha256, original_bytes) = match &turn.blocks[result_index] {
+        // The oversized-record reader already made a bounded, explicitly
+        // partial projection. Never mint a "full output" reference whose hash
+        // actually describes that projection rather than the native content.
+        if turn.blocks.iter().any(|block| matches!(block, ContentBlock::ToolUse { meta: Some(meta), .. } if meta.get("codeg.nativeRecord").is_some())) {
+            continue;
+        }
+        let mut result_index = 0;
+        while result_index < turn.blocks.len() {
+            let current_index = result_index;
+            result_index += 1;
+            let (tool_use_id, content_sha256, original_bytes) = match &turn.blocks[current_index] {
                 ContentBlock::ToolResult {
                     tool_use_id,
                     output_preview: Some(output),
@@ -1946,24 +1959,25 @@ fn defer_heavy_tool_outputs(
                 }
                 _ => continue,
             };
-            // Do not truncate an orphan result: without an owning ToolUse
-            // there is nowhere in the current wire model to carry the opaque
-            // load reference, and losing access would be worse than a larger
-            // page. Normal Codex transcripts pair these blocks.
-            let matching_index = tool_use_id
-                .as_deref()
-                .and_then(|wanted| {
-                    turn.blocks[..result_index].iter().rposition(|block| {
-                        matches!(block, ContentBlock::ToolUse { tool_use_id: Some(id), .. } if id == wanted)
-                    })
+            // Byte pages may legitimately separate a call from its output.
+            // Never put that output's reference on an unrelated nearby call.
+            let matching_index = tool_use_id.as_deref().and_then(|wanted| {
+                turn.blocks[..current_index].iter().rposition(|block| {
+                    matches!(block, ContentBlock::ToolUse {tool_use_id: Some(id), ..} if id == wanted)
                 })
-                .or_else(|| {
-                    turn.blocks[..result_index]
-                        .iter()
-                        .rposition(|block| matches!(block, ContentBlock::ToolUse { .. }))
+            });
+            let (matching_index, output_index) = if let Some(index) = matching_index {
+                (index, current_index)
+            } else {
+                turn.blocks.insert(current_index, ContentBlock::ToolUse {
+                    tool_use_id: tool_use_id.clone(),
+                    tool_name: "historical_tool_output".into(),
+                    input_preview: Some("Output continued from an earlier history page; the original call is retained there.".into()),
+                    status: Some("completed".into()),
+                    meta: Some(serde_json::json!({"codeg.historyContinuation": true})),
                 });
-            let Some(matching_index) = matching_index else {
-                continue;
+                result_index += 1;
+                (current_index, current_index + 1)
             };
             let reference = DeferredHistoryContentRef {
                 source_session: None,
@@ -1981,7 +1995,7 @@ fn defer_heavy_tool_outputs(
             let preview_bytes = if let ContentBlock::ToolResult {
                 output_preview: Some(output),
                 ..
-            } = &mut turn.blocks[result_index]
+            } = &mut turn.blocks[output_index]
             {
                 *output = truncate_history_preview(output);
                 output.len()
@@ -2740,6 +2754,8 @@ async fn get_folder_conversation_raw_with_compactions(
                             has_more: page.has_more,
                             loaded_turns,
                             page_complete: Some(page.page_complete),
+                            read_mode: Some(page.read_mode.into()),
+                            read_issue: page.read_issue,
                             source_version: Some(page.source_version.clone()),
                             read_start_offset: Some(page.start_offset),
                             read_end_offset: Some(page.end_offset),
@@ -3137,6 +3153,12 @@ async fn get_folder_conversation_raw_with_compactions(
         parser_cache_hit = history_read_metrics.is_some_and(|metrics| metrics.cache_hit),
         offset_index_hit = history_read_metrics.is_some_and(|metrics| metrics.index_hit),
         index_status = history_read_metrics.map(|metrics| metrics.index_status),
+        history_read_mode = history_page
+            .as_ref()
+            .and_then(|page| page.read_mode.as_deref()),
+        history_read_issue = history_page
+            .as_ref()
+            .and_then(|page| page.read_issue.as_deref()),
         indexed_through_offset = history_read_metrics.map(|metrics| metrics.indexed_through_offset),
         related_db_elapsed_ms,
         children_db_elapsed_ms,
@@ -4668,6 +4690,11 @@ fn parse_error_to_app_error(error: ParseError) -> AppCommandError {
     match error {
         ParseError::ConversationNotFound(id) => {
             AppCommandError::not_found("Conversation not found").with_detail(id)
+        }
+        ParseError::InvalidData(message) if message.starts_with("HISTORY_") => {
+            // Handoff converts this error to Display, so a detail-only cause
+            // would disappear and leave another misleading generic failure.
+            AppCommandError::invalid_input(message)
         }
         ParseError::InvalidData(message) => {
             AppCommandError::invalid_input("Invalid conversation data").with_detail(message)
@@ -9880,6 +9907,101 @@ mod tests {
         };
         assert!(preview.len() < full.len() / 2);
         assert!(preview.contains("deferred"));
+    }
+
+    #[test]
+    fn bounded_history_cross_page_output_never_borrows_another_tools_reference() {
+        let mut turns = four_turns();
+        let target = &mut turns[1];
+        target.blocks = vec![
+            ContentBlock::ToolUse {
+                tool_use_id: Some("unrelated-call".into()),
+                tool_name: "read_file".into(),
+                input_preview: None,
+                status: None,
+                meta: None,
+            },
+            ContentBlock::ToolResult {
+                tool_use_id: Some("original-call-on-older-page".into()),
+                output_preview: Some("large native output".repeat(2000)),
+                is_error: false,
+                agent_stats: None,
+                images: vec![],
+                exit_code: None,
+            },
+        ];
+        defer_heavy_tool_outputs(
+            &mut turns,
+            26,
+            HistoryReadMetrics {
+                start_offset: 100,
+                end_offset: 200,
+                ..Default::default()
+            },
+        );
+        let ContentBlock::ToolUse { meta, .. } = &turns[1].blocks[0] else {
+            panic!("unrelated call")
+        };
+        assert!(
+            meta.is_none(),
+            "another call must not receive this output's lazy reference"
+        );
+        let ContentBlock::ToolUse {
+            tool_use_id,
+            meta: Some(meta),
+            ..
+        } = &turns[1].blocks[1]
+        else {
+            panic!("explicit cross-page output")
+        };
+        assert_eq!(tool_use_id.as_deref(), Some("original-call-on-older-page"));
+        assert_eq!(meta["codeg.historyContinuation"], true);
+        let encoded = meta["codeg.historyOutput"]["ref"].as_str().unwrap();
+        let reference: DeferredHistoryContentRef =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded).unwrap()).unwrap();
+        assert_eq!(
+            reference.tool_use_id.as_deref(),
+            Some("original-call-on-older-page")
+        );
+        assert_eq!(
+            reference.content_sha256,
+            sha256_hex(&"large native output".repeat(2000))
+        );
+        let ContentBlock::ToolResult {
+            output_preview: Some(text),
+            ..
+        } = &turns[1].blocks[2]
+        else {
+            panic!("preserved output")
+        };
+        assert!(text.len() < HISTORY_DEFER_THRESHOLD_BYTES);
+    }
+
+    #[test]
+    fn bounded_history_native_record_preview_never_claims_to_be_full_output() {
+        let mut turns = four_turns();
+        turns[1].blocks = vec![
+            ContentBlock::ToolUse {
+                tool_use_id: Some("call".into()),
+                tool_name: "native_history_record".into(),
+                input_preview: None,
+                status: None,
+                meta: Some(
+                    serde_json::json!({"codeg.nativeRecord":{"previewOnly":true,"startOffset":0,"endOffset":100_000_000}}),
+                ),
+            },
+            ContentBlock::ToolResult {
+                tool_use_id: Some("call".into()),
+                output_preview: Some("bounded preview only".repeat(2000)),
+                is_error: false,
+                agent_stats: None,
+                images: vec![],
+                exit_code: None,
+            },
+        ];
+        let before = serde_json::to_value(&turns).unwrap();
+        defer_heavy_tool_outputs(&mut turns, 26, HistoryReadMetrics::default());
+        assert_eq!(serde_json::to_value(&turns).unwrap(), before);
     }
 
     #[test]

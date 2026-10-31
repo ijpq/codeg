@@ -282,10 +282,14 @@ pub struct ConversationHistoryPage {
     pub next_cursor: Option<String>,
     pub has_more: bool,
     pub loaded_turns: u32,
-    /// False only when the bounded scanner could not recover the requested
-    /// rounds. Index progress is independent of page completeness.
+    /// True when all records in this selected byte window are accounted for.
+    /// A complete byte-limited page may contain fewer requested user rounds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub page_complete: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_issue: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

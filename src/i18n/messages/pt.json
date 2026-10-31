@@ -3902,7 +3902,12 @@
         },
         "worked": "Trabalho concluído",
         "workedFor": "Trabalhou por {duration}",
-        "working": "Trabalhando..."
+        "working": "Trabalhando...",
+        "partialHistoryBuilding": "History indexing has not reached a safe record boundary. Wait for indexing to complete, then retry.",
+        "partialHistoryRebuilding": "The history index is being rebuilt. Original history is preserved; retry after rebuilding.",
+        "partialHistoryIndexLimited": "The history index reached its capacity. Original history is preserved; check diagnostics before retrying.",
+        "partialHistoryParseFailed": "A native history record could not be parsed. Check the reported byte range; no incomplete handoff was activated.",
+        "partialHistoryBudget": "This page reached its safe read budget without a complete boundary. Original history is preserved; retry when the index is ready or report diagnostics."
       },
       "liveTurnStats": {
         "elapsedHours": "{value} h",

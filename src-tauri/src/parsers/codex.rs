@@ -1089,6 +1089,8 @@ pub(crate) struct CodexConversationPage {
     pub end_offset: u64,
     pub has_more: bool,
     pub page_complete: bool,
+    pub read_mode: &'static str,
+    pub read_issue: Option<String>,
     /// Bytes inspected while locating the page boundary. Zero means the
     /// persistent offset index answered the lookup without scanning JSONL.
     pub scan_bytes: u64,
@@ -1135,7 +1137,7 @@ const CODEX_HISTORY_SCAN_CHUNK_BYTES: usize = 1024 * 1024;
 pub(crate) const CODEX_HISTORY_FIRST_PAGE_INITIAL_BYTES: u64 = 16 * 1024 * 1024;
 pub(crate) const CODEX_HISTORY_FIRST_PAGE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 // v2 could persist a partial scan's offset as a complete page boundary.
-const CODEX_HISTORY_INDEX_VERSION: u8 = 3;
+const CODEX_HISTORY_INDEX_VERSION: u8 = 4;
 #[cfg(not(test))]
 const CODEX_HISTORY_INDEX_SLICE_BYTES: u64 = CODEX_HISTORY_FIRST_PAGE_INITIAL_BYTES;
 #[cfg(not(test))]
@@ -1153,6 +1155,8 @@ const INDEX_MARK_MESSAGE: u16 = 1 << 1;
 const INDEX_MARK_TURN: u16 = 1 << 2;
 const INDEX_MARK_TOOL: u16 = 1 << 3;
 const INDEX_MARK_COMPACTION: u16 = 1 << 4;
+const INDEX_MARK_TASK_START: u16 = 1 << 5;
+const INDEX_MARK_TASK_END: u16 = 1 << 6;
 const INDEX_MARKER_TAIL_BYTES: usize = 96;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1163,6 +1167,9 @@ enum CodexHistoryEntryKind {
     Turn = 3,
     Tool = 4,
     Compaction = 5,
+    Other = 6,
+    TaskStart = 7,
+    TaskEnd = 8,
 }
 
 impl CodexHistoryEntryKind {
@@ -1173,6 +1180,9 @@ impl CodexHistoryEntryKind {
             3 => Some(Self::Turn),
             4 => Some(Self::Tool),
             5 => Some(Self::Compaction),
+            6 => Some(Self::Other),
+            7 => Some(Self::TaskStart),
+            8 => Some(Self::TaskEnd),
             _ => None,
         }
     }
@@ -1480,7 +1490,7 @@ fn decode_history_entries(
         let start_offset = u64::from_le_bytes(record[..8].try_into().ok()?);
         let end_offset = u64::from_le_bytes(record[8..16].try_into().ok()?);
         let kind = CodexHistoryEntryKind::from_byte(record[16])?;
-        if end_offset <= start_offset || start_offset < previous_end {
+        if end_offset <= start_offset || start_offset != previous_end {
             return None;
         }
         previous_end = end_offset;
@@ -1595,7 +1605,7 @@ fn indexed_page_start(
     modified_ns: u128,
     end_offset: u64,
     user_turn_limit: usize,
-) -> Option<u64> {
+) -> Option<(u64, &'static str)> {
     let metadata = fs::metadata(rollout_path).ok()?;
     let mut indexes = HISTORY_INDEX_CACHE
         .lock()
@@ -1603,8 +1613,6 @@ fn indexed_page_start(
     let index = indexes
         .entry(rollout_path.to_path_buf())
         .or_insert_with(|| load_history_index(rollout_path, &metadata));
-    // Rollouts are append-only. Preserve offsets across growth; a shrink or a
-    // same-length rewrite invalidates them and is safely rebuilt on demand.
     if !validate_history_index_source(rollout_path, &metadata, index) {
         *index = empty_history_index(rollout_path, &metadata);
         index.load_status = "stale";
@@ -1618,47 +1626,160 @@ fn indexed_page_start(
         .get(&history_page_index_key(end_offset, user_turn_limit))
         .copied()
         .filter(|start| {
-            *start <= end_offset
-                && end_offset.saturating_sub(*start) <= CODEX_HISTORY_FIRST_PAGE_MAX_BYTES
+            *start < end_offset && end_offset - *start <= CODEX_HISTORY_FIRST_PAGE_MAX_BYTES
         })
     {
-        return Some(start);
+        return Some((start, "indexed_page"));
     }
     if index.meta.indexed_through_offset < end_offset {
         return None;
     }
-    if index.meta.entries_saturated
-        && index
-            .entries
-            .last()
-            .is_none_or(|entry| entry.end_offset < end_offset)
-    {
+    let count = index
+        .entries
+        .partition_point(|e| e.end_offset <= end_offset);
+    let entries = &index.entries[..count];
+    if end_offset != 0 && entries.last().is_none_or(|e| e.end_offset != end_offset) {
+        // Indexed-through includes partially scanned records. It is not proof
+        // that a cursor is a committed JSONL boundary (nor is saturation).
         return None;
     }
-    let mut users = index
-        .entries
+    let round_start = |user: usize| {
+        let prefix = &entries[..user];
+        let context = prefix.iter().rposition(|e| {
+            matches!(
+                e.kind,
+                CodexHistoryEntryKind::Turn
+                    | CodexHistoryEntryKind::TaskStart
+                    | CodexHistoryEntryKind::TaskEnd
+            )
+        });
+        match context {
+            Some(i) if entries[i].kind != CodexHistoryEntryKind::TaskEnd => {
+                let i = if i > 0 && entries[i - 1].kind == CodexHistoryEntryKind::TaskStart {
+                    i - 1
+                } else {
+                    i
+                };
+                entries[i].start_offset
+            }
+            _ => entries[user].start_offset,
+        }
+    };
+    let user = entries
         .iter()
-        .filter(|entry| entry.kind == CodexHistoryEntryKind::User && entry.end_offset <= end_offset)
-        .rev();
-    let user = users.nth(user_turn_limit.saturating_sub(1));
-    match user {
-        Some(user) => {
-            let preceding_turn = index.entries.iter().rev().find(|entry| {
-                entry.end_offset <= user.start_offset && entry.kind == CodexHistoryEntryKind::Turn
-            });
-            let start = preceding_turn
-                .map(|entry| entry.start_offset)
-                .unwrap_or(user.start_offset);
-            (end_offset.saturating_sub(start) <= CODEX_HISTORY_FIRST_PAGE_MAX_BYTES)
-                .then_some(start)
-        }
-        None if index.meta.indexed_through_offset >= end_offset
-            && end_offset <= CODEX_HISTORY_FIRST_PAGE_MAX_BYTES =>
-        {
-            Some(0)
-        }
-        None => None,
+        .enumerate()
+        .rev()
+        .filter(|(_, e)| e.kind == CodexHistoryEntryKind::User)
+        .nth(user_turn_limit.saturating_sub(1))
+        .map(|(i, _)| i);
+    let requested = user.map(round_start).unwrap_or(0);
+    if end_offset - requested <= CODEX_HISTORY_FIRST_PAGE_MAX_BYTES {
+        return Some((requested, "user_turns"));
     }
+    let floor = end_offset - CODEX_HISTORY_FIRST_PAGE_MAX_BYTES;
+    let first = entries.partition_point(|e| e.start_offset < floor);
+    // Prefer intact user rounds. The requested count is an upper target; byte
+    // pressure reduces it rather than turning a ready index into a failure.
+    for (i, entry) in entries.iter().enumerate().skip(first) {
+        if entry.kind == CodexHistoryEntryKind::User {
+            let start = round_start(i);
+            if start >= floor {
+                return Some((start, "byte_budget"));
+            }
+        }
+    }
+    if let Some(entry) = entries.get(first) {
+        return Some((entry.start_offset, "byte_budget"));
+    }
+    // The sole remaining record is larger than a page. Only its exact indexed
+    // boundary permits bounded streaming, never a guessed byte position.
+    entries
+        .last()
+        .map(|entry| (entry.start_offset, "streamed_record"))
+}
+
+/// A byte page can start halfway through a native task. Seed only verified
+/// task/config metadata (at most two small records), never prior messages or
+/// tools. This retains task identity and native duration without overlap in
+/// the page's owned byte range or replaying earlier user/canonical messages.
+fn history_task_prefix(path: &Path, start: u64) -> Result<Vec<u8>, ParseError> {
+    const CONTEXT_RECORD_BYTES: u64 = 64 * 1024;
+    let ranges = {
+        let indexes = HISTORY_INDEX_CACHE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // The incremental builder temporarily owns/removes the cache entry.
+        // Restore its last durable snapshot instead of losing task identity
+        // merely because that unrelated background I/O is in progress.
+        let metadata = fs::metadata(path)?;
+        let restored = (!indexes.contains_key(path)).then(|| load_history_index(path, &metadata));
+        let index = indexes
+            .get(path)
+            .or(restored.as_ref())
+            .expect("cached or restored index");
+        if !validate_history_index_source(path, &metadata, index)
+            || matches!(index.load_status, "corrupt" | "stale")
+            || index.meta.indexed_through_offset < start
+        {
+            return Err(ParseError::InvalidData("HISTORY_INDEX_REBUILDING: task context index changed; retry without changing the original session".into()));
+        }
+        let end = index.entries.partition_point(|e| e.end_offset <= start);
+        index.entries[..end]
+            .iter()
+            .rev()
+            .filter(|e| {
+                matches!(
+                    e.kind,
+                    CodexHistoryEntryKind::Turn
+                        | CodexHistoryEntryKind::TaskStart
+                        | CodexHistoryEntryKind::TaskEnd
+                )
+            })
+            .take(2)
+            .copied()
+            .collect::<Vec<_>>()
+    };
+    let mut prefix = Vec::new();
+    // Consider the newest boundary first. A terminal boundary closes the
+    // scope; two contexts from different tasks must never inherit one start.
+    let mut newest_id: Option<String> = None;
+    for entry in ranges {
+        if entry.kind == CodexHistoryEntryKind::TaskEnd {
+            break;
+        }
+        if entry.end_offset - entry.start_offset > CONTEXT_RECORD_BYTES {
+            continue;
+        }
+        let mut file = fs::File::open(path)?;
+        file.seek(SeekFrom::Start(entry.start_offset))?;
+        let mut record = vec![0; (entry.end_offset - entry.start_offset) as usize];
+        file.read_exact(&mut record)?;
+        let value: serde_json::Value = serde_json::from_slice(&record).map_err(|e| {
+            ParseError::InvalidData(format!(
+                "HISTORY_PARSE_FAILED: task context at bytes {}..{}: {e}",
+                entry.start_offset, entry.end_offset
+            ))
+        })?;
+        if value["type"] == "turn_context"
+            || (value["type"] == "event_msg" && value["payload"]["type"] == "task_started")
+        {
+            let id = value["payload"]["turn_id"].as_str();
+            if !prefix.is_empty()
+                && (entry.kind != CodexHistoryEntryKind::TaskStart
+                    || id.is_none()
+                    || id != newest_id.as_deref())
+            {
+                break;
+            }
+            newest_id = id.map(str::to_owned);
+            record.extend_from_slice(&prefix);
+            prefix = record;
+            if entry.kind == CodexHistoryEntryKind::TaskStart {
+                break;
+            }
+        }
+    }
+    Ok(prefix)
 }
 
 fn remember_page_start(
@@ -1769,6 +1890,23 @@ fn update_index_record_markers(markers: &mut u16, tail: &mut Vec<u8>, bytes: &[u
     ) {
         *markers |= INDEX_MARK_COMPACTION;
     }
+    if contains_any(
+        &searchable,
+        &[br#""type":"task_started""#, br#""type": "task_started""#],
+    ) {
+        *markers |= INDEX_MARK_TASK_START;
+    }
+    if contains_any(
+        &searchable,
+        &[
+            br#""type":"task_complete""#,
+            br#""type": "task_complete""#,
+            br#""type":"turn_aborted""#,
+            br#""type": "turn_aborted""#,
+        ],
+    ) {
+        *markers |= INDEX_MARK_TASK_END;
+    }
     let keep = searchable.len().min(INDEX_MARKER_TAIL_BYTES);
     tail.clear();
     tail.extend_from_slice(&searchable[searchable.len().saturating_sub(keep)..]);
@@ -1783,6 +1921,10 @@ fn index_entry_kind(markers: u16) -> Option<CodexHistoryEntryKind> {
         Some(CodexHistoryEntryKind::Tool)
     } else if markers & INDEX_MARK_MESSAGE != 0 {
         Some(CodexHistoryEntryKind::Message)
+    } else if markers & INDEX_MARK_TASK_START != 0 {
+        Some(CodexHistoryEntryKind::TaskStart)
+    } else if markers & INDEX_MARK_TASK_END != 0 {
+        Some(CodexHistoryEntryKind::TaskEnd)
     } else if markers & INDEX_MARK_TURN != 0 {
         Some(CodexHistoryEntryKind::Turn)
     } else {
@@ -1899,7 +2041,8 @@ fn build_history_index_slice(
                 &chunk[segment_start..=position],
             );
             let record_end = absolute + position as u64 + 1;
-            if let Some(kind) = index_entry_kind(markers) {
+            {
+                let kind = index_entry_kind(markers).unwrap_or(CodexHistoryEntryKind::Other);
                 if index.entries.len() + appended.len() < CODEX_HISTORY_INDEX_MAX_ENTRIES {
                     appended.push(CodexHistoryIndexEntry {
                         start_offset: record_start,
@@ -2076,10 +2219,7 @@ fn is_codex_user_boundary(line: &[u8]) -> bool {
 }
 
 fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
-    !needle.is_empty()
-        && haystack
-            .windows(needle.len())
-            .any(|window| window == needle)
+    !needle.is_empty() && memchr::memmem::find(haystack, needle).is_some()
 }
 
 /// Read an unescaped top-level string field without deserializing the complete
@@ -4871,45 +5011,61 @@ impl CodexParser {
         }
 
         let mut file = fs::File::open(&path)?;
-        let (start_offset, scan_bytes, index_hit, selection_complete) = if max_bytes.is_none() {
-            if let Some(start) =
-                indexed_page_start(&path, file_len, modified_ns, end_offset, user_turn_limit)
-            {
-                (start, 0, true, true)
+        let (start_offset, scan_bytes, index_hit, selection_complete, read_mode) =
+            if max_bytes.is_none() {
+                if let Some((start, mode)) =
+                    indexed_page_start(&path, file_len, modified_ns, end_offset, user_turn_limit)
+                {
+                    (start, 0, true, true, mode)
+                } else {
+                    // The scanner already walks backwards in bounded chunks. Keep
+                    // its state across the 16 MiB boundary rather than rescanning
+                    // those bytes, so boundary scanning obeys the 64 MiB ceiling.
+                    // Parsing reads the selected page once (also at most 64 MiB).
+                    let (start, scanned, complete) = find_codex_page_start(
+                        &mut file,
+                        end_offset,
+                        user_turn_limit,
+                        Some(CODEX_HISTORY_FIRST_PAGE_MAX_BYTES),
+                        cancelled.as_deref(),
+                    )?;
+                    if complete {
+                        remember_page_start(
+                            &path,
+                            file_len,
+                            modified_ns,
+                            end_offset,
+                            user_turn_limit,
+                            start,
+                        );
+                    }
+                    (start, scanned, false, complete, "bounded_scan")
+                }
             } else {
-                // The scanner already walks backwards in bounded chunks. Keep
-                // its state across the 16 MiB boundary rather than rescanning
-                // those bytes, so boundary scanning obeys the 64 MiB ceiling.
-                // Parsing reads the selected page once (also at most 64 MiB).
                 let (start, scanned, complete) = find_codex_page_start(
                     &mut file,
                     end_offset,
                     user_turn_limit,
-                    Some(CODEX_HISTORY_FIRST_PAGE_MAX_BYTES),
+                    max_bytes,
                     cancelled.as_deref(),
                 )?;
-                if complete {
-                    remember_page_start(
-                        &path,
-                        file_len,
-                        modified_ns,
-                        end_offset,
-                        user_turn_limit,
-                        start,
-                    );
-                }
-                (start, scanned, false, complete)
-            }
+                (start, scanned, false, complete, "bounded_merge")
+            };
+        let end_committed = if end_offset == 0 {
+            true
         } else {
-            let (start, scanned, complete) = find_codex_page_start(
-                &mut file,
-                end_offset,
-                user_turn_limit,
-                max_bytes,
-                cancelled.as_deref(),
-            )?;
-            (start, scanned, false, complete)
+            file.seek(SeekFrom::Start(end_offset - 1))?;
+            let mut ending = [0];
+            file.read_exact(&mut ending)?;
+            ending[0] == b'\n'
         };
+        if before_offset.is_some() && !end_committed {
+            return Err(ParseError::InvalidData("HISTORY_CURSOR_INVALID: cursor is not a complete JSONL boundary; reload history and retry".into()));
+        }
+        if !end_committed {
+            return Err(ParseError::InvalidData("HISTORY_RECORD_INCOMPLETE: the last native record has not been committed with a newline. Wait for its writer to finish, then reload and retry; no handoff was activated".into()));
+        }
+        let selection_complete = selection_complete && end_committed;
         let page_bytes = end_offset.saturating_sub(start_offset);
         if max_bytes.is_some_and(|limit| page_bytes > limit) {
             return Err(ParseError::InvalidData(format!(
@@ -4925,23 +5081,107 @@ impl CodexParser {
                 "Codex history page read was cancelled".into(),
             ));
         }
-        let reader = BufReader::new(file.take(end_offset.saturating_sub(start_offset)));
-        let detail = self.parse_conversation_detail_reader(
-            &path,
-            conversation_id,
-            reader,
-            cwd_hint,
-            Some(start_offset),
-        )?;
+        let large_record = if read_mode == "streamed_record" {
+            Some(super::codex_large_record::read(
+                &path,
+                start_offset,
+                end_offset,
+                cancelled.as_deref(),
+            )?)
+        } else {
+            None
+        };
+        let prefix = if matches!(read_mode, "byte_budget" | "streamed_record") {
+            history_task_prefix(&path, start_offset)?
+        } else {
+            vec![]
+        };
+        let mut detail = if let Some(record) = large_record.as_ref() {
+            self.parse_conversation_detail_reader(
+                &path,
+                conversation_id,
+                std::io::Cursor::new(prefix.clone()).chain(std::io::Cursor::new(
+                    record.preview.as_deref().unwrap_or_default(),
+                )),
+                cwd_hint,
+                Some(start_offset),
+            )?
+        } else {
+            let reader = BufReader::new(super::codex_large_record::page_reader(
+                &path,
+                start_offset,
+                end_offset,
+                cancelled.as_deref(),
+            )?);
+            self.parse_conversation_detail_reader(
+                &path,
+                conversation_id,
+                std::io::Cursor::new(prefix).chain(reader),
+                cwd_hint,
+                Some(start_offset),
+            )?
+        };
+        if let Some(record) = large_record.as_ref() {
+            let reference = serde_json::json!({
+                "sourceSession": conversation_id, "startOffset": start_offset,
+                "endOffset": end_offset, "sha256": record.sha256,
+                "sourcePath": path, "byteCount": record.bytes,
+                "maxReadBytes": record.max_read_bytes, "previewOnly": true,
+            });
+            let id = format!("codex-native-record-{start_offset}");
+            let blocks = vec![
+                ContentBlock::ToolUse { tool_use_id: Some(id.clone()), tool_name: "native_history_record".into(), input_preview: Some(reference.to_string()), status: Some("completed".into()), meta: Some(serde_json::json!({"codeg.nativeRecord":reference})) },
+                ContentBlock::ToolResult { tool_use_id: Some(id.clone()), output_preview: Some("This record exceeds the normal history-page budget. Only a bounded preview is displayed. The complete original record is retained at sourcePath and the exact byte range; use native file tools for bounded reads if needed. This is not acknowledgement that the full record was delivered to the target Agent.".into()), is_error: false, agent_stats: None, images: vec![], exit_code: None },
+            ];
+            if let Some(turn) = detail.turns.last_mut() {
+                turn.blocks.extend(blocks);
+            } else {
+                detail.turns.push(MessageTurn {
+                    id,
+                    role: TurnRole::System,
+                    blocks,
+                    timestamp: detail.summary.started_at,
+                    usage: None,
+                    duration_ms: None,
+                    model: None,
+                    completed_at: None,
+                    agent_message_id: None,
+                    native_task_id: None,
+                });
+            }
+        }
+        let after = fs::metadata(&path)?;
+        if after.len() < file_len
+            || (after.len() == file_len
+                && after.modified().map(system_time_ns).unwrap_or_default() != modified_ns)
+        {
+            return Err(ParseError::InvalidData("HISTORY_SOURCE_CHANGED: source changed while reading; original history and Agent were preserved; retry the read".into()));
+        }
         #[cfg(not(test))]
         schedule_history_index_build(path.clone());
         let (index_status, indexed_through_offset) = current_history_index_status(&path, &metadata);
+        let read_issue = (!selection_complete).then(|| {
+            if !end_committed {
+                "record_incomplete"
+            } else if index_status == "ready" {
+                "record_boundary_unavailable"
+            } else if index_status == "limited" {
+                "index_capacity_limited"
+            } else if index_status == "stale" || index_status == "corrupt" {
+                "index_rebuilding"
+            } else {
+                "index_building"
+            }
+            .to_string()
+        });
         let page = CodexConversationPage {
             detail,
             start_offset,
             end_offset,
             has_more: start_offset > 0,
-            page_complete: selection_complete,
+            page_complete: selection_complete && read_issue.is_none(),
+            read_mode,
+            read_issue,
             scan_bytes,
             cache_hit: false,
             index_hit,
@@ -4949,7 +5189,7 @@ impl CodexParser {
             indexed_through_offset,
             source_version: format!("{file_len}:{modified_ns}"),
         };
-        if selection_complete
+        if page.page_complete
             && max_bytes.is_none()
             && page_bytes <= CODEX_HISTORY_PAGE_CACHE_MAX_ENTRY_BYTES
         {
@@ -5296,9 +5536,16 @@ impl CodexParser {
         // `item_completed.ContextCompaction` names (see the `compacted` arm).
         let mut unnamed_compaction_divider: Option<usize> = None;
 
-        for line in reader.lines() {
+        for (record_number, line) in reader.lines().enumerate() {
             let line = match line {
                 Ok(line) => line,
+                Err(e) if page_start_offset.is_some() => {
+                    return Err(ParseError::InvalidData(format!(
+                        "HISTORY_READ_FAILED: page starting at {:?}, record {}: {e}",
+                        page_start_offset,
+                        record_number + 1
+                    )))
+                }
                 Err(_) => continue,
             };
             if line.trim().is_empty() {
@@ -5316,6 +5563,15 @@ impl CodexParser {
                         record_type,
                         "session_meta" | "turn_context" | "event_msg" | "response_item"
                     ) {
+                        if page_start_offset.is_some() {
+                            serde_json::from_str::<serde::de::IgnoredAny>(&line).map_err(|e| {
+                                ParseError::InvalidData(format!(
+                                    "HISTORY_PARSE_FAILED: page starting at {:?}, record {}: {e}",
+                                    page_start_offset,
+                                    record_number + 1
+                                ))
+                            })?;
+                        }
                         promotion.note_record(record_type, "");
                         if let Some(ts_str) =
                             json_object_string_field(line.as_bytes(), b"timestamp")
@@ -5334,6 +5590,13 @@ impl CodexParser {
 
             let value: serde_json::Value = match serde_json::from_str(&line) {
                 Ok(v) => v,
+                Err(e) if page_start_offset.is_some() => {
+                    return Err(ParseError::InvalidData(format!(
+                        "HISTORY_PARSE_FAILED: page starting at {:?}, record {}: {e}",
+                        page_start_offset,
+                        record_number + 1
+                    )))
+                }
                 Err(_) => continue,
             };
 
@@ -10154,7 +10417,7 @@ mod tests {
             .remove(path);
     }
 
-    fn remove_history_index_fixture(path: &std::path::Path) {
+    pub(super) fn remove_history_index_fixture(path: &std::path::Path) {
         evict_history_fixture_caches(path);
         if let Some(index_path) = history_index_path(path) {
             let _ = fs::remove_file(index_path);
@@ -20838,3 +21101,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "codex_paging_tests.rs"]
+mod paging_tests;
