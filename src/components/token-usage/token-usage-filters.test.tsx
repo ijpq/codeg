@@ -111,12 +111,33 @@ describe("CustomRangeFields", () => {
     expect(onChange.mock.calls[0][0].from).toBe(toLocalDayValue(first))
   })
 
-  it("disables days after today — there are no future statistics", async () => {
-    renderFields()
-    const tomorrow = new Date()
-    tomorrow.setDate(tomorrow.getDate() + 1)
-    expect(await findDay(tomorrow)).toBeDisabled()
-  })
+  it.each([
+    "2026-10-15T12:00:00",
+    "2026-10-31T12:00:00",
+    "2026-12-31T12:00:00",
+  ])(
+    "disables days after today (%s) — there are no future statistics",
+    async (today) => {
+      vi.useFakeTimers({ toFake: ["Date"] })
+      vi.setSystemTime(new Date(today))
+      try {
+        renderFields()
+        const tomorrow = new Date()
+        tomorrow.setDate(tomorrow.getDate() + 1)
+        // The default panes are [last month, this month]. At a month boundary
+        // tomorrow may be in an unrendered row (e.g. Sunday 2026-11-01), so
+        // navigate to it before checking the actual disabled constraint.
+        if (tomorrow.getMonth() !== new Date().getMonth()) {
+          await userEvent.click(
+            screen.getByRole("button", { name: "Go to the Next Month" })
+          )
+        }
+        expect(await findDay(tomorrow)).toBeDisabled()
+      } finally {
+        vi.useRealTimers()
+      }
+    }
+  )
 
   it("opens on last month too, so a cross-month span needs no paging", async () => {
     // Defaulting to today would show [this month, next month] — and next month
