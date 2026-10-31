@@ -7,6 +7,56 @@ import { randomUUID } from "node:crypto"
 import { openBusiness } from "./business-agent-page.mjs"
 import { businessComposer, reloadBusiness } from "./business-composer-page.mjs"
 const pause = (ms) => new Promise((done) => setTimeout(done, ms))
+// Observe complete DOM commits, including short live/history overlap. Keep the
+// verifier separate from the packaged application and retain only card labels
+// and row identities, never unrelated transcript content.
+async function startCompactionProbe(page) {
+  await page.evaluate(() => {
+    const samples = []
+    let previous = null
+    const sample = () => {
+      const cards = [
+        ...document.querySelectorAll('[data-testid="context-compaction"]'),
+      ].map((node) => {
+        const row = node.closest("[data-index], [data-item-key]")
+        return {
+          status: node.getAttribute("data-compaction-status"),
+          text: node.textContent,
+          visible: node.getClientRects().length > 0,
+          row: row
+            ? Object.fromEntries(
+                [...row.attributes]
+                  .filter((a) => a.name.startsWith("data-"))
+                  .map((a) => [a.name, a.value])
+              )
+            : null,
+        }
+      })
+      const signature = JSON.stringify(cards)
+      if (signature === previous) return
+      previous = signature
+      samples.push({ at: Date.now(), cards })
+      if (samples.length > 256) samples.shift()
+    }
+    const observer = new MutationObserver(sample)
+    observer.observe(document.body, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      characterData: true,
+    })
+    window.__codegCompactionProbe = {
+      samples,
+      stop: () => observer.disconnect(),
+    }
+    sample()
+  })
+}
+async function compactionProbe(page) {
+  return page
+    .evaluate(() => window.__codegCompactionProbe?.samples ?? [])
+    .catch(() => [])
+}
 export async function submitCompactionComposer(page, editor, text) {
   await editor.fill(text)
   if (text.startsWith("/")) {
@@ -341,6 +391,7 @@ export async function piCompactionPage({
         (v) => v > 31000,
         "Native compaction exceeds the old 30-second deadline"
       )
+      await startCompactionProbe(page)
       const during = await snapshot()
       assert.ok(
         during.turn_in_flight || during.status === "prompting",
@@ -367,7 +418,30 @@ export async function piCompactionPage({
         (n) => n === 1,
         "Live/native history converge to one completed record"
       )
-      assert.equal(await cards("in_progress").count(), 0)
+      const completionRead = await page
+        .locator('[data-testid="context-compaction"]')
+        .evaluateAll((nodes) => ({
+          at: Date.now(),
+          cards: nodes.map((node) => ({
+            status: node.getAttribute("data-compaction-status"),
+            text: node.textContent,
+            visible: node.getClientRects().length > 0,
+          })),
+        }))
+      await writeFile(
+        join(output, `${name}-compaction-transition.json`),
+        JSON.stringify(
+          { completionRead, samples: await compactionProbe(page) },
+          null,
+          2
+        )
+      )
+      assert.equal(
+        completionRead.cards.filter(
+          (card) => card.visible && card.status === "in_progress"
+        ).length,
+        0
+      )
       await latestCompletionSummary()
       checks.push(
         "long-native-preflight-over-30s-reply-once",
@@ -532,6 +606,7 @@ export async function piCompactionPage({
       JSON.stringify(
         {
           message: String(error),
+          transitionSamples: await compactionProbe(page),
           cards: await page
             .locator('[data-testid="context-compaction"]')
             .evaluateAll((nodes) =>
@@ -558,6 +633,9 @@ export async function piCompactionPage({
     )
     throw error
   } finally {
+    await page
+      .evaluate(() => window.__codegCompactionProbe?.stop())
+      .catch(() => {})
     piModel.historyReply(false)
     piModel.tokens(42)
     piModel.compaction(50)
