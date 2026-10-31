@@ -1637,6 +1637,7 @@ fn tag_mcp_suspect(
 ///   and remove the entry asynchronously. The guard must hold owned
 ///   `Arc<Mutex<_>>` and `String` so the spawned task has `'static`
 ///   captures.
+///
 /// The driver drops this guard after `block_on`, so deferred cleanup must use
 /// its captured runtime rather than require an ambient runtime on that thread.
 struct ConnectionCleanupGuard {
