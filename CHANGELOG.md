@@ -1,6 +1,17 @@
 # Changelog
 
-## 0.41.3-fix6 — 2026-10-31
+## 0.41.3-fix7 — 2026-10-31
+
+- Complete connection cleanup through the captured Tokio runtime when the driver thread exits `block_on`. If the manager map was contended, the old ambient `tokio::spawn` panicked outside a runtime, leaving an already-exited connection registered and native Pi fork waiting until snapshot fallback. Setup and Server share the fix; the real writer-exit check remains mandatory.
+- Add deterministic cleanup regressions for contention after the driver's runtime scope, independent Pi/Codex connection identity and the synchronous uncontended path. Retain the exact-source before/after reproducer; the downloaded fix6 package supplied the original panic evidence.
+- Keep the bounded long-history handoff changes and add ten-second settled-page sampling to the final-package acceptance itself: no duplicate message/reply or missing duration may persist in its final observation window. Include native fork fallback reasons in verification failures without accepting a snapshot as native.
+- Quarantine fix6 after its postpublication native-fork failure; retain its tag, packages and diagnostics. Rebuild and verify new Windows Server and Setup packages with matching MCP and the unchanged Pi ACP 0.0.34-codeg.5 / Pi 1.4.0 / Node 24.16.0 group. Preserve all existing recovery, compaction, execution-mode, business-context, provider, external-delivery, duration, artifact/Office and virtualized-scroll fixes.
+
+See [release notes](docs/releases/v0.41.3-fix7.md).
+
+## 0.41.3-fix6 — 2026-10-31 (quarantined; postpublication verification failed)
+
+- Postpublication retesting caught a contended connection cleanup panic after native Pi fork, which led to snapshot fallback. The original tag/assets remain quarantined; prepublication and independent diagnostic passes do not qualify this candidate as an accepted delivery.
 
 - Page indexed Codex history by both the requested user-turn count and the 64 MiB byte budget. Prefer complete rounds, then complete record boundaries; cursors advance through oversized rounds without loading the full conversation or dropping history. Retain native task identity and whole-task duration across byte pages.
 - Stream-validate individual records larger than a page using bounded read chunks and a bounded preview, including UTF-8 beyond the preview and codepoints split across chunks. Retain the original session/path, exact byte range and SHA256; mark partial text and omit incomplete data URIs. Original native files remain untouched, and a source reference never claims the entire record was sent to the next Agent.

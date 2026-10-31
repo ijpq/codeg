@@ -1637,9 +1637,12 @@ fn tag_mcp_suspect(
 ///   and remove the entry asynchronously. The guard must hold owned
 ///   `Arc<Mutex<_>>` and `String` so the spawned task has `'static`
 ///   captures.
+/// The driver drops this guard after `block_on`, so deferred cleanup must use
+/// its captured runtime rather than require an ambient runtime on that thread.
 struct ConnectionCleanupGuard {
     connections: Arc<tokio::sync::Mutex<HashMap<String, AgentConnection>>>,
     connection_id: String,
+    cleanup_runtime: tokio::runtime::Handle,
 }
 
 impl Drop for ConnectionCleanupGuard {
@@ -1650,9 +1653,68 @@ impl Drop for ConnectionCleanupGuard {
         }
         let connections = self.connections.clone();
         let connection_id = std::mem::take(&mut self.connection_id);
-        tokio::spawn(async move {
+        self.cleanup_runtime.spawn(async move {
             connections.lock().await.remove(&connection_id);
         });
+    }
+}
+
+#[cfg(test)]
+mod connection_cleanup_tests {
+    use super::*;
+    use crate::acp::manager::ConnectionManager;
+
+    #[tokio::test]
+    async fn contended_cleanup_after_driver_block_on_removes_only_its_connection() {
+        for agent_type in [AgentType::Pi, AgentType::Codex] {
+            let manager = ConnectionManager::new();
+            manager
+                .insert_test_connection("source", agent_type, None, EventEmitter::Noop)
+                .await;
+            manager
+                .insert_test_connection("other", agent_type, None, EventEmitter::Noop)
+                .await;
+            let owner = tokio::runtime::Handle::current();
+            let cleanup = ConnectionCleanupGuard {
+                connections: manager.connections.clone(),
+                connection_id: "source".into(),
+                cleanup_runtime: owner.clone(),
+            };
+            let lock = manager.connections.lock().await;
+            let result = std::thread::spawn(move || {
+                owner.block_on(async {});
+                assert!(tokio::runtime::Handle::try_current().is_err());
+                drop(cleanup);
+            })
+            .join();
+            drop(lock);
+            assert!(result.is_ok(), "cleanup panicked outside the runtime");
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while manager.get_state("source").await.is_some() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("stale source connection was not removed");
+            assert!(manager.get_state("other").await.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn uncontended_cleanup_outside_runtime_is_synchronous() {
+        let manager = ConnectionManager::new();
+        manager
+            .insert_test_connection("source", AgentType::Pi, None, EventEmitter::Noop)
+            .await;
+        let cleanup = ConnectionCleanupGuard {
+            connections: manager.connections.clone(),
+            connection_id: "source".into(),
+            cleanup_runtime: tokio::runtime::Handle::current(),
+        };
+        std::thread::spawn(move || drop(cleanup))
+            .join()
+            .expect("cleanup panicked outside the runtime");
+        assert!(manager.get_state("source").await.is_none());
     }
 }
 
@@ -3007,6 +3069,7 @@ pub async fn spawn_agent_connection(
     let cleanup_guard = ConnectionCleanupGuard {
         connections: cleanup_connections,
         connection_id: cleanup_connection_id,
+        cleanup_runtime: connection_rt.clone(),
     };
     let connection_thread = std::thread::Builder::new()
         .name(format!("acp-conn-{conn_id}"))

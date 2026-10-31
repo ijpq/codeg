@@ -369,7 +369,11 @@ export async function piCapabilityChecks({
     )
     assert.equal(branchTask.status, "succeeded", branchTask.error)
     const branch = branchTask.result
-    assert.equal(branch.forkMode, "native")
+    assert.equal(
+      branch.forkMode,
+      "native",
+      `Pi native fork fell back: ${branch.fallbackReason ?? "no reason reported"}`
+    )
     assert.notEqual(branch.branchSessionId, original)
     assert.equal(
       (await api("list_all_conversations")).find((c) => c.id === cid)
