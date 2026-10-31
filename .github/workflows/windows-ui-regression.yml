@@ -335,6 +335,7 @@ jobs:
             ${{ runner.temp }}/package-verifier-diagnosis/**/*-failure.json
             ${{ runner.temp }}/package-verifier-diagnosis/**/*-compaction-transition.json
             ${{ runner.temp }}/package-verifier-diagnosis/**/*-pi-multi-provider.json
+            ${{ runner.temp }}/package-verifier-diagnosis/**/*-handoff.json
             ${{ runner.temp }}/package-verifier-diagnosis/**/resources-and-migrations.json
             ${{ runner.temp }}/package-verifier-diagnosis/**/*dependencies.json
           retention-days: 14

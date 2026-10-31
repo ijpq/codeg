@@ -275,6 +275,7 @@ export async function longHistoryHandoffPage({
         "Frontend observes successful switch"
       )
       const sent = []
+      evidence.settlement = []
       for (let round = 0; round < 2; round++) {
         const input =
           round === 0
@@ -319,6 +320,43 @@ export async function longHistoryHandoffPage({
           .getByText(text.replace("_SEND_", "_REPLY_"), { exact: false })
           .last()
           .waitFor({ timeout: 90_000 })
+        // Observe the actual packaged UI after the first reply appears. A
+        // successful provider call alone cannot rule out duplicate live and
+        // persisted rows, or a completed row that never receives its timing.
+        const samples = [],
+          started = Date.now()
+        do {
+          const viewport = page.locator(".chat-scroll-port:visible").last()
+          const answers = viewport.getByText(
+            text.replace("_SEND_", "_REPLY_"),
+            { exact: false }
+          )
+          const answerCount = await answers.count()
+          const timed = answerCount
+            ? await answers
+                .last()
+                .locator("xpath=ancestor::*[@data-message-thread-row]")
+                .locator("[data-completed-turn-duration-ms]")
+                .count()
+            : 0
+          samples.push({
+            elapsedMs: Date.now() - started,
+            users: await viewport.getByText(text, { exact: true }).count(),
+            replies: answerCount,
+            timed,
+          })
+          await delay(100)
+        } while (Date.now() - started < 10_000)
+        evidence.settlement.push({ marker: text, samples })
+        const tail = samples.filter((sample) => sample.elapsedMs >= 8000)
+        assert.ok(tail.length >= 5)
+        assert.ok(
+          tail.every(
+            (sample) =>
+              sample.users === 1 && sample.replies === 1 && sample.timed === 1
+          ),
+          "Completed frontend round settles to one user, one reply and one timed header"
+        )
       }
       const requests = piModel.evidence().slice(before)
       for (const marker of sent)
