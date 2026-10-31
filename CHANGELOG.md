@@ -1,6 +1,14 @@
 # Changelog
 
-## 0.41.3-fix4 — 2026-10-30
+## 0.41.3-fix5 — 2026-10-31
+
+- Resolve repeated compaction records across restored history, standalone dividers and inline reply steps. A proven terminal native lifecycle takes precedence over an earlier start; explicit running state still overrides generic tool settlement. Correlation uses event/call identities, preserving unrelated events and reply content without loading full history.
+- Retain atomic DOM transition evidence in final-package frontend verification. fix4 was blocked before publication when the Server page briefly retained an active card after completion; its builds and partial passes do not qualify as accepted release evidence. New before/after regressions cover stale starts, inline duplicates, native identity bridges and actual card rendering.
+- Carry all Pi compaction admission, cancellation, persistence and restored-lifecycle fixes, with Pi ACP 0.0.34-codeg.5 / Pi 1.4.0 / Node 24.16.0. Preserve business sessions, recovery queues, providers, native Plan/Goal, duration, deliverables, Office review and virtualized scrolling. Both exact Windows packages require full downloaded installation, upgrade, frontend and postpublication SHA256 acceptance.
+
+See [release notes](docs/releases/v0.41.3-fix5.md).
+
+## 0.41.3-fix4 — 2026-10-30 (unpublished candidate)
 
 - Keep the authoritative compaction lifecycle when a page reload or passive client adapts an unmatched historical tool as settled. An active native operation now continues to show its real summarizing phase and elapsed time, instead of falsely displaying completion or failure; terminal native outcomes still take precedence.
 - The fix3 final-package frontend gate caught this remaining shared rendering defect before publication: the backend snapshot and durable history both correctly reported `in_progress`. Three new regressions fail before the fix; an additional history-adapter-to-renderer case covers cold attachment without a live subscription.

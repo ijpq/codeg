@@ -1375,6 +1375,117 @@ describe("dedupeCompactionItems", () => {
     expect(keys(dedupeCompactionItems(items))).toEqual(["history", "unrelated"])
   })
 
+  it("keeps the terminal lifecycle when a stale persisted start precedes it", () => {
+    const running = divider(
+      "restored-start",
+      { eventId: "live-id", status: "in_progress" },
+      "live-id"
+    )
+    const completed = divider(
+      "native-completion",
+      { eventId: "native-entry", status: "completed" },
+      "live-id"
+    )
+    expect(dedupeCompactionItems([running, completed])).toEqual([completed])
+    expect(dedupeCompactionItems([completed, running])).toEqual([completed])
+  })
+
+  it.each(["completed", "failed", "cancelled"])(
+    "uses the native identity bridge to collapse three copies into one %s outcome",
+    (status) => {
+      const start = divider(
+        "start",
+        { eventId: "live-id", status: "in_progress" },
+        "live-id"
+      )
+      const native = divider(
+        "native",
+        { eventId: "native-entry", status },
+        "native-entry"
+      )
+      const bridge = divider(
+        "bridge",
+        { eventId: "native-entry", status },
+        "live-id"
+      )
+      expect(dedupeCompactionItems([start, native, bridge])).toEqual([native])
+    }
+  )
+
+  it("prefers an explicit running lifecycle to an unmatched tool's generic settled state", () => {
+    const generic = {
+      ...divider("legacy", {}, "live-id"),
+      state: "output-available" as const,
+    }
+    const running = divider(
+      "running",
+      { eventId: "live-id", status: "in_progress" },
+      "live-id"
+    )
+    expect(dedupeCompactionItems([generic, running])).toEqual([running])
+  })
+
+  it("dedupes a restored standalone start against completion inside the continuing reply", () => {
+    const running = divider(
+      "restored-start",
+      { eventId: "live-id", status: "in_progress" },
+      "live-id"
+    )
+    const part: AdaptedToolCallPart = {
+      type: "tool-call",
+      toolCallId: "live-id",
+      toolName: "context_compaction",
+      state: "output-available",
+      input: null,
+      meta: {
+        contextCompaction: {
+          version: 1,
+          eventId: "native-entry",
+          status: "completed",
+        },
+      },
+    }
+    const reply = assistantItem("reply", {
+      parts: [part, { type: "text", text: "continued after compaction" }],
+    })
+    expect(dedupeCompactionItems([running, reply])).toEqual([reply])
+  })
+
+  it("removes only the repeated inline card and preserves the reply and distinct compactions", () => {
+    const part: AdaptedToolCallPart = {
+      type: "tool-call",
+      toolCallId: "native-entry",
+      toolName: "context_compaction",
+      state: "output-available",
+      input: null,
+      meta: {
+        contextCompaction: {
+          version: 1,
+          eventId: "native-entry",
+          status: "completed",
+        },
+      },
+    }
+    const reply = assistantItem("reply", {
+      parts: [part, { type: "text", text: "keep this reply" }],
+    })
+    const repeated = assistantItem("repeated", {
+      parts: [part, { type: "text", text: "keep this too" }],
+    })
+    const distinct = divider(
+      "distinct",
+      { eventId: "another-native-entry", status: "in_progress" },
+      "other-call"
+    )
+    const items = dedupeCompactionItems([reply, repeated, distinct])
+    expect(items[0]).toBe(reply)
+    expect(items[1]).toMatchObject({
+      group: { parts: [{ type: "text", text: "keep this too" }] },
+    })
+    expect(items[2]).toBe(distinct)
+    expect(repeated.kind === "turn" && repeated.group.parts).toHaveLength(2)
+  })
+
   // The live ACP tool_call and the transcript-derived divider are the same
   // compaction under two ids, and mid-turn both are in the timeline at once.
   it("keeps the first of two renderings of one compaction", () => {

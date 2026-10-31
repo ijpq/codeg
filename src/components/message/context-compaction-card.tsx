@@ -239,6 +239,7 @@ export function ContextCompactionCard({ state, meta, summary }: Props) {
   const divider = (
     <div
       data-testid="context-compaction"
+      data-compaction-event-id={readText(payload, "eventId") ?? undefined}
       data-compaction-status={
         cancelled
           ? "cancelled"

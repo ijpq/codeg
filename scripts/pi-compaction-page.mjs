@@ -424,6 +424,7 @@ export async function piCompactionPage({
           at: Date.now(),
           cards: nodes.map((node) => ({
             status: node.getAttribute("data-compaction-status"),
+            eventId: node.getAttribute("data-compaction-event-id"),
             text: node.textContent,
             visible: node.getClientRects().length > 0,
           })),
@@ -612,6 +613,7 @@ export async function piCompactionPage({
             .evaluateAll((nodes) =>
               nodes.map((node) => ({
                 status: node.getAttribute("data-compaction-status"),
+                eventId: node.getAttribute("data-compaction-event-id"),
                 text: node.textContent,
                 reasons: [...node.querySelectorAll("[title]")].map((item) =>
                   item.getAttribute("title")

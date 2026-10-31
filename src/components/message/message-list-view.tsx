@@ -1078,7 +1078,7 @@ function compactionEventKey(
 }
 
 /**
- * Drop repeat renderings of one compaction, keeping the first.
+ * Drop repeat renderings of one compaction, preferring a proven terminal state.
  *
  * A compaction reaches the timeline through two independent channels: the live
  * ACP `tool_call` (a `live-…` turn) and the agent's own transcript, which the
@@ -1096,28 +1096,104 @@ function compactionEventKey(
  *   status message and its transcript's is the boundary record; see
  *   [`compactionEventKey`] for why the content key is safe.
  *
- * Returns the input array when nothing is dropped, so the common path
- * allocates nothing.
+ * Inspect inline reply steps too: Pi can resume its reply while a restored
+ * standalone start is still in the history window. Neither a stale start nor
+ * a duplicate inline card may survive the terminal copy. Unrelated reply
+ * parts, input groups and render keys are never changed.
  */
 export function dedupeCompactionItems(
   items: ThreadRenderItem[]
 ): ThreadRenderItem[] {
-  const seen = new Set<string>()
-  let dropped = false
-  const kept = items.filter((item) => {
-    if (item.kind !== "compaction") return true
+  const entries: {
+    item: number
+    part: number | null
+    parent: number
+    priority: number
+  }[] = []
+  const seen = new Map<string, number>()
+  const root = (index: number): number => {
+    while (entries[index].parent !== index) {
+      entries[index].parent = entries[entries[index].parent].parent
+      index = entries[index].parent
+    }
+    return index
+  }
+  const add = (
+    item: number,
+    part: number | null,
+    meta: Record<string, unknown> | null,
+    callId: string | undefined,
+    state: ToolCallState | undefined
+  ) => {
     const keys = [
-      compactionEventKey(item.meta),
-      item.callId ? `call:${item.callId}` : null,
+      compactionEventKey(meta),
+      callId ? `call:${callId}` : null,
     ].filter((key): key is string => key !== null)
-    const repeat = keys.some((key) => seen.has(key))
-    // A repeat's other identity names the same event too, so it is recorded
-    // even though the item itself goes.
-    for (const key of keys) seen.add(key)
-    if (repeat) dropped = true
-    return !repeat
+    if (!keys.length) return
+    const status = contextCompactionPayload(meta)?.status
+    const terminal =
+      status === "completed" || status === "failed" || status === "cancelled"
+    const index = entries.length
+    entries.push({
+      item,
+      part,
+      parent: index,
+      priority: terminal
+        ? 3
+        : status === "in_progress"
+          ? 2
+          : state === "output-available" || state === "output-error"
+            ? 1
+            : 0,
+    })
+    for (const key of keys) {
+      const previous = seen.get(key)
+      if (previous !== undefined) entries[root(index)].parent = root(previous)
+      seen.set(key, index)
+    }
+  }
+  items.forEach((item, i) => {
+    if (item.kind === "compaction") {
+      add(i, null, item.meta, item.callId, item.state)
+    } else if (item.kind === "turn" && item.group.role === "assistant") {
+      item.group.parts.forEach((part, p) => {
+        if (part.type === "tool-call" && isContextCompactionMeta(part.meta)) {
+          add(i, p, part.meta ?? null, part.toolCallId, part.state)
+        }
+      })
+    }
   })
-  return dropped ? kept : items
+  const winner = new Map<number, number>()
+  entries.forEach((entry, index) => {
+    const group = root(index)
+    const previous = winner.get(group)
+    if (previous === undefined || entry.priority > entries[previous].priority) {
+      winner.set(group, index)
+    }
+  })
+  const dropped = new Map<number, Set<number | null>>()
+  entries.forEach((entry, index) => {
+    if (winner.get(root(index)) === index) return
+    const parts = dropped.get(entry.item) ?? new Set<number | null>()
+    parts.add(entry.part)
+    dropped.set(entry.item, parts)
+  })
+  if (!dropped.size) return items
+  return items.flatMap((item, i) => {
+    const parts = dropped.get(i)
+    if (!parts) return [item]
+    if (parts.has(null)) return []
+    if (item.kind !== "turn") return [item]
+    return [
+      {
+        ...item,
+        group: {
+          ...item.group,
+          parts: item.group.parts.filter((_, p) => !parts.has(p)),
+        },
+      },
+    ]
+  })
 }
 
 /**

@@ -30,13 +30,21 @@ vi.mock("@/components/ai-elements/message", () => ({
 import { ContentPartsRenderer } from "./content-parts-renderer"
 import enMessages from "@/i18n/messages/en.json"
 import { adaptMessageTurn } from "@/lib/adapters/ai-elements-adapter"
-import type { AdaptedContentPart } from "@/lib/adapters/ai-elements-adapter"
+import type {
+  AdaptedContentPart,
+  AdaptedToolCallPart,
+} from "@/lib/adapters/ai-elements-adapter"
 import { COMPACTION_SUMMARY_META_KEY } from "@/lib/context-compaction"
+import { ContextCompactionCard } from "./context-compaction-card"
+import {
+  dedupeCompactionItems,
+  type ThreadRenderItem,
+} from "./message-list-view"
 
 function compactionPart(
   meta: Record<string, unknown>,
   output: string
-): AdaptedContentPart {
+): AdaptedToolCallPart {
   return {
     type: "tool-call",
     toolCallId: "cmp_1",
@@ -57,6 +65,89 @@ function renderParts(parts: AdaptedContentPart[]) {
 }
 
 describe("compaction summary in a live turn", () => {
+  it("settles one card when a restored start overlaps the native completion in the continuing reply", () => {
+    const start = {
+      contextCompaction: {
+        version: 1,
+        eventId: "active-operation",
+        status: "in_progress",
+      },
+    }
+    const completed = {
+      contextCompaction: {
+        version: 1,
+        eventId: "native-entry",
+        status: "completed",
+      },
+    }
+    const reply: Extract<ThreadRenderItem, { kind: "turn" }> = {
+      key: "reply",
+      kind: "turn",
+      phase: "streaming",
+      group: {
+        id: "reply",
+        role: "assistant",
+        images: [],
+        resources: [],
+        parts: [
+          {
+            ...compactionPart(completed, "summary"),
+            toolCallId: "active-operation",
+          },
+          {
+            type: "text",
+            text: "The reply continues after the completed compaction.",
+          },
+        ],
+      },
+      isResponseComplete: false,
+      showStats: false,
+      isRoleTransition: false,
+      previousUserIndex: null,
+      previousUserId: null,
+      isLastAssistantRun: false,
+      isThreadTail: false,
+      sourceTurns: [],
+    }
+    const items = dedupeCompactionItems([
+      {
+        key: "restored-start",
+        kind: "compaction",
+        meta: start,
+        callId: "active-operation",
+      },
+      reply,
+    ])
+    render(
+      <NextIntlClientProvider locale="en" messages={enMessages}>
+        {items.map((item) =>
+          item.kind === "compaction" ? (
+            <ContextCompactionCard key={item.key} meta={item.meta} />
+          ) : item.kind === "turn" ? (
+            <ContentPartsRenderer
+              key={item.key}
+              parts={item.group.parts}
+              role="assistant"
+            />
+          ) : null
+        )}
+      </NextIntlClientProvider>
+    )
+    expect(screen.getAllByTestId("context-compaction")).toHaveLength(1)
+    expect(screen.getByTestId("context-compaction")).toHaveAttribute(
+      "data-compaction-status",
+      "completed"
+    )
+    expect(screen.getByTestId("context-compaction")).toHaveAttribute(
+      "data-compaction-event-id",
+      "native-entry"
+    )
+    expect(screen.queryByText("Compacting context…")).not.toBeInTheDocument()
+    expect(
+      screen.getByText("The reply continues after the completed compaction.")
+    ).toBeInTheDocument()
+  })
+
   it("keeps restored native compaction active without a live tool subscription", () => {
     const adapted = adaptMessageTurn(
       {
